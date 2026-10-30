@@ -318,6 +318,26 @@ pub(super) fn prepare(index: &mut ScanIndex, now: u64, at: &str, requested: bool
                 crate::heap_layout_bound::completed_bound(walk, 64 * 1024 * 1024),
             )
         });
+    if ceiling {
+        // Start the capped root probe now, even if an older directory queue
+        // is long. Preserve its entries; only metadata roots take priority.
+        let traversal = index.traversal.as_mut().unwrap();
+        for root in traversal.scan_roots.iter().rev() {
+            let prior = traversal
+                .pending_directories
+                .iter()
+                .position(|p| p.path == *root)
+                .and_then(|i| traversal.pending_directories.remove(i));
+            traversal
+                .pending_directories
+                .push_front(prior.unwrap_or_else(|| ScanTraversalPath {
+                    scan_root: root.clone(),
+                    path: root.clone(),
+                    census_member: true,
+                    watcher_hint: false,
+                }));
+        }
+    }
     if new_round {
         index
             .traversal
@@ -359,7 +379,7 @@ pub(super) fn walk_path(
         }
         if !watcher
             && walk.suppressing
-            && stat.is_some_and(|s| s.identity.is_some())
+            && stat.is_some_and(|s| s.identity.is_some() && s.modified.is_some() && s.birth > 0)
             && walk
                 .observations
                 .get(&digest(&key))

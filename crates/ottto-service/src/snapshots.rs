@@ -43245,7 +43245,7 @@ fn enqueue_watcher_hints(
                 || !traversal
                     .observed_index_keys
                     .contains(&local_index_key(path)));
-        next_generation += u64::from(!census_member);
+        next_generation += u64::from(source == SnapshotSource::Codex && !census_member);
         // FIFO keeps an actively rewritten path from repeatedly jumping ahead
         // of an older remove/rename hint in a small bounded page.
         if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
