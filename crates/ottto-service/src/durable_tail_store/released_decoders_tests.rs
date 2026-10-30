@@ -363,10 +363,3 @@ pub(super) fn assert_old_readers_refuse_native_v3(
     assert!(v201::refuses_new_record(bytes, &original.allowlist));
     assert!(v202::refuses_new_record(bytes, &original.allowlist));
 }
-
-/// M-2 seam control. Runs both genuine released envelope decoders without
-/// changing their pins or decoder spans, using the frozen old body encoder.
-pub(super) fn assert_pre_m2_bytes(bytes: &[u8], expected: &PendingRecord, generation: u64) {
-    v201::assert_original_v1(bytes, expected, generation);
-    v202::assert_original_v1(bytes, expected, generation);
-}

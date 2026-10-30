@@ -5304,36 +5304,3 @@ fn exact_retirement_stat_io_error_is_retry_and_never_proven_absence() {
     assert!(!sync_due);
     assert_eq!(store.counters.records_invalidated, 1);
 }
-
-/// The historical v1 envelope writer and both released decoders carry the
-/// pre-M-2 typed body unchanged. The caller compares old and candidate bodies.
-pub(crate) fn assert_pre_m2_record_bytes(source: crate::snapshots::SnapshotSource, body: &[u8]) {
-    let source = DurableSource::from_snapshot(source).unwrap();
-    let mut record = pending(
-        binding("m2-wire", "fixture", ("fixture", None)),
-        DurableCertificate {
-            device: 11,
-            inode: 12,
-            length: 13,
-            modified: (14, 15),
-            birth_nanos: 16,
-            sealed_offset: 13,
-            sample_len: 13,
-            head_sha256: [17; 32],
-            boundary_sha256: [18; 32],
-            verified_unix_seconds: 19,
-            audit_debt_unix_seconds: None,
-        },
-        1,
-    );
-    record.binding.source = source;
-    record.allowlist = source.properties().allowlist();
-    record.body = body.to_vec();
-    let bytes = pinned_v1_bytes(&record, 9);
-    super::released_decoders_tests::assert_pre_m2_bytes(&bytes, &record, 9);
-    let decoded = decode(&bytes).unwrap();
-    assert_eq!(
-        pinned_v1_bytes(&decoded.record, decoded.index_generation),
-        bytes
-    );
-}
