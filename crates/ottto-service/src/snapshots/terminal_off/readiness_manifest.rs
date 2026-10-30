@@ -64,7 +64,6 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshots/claude_context_file_birth_tests.rs", "terminal_off_on_api_sidecar_without_trace_sidecar_still_vetoes", "r25-code-unclassified"),
     ("snapshots/claude_context_file_birth_tests.rs", "terminal_off_on_capture_on_bodies_match_the_clear_outside_context_scalars", "r25-code-unclassified"),
     ("snapshots/claude_history_upgrade_tests.rs", "terminal_off_on_copies_read_under_a_closed_duplicate_fence_settle_after_one_walk", "P3"),
-    ("snapshots/claude_history_upgrade_tests.rs", "terminal_off_on_held_member_owed_a_proof_correction_is_skipped_and_deferred", "R5"),
     ("snapshots/claude_history_upgrade_tests.rs", "terminal_off_on_installed_empty_list_paces_history_and_differs_from_a_missing_list", "r25-code-unclassified"),
     ("snapshots/claude_history_upgrade_tests.rs", "terminal_off_on_member_only_line_protects_its_root_on_a_fresh_index", "r25-code-unclassified"),
     ("snapshots/claude_history_upgrade_tests.rs", "terminal_off_on_no_list_and_paused_list_states_hold_history_selected_for_another_reason", "r25-code-unclassified"),

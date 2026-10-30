@@ -90,7 +90,7 @@ fn terminal_off_on_scan(
     context: &str,
     revision: u64,
 ) -> SourceScanResult {
-    index.activate_upload_context(context.into());
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, context.into());
     index.activate_effective_upload_body_witness_revision(revision);
     index.adopt_effective_upload_body_witness_revision_monotonically();
     // This fixed-clock classifier driver requests the next bounded history
@@ -123,9 +123,25 @@ fn settle(
         .map(|item| item.snapshot_fingerprint.clone())
         .collect();
     let mut settled = index.committable_subset(previous, &accepted, &BTreeMap::new());
+    if crate::snapshots::ClaudeTerminalOffForTest::active() {
+        terminal_off_ack_emitted(&mut settled, &scan.snapshots);
+    }
     let path = home.join("scan-index.json");
     settled.save(&path).unwrap();
     ScanIndex::load(&path).unwrap()
+}
+
+// C6 adapter: production file-context activation and validated uploader ACKs.
+fn terminal_off_ack_emitted(index: &mut ScanIndex, items: &[SnapshotItem]) {
+    let candidates = index.file_upload_context_ack_candidates(items);
+    let acks = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(
+        SnapshotSource::ClaudeCode,
+        items,
+    );
+    index
+        .accepted_snapshot_fingerprints
+        .extend(acks.keys().cloned());
+    index.accept_file_upload_context_acks(&candidates, &acks);
 }
 
 fn support(name: &str) -> crate::test_scratch::ScratchDir {
@@ -1883,7 +1899,6 @@ fn held_member_owed_a_proof_correction_is_skipped_and_deferred() {
 /// adoption, and its correction is deferred to the history gate (disclosed)
 /// instead of blocking a fully settled upload.
 #[test]
-#[ignore = "terminal-off ON-readiness: R5"]
 fn terminal_off_on_held_member_owed_a_proof_correction_is_skipped_and_deferred() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -1941,6 +1956,7 @@ fn terminal_off_on_held_member_owed_a_proof_correction_is_skipped_and_deferred()
         let mut result = scan(&root, &mut index, "ctx-1", 2);
         scanned.push(result.scanned_file_count);
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+        terminal_off_ack_emitted(&mut index, &result.snapshots);
         assert!(result
             .snapshots
             .iter()
