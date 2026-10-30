@@ -861,16 +861,25 @@ fn desktop_identity_adoption_sends_once_from_cache_with_the_childs_own_account()
 fn desktop_identity_natural_complete_refusal_cannot_settle_whole_or_partial_save() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     for backend in [Backend::Rejected, Backend::Conflict] {
-        for downgraded in [false, true] {
+        for previous_missing in [false, true] {
             desktop_identity::reset_refused_memo_for_test();
-            let f = IdentityFixture::new(if downgraded { CREATED_LATE } else { CREATED });
-            let (committed, old_acks) = if downgraded {
-                let (missing, _) = f.run(ScanIndex::default(), COLLECTED);
+            let f = IdentityFixture::new(CREATED);
+            let (committed, old_acks) = if previous_missing {
+                let (missing, _) = f.run(f.loaded_incomplete("2026-08-02T07:11:00Z"), COLLECTED);
                 assert_eq!(disposition(f.child(&missing)), Some("missing"));
                 let old = ledger(f.child(&missing));
-                let committed = ack(missing);
-                assert_eq!(f.latch(&committed), None);
-                f.write_store(CREATED, "natural proof recovery");
+                let mut committed = ack(missing);
+                assert_eq!(f.latch(&committed), Some(Pending));
+                // Legacy/old-reader loss: no latch, but this exact fingerprint
+                // still names an ACK of the older missing body. A blank append
+                // takes an ordinary natural read without changing body identity.
+                committed.claude_desktop_identity_latches.clear();
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&f.native.path)
+                    .unwrap()
+                    .write_all(b"\n")
+                    .unwrap();
                 (committed, old)
             } else {
                 (ScanIndex::default(), BTreeMap::new())
@@ -888,7 +897,7 @@ fn desktop_identity_natural_complete_refusal_cannot_settle_whole_or_partial_save
                 .pending_finalization
                 .iter()
                 .all(|p| p.desktop_identity_reoffer.is_none()));
-            if downgraded {
+            if previous_missing {
                 assert!(old_acks.contains_key(&body.snapshot_fingerprint));
                 assert_ne!(ledger(body), old_acks);
             }

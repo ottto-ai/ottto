@@ -2846,10 +2846,26 @@ fn desktop_identity_real_sync_rejected_body_stays_pending_exact_acked_retry_sett
         offered[0]["session_account_evidence"]
     );
     assert_eq!(
-        acked.progress.accepted_body_witnesses.get(&fingerprint),
-        Some(&refused_witness),
-        "ACK bound the exact retried bytes"
+        entity_ack(&offered[1])["body_witness_digest"],
+        refused_witness,
+        "the backend ACK independently hashes the exact retried body",
     );
+    // Successful save transfers the exact ACK into file custody and retires
+    // it from the upload ledger. Verify that transfer, not stale ledger RAM.
+    assert!(
+        acked
+            .index
+            .adopted_upload_progress_acks(&BTreeMap::from([(
+                fingerprint.clone(),
+                refused_witness.clone()
+            ),]))
+            .contains(&fingerprint),
+        "saved file custody adopts these exact ACK bytes"
+    );
+    assert!(!acked
+        .progress
+        .permanent_rejections
+        .contains_key(&fingerprint));
     assert_eq!(
         serde_json::to_value(&acked.index).unwrap()["claude_desktop_identity_latches"][&key],
         "settled",
