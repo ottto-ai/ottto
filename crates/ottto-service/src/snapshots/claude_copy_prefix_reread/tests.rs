@@ -213,6 +213,46 @@ fn combined_context_and_revision_debt_never_reads_past_native_page_budget() {
 }
 
 #[test]
+fn scoped_recovery_consumes_existing_replay_without_duplicate_native_reads() {
+    let (home, root, mut index, _) = setup("copy-prefix-existing-replay");
+    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
+    let support = home.join("support");
+    let counts = run(&home.join("scope.json"), &support, true).unwrap();
+    activate_mode(&mut index, "ctx-1", true, false);
+    let roots = vec![root.clone()];
+    let pending = prepare(&mut index, &support, &roots).unwrap();
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &roots,
+        &mut index,
+        "2026-08-23T18:40:00Z",
+        BACKFILL_WINDOW_DAYS,
+    );
+    let replay = ScanTraversalPath {
+        scan_root: root.clone(),
+        path: pending[0].clone(),
+        census_member: false,
+        watcher_hint: true,
+    };
+    index.claude_stale_family_carry.replay.push(replay.clone());
+    index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_candidates
+        .push_back(ScanTraversalPath {
+            census_member: true,
+            watcher_hint: false,
+            ..replay
+        });
+    let (_, scan, opened) = walk(&root, index, &pending);
+    assert_eq!(opened, pending, "one physical path is read only once");
+    assert_eq!(scan.scanned_file_count, counts.files);
+    assert_eq!(opened.iter().collect::<BTreeSet<_>>().len(), opened.len());
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn estimate_reports_out_of_window_members_and_apply_refuses_without_state() {
     let (home, _, index, paths) = setup("copy-prefix-window-estimate");
     fs::File::open(&paths[0])

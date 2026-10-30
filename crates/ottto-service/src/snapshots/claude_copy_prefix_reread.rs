@@ -308,6 +308,9 @@ pub(super) fn select(
         if selected.len() >= limit {
             break;
         }
+        if selected.iter().any(|candidate| candidate.path == *path) {
+            continue;
+        }
         let key = local_index_key(path);
         if !index.effective_upload_body_witness_revision_requires_adoption(&key) {
             continue;
@@ -318,14 +321,35 @@ pub(super) fn select(
         if !page.reserve(&key, entry.size_bytes) {
             break;
         }
-        let Some(traversal) = index.traversal.as_mut() else {
+        if index.traversal.is_none() {
             break;
-        };
-        let queued = traversal
-            .pending_candidates
-            .iter()
-            .position(|p| p.path == *path)
-            .and_then(|at| traversal.pending_candidates.remove(at));
+        }
+        // A cancelled family carry may already owe this exact path. Consume
+        // both queues before injecting priority work, preserving census/hint
+        // facts while preventing two reads/folds of one physical file.
+        let mut queued: Option<ScanTraversalPath> = None;
+        {
+            let mut take = |candidate: &ScanTraversalPath| {
+                if candidate.path != *path {
+                    return true;
+                }
+                if let Some(kept) = queued.as_mut() {
+                    kept.census_member |= candidate.census_member;
+                    kept.watcher_hint |= candidate.watcher_hint;
+                } else {
+                    queued = Some(candidate.clone());
+                }
+                false
+            };
+            index.claude_stale_family_carry.replay.retain(&mut take);
+            index
+                .traversal
+                .as_mut()
+                .expect("checked traversal")
+                .pending_candidates
+                .retain(&mut take);
+        }
+        let traversal = index.traversal.as_ref().expect("checked traversal");
         let candidate = queued.or_else(|| {
             let root = traversal
                 .scan_roots
