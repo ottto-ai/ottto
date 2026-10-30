@@ -1368,7 +1368,10 @@ fn defer_retained_rows(
             let Some(prior) = proved.proved_row(start, &key) else {
                 // A lost replacement ACK must not erase proof the server may
                 // still hold when today's transcript can no longer prove it.
-                if !proves && proved.row_shares(start, &key).iter().any(Option::is_some) {
+                if !proves
+                    && (proved.replacement_unsettled(start, &key)
+                        || proved.row_shares(start, &key).iter().any(Option::is_some))
+                {
                     group.refused = true;
                 }
                 continue;

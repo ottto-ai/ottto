@@ -653,6 +653,8 @@ fn retained_lost_replacement_then_missing_proof_is_a_counted_refusal() {
     let mut replacement = original.clone();
     sticky_apply(&mut replacement, &changed, &state).unwrap();
     assert!(state.invalidate_replaced(&serde_json::to_value(replacement).unwrap()));
+    // Share hints evict independently; the unsettled replacement must not.
+    state.forget_share_hints_for_test(&original.source_session_id);
     for c in &mut changed[..3] { c.identity = RequestIdentity::Missing; }
     let mut missing = original;
     sticky_apply(&mut missing, &changed, &state).unwrap();

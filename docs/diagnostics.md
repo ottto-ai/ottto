@@ -1412,8 +1412,10 @@ untagged fallback cannot fit every marker beside the stripped body, it keeps
 the newest that fit and counts each dropped proved row as a refusal.
 
 Before any upload, a proved row that the outgoing body freshly tags with a
-different proof leaves the ledger, and progress is saved before the request,
-so a lost reply cannot leave a stale proof that a later marker would honour.
+different proof becomes a proof-free tombstone, and progress is saved before
+the request, so a lost reply cannot leave a stale proof that a later marker
+would honour. While that tombstone stands, a row the transcript no longer
+proves is a counted refusal; the replacement's ACK replaces it.
 A stored-body ACK's optional `retained_proof_missing` bucket starts remove that
 body's marked rows, so a later revision re-tags them through the same
 allocator. A destination namespace or historical replay generation change

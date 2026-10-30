@@ -11,6 +11,8 @@ pub(crate) const MAX_SESSIONS: usize = 16;
 pub(crate) const MAX_BUCKETS: usize = 5_000;
 const MAX_SHARES: usize = 1_536;
 pub(crate) const MAX_PROVED_ROWS: usize = 1_024;
+/// Tombstone for a proof superseded before upload: a keyed digest is never zero.
+const REPLACED_PROOF: [u8; 16] = [0; 16];
 /// Pending `retained_proof_missing` buckets feed one diagnostic only.
 const MAX_PENDING_MISSING: usize = 64;
 
@@ -379,6 +381,15 @@ impl AcceptedSession {
             .binary_search_by(|entry| (entry.bucket, entry.row).cmp(&(bucket, row)))
             .ok()
             .map(|index| self.proved[index].proof)
+            .filter(|proof| *proof != REPLACED_PROOF)
+    }
+    /// A replacement's reply never settled, so the server may hold either
+    /// proof. Kept here because the share hints are evicted independently.
+    pub(super) fn replacement_unsettled(&self, bucket: i64, row: &RowKey) -> bool {
+        let row = proved_row_hash(self.bound_key(), row);
+        self.proved
+            .binary_search_by_key(&(bucket, row), |entry| (entry.bucket, entry.row))
+            .is_ok_and(|index| self.proved[index].proof == REPLACED_PROOF)
     }
     /// ACKed row hash, for grain only; never an identity authority.
     pub(super) fn proved_account(&self, bucket: i64, row: &RowKey) -> Option<String> {
@@ -575,9 +586,19 @@ impl AcceptedBuckets {
         self.3
     }
     #[cfg(test)]
+    pub(crate) fn forget_share_hints_for_test(&mut self, session: &str) {
+        let entry = self.session_mut(session).expect("session");
+        entry.shares = Vec::new();
+    }
+    #[cfg(test)]
     pub(crate) fn proved_rows_for_test(&self, session: &str) -> Option<(usize, usize)> {
-        self.get(session)
-            .map(|state| (state.proved.len(), state.missing.len()))
+        self.get(session).map(|state| {
+            let live = state
+                .proved
+                .iter()
+                .filter(|row| row.proof != REPLACED_PROOF);
+            (live.count(), state.missing.len())
+        })
     }
     fn has_retained(&self) -> bool {
         self.0
@@ -654,8 +675,9 @@ impl AcceptedBuckets {
     /// their marked rows, so a later revision re-tags them if proof remains.
     /// Before an upload: a row this body freshly tags with a different proof
     /// may replace the server's retained proof even if the ACK is lost, so the
-    /// superseded entry must leave first. Returns whether anything changed;
-    /// the caller persists before the request. Independent of the capability.
+    /// superseded entry becomes a tombstone first; a later ACK replaces it.
+    /// Returns whether anything changed; the caller persists before the
+    /// request. Independent of the capability.
     pub(crate) fn invalidate_replaced(&mut self, body: &Value) -> bool {
         if body["provenance"]["collector"].as_str() != Some(COLLECTOR) {
             return false;
@@ -683,18 +705,22 @@ impl AcceptedBuckets {
                     continue;
                 };
                 let row_hash = proved_row_hash(&key, &row_key);
-                if entry
-                    .proved
-                    .iter()
-                    .any(|held| held.bucket == start && held.row == row_hash && held.proof != proof)
-                {
+                if entry.proved.iter().any(|held| {
+                    held.bucket == start
+                        && held.row == row_hash
+                        && held.proof != proof
+                        && held.proof != REPLACED_PROOF
+                }) {
                     replaced.insert((start, row_hash));
                 }
             }
         }
-        entry
-            .proved
-            .retain(|held| !replaced.contains(&(held.bucket, held.row)));
+        for held in &mut entry.proved {
+            if replaced.contains(&(held.bucket, held.row)) {
+                held.proof = REPLACED_PROOF;
+                held.account = None;
+            }
+        }
         !replaced.is_empty()
     }
     pub(crate) fn record_proved(&mut self, body: &Value, witnessed: bool, missing: &[String]) {
@@ -1301,6 +1327,27 @@ mod retained_tests {
         )));
         assert!(sent.invalidate_replaced(&a));
         assert_eq!(sent.proved_rows_for_test("synthetic"), Some((0, 0)));
+        // The tombstone outlives a restart, re-sends do not churn it, and it
+        // holds no class H hash; the replacement's ACK settles it.
+        let held = &sent.get("synthetic").unwrap().proved;
+        assert_eq!((held[0].proof, held[0].account), (REPLACED_PROOF, None));
+        let mut restored = AcceptedBuckets::restore_for_test(&serde_json::to_vec(&sent).unwrap());
+        assert_eq!(restored.proved_rows_for_test("synthetic"), Some((0, 0)));
+        let (row, start) = (
+            wire_row_key(&json!({"model":"claude-synthetic"})).unwrap(),
+            bucket_key("2026-09-01T10:00:00Z").unwrap(),
+        );
+        let settled = |state: &AcceptedBuckets| {
+            state
+                .get("synthetic")
+                .unwrap()
+                .replacement_unsettled(start, &row)
+        };
+        assert!(settled(&restored));
+        assert!(!restored.invalidate_replaced(&a));
+        restored.record_proved(&a, true, &[]);
+        assert!(!settled(&restored));
+        assert_eq!(restored.proved_rows_for_test("synthetic"), Some((1, 0)));
         // retained_proof_missing removes only rows this body marked.
         state.record_proved(&b, true, &["2026-09-01T10:00:00Z".into()]);
         assert_eq!(proof(&state), Some(second));
