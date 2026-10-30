@@ -120,6 +120,8 @@ impl RecordKind {
                 | "file.entities"
                 | "file.census"
                 | "file.growth_retention"
+                // V2-only custody has no corresponding v1 positional slot.
+                | "raw_hold.growth_retention"
                 | "account_window"
                 | "account.window_retention"
                 | "account.current"
@@ -155,7 +157,7 @@ impl RecordKind {
             name.strip_prefix(prefix)
                 .is_some_and(|slot| super::lenient_decode::FIELDS.contains(&slot))
         });
-        anyhow::ensure!(known, "scan_index_representation_refused");
+        anyhow::ensure!(known, Hold::UnknownRecordKind);
         Ok(Self(name.to_owned()))
     }
     fn name(&self) -> &str {

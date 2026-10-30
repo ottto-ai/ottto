@@ -2039,10 +2039,6 @@ fn every_persisted_field_fixture() -> ScanIndex {
             "claude_desktop_census_witness" => {
                 serde_json::json!({"completed_at_unix_seconds":1,"process_id":1,"inventory":"inventory"})
             }
-            "growth_retention" => serde_json::json!({"/synthetic/0.jsonl": {
-                "predecessor_size": 11, "uncertain_passes": 2,
-                "checked_generation": 3, "last_growth_full_unix": 4
-            }}),
             "accepted_rebuild_incidence" => {
                 serde_json::json!({"/synthetic/carried.jsonl":["a".repeat(64)]})
             }
@@ -2128,6 +2124,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
     assert_eq!(serde_json::to_vec_pretty(&decoded).unwrap(), bytes);
 }
 
+/// [format] historical named and positional writers preserve appended v1 fields.
 #[test]
 fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
     // Main shipped audit progress first. The earlier E2 writer saved a named
@@ -2136,18 +2133,16 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
     let current = serde_json::to_value(&seed).unwrap();
     let fields = lenient_decode::FIELDS;
     assert_eq!(
-        &fields[fields.len() - 5..],
+        &fields[fields.len() - 4..],
         &[
             "upload_ack_retirement_handoff",
             "held_audit_progress",
             "claude_money_birth_store",
             "claude_desktop_store_inventory",
-            "growth_retention",
         ]
     );
     for earlier_e2 in [false, true] {
         let mut legacy = current.clone();
-        legacy.as_object_mut().unwrap().remove("growth_retention");
         legacy.as_object_mut().unwrap().remove(if earlier_e2 {
             "held_audit_progress"
         } else {
@@ -2339,26 +2334,27 @@ fn desktop_inventory_keeps_existing_positional_index_slots() {
     }
 }
 
-/// [format] growth retention keeps existing positional index slots.
+/// [format] v1 keeps main's positional slots and skips v2-only growth custody.
 #[test]
 fn growth_retention_keeps_existing_positional_index_slots() {
     let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
-    let mut legacy = current.clone();
-    legacy.as_object_mut().unwrap().remove("growth_retention");
+    assert!(current.get("growth_retention").is_none());
     let fields = lenient_decode::FIELDS;
     assert_eq!(fields[85], "claude_money_birth_store");
     assert_eq!(fields[86], DESKTOP_INVENTORY);
-    assert_eq!(fields[87], "growth_retention");
-    assert_eq!(fields.len(), 88);
-    for (expected, slots) in [(&legacy, &fields[..87]), (&current, fields)] {
-        let array = Value::Array(slots.iter().map(|name| expected[*name].clone()).collect());
-        let bytes = serde_json::to_vec(&array).unwrap();
+    assert_eq!(fields.len(), 87);
+    let positional = Value::Array(fields.iter().map(|name| current[*name].clone()).collect());
+    let mut unknown = current.clone();
+    unknown["growth_retention"] = serde_json::json!({"v2-only": {"owed": true}});
+    for form in [positional, unknown] {
+        let bytes = serde_json::to_vec(&form).unwrap();
         let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
         let streaming =
             lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
         let bounded = lenient_decode::read_bounded(&bytes).unwrap();
         for decoded in [native, streaming, bounded] {
-            assert_eq!(serde_json::to_value(decoded).unwrap(), *expected);
+            assert!(decoded.v2.is_none());
+            assert_eq!(serde_json::to_value(decoded).unwrap(), current);
         }
     }
 }

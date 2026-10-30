@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 #[serde(rename_all = "snake_case")]
 pub(in super::super) enum Hold {
     Future,
+    UnknownRecordKind,
     DbUnavailable,
     ForeignBinding,
     FenceLost,
@@ -28,7 +29,7 @@ pub(in super::super) enum Hold {
 impl std::fmt::Display for Hold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Future => "scan_index_representation_refused",
+            Self::Future | Self::UnknownRecordKind => "scan_index_representation_refused",
             Self::DbUnavailable => "state_v2_db_unavailable",
             Self::ForeignBinding => "state_v2_foreign_binding",
             Self::NewerSchema => "state_v2_newer_schema_refused",
@@ -46,6 +47,14 @@ impl std::fmt::Display for Hold {
 impl std::error::Error for Hold {}
 impl Hold {
     pub(super) fn storage(error: anyhow::Error) -> anyhow::Error {
+        // Keep only the content-free typed cause, including through SQLite's
+        // conversion wrapper; arbitrary engine messages still stay private.
+        if error
+            .chain()
+            .any(|cause| matches!(cause.downcast_ref::<Self>(), Some(Self::UnknownRecordKind)))
+        {
+            return Self::UnknownRecordKind.into();
+        }
         if let Some(hold) = error.downcast_ref::<Self>() {
             return (*hold).into();
         }

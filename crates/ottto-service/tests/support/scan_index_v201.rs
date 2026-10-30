@@ -129,6 +129,7 @@ fn assert_integrated_decision(source: &str, frozen: &str) {
             "                path,\n",
             "                scan_index_source_label(source),\n",
             "                support_dir,\n",
+            "                custody,\n",
             "            )?;"
         )));
         assert!(source.contains("let persistence_root ="));

@@ -174,7 +174,11 @@ fn header(table: Table, row: &rusqlite::Row<'_>) -> rusqlite::Result<Header> {
     convert(table, row)
         .inspect(|_| super::telemetry::decoded(0, 1, 0))
         .map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, error.into())
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Blob,
+                error.reallocate_into_boxed_dyn_error_without_backtrace(),
+            )
         })
 }
 fn predicate(table: Table) -> String {

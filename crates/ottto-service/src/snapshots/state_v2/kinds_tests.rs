@@ -78,6 +78,26 @@ fn commit_populate(db: &mut sqlite::Sqlite, index: &ScanIndex) {
     populate(index, &mut tx, &mut cx).unwrap();
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
 }
+/// [regress] v2 hydration's closed catalogue includes its own growth raw holds.
+#[test]
+fn owned_kinds_are_admitted_without_adding_v1_growth_slots() {
+    for kind in [
+        kinds_files::KINDS,
+        kinds_census::KINDS,
+        kinds_accounts::KINDS,
+        kinds_misc::KINDS,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert_eq!(RecordKind::parse(kind).unwrap().name(), *kind);
+    }
+    for kind in ["raw_hold.future", "v1_field.growth_retention"] {
+        let error = RecordKind::parse(kind).unwrap_err();
+        assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::UnknownRecordKind));
+    }
+}
+
 /// [format] all groups share one snapshot and roundtrip real v1 without losing context or membership.
 #[test]
 fn all_groups_share_one_snapshot_and_roundtrip_real_v1_without_losing_context_or_membership() {

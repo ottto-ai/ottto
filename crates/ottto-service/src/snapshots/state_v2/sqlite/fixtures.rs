@@ -1,5 +1,32 @@
 //! Backend-only synthetic damage hooks. Never open a provider database.
 use super::*;
+
+/// [regress] SQLite header conversion preserves typed representation refusals.
+#[test]
+fn unknown_record_kind_survives_sqlite_conversion_and_health_sanitization() {
+    let scratch = crate::test_scratch::ScratchDir::new("v2-unknown-record-kind");
+    let mut db = Sqlite::create_import(&scratch.join("index.v2.sqlite.import")).unwrap();
+    db.conn().unwrap().execute("INSERT INTO records(kind,key_bytes,position,value_version,header,value_digest,row_checksum,value_bytes,chunk_count,inline_value) VALUES('file.future',X'',0,1,NULL,zeroblob(16),zeroblob(16),0,0,X'')",[]).unwrap();
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let error = tx
+        .scan_prefix(
+            RowPrefix {
+                table: Table::Records,
+            },
+            None,
+            1,
+        )
+        .unwrap_err();
+    assert!(error.chain().any(|cause| cause.is::<Hold>()));
+    let error = Hold::storage(error.context("private engine detail"));
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::UnknownRecordKind));
+    assert_eq!(format!("{error:#}"), "scan_index_representation_refused");
+    assert_eq!(
+        serde_json::to_value(error.downcast_ref::<Hold>().unwrap()).unwrap(),
+        serde_json::json!("unknown_record_kind")
+    );
+}
+
 pub(in super::super) fn damage_part_for_test(db: &mut Sqlite) {
     db.conn()
         .unwrap()
