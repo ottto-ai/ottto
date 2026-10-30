@@ -225,3 +225,30 @@ Portable restart-counter fixtures exercise Codex's strict EntryChanged binding;
 Claude's original-v1 adapter/accepted-floor handling is not that premise and is
 unchanged. A fault-free Linux v1 decode may classify layout backpressure without
 starting a Full; the control checks the typed outcome and zero fault counters.
+
+The carried-upload literal experiment is parked and reverted: uploaded prompt
+labels cannot in general restore the existing raw-material-plus-title digest.
+No PL codec or shared-body extension ships from that experiment. The bounded
+content-only extractor now accepts Pi workspace solely from a session header's
+cwd, with native trim/empty semantics, the existing 4096-byte capture cap and
+workspace digest fence. Pi first-prompt obligations remain unfunded. Portable
+controls compare the extractor with the native test oracle and exercise later
+headers, wrong-row cwd, decoy fields, whitespace/Unicode and cap refusal.
+
+Content-free diagnostics now split unsupported re-derive attempts by each
+blocking class and source, and report input bytes by head, Tail and Full. Head
+counts actual extractor preads, including refused captures; Tail/Full counts
+native bytes consumed under an acquisition plan, including partial/error steps.
+Certificate samples, prefetch beyond consumed input and legacy readers without
+a plan are excluded, so these are not total physical disk bytes or a causal
+attribution of every Full to a re-derive refusal. Fixed atomics add no per-key
+state and never influence admission, pacing, owed state or persistence. Codex's
+existing resource_full count is committed at start_resource_full, after cursor
+funding; an earlier eligible probe remains uncounted. No new Full cause.
+
+A nonempty activity_skills field still refuses the complete durable record as
+class E. The bounded detector keeps up to 33 names while upload takes 32 and may
+replace spelling with provider-native names; its retained set is not an exact
+wire-value set. Changing that class or persisting/re-deriving names requires an
+explicit class ruling and a reader-first or new-records-only compatibility plan.
+Existing Claude/Codex field inventories and allowlist pins remain unchanged.

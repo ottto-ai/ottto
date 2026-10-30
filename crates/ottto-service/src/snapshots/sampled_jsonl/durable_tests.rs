@@ -901,6 +901,11 @@ fn pi_cwd_and_first_prompt_body_is_admitted_for_restore() {
     assert_eq!(decoded.rederive.title, None);
     assert!(decoded.content_charge().unwrap() > 0, "funded");
 
+    let (restored, _) = decoded
+        .rederive_content(&File::open(&path).unwrap())
+        .unwrap();
+    assert!(restored.accumulator.workspace_path.is_some());
+
     let path = scratch.write("no-cwd.jsonl", &pi_wire_lines(false));
     let (_, mut decoded) = pi_carried(&path, None, pi_gates(true, false, false));
     decoded.settle_pi_wire_prompt(None);
@@ -913,12 +918,10 @@ fn pi_cwd_and_first_prompt_body_is_admitted_for_restore() {
     assert!(restored.accumulator.pi_carried_title().is_some());
 }
 
-/// What still refuses. Without carried values a first prompt refuses before
-/// input (`durable_tail.rs` maps it to `rederive_unfunded`). With them, or with
-/// a workspace alone, the charge is funded and the head row refuses until E1's
-/// workspace arm lands; that arm flips both `workspace_source` asserts.
+/// Without carried values a first prompt refuses before input. With carried
+/// values, or a workspace alone, the header workspace rederives successfully.
 #[test]
-fn pi_body_without_carried_values_or_workspace_arm_refuses_restore() {
+fn pi_body_requires_carried_prompt_and_rederives_header_workspace() {
     let scratch = Scratch::new("pi-refused");
     let path = scratch.write("prompt.jsonl", &pi_lines(true));
     let (_, decoded) = pi_decoded(&path);
@@ -928,20 +931,20 @@ fn pi_body_without_carried_values_or_workspace_arm_refuses_restore() {
 
     let (_, mut decoded) = pi_carried(&path, None, pi_gates(true, false, false));
     decoded.settle_pi_wire_prompt(None);
-    assert!(matches!(
-        decoded.rederive_content(&File::open(&path).unwrap()),
-        Err(Refuse::NotRederivable("workspace_source"))
-    ));
+    let (restored, _) = decoded
+        .rederive_content(&File::open(&path).unwrap())
+        .unwrap();
+    assert!(restored.accumulator.workspace_path.is_some());
 
     let path = scratch.write("workspace.jsonl", &pi_lines(false));
     let (_, decoded) = pi_decoded(&path);
     assert!(decoded.rederive.first_prompt.is_none());
     assert!(decoded.rederive.workspace.is_some());
     assert!(decoded.content_charge().unwrap() > 0, "funded");
-    assert!(matches!(
-        decoded.rederive_content(&File::open(&path).unwrap()),
-        Err(Refuse::NotRederivable("workspace_source"))
-    ));
+    let (restored, _) = decoded
+        .rederive_content(&File::open(&path).unwrap())
+        .unwrap();
+    assert!(restored.accumulator.workspace_path.is_some());
 }
 
 const PI_MARKER: &str = "ZZsyntheticcanaryQQ";
@@ -1164,7 +1167,7 @@ fn pi_restored_tail_publishes_the_cold_first_prompt_and_title() {
     pi_restore_tail_case(false, pi_all_on());
 }
 
-/// The same with a header `cwd`. Expected red until E1's workspace arm lands.
+/// The same with a header `cwd`, rederived from its marked header row.
 #[test]
 fn pi_restored_tail_with_header_cwd_publishes_the_cold_body() {
     pi_restore_tail_case(true, pi_all_on());
@@ -2203,6 +2206,8 @@ fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
     // Since #870, audit debt alone never forces a Full on a checkpoint; an
     // independently owed Full (here a scope change) must not touch the gate.
     let mut due = parser(&path, source);
+    // Since #870, audit debt alone never forces a Full on a checkpoint; an
+    // independently owed Full (here a scope change) must not touch the gate.
     let mode = due
         .prepare_acquisition_with_reuse_gate(
             Some(Retained {
@@ -2563,4 +2568,156 @@ fn m3_seam_never_runs_before_the_held_object_is_revalidated() {
         .finish_native(request("another opened object"), Some(&mut count))
         .is_err());
     assert_eq!(calls, 0);
+}
+
+/// The Pi source/section is not admitted on this branch. Exercise the bounded
+/// content consumer directly against the native cfg(test) oracle, without
+/// manufacturing a Pi body or moving either existing source's allowlist pin.
+#[test]
+fn bounded_pi_workspace_matches_native_header_only_precedence() {
+    let scratch = Scratch::new("pi-workspace-content");
+    let source = SnapshotSource::Pi;
+    let cases = [
+        vec![json!({"type":"session","id":"synthetic-pi","cwd":"/synthetic/workspace"})],
+        vec![
+            json!({"type":"message","cwd":"/ignore-message","workspace":"/ignore"}),
+            json!({"type":" session ","id":"synthetic-pi","cwd":"  /synthetic/a\u{e9}  ",
+                "projectPath":"/ignore-project","workspace":"/ignore-workspace",
+                "payload":{"cwd":"/ignore-payload"}}),
+            json!({"type":"session","cwd":"/later-does-not-overwrite"}),
+        ],
+        vec![
+            json!({"type":"session","id":"synthetic-pi","cwd":"  ","workspace":"/ignore"}),
+            json!({"type":"session","cwd":"/first-nonempty"}),
+        ],
+    ];
+    for (i, lines) in cases.into_iter().enumerate() {
+        let lines = lines
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let path = scratch.write(&format!("pi-{i}"), &lines);
+        let mut native = parser(&path, source);
+        assert!(matches!(
+            native
+                .prepare_acquisition(None, &scope(), None, NOW)
+                .unwrap(),
+            ReadMode::Full(FullReason::StateMissing)
+        ));
+        while !native.step().unwrap() {}
+        let native = native.reduction_copy();
+        let make = || {
+            let mut reduction = native.clone();
+            reduction.accumulator.workspace_path = None;
+            Decoded {
+                reduction,
+                rederive: Rederive {
+                    workspace: Some(workspace_digest(&native.accumulator).unwrap()),
+                    ..Default::default()
+                },
+            }
+        };
+        let expected = make()
+            .rederive(
+                parser(&path, source),
+                &mut File::open(&path).unwrap(),
+                line_cap(),
+            )
+            .unwrap();
+        assert!(
+            make().content_charge().unwrap() >= native.accumulator.durable_marks.workspace.unwrap()
+        );
+        let (actual, receipt) = make()
+            .rederive_content(&File::open(&path).unwrap())
+            .unwrap();
+        assert_eq!(
+            actual.accumulator.workspace_path,
+            native.accumulator.workspace_path
+        );
+        assert_eq!(
+            actual.accumulator.workspace_path,
+            expected.0.accumulator.workspace_path
+        );
+        assert_eq!(receipt.head_bytes, expected.1.head_bytes);
+        assert_eq!(receipt.line_bytes, 0);
+        assert_eq!(receipt.named_lines, 0);
+        let mut prompt = make();
+        prompt.rederive.first_prompt = Some([1; 32]);
+        assert!(
+            prompt.content_charge().is_err(),
+            "Pi first prompt is still unfunded"
+        );
+        let mut wrong = make();
+        wrong.rederive.workspace = Some([0; 32]);
+        assert!(matches!(
+            wrong.rederive_content(&File::open(&path).unwrap()),
+            Err(Refuse::NotRederivable("workspace_digest"))
+        ));
+    }
+}
+
+#[test]
+fn bounded_pi_workspace_enforces_cap_and_refuses_nonheader_cwd() {
+    let scratch = Scratch::new("pi-workspace-caps");
+    for size in [4096, 4097] {
+        let path = scratch.write(
+            &format!("pi-{size}"),
+            &[json!({"type":"session","id":"synthetic-pi","cwd":"x".repeat(size)}).to_string()],
+        );
+        let mut native = parser(&path, SnapshotSource::Pi);
+        assert!(matches!(
+            native
+                .prepare_acquisition(None, &scope(), None, NOW)
+                .unwrap(),
+            ReadMode::Full(FullReason::StateMissing)
+        ));
+        while !native.step().unwrap() {}
+        let mut reduction = native.reduction_copy();
+        let want = workspace_digest(&reduction.accumulator).unwrap();
+        reduction.accumulator.workspace_path = None;
+        let decoded = Decoded {
+            reduction,
+            rederive: Rederive {
+                workspace: Some(want),
+                ..Default::default()
+            },
+        };
+        decoded.content_charge().unwrap();
+        let result = decoded.rederive_content(&File::open(&path).unwrap());
+        if size == 4096 {
+            assert_eq!(
+                result.unwrap().0.accumulator.workspace_path,
+                Some(PathBuf::from("x".repeat(size)))
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(Refuse::NotRederivable("workspace_capture"))
+            ));
+        }
+    }
+    let row = json!({"type":"message","cwd":"/synthetic/wrong-row"}).to_string();
+    let path = scratch.write("not-header", std::slice::from_ref(&row));
+    let mut acc = SnapshotAccumulator::new(SnapshotSource::Pi);
+    acc.workspace_path = Some(PathBuf::from("/synthetic/wrong-row"));
+    acc.durable_marks.workspace = Some((row.len() + 1) as u64);
+    let want = workspace_digest(&acc).unwrap();
+    acc.workspace_path = None;
+    let decoded = Decoded {
+        reduction: CachedJsonlReduction {
+            accumulator: acc,
+            report: JsonlReadReport::default(),
+            recognized_usage_drop_count: 0,
+            positive_recognized_usage_count: 0,
+            positive_usage_evidence: false,
+        },
+        rederive: Rederive {
+            workspace: Some(want),
+            ..Default::default()
+        },
+    };
+    assert!(matches!(
+        decoded.rederive_content(&File::open(&path).unwrap()),
+        Err(Refuse::NotRederivable("workspace_digest"))
+    ));
 }
