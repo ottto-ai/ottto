@@ -1,9 +1,9 @@
 {
   "producer_repository": "ottto-ai/ottto",
-  "generated_by_ci_commit": "78232b4ad01aaa5be7e785483db4fd53d023f551",
+  "generated_by_ci_commit": "41b7fb04e8aeaaf8c52974e68e5f1ab6090c6c14",
   "producer_test": "retained_emitted_wire_goldens_for_the_receiver_contract",
   "producer_path": "crates/ottto-service/src/snapshots/fixtures/claude_identity_retained_emitted.json",
-  "sha256": "596ac7e263dab766195ae12f8d817489531c6fa162cd18881a4c7bfe0df955c5",
+  "sha256": "b75da4fa691b446ea19c5a7e2e06fc284d7eaee28de2b6a0d848d18fb6246508",
   "item_bytes": {
     "contract5_fresh": 3941,
     "contract5_fresh_proving": 3941,
@@ -21,7 +21,9 @@
     "missing_proof_retag_fit_proving": 6952,
     "missing_proof_retag_unfit": 13883,
     "missing_proof_retag_unfit_proving": 6952,
-    "unpriced_strip_after_proof": 5499,
+    "presence_split_fresh": 12738,
+    "presence_split_fresh_proving": 12738,
+    "unpriced_strip_after_proof": 12290,
     "unpriced_strip_after_proof_proving": 12290
   },
   "items": {
@@ -162,12 +164,28 @@
         "claude_request_owned_usage:v1",
         "claude_request_owned_usage:v1"
       ],
-      "expected_outcome": "r7 unpriced rollup strip after witnessed proof: whole model row untagged, one refusal per bucket row, unpriced_part_untagged=1, no marker",
+      "expected_outcome": "r7 cost-presence fixture after witnessed proof: deferring would trip the unpriced strip, so the model re-sends its fresh tags (equal to the proving body); no marker, no strip",
       "bucket_rows": 4,
       "marker_rows": 0,
       "marker_rows_with_hash": 0,
-      "fresh_tagged_rows": 0,
-      "request_identity_refusals": 4
+      "fresh_tagged_rows": 4,
+      "request_identity_refusals": 0
+    },
+    "presence_split_fresh": {
+      "bodies": [
+        "presence_split_fresh_proving",
+        "presence_split_fresh"
+      ],
+      "contracts": [
+        "claude_request_owned_usage:v1",
+        "claude_request_owned_usage:v1"
+      ],
+      "expected_outcome": "closed proved hours carry every cost field, the open hour lacks one: no strip, fresh tags (equal to the proving body), no marker for that model",
+      "bucket_rows": 4,
+      "marker_rows": 0,
+      "marker_rows_with_hash": 0,
+      "fresh_tagged_rows": 4,
+      "request_identity_refusals": 0
     }
   }
 }
