@@ -382,3 +382,437 @@ fn route_replays_receipt_before_fresh_or_cached_graph_and_missing_receipt_holds(
         assert!(guard_containment_locked(&f.path).is_err());
     }
 }
+
+// Real mapper coverage for the raw decoder/load route (the fixtures above use
+// EmptyMapper only to isolate publication and recovery).
+mod hydrate_parity {
+    use super::*;
+    use crate::snapshots as s;
+    use s::lenient_decode;
+    use serde_json::value::RawValue;
+    use std::collections::BTreeSet;
+    use std::time::SystemTime;
+
+    fn seed() -> ScanIndex {
+        let mut index = ScanIndex::default();
+        index.accepted_snapshot_fingerprints.insert("a".repeat(64));
+        index.files.insert(
+            "/synthetic/family.jsonl".into(),
+            s::tests::manifest_index_entry(Some(&"a".repeat(64))),
+        );
+        index.insert_retry_pending_claude_authority_for_test("family");
+        index.insert_claude_usage_family_pending_for_test("family", "2026-10-30T00:00:00Z");
+        index
+    }
+    fn raw_slot(bytes: &[u8], field: &str, key: &str) -> String {
+        let root: BTreeMap<String, &RawValue> = serde_json::from_slice(bytes).unwrap();
+        let records: BTreeMap<String, &RawValue> = serde_json::from_str(root[field].get()).unwrap();
+        records[key].get().into()
+    }
+    fn attach_raw(index: &mut ScanIndex, field: &str, key: &str, raw: &str) {
+        // Reuse the v1 hold codec to derive its platform-specific bookkeeping
+        // charge rather than duplicating the private HeldRaw layout in a fixture.
+        let probe =
+            lenient_decode::read_bounded(br#"{"files":{"probe":{"size_bytes":[]}}}"#).unwrap();
+        let (_, _, bytes, _, charge) = probe.decode_holds.v2_entries().next().unwrap();
+        let overhead =
+            charge - bytes.len() as u64 - serde_json::to_vec("probe").unwrap().len() as u64;
+        index
+            .decode_holds
+            .v2_insert(
+                field,
+                key.into(),
+                raw.as_bytes().to_vec(),
+                None,
+                overhead + raw.len() as u64 + serde_json::to_vec(key).unwrap().len() as u64,
+            )
+            .unwrap();
+        index.decode_holds.v2_finish((0, 0));
+    }
+    fn publish(f: &Fixture, index: &ScanIndex) {
+        let mut db =
+            sqlite::Sqlite::create_import(&fence::sibling(&f.path, ".v2.sqlite.import")).unwrap();
+        db.control("identity", &f.identity()).unwrap();
+        db.control("generation", &0_u64).unwrap();
+        let mut cx = KindCx::default();
+        cx.binding = Some(f.identity().binding);
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        kinds::populate(index, &mut tx, &mut cx).unwrap();
+        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+        db.finish_import().unwrap();
+        super::super::super::ack::ProgressRecovery::seal_import(f.identity(), 1, &f.path, None)
+            .unwrap();
+        fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+    }
+    fn assert_graph(expected: &ScanIndex, actual: &ScanIndex) {
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert!(actual.decode_holds.same_as(&expected.decode_holds));
+        assert_eq!(
+            actual.decode_holds.v2_provenance(),
+            expected.decode_holds.v2_provenance()
+        );
+        let custody = |index: &ScanIndex| {
+            index
+                .decode_holds
+                .v2_entries()
+                .map(|(field, key, raw, owner, charge)| {
+                    (
+                        field.to_owned(),
+                        key.to_owned(),
+                        raw.to_vec(),
+                        owner,
+                        charge,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(custody(actual), custody(expected));
+        assert_eq!(
+            actual.codex_parent_proof_parents_live,
+            expected.codex_parent_proof_parents_live
+        );
+    }
+    fn compare(bytes: &[u8], mapped: ScanIndex) -> ScanIndex {
+        // Exercise the shared API with the stage used by both ordinary and
+        // claim-only CAS. SAVE owns installing its current-snapshot caller.
+        for bounded in [false, true] {
+            let expected = if bounded {
+                lenient_decode::read_bounded(bytes).unwrap()
+            } else {
+                lenient_decode::read(std::io::Cursor::new(bytes), "cas", "claude_code").unwrap()
+            };
+            let mut current = mapped.clone();
+            lenient_decode::post_decode_hydrated(&mut current, "cas", "claude_code").unwrap();
+            assert_graph(&expected, &current);
+        }
+        let f = Fixture::new();
+        let v1 = f.support.join("v1-index.json");
+        fs::write(&v1, bytes).unwrap();
+        let (mut expected, _) = ScanIndex::load_inner_with_support(
+            &v1,
+            Some(s::SnapshotSource::ClaudeCode),
+            None,
+            SystemTime::now(),
+        )
+        .unwrap();
+        publish(&f, &mapped);
+        expected.generation = 1;
+        let fence_bytes = fs::read(&f.path).unwrap();
+        let load = || {
+            ScanIndex::load_inner_with_support(
+                &f.path,
+                Some(s::SnapshotSource::ClaudeCode),
+                None,
+                SystemTime::now(),
+            )
+            .unwrap()
+            .0
+        };
+        let actual = load();
+        assert_graph(&expected, &actual);
+        assert_graph(&expected, &load()); // cached graph still runs outer load steps
+        with_state(&f.path, |state| {
+            state.cached = None;
+            Ok(())
+        })
+        .unwrap();
+        assert_graph(&expected, &load()); // hydrate again on the resident connection
+        assert_eq!(fs::read(&v1).unwrap(), bytes);
+        assert_eq!(fs::read(&f.path).unwrap(), fence_bytes);
+        assert!(!fence::sibling(&f.path, ".v1-readonly").exists());
+        actual
+    }
+    fn typed_case(index: ScanIndex) -> ScanIndex {
+        let bytes = serde_json::to_vec(&index).unwrap();
+        // Mapped tombstone codecs, like serde, reconstruct decoded evidence.
+        let mapped = serde_json::from_slice(&bytes).unwrap();
+        compare(&bytes, mapped)
+    }
+    #[test]
+    fn future_controls_refuse_before_hydrate_normalization_and_keep_custody() {
+        for schema in [false, true] {
+            let mut index = seed();
+            if schema {
+                index.schema_version = s::SCAN_INDEX_SCHEMA_VERSION + 1;
+            } else {
+                index.accepted_snapshot_fingerprint_ledger_version =
+                    s::SNAPSHOT_ACCEPTED_LEDGER_VERSION + 1;
+            }
+            let f = Fixture::new();
+            publish(&f, &index);
+            let before = fs::read(&f.path).unwrap();
+            let error = load_locked(&f.path, None).unwrap_err();
+            assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
+            assert_eq!(fs::read(&f.path).unwrap(), before);
+        }
+    }
+    #[test]
+    fn every_hydrate_runs_deadline_drop_cutoff_and_tombstone_rules() {
+        let mut index = seed();
+        let mut quarantine = s::snapshot_quarantine_record(s::SnapshotSource::ClaudeCode);
+        quarantine.retry_after_unix_seconds = u64::MAX;
+        index
+            .quarantined_snapshot_fingerprints
+            .insert("b".repeat(64), quarantine);
+        let actual = typed_case(index);
+        assert!(s::snapshot_quarantine_deadline_is_bounded(
+            &actual.quarantined_snapshot_fingerprints[&"b".repeat(64)]
+        ));
+
+        let mut index = seed();
+        index
+            .snapshot_activity_at
+            .insert("c".repeat(64), Some("invalid time".into()));
+        index.accepted_snapshot_fingerprints.insert("bad".into());
+        index.legacy_settlement_reconcile_after_fingerprint = Some("bad".into());
+        index.claude_history_cutoff_unix_seconds = Some(s::MALFORMED_CLAUDE_HISTORY_CUTOFF);
+        index.claude_history_gate_loaded = true;
+        let actual = typed_case(index);
+        assert!(!actual.snapshot_activity_at.contains_key(&"c".repeat(64)));
+        assert!(!actual.accepted_snapshot_fingerprints.contains("bad"));
+        assert!(!actual.claude_history_gate_loaded);
+
+        let mut index = seed();
+        index.claude_retired_family_tombstones_initialized = true;
+        let actual = typed_case(index);
+        assert!(actual.claude_retired_family_tombstones_initialized);
+    }
+    #[test]
+    fn missing_and_damaged_retirement_evidence_keep_the_v1_uncertainty_and_commitment() {
+        for missing in [false, true] {
+            let mut index = seed();
+            index.claude_retired_family_tombstones_initialized = true;
+            let mut value = serde_json::to_value(index).unwrap();
+            if missing {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("claude_retired_family_tombstones");
+            } else {
+                value["claude_retired_family_tombstones"] =
+                    serde_json::json!({"invalid": "timestamp"});
+            }
+            let bytes = serde_json::to_vec(&value).unwrap();
+            // The importer already carries the original tombstone repair
+            // commitment. Hydration must settle without forgetting or doubling it.
+            let mapped = lenient_decode::read_bounded(&bytes).unwrap();
+            let actual = compare(&bytes, mapped);
+            assert!(actual.claude_retired_family_tombstones_uncertain);
+            assert_eq!(actual.decode_holds.v2_provenance().1, 1);
+        }
+    }
+    #[test]
+    fn v2_load_rearms_legacy_terminal_with_the_v1_pacing_rule() {
+        let mut index = seed();
+        let fingerprint = "b".repeat(64);
+        let mut quarantine = s::snapshot_quarantine_record(s::SnapshotSource::ClaudeCode);
+        quarantine.disposition = s::SnapshotQuarantineDisposition::UnprovenTerminal;
+        quarantine.failed_reconstruction_count = s::MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+        quarantine.retry_after_unix_seconds = 0;
+        quarantine.reconstruction_contract = 0;
+        index
+            .quarantined_snapshot_fingerprints
+            .insert(fingerprint.clone(), quarantine);
+        let f = Fixture::new();
+        let v1 = f.support.join("v1-index.json");
+        fs::write(&v1, serde_json::to_vec(&index).unwrap()).unwrap();
+        let (mut expected, _) = ScanIndex::load_inner_with_support(
+            &v1,
+            Some(s::SnapshotSource::ClaudeCode),
+            None,
+            SystemTime::now(),
+        )
+        .unwrap();
+        publish(&f, &index);
+        let earliest = crate::snapshot_sync::quarantine_retry_after(&fingerprint);
+        let (mut actual, _) = ScanIndex::load_inner_with_support(
+            &f.path,
+            Some(s::SnapshotSource::ClaudeCode),
+            None,
+            SystemTime::now(),
+        )
+        .unwrap();
+        let latest = crate::snapshot_sync::quarantine_retry_after(&fingerprint);
+        let record = &actual.quarantined_snapshot_fingerprints[&fingerprint];
+        assert_eq!(record.contract_retry_claims, Some(0));
+        assert!((earliest..=latest).contains(&record.retry_after_unix_seconds));
+        // Separate loads sample the wall clock independently. Compare the full
+        // graph after accounting solely for that clock sample, and prove the
+        // actual deadline against the shared jitter/pacing rule above.
+        expected.generation = 1;
+        expected
+            .quarantined_snapshot_fingerprints
+            .get_mut(&fingerprint)
+            .unwrap()
+            .retry_after_unix_seconds = 0;
+        actual
+            .quarantined_snapshot_fingerprints
+            .get_mut(&fingerprint)
+            .unwrap()
+            .retry_after_unix_seconds = 0;
+        assert_graph(&expected, &actual);
+    }
+    #[test]
+    fn typed_unbound_authority_rearms_files_and_collapse_uses_shared_load_tail() {
+        let mut index = seed();
+        index
+            .claude_usage_family_witnesses
+            .get_mut("family")
+            .unwrap()
+            .legacy_owner_roots
+            .insert("unbound-owner".into());
+        let actual = typed_case(index);
+        assert!(actual.claude_usage_authority_quarantine.is_empty());
+        assert!(actual.files["/synthetic/family.jsonl"]
+            .source_file_fingerprint
+            .is_empty());
+
+        let mut index = seed();
+        let window = |day| s::ClaudeAccountFamilyPendingWindow {
+            version: "v2".into(),
+            census_window_end: format!("2026-10-{day:02}T00:00:00Z"),
+            account_identifier_hash: "d".repeat(64),
+            evidence_request_count: 0,
+            census_complete: true,
+            members: BTreeMap::new(),
+            member_requests: BTreeMap::new(),
+            invalid: false,
+        };
+        index.claude_account_family_pending.insert(
+            "other-family".into(),
+            s::ClaudeAccountFamilyPending {
+                current: window(30),
+                previous_windows: vec![window(25), window(26), window(27)],
+                confirmed_absent_members: BTreeSet::new(),
+            },
+        );
+        let actual = typed_case(index);
+        assert_eq!(
+            actual.claude_account_family_pending["other-family"]
+                .previous_windows
+                .len(),
+            2
+        );
+    }
+    #[test]
+    fn raw_quarantine_repairs_and_opaque_file_freezes_match_v1_custody() {
+        let mut index = seed();
+        let fingerprint = "b".repeat(64);
+        index.quarantined_snapshot_fingerprints.insert(
+            fingerprint.clone(),
+            s::snapshot_quarantine_record(s::SnapshotSource::ClaudeCode),
+        );
+        let canonical = serde_json::to_string(&index).unwrap();
+        let old = raw_slot(
+            canonical.as_bytes(),
+            "quarantined_snapshot_fingerprints",
+            &fingerprint,
+        );
+        let mut value: serde_json::Value = serde_json::from_str(&old).unwrap();
+        value["retry_after_unix_seconds"] = "mistyped-original".into();
+        let raw = serde_json::to_string_pretty(&value).unwrap();
+        let bytes = canonical.replace(&old, &raw).into_bytes();
+        index.quarantined_snapshot_fingerprints.clear();
+        attach_raw(
+            &mut index,
+            "quarantined_snapshot_fingerprints",
+            &fingerprint,
+            &raw,
+        );
+        let actual = compare(&bytes, index);
+        assert!(actual.decode_holds.is_empty());
+        assert_eq!(actual.decode_holds.v2_provenance().1, 1);
+
+        let mut index = seed();
+        let key = "/synthetic/family.jsonl";
+        let canonical = serde_json::to_string(&index).unwrap();
+        let old = raw_slot(canonical.as_bytes(), "files", key);
+        let mut value: serde_json::Value = serde_json::from_str(&old).unwrap();
+        value["size_bytes"] = serde_json::json!([]);
+        let raw = serde_json::to_string_pretty(&value).unwrap();
+        let bytes = canonical.replace(&old, &raw).into_bytes();
+        index.files.clear();
+        attach_raw(&mut index, "files", key, &raw);
+        let actual = compare(&bytes, index);
+        assert!(actual.decode_holds_family("family"));
+        assert!(actual.claude_usage_authority_quarantine.is_empty());
+        assert!(actual.claude_usage_family_pending.is_empty());
+    }
+    #[test]
+    fn original_mistyped_authority_freezes_siblings_before_canonicalization_and_bound_control_repairs(
+    ) {
+        for bound in [false, true] {
+            let mut index = seed();
+            if !bound {
+                index
+                    .claude_usage_family_witnesses
+                    .get_mut("family")
+                    .unwrap()
+                    .legacy_owner_roots
+                    .insert("unbound-owner".into());
+            }
+            // Preserve noncanonical spacing and number spelling in the original
+            // raw slot. Re-encoding the repaired authority would lose this proof.
+            let canonical = serde_json::to_vec(&index).unwrap();
+            let original = raw_slot(&canonical, "claude_usage_authority_quarantine", "family");
+            let mut value: serde_json::Value = serde_json::from_str(&original).unwrap();
+            value["retry_after_unix_seconds"] = "mistyped-original".into();
+            let raw = serde_json::to_string_pretty(&value).unwrap();
+            let bytes = String::from_utf8(canonical)
+                .unwrap()
+                .replace(&original, &raw)
+                .into_bytes();
+            // A forced-unbound v1 read supplies the exact held slot's lexical
+            // charge. The mapped graph itself retains only this raw authority;
+            // all pending/witness siblings are still typed and must be frozen.
+            let mut unbound: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            unbound["claude_usage_family_witnesses"]["family"]["legacy_owner_roots"] =
+                serde_json::json!(["unbound-owner"]);
+            let unbound_bytes = serde_json::to_string(&unbound).unwrap();
+            let compact_raw = raw_slot(
+                unbound_bytes.as_bytes(),
+                "claude_usage_authority_quarantine",
+                "family",
+            );
+            let unbound_bytes = unbound_bytes.replace(&compact_raw, &raw);
+            let held = lenient_decode::read_bounded(unbound_bytes.as_bytes()).unwrap();
+            let (_, _, raw_bytes, owner, charge) = held
+                .decode_holds
+                .v2_entries()
+                .find(|(field, key, ..)| {
+                    *field == "claude_usage_authority_quarantine" && *key == "family"
+                })
+                .unwrap();
+            assert_eq!(raw_bytes, raw.as_bytes());
+            index.claude_usage_authority_quarantine.clear();
+            index
+                .decode_holds
+                .v2_insert(
+                    "claude_usage_authority_quarantine",
+                    "family".into(),
+                    raw_bytes.to_vec(),
+                    owner,
+                    charge,
+                )
+                .unwrap();
+            index.decode_holds.v2_finish((0, 0));
+            let actual = compare(&bytes, index);
+            assert_eq!(actual.decode_holds_family("family"), !bound);
+            assert!(actual
+                .accepted_snapshot_fingerprints
+                .contains(&"a".repeat(64)));
+            assert_eq!(actual.decode_holds.v2_provenance().1, u64::from(bound));
+            if !bound {
+                assert!(actual.claude_usage_family_witnesses.is_empty());
+                assert!(actual.claude_usage_family_pending.is_empty());
+                assert_eq!(
+                    actual.files["/synthetic/family.jsonl"].source_file_fingerprint,
+                    "source"
+                );
+            }
+        }
+    }
+}
