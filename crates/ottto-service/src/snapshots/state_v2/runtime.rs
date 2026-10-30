@@ -947,3 +947,39 @@ mod tests;
 #[path = "runtime_ops.rs"]
 mod ops;
 pub(in super::super) use ops::before_collection;
+
+/// Read-only custody seam for growth receipts. Callers doing CAS retain the
+/// checkpoint lock; never acquire it recursively from the save hook.
+pub(in super::super) fn confirmed_growth_stamp(
+    index: &ScanIndex,
+    path: &Path,
+) -> Result<(u64, u64)> {
+    held(with_state(path, |state| {
+        let runtime = index.persistence_v2.as_ref().ok_or(Hold::ReloadRequired)?;
+        ensure!(
+            state
+                .current
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, runtime)),
+            Hold::ForeignBinding
+        );
+        let guard = runtime.session.lock().map_err(|_| Hold::ReloadRequired)?;
+        let session = guard.as_ref().ok_or(Hold::ReloadRequired)?;
+        ensure!(
+            !session.reload && session.path == path,
+            Hold::ReloadRequired
+        );
+        let pair = fence::reconcile(path, &session.identity.binding, state.latched)?;
+        ensure!(
+            pair.is_some_and(|(identity, _)| identity == session.identity),
+            Hold::FenceLost
+        );
+        let stamp = session.db.stamp()?;
+        ensure!(stamp == session.stamp, Hold::ReloadRequired);
+        Ok(stamp)
+    }))
+}
+
+#[cfg(test)]
+#[path = "runtime_growth_tests.rs"]
+mod growth_tests;

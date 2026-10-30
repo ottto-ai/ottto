@@ -2010,7 +2010,13 @@ pub(super) fn prune_growth_retention(index: &mut ScanIndex, now: u64) {
 pub(super) struct GrowthClaimContext {
     path: PathBuf,
     base_generation: u64,
-    receipt: Mutex<Option<(u64, sampled_scan::codex_cursor::OpenStamp)>>,
+    v2_owner: Option<std::sync::Weak<state_v2::Runtime>>,
+    receipt: Mutex<Option<(u64, GrowthClaimStamp)>>,
+}
+#[derive(Debug, Clone)]
+enum GrowthClaimStamp {
+    V1(sampled_scan::codex_cursor::OpenStamp),
+    V2((u64, u64)),
 }
 impl crate::heap_layout_bound::HeapLayoutBound for GrowthClaimContext {
     // The only heap allocation is the immutable path; the mutable receipt
@@ -2024,6 +2030,7 @@ pub(super) fn bind_growth_claims(index: &mut ScanIndex, path: &Path) {
     index.growth_claim_context = Some(Arc::new(GrowthClaimContext {
         path: path.to_owned(),
         base_generation: index.generation,
+        v2_owner: index.persistence_v2.as_ref().map(Arc::downgrade),
         receipt: Mutex::new(None),
     }));
 }
@@ -2035,11 +2042,50 @@ pub(super) fn renew_growth_claims(index: &mut ScanIndex, path: &Path) {
 pub(super) fn own_growth_claim_generation(index: &ScanIndex, path: &Path) -> Option<u64> {
     let context = index.growth_claim_context.as_ref()?;
     let (generation, stamp) = context.receipt.lock().ok()?.clone()?;
+    let matches = match stamp {
+        GrowthClaimStamp::V1(stamp) => {
+            index.persistence_v2.is_none()
+                && context.v2_owner.is_none()
+                && sampled_scan::codex_cursor::OpenStamp::of_path(path).as_ref() == Some(&stamp)
+        }
+        GrowthClaimStamp::V2(stamp) => {
+            growth_owner_matches(index, context)
+                && state_v2::confirmed_growth_stamp(index, path).ok() == Some(stamp)
+                && stamp.0 == generation
+        }
+    };
     (context.path == path
         && index.generation == context.base_generation
         && generation > context.base_generation
-        && sampled_scan::codex_cursor::OpenStamp::of_path(path).as_ref() == Some(&stamp))
-    .then_some(generation)
+        && matches)
+        .then_some(generation)
+}
+
+fn growth_owner_matches(index: &ScanIndex, context: &GrowthClaimContext) -> bool {
+    match (&index.persistence_v2, &context.v2_owner) {
+        (Some(runtime), Some(owner)) => owner
+            .upgrade()
+            .is_some_and(|owner| Arc::ptr_eq(runtime, &owner)),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn authenticate_growth_generation(index: &ScanIndex, path: &Path) -> Result<()> {
+    let context = index
+        .growth_claim_context
+        .as_ref()
+        .context("growth claim context missing")?;
+    anyhow::ensure!(
+        context.path == path && growth_owner_matches(index, context),
+        "growth claim owner changed"
+    );
+    let expected = own_growth_claim_generation(index, path).unwrap_or(index.generation);
+    anyhow::ensure!(
+        state_v2::confirmed_growth_stamp(index, path)?.0 == expected,
+        "growth claim needs index reload"
+    );
+    Ok(())
 }
 
 /// Called by save while the checkpoint lock still protects this publication.
@@ -2050,8 +2096,24 @@ pub(super) fn publish_growth_claim_receipt(index: &ScanIndex, path: &Path) -> Re
         .as_ref()
         .context("growth claim context missing")?;
     anyhow::ensure!(context.path == path, "growth claim path changed");
-    let stamp = sampled_scan::codex_cursor::OpenStamp::of_path(path)
-        .context("growth claim publication missing")?;
+    let stamp = if index.persistence_v2.is_some() {
+        anyhow::ensure!(
+            growth_owner_matches(index, context),
+            "growth claim owner changed"
+        );
+        let stamp = state_v2::confirmed_growth_stamp(index, path)?;
+        anyhow::ensure!(
+            stamp.0 == index.generation,
+            "growth claim publication changed"
+        );
+        GrowthClaimStamp::V2(stamp)
+    } else {
+        anyhow::ensure!(context.v2_owner.is_none(), "growth claim owner changed");
+        GrowthClaimStamp::V1(
+            sampled_scan::codex_cursor::OpenStamp::of_path(path)
+                .context("growth claim publication missing")?,
+        )
+    };
     *context
         .receipt
         .lock()
@@ -2092,8 +2154,19 @@ fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool>
         .context("growth Full needs a committed scan index")?;
     // Decode the committed index, not the working page: persisting a claim
     // must never publish unaccepted bodies, progress or census changes.
-    let mut committed =
-        read_scan_index_representation(&context.path, "growth_claim", "claude_code", None)?;
+    let v2 = index.persistence_v2.is_some();
+    let mut committed = if v2 {
+        authenticate_growth_generation(index, &context.path)?;
+        let committed = ScanIndex::load(&context.path)?;
+        anyhow::ensure!(
+            growth_owner_matches(&committed, &context),
+            "growth claim owner changed"
+        );
+        authenticate_growth_generation(index, &context.path)?;
+        committed
+    } else {
+        read_scan_index_representation(&context.path, "growth_claim", "claude_code", None)?
+    };
     let expected = own_growth_claim_generation(index, &context.path).unwrap_or(index.generation);
     anyhow::ensure!(
         committed.generation == expected,
@@ -2113,6 +2186,10 @@ fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool>
     // fails (including ambiguous publication), no acquisition is authorized.
     committed.growth_claim_context = Some(context.clone());
     committed.save_growth_claim(&context.path)?;
+    if v2 {
+        let _lock = CheckpointLock::acquire(&context.path)?;
+        publish_growth_claim_receipt(&committed, &context.path)?;
+    }
     merge_growth_claims(&mut index.growth_retention, &committed.growth_retention);
     Ok(true)
 }
@@ -2127,7 +2204,7 @@ pub(super) fn growth_read_admitted(
 ) -> bool {
     growth_read_admitted_at(index, candidate, mode, sampled_scan::now_seconds())
 }
-fn growth_read_admitted_at(
+pub(super) fn growth_read_admitted_at(
     index: &mut ScanIndex,
     candidate: &CandidateFile,
     mode: crate::transcript_acquisition::ReadMode,
@@ -2137,6 +2214,23 @@ fn growth_read_admitted_at(
     let key = local_index_key(&candidate.path);
     if !growth_active(index) {
         return true;
+    }
+    // A stale graph must not erase committed growth debt and bypass pacing.
+    // Authenticate even rewrite Fulls before consulting working-page debt.
+    if index.persistence_v2.is_some() && matches!(mode, ReadMode::Full(_)) {
+        let valid = (|| -> Result<()> {
+            let path = &index
+                .growth_claim_context
+                .as_ref()
+                .context("growth claim context missing")?
+                .path;
+            let _lock = CheckpointLock::acquire(path)?;
+            authenticate_growth_generation(index, path)
+        })();
+        if valid.is_err() {
+            state_v2::growth_claim_refused("lineage");
+            return false;
+        }
     }
     let held = index.decode_holds.contains("growth_retention", &key);
     if !held
@@ -2155,7 +2249,15 @@ fn growth_read_admitted_at(
                 | FullReason::UnsupportedIdentity
         )
     ) {
-        return claim_growth_full(index, &key, now).unwrap_or(false);
+        return match claim_growth_full(index, &key, now) {
+            Ok(admitted) => admitted,
+            Err(_) => {
+                if index.persistence_v2.is_some() {
+                    state_v2::growth_claim_refused("publication");
+                }
+                false
+            }
+        };
     }
     true
 }
@@ -2444,6 +2546,15 @@ mod growth_tests {
         fixture.grow();
         let before = serde_json::to_vec(&index).unwrap();
         assert!(!growth_active(&index));
+        let candidate = identified(&fixture, &index);
+        assert!(growth_read_admitted_at(
+            &mut index,
+            &candidate,
+            crate::transcript_acquisition::ReadMode::Full(
+                crate::transcript_acquisition::FullReason::StateMissing
+            ),
+            100,
+        ));
         assert!(!revalidate_growth(
             &mut index,
             &fixture.key,
