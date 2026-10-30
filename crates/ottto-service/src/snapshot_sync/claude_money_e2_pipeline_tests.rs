@@ -1961,9 +1961,6 @@ fn settle(
     mut page: Page,
     progress: &mut SnapshotUploadProgress,
 ) -> ScanIndex {
-    if crate::snapshots::ClaudeTerminalOffForTest::active() {
-        return terminal_off_on_settle(c, committed, page, progress);
-    }
     page.finish();
     upload(&page.scan.snapshots, progress, ack).0.unwrap();
     let holds = LocalHoldSettlement::classify(
@@ -1977,24 +1974,7 @@ fn settle(
     c.reload(&mut settled.index)
 }
 
-fn terminal_off_on_settle(
-    c: &Corpus,
-    committed: &ScanIndex,
-    mut page: Page,
-    progress: &mut SnapshotUploadProgress,
-) -> ScanIndex {
-    page.finish();
-    page.upload_context(progress, ack).0.unwrap();
-    let holds = LocalHoldSettlement::classify(
-        SnapshotSource::ClaudeCode,
-        &mut page.index,
-        &mut page.scan,
-        &page.disposition,
-    );
-    let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
-    settle_index_after_upload(&mut settled.index, committed, progress);
-    c.reload(&mut settled.index)
-}
+
 fn body<'a>(page: &'a Page, session: &str) -> Option<&'a SnapshotItem> {
     page.scan
         .snapshots
