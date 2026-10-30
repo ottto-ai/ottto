@@ -56265,7 +56265,12 @@ mod tests {
         )
     }
 
-    fn held_money_seed(label: &str) -> (PathBuf, PathBuf, ScanIndex, String) {
+    /// With `cache`, the baseline reads through the production sampled
+    /// acquisition, so the RAM cache keeps its checkpoint for a held Tail.
+    fn held_money_seed(
+        label: &str,
+        cache: Option<Arc<sampled_scan::SharedCache>>,
+    ) -> (PathBuf, PathBuf, ScanIndex, String) {
         let root = temp_dir(label);
         let path = root.join("held-growing.jsonl");
         let at = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
@@ -56281,16 +56286,50 @@ mod tests {
         )
         .unwrap();
         let mut index = ScanIndex::default();
-        let mut baseline = scan_source_roots_with_limit(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&root),
-            &mut index,
-            &at,
-            BACKFILL_WINDOW_DAYS,
-            16,
-            false,
-        )
-        .unwrap();
+        let mut baseline = match cache {
+            Some(cache) => {
+                let mut state = OwnedSourceScan::new(
+                    SnapshotSource::ClaudeCode,
+                    std::slice::from_ref(&root),
+                    std::mem::take(&mut index),
+                    &at,
+                    BACKFILL_WINDOW_DAYS,
+                    16,
+                    false,
+                    None,
+                    &[],
+                    false,
+                    true,
+                )
+                .with_sampled_acquisition(
+                    cache,
+                    crate::transcript_acquisition::Scope("held-money-fixture".into()),
+                );
+                loop {
+                    match state.step(None) {
+                        OwnedSourceScanStep::Pending(next) => state = next,
+                        OwnedSourceScanStep::Complete {
+                            index: completed,
+                            scan,
+                            ..
+                        } => {
+                            index = completed;
+                            break scan;
+                        }
+                    }
+                }
+            }
+            None => scan_source_roots_with_limit(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&root),
+                &mut index,
+                &at,
+                BACKFILL_WINDOW_DAYS,
+                16,
+                false,
+            )
+            .unwrap(),
+        };
         apply_claude_reported_usage_with_index(
             &mut baseline.snapshots,
             &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
@@ -56443,9 +56482,26 @@ mod tests {
 
     /// Lead B round 11: every intended pass has retained stale witnessless
     /// pending, an installed B3 hold, and nonempty FINAL money bodies.
+    /// The daemon always scans Claude with sampled acquisition
+    /// (snapshot_sync.rs); a held, indexed file is never published by a
+    /// Full, so its growth uploads through the held Tail from the RAM
+    /// checkpoint. The unsampled scan has no checkpoint and blocks the Full
+    /// of every held file, so it never emits held growth. Native heap
+    /// admission is supported on macOS only; Linux compiles but cannot
+    /// exercise this path.
     #[test]
     fn held_no_witness_family_growing_file_uploads_usage_under_file_birth_posture() {
-        let (root, path, mut index, at) = held_money_seed("held-no-witness-growing");
+        if !crate::heap_layout_bound::layout_supported() {
+            return;
+        }
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (root, path, mut index, at) =
+            held_money_seed("held-no-witness-growing", Some(cache.clone()));
+        let key = local_index_key(&path);
+        assert!(
+            cache.claude_checkpoint(&key).unwrap().is_some(),
+            "the baseline Full retained a checkpoint"
+        );
         let mut held_passes = 0;
         for generation in 1..=4_u32 {
             let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -56455,7 +56511,14 @@ mod tests {
                 + time::Duration::minutes(i64::from(generation)))
             .format(&Rfc3339)
             .unwrap();
-            let mut scan = held_money_page(&root, &mut index, &started, None);
+            let (mut scan, rows) = crate::local_resource_diagnostics::capture(|| {
+                held_money_page(&root, &mut index, &started, Some(cache.clone()))
+            });
+            assert!(
+                rows.iter().any(|r| r["counts"]["unknown_held_tail"] == 1),
+                "pass {generation}: growth continues through the counted held Tail"
+            );
+            assert!(!rows.iter().any(|r| r["counts"]["withheld_full"] == 1));
             held_passes += 1;
             assert_held_money_emission(&mut scan, &mut index, &path, &started);
         }
@@ -56472,7 +56535,7 @@ mod tests {
         if !crate::heap_layout_bound::layout_supported() {
             return;
         }
-        let (root, path, mut index, at) = held_money_seed("held-withheld-full-tail");
+        let (root, path, mut index, at) = held_money_seed("held-withheld-full-tail", None);
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let key = local_index_key(&path);
         assert!(cache.claude_checkpoint(&key).unwrap().is_none());
