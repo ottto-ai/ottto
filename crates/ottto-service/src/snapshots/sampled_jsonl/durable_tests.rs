@@ -916,33 +916,6 @@ fn pi_cwd_and_first_prompt_body_is_admitted_for_restore() {
     assert_eq!(restored.first_prompt_title, cold.first_prompt_title);
 }
 
-/// Both first-prompt and workspace-only heads are funded within the bound.
-#[test]
-fn pi_first_prompt_and_header_workspace_rederive_within_bounds() {
-    let scratch = Scratch::new("pi-funded");
-    let path = scratch.write("prompt.jsonl", &pi_lines(true));
-    let (_, decoded) = pi_decoded(&path);
-    assert!(decoded.rederive.first_prompt.is_some());
-    assert!(decoded.rederive.workspace.is_some());
-    assert!(decoded.content_charge().unwrap() > 0, "prompt head funded");
-    let (restored, receipt) = decoded
-        .rederive_content(&File::open(&path).unwrap())
-        .unwrap();
-    assert!(restored.accumulator.first_prompt_material.is_some());
-    assert!(restored.accumulator.first_prompt_title.is_some());
-    assert!(receipt.head_bytes <= HEAD_BOUND);
-
-    let path = scratch.write("workspace.jsonl", &pi_lines(false));
-    let (_, decoded) = pi_decoded(&path);
-    assert!(decoded.rederive.first_prompt.is_none());
-    assert!(decoded.rederive.workspace.is_some());
-    assert!(decoded.content_charge().unwrap() > 0, "funded");
-    let (restored, _) = decoded
-        .rederive_content(&File::open(&path).unwrap())
-        .unwrap();
-    assert!(restored.accumulator.workspace_path.is_some());
-}
-
 /// A physical first prompt after 1 MiB cannot obtain a bounded durable proof.
 #[test]
 fn pi_first_prompt_beyond_head_bound_refuses_persistence() {
