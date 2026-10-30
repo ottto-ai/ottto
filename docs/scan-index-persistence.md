@@ -510,24 +510,27 @@ its count/bytes through `ack_receipt_inventory`; inventory alone grants no recov
 or GC authority. Baseline age/escalation gauges refresh after import preservation,
 on authenticated saves and at maintenance/load boundaries.
 
-Deferred selected-save custody uses version 2 of `unit.deferred`: a bounded
-manifest at position zero names exact before/after headers and payload positions;
-other positions hold original row bytes. Keys and payloads inherit their owner
-classes. Old version-1 carries decode within the bounded 8 MiB expanded envelope
-and move their payloads into one shared anonymous arena. Scratch files are unlinked
-before receiving private bytes; each plan/carry uses one descriptor. Metadata keeps
-its 8 MiB admission and scratch keeps its 512 MiB disk envelope.
+Each steady save publishes its complete dirty delta in one `BEGIN IMMEDIATE` /
+`COMMIT`: progress, census, evidence, ACK retirement, shared references, restart
+checkpoints and generation advance together. Restart planning, preflight and
+fsynced staging precede BEGIN. The restart owner receives `post_commit` only after
+an unambiguous durable COMMIT; Published/Ambiguous outcomes require reopening.
 
-Pending payloads are durably staged in separate admitted inert transactions. These
-writes change neither semantic generation nor fairness; only the position-zero
-manifest activates custody. A crash before manifest publication leaves inert residue.
-Later passes reuse exact unchanged payloads, atomically advance the manifest and
-persist the fair cursor with selected work. GC consumes remaining transaction space;
-it cannot prevent semantic progress. Individual values retain their kind limits.
-Every transaction stays within 256 MiB, including prior/new values, controls,
-manifest replacement and GC. A lone unit may exceed the 5,000-row/32 MiB target up
-to that hard ceiling; a larger indivisible unit has a named `hard_ceiling` hold and
-oversize alarm while independent units remain eligible. No held work is truncated
-or acknowledged. Conversion remains paused with reason **R1 staging not installed**.
-Omitting checkpoint rows is unsafe: the next active file admission still needs M1
-protection, and a published source cannot fall back to v1 on missing staging.
+The 5,000-mutation / 32 MiB soft target sizes the next collection page. A save over
+target still commits and halves the next page; a save under target grows it by
+25 files up to the requested page. Charged work includes old/new values, chunks,
+reference updates, metadata, tombstones and restart staging. More than 256 MiB
+rolls back the whole save, reloads the committed graph and halves the page for a
+retry from committed checkpoints. If a page of one is still too large, the source
+holds with `state_v2_save_oversize` and an alarm. Uploads and ACKs stay fenced
+until a complete save succeeds. A held cycle retries through the existing local
+partial-checkpoint settlement path before any upload, then starts a fresh pass;
+unACKed file progress stays owed. SQLITE_FULL likewise rolls back and holds for
+retry. No partial publication or deferred-work journal exists; transcripts and
+committed checkpoints retain retry custody. Unknown persisted kinds are refused.
+
+WAL above 64 MiB, save payload above 32 MiB and page reduction are alarms, not
+transaction caps. WAL/FULL, fullfsync, the 16 MiB journal size limit, PASSIVE at
+8 MiB and idle TRUNCATE remain in effect. Conversion remains paused with reason
+**R1 staging not installed** until restart custody is available; omitting restart
+rows cannot enable publication or fallback to v1.

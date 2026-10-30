@@ -115,7 +115,10 @@ impl MaintenanceStats {
     pub(super) fn observe_wal(&mut self, bytes: Option<u64>) {
         if let Some(bytes) = bytes {
             self.wal_peak_bytes = self.wal_peak_bytes.max(bytes);
-            self.wal_alarm |= bytes >= WAL_ALARM_BYTES;
+            if bytes > WAL_ALARM_BYTES && !self.wal_alarm {
+                super::super::telemetry::event("wal_size_alarm", &bytes);
+            }
+            self.wal_alarm |= bytes > WAL_ALARM_BYTES;
         } else {
             self.wal_measurement_unavailable = self.wal_measurement_unavailable.saturating_add(1);
         }

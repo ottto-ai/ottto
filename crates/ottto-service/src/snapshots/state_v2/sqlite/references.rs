@@ -113,7 +113,6 @@ pub(super) fn adjust(tx: &mut Txn<'_>, key: &RowKey, delta: i64) -> Result<u64> 
     ensure!(tx.write && !tx.failed, "state_v2_transaction_refused");
     let result = (|| {
         let mut h = tx.get(key)?.context("state_v2_reference_missing")?;
-        let before = h.clone();
         let Fixed::RequestSet { refs, .. } = &mut h.fixed else {
             bail!("state_v2_reference_kind")
         };
@@ -126,8 +125,7 @@ pub(super) fn adjust(tx: &mut Txn<'_>, key: &RowKey, delta: i64) -> Result<u64> 
         } else if delta != 0 {
             *refs = next;
             h.row_checksum = row_checksum(&h)?;
-            tx.admit_selected(Some(&before), Some(&h), true)?;
-            tx.admit_change(key, 0)?;
+            tx.admit_change(key, 0, 0, true)?;
             let RowKey::RequestSet(id) = key else {
                 bail!("state_v2_reference_kind")
             };
@@ -136,6 +134,9 @@ pub(super) fn adjust(tx: &mut Txn<'_>, key: &RowKey, delta: i64) -> Result<u64> 
         }
         Ok(next)
     })();
+    if let Err(error) = &result {
+        tx.store.record_save_error(error);
+    }
     tx.failed |= result.is_err();
     result
 }

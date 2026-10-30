@@ -1526,11 +1526,16 @@ counts, plus `recovery_backup_superseded` after a verified replacement switches
 the current pointer. `recovery_backup_unpublished_reclaimed` counts cleanup of
 failed attempts. These counters describe rolling artifact protection, without
 claiming runtime/native restore qualification or enabling conversion.
-Selected saves retain `unit_selected`, `unit_deferred`, charge rows/bytes/pages,
-`unit_oversize_alarm`, retained-account-window counts and `save_page_reduced`.
-Inert staging reports `unit_custody_staged` and
-`unit_custody_charge_rows_bytes_pages`; bounded cleanup reports
-`unit_custody_reclaimed` and `unit_custody_gc_deferred`. Staging does not advance
-semantic generation or inflate semantic selection counts. The fixed import pause
-label `r1_staging_not_installed` means **R1 staging not installed**.
+Each save reports `save_dirty_rows` and `save_dirty_bytes` distributions (`p50`, `p95`, `max`)
+on the `claude_state_v2` row. Samples include refused attempts; percentiles use
+the last 128 samples and maximum is process-lifetime. Charges include old/new
+values, chunks, metadata, tombstones, reference updates and restart staging.
+`save_payload_alarm` (>32 MiB), `save_page_reduced` and the existing WAL alarm
+(>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records a
+whole-save refusal above 256 MiB; at page size one, `save_oversize_alarm` and
+`state_v2_save_oversize` hold the source. `sqlite_full` counts disk-full failures;
+`state_v2_sqlite_full` holds uploads through rollback/reload until a save succeeds.
+`account_windows_alarm` and `account_windows_retained` still report retained
+account-window pressure without capping owed history. The fixed import pause label
+`r1_staging_not_installed` means **R1 staging not installed**.
 These events contain no keys, paths, restart names, reference tuples or digests.

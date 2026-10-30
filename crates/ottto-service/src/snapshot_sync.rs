@@ -7256,8 +7256,8 @@ fn finish_sync_source(
         Ok(())
     };
     let state_v2_guard = crate::snapshots::state_v2_side_effect_guard(&index_path, &index);
-    let ensure_authority = || {
-        state_v2_guard()?;
+    let recovery_save_guard = crate::snapshots::state_v2_recovery_save_guard(&index_path, &index)?;
+    let ensure_destination_authority = || {
         ensure_snapshot_scan_authority(device, source, client, &account_witness, daemon)?;
         ensure_snapshot_destination_current(&upload_destination_namespace)?;
         if let Some(roots) = &claude_scan_roots {
@@ -7265,12 +7265,23 @@ fn finish_sync_source(
         }
         Ok(())
     };
-    codex_scan_diagnostics::after_existing_census_fence(
-        source,
-        support_dir,
-        ensure_authority,
-        || codex_scan_diagnostics::write_fenced_census(support_dir, &scan_result, &index),
-    )?;
+    let ensure_authority = || {
+        state_v2_guard()?;
+        ensure_destination_authority()
+    };
+    if let Some(validate_recovery_save) = recovery_save_guard.as_ref() {
+        // The ordinary early census fence includes the external upload hold.
+        // A held pass authenticates local recovery here before any upload IO.
+        validate_recovery_save()?;
+        ensure_destination_authority()?;
+    } else {
+        codex_scan_diagnostics::after_existing_census_fence(
+            source,
+            support_dir,
+            ensure_authority,
+            || codex_scan_diagnostics::write_fenced_census(support_dir, &scan_result, &index),
+        )?;
+    }
     let scan_agent_status = reconciliation_agent_status(&scan_agent_status_collection);
     // State advances only after the exact paged replay census and its upload
     // both finish. Incomplete pages persist their cursor in the destination
@@ -7593,6 +7604,39 @@ fn finish_sync_source(
         &claude_authority_disposition,
     );
     let locally_held_fingerprints = &local_holds.held_fingerprints;
+    if let Some(validate_recovery_save) = recovery_save_guard {
+        // Retry a consistent local delta before any upload/ACK. Reuse the
+        // partial-checkpoint settlement rules: unACKed files stay owed, exact
+        // durable receipts remain authoritative, and no manifest is published.
+        withdraw_source_manifest(&upload_destination_namespace, source);
+        checkpoint_partial_snapshot_index_with_audit_release(
+            &index,
+            &committed_index,
+            &upload_progress,
+            &scan_result.snapshots,
+            Some(&scan_result),
+            locally_held_fingerprints,
+            &index_path,
+            &upload_progress_path,
+            || {
+                validate_recovery_save()?;
+                ensure_destination_authority()
+            },
+            None,
+            comparison_completion
+                .as_mut()
+                .map(NativeSelectedRestore::Paid),
+            Some(UnsettledUploadCause::UploadError),
+            (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
+                previous: &committed_index,
+                cache: &daemon.transcript_cache,
+                roots: claude_scan_roots.as_deref().unwrap_or_default(),
+                backfill_window_days: receipt_window_days,
+            }),
+        )?;
+        // A new pass reconstructs external guards from the saved generation.
+        return Err(anyhow!("state_v2_save_recovered_retry"));
+    }
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_cache_probe_for_test(&mut scan_result.snapshots);
 

@@ -94,12 +94,7 @@ impl Mapper for EmptyMapper {
     fn merge_cas<T: Transaction>(&self, _: &mut T, _: &mut ScanIndex) -> Result<()> {
         Ok(())
     }
-    fn delta<T: Transaction>(
-        &self,
-        _: &mut T,
-        _: &ScanIndex,
-        _: Option<&units_graph::RowPlan>,
-    ) -> Result<()> {
+    fn delta<T: Transaction>(&self, _: &mut T, _: &ScanIndex) -> Result<()> {
         Ok(())
     }
 }
@@ -918,4 +913,87 @@ mod hydrate_parity {
             }
         }
     }
+}
+
+#[test]
+fn ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    assert_eq!(collection_page_limit(&index, 250), 250);
+    sqlite::seed_next_save_bytes_for_test(256 * 1024 * 1024);
+    let error = save_with(&f.path, &mut index, &EmptyMapper).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
+    assert_eq!(collection_page_limit(&index, 250), 125);
+    assert!(guard_external(&f.path, index.persistence_v2.as_ref(), index.generation).is_err());
+    let mut retry = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    assert_eq!(retry.generation, 0);
+    // Reopen cannot clear a failed-save upload fence.
+    assert!(guard_external(&f.path, retry.persistence_v2.as_ref(), retry.generation).is_err());
+    let recovery = crate::snapshots::state_v2_recovery_save_guard(&f.path, &retry)
+        .unwrap()
+        .unwrap();
+    recovery().unwrap();
+    assert!(save_with(&f.path, &mut retry, &EmptyMapper).unwrap());
+    assert_eq!(retry.generation, 1);
+    assert_eq!(collection_page_limit(&retry, 250), 150);
+    guard_external(&f.path, retry.persistence_v2.as_ref(), retry.generation).unwrap();
+    for expected in [175, 200, 225, 250, 250] {
+        save_with(&f.path, &mut retry, &EmptyMapper).unwrap();
+        assert_eq!(collection_page_limit(&retry, 250), expected);
+    }
+}
+
+#[test]
+fn page_one_oversize_holds_and_fences_upload_ack_and_publication() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    assert_eq!(collection_page_limit(&index, 1), 1);
+    sqlite::seed_next_save_bytes_for_test(256 * 1024 * 1024);
+    let error = save_with(&f.path, &mut index, &EmptyMapper).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveOversize));
+    let current = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    assert_eq!(current.generation, 0);
+    assert_eq!(collection_page_limit(&current, 1), 1);
+    // This is the production external boundary used before uploads and ACKs.
+    let guard = crate::snapshots::state_v2_side_effect_guard(&f.path, &current);
+    assert_eq!(
+        guard().unwrap_err().downcast_ref::<Hold>(),
+        Some(&Hold::SaveOversize)
+    );
+    assert_eq!(
+        with_state(&f.path, |state| Ok(state.save_hold)).unwrap(),
+        Some(Hold::SaveOversize)
+    );
+}
+
+#[test]
+fn sqlite_full_holds_across_reopen_until_a_complete_save_succeeds() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    sqlite::fail_commit_full_for_test();
+    let error = save_with(&f.path, &mut index, &EmptyMapper).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveFull));
+    let mut retry = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    assert_eq!(retry.generation, 0);
+    let guard = crate::snapshots::state_v2_side_effect_guard(&f.path, &retry);
+    assert_eq!(
+        guard().unwrap_err().downcast_ref::<Hold>(),
+        Some(&Hold::SaveFull)
+    );
+    assert!(save_with_mode(&f.path, &mut retry, &EmptyMapper, true, None).unwrap());
+    assert_eq!(
+        guard_external(&f.path, retry.persistence_v2.as_ref(), retry.generation)
+            .unwrap_err()
+            .downcast_ref::<Hold>(),
+        Some(&Hold::SaveFull)
+    );
+    let recovery = crate::snapshots::state_v2_recovery_save_guard(&f.path, &retry)
+        .unwrap()
+        .unwrap();
+    recovery().unwrap();
+    assert!(save_with(&f.path, &mut retry, &EmptyMapper).unwrap());
+    guard_external(&f.path, retry.persistence_v2.as_ref(), retry.generation).unwrap();
 }

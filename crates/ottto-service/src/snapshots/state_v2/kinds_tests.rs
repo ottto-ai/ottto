@@ -288,8 +288,17 @@ fn shared_privacy_dispatch_preserves_both_census_domains_and_account_exclusion_l
 }
 
 #[derive(Default)]
-struct SelectedHooks(Vec<&'static str>);
-impl kinds_files::ResumeHooks for SelectedHooks {
+struct SaveHooks(Vec<&'static str>);
+impl kinds_files::ResumeHooks for SaveHooks {
+    fn plan(
+        &mut self,
+        _: &ScanIndex,
+        _: &ScanIndex,
+        _: &BTreeMap<String, kinds_files::ResumeCheckpoint>,
+    ) -> Result<kinds_files::StagedCheckpoints> {
+        self.0.push("plan");
+        Ok(Default::default())
+    }
     fn preflight_selected(
         &mut self,
         _: &ScanIndex,
@@ -316,67 +325,6 @@ impl kinds_files::ResumeHooks for SelectedHooks {
         self.0.push("post_commit");
         Ok(())
     }
-}
-fn empty_selection(db: &mut sqlite::Sqlite, generation: u64) -> units::Selection {
-    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    let schedule = units::Schedule::read(&mut tx).unwrap();
-    units::Planner::new(identity, generation, schedule)
-        .select()
-        .unwrap()
-}
-#[test]
-fn selected_save_installs_context_and_calls_r1_only_after_confirmed_commit() {
-    let (_scratch, mut db) = Scratch::live_store();
-    commit_populate(&mut db, &fixture());
-    let (prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
-    let mut next = prev.clone();
-    next.generation += 1;
-    let selection = empty_selection(&mut db, prev.generation);
-    let mut hooks = SelectedHooks::default();
-    save_selected_graph(&mut db, &prev, &mut next, &mut cx, selection, &mut hooks).unwrap();
-    assert_eq!(hooks.0, ["preflight", "stage", "post_commit"]);
-    assert!(cx.valid && !cx.ambiguous && cx.prepared.is_none());
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    let key = RowKey::Meta("generation".into());
-    assert_eq!(cx.misc_rows[&key].0, tx.get(&key).unwrap().unwrap());
-}
-#[test]
-fn unplanned_semantic_write_rolls_back_and_invalidates_context_without_r1_gc() {
-    let (_scratch, mut db) = Scratch::live_store();
-    commit_populate(&mut db, &fixture());
-    let (prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
-    let mut next = prev.clone();
-    next.generation += 1;
-    next.upload_context_fingerprint = Some("selected-but-not-admitted".into());
-    let selection = empty_selection(&mut db, prev.generation);
-    let mut hooks = SelectedHooks::default();
-    assert!(
-        save_selected_graph(&mut db, &prev, &mut next, &mut cx, selection, &mut hooks).is_err()
-    );
-    assert_eq!(hooks.0, ["preflight", "stage"]);
-    assert!(!cx.valid && cx.ambiguous);
-    let (current, _) = hydrate(&mut db, Scratch::binding()).unwrap();
-    assert_eq!(current.generation, prev.generation);
-    assert_eq!(
-        current.upload_context_fingerprint,
-        prev.upload_context_fingerprint
-    );
-}
-#[test]
-fn stale_selected_generation_refuses_before_r1_preflight_or_staging() {
-    let (_scratch, mut db) = Scratch::live_store();
-    commit_populate(&mut db, &fixture());
-    let (prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
-    let mut next = prev.clone();
-    next.generation += 1;
-    let selection = empty_selection(&mut db, 0);
-    let mut hooks = SelectedHooks::default();
-    assert!(
-        save_selected_graph(&mut db, &prev, &mut next, &mut cx, selection, &mut hooks).is_err()
-    );
-    assert!(hooks.0.is_empty());
-    assert!(!cx.valid);
 }
 #[test]
 fn complete_misc_dirty_plan_covers_scalar_map_ack_and_raw_hold_changes() {
@@ -477,19 +425,55 @@ fn growth_raw_hold_survives_composed_hydration_and_cas_cannot_release_it() {
     working.decode_holds = Default::default();
     assert!(kinds_misc::merge_cas(&mut tx, &mut working).is_err());
 }
+
 #[test]
-fn writer_capability_refuses_selected_save_before_any_r1_side_effect() {
+fn whole_delta_stages_before_begin_and_calls_gc_only_after_commit() {
     let (_scratch, mut db) = Scratch::live_store();
     commit_populate(&mut db, &fixture());
     let (prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
     let mut next = prev.clone();
-    next.generation += 1;
-    let selection = empty_selection(&mut db, prev.generation);
-    sqlite::future_writer_for_test(&mut db);
-    let mut hooks = SelectedHooks::default();
-    assert!(
-        save_selected_graph(&mut db, &prev, &mut next, &mut cx, selection, &mut hooks).is_err()
+    next.upload_context_fingerprint = Some("new-context".into());
+    let mut hooks = SaveHooks::default();
+    save_graph(&mut db, &identity, &prev, &mut next, &mut cx, &mut hooks).unwrap();
+    assert_eq!(hooks.0, ["plan", "preflight", "stage", "post_commit"]);
+    let (current, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(
+        current.upload_context_fingerprint,
+        next.upload_context_fingerprint
     );
-    assert!(hooks.0.is_empty());
-    assert_eq!(next.generation, prev.generation);
+    hooks.0.clear();
+    let mut retry = current.clone();
+    retry.upload_context_fingerprint = Some("never-committed".into());
+    sqlite::fail_commit_full_for_test();
+    assert!(save_graph(&mut db, &identity, &current, &mut retry, &mut cx, &mut hooks).is_err());
+    assert_eq!(hooks.0, ["plan", "preflight", "stage"]);
+    assert!(!cx.valid && cx.ambiguous);
+    assert_eq!(
+        hydrate(&mut db, Scratch::binding())
+            .unwrap()
+            .0
+            .upload_context_fingerprint,
+        current.upload_context_fingerprint
+    );
+}
+
+#[test]
+fn stale_generation_or_future_writer_refuses_before_restart_side_effects() {
+    for future_writer in [false, true] {
+        let (_scratch, mut db) = Scratch::live_store();
+        commit_populate(&mut db, &fixture());
+        let (mut prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+        let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+        let mut next = prev.clone();
+        if future_writer {
+            sqlite::future_writer_for_test(&mut db);
+        } else {
+            prev.generation += 1;
+        }
+        let mut hooks = SaveHooks::default();
+        assert!(save_graph(&mut db, &identity, &prev, &mut next, &mut cx, &mut hooks).is_err());
+        assert!(hooks.0.is_empty());
+        assert!(!cx.valid && cx.ambiguous);
+    }
 }
