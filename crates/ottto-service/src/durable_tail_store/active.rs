@@ -123,10 +123,6 @@ impl ActiveLease {
         event(self.source, "active_current_bytes", self.bytes);
         Ok(())
     }
-    #[cfg(test)]
-    pub(crate) fn charged_for_test(&self) -> u64 {
-        self.bytes
-    }
     pub(crate) fn release(mut self) {
         self.finish(false);
     }

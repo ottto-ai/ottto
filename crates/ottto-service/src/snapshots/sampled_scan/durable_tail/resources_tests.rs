@@ -42,38 +42,6 @@ fn entry() -> ScanIndexEntry {
     .unwrap()
 }
 
-fn certificate(path: &Path, scope: &Scope) -> DurableCertificate {
-    let mut file = File::open(path).unwrap();
-    let mut plan = ReadPlan::prepare(&mut file, None, scope, None, 1_800_000_000).unwrap();
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).unwrap();
-    plan.observe_complete_records(&bytes).unwrap();
-    plan.commit_after_native_completion(&file, scope, 1_800_000_000)
-        .unwrap()
-        .durable_certificate(birth_unix_nanos(&std::fs::metadata(path).unwrap()))
-        .unwrap()
-}
-
-fn native_reduction(path: &Path, scope: &Scope) -> CachedJsonlReduction {
-    let mut parser = OwnedJsonlParser::new(
-        File::open(path).unwrap(),
-        path,
-        CLAUDE,
-        apply_claude_code_line,
-        None,
-        None,
-        None,
-        false,
-        true,
-    )
-    .unwrap();
-    parser
-        .prepare_acquisition(None, scope, None, 1_800_000_000)
-        .unwrap();
-    while !parser.step().unwrap() {}
-    parser.durable_test_reduction_copy()
-}
-
 /// SOURCE cond. 5 carrier without a new field: a Codex selection cleared
 /// over a record not proved absent (the D3 strict-rebind store is disabled)
 /// counts a stale refusal and takes one paced Full under its own cause.
