@@ -23,21 +23,6 @@ fn scratch(source: SnapshotSource) -> Box<SnapshotAccumulator> {
 }
 
 impl Decoded {
-    #[cfg(test)]
-    pub(crate) fn content_charge(&self) -> Result<u64, RederiveUnfunded> {
-        self.rederive_plan()
-            .map(|p| p.charge)
-            .map_err(|_| RederiveUnfunded)
-    }
-    #[cfg(test)]
-    pub(crate) fn rederive_content(
-        self,
-        file: &File,
-    ) -> Result<(CachedJsonlReduction, RederiveReceipt), Refuse> {
-        let plan = self.rederive_plan().map_err(Refuse::NotRederivable)?;
-        self.rederive_content_planned(file, &plan)
-            .map(|(r, receipt, _)| (r, receipt))
-    }
     pub(crate) fn content_classes(&self) -> [bool; 5] {
         let r = &self.rederive;
         [
