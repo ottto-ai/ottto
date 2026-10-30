@@ -8807,6 +8807,12 @@ pub struct ClaudeLocalEvidenceStats {
     pub effort_evidence_load_failed: bool,
     pub own_request_complete_root_count: usize,
     pub own_request_unknown_root_count: usize,
+    /// E2 requests left Unknown because their family's strict read failed;
+    /// absent from the line while empty.
+    #[serde(
+        skip_serializing_if = "crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts::is_empty"
+    )]
+    pub unhealthy_root_no_fallback_requests: crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts,
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
     pub first_proof_hold: crate::snapshots::ClaudeFirstProofHoldCounts,
     /// RetryPending families whose returning root retains a retirement
@@ -9337,6 +9343,15 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     let request_owned =
         |root: &str| crate::snapshots::claude_request_money::e2::family_applies(index, root, None);
     let mut identity_unhealthy_roots = BTreeSet::new();
+    // The strongest cause per unhealthy root, for its no-fallback counter.
+    let mut unhealthy_reasons = BTreeMap::new();
+    let mut note_unhealthy =
+        |root: &str, reason: crate::snapshots::claude_request_identity::UnhealthyRootReason| {
+            unhealthy_reasons
+                .entry(root.to_owned())
+                .and_modify(|known| *known = reason.min(*known))
+                .or_insert(reason);
+        };
     let usage_roots = usage_roots
         .into_iter()
         .filter(|session_id| {
@@ -9361,6 +9376,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             {
                 full_rearm_evidence_complete = false;
                 identity_unhealthy_roots.insert(session_id.clone());
+                note_unhealthy(
+                    session_id,
+                    crate::snapshots::claude_request_identity::UnhealthyRootReason::Incomplete,
+                );
             }
             // Contract 5 must tell absent evidence from failed evidence.
             if !paired && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
@@ -9368,6 +9387,17 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 full_rearm_evidence_complete = false;
                 if builds_evidence || request_owned(session_id) {
                     identity_unhealthy_roots.insert(session_id.clone());
+                    let (oversized, unreadable) =
+                        crate::claude_local_otel::claude_sidecar_pair_faults(
+                            support_dir,
+                            session_id,
+                        );
+                    note_unhealthy(
+                        session_id,
+                        crate::snapshots::claude_request_identity::UnhealthyRootReason::of(
+                            oversized, unreadable, 0,
+                        ),
+                    );
                 }
             }
             paired
@@ -9423,6 +9453,24 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 veto_api_rows.insert(root_session_id.clone(), rows);
             }
             if builds_evidence || request_owned(&root_session_id) {
+                use crate::snapshots::claude_request_identity::UnhealthyRootReason;
+                let api_reason = (!api.health.is_complete()).then(|| {
+                    UnhealthyRootReason::of(
+                        api.health.oversized_files,
+                        api.health.unreadable_lines,
+                        api.health.malformed_lines,
+                    )
+                });
+                let trace_reason = (!trace.is_complete()).then(|| {
+                    UnhealthyRootReason::of(
+                        trace.oversized_files,
+                        trace.unreadable_lines,
+                        trace.malformed_lines,
+                    )
+                });
+                if let Some(reason) = api_reason.into_iter().chain(trace_reason).min() {
+                    note_unhealthy(&root_session_id, reason);
+                }
                 identity_unhealthy_roots.insert(root_session_id);
             }
             continue;
@@ -9493,6 +9541,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             identity_unhealthy_roots,
             crate::snapshots::claude_request_identity::desktop_census(index),
         )
+        .with_unhealthy_reasons(unhealthy_reasons)
         .with_status_coverage(crate::claude_status_coverage::snapshot())
         .with_native_originals(&originals)
         .with_accepted_buckets(accepted_identity_buckets)
@@ -9529,10 +9578,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     }
     if crate::snapshots::claude_request_money::e2::enabled() {
         if let Some(evidence) = &identity_evidence {
-            crate::snapshots::claude_request_identity::reconcile_request_accounts(
-                &mut scan_result.snapshots,
-                evidence,
-            );
+            stats.unhealthy_root_no_fallback_requests =
+                crate::snapshots::claude_request_identity::reconcile_request_accounts(
+                    &mut scan_result.snapshots,
+                    evidence,
+                );
         }
     }
     let request_owned_activity = identity_evidence.as_ref().map(|evidence| {

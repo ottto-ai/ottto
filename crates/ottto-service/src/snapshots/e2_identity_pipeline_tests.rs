@@ -493,3 +493,353 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     assert_eq!(disposition.quarantined_entity_count(), 0);
     fs::remove_dir_all(dir).unwrap();
 }
+
+// SOURCE 2026-10-30 (unhealthy root): a family whose strict sidecar read failed
+// gets no account. Requests stay Unknown and are counted per reason, never
+// bound to the retained creator A. Bindings, custody and holds are untouched.
+
+const E2_SIBLING: &str = "2449b91b-f36e-4cbc-a5bb-50fc66430ba5";
+
+fn e2_owner_key(root: &str) -> String {
+    sha256_hex(&["session_owner:v1", "e2-identity-machine", root])
+}
+
+/// A healthy markerless sibling session under its own root: two requests,
+/// own login D, also bound A. Its directory is scanned on the same page.
+fn e2_healthy_sibling(support: &Path) -> PathBuf {
+    let dir = temp_dir("e2-unhealthy-sibling");
+    let lines = (1..=2)
+        .map(|n| {
+            format!("{}\n", json!({
+                "timestamp": format!("2026-08-02T07:00:{n:02}Z"), "type": "assistant",
+                "sessionId": E2_SIBLING, "requestId": format!("req_sib_{n}"),
+                "message": {"id": format!("msg_sib_{n}"), "model": "claude-haiku-4-5", "usage": {"input_tokens": 10, "output_tokens": 10}}
+            }))
+        })
+        .collect::<String>();
+    fs::write(dir.join(format!("{E2_SIBLING}.jsonl")), lines).unwrap();
+    e2_sibling_evidence(support);
+    dir
+}
+
+/// (Re)write the sibling's clean sidecars, so a later page selects it again.
+fn e2_sibling_evidence(support: &Path) {
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let mut api = Vec::new();
+    let mut trace = Vec::new();
+    for n in 1..=2 {
+        let request = format!("req_sib_{n}");
+        let mut row = complete_api_row(E2_SIBLING, &request, n, 10, 10, 0);
+        row.account_identifier_hash = Some("d".repeat(64));
+        e2_resign(&mut row);
+        api.push(row);
+        trace.push(complete_trace_row(E2_SIBLING, &request, ""));
+    }
+    e2_write_rows(support, crate::claude_local_otel::STORE_DIR, E2_SIBLING, &api);
+    e2_write_rows(
+        support,
+        "local-otel/claude-code-trace-ownership",
+        E2_SIBLING,
+        &trace,
+    );
+}
+
+/// One real page over the family and its sibling, with the family's owed
+/// history custody seeded. Asserts the durable bindings and custody survive.
+fn e2_unhealthy_root_page(
+    dirs: &[PathBuf],
+    support: &Path,
+    root: &str,
+    index: &mut ScanIndex,
+    unhealthy: bool,
+) -> (
+    Vec<SnapshotItem>,
+    ClaudeUsageAuthorityDisposition,
+    crate::snapshot_sync::ClaudeLocalEvidenceStats,
+    serde_json::Value,
+) {
+    claude_request_money::e2::with_enabled(|| {
+        // Sidecar changes must select the family even when its transcript
+        // bytes are unchanged (unhealthy -> clean).
+        let mut scan = scan_source_roots_with_test_limit_and_claude_support(
+            dirs,
+            index,
+            "2026-08-02T07:10:00Z",
+            7,
+            100,
+            support,
+        )
+        .unwrap();
+        claude_request_identity::retain_root_accounts(
+            &mut scan.snapshots,
+            index,
+            "e2-identity-machine",
+        );
+        let previous = claude_history_upgrade::HeldUploadTuple {
+            last_snapshot_fingerprint: Some("owed-snapshot".into()),
+            last_upload_body_witness: Some("owed-witness".into()),
+            file_snapshot_fingerprints: Some(BTreeSet::from(["owed-member".into()])),
+            confirmed_empty: false,
+        };
+        index.claude_history_emission.files.clear();
+        for item in scan
+            .snapshots
+            .iter()
+            .filter(|item| claude_snapshot_family_root_ref(item) == root)
+        {
+            let path = if item.source_session_id == root {
+                dirs[0].join(format!("{root}.jsonl"))
+            } else {
+                dirs[0]
+                    .join(root)
+                    .join("subagents")
+                    .join(format!("agent-{E2_CHILD}.jsonl"))
+            };
+            index.claude_history_emission.files.insert(
+                item.source_file_fingerprint.clone().unwrap(),
+                claude_history_upgrade::GatedHistory {
+                    index_key: local_index_key(&path),
+                    permitted: true,
+                    previous: Some(previous.clone()),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(index.claude_history_emission.files.len(), 2);
+        let ((disposition, _, stats), counts) =
+            claude_request_money::e2::pipeline_test_observer::capture_identity_counts(|| {
+                crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, &mut scan, index)
+            });
+        for gated in index.claude_history_emission.files.values() {
+            assert!(gated.permitted, "owed permission is retained");
+            assert_eq!(gated.previous.as_ref(), Some(&previous), "custody is kept");
+            assert_eq!(
+                gated.held,
+                unhealthy.then_some(HistoryHold::TelemetryUnread),
+                "root and child history keep the existing hold"
+            );
+        }
+        for bound in [root, E2_SIBLING] {
+            assert_eq!(
+                index.session_account_bindings[&e2_owner_key(bound)].account_identifier_hash,
+                e2_account(),
+                "the durable creator binding A is untouched"
+            );
+        }
+        (scan.snapshots, disposition, stats, counts)
+    })
+}
+
+/// Each family item's request shares, rows and identity parts carry `login`;
+/// the sibling keeps its own D.
+fn e2_unhealthy_assert_logins(
+    items: &[SnapshotItem],
+    root: &str,
+    root_login: Option<String>,
+    child_login: Option<String>,
+) {
+    assert_eq!(items.len(), 3, "root, child and sibling all emit");
+    for item in items {
+        let (login, requests) = if item.source_session_id == E2_SIBLING {
+            (Some("d".repeat(64)), 2)
+        } else if item.source_session_id == root {
+            (root_login.clone(), 4)
+        } else {
+            (child_login.clone(), 1)
+        };
+        assert!(e2_is_literal(item));
+        assert_eq!(item.request_count, requests);
+        assert_eq!(
+            e2_login_counts(item),
+            BTreeMap::from([(login.clone(), requests)]),
+            "{}: every request share, including child inheritance",
+            item.source_session_id
+        );
+        for row in e2_rows(item) {
+            assert_eq!(row.account_identifier_hash, login);
+            for part in row.identity_parts.iter().flatten() {
+                assert_eq!(part.account_identifier_hash, login, "identity_parts");
+            }
+        }
+    }
+}
+
+fn e2_unhealthy_totals(items: &[SnapshotItem]) -> BTreeMap<String, serde_json::Value> {
+    items
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                json!({
+                    "requests": item.request_count,
+                    "input": item.input_tokens, "output": item.output_tokens,
+                    "cache_read": item.cache_read_tokens,
+                    "cache_5m": item.cache_creation_5m_tokens,
+                    "cache_1h": item.cache_creation_1h_tokens,
+                    "reasoning": item.reasoning_output_tokens,
+                    "unattributed": item.unattributed_total_tokens,
+                    "cost": item.cost,
+                }),
+            )
+        })
+        .collect()
+}
+
+/// Bound A, own B (child C when `split_logins`), then a trace that is
+/// `malformed`, `unreadable` (a directory) or `oversized` at open.
+fn e2_unhealthy_root_case(mode: &str, split_logins: bool) {
+    let (dir, root, _) = claude_account_family_fixture();
+    let support = dir.join("support");
+    let (mut api, trace) = e2_family_evidence(&root);
+    for row in &mut api {
+        row.account_identifier_hash = Some("b".repeat(64));
+        e2_resign(row);
+    }
+    if split_logins {
+        api[4].account_identifier_hash = Some("c".repeat(64));
+        e2_resign(&mut api[4]);
+    }
+    e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
+    e2_write_rows(
+        &support,
+        "local-otel/claude-code-trace-ownership",
+        &root,
+        &trace,
+    );
+    let sibling = e2_healthy_sibling(&support);
+    let dirs = [dir.clone(), sibling.clone()];
+    let path = support
+        .join("local-otel/claude-code-trace-ownership")
+        .join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
+    let mut index = ScanIndex::default();
+    for bound in [root.as_str(), E2_SIBLING] {
+        index.session_account_bindings.insert(
+            e2_owner_key(bound),
+            SessionAccountBinding {
+                account_identifier_hash: e2_account(),
+                workspace_identifier_hash: None,
+            },
+        );
+    }
+    let b = Some("b".repeat(64));
+    let child = Some(if split_logins { "c" } else { "b" }.repeat(64));
+
+    let (clean, _, stats, _) = e2_unhealthy_root_page(&dirs, &support, &root, &mut index, false);
+    e2_unhealthy_assert_logins(&clean, &root, b.clone(), child.clone());
+    assert!(stats.unhealthy_root_no_fallback_requests.is_empty());
+    let line = serde_json::to_value(&stats).unwrap();
+    assert!(line.get("unhealthy_root_no_fallback_requests").is_none(), "absent while empty");
+    let totals = e2_unhealthy_totals(&clean);
+
+    match mode {
+        "malformed" => {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"malformed\n")
+                .unwrap();
+        }
+        "unreadable" => {
+            fs::remove_file(&path).unwrap();
+            fs::create_dir_all(&path).unwrap();
+        }
+        "oversized" => {
+            // Sparse: the strict reader refuses at open from metadata alone.
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(64 * 1024 * 1024)
+                .unwrap();
+        }
+        other => panic!("unknown mode {other}"),
+    }
+    e2_sibling_evidence(&support);
+    let (items, disposition, stats, counts) =
+        e2_unhealthy_root_page(&dirs, &support, &root, &mut index, true);
+    // Never A, never another login: every family share is Unknown. The
+    // sibling's own clean evidence keeps D on the same page.
+    e2_unhealthy_assert_logins(&items, &root, None, None);
+    assert_eq!(
+        counts.get("claude_inherited_org_requests"),
+        None,
+        "no request is filled from the retained, start or root account: {counts}"
+    );
+    let expected = json!({ mode: 5 });
+    assert_eq!(
+        serde_json::to_value(stats.unhealthy_root_no_fallback_requests).unwrap(),
+        expected,
+        "root 4 + child 1, under this cause only"
+    );
+    let line = serde_json::to_value(&stats).unwrap();
+    assert_eq!(line["unhealthy_root_no_fallback_requests"], expected);
+    assert_eq!(disposition.quarantined_entity_count(), 0, "Unknown, not deferred");
+    if mode == "malformed" {
+        // The same paired read: money is unchanged, only the account moves.
+        assert_eq!(e2_unhealthy_totals(&items), totals, "per-session money is unchanged");
+    }
+    for item in items.iter().filter(|item| item.source_session_id != E2_SIBLING) {
+        assert_eq!(item.telemetry_owned_complete, Some(false));
+        assert!(item.request_count > 0, "never $0 by dropping requests");
+    }
+
+    // The sidecar reads clean again: its own proof replaces Unknown.
+    if mode == "unreadable" {
+        fs::remove_dir(&path).unwrap();
+    }
+    e2_write_rows(
+        &support,
+        "local-otel/claude-code-trace-ownership",
+        &root,
+        &trace,
+    );
+    e2_sibling_evidence(&support);
+    let (recovered, _, stats, _) =
+        e2_unhealthy_root_page(&dirs, &support, &root, &mut index, false);
+    e2_unhealthy_assert_logins(&recovered, &root, b, child);
+    assert_eq!(e2_unhealthy_totals(&recovered), totals, "no usage is dropped");
+    assert!(stats.unhealthy_root_no_fallback_requests.is_empty());
+    fs::remove_dir_all(sibling).unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn e2_pipeline_bound_a_split_logins_malformed_trace_is_unknown_not_a() {
+    e2_unhealthy_root_case("malformed", true);
+}
+
+#[test]
+fn e2_pipeline_bound_a_uniform_b_malformed_trace_is_unknown_not_a() {
+    e2_unhealthy_root_case("malformed", false);
+}
+
+#[test]
+fn e2_pipeline_bound_a_split_logins_unreadable_trace_is_unknown_not_a() {
+    e2_unhealthy_root_case("unreadable", true);
+}
+
+#[test]
+fn e2_pipeline_bound_a_split_logins_oversized_trace_is_unknown_not_a() {
+    e2_unhealthy_root_case("oversized", true);
+}
+
+#[test]
+fn e2_unhealthy_root_reason_precedence_and_counter_shape() {
+    use claude_request_identity::UnhealthyRootReason as Reason;
+    assert_eq!(Reason::of(1, 1, 1), Reason::Oversized);
+    assert_eq!(Reason::of(0, 1, 1), Reason::Unreadable);
+    assert_eq!(Reason::of(0, 0, 1), Reason::Malformed);
+    assert_eq!(Reason::of(0, 0, 0), Reason::Incomplete);
+    assert!(Reason::Oversized < Reason::Unreadable && Reason::Malformed < Reason::Incomplete);
+    let mut counts = ClaudeUnhealthyRootNoFallbackCounts::default();
+    assert!(counts.is_empty());
+    assert_eq!(serde_json::to_value(counts).unwrap(), json!({}));
+    counts.add(Reason::Malformed, 3);
+    counts.add(Reason::Incomplete, 2);
+    counts.add(Reason::Malformed, 1);
+    assert_eq!(
+        serde_json::to_value(counts).unwrap(),
+        json!({"malformed": 4, "incomplete": 2})
+    );
+}

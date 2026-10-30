@@ -218,6 +218,33 @@ pub(crate) enum Refusal {
     CoverageUnqualified,
 }
 
+/// Why a root's strict sidecar evidence was unhealthy this pass. Local counter
+/// label only; declaration order is precedence when several causes apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum UnhealthyRootReason {
+    Oversized,
+    Unreadable,
+    Malformed,
+    /// A missing pair member, failed permissive read, invalid or missing
+    /// request ids, or conflicting ids.
+    Incomplete,
+}
+
+impl UnhealthyRootReason {
+    /// The strongest cause among one read's health counters.
+    pub(crate) fn of(oversized: u64, unreadable: u64, malformed: u64) -> Self {
+        if oversized > 0 {
+            Self::Oversized
+        } else if unreadable > 0 {
+            Self::Unreadable
+        } else if malformed > 0 {
+            Self::Malformed
+        } else {
+            Self::Incomplete
+        }
+    }
+}
+
 /// Owned form of `IdentityRef`, for tests and the W0 builder oracle.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2276,9 +2303,12 @@ pub(crate) struct RequestAccounts {
     reconciled: bool,
     /// Root start known, but the native Unknown grains are not filled yet.
     root_fallback_pending: bool,
+    /// This page could not read the family's strict sidecar evidence; no
+    /// account may fill its shares (SOURCE: unhealthy root is all-Unknown).
+    unhealthy_no_fallback: bool,
 }
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
-crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending);
+crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, unhealthy_no_fallback);
 
 /// One account policy for E2. Never use a later marker for an earlier request.
 /// A conflict fills missing shares; trusted own/earlier org runs stay intact.
@@ -2443,6 +2473,9 @@ pub(crate) fn request_accounts(
 
 impl RequestAccounts {
     pub(crate) fn account(&self, sequence: u64) -> AccountPartition {
+        if self.unhealthy_no_fallback {
+            return None;
+        }
         if self.subagent {
             return self.starting.clone().or_else(|| {
                 (!self.root_fallback_pending)
@@ -2587,8 +2620,14 @@ impl RequestAccounts {
 /// Own exact telemetry uses the existing request classifier, with the same
 /// standing as an own credential_org. Only missing evidence inherits an
 /// earlier own request, then the start/binding; every such fill is counted.
-pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &ScanEvidence<'_>) {
+/// A family whose strict sidecar read failed this page inherits nothing: its
+/// requests stay Unknown, counted per reason in the returned totals.
+pub(crate) fn reconcile_request_accounts(
+    items: &mut [SnapshotItem],
+    evidence: &ScanEvidence<'_>,
+) -> super::ClaudeUnhealthyRootNoFallbackCounts {
     use super::claude_request_money::e2::place_request_identity;
+    let mut no_fallback = super::ClaudeUnhealthyRootNoFallbackCounts::default();
     for item in items {
         let Some(mut fold) = item.claude_money.take() else {
             continue;
@@ -2598,6 +2637,35 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
             continue;
         };
         if accounts.reconciled {
+            fold.accounts = Some(accounts);
+            item.claude_money = Some(fold);
+            continue;
+        }
+        let root = super::claude_snapshot_family_root_ref(item);
+        if evidence.unhealthy_roots.contains(root) {
+            // The classifier refuses every request here (IncompleteEvidence).
+            // A retained, creator, start or earlier-request account is not
+            // evidence for requests whose own proof could not be read: collapse
+            // the partitions in place so tokens, costs, side calls and id-less
+            // shares survive with no account. Durable bindings are untouched.
+            no_fallback.add(
+                evidence.unhealthy_reason(root),
+                fold.entity
+                    .grains
+                    .values()
+                    .map(|grain| grain.requests)
+                    .fold(0_u64, u64::saturating_add),
+            );
+            fold.entity.repartition(None);
+            accounts.unhealthy_no_fallback = true;
+            accounts.starting = None;
+            accounts.fallback = None;
+            accounts.inherited = 0;
+            accounts.skipped_inherited = 0;
+            accounts.reconciled = true;
+            for occurrence in item.claude_usage_occurrences.values_mut() {
+                occurrence.e2_inherited = Some(false);
+            }
             fold.accounts = Some(accounts);
             item.claude_money = Some(fold);
             continue;
@@ -2781,6 +2849,7 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
         fold.accounts = Some(accounts);
         item.claude_money = Some(fold);
     }
+    no_fallback
 }
 
 /// Read retained creator bindings using the same machine/session key as the
@@ -2855,7 +2924,8 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
         else {
             continue;
         };
-        if accounts.subagent {
+        // An unhealthy family lends no start to its children or twins.
+        if accounts.subagent || accounts.unhealthy_no_fallback {
             continue;
         }
         let first = item
@@ -2928,6 +2998,9 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
         let Some(accounts) = fold.accounts.as_deref_mut() else {
             continue;
         };
+        if accounts.unhealthy_no_fallback {
+            continue;
+        }
         if accounts.subagent {
             accounts.starting = match roots.get(&root) {
                 Some(root) => root.starting.clone(),
@@ -3209,6 +3282,9 @@ pub(crate) struct ScanEvidence<'a> {
     request_roots: std::cell::OnceCell<Vec<(&'a str, Option<&'a str>)>>,
     /// Roots whose sidecar reads were incomplete in this pass.
     pub(crate) unhealthy_roots: BTreeSet<String>,
+    /// Why each unhealthy root failed, for its no-fallback counter only.
+    /// A root missing here counts as `Incomplete`.
+    unhealthy_reasons: BTreeMap<String, UnhealthyRootReason>,
     /// Roots with a qualified witness that their telemetry writer is healthy
     /// NOW, the precondition for `Refusal::Pending`. A complete paired-sidecar
     /// load proves only what was already written, not a live writer, and no
@@ -3297,6 +3373,21 @@ impl<'a> ScanEvidence<'a> {
             }
         }
         evidence
+    }
+
+    pub(crate) fn with_unhealthy_reasons(
+        mut self,
+        reasons: BTreeMap<String, UnhealthyRootReason>,
+    ) -> Self {
+        self.unhealthy_reasons = reasons;
+        self
+    }
+
+    fn unhealthy_reason(&self, root: &str) -> UnhealthyRootReason {
+        self.unhealthy_reasons
+            .get(root)
+            .copied()
+            .unwrap_or(UnhealthyRootReason::Incomplete)
     }
 
     pub(crate) fn with_accepted_buckets(mut self, accepted: Option<&'a AcceptedBuckets>) -> Self {
@@ -4511,7 +4602,9 @@ fn keeps_markerless_account(item: &SnapshotItem) -> bool {
             .claude_money
             .as_deref()
             .and_then(|fold| fold.accounts.as_deref())
-            .is_some_and(|accounts| accounts.starting.is_some() && !accounts.conflict)
+            .is_some_and(|accounts| {
+                !accounts.unhealthy_no_fallback && accounts.starting.is_some() && !accounts.conflict
+            })
 }
 
 fn tag_item(
