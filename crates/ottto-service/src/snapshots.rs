@@ -38689,8 +38689,8 @@ fn codex_total_usage_has_request_count(value: &Value) -> bool {
 }
 
 fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
-    // Count source-field observations once per applied record, never in the
-    // side-effect-free usage-shape probes or again during response deduplication.
+    // Count per observed usage line, before response deduplication and timestamp
+    // drops; rereads count again. Usage-shape probes remain side-effect-free.
     if pi_usage_event(value) {
         if let Some(usage) = pi_usage_value(value) {
             let (_, observations) = pi_usage_costs_with_observations(usage);

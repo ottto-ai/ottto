@@ -66,24 +66,14 @@ pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     );
 }
 
-/// Per-field Pi parse observations, counted once per applied source record.
-/// The lifecycle registry provides process totals and the labelled refusal
-/// projection follows the other content-free refusal diagnostics.
+/// Counts per observed usage line, before response deduplication and timestamp
+/// drops; rereads count again. Only the lifecycle registry atomics are updated.
 pub(crate) fn pi_cost_observations(refused: u64, rounded: u64) {
     if refused == 0 && rounded == 0 {
         return;
     }
     cache_lifecycle::add(cache_lifecycle::Event::PiCostRefusedOverflow, refused);
     cache_lifecycle::add(cache_lifecycle::Event::PiCostPrecisionRounded, rounded);
-    let totals = cache_lifecycle::snapshot();
-    traversal_point(
-        "pi_cost_observations",
-        "pi",
-        &serde_json::json!({
-            "pi_cost_refused": {"overflow": totals.pi_cost_refused_overflow},
-            "pi_cost_precision_rounded": totals.pi_cost_precision_rounded,
-        }),
-    );
 }
 
 /// Per-pass observations, not distinct entries/files or a lifetime counter.
@@ -2329,7 +2319,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_cost_observations_use_labelled_refusals_and_registered_totals() {
+    fn pi_cost_observations_update_registry_without_emitting_records() {
         let (((), counts), rows) = capture(|| {
             cache_lifecycle::observe(|| {
                 pi_cost_observations(0, 0);
@@ -2338,21 +2328,7 @@ mod tests {
         });
         assert_eq!(counts.pi_cost_refused_overflow, 2);
         assert_eq!(counts.pi_cost_precision_rounded, 3);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["stage"], "pi_cost_observations");
-        assert_eq!(rows[0]["source"], "pi");
-        assert!(
-            rows[0]["counts"]["pi_cost_refused"]["overflow"]
-                .as_u64()
-                .unwrap()
-                >= 2
-        );
-        assert!(
-            rows[0]["counts"]["pi_cost_precision_rounded"]
-                .as_u64()
-                .unwrap()
-                >= 3
-        );
+        assert!(rows.is_empty());
     }
 
     #[test]
