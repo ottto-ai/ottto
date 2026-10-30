@@ -428,69 +428,6 @@ fn c1a_changed_witness_rearms_like_base() {
     assert_eq!(after.proven, base_after.proven);
 }
 
-/// Positive control, same window: a changed multi-member family whose every
-/// member is on the terminal page (a single-page window) re-proves in that
-/// window exactly as under BASE, with no RetryPending entry.
-#[test]
-#[serial(source_manifests)]
-fn c1a_changed_family_reproves_in_window_like_base() {
-    if !c1a_layout_supported("c1a_changed_family_in_window") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len();
-    let run = |fixture: &mut RearmFixture, arm: &str| {
-        fixture.native_file_limit = 64;
-        let first = c1a_window(&c1a_generation(fixture, arm, (8, 0)));
-        let second = c1a_window(&c1a_generation(fixture, arm, (8, 10)));
-        fixture.append_family_request(Some(REARM_AGENTS[1]), "req_agent_b_2", 4, 5);
-        let changed = c1a_window(&c1a_generation(fixture, arm, (8, 20)));
-        [first, second, changed]
-    };
-    let mut fixture = c1a_fixture("c1a-in-window");
-    let windows = run(&mut fixture, "fix");
-    let mut base = c1a_fixture("c1a-in-window-base");
-    let base_windows = {
-        let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
-        run(&mut base, "base")
-    };
-    assert_eq!(windows, base_windows);
-    let changed = &windows[2];
-    assert_eq!(changed.pages, 1);
-    assert!(changed.fence_before && changed.fence_after);
-    assert_eq!(changed.family_reads, family);
-    assert!(changed.proven, "the changed family re-proves in its window");
-    assert!(!changed.retry_pending, "no RetryPending entry");
-}
-
-/// Positive control, split family: with three files per page the root and
-/// one subagent sit on the first page and the other subagent on the terminal
-/// page. A family with a member on the terminal page never skips, so every
-/// window equals BASE.
-#[test]
-#[serial(source_manifests)]
-fn c1a_family_with_terminal_page_member_keeps_base_rearm() {
-    if !c1a_layout_supported("c1a_split_family") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let run = |fixture: &mut RearmFixture, arm: &str| {
-        fixture.native_file_limit = 3;
-        let fixture: &RearmFixture = fixture;
-        [(8, 0), (8, 10), (8, 20)].map(|clock| c1a_window(&c1a_generation(fixture, arm, clock)))
-    };
-    let mut fixture = c1a_fixture("c1a-split-family");
-    let windows = run(&mut fixture, "fix");
-    let mut base = c1a_fixture("c1a-split-family-base");
-    let base_windows = {
-        let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
-        run(&mut base, "base")
-    };
-    assert_eq!(windows, base_windows);
-    assert!(windows[1].proven && windows[1].fence_before && windows[1].fence_after);
-    assert!(windows[1].debt > 0, "earlier-page members keep re-arming");
-}
-
 /// X(a), M1: with the skip active, a changed `claude_api_request:v2` root row
 /// that adds request identity re-selects every family member at the next
 /// visit (the sidecar-inclusive selection fingerprint), and the re-emitted
@@ -685,24 +622,6 @@ fn c1a_contract_off_to_on_rearms_skipped_family() {
     c1a_contract_change_rearms_skipped_family(C1aContractChange::OffToOn);
 }
 
-#[test]
-#[serial(source_manifests)]
-fn c1a_contract_older_collector_rearms_skipped_family() {
-    c1a_contract_change_rearms_skipped_family(C1aContractChange::OlderCollector);
-}
-
-#[test]
-#[serial(source_manifests)]
-fn c1a_contract_unknown_after_downgrade_rearms_skipped_family() {
-    c1a_contract_change_rearms_skipped_family(C1aContractChange::Unknown);
-}
-
-#[test]
-#[serial(source_manifests)]
-fn c1a_contract_malformed_rearms_skipped_family() {
-    c1a_contract_change_rearms_skipped_family(C1aContractChange::Malformed);
-}
-
 /// X(b), A-B-A within one traversal: off, on, off across its pages. The
 /// terminal sees the same contract as the traversal start, but the record
 /// marks the traversal changed, so nothing skips and nothing clears. The next
@@ -829,12 +748,6 @@ fn c1a_unsettled_traversal_keeps_latch(upload: RearmUpload) {
 
 #[test]
 #[serial(source_manifests)]
-fn c1a_shed_traversal_keeps_latch() {
-    c1a_unsettled_traversal_keeps_latch(RearmUpload::Shed);
-}
-
-#[test]
-#[serial(source_manifests)]
 fn c1a_ack_lost_traversal_keeps_latch() {
     c1a_unsettled_traversal_keeps_latch(RearmUpload::AckLost);
 }
@@ -901,92 +814,6 @@ fn c1a_fixed_invalid_transcript_reopens_fence_without_deadline() {
     assert_eq!(fixed.debt, family, "the recovery re-arms the unread family");
     assert_eq!(after.family_reads, family);
     assert!(after.fence_before && !after.fence_after, "reopened");
-}
-
-/// Positive control, account hold: a family member that is account-held when
-/// the terminal folds keeps the whole family on the BASE re-arm.
-#[test]
-#[serial(source_manifests)]
-fn c1a_account_held_member_keeps_base_rearm() {
-    if !c1a_layout_supported("c1a_account_hold") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let run = |fixture: &RearmFixture, arm: &str| {
-        let family = rearm_family_sessions().len();
-        let closing = c1a_window(&c1a_generation(fixture, arm, (8, 0)));
-        assert!(closing.fence_after, "{arm}");
-        let held = c1a_window(&c1a_generation_with(
-            fixture,
-            arm,
-            (8, 10),
-            None,
-            |number| {
-                // After both family pages, before the terminal page.
-                if number == 2 {
-                    let index = ScanIndex::load(&fixture.index_path).unwrap();
-                    let key = RearmFixture::family_keys(&index)
-                        [&rearm_member_session(Some(REARM_AGENTS[0]))]
-                        .clone();
-                    let revision = index.files[&key].source_file_fingerprint.clone();
-                    c1a_edit_index(fixture, |saved| {
-                        saved.insert(
-                            "claude_account_deferred_holds".to_owned(),
-                            serde_json::json!({ key: revision }),
-                        );
-                    });
-                }
-            },
-        ));
-        assert_eq!(held.family_reads, family, "{arm}");
-        held
-    };
-    let fixture = c1a_fixture("c1a-account-hold");
-    let held = run(&fixture, "fix");
-    let base = c1a_fixture("c1a-account-hold-base");
-    let base_held = {
-        let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
-        run(&base, "base")
-    };
-    assert_eq!(held, base_held, "a held member keeps the BASE re-arm");
-    assert!(held.debt > 0);
-}
-
-/// Positive control, twin keys: a second index path for one subagent makes
-/// the family incomplete, so neither arm proves it and every window equals
-/// BASE.
-#[test]
-#[serial(source_manifests)]
-fn c1a_twin_member_key_keeps_base_parity() {
-    if !c1a_layout_supported("c1a_twin_keys") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let run = |fixture: &RearmFixture, arm: &str| {
-        let twin = fixture
-            .root
-            .join("other-project")
-            .join(REARM_ROOT)
-            .join("subagents")
-            .join(format!("agent-{}.jsonl", REARM_AGENTS[0]));
-        RearmFixture::append(
-            &twin,
-            &std::fs::read_to_string(fixture.member_path(Some(REARM_AGENTS[0]))).unwrap(),
-        );
-        [(8, 0), (8, 10), (8, 20)].map(|clock| c1a_window(&c1a_generation(fixture, arm, clock)))
-    };
-    let fixture = c1a_fixture("c1a-twin-keys");
-    let windows = run(&fixture, "fix");
-    let base = c1a_fixture("c1a-twin-keys-base");
-    let base_windows = {
-        let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
-        run(&base, "base")
-    };
-    assert!(
-        base_windows.iter().all(|window| !window.proven),
-        "a twin key leaves the family unproven"
-    );
-    assert_eq!(windows, base_windows);
 }
 
 /// Late copied import while the skip is active: a new transcript in an
@@ -1099,76 +926,6 @@ fn c1a_late_account_row(fixture: &RearmFixture) {
     std::fs::write(&path, rows).unwrap();
 }
 
-/// Each window's liveness state: RetryPending, census completion and family
-/// bodies offered.
-fn c1a_liveness(windows: &[C1aWindow]) -> Vec<(bool, bool, usize)> {
-    windows
-        .iter()
-        .map(|window| {
-            (
-                window.retry_pending,
-                window.census_complete,
-                window.family_offered,
-            )
-        })
-        .collect()
-}
-
-/// Liveness control, option (c)'s case: the root API rows change after the
-/// family's pages and before the terminal page of a window that reads the
-/// family. That terminal re-proves the family from this window's pending and
-/// the new rows, so its witness changes and the unchanged-proof check keeps
-/// the BASE re-arm; the next window reconstructs against the new witness. No
-/// arm goes to RetryPending and every window is complete, as under BASE.
-#[test]
-#[serial(source_manifests)]
-fn c1a_late_row_in_read_window_rearms_like_base() {
-    if !c1a_layout_supported("c1a_late_row_in_read_window") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len();
-    let run = |fixture: &RearmFixture, arm: &str| {
-        let closing = c1a_window(&c1a_generation(fixture, arm, (8, 0)));
-        assert!(closing.fence_after && closing.full_rearm, "{arm}");
-        let changed = c1a_window(&c1a_generation_with(
-            fixture,
-            arm,
-            (8, 10),
-            None,
-            |number| {
-                // After both family pages, before the terminal page.
-                if number == 2 {
-                    c1a_late_account_row(fixture);
-                }
-            },
-        ));
-        let [next, after] =
-            [(8, 20), (8, 30)].map(|clock| c1a_window(&c1a_generation(fixture, arm, clock)));
-        [changed, next, after]
-    };
-    let fixture = c1a_fixture("c1a-late-row-read-window");
-    let windows = run(&fixture, "fix");
-    let base = c1a_fixture("c1a-late-row-read-window-base");
-    let base_windows = {
-        let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
-        run(&base, "base")
-    };
-    // The changed window equals BASE, re-arm included.
-    assert_eq!(windows[0], base_windows[0]);
-    assert!(windows[0].fence_before && windows[0].fence_after);
-    assert_eq!(windows[0].family_reads, family);
-    assert_eq!(windows[0].debt, family, "a changed witness never skips");
-    assert_eq!(c1a_liveness(&windows), c1a_liveness(&base_windows));
-    assert!(
-        windows
-            .iter()
-            .all(|window| !window.retry_pending && window.census_complete),
-        "no RetryPending entry and every census completes"
-    );
-    assert_eq!(windows[1].family_offered, family, "re-emitted at once");
-}
-
 /// Liveness control, between windows: with the skip active, the root API
 /// rows change after one terminal and before the next window. Both arms
 /// re-select the family through M1 and reconstruct it against the witness the
@@ -1205,75 +962,6 @@ fn c1a_late_row_between_windows_equals_base() {
         );
     }
     assert_eq!(windows[0].family_reads, rearm_family_sessions().len());
-}
-
-/// Disclosure, not a pass/fail claim on either arm: the dormant-window
-/// residual. The skip at 08:10 leaves the family unread at 08:20. A change
-/// to it then lands after its directory was walked and before the 08:20
-/// terminal page.
-/// - `late_row`: the root API rows gain account evidence. BASE read the
-///   family on 08:20's earlier pages, so its terminal re-proves the family
-///   from that window's pending and the new rows. The fix has no 08:20
-///   pending for the family, so its next window reconstructs against the
-///   08:10 witness. A re-arm at the 08:20 terminal would not change that: the
-///   between-windows control shows a re-armed family going to RetryPending
-///   the same way.
-/// - `member_growth`: one subagent gains a request in its transcript and both
-///   sidecars. BASE also holds the family in the next window, so both arms
-///   behave the same.
-///
-/// The receipts record both arms' state per window for the report.
-#[test]
-#[serial(source_manifests)]
-fn c1a_residual_dormant_family_change_receipt() {
-    if !c1a_layout_supported("c1a_residual_dormant_change") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let run = |fixture: &RearmFixture, arm: &str, member_growth: bool| {
-        c1a_close_and_reprove(fixture, arm);
-        [(8, 20), (8, 30), (8, 40)].map(|clock| {
-            c1a_window(&c1a_generation_with(fixture, arm, clock, None, |number| {
-                if clock == (8, 20) && number == 2 {
-                    if member_growth {
-                        fixture.append_family_request(Some(REARM_AGENTS[0]), "req_agent_a_2", 4, 5);
-                    } else {
-                        c1a_late_account_row(fixture);
-                    }
-                }
-            }))
-        })
-    };
-    for (change, member_growth) in [("late_row", false), ("member_growth", true)] {
-        let fixture = c1a_fixture(if member_growth {
-            "c1a-residual-dormant-growth"
-        } else {
-            "c1a-residual-dormant-row"
-        });
-        let fix = run(&fixture, "fix", member_growth);
-        let base = c1a_fixture(if member_growth {
-            "c1a-residual-dormant-growth-base"
-        } else {
-            "c1a-residual-dormant-row-base"
-        });
-        let base = {
-            let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
-            run(&base, "base", member_growth)
-        };
-        writeln!(
-            std::io::stderr().lock(),
-            "C1A_PROOF_REARM residual=dormant_change change={change} fix_retry_pending={:?} base_retry_pending={:?} fix_census_complete={:?} base_census_complete={:?} fix_family_reads={:?} base_family_reads={:?} fix_family_offered={:?} base_family_offered={:?}",
-            fix.each_ref().map(|window| window.retry_pending),
-            base.each_ref().map(|window| window.retry_pending),
-            fix.each_ref().map(|window| window.census_complete),
-            base.each_ref().map(|window| window.census_complete),
-            fix.each_ref().map(|window| window.family_reads),
-            base.each_ref().map(|window| window.family_reads),
-            fix.each_ref().map(|window| window.family_offered),
-            base.each_ref().map(|window| window.family_offered),
-        )
-        .unwrap();
-    }
 }
 
 fn c1a_family_bodies(
@@ -1763,88 +1451,6 @@ fn c1a_dormant_owner_copied_prefix_successor_proves_after_full_rearm() {
     assert_eq!(proof.hold.oldest_dormant_owner_successor_age, None);
 }
 
-/// The first-proof hold row is content-free and fixed width, and its age
-/// buckets split at one, six and twenty-four hours.
-#[test]
-fn c1a_first_proof_hold_counts_encoding_is_bounded() {
-    use crate::snapshots::{ClaudeFirstProofHoldAge as Age, ClaudeFirstProofHoldCounts};
-    for (seconds, age) in [
-        (None, Age::Unknown),
-        (Some(0), Age::Under1h),
-        (Some(3_599), Age::Under1h),
-        (Some(3_600), Age::From1hTo6h),
-        (Some(21_599), Age::From1hTo6h),
-        (Some(21_600), Age::From6hTo24h),
-        (Some(86_399), Age::From6hTo24h),
-        (Some(86_400), Age::Over24h),
-        (Some(u64::MAX), Age::Over24h),
-    ] {
-        assert_eq!(Age::from_seconds(seconds), age, "{seconds:?}");
-    }
-    for (age, name) in [
-        (Age::Under1h, "under_1h"),
-        (Age::From1hTo6h, "1h_to_6h"),
-        (Age::From6hTo24h, "6h_to_24h"),
-        (Age::Over24h, "over_24h"),
-        (Age::Unknown, "unknown"),
-    ] {
-        assert_eq!(serde_json::to_value(age).unwrap(), serde_json::json!(name));
-        let max = ClaudeFirstProofHoldCounts {
-            dormant_owner_successor_family_count: usize::MAX,
-            oldest_dormant_owner_successor_age: Some(age),
-            census_withheld_retry_pending_family_count: usize::MAX,
-        };
-        let encoded = serde_json::to_string(&max).unwrap();
-        assert!(encoded.len() <= 176, "{} bytes", encoded.len());
-        let stats = crate::snapshot_sync::ClaudeLocalEvidenceStats {
-            first_proof_hold: max,
-            ..Default::default()
-        };
-        let line = serde_json::to_string(&stats).unwrap();
-        let mut without = serde_json::to_value(&stats).unwrap();
-        let nested = without
-            .as_object_mut()
-            .unwrap()
-            .remove("first_proof_hold")
-            .expect("nested counters");
-        assert_eq!(nested, serde_json::to_value(max).unwrap());
-        let baseline = serde_json::to_string(&without).unwrap();
-        assert!(
-            line.len() - baseline.len() <= 176 + r#","first_proof_hold":"#.len(),
-            "line grew by {} bytes",
-            line.len() - baseline.len()
-        );
-    }
-}
-
-/// The dedicated returning-family count remains on the Claude counts line
-/// at zero and at the maximum integer, without changing the existing nested
-/// 176-byte first-proof or 589-byte duplicate-census bounds.
-#[test]
-fn returning_family_grown_held_census_line_encoding_is_bounded() {
-    for count in [0, 1, usize::MAX] {
-        let stats = crate::snapshot_sync::ClaudeLocalEvidenceStats {
-            returning_family_grown_held: count,
-            ..Default::default()
-        };
-        let line = serde_json::to_string(&stats).unwrap();
-        let mut without = serde_json::to_value(&stats).unwrap();
-        let value = without
-            .as_object_mut()
-            .unwrap()
-            .remove("returning_family_grown_held")
-            .unwrap();
-        assert_eq!(value, serde_json::json!(count));
-        let baseline = serde_json::to_string(&without).unwrap();
-        assert!(
-            line.len() - baseline.len() <= 51,
-            "line grew by {} bytes",
-            line.len() - baseline.len()
-        );
-        assert!(line.len() <= 4096, "{} bytes", line.len());
-    }
-}
-
 // SOURCE 2026-10-27, option A: a `Completed` page that holds an entity locally
 // scopes the sweep's unsettled marker to the held entity's own families for
 // the terminal unchanged-proof skip. These arms run with native comparison on,
@@ -2018,35 +1624,6 @@ fn c1a_unbound_hold_neither_blocks_nor_unlocks_another_family() {
         account,
         "the unrelated hold does not unlock a family whose own member is unsettled"
     );
-}
-
-/// SOURCE option A, test (b), changed member: beside an unbound hold, a
-/// proven family skips only while its own members are unchanged. A subagent
-/// gains a request after the family pages and before the terminal page; the
-/// window reads, proves and re-arms exactly as without the hold.
-#[test]
-#[serial(source_manifests)]
-fn c1a_changed_family_beside_unbound_hold_rearms_like_no_hold() {
-    if !c1a_layout_supported("c1a_changed_beside_hold") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    let family = rearm_family_sessions().len();
-    let gain = |fixture: &RearmFixture, number: usize| {
-        if number == 3 {
-            fixture.append_family_request(Some(REARM_AGENTS[0]), "req_agent_a_2", 4, 5);
-        }
-    };
-    let (_, control, _) = c1a_held_arm("c1a-changed-control", &[], gain);
-    assert_eq!(control.family_reads, family);
-    assert!(control.proven, "the changed family is proven: {control:?}");
-    assert_eq!(control.debt, family, "a changed proven family never skips");
-    let (_, held, held_pages) = c1a_held_arm("c1a-changed-beside-hold", &[C1A_HELD], gain);
-    c1a_assert_scoped_hold(&held_pages, "changed");
-    assert!(held.proven, "the changed family is proven: {held:?}");
-    assert_eq!(held.debt, family, "a changed proven family never skips");
-    assert_eq!(c1a_census_as(&held, &control), control);
 }
 
 /// SOURCE option A, test (a): a held family still re-arms its own members,

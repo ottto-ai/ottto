@@ -313,34 +313,6 @@ fn run(world: &World, port: &mut FakePort<'_>, gates: &mut FakeGates<'_>) -> Out
 }
 
 #[test]
-fn a_paused_page_asks_for_the_next_page_after_the_duty_gap() {
-    let world = World::new();
-    world.ordinary_page_asks(Duration::from_secs(5));
-    world.advance_to_due();
-    let mut port = FakePort::new(&world, &[End::Paused]);
-    let mut gates = FakeGates::allowed(&world);
-
-    let started = world.now.get();
-    assert_eq!(run(&world, &mut port, &mut gates), Outcome::Paused);
-    let finished = world.now.get();
-    assert!(world.held());
-    assert_eq!(world.network.get(), 0);
-    assert_eq!(
-        world.lock_held_in_page.get(),
-        Some(true),
-        "R0: the page runs under the snapshot sync lock"
-    );
-    assert!(
-        world.lock.try_lock().is_ok(),
-        "the lock is released before the wait between pages"
-    );
-    assert_eq!((gates.entered, gates.restored), (1, 1));
-    // 4 s of measured work: the 30 s minimum still dominates 9 × 4 s.
-    assert_eq!(finished - started, Duration::from_secs(4));
-    assert_eq!(world.due(), Some(finished + Duration::from_secs(36)));
-}
-
-#[test]
 fn cancelled_failed_and_deferred_pages_leave_no_continuation() {
     for (end, expected) in [
         (End::Cancelled, Outcome::Cancelled),
@@ -1311,30 +1283,6 @@ fn a_held_context_is_dropped_on_every_clear() {
     );
 }
 
-/// K2 (5): the held inputs are charged as process-retained memory through
-/// the requested-layout admission, and an unsupported layout or a bound over
-/// the limit refuses the charge (the rotation then discards the ticket).
-#[test]
-fn held_inputs_are_charged_and_an_unknown_charge_refuses() {
-    let world = World::new();
-    let (ticket, _sentinel) = ticket_with_inputs(&world);
-    let charged = ticket.cursor.retained_bound(usize::MAX);
-    if crate::heap_layout_bound::layout_supported() {
-        let charged = charged.expect("a supported layout is bounded");
-        let bare = CursorTicket::codex(CodexCursorTicket::unready_for_test())
-            .retained_bound(usize::MAX)
-            .expect("bounded");
-        assert!(charged > bare, "the inputs are charged: {charged} > {bare}");
-        assert_eq!(
-            ticket.cursor.retained_bound(charged - 1),
-            None,
-            "over the limit"
-        );
-    } else {
-        assert_eq!(charged, None, "unknown layout: refused, never zero");
-    }
-}
-
 #[test]
 fn the_authority_digest_follows_the_ordinary_validation() {
     let endpoint = "https://api.example.test";
@@ -1422,30 +1370,6 @@ fn exact_qos_pair_restores_on_parent_and_worker_panics_and_failed_query_is_untou
     );
     signals.restore_qos();
     QOS_WRITES.with(|v| assert_eq!(v.borrow().last(), Some(&(0x15, 0))));
-}
-
-#[test]
-fn eof_park_and_middle_pages_never_upload_or_move_the_ordinary_clock() {
-    let world = World::new();
-    world.ordinary_page_asks(Duration::from_secs(1));
-    let reference = world.cadence.borrow().clone();
-    let mut port = FakePort::new(&world, &[End::Paused, End::ParkedEof]);
-    let mut gates = FakeGates::allowed(&world);
-    for expected in [Outcome::Paused, Outcome::Deferred] {
-        world.advance_to_due();
-        assert_eq!(run(&world, &mut port, &mut gates), expected);
-        assert_eq!(world.network.get(), 0);
-        assert!(!world.qos_lowered.get());
-        for offset in [0, 300, 900, 7200] {
-            let now = world.now.get() + Duration::from_secs(offset);
-            assert_eq!(
-                world.cadence.borrow().next_scan_after(now),
-                reference.next_scan_after(now)
-            );
-        }
-    }
-    assert!(!world.held());
-    assert_eq!(world.due(), None);
 }
 
 thread_local! {

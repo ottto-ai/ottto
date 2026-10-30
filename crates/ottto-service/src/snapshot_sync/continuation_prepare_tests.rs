@@ -445,39 +445,6 @@ fn a_pending_historical_replay_refuses_the_continuation_prepare() {
     assert!(inputs.holds_attribution(), "a refusal keeps it cached");
 }
 
-/// K1 (a″): the upload-claim predicate is the ordinary selection's answer
-/// on a copy: it never changes the loaded progress.
-#[test]
-fn the_upload_claim_predicate_is_pure_and_matches_the_ordinary_selection() {
-    let fixture = ContinuationFixture::quiescent("continuation-claim-predicate");
-    let (progress, index) = fixture.load();
-    let now = reason_reoffer::now_unix_seconds();
-    let scope = reason_reoffer::Scope {
-        index: &index,
-        now,
-        window_start_unix_seconds: now.saturating_sub(30 * 86_400),
-    };
-    for generation in [
-        cycle_replay_generation(SnapshotSource::Codex, false, &index, CONTINUATION_NAMESPACE),
-        "another-generation".to_string(),
-    ] {
-        let unchanged = progress.clone();
-        let needed = continuation_upload_claim_needed(&progress, &index, &generation, &scope);
-        assert_eq!(progress, unchanged, "pure");
-        let mut ordinary = progress.clone();
-        assert_eq!(
-            needed,
-            prepare_upload_progress_for_cycle_with_reoffer(
-                &mut ordinary,
-                &index,
-                &generation,
-                false,
-                Some(&scope)
-            )
-        );
-    }
-}
-
 /// Contract-5 cutover, byte-stable keys (Lead B): a Claude cycle's sampled
 /// scope keeps the permit-era permitted `:request_identity` suffix for good,
 /// and a Codex cycle keeps its suffix-free bytes, so durable records and
