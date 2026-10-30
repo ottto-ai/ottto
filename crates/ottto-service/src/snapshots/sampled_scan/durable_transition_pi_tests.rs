@@ -257,6 +257,18 @@ impl PiDriver {
         counts.active_bound[2]
     }
 
+    /// This route's store (faults, failed cleanups).
+    fn store_faults(&self, mode: Mode) -> (u64, u64) {
+        let (_, store) = self.pages[&mode].cache.durable_counters(SOURCE).unwrap();
+        (store.store_faults, store.store_write_cleanup_failed)
+    }
+
+    /// This route's certificate refusals of one class (`full_reason_class`).
+    fn certificate_refused(&self, mode: Mode, class: &str) -> u64 {
+        let (counts, _) = self.pages[&mode].cache.durable_counters(SOURCE).unwrap();
+        counts.certificate_refused.get(class).copied().unwrap_or(0)
+    }
+
     /// This route's cache-admission refusals: (the Pi `cache_transit` Full
     /// count, pending delays, Pi slot paced recovery [Full, delay]).
     fn cache_transit(&self, mode: Mode) -> (u64, u64, [u64; 2]) {
@@ -642,6 +654,179 @@ fn pi_ram_resident_same_head_cut_reads_one_real_edit_full() {
     assert_eq!(format_hold, [0; 8]);
     money_oracle::assert_equivalent(&cold, &edited);
     whole_body(&cold, &edited);
+}
+
+// Stale survivor (D-N1-HOLD, source=pi): a real write + cleanup double fault at
+// the native rename leaves the predecessor in place. Pi has no D3 key hold, so
+// the store's `stale_survivor` settles FailedHeld(ReceiptPending): no body, the
+// accepted state kept, the survivor byte-identical, the faults counted. Once
+// writes work the next pass is one Tail equal to cold Full and replaces the
+// survivor. "ram" resumes the owed RAM completion past new growth; "restart"
+// lost it, so the survivor restores and its Tail reads the held growth too.
+// Neither arm reads Full, and a later quiet restart POSTs nothing.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "Pi restore requires qualified native heap layout"
+)]
+fn pi_stale_survivor_holds_then_resolves_with_a_counted_tail() {
+    if !supported("pi_transition_survivor") {
+        return;
+    }
+    use crate::durable_tail_store::test_hooks::set_write_failure;
+    for arm in ["ram", "restart"] {
+        let name = format!("transition-pi-survivor-{arm}");
+        let mut f = PiDriver::warm(&name, &pi_seed());
+        let survivor = f.disk.record_bytes();
+        let bodies = stored_bodies(&f.prior);
+        f.grow(&[pi_turn(
+            "message",
+            Some("held-growth"),
+            20,
+            "2026-10-27T06:01:00Z",
+        )]);
+        let cold = f.emit_bodies(Mode::ColdFull);
+        let _reset = Reset(|| set_write_failure(None));
+        let rename = fixture::fail_store_at(fixture::CrashPoint::BeforeRename, 1);
+        set_write_failure(Some("native_cleanup"));
+        let held = f.emit_bodies(Mode::Ram);
+        assert_eq!(rename.hits(), 1, "{arm}: the native write reached rename");
+        drop(rename);
+        set_write_failure(None);
+        assert_eq!(held.modes.0, 0, "{arm}: no Full");
+        assert!(held.batches.is_empty(), "{arm}: no POST");
+        money_oracle::assert_held(&f.entity, &cold, &held, &cold);
+        assert_eq!(
+            f.store_faults(Mode::Ram),
+            (1, 1),
+            "{arm}: the double fault is counted"
+        );
+        f.save_gc(Mode::Ram);
+        assert_eq!(f.disk.record_bytes(), survivor, "{arm}: survivor kept");
+        assert_eq!(stored_bodies(&f.prior), bodies, "{arm}: accepted kept");
+
+        let (mode, read_from, restored) = if arm == "ram" {
+            let end = std::fs::metadata(&f.path).unwrap().len();
+            f.grow(&[pi_turn(
+                "message",
+                Some("after-survivor"),
+                30,
+                "2026-10-27T06:02:00Z",
+            )]);
+            (Mode::Ram, end, 0)
+        } else {
+            f.restart();
+            let committed = f.prior.files[&fixture::local_key(&f.path)].size_bytes;
+            (Mode::Restart, committed, 1)
+        };
+        let tail = std::fs::metadata(&f.path).unwrap().len() - read_from;
+        let cold = f.emit_bodies(Mode::ColdFull);
+        let resolved = f.emit_bodies(mode);
+        assert_eq!(
+            (resolved.modes, resolved.restored),
+            ((0, 1, 0), restored),
+            "{arm}: one Tail"
+        );
+        assert_eq!(
+            resolved.io.consumed,
+            tail + resolved.io.rederive_head,
+            "{arm}"
+        );
+        assert_eq!(resolved.batches.len(), 1, "{arm}: one POST");
+        money_oracle::assert_equivalent(&cold, &resolved);
+        whole_body(&cold, &resolved);
+        f.save_gc(mode);
+        assert_ne!(f.disk.record_bytes(), survivor, "{arm}: survivor replaced");
+        assert_ne!(stored_bodies(&f.prior), bodies, "{arm}: accepted advanced");
+        f.restart();
+        let quiet = f.emit_bodies(Mode::Restart);
+        assert_eq!((quiet.modes.0, quiet.modes.1), (0, 0), "{arm}");
+        assert!(quiet.batches.is_empty(), "{arm}: published exactly once");
+    }
+}
+
+// P-REWRITE, restart arms: Pi's own writer rewrites the same inode at a version
+// upgrade. v1->v3 grows (HeadChanged) and v2->v3 shrinks (Shrunk); the cheap
+// checks classify either before restore, so a restarted owner reads exactly
+// ONE A2 Full equal to cold Full, counted by its certificate class, never T14
+// or a hold. It writes a new record: a quiet restart reads nothing, and the
+// next growth restores that record and Tails, so no second Full follows.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "Pi restore requires qualified native heap layout"
+)]
+fn pi_version_rewrite_after_restart_reads_one_real_edit_full() {
+    use std::os::unix::fs::MetadataExt;
+    if !supported("pi_transition_rewrite") {
+        return;
+    }
+    for (arm, version, class) in [("grow", 1, "head_changed"), ("shrink", 2, "shrunk")] {
+        let name = format!("transition-pi-rewrite-{arm}");
+        let stored = format!("\"version\":{version}");
+        let initial = pi_seed().replacen("\"version\":3", &stored, 1);
+        let mut f = PiDriver::warm(&name, &initial);
+        let record = f.disk.record_bytes();
+        f.restart();
+        let mut migrated = initial.replacen(&stored, "\"version\":3", 1);
+        if arm == "shrink" {
+            migrated = migrated
+                .lines()
+                .filter(|line| !line.contains("Synthetic system instruction."))
+                .map(|line| format!("{line}\n"))
+                .collect();
+        }
+        migrated += &pi_json(pi_turn(
+            "message",
+            Some("after-migration"),
+            30,
+            "2026-10-27T06:02:00Z",
+        ));
+        let before = std::fs::metadata(&f.path).unwrap();
+        std::fs::write(&f.path, migrated).unwrap();
+        input_clock(&f.path);
+        let after = std::fs::metadata(&f.path).unwrap();
+        assert_eq!(before.ino(), after.ino(), "{arm}: same inode");
+        assert_eq!(after.len() > before.len(), arm == "grow", "{arm}");
+        let cold = f.emit_bodies(Mode::ColdFull);
+        let edited = f.emit_bodies(Mode::Restart);
+        assert_eq!(
+            (edited.modes, edited.restored),
+            ((1, 0, 0), 0),
+            "{arm}: ONE Full, no restore"
+        );
+        assert_eq!(edited.io.consumed, after.len(), "{arm}");
+        assert_eq!(f.certificate_refused(Mode::Restart, class), 1, "{arm}");
+        let (_, refused, t14) = f.counters(Mode::Restart);
+        assert_eq!((refused, t14), (0, 0), "{arm}: never T14");
+        assert_eq!(f.holds(Mode::Restart), ([0; 8], 0), "{arm}: never a hold");
+        assert_eq!(edited.snapshots[&f.entity]["request_count"], json!(2));
+        money_oracle::assert_equivalent(&cold, &edited);
+        whole_body(&cold, &edited);
+        f.save_gc(Mode::Restart);
+        assert_ne!(f.disk.record_bytes(), record, "{arm}: new record");
+        f.restart();
+        let quiet = f.emit_bodies(Mode::Restart);
+        assert_eq!((quiet.modes.0, quiet.modes.1), (0, 0), "{arm}: no 2nd Full");
+        assert!(quiet.batches.is_empty(), "{arm}: quiet restart POSTed");
+        f.restart();
+        let tail = f.grow(&[pi_turn(
+            "message",
+            Some("after-rewrite"),
+            40,
+            "2026-10-27T06:03:00Z",
+        )]);
+        let cold = f.emit_bodies(Mode::ColdFull);
+        let restored = f.emit_bodies(Mode::Restart);
+        assert_eq!(
+            (restored.modes, restored.restored),
+            ((0, 1, 0), 1),
+            "{arm}: the new record Tails"
+        );
+        assert_eq!(restored.io.consumed, tail + restored.io.rederive_head);
+        money_oracle::assert_equivalent(&cold, &restored);
+        whole_body(&cold, &restored);
+    }
 }
 
 // P-T14: a corrupt or truncated Pi record is read Full once (counted T14
