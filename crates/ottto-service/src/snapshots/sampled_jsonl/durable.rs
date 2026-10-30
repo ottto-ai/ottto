@@ -54,16 +54,25 @@ fn digest(
 }
 
 fn first_prompt_digest(acc: &SnapshotAccumulator) -> Result<[u8; 32], Refuse> {
+    first_prompt_parts_digest(&acc.first_prompt_material, &acc.first_prompt_title)
+}
+
+fn first_prompt_parts_digest(
+    material: &Option<String>,
+    title: &Option<String>,
+) -> Result<[u8; 32], Refuse> {
     digest("ottto-dt-rederive:first_prompt:v1", |e| {
-        acc.first_prompt_material.put(e)?;
-        acc.first_prompt_title.put(e)
+        material.put(e)?;
+        title.put(e)
     })
 }
 
 fn workspace_digest(acc: &SnapshotAccumulator) -> Result<[u8; 32], Refuse> {
-    digest("ottto-dt-rederive:workspace:v1", |e| {
-        acc.workspace_path.put(e)
-    })
+    workspace_value_digest(&acc.workspace_path)
+}
+
+fn workspace_value_digest(path: &Option<PathBuf>) -> Result<[u8; 32], Refuse> {
+    digest("ottto-dt-rederive:workspace:v1", |e| path.put(e))
 }
 
 fn agent_label_digest(acc: &SnapshotAccumulator) -> Result<[u8; 32], Refuse> {
@@ -339,8 +348,10 @@ impl SnapshotAccumulator {
         self.codex_counting.as_deref().map(|c| c.durable_contract())
     }
 }
+mod carried;
 #[cfg(unix)]
 mod content;
+pub(crate) use carried::{CarriedUploaded, UploadedLiterals};
 
 /// Content obligations without a supported, pre-funded extractor.
 #[derive(Debug)]

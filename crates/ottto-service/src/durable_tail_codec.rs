@@ -8,6 +8,9 @@
 //! - `H` a fixed 32-byte domain-separated SHA-256 or HMAC value used only
 //!   for equality, membership or order. A type (`HDigest`), not a label;
 //! - `U` a value the upload body already carries in exactly this form;
+//! - `PL` private local literal: exactly an already-uploaded, consent-gated
+//!   value; same-field restore only, record lifetime, purge on consent revocation.
+//!   SOURCE 2026-10-30: these known user-content literals are not class U.
 //! - `L` a provider-minted opaque id (request, response, message, tool-use,
 //!   call or MCP call id). Persisted only in the local 0600 durable-tail store;
 //!   never logged, never in diagnostics or counters, never uploaded from it;
@@ -256,7 +259,7 @@ impl<'a> Dec<'a> {
         self.refused |= !granted;
         granted.then_some(()).ok_or(Corrupt)
     }
-    fn slots<T>(&mut self, len: usize) -> Result<(), Corrupt> {
+    pub(crate) fn slots<T>(&mut self, len: usize) -> Result<(), Corrupt> {
         self.reserve(len.checked_mul(std::mem::size_of::<T>()))
     }
     fn tree<K, V>(&mut self, len: usize) -> Result<(), Corrupt> {
@@ -641,6 +644,16 @@ fn verify_entries<'a, K: Ord>(
         previous = Some(current);
     }
     Ok(())
+}
+
+/// SOURCE PL (2026-10-30): bounded private local upload literals. Implementors
+/// must validate bounds before allocation and never expose values in errors.
+/// This separate codec keeps the ordinary PathBuf persistence refusal intact.
+pub(crate) trait PrivateLocalLiteral: Sized {
+    fn put_pl(&self, e: &mut Enc) -> Result<(), Refuse>;
+    fn take_pl(d: &mut Dec<'_>) -> Result<Self, Corrupt>;
+    fn verify_pl(d: &mut Dec<'_>) -> Result<(), Corrupt>;
+    fn shape_pl(s: &mut Shape);
 }
 
 /// The default value an `E` field must hold for the record to be written.
@@ -1250,6 +1263,9 @@ macro_rules! durable_field {
     (put U, $e:ident, $f:ident, $ty:ty, $path:expr) => {
         $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
     };
+    (put PL, $e:ident, $f:ident, $ty:ty, $path:expr) => {
+        $crate::durable_tail_codec::PrivateLocalLiteral::put_pl($f, $e)?
+    };
     (put L, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
         let value: &$ty = $f;
         #[cfg(test)]
@@ -1288,6 +1304,9 @@ macro_rules! durable_field {
     (take U, $d:ident, $ty:ty) => {
         <$ty as $crate::durable_tail_codec::Durable>::take($d)?
     };
+    (take PL, $d:ident, $ty:ty) => {
+        <$ty as $crate::durable_tail_codec::PrivateLocalLiteral>::take_pl($d)?
+    };
     (take L, $d:ident, $ty:ty) => {
         <$ty as $crate::durable_tail_codec::Durable>::take($d)?
     };
@@ -1306,10 +1325,13 @@ macro_rules! durable_field {
     (verify I, $d:ident, $ty:ty) => {};
     (verify N, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
     (verify U, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
+    (verify PL, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::PrivateLocalLiteral>::verify_pl($d)? };
     (verify L, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
     (verify D, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
     (verify P, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
     (verify $other:ident, $d:ident, $ty:ty) => { compile_error!("unknown durable field class in verify") };
+    (key_type PL, $ty:ty, $lt:lifetime) => { compile_error!("PL literals cannot be durable keys") };
+    (key PL, $d:ident, $ty:ty) => { compile_error!("PL literals cannot be durable keys") };
     (key_type X, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
     (key_type E, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
     (key_type I, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
@@ -1323,6 +1345,10 @@ macro_rules! durable_field {
     (shape X, $s:ident, $f:ident, $ty:ty) => {{
         $s.push(concat!("X ", stringify!($f)));
         <$ty as $crate::durable_tail_codec::Durable>::shape($s);
+    }};
+    (shape PL, $s:ident, $f:ident, $ty:ty) => {{
+        $s.push(concat!("PL ", stringify!($f)));
+        <$ty as $crate::durable_tail_codec::PrivateLocalLiteral>::shape_pl($s);
     }};
     (shape H, $s:ident, $f:ident, $ty:ty) => {{
         $s.push(concat!("H ", stringify!($f)));

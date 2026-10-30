@@ -1755,7 +1755,7 @@ fn bounded_workspace_matches_native_corpus_and_refuses_other_classes() {
         let decoded = decode(&body, source).unwrap();
         assert!(decoded.rederive.workspace.is_some());
         assert!(
-            decoded.content_charge().is_err(),
+            decoded.content_charge(None).is_err(),
             "rich record remains unsupported"
         );
         let oracle = restore(&path, &body, source).unwrap().0;
@@ -1764,20 +1764,20 @@ fn bounded_workspace_matches_native_corpus_and_refuses_other_classes() {
             workspace: workspace.rederive.workspace,
             ..Default::default()
         };
-        let charge = workspace.content_charge().unwrap();
+        let charge = workspace.content_charge(None).unwrap();
         assert!(charge >= workspace.head_end().unwrap());
         let mut wrong = decode(&body, source).unwrap();
         wrong.rederive = Rederive {
             workspace: Some([0; 32]),
             ..Default::default()
         };
-        wrong.content_charge().unwrap();
+        wrong.content_charge(None).unwrap();
         assert!(matches!(
-            wrong.rederive_content(&File::open(&path).unwrap()),
+            wrong.rederive_content(&File::open(&path).unwrap(), None),
             Err(Refuse::NotRederivable("workspace_digest"))
         ));
         let (bounded, receipt) = workspace
-            .rederive_content(&File::open(&path).unwrap())
+            .rederive_content(&File::open(&path).unwrap(), None)
             .unwrap();
         assert_eq!(
             bounded.accumulator.workspace_path,
@@ -1803,7 +1803,7 @@ fn bounded_workspace_matches_native_corpus_and_refuses_other_classes() {
                 2 => excluded.rederive.agent_label = Some([1; 32]),
                 _ => excluded.rederive.session_start = Some([1; 32]),
             }
-            assert!(excluded.content_charge().is_err());
+            assert!(excluded.content_charge(None).is_err());
         }
     }
 }
@@ -1831,8 +1831,8 @@ fn bounded_workspace_cap_and_escaped_text_keep_native_values_or_refuse() {
                 workspace: decoded.rederive.workspace,
                 ..Default::default()
             };
-            decoded.content_charge().unwrap();
-            let actual = decoded.rederive_content(&File::open(&path).unwrap());
+            decoded.content_charge(None).unwrap();
+            let actual = decoded.rederive_content(&File::open(&path).unwrap(), None);
             if length > 4096 {
                 assert!(matches!(
                     actual,
@@ -1854,10 +1854,10 @@ fn bounded_workspace_cap_and_escaped_text_keep_native_values_or_refuse() {
         workspace: decoded.rederive.workspace,
         ..Default::default()
     };
-    decoded.content_charge().unwrap();
+    decoded.content_charge(None).unwrap();
     assert_eq!(
         decoded
-            .rederive_content(&File::open(&path).unwrap())
+            .rederive_content(&File::open(&path).unwrap(), None)
             .unwrap()
             .0
             .accumulator
@@ -1884,9 +1884,9 @@ fn workspace_wrong_object_shapes_refuse_without_formatting_the_input() {
             ..Default::default()
         };
         assert!(decoded.rederive.workspace.is_some());
-        decoded.content_charge().unwrap();
+        decoded.content_charge(None).unwrap();
         assert!(matches!(
-            decoded.rederive_content(&File::open(&path).unwrap()),
+            decoded.rederive_content(&File::open(&path).unwrap(), None),
             Err(Refuse::NotRederivable("workspace_capture"))
         ));
     }

@@ -3858,7 +3858,7 @@ impl SharedCache {
         // Metadata and bounded certificate samples precede every repeatable
         // resource refusal. Fund b4's content-only extractor before its input.
         let charge = decoded
-            .content_charge()
+            .content_charge(None)
             .map_err(|_| Failure::Resource("rederive_unfunded"))?;
         lease
             .charge(charge)
@@ -3871,7 +3871,7 @@ impl SharedCache {
             self.reserve_rederive(source, head)?;
         }
         let (reduction, receipt) = decoded
-            .rederive_content(held)
+            .rederive_content(held, None)
             .map_err(Failure::NotRederived)?;
         if source == SnapshotSource::Codex
             && v3.is_some_and(|inputs| {

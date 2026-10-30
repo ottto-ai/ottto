@@ -5,7 +5,7 @@ use std::fmt;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
-const CWD_CAP: usize = 4096;
+const CWD_CAP: usize = super::carried::WORKSPACE_CAP;
 
 /// The visitor checks BEFORE making an owned capture. Unknown fields use
 /// serde's IgnoredAny; no Value or collection of unknown content is built.
@@ -89,19 +89,23 @@ struct Row {
 }
 
 impl Decoded {
-    /// Enabled obligation class: workspace only. Other classes refuse before
-    /// I/O, retaining the existing resource-growth fallback and all hash fences.
-    pub(crate) fn content_charge(&self) -> Result<u64, RederiveUnfunded> {
+    /// Fund carried-field copies and the existing workspace-only extractor.
+    /// None preserves the legacy obligation/funding decisions exactly.
+    pub(crate) fn content_charge(
+        &self,
+        carried: Option<&CarriedUploaded>,
+    ) -> Result<u64, RederiveUnfunded> {
         let r = &self.rederive;
-        if r.first_prompt.is_some()
+        if (r.first_prompt.is_some() && !carried.is_some_and(CarriedUploaded::has_prompt))
             || r.title.is_some()
             || r.agent_label.is_some()
             || r.session_start.is_some()
         {
             return Err(RederiveUnfunded);
         }
-        if r.workspace.is_none() {
-            return Ok(0);
+        let copies = carried.map_or(0, CarriedUploaded::restore_charge);
+        if r.workspace.is_none() || carried.is_some_and(CarriedUploaded::has_workspace) {
+            return Ok(copies);
         }
         let end = self.head_end().map_err(|_| RederiveUnfunded)?;
         // One exact head buffer; serde_json's string/key scratch grows by
@@ -111,6 +115,7 @@ impl Decoded {
         // the output is moved; count both anyway. No native accumulator.
         let scratch = end.checked_next_power_of_two().ok_or(RederiveUnfunded)?;
         end.checked_add(scratch.checked_mul(2).ok_or(RederiveUnfunded)?)
+            .and_then(|n| n.checked_add(copies))
             .and_then(|n| {
                 n.checked_add(
                     (8 * CWD_CAP
@@ -128,7 +133,15 @@ impl Decoded {
     pub(crate) fn rederive_content(
         mut self,
         file: &File,
+        carried: Option<&CarriedUploaded>,
     ) -> Result<(CachedJsonlReduction, RederiveReceipt), Refuse> {
+        if let Some(carried) = carried {
+            carried.restore_fields(&mut self)?;
+        }
+        // Do not accidentally succeed with an unfunded first-prompt (or other)
+        // obligation when a caller bypasses content_charge's admission.
+        self.content_charge(None)
+            .map_err(|_| Refuse::NotRederivable("content_unfunded"))?;
         let Some(want) = self.rederive.workspace else {
             return Ok((self.reduction, RederiveReceipt::default()));
         };
@@ -177,7 +190,7 @@ impl Decoded {
             SnapshotSource::Pi => return Err(Refuse::NotRederivable("workspace_source")),
         };
         let path = raw.map(PathBuf::from);
-        let got = digest("ottto-dt-rederive:workspace:v1", |e| path.put(e))?;
+        let got = workspace_value_digest(&path)?;
         if got != want {
             return Err(Refuse::NotRederivable("workspace_digest"));
         }

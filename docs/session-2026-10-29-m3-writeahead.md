@@ -225,3 +225,25 @@ Portable restart-counter fixtures exercise Codex's strict EntryChanged binding;
 Claude's original-v1 adapter/accepted-floor handling is not that premise and is
 unchanged. A fault-free Linux v1 decode may classify layout backpressure without
 starting a Full; the control checks the typed outcome and zero fault counters.
+
+A source may opt into the shared CarriedUploaded helper in its own durable
+section, using class PL (private local literal), not U. It accepts explicit
+final wire values after consent, redaction, normalization and truncation, and
+copies only exact accumulator matches. The workspace cap is 4096 UTF-8 bytes;
+the prompt cap is the existing 96-byte uploaded prompt-prefix label bound.
+A longer or differently redacted prompt remains an H-only obligation; upload
+hashes do not authorize storing the underlying material. No transcript read is
+added. Restore funds copies before allocation and verifies the existing domain
+hashes, including the first prompt's display title, before using either field.
+
+The helper owns no separate store, exposes no literal getters or serialization,
+and formats Debug as lengths only. PL is forbidden as a durable key. The purge
+API removes owned values and emits only a per-source count. A source must save
+purged literals together with consent-filtered obligations (no upload means no
+obligation), and discard the section with its record on identity/head changes,
+retirement, removal, forget or uninstall. Missing literals do not silently erase
+existing obligations. E5 owns PiSection wiring, its pin and production consent,
+head-change and erasure integration. Claude/Codex still pass None; their shared
+record fields and allowlist pins are unchanged. Portable helper fixtures are
+compiled by both Clippy configurations; execution remains unverified. This
+checkpoint is local only pending explicit owner authorization to push.
