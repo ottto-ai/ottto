@@ -512,7 +512,10 @@ impl PipelineFixture {
             &mut progress,
         );
         let committed_index = index.clone();
-        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+        let mut scan = crate::snapshots::with_terminal_off_audit_now_for_test(
+            OffsetDateTime::parse(collected_at, &Rfc3339).unwrap().unix_timestamp() as u64,
+            || {
+                crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&self.root),
             &mut index,
@@ -521,7 +524,9 @@ impl PipelineFixture {
             self.page_files,
             true,
         )
-        .expect("scan bounded Claude page");
+        .expect("scan bounded Claude page")
+            },
+        );
         let parsed = scan
             .snapshots
             .iter()
@@ -1166,7 +1171,7 @@ fn account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
 /// ordinary traversal reparses only the held file instead of every unchanged
 /// file.
 #[test]
-#[ignore = "terminal-off ON-readiness: C6"]
+#[ignore = "terminal-off ON-readiness: NBF"]
 #[serial(source_manifests)]
 fn terminal_off_on_account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -1271,7 +1276,8 @@ fn terminal_off_on_account_deferred_hold_lets_a_bounded_claude_traversal_converg
 
     // TODO #901: the next retained service round reparses only the held file
     // once exact ACK context pacing lands. Keep the one-read bound strict.
-    let next = fixture.traversal(10, &PIPELINE_HOLD_CYCLE);
+    // Lead B NBF: retry service is due at +6 h; the one-read assertion stays.
+    let next = fixture.traversal(15, &PIPELINE_HOLD_CYCLE);
     let next_last = next.last().expect("next traversal page");
     assert!(!next_last.scan.census_complete);
     assert_eq!(
@@ -2296,7 +2302,7 @@ fn terminal_family_never_committed_members_let_the_claude_census_complete() {
 /// are never uploaded, accepted, or in the manifest, healthy siblings keep
 /// their accepted bodies, and the next unchanged traversal parses nothing.
 #[test]
-#[ignore = "terminal-off ON-readiness: C6"]
+#[ignore = "terminal-off ON-readiness: NBF"]
 #[serial(source_manifests)]
 fn terminal_off_on_terminal_family_never_committed_members_let_the_claude_census_complete() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2399,7 +2405,8 @@ fn terminal_off_on_terminal_family_never_committed_members_let_the_claude_census
     );
 
     // Quiet reads require paired #901; terminal-off grants no source-wide adoption.
-    let next = fixture.traversal(11, &TERMINAL_FAMILY_CYCLE);
+    // Lead B NBF: quiet service round at +6 h, assertions unchanged.
+    let next = fixture.traversal(16, &TERMINAL_FAMILY_CYCLE);
     let next_last = next.last().expect("next traversal page");
     assert!(!next_last.scan.census_complete);
     assert_eq!(
@@ -2600,7 +2607,7 @@ fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
 /// missing member is pruned only by the complete census; a replaced member is
 /// reparsed once, held, and rebound.
 #[test]
-#[ignore = "terminal-off ON-readiness: C6"]
+#[ignore = "terminal-off ON-readiness: NBF"]
 #[serial(source_manifests)]
 fn terminal_off_on_terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2690,7 +2697,7 @@ fn terminal_off_on_terminal_family_member_controls_keep_blocking_pruning_and_reb
         std::fs::remove_file(fixture.subagent_path(TERMINAL_FAMILY_AGENTS[0]))
             .expect("remove one subagent transcript");
         let mut all_pages = Vec::new();
-        for hour in 11..13 {
+        for hour in 16..18 {
             let pages = fixture.traversal(hour, &TERMINAL_FAMILY_CYCLE);
             let last = pages.last().expect("terminal page");
             assert!(!last.scan.census_complete);
@@ -2716,7 +2723,7 @@ fn terminal_off_on_terminal_family_member_controls_keep_blocking_pruning_and_reb
             ])
         );
         assert_held_bodies_never_delivered(&all_pages, settled, &baseline);
-        let quiet = fixture.traversal(13, &TERMINAL_FAMILY_CYCLE);
+        let quiet = fixture.traversal(18, &TERMINAL_FAMILY_CYCLE);
         assert!(quiet.last().is_some_and(|page| !page.scan.census_complete));
         assert_eq!(
             quiet
@@ -2760,7 +2767,8 @@ fn terminal_off_on_terminal_family_member_controls_keep_blocking_pruning_and_reb
         assert_ne!(rebound, old_revision);
         assert!(PipelineFixture::subagent_key(&last.index, TERMINAL_FAMILY_AGENTS[1]).is_some());
         assert_held_bodies_never_delivered(&pages, &last.index, &baseline);
-        let quiet = fixture.traversal(12, &TERMINAL_FAMILY_CYCLE);
+        // Lead B NBF: +6 h after the replaced member's 11:00 parse.
+        let quiet = fixture.traversal(17, &TERMINAL_FAMILY_CYCLE);
         assert!(quiet.last().is_some_and(|page| !page.scan.census_complete));
         assert_eq!(
             quiet
@@ -7216,4 +7224,60 @@ pub(super) fn exact_pipeline_accept(
         client_report: crate::client_report::ClientReport::empty(),
     })?;
     Ok(response)
+}
+
+/// NBF measures actual body acquisitions, rather than scan selection. Both
+/// non-progressing hold forms keep their original accepted custody throughout.
+#[test]
+#[serial(source_manifests)]
+fn terminal_off_nonblocking_held_keys_read_at_six_hours_not_every_page() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let _manifests = SourceManifestTestGuard::new();
+    for bound in [false, true] {
+        let (fixture, baseline, initial) = if bound {
+            let (fixture, baseline, first, last) = terminal_bound_hold_traversal(
+                "nbf-bound-committed-member", PipelineUpload::Accept, false,
+            );
+            assert!(!first.progress_blocking);
+            assert_eq!(first.held.len(), 1);
+            (fixture, baseline, last)
+        } else {
+            let fixture = PipelineFixture::new("nbf-account-deferred");
+            let baseline = fixture.baseline();
+            fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
+            let mut pages = fixture.traversal(9, &PIPELINE_HOLD_CYCLE);
+            assert!(pages.iter().any(|page| !page.held.is_empty() && !page.progress_blocking));
+            (fixture, baseline, pages.pop().unwrap())
+        };
+        let key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
+        let path = PathBuf::from(&key);
+        let old_entities = &baseline.file_snapshot_fingerprints[&key];
+        let cycle = if bound { PipelineCycle {
+            proven_owner_session: Some(PIPELINE_HELD_SESSION), ..PIPELINE_HOLD_CYCLE
+        }} else { PIPELINE_HOLD_CYCLE };
+        let assert_custody = |page: &PipelinePage| {
+            assert!(!page.scan.census_complete);
+            assert!(!page.index.bounded_sweep_had_unsettled_upload());
+            assert_eq!(&page.index.file_snapshot_fingerprints[&key], old_entities);
+            assert!(old_entities.iter().all(|fp| page.index.accepted_snapshot_fingerprint_recorded(fp)));
+            assert!(page.uploaded.is_disjoint(&page.held));
+            if bound {
+                assert!(page.index.bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION).is_some());
+            } else {
+                assert_eq!(page.index.claude_account_deferred_hold_count(), 1);
+            }
+        };
+        assert_custody(&initial);
+        for (at, expected) in [("15:00:00", 1), ("15:05:00", 0), ("21:00:00", 1)] {
+            let (page, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+                fixture.page(&format!("2026-08-02T{at}Z"), &cycle, PipelineUpload::Accept)
+            });
+            assert_eq!(reads.get(&path).copied().unwrap_or(0), expected, "bound={bound}/{at}");
+            assert_custody(&page);
+            assert!(page.uploaded.is_empty(), "held body must never upload");
+        }
+    }
 }

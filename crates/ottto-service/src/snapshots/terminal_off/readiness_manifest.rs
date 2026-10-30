@@ -18,14 +18,14 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_retryable_refusal_keeps_its_member_owed_across_restart", "proof-grant"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned", "proof-grant"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant", "proof-grant"),
-    ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_account_deferred_hold_lets_a_bounded_claude_traversal_converge", "C6"),
+    ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_account_deferred_hold_lets_a_bounded_claude_traversal_converge", "NBF"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_full_tombstone_set_keeps_the_excess_family_and_holds_both_returns", "completion-fold"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_real_rejected_page_records_account_hold_across_reload_and_reparses_next_generation", "R8"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_real_rejected_page_restores_terminal_hold_and_discloses_refusal_beside_accepted_sibling", "R8"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_retry_pending_debt_elsewhere_settles_unrelated_pages_like_no_debt", "R9"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_returning_member_that_never_reproves_is_held_until_its_bounded_terminal", "completion-fold"),
-    ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_terminal_family_member_controls_keep_blocking_pruning_and_rebinding", "C6"),
-    ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_terminal_family_never_committed_members_let_the_claude_census_complete", "C6"),
+    ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_terminal_family_member_controls_keep_blocking_pruning_and_rebinding", "NBF"),
+    ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_terminal_family_never_committed_members_let_the_claude_census_complete", "NBF"),
     ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_dark_matches_fold_absent_publication_and_selection", "r25-code-unclassified"),
     ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_held_new_file_lifetime_losses_preserve_main_body", "unclassified"),
     ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_overlapping_restored_histories_count_their_union_once", "prior-code-unclassified"),
@@ -57,6 +57,9 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_seen_marker_rebuild_latch_and_cutoff_feed_one_decision", "prior-code-unclassified"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_session_created_after_a_pre_gate_index_last_receipt_is_uploaded", "r25-code-unclassified"),
     ("snapshot_sync/oversized_discovery_pipeline_tests.rs", "terminal_off_on_oversized_blocking_hold_is_reoffered_once_per_six_hour_floor", "R12"),
+    ("snapshot_sync/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_account_deferred_hold_lets_a_bounded_claude_traversal_converge", "NBF"),
+    ("snapshot_sync/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_terminal_family_member_controls_keep_blocking_pruning_and_rebinding", "NBF"),
+    ("snapshot_sync/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_terminal_family_never_committed_members_let_the_claude_census_complete", "NBF"),
     ("snapshot_sync/prior_index_lifetime_tests.rs", "terminal_off_on_prior_index_lifetime_real_finish_preserves_refusals_retry_and_failed_cas", "r25-code-unclassified"),
     ("snapshots.rs", "terminal_off_on_claude_context_backfill_resumes_after_restart_without_rereading_settled_files", "P1"),
     ("snapshots/claude_context_file_birth_tests.rs", "terminal_off_on_api_sidecar_without_trace_sidecar_still_vetoes", "r25-code-unclassified"),
@@ -127,7 +130,7 @@ fn terminal_off_on_readiness_ignores_equal_the_checked_in_manifest() {
     assert_eq!(expected, sorted, "keep the manifest sorted");
     assert_eq!(ignored_for_readiness(), expected);
     // The count is the ON gate: it must reach 0 before ON anywhere.
-    assert_eq!(READINESS_MANIFEST.len(), 73);
+    assert_eq!(READINESS_MANIFEST.len(), 76);
 }
 
 #[test]
