@@ -2478,7 +2478,6 @@ mod tests {
             "cache_evicted_by_pi_claude_code",
             "cache_evicted_by_pi_codex",
             "retention_bound_refused_pi",
-            "pi",
         ] {
             assert_eq!(record["counts"][key], u64::MAX);
         }
