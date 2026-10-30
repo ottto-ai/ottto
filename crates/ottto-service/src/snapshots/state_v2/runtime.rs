@@ -105,6 +105,7 @@ struct RouteState {
     last_read: Option<(String, u64)>,
     save_retry_completed: bool,
     pass_written_start: Option<u64>,
+    resume_excluded: BTreeMap<String, Instant>,
 }
 impl RouteState {
     fn reduce_page(&mut self) {
@@ -164,6 +165,7 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     last_read: None,
                     save_retry_completed: false,
                     pass_written_start: None,
+                    resume_excluded: BTreeMap::new(),
                 }))
             })
             .clone()
@@ -633,7 +635,15 @@ fn save_with_mode<M: Mapper>(
                 state.saved_page(session.db.save_over_target(), claim_only);
                 Ok(true)
             });
-        if save_result.is_err() {
+        if let Err(error) = &save_result {
+            if let Some(excluded) = error.downcast_ref::<resume::StageExcluded>() {
+                let now = Instant::now();
+                state.resume_excluded.retain(|_, until| *until > now);
+                let until = now + Duration::from_secs(60);
+                for key in &excluded.0 {
+                    state.resume_excluded.insert(key.clone(), until);
+                }
+            }
             if let Some(hold) = session.db.save_failure() {
                 return Err(hold.into());
             }
@@ -1083,7 +1093,7 @@ mod tests;
 // OPS maintenance boundary; routing/import/ACK remain owned by their adapters.
 #[path = "runtime_ops.rs"]
 mod ops;
-pub(in super::super) use ops::before_collection;
+pub(in super::super) use ops::{before_collection, resume_selection_held};
 
 /// Read-only custody seam for growth receipts. Callers doing CAS retain the
 /// checkpoint lock; never acquire it recursively from the save hook.

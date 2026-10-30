@@ -45,9 +45,11 @@ yields to the forced maintenance pause and overdue recovery.
 
 Preparation and every acquisition continuation check maintenance before normal
 collection. After sleep or space recovery, overdue VACUUM plus verified TRUNCATE,
-and any previously failed idle purge, run before collection resumes, overriding retry and successful-run cooldowns.
-If it cannot complete, collection remains paused and debt remains visible;
-previously committed data remains committed. A missing or regressed deletion
+run at the recovery boundary before collection resumes, overriding retry and
+successful-run cooldowns. Recovery has at most two consecutive bounded attempts;
+if they fail, collection continues with debt and the overdue alarm retained,
+and retries resume with pacing. An ordinary failed idle attempt does not arm this
+recovery boundary. Previously committed data remains committed. A missing or regressed deletion
 clock uses the same conservative overdue posture, rather than postponing purge.
 Privacy work precedes optional daily reference verification.
 
@@ -55,8 +57,10 @@ Admission requires available space of at least twice the larger of the main
 file length and the logical database size, including pages still in WAL.
 An additional 1 GiB is reserved; unknown space refuses the attempt. VACUUM has a
 configurable VM work budget (2 seconds minimum, with 20 ms per MiB plus 2 seconds)
-plus the existing bounded busy wait. This is interruptible work, not a hard latency guarantee. A large database can require a larger budget
-to finish. Its WAL may grow approximately with database size; the 64 MiB WAL
+plus the existing bounded busy wait. Failed attempts increase the next work
+allowance geometrically, capped at 60 seconds per attempt. This is interruptible
+work, not a hard latency guarantee. Failures back off inside the remaining deadline;
+overdue retries back off up to five minutes. Debt clears only after success. Its WAL may grow approximately with database size; the 64 MiB WAL
 alarm is not a cap. System SQLite temporary-file behavior and maintenance cost
 still require platform qualification before routing or enabling conversion.
 
@@ -474,7 +478,12 @@ creates no retirement authority. Delivery is not claimed to be exactly once.
 Missing/unbound receipts, identity mismatches, source rollback, corrupted receipts
 and unexpected progress bytes hold the source without quarantine/reset. Counts-only
 `ack_recovery_hold` and `ack_receipt_reconciled` events expose refusal/replay. Receipt
-encoding is capped at 64 MiB; oversize state holds rather than evicting ACKs. Empty v2
+encoding is capped at 64 MiB. Before each POST, conservative admission reserves
+the current progress plus the page's possible ACK, identity, cache, head and refusal
+additions. Serialized progress must fit `(64 MiB - 16 KiB) / 6` (about 10.66 MiB),
+allowing worst-case JSON escaping and receipt controls. Exhaustion is counted as
+`ack_recovery_hold{size_before_upload}` and requests local ACK settlement before any
+remote write; it never evicts accepted shares or cache evidence. Empty v2
 progress remains durable so a missing ledger cannot silently reopen old work.
 
 Before publication, the import owner must seal the proved original progress bytes
@@ -505,6 +514,13 @@ Each steady save publishes its complete dirty delta in one `BEGIN IMMEDIATE` /
 checkpoints and generation advance together. Restart planning, preflight and
 fsynced staging precede BEGIN. The restart owner receives `post_commit` only after
 an unambiguous durable COMMIT; Published/Ambiguous outcomes require reopening.
+
+If restart staging excludes any file, the complete save is discarded and the
+committed graph is reloaded. No acceptance, ACK handoff, rebuild-debt retirement,
+owned-start census or account-window retirement from that attempt is published.
+The route retains excluded keys for a short backoff; the next pass omits them
+before candidate parsing while independent files can commit. Exclusions are
+counted by `v2_resume_stage_excluded`.
 
 The 5,000-mutation / 32 MiB soft target sizes the next collection page. A save over
 target still commits and halves the next page; a collection save under target

@@ -26864,6 +26864,9 @@ impl OwnedSourceScan {
             };
         let mut files = pending_paths
             .into_iter()
+            .filter(|pending| {
+                !state_v2::resume_selection_held(index, &local_index_key(&pending.path))
+            })
             .filter_map(|pending| {
                 candidate_from_traversal_path_with_growth(
                     source,
@@ -27055,6 +27058,7 @@ impl OwnedSourceScan {
                 .unwrap_or_default();
             let missing_family_paths = family_index_keys
                 .into_iter()
+                .filter(|index_key| !state_v2::resume_selection_held(index, index_key))
                 .filter(|index_key| !already_identified.contains(index_key))
                 .filter_map(|index_key| {
                     let path = PathBuf::from(&index_key);

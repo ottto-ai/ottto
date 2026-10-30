@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 // Bound before reading/serializing a companion. Overflow holds this source;
 // it never evicts accepted bodies to make room for another upload.
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PROGRESS_BYTES: u64 = (MAX_BYTES - CONTROL_BYTES) / 6;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -61,9 +62,9 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
     hash.finalize().into()
 }
 fn read(path: &Path) -> Result<Option<Vec<u8>>> {
-    read_limited(path, MAX_BYTES)
+    read_limited(path, MAX_BYTES, false)
 }
-fn read_limited(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
+fn read_limited(path: &Path, limit: u64, original: bool) -> Result<Option<Vec<u8>>> {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
@@ -82,7 +83,7 @@ fn read_limited(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
         meta.is_file()
             && meta.nlink() == 1
             && meta.uid() == unsafe { libc::geteuid() }
-            && meta.mode() & 0o077 == 0,
+            && meta.mode() & if original { 0o022 } else { 0o077 } == 0,
         "permissions",
     )?;
     let mut bytes = Vec::new();
@@ -213,7 +214,7 @@ impl OriginalProgress {
         Ok(original)
     }
     fn read_owned(&self, path: &Path) -> Result<Option<Vec<u8>>> {
-        let bytes = read_limited(path, (MAX_BYTES - CONTROL_BYTES) / 6)?;
+        let bytes = read_limited(path, MAX_PROGRESS_BYTES, true)?;
         if let Some(bytes) = &bytes {
             crate::snapshot_sync::validate_state_v2_original_progress(bytes, &self.namespace)?;
         }
@@ -463,10 +464,7 @@ impl ProgressRecovery {
     }
     fn write(&self, receipt: Receipt) -> Result<()> {
         // JSON escaping costs at most 6x its input, so admit before allocation.
-        require(
-            receipt.progress.len() as u64 <= (MAX_BYTES - CONTROL_BYTES) / 6,
-            "size",
-        )?;
+        require(receipt.progress.len() as u64 <= MAX_PROGRESS_BYTES, "size")?;
         let bytes = serde_json::to_vec(&receipt)?;
         require(bytes.len() as u64 <= MAX_BYTES, "size")?;
         ottto_core::write_owner_only_file_atomic(&self.path, &bytes)?;
@@ -481,7 +479,7 @@ impl ProgressRecovery {
     pub(crate) fn recover(&self, progress_path: &Path) -> Result<()> {
         let receipt = self.receipt()?;
         super::super::sync_checkpoint_parent(&self.path)?;
-        let current = read(progress_path)?;
+        let current = read_limited(progress_path, MAX_PROGRESS_BYTES, true)?;
         if current.as_deref().map(digest) == Some(receipt.digest) {
             // Retry the durability barrier even after a visible failed rename.
             super::super::sync_checkpoint_parent(progress_path)?;
@@ -507,6 +505,12 @@ impl ProgressRecovery {
         Ok(())
     }
 
+    /// A conservative page projection must fit before the remote write. Keep
+    /// the same bound at persistence as defense against unexpected mutation.
+    pub(crate) fn admit_progress_bytes(&self, bytes: u64) -> Result<()> {
+        require(bytes <= MAX_PROGRESS_BYTES, "size_before_upload")
+    }
+
     /// Called inside the existing progress CAS lock, after the exact response
     /// has been validated. Failure creates no index acceptance/retirement.
     pub(crate) fn before_progress_save(&self, previous: Option<&[u8]>, next: &[u8]) -> Result<()> {
@@ -521,7 +525,7 @@ impl ProgressRecovery {
         )?;
         let previous_generation = previous.map(progress_generation).transpose()?.unwrap_or(0);
         let generation = progress_generation(next)?;
-        require(next.len() as u64 <= (MAX_BYTES - CONTROL_BYTES) / 6, "size")?;
+        self.admit_progress_bytes(next.len() as u64)?;
         require(
             previous_generation.checked_add(1) == Some(generation),
             "progress_generation",

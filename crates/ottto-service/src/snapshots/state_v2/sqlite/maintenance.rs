@@ -259,7 +259,13 @@ impl Sqlite {
         let started = Instant::now();
         self.stats.vacuum_attempts = self.stats.vacuum_attempts.saturating_add(1);
 
-        let budget = size_budget(logical.unwrap_or(0), 20).max(self.purge_policy.work);
+        // Interrupted VACUUM restarts from scratch. Increase its work allowance
+        // after failures, with a hard pause bound; never loop until it succeeds.
+        let failures = self.read_control::<u64>("erasure_failures")?.unwrap_or(0);
+        let budget = size_budget(logical.unwrap_or(0), 20)
+            .max(self.purge_policy.work)
+            .saturating_mul(1_u32 << failures.saturating_sub(1).min(5))
+            .min(Duration::from_secs(60));
         let result = limited(self.conn()?, budget, || {
             Ok(self.conn()?.execute_batch("VACUUM")?)
         });
@@ -331,37 +337,72 @@ impl Sqlite {
     pub(in super::super) fn between_cycles(&mut self, quiet: bool) -> Result<()> {
         self.maintain(Some(quiet), false)
     }
-    /// Run before each collection continuation, including the first after sleep
-    /// or disk recovery. Never resume normal collection with overdue debt.
-    pub(in super::super) fn collection_pause_due(&self) -> Result<bool> {
+    /// A failed idle attempt is debt, not a recovery boundary. Only overdue
+    /// startup, a wall/monotonic sleep gap, or recovered space arms recovery.
+    pub(in super::super) fn collection_pause_due(&mut self) -> Result<bool> {
+        let wall = SystemTime::now();
+        let mono = Instant::now();
+        let previous = self.last_collection_check.replace((wall, mono));
         if self.read_control::<u64>("erasure_pending")?.unwrap_or(0) == 0 {
+            self.recovery_attempts_left = 0;
             return Ok(false);
         }
-        if self.read_control::<u64>("erasure_failures")?.unwrap_or(0) != 0 {
-            return Ok(true);
-        }
+        let now = wall.duration_since(UNIX_EPOCH)?.as_secs();
         let age = self
             .read_control::<u64>("erasure_since")?
-            .and_then(|since| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .ok()?
-                    .as_secs()
-                    .checked_sub(since)
-            });
-        Ok(age.map_or(true, |age| {
-            age >= (self.purge_policy.deadline.as_secs() * 5 / 6).min(20 * 3600)
-        }))
+            .and_then(|s| now.checked_sub(s));
+        let overdue = age.map_or(true, |a| a >= self.purge_policy.deadline.as_secs());
+        let woke = previous.map_or(true, |(old_wall, old_mono)| {
+            wall.duration_since(old_wall).map_or(true, |elapsed| {
+                elapsed
+                    > mono
+                        .duration_since(old_mono)
+                        .saturating_add(Duration::from_secs(5))
+            })
+        });
+        let recovered_space = self.stats.free_space_admitted == Some(false)
+            && self
+                .stats
+                .free_space_required_bytes
+                .zip(free_space(&self.path))
+                .is_some_and(|(required, available)| available >= required);
+        if overdue && (woke || recovered_space) {
+            // Bound consecutive recovery pauses even if the engine repeatedly
+            // times out. Debt/alarm remain until a verified purge completes.
+            self.recovery_attempts_left = 2;
+            if recovered_space {
+                self.stats.free_space_admitted = Some(true);
+            }
+        }
+        let pause_due = age.map_or(true, |a| {
+            a >= (self.purge_policy.deadline.as_secs() * 5 / 6).min(20 * 3600)
+        });
+        Ok(self.recovery_attempts_left > 0 || pause_due && self.purge_retry_due(now, age)?)
+    }
+    fn purge_retry_due(&self, now: u64, age: Option<u64>) -> Result<bool> {
+        let failures = self.read_control::<u64>("erasure_failures")?.unwrap_or(0);
+        let remaining = age.and_then(|a| self.purge_policy.deadline.as_secs().checked_sub(a));
+        let retry = Duration::from_secs(match remaining {
+            Some(remaining) if remaining > 0 => retry_seconds(failures).min((remaining / 2).max(1)),
+            _ => retry_seconds(failures).min(300),
+        });
+        let last = self.read_control::<u64>("erasure_attempt")?;
+        let wall_due = last.map_or(true, |s| {
+            now.checked_sub(s).is_some_and(|a| a >= retry.as_secs())
+        });
+        let monotonic_due = self
+            .last_purge_attempt
+            .map_or(true, |s| s.elapsed() >= retry);
+        Ok(wall_due && monotonic_due)
     }
     pub(in super::super) fn before_collection(&mut self) -> Result<()> {
         if !self.collection_pause_due()? {
             return Ok(());
         }
-        self.maintain(Some(false), true)?;
-        if self.stats.erasure_overdue
-            || self.read_control::<u64>("erasure_pending")?.unwrap_or(0) != 0
-                && self.read_control::<u64>("erasure_failures")?.unwrap_or(0) != 0
-        {
+        let recovering = self.recovery_attempts_left > 0;
+        self.recovery_attempts_left = self.recovery_attempts_left.saturating_sub(1);
+        self.maintain(Some(false), recovering)?;
+        if recovering && self.read_control::<u64>("erasure_pending")?.unwrap_or(0) != 0 {
             self.stats.erasure_resume_refusals =
                 self.stats.erasure_resume_refusals.saturating_add(1);
             crate::local_resource_diagnostics::claude_state_v2(&self.stats);
@@ -454,40 +495,23 @@ impl Sqlite {
             super::super::telemetry::event("erasure_deadline_breach", &1);
         }
         self.stats.erasure_overdue = overdue;
-        let last = self.read_control::<u64>("erasure_attempt")?;
         let failures = self.read_control::<u64>("erasure_failures")?.unwrap_or(0);
-        let recovering = resume && failures != 0;
+        let recovering = resume && overdue;
         let success = self.read_control::<u64>("erasure_success")?;
         let success_due =
             success.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 86400));
-        let retry = Duration::from_secs(age.map_or(retry_seconds(failures), |age| {
-            retry_seconds(failures)
-                .min((self.purge_policy.deadline.as_secs().saturating_sub(age) / 2).max(1))
-        }));
-        let wall_due = last.map_or(true, |s| {
-            now.checked_sub(s).is_some_and(|age| age >= retry.as_secs())
-        });
-        let monotonic_due = self
-            .last_purge_attempt
-            .map_or(true, |s| s.elapsed() >= retry);
-        // Only an explicit acquisition pause may VACUUM. Ordinary writes do
-        // not acquire this permission. On recovery, overdue debt overrides the
-        // normal successful-run cadence and failed-attempt backoff: erasure
-        // must precede resuming collection, even just after a failed attempt.
+        // Ordinary failed idle and overdue attempts retain deadline-aware
+        // pacing. Only an actual recovery boundary bypasses that backoff.
+        let retry_due = self.purge_retry_due(now, age)?;
         let deadline = self.purge_policy.deadline.as_secs();
         let early = age.map_or(true, |a| a >= (deadline / 2).min(12 * 3600));
         let pause_due = age.map_or(true, |a| a >= (deadline * 5 / 6).min(20 * 3600));
         let idle = window.is_some();
         let opportunity = window
             .is_some_and(|quiet| overdue || recovering || if quiet { early } else { pause_due });
-        // A forced pause may override successful-run cadence, but ordinary
-        // failures still back off within the remaining deadline. After the
-        // deadline, or when resuming after a failed idle purge, recovery
-        // attempts take precedence over both cooldowns.
-        if pending
-            && opportunity
-            && (overdue || recovering || (success_due || pause_due) && wall_due && monotonic_due)
-        {
+        // Forced pauses override successful-run cadence, never failed-attempt
+        // pacing. Genuine recovery gets a bounded immediate attempt budget.
+        if pending && opportunity && (recovering || (success_due || pause_due) && retry_due) {
             if window == Some(false) {
                 self.stats.maintenance_pauses = self.stats.maintenance_pauses.saturating_add(1);
             }
@@ -589,7 +613,7 @@ impl Sqlite {
         let max_wal = self.logical_bytes()?.max(256 * 1024 * 1024);
         ensure!(
             !self.debt
-                || pending && last.is_some()
+                || pending && self.read_control::<u64>("erasure_attempt")?.is_some()
                 || self.wal_bytes().is_some_and(|b| b < max_wal),
             "state_v2_wal_debt"
         );

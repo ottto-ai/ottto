@@ -8,8 +8,8 @@ pub(in super::super::super) fn before_collection(index: &ScanIndex) -> Result<()
     // Release the session lock before acquiring the checkpoint lock, preserving
     // the established checkpoint -> route -> session ordering.
     let (path, due) = {
-        let guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
-        let session = guard.as_ref().ok_or(Hold::DbUnavailable)?;
+        let mut guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+        let session = guard.as_mut().ok_or(Hold::DbUnavailable)?;
         (session.path.clone(), session.db.collection_pause_due()?)
     };
     if telemetry::sample_cached_graph() {
@@ -57,4 +57,24 @@ pub(in super::super::super) fn before_collection(index: &ScanIndex) -> Result<()
         session.stamp = session.db.stamp()?;
         Ok(())
     }))
+}
+
+/// Hold failed R1 keys before opening/parsing candidates. The route outlives a
+/// discarded session, so reloading cannot lose the short staging backoff.
+pub(in super::super::super) fn resume_selection_held(index: &ScanIndex, key: &str) -> bool {
+    let Some(runtime) = &index.persistence_v2 else {
+        return false;
+    };
+    let result = (|| {
+        let path = {
+            let guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+            guard.as_ref().ok_or(Hold::DbUnavailable)?.path.clone()
+        };
+        with_state(&path, |state| {
+            let now = Instant::now();
+            state.resume_excluded.retain(|_, until| *until > now);
+            Ok(state.resume_excluded.contains_key(key))
+        })
+    })();
+    result.unwrap_or(true)
 }

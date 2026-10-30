@@ -173,7 +173,6 @@ pub(super) fn save_graph(
         ensure!(staging <= reserved, "state_v2_resume_staging_admission");
         pending.preflight_reserved(prev, next, hooks, staging)?;
         pending.check_planned_checkpoints(planned.as_ref())?;
-        pending.retain_excluded(prev, next)?;
         let dirty = kinds_misc::dirty_fields(prev, next)?;
         let mut tx = store.begin(TxnMode::Write)?;
         tx.charge_staging(staging)?;
@@ -230,7 +229,13 @@ pub(super) fn save_graph(
         // No callback or GC on definite rollback, Published or Ambiguous.
         // No speculative encoder metadata survives any failed attempt.
         committed.ambiguous = true;
-        if !published {
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.is::<resume::StageExcluded>())
+        {
+            *next = prev.clone();
+        } else if !published {
             next.generation = prev.generation;
         }
     }

@@ -378,6 +378,112 @@ impl SnapshotUploadProgress {
         Ok(())
     }
 
+    /// Reserve the current ledger plus all possible additions from this page.
+    /// Keeping both predecessor and replacement values bounds mixed ACK and
+    /// refusal responses without evicting accepted shares or cache evidence.
+    pub(super) fn admit_ack_custody<'a, T: Serialize + 'a>(
+        &self,
+        items: impl IntoIterator<Item = &'a T>,
+        fingerprint: &impl Fn(&T) -> &str,
+        body_witness: &impl Fn(&T) -> String,
+    ) -> Result<()> {
+        let Some(recovery) = &self.ack_recovery else {
+            return Ok(());
+        };
+        let mut projected = Self::new(
+            self.destination_namespace_hash.clone(),
+            self.active_quarantine_witness
+                .clone()
+                .context("upload witness missing")?,
+        );
+        projected.accepted_identity_buckets = self.accepted_identity_buckets.clone();
+        let mut deferred = 0;
+        let mut padding = 20_u64; // generation may grow to u64::MAX at save
+        for item in items {
+            deferred += 1;
+            let fp = fingerprint(item);
+            let body = body_witness(item);
+            let value = serde_json::to_value(item)?;
+            if let Some(session) = value
+                .get("source_session_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                let key = cache_session_key(session);
+                if let Some(state) = self.accepted_cache_states.get(&key) {
+                    projected
+                        .accepted_cache_states
+                        .entry(key.clone())
+                        .or_insert_with(|| state.clone());
+                }
+                // Validated returned head tokens are exactly 64 hex bytes.
+                projected.accepted_cache_heads.insert(key, "f".repeat(64));
+            }
+            let before_identity = serde_json::to_value(&projected.accepted_identity_buckets)?;
+            projected.record_cache_state_with_mode(item, false, true)?;
+            let after_identity = serde_json::to_value(&projected.accepted_identity_buckets)?;
+            if let Some(sessions) = after_identity.as_object() {
+                for (key, session) in sessions {
+                    if before_identity.get(key) != Some(session) {
+                        padding = padding.saturating_add(
+                            serde_json::to_vec_pretty(
+                                &serde_json::json!({"accepted_identity_buckets": {key: session}}),
+                            )?
+                            .len() as u64,
+                        );
+                    }
+                }
+            }
+            if let Some(session) = value
+                .get("source_session_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                if let Some(state) = projected
+                    .accepted_cache_states
+                    .get(&cache_session_key(session))
+                {
+                    padding =
+                        padding.saturating_add(serde_json::to_vec_pretty(&serde_json::json!({"accepted_cache_states": {cache_session_key(session): state}}))?.len() as u64);
+                }
+            }
+            if let Some(record) = self.quarantined_fingerprints.get(fp) {
+                projected
+                    .quarantined_fingerprints
+                    .insert(fp.into(), record.clone());
+            }
+            projected.quarantine_permanent_body(
+                fp,
+                &body,
+                reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED,
+            );
+            // Keep the refusal and ACK simultaneously in the projection; the
+            // response can select either, never more than this union.
+            projected.accepted_fingerprints.insert(fp.into());
+            projected.accepted_body_witnesses.insert(fp.into(), body);
+            if let Some(context) = &self.context_resend.active {
+                projected
+                    .accepted_body_contexts
+                    .insert(fp.into(), context.clone());
+            }
+            // Numeric widths, enum variants and map punctuation for all
+            // refusal outcomes are bounded independently of source data.
+            padding = padding.saturating_add(1024);
+        }
+        let mut length = SnapshotPackingLength { bytes: 0 };
+        serde_json::to_writer_pretty(&mut length, self)?;
+        serde_json::to_writer_pretty(&mut length, &projected)?;
+        recovery
+            .admit_progress_bytes((length.bytes as u64).saturating_add(padding))
+            .map_err(|_| {
+                AckSettlementRequired {
+                    retained_ack_count: self.accepted_fingerprints.len(),
+                    retained_stale_ack_count: self.retained_stale_ack_count,
+                    capacity: self.ack_capacity,
+                    deferred_entity_count: deferred,
+                }
+                .into()
+            })
+    }
+
     pub(super) fn admit_ack_batch(&self, new_acks: usize) -> Result<()> {
         if new_acks > 0
             && self.accepted_fingerprints.len().saturating_add(new_acks) > self.ack_capacity

@@ -189,6 +189,11 @@ fn bootstrap_cache_heads_with_budget(
                 // Refusal must leave the in-memory ledger equal to its saved
                 // checkpoint so partial settlement can commit retirement proof.
                 progress.admit_ack_reoffers(probes)?;
+                progress.admit_ack_custody(
+                    probes.iter(),
+                    &|item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
+                    &snapshot_upload_body_witness,
+                )?;
                 for probe in probes {
                     progress
                         .accepted_fingerprints
@@ -2180,6 +2185,15 @@ impl SnapshotUploadProgress {
         item: &T,
         head_changed_without_proof: bool,
     ) -> Result<()> {
+        self.record_cache_state_with_mode(item, head_changed_without_proof, false)
+    }
+
+    fn record_cache_state_with_mode<T: Serialize>(
+        &mut self,
+        item: &T,
+        head_changed_without_proof: bool,
+        preview: bool,
+    ) -> Result<()> {
         let value = serde_json::to_value(item)?;
         let Some(session) = value
             .get("source_session_id")
@@ -2187,7 +2201,11 @@ impl SnapshotUploadProgress {
         else {
             return Ok(());
         };
-        self.accepted_identity_buckets.record(&value);
+        if preview {
+            self.accepted_identity_buckets.preview_record(&value);
+        } else {
+            self.accepted_identity_buckets.record(&value);
+        }
         let key = cache_session_key(session);
         // Count-only legacy ACKs cannot distinguish changed from unchanged.
         // Recover authority through the same bootstrap rather than retaining
@@ -10276,6 +10294,11 @@ where
         })
         .count();
     progress.admit_ack_batch(new_acks)?;
+    progress.admit_ack_custody(
+        indices.iter().map(|index| &items[*index]),
+        fingerprint,
+        body_witness,
+    )?;
     let batch = indices
         .iter()
         .map(|index| items[*index].clone())
@@ -24301,6 +24324,71 @@ mod tests {
     impl Drop for SameSourceAckFixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// [regress] ACK companion admission refuses an oversized future ledger before POST.
+    #[test]
+    fn v2_companion_budget_refuses_before_post_without_changing_custody() {
+        for bootstrap in [false, true] {
+            let mut f = SameSourceAckFixture::new();
+            if bootstrap {
+                let item = &f.items[0];
+                f.progress.record_body(
+                    &item.snapshot_fingerprint,
+                    &snapshot_upload_body_witness(item),
+                );
+            }
+            // Reachable cumulative cache evidence; each record stays below 128 KiB.
+            for n in 0..111 {
+                f.progress.accepted_cache_states.insert(
+                    cache_session_key(&format!("old-{n}")),
+                    serde_json::json!({"observations":[], "value":"x".repeat(100_000)}),
+                );
+            }
+            let remaining = 11_182_000 - serde_json::to_vec_pretty(&f.progress).unwrap().len() - 64;
+            f.progress.accepted_cache_states.insert(
+                cache_session_key("edge"),
+                serde_json::json!({"observations":[], "value":"x".repeat(remaining)}),
+            );
+            f.progress.save(&f.progress_path).unwrap();
+            let bytes = std::fs::read(&f.progress_path).unwrap();
+            let index_bytes = std::fs::read(&f.index_path).unwrap();
+            let recovery = crate::snapshots::ProgressRecovery::synthetic(
+                &f.index_path,
+                &f.progress.destination_namespace_hash,
+                f.baseline.generation,
+            );
+            recovery.admit_progress_bytes(bytes.len() as u64).unwrap();
+            f.progress.ack_recovery = Some(recovery);
+            let before = f.progress.clone();
+            let mut posts = 0;
+            let error = if bootstrap {
+                bootstrap_cache_heads_with_budget(
+                    &f.items[..1],
+                    &unique_poison_scope(),
+                    &mut f.progress,
+                    false,
+                    &mut InplaceRetryBudget::default(),
+                    |items, _| {
+                        posts += 1;
+                        same_source_fixture_ack(items)
+                    },
+                    |progress| progress.save(&f.progress_path),
+                )
+                .unwrap_err()
+            } else {
+                f.send(0, |items| {
+                    posts += 1;
+                    same_source_fixture_ack(items)
+                })
+                .unwrap_err()
+            };
+            assert!(error.is::<ack_retention::AckSettlementRequired>());
+            assert_eq!(posts, 0);
+            assert_eq!(f.progress, before);
+            assert_eq!(std::fs::read(&f.progress_path).unwrap(), bytes);
+            assert_eq!(std::fs::read(&f.index_path).unwrap(), index_bytes);
         }
     }
 
