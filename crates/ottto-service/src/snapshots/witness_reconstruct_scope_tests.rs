@@ -143,6 +143,26 @@ fn rebuild_phase_peak(families: &Families) -> usize {
 
 #[test]
 fn unrelated_witnessed_families_do_not_change_page_family_rebuild() {
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let alone = proven_families("witness-scope-alone", 1);
+    let crowded = proven_families("witness-scope-crowded", 9);
+    let expected = rebuild_first_family(&alone);
+    let actual = rebuild_first_family(&crowded);
+    assert_eq!(
+        actual.usage_accounting_contract.as_deref(),
+        Some("session_exclusive_reported_usage:v1")
+    );
+    assert_eq!(
+        serde_json::to_value(&actual).unwrap(),
+        serde_json::to_value(&expected).unwrap()
+    );
+    let _ = fs::remove_dir_all(&alone.dir);
+    let _ = fs::remove_dir_all(&crowded.dir);
+}
+
+#[test]
+fn terminal_off_on_unrelated_witnessed_families_do_not_change_page_family_rebuild() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
@@ -166,6 +186,38 @@ fn unrelated_witnessed_families_do_not_change_page_family_rebuild() {
 
 #[test]
 fn rebuild_retains_no_copy_of_unrelated_family_rows() {
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let small = proven_families("witness-scope-small", 8);
+    let large = proven_families("witness-scope-large", 32);
+    let small_peak = rebuild_phase_peak(&small);
+    let large_peak = rebuild_phase_peak(&large);
+    let per_family = large_peak.saturating_sub(small_peak) / (32 - 8);
+    let rows = &large.api.evidence[&family_root(31)];
+    let (row_copy, _) = probe::measure(|| {
+        probe::phase_begin();
+        let copy = rows.clone();
+        let peak = probe::phase_peak();
+        drop(copy);
+        peak
+    });
+    writeln!(
+        std::io::stderr().lock(),
+        "witness_reconstruct_scope: requests_per_family={REQUESTS_PER_FAMILY} rebuild_phase_peak_8={small_peak} rebuild_phase_peak_32={large_peak} per_unrelated_family={per_family} one_family_api_row_copy={row_copy} requested_bytes_not_RSS=true"
+    )
+    .unwrap();
+    // Loaded rows, legacy owners and witness fingerprints still scale with the
+    // join. A reconstructed family would also hold a copy of its API rows.
+    assert!(
+        per_family < row_copy,
+        "per unrelated family {per_family} B >= one API-row copy {row_copy} B"
+    );
+    let _ = fs::remove_dir_all(&small.dir);
+    let _ = fs::remove_dir_all(&large.dir);
+}
+
+#[test]
+fn terminal_off_on_rebuild_retains_no_copy_of_unrelated_family_rows() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
@@ -204,6 +256,78 @@ fn rebuild_retains_no_copy_of_unrelated_family_rows() {
 /// removes unrelated witnesses or replaces N-family state with one family.
 #[test]
 fn terminal_proven_rows_preserve_identical_family_state_with_lower_peak() {
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    const FAMILIES: usize = 16;
+    let families = proven_families("terminal-proven-row-scope", FAMILIES);
+    let mut pending_index = families.index.clone();
+    let mut native_page = families.raw.clone();
+    apply_claude_reported_usage_with_index(
+        &mut native_page,
+        &families.api,
+        &families.trace,
+        &mut pending_index,
+        false,
+        WINDOW,
+    );
+    assert_eq!(pending_index.claude_usage_family_pending.len(), FAMILIES);
+
+    let run = |retain_all| {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                RETAIN_ALL_CLAUDE_PROVEN_ROWS_FOR_TEST.with(|flag| flag.set(self.0));
+            }
+        }
+        let previous = RETAIN_ALL_CLAUDE_PROVEN_ROWS_FOR_TEST.with(|flag| flag.replace(retain_all));
+        let _restore = Restore(previous);
+        let mut index = pending_index.clone();
+        let mut page = vec![families.raw[0].clone()];
+        let (disposition, allocation) = probe::measure_caller_thread(|| {
+            apply_claude_reported_usage_with_index(
+                &mut page,
+                &families.api,
+                &families.trace,
+                &mut index,
+                true,
+                WINDOW,
+            )
+        });
+        assert_eq!(index.claude_usage_family_witnesses.len(), FAMILIES);
+        assert_eq!(
+            page[0].usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        (
+            serde_json::to_value(page).unwrap(),
+            serde_json::to_value(index).unwrap(),
+            disposition,
+            allocation.requested_peak_with_overlap,
+        )
+    };
+    let baseline = run(true);
+    let candidate = run(false);
+    assert_eq!(baseline.0, candidate.0, "same-input page body parity");
+    assert_eq!(baseline.1, candidate.1, "entire N-family index, including all witnesses, pending, quarantine, accepted state and debt");
+    assert_eq!(
+        baseline.2, candidate.2,
+        "authority, identity grouping and quarantine disposition parity"
+    );
+    assert!(
+        candidate.3 < baseline.3,
+        "candidate {} must retain less than BASE {} requested bytes",
+        candidate.3,
+        baseline.3
+    );
+    writeln!(std::io::stderr().lock(), "terminal_proven_row_scope: families={FAMILIES} requests_per_family={REQUESTS_PER_FAMILY} base_requested_peak={} candidate_requested_peak={} same_input_full_index_and_body_parity=true all_family_witnesses_retained=true requested_bytes_not_RSS=true", baseline.3, candidate.3).unwrap();
+    let _ = fs::remove_dir_all(&families.dir);
+}
+
+/// Both arms start from the SAME N-family native evidence and complete index.
+/// The BASE arm changes only the test-only row-retention control; it never
+/// removes unrelated witnesses or replaces N-family state with one family.
+#[test]
+fn terminal_off_on_terminal_proven_rows_preserve_identical_family_state_with_lower_peak() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();

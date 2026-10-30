@@ -399,3 +399,249 @@ fn unhealthy_retries_reread_only_unsettled_files() {
         violations.join("\n")
     );
 }
+
+#[test]
+#[serial(source_manifests)]
+fn terminal_off_on_unhealthy_retries_reread_only_unsettled_files() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    if !c1a_layout_supported("unhealthy_retry_reread_acceptance") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = c1a_fixture("unhealthy-retry-reread-acceptance");
+    for session in AT_HEALTHY.iter().chain([&AT_CHANGED]) {
+        std::fs::write(
+            at_path(&fixture, session),
+            rearm_transcript_line(session, None, &format!("req_{session}"), 0),
+        )
+        .expect("write a healthy transcript");
+    }
+    // Every file that stays healthy and unchanged after its first read.
+    let healthy = AT_HEALTHY
+        .iter()
+        .map(|session| session.to_string())
+        .chain(rearm_family_sessions())
+        .chain([C1A_INVALID.to_owned()])
+        .collect::<BTreeSet<_>>();
+
+    let closing = at_window(&fixture, AT_BASE_UNIX_SECONDS);
+    assert!(closing.census_complete, "the first census completes");
+    let replay_deadline = at_saved_u64(
+        &fixture,
+        "/claude_duplicate_fence_next_full_rearm_unix_seconds",
+    )
+    .expect("the closed fence schedules its next full replay");
+
+    let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+    let held_head = c1b_terminal_head(&index);
+    assert!(
+        held_head.is_some(),
+        "the terminal session was accepted once"
+    );
+    index.insert_retry_pending_claude_authority_for_test(REARM_TERMINAL);
+    index.save(&fixture.index_path).unwrap();
+    RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
+    RearmFixture::append(
+        &c1b_terminal_path(&fixture),
+        &rearm_transcript_line(REARM_TERMINAL, None, "req_terminal_2", 1),
+    );
+    // One earlier whole-history trigger: every indexed revision cleared once.
+    c1a_edit_index(&fixture, |saved| {
+        for entry in saved
+            .get_mut("files")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("the saved index has files")
+            .values_mut()
+        {
+            entry["source_file_fingerprint"] = "".into();
+        }
+    });
+    let seeded = at_window(&fixture, AT_BASE_UNIX_SECONDS + 600);
+    assert!(
+        seeded.red && !seeded.census_complete,
+        "the held, red window keeps the census open"
+    );
+    for session in &healthy {
+        assert_eq!(
+            seeded.reads_of(session),
+            1,
+            "{session}: the one whole-history re-read reached it"
+        );
+    }
+    let held = seeded.held.clone().expect("the terminal family is held");
+    assert!(!held.terminal, "RetryPending after the seeded window");
+
+    let mut retries: Vec<AtWindow> = Vec::new();
+    while retries.len() < AT_MAX_RETRIES {
+        let before = retries
+            .iter()
+            .filter(|window| window.ended_unix_seconds < replay_deadline)
+            .count();
+        let after = retries
+            .iter()
+            .filter(|window| window.started_unix_seconds >= replay_deadline)
+            .count();
+        if before >= 4 && after >= 2 {
+            break;
+        }
+        match retries.len() {
+            1 => RearmFixture::append(
+                &at_path(&fixture, AT_CHANGED),
+                &rearm_transcript_line(AT_CHANGED, None, "req_changed_2", 1),
+            ),
+            2 => RearmFixture::append(
+                &c1b_terminal_path(&fixture),
+                &rearm_transcript_line(REARM_TERMINAL, None, "req_terminal_3", 2),
+            ),
+            _ => {}
+        }
+        let next = at_next_start(&fixture, retries.last().unwrap_or(&seeded));
+        retries.push(at_window(&fixture, next));
+    }
+
+    // Preconditions: each is a real terminal-unhealthy retry that ends red
+    // with the census still open, at least four of them before the replay
+    // deadline and two after it.
+    for window in &retries {
+        let start = window
+            .start
+            .as_ref()
+            .unwrap_or_else(|| panic!("{}: a traversal starts", window.at));
+        assert_eq!(start.reason, "terminal_unhealthy_retry", "{}", window.at);
+        assert!(
+            window.red && !window.census_complete,
+            "{}: red, census open",
+            window.at
+        );
+    }
+    assert!(
+        retries
+            .iter()
+            .filter(|window| window.ended_unix_seconds < replay_deadline)
+            .count()
+            >= 4
+            && retries
+                .iter()
+                .filter(|window| window.started_unix_seconds >= replay_deadline)
+                .count()
+                >= 2,
+        "retries straddle the replay deadline {}",
+        at_clock(replay_deadline)
+    );
+
+    // Every violation is collected, so one run names each remaining path.
+    let mut violations = Vec::new();
+    let family = rearm_family_sessions();
+    let changed_retry = &retries[1];
+    // 1. Healthy unchanged files: zero reads at every unhealthy retry.
+    for window in &retries {
+        let reread = |keep: &dyn Fn(&str) -> bool| {
+            window
+                .reads
+                .keys()
+                .filter(|session| healthy.contains(*session) && keep(session.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let witnessed = reread(&|session| family.contains(session));
+        let invalid = reread(&|session| session == C1A_INVALID);
+        let unwitnessed = reread(&|session| AT_HEALTHY.contains(&session));
+        if !(witnessed.is_empty() && invalid.is_empty() && unwitnessed.is_empty()) {
+            violations.push(format!(
+                "{} ({} the replay deadline): an unhealthy retry re-read healthy unchanged \
+                 files: witnessed family {witnessed:?}, unwitnessed {unwitnessed:?}, invalid \
+                 pending {invalid:?} (start {:?})",
+                window.at,
+                if window.started_unix_seconds >= replay_deadline {
+                    "after"
+                } else {
+                    "before"
+                },
+                window.start
+            ));
+        }
+    }
+    // 2. Only unsettled files are read, each at most once a window: the red
+    // producer, the held family, and the changed file after its change.
+    for window in &retries {
+        let mut allowed = BTreeSet::from([REARM_SIBLING.to_owned(), REARM_TERMINAL.to_owned()]);
+        if window.at == changed_retry.at {
+            allowed.insert(AT_CHANGED.to_owned());
+        }
+        for (session, count) in &window.reads {
+            if !allowed.contains(session) && !healthy.contains(session) {
+                violations.push(format!("{}: {session} read at a retry", window.at));
+            }
+            if *count > 1 {
+                violations.push(format!("{}: {session} read {count} times", window.at));
+            }
+        }
+    }
+    // 3. The file that really changed is read once, after its change.
+    let changed = retries
+        .iter()
+        .map(|window| window.reads_of(AT_CHANGED))
+        .collect::<Vec<_>>();
+    let mut expected = vec![0; retries.len()];
+    expected[1] = 1;
+    if changed != expected {
+        violations.push(format!(
+            "the changed file is read once, in the window after its change: {changed:?}"
+        ));
+    }
+    // 4. The held family is retried, at most once a window, and stays held
+    // and disclosed: quarantined, never accepted, census open. Its binding
+    // does not move while its bytes do not.
+    if !retries
+        .iter()
+        .any(|window| window.reads_of(REARM_TERMINAL) > 0)
+    {
+        violations.push("the held family is never retried".to_owned());
+    }
+    for (number, window) in retries.iter().enumerate() {
+        let Some(record) = window.held.as_ref() else {
+            violations.push(format!("{}: the hold is no longer disclosed", window.at));
+            continue;
+        };
+        if window.held_head != held_head {
+            violations.push(format!("{}: the held family was accepted", window.at));
+        }
+        if number < 2
+            && record.member_source_file_fingerprints != held.member_source_file_fingerprints
+        {
+            violations.push(format!(
+                "{}: the unchanged held family lost its binding",
+                window.at
+            ));
+        }
+    }
+    // 5. N3: at most two reads per file over the run (well inside 7 days),
+    // not counting the one read its own change justifies.
+    let total = |session: &str| {
+        [&closing, &seeded]
+            .into_iter()
+            .chain(&retries)
+            .map(|window| window.reads_of(session))
+            .sum::<usize>()
+    };
+    for session in &healthy {
+        if total(session.as_str()) > 2 {
+            violations.push(format!(
+                "N3: {session} read {} times",
+                total(session.as_str())
+            ));
+        }
+    }
+    if total(AT_CHANGED) - changed_retry.reads_of(AT_CHANGED) > 2 {
+        violations.push(format!("N3: {AT_CHANGED} read {} times", total(AT_CHANGED)));
+    }
+    assert!(
+        violations.is_empty(),
+        "{} violation(s):\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
+}

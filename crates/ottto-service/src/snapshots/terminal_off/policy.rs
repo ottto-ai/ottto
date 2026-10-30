@@ -39,8 +39,11 @@ impl ClaudeTerminalOffForTest {
     pub(crate) fn enabled() -> Self {
         Self::set(true)
     }
-    pub(crate) fn disabled() -> Self {
-        Self::set(false)
+    /// The thread's test policy, ignoring any completion-path override.
+    /// Shared fixtures use it to keep main's helper at the default OFF and
+    /// give `terminal_off_on_*` twins the containment version.
+    pub(crate) fn active() -> bool {
+        ENABLED.with(std::cell::Cell::get)
     }
     fn set(enabled: bool) -> Self {
         Self {

@@ -226,6 +226,20 @@ mod tests {
     use super::*;
     #[test]
     fn context_cursor_room_excludes_prior_ordinary_native_bytes() {
+        let mut budget = Budget::new(SnapshotSource::Codex);
+        budget.native_read = 1024;
+        let mut page = sampled_scan::codex_cursor::PageBudget::default();
+        budget.charge_cursor_ordinary(&mut page);
+        let limits = sampled_scan::codex_cursor::Limits::current();
+        page.charge(true, limits.singleton() - 1025);
+        assert!(!page.cursor_exhausted(limits));
+        page.charge(true, 1);
+        assert!(page.cursor_exhausted(limits));
+        budget.charge_cursor_ordinary(&mut page); // charged only once
+    }
+
+    #[test]
+    fn terminal_off_on_context_cursor_room_excludes_prior_ordinary_native_bytes() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let mut budget = Budget::new(SnapshotSource::Codex);

@@ -92,6 +92,117 @@ fn parked_alarms(records: &[serde_json::Value]) -> usize {
 
 #[test]
 fn held_open_failure_backs_off_parks_once_and_keeps_due_owed() {
+    reset_open_backoff_for_test();
+    let root = Root::new("park");
+    let failing = root.key("000-unavailable.jsonl");
+    let healthy = root.key("session.jsonl");
+    let mut index = held_index(&root, &[&failing, &healthy]);
+    index.held_audit_progress = Some(HeldAuditProgress {
+        key: failing.clone(),
+        due: D,
+        attempted: false,
+    });
+
+    // Fixed clock: 1 page, then doubling waits. The healthy key takes the
+    // page's single attempt right after the first failure.
+    let (attempts, alarms) = crate::local_resource_diagnostics::capture(|| {
+        (1..=9)
+            .map(|_| page(&mut index, D, &failing))
+            .collect::<Vec<_>>()
+    });
+    let f = Some(failing.clone());
+    assert_eq!(
+        attempts,
+        vec![
+            f.clone(),
+            Some(healthy.clone()),
+            f.clone(),
+            None,
+            f.clone(),
+            None,
+            None,
+            None,
+            f.clone(),
+        ],
+        "failures 1-4 retry after 1, 2 and 4 pages; the healthy key progressed"
+    );
+    assert_eq!(parked_alarms(&alarms), 0);
+    assert!(!awaits_hold_deadline_restoration(&index, &healthy));
+    // Only the failing key is left: it holds the slot, unqueued, at D.
+    assert_eq!(slot(&index), Some((failing.clone(), D, false)));
+    assert_eq!(held_audit_open_failed(D + 60), (1, 60));
+
+    // Each wait is capped at 6 h: failures 5-8, then the 8th parks, once.
+    let mut now = D;
+    let (attempts, alarms) = crate::local_resource_diagnostics::capture(|| {
+        (0..4)
+            .map(|_| {
+                now += CAP;
+                page(&mut index, now, &failing)
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(attempts, vec![f.clone(); 4]);
+    assert_eq!(parked_alarms(&alarms), 1, "one alarm per park");
+    let alarm = alarms
+        .iter()
+        .find(|record| record["stage"] == "claude_held_audit_open_parked")
+        .unwrap();
+    assert_eq!(alarm["counts"]["held_audit_open_failures"], 8);
+    assert_eq!(alarm["counts"]["held_audit_open_owed_age_seconds"], now - D);
+    assert!(!alarm.to_string().contains("unavailable"), "no path");
+
+    // Parked: no retries, even past the cap; the debt stays owed at D.
+    let (attempts, alarms) = crate::local_resource_diagnostics::capture(|| {
+        (0..4)
+            .map(|_| {
+                now += 4 * CAP;
+                page(&mut index, now, &failing)
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(attempts, vec![None; 4]);
+    assert_eq!(parked_alarms(&alarms), 0);
+    assert_eq!(slot(&index), Some((failing.clone(), D, false)));
+    assert!(awaits_hold_deadline_restoration(&index, &failing));
+    assert_eq!(
+        debt_for_key(&index, &failing, now).map(|debt| debt.due_unix_seconds),
+        Some(D)
+    );
+    let path = root.0.join("index.json");
+    index.save(&path).unwrap();
+    let reloaded = ScanIndex::load(&path).unwrap();
+    assert_eq!(slot(&reloaded), Some((failing.clone(), D, false)));
+    assert_eq!(
+        debt_for_key(&reloaded, &failing, now).map(|debt| debt.due_unix_seconds),
+        Some(D)
+    );
+    let mut index = reloaded;
+
+    // A stat change retries once; a failed retry stays parked, no new alarm.
+    fs::write(&failing, b"{}\n").unwrap();
+    let (attempts, alarms) = crate::local_resource_diagnostics::capture(|| {
+        (0..3)
+            .map(|_| {
+                now += 4 * CAP;
+                page(&mut index, now, &failing)
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(attempts, vec![f.clone(), None, None], "retried once");
+    assert_eq!(parked_alarms(&alarms), 0);
+    assert_eq!(slot(&index), Some((failing.clone(), D, false)));
+
+    // A restart forgets the backoff and retries at the same owed D.
+    reset_open_backoff_for_test();
+    assert_eq!(held_audit_open_failed(now), (0, 0));
+    assert_eq!(page(&mut index, now, ""), f);
+    assert!(!awaits_hold_deadline_restoration(&index, &failing));
+    assert_eq!(held_audit_open_failed(now), (0, 0), "success clears it");
+}
+
+#[test]
+fn terminal_off_on_held_open_failure_backs_off_parks_once_and_keeps_due_owed() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     reset_open_backoff_for_test();
@@ -207,6 +318,39 @@ fn held_open_failure_backs_off_parks_once_and_keeps_due_owed() {
 /// the original D, and the backoff entry is dropped.
 #[test]
 fn held_open_parked_key_stat_change_retries_at_owed_due() {
+    reset_open_backoff_for_test();
+    let root = Root::new("stat");
+    let failing = root.key("held.jsonl");
+    let mut index = held_index(&root, &[&failing]);
+    index.held_audit_progress = Some(HeldAuditProgress {
+        key: failing.clone(),
+        due: D,
+        attempted: false,
+    });
+    let mut now = D;
+    for _ in 0..OPEN_PARK_FAILURES {
+        assert_eq!(
+            page(&mut index, now, &failing).as_deref(),
+            Some(failing.as_str())
+        );
+        now += CAP;
+    }
+    assert_eq!(page(&mut index, now, &failing), None, "parked");
+    fs::write(&failing, b"{}\n").unwrap();
+    let key = schedule_held_audit_progress(&mut index, now).expect("stat change retries");
+    assert_eq!(
+        progress_debt(&index, &key, now).map(|debt| debt.due_unix_seconds),
+        Some(D)
+    );
+    progress_opened(&mut index, &key);
+    assert_eq!(slot(&index), Some((failing.clone(), D, true)));
+    assert_eq!(held_audit_open_failed(now), (0, 0));
+}
+
+/// A parked key's stat change lets its retry succeed: the Full runs with
+/// the original D, and the backoff entry is dropped.
+#[test]
+fn terminal_off_on_held_open_parked_key_stat_change_retries_at_owed_due() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     reset_open_backoff_for_test();
@@ -242,6 +386,33 @@ fn held_open_parked_key_stat_change_retries_at_owed_due() {
 /// converting a backing-off key carries its owed due.
 #[test]
 fn held_open_backoff_due_carries_into_rotation_and_restoration() {
+    reset_open_backoff_for_test();
+    let root = Root::new("carry");
+    let failing = root.key("a.jsonl");
+    let other = root.key("b.jsonl");
+    let mut index = held_index(&root, &[&failing, &other]);
+    index.held_audit_progress = Some(HeldAuditProgress {
+        key: failing.clone(),
+        due: D,
+        attempted: false,
+    });
+    assert_eq!(
+        page(&mut index, D, &failing).as_deref(),
+        Some(failing.as_str())
+    );
+    // The other key inherits the slot's due; it is not later than D.
+    assert_eq!(slot(&index), Some((other.clone(), D, false)));
+    // Capacity opens: the restorer converts the failing key with D, not
+    // now + interval.
+    let mut restored = index.clone();
+    assert_eq!(restore_held_audit_deadlines(&mut restored, D + 100), 1);
+    assert_eq!(restored.files[&failing].unverified_deadline(), Some(D));
+}
+
+/// A blocked key yields the slot to any eligible key, and the restorer
+/// converting a backing-off key carries its owed due.
+#[test]
+fn terminal_off_on_held_open_backoff_due_carries_into_rotation_and_restoration() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     reset_open_backoff_for_test();
@@ -272,6 +443,64 @@ fn held_open_backoff_due_carries_into_rotation_and_restoration() {
 /// turn with its owed due, never later, across a save/reload.
 #[test]
 fn held_open_backoff_overflow_evicts_oldest_and_keeps_its_due_owed() {
+    reset_open_backoff_for_test();
+    let root = Root::new("overflow");
+    let keys = (0..=OPEN_BACKOFF_KEYS)
+        .map(|n| root.key(&format!("k{n:04}.jsonl")))
+        .collect::<Vec<_>>();
+    let mut index = held_index(&root, &keys.iter().map(String::as_str).collect::<Vec<_>>());
+    // Fill the map: k0000 failed first and owes the earliest due.
+    let owed = D - 1_000;
+    with_open_backoff(|backoff| {
+        for (n, key) in keys[..OPEN_BACKOFF_KEYS].iter().enumerate() {
+            let recorded = backoff.record_failure(key, owed + n as u64, D + n as u64);
+            assert!(recorded.evicted.is_none() && recorded.parked.is_none());
+        }
+    });
+    assert_eq!(held_audit_open_failed(D).0, OPEN_BACKOFF_KEYS);
+    assert_eq!(held_audit_open_backoff_evicted(), 0);
+
+    let last = &keys[OPEN_BACKOFF_KEYS];
+    index.held_audit_progress = Some(HeldAuditProgress {
+        key: last.clone(),
+        due: D,
+        attempted: false,
+    });
+    let now = D + 10_000;
+    progress_open_failed(&mut index, last, now);
+    assert_eq!(held_audit_open_backoff_evicted(), 1, "counted");
+    assert_eq!(held_audit_open_failed(now).0, OPEN_BACKOFF_KEYS);
+    assert_eq!(with_open_backoff(|backoff| backoff.owed(&keys[0])), None);
+    assert_eq!(
+        with_open_backoff(|backoff| backoff.owed(last)),
+        Some(D),
+        "the new failure keeps its own due"
+    );
+    // The evicted key's owed due moved into the slot, with it.
+    assert_eq!(slot(&index), Some((keys[0].clone(), owed, false)));
+    assert!(awaits_hold_deadline_restoration(&index, &keys[0]));
+
+    let path = root.0.join("index.json");
+    index.save(&path).unwrap();
+    let mut index = ScanIndex::load(&path).unwrap();
+    assert_eq!(slot(&index), Some((keys[0].clone(), owed, false)));
+    // The next rotation queues it at that due: it may retry, never later.
+    assert_eq!(
+        schedule_held_audit_progress(&mut index, now).as_deref(),
+        Some(keys[0].as_str())
+    );
+    assert_eq!(
+        progress_debt(&index, &keys[0], now).map(|debt| debt.due_unix_seconds),
+        Some(owed)
+    );
+    assert_eq!(held_audit_open_backoff_evicted(), 1);
+}
+
+/// Rule 7 overflow: with 256 failing keys tracked, a 257th failure evicts
+/// the longest-quiet entry (counted). That key may retry: it takes the next
+/// turn with its owed due, never later, across a save/reload.
+#[test]
+fn terminal_off_on_held_open_backoff_overflow_evicts_oldest_and_keeps_its_due_owed() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     reset_open_backoff_for_test();

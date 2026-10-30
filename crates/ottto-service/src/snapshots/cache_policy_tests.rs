@@ -244,6 +244,31 @@ fn cached_scan(
     index: ScanIndex,
     cache: &Arc<sampled_scan::SharedCache>,
 ) -> OwnedSourceScan {
+    if crate::snapshots::ClaudeTerminalOffForTest::active() {
+        return terminal_off_on_cached_scan(fixture, source, index, cache);
+    }
+    OwnedSourceScan::new(
+        source,
+        std::slice::from_ref(&fixture.root),
+        index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        true,
+    )
+    .with_sampled_acquisition(cache.clone(), Scope(NAMESPACE.into()))
+}
+
+fn terminal_off_on_cached_scan(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: &Arc<sampled_scan::SharedCache>,
+) -> OwnedSourceScan {
     OwnedSourceScan::new(
         source,
         std::slice::from_ref(&fixture.root),
@@ -621,6 +646,47 @@ fn tail_beside_full_cache(older_tail: bool, append: fn(&ScanFixture)) -> TailBes
 /// fillers resident 0.
 #[test]
 fn cache_policy_g3_older_candidate_never_evicts_newer_entries() {
+    if unexecuted("G3_priority") {
+        return;
+    }
+    let run = tail_beside_full_cache(true, append_padded_usage);
+    let receipt = format!(
+        "state_bytes={POLICY_STATE_BYTES} resident_before={} tail_zero_budget_steps={} clear_other_active={} clear_entries_released={} insert_entries_evicted={} fillers_after={} tail_retained_after={}",
+        run.resident_before,
+        run.tail.tail_zero_budget_steps,
+        run.counts.clear_other_active,
+        run.counts.clear_entries_released,
+        run.counts.insert_entries_evicted,
+        run.fillers_after,
+        run.tail_retained_after,
+    );
+    eprintln!("CACHE_POLICY test=G3_priority {receipt} {}", run.r0);
+    assert_eq!(
+        wipe_clears(&run.counts),
+        0,
+        "G3: the older candidate's step wiped newer entries; {receipt}"
+    );
+    assert_eq!(
+        run.fillers_after, FILLERS,
+        "G3: an older-mtime candidate evicted a newer entry; {receipt}"
+    );
+}
+
+/// G3, priority (design §5c G3; §3a rank; §2 L1).
+///
+/// A Claude entry ranked older than everything else in the cache (mtime two
+/// days back) is read as a tail beside four newer filler entries that fill
+/// the cache. Its appended long record meets a zero copy budget. That
+/// overflow is the tail's native line buffer; its borrowed state already fit
+/// beside the fillers. Desired: the older candidate evicts no newer entry,
+/// neither at the zero-budget step nor at its re-admission. All four fillers
+/// stay resident and nothing is wiped.
+///
+/// Red on main: the zero budget beside a tail active records
+/// `ClearOtherActive` and clears the cache: `clear_entries_released=4`,
+/// fillers resident 0.
+#[test]
+fn terminal_off_on_cache_policy_g3_older_candidate_never_evicts_newer_entries() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("G3_priority") {
@@ -671,6 +737,66 @@ fn cache_policy_g3_older_candidate_never_evicts_newer_entries() {
 /// filler is gone.
 #[test]
 fn cache_policy_m1_full_cache_tail_at_zero_budget_releases_nothing() {
+    if unexecuted("M1_no_wipe") {
+        return;
+    }
+    let run = tail_beside_full_cache(false, append_padded_usage);
+    let receipt = format!(
+        "state_bytes={POLICY_STATE_BYTES} resident_before={} tail_zero_budget_steps={} clear_other_active={} clear_entries_released={} copy_refusal_entries_evicted={} copy_refusal_admission_evicted={} fillers_after={} tail_retained_after={}",
+        run.resident_before,
+        run.tail.tail_zero_budget_steps,
+        run.counts.clear_other_active,
+        run.counts.clear_entries_released,
+        run.counts.copy_refusal_entries_evicted,
+        run.counts.copy_refusal_admission_evicted,
+        run.fillers_after,
+        run.tail_retained_after,
+    );
+    eprintln!("CACHE_POLICY test=M1_no_wipe {receipt}");
+    assert_eq!(
+        run.counts.clear_other_active, 0,
+        "M1: a tail at a zero copy budget wiped the cache; {receipt}"
+    );
+    assert_eq!(
+        run.counts.clear_entries_released, 0,
+        "M1: released entries beside a cache that was not overflowing; {receipt}"
+    );
+    assert_eq!(
+        run.counts.copy_refusal_entries_evicted, 0,
+        "M1: evicted to fit a cache that was not overflowing; {receipt}"
+    );
+    assert!(
+        run.fillers_after + 2 >= FILLERS,
+        "Path A: more than two older fillers lost; {receipt}"
+    );
+    assert!(
+        run.tail_retained_after,
+        "Path A: the older fillers did not make room for the tail's copy; {receipt}"
+    );
+}
+
+/// M1 test (i), no wipe-all (design §6 row M1; §2 L1), restated for Path A.
+///
+/// A full but not overflowing cache: one retained Claude entry plus four
+/// fillers within the state budget. The Claude file's append (one long record,
+/// then a usage record) reads as a tail and meets a zero copy budget at a step
+/// start. That overflow is the tail's line buffer (16 MiB after the 8 MiB
+/// record), not optional memory. Desired: no wipe-all clear and no
+/// evict-to-fit eviction (`clear_*` 0, `clear_entries_released` 0,
+/// `copy_refusal_entries_evicted` 0).
+///
+/// Path A, the intended behavior (owner-accepted; review §3c): every filler is
+/// older than the tailed file, so that zero-budget step evicts the oldest, in
+/// victim order, until the tail's own copy fits its next step's budget beside
+/// that line buffer. The buffer leaves room for two of the four fillers, so
+/// at most two yield, and the tail is re-retained as main's wipe re-retained
+/// it. Round 1 asserted at most one filler lost; it never re-retained the
+/// tail.
+///
+/// Red on main: `ClearOtherActive` 1 and `clear_entries_released` 4, so every
+/// filler is gone.
+#[test]
+fn terminal_off_on_cache_policy_m1_full_cache_tail_at_zero_budget_releases_nothing() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M1_no_wipe") {
@@ -717,6 +843,33 @@ fn cache_policy_m1_full_cache_tail_at_zero_budget_releases_nothing() {
 /// unchanged. Asserts only that nothing is wiped.
 #[test]
 fn cache_policy_r0_diagnostic_m1_full_cache_tail() {
+    if unexecuted("R0_diag_M1_no_wipe") {
+        return;
+    }
+    let run = tail_beside_full_cache(false, append_padded_usage);
+    let receipt = format!(
+        "state_bytes={POLICY_STATE_BYTES} resident_before={} filler_charge={} tail_zero_budget_steps={} clear_other_active={} clear_entries_released={} copy_refusal_entries_evicted={} copy_refusal_admission_evicted={} insert_entries_evicted={} fillers_after={} tail_retained_after={}",
+        run.resident_before,
+        run.filler_charge,
+        run.tail.tail_zero_budget_steps,
+        run.counts.clear_other_active,
+        run.counts.clear_entries_released,
+        run.counts.copy_refusal_entries_evicted,
+        run.counts.copy_refusal_admission_evicted,
+        run.counts.insert_entries_evicted,
+        run.fillers_after,
+        run.tail_retained_after,
+    );
+    eprintln!("CACHE_POLICY test=R0_diag_M1_no_wipe {receipt} {}", run.r0);
+    assert_eq!(wipe_clears(&run.counts), 0, "a wipe-all clear; {receipt}");
+}
+
+/// Diagnostic, not acceptance (parent ruling 2): M1 (i)'s scenario, with R0's
+/// completion probe and decision in its receipt. The acceptance row is main's
+/// `cache_policy_m1_full_cache_tail_at_zero_budget_releases_nothing`,
+/// unchanged. Asserts only that nothing is wiped.
+#[test]
+fn terminal_off_on_cache_policy_r0_diagnostic_m1_full_cache_tail() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("R0_diag_M1_no_wipe") {
@@ -773,6 +926,79 @@ fn append_growth(tailed: &ScanFixture) {
 /// which pinned two evictions: a release without benefit.
 #[test]
 fn cache_policy_m1_tail_growth_refuses_its_copy_without_eviction() {
+    if unexecuted("M1_tail_growth_refusal") {
+        return;
+    }
+    let run = tail_beside_full_cache(false, append_growth);
+    let refusals = run.counts.retention_bound_refused
+        + run.counts.retention_clone_bound_refused
+        + run.counts.retention_finalization_bound_refused
+        + run.counts.insert_live_reservation_refused
+        + run.counts.insert_entry_bound_refused
+        + run.counts.insert_frozen_charge_refused
+        + run.counts.insert_no_victim_refused;
+    let receipt = format!(
+        "state_bytes={POLICY_STATE_BYTES} resident_before={} filler_charge={} tail_zero_budget_steps={} clear_other_active={} clear_entries_released={} cursor_reservation_entries_evicted={} copy_refusal_entries_evicted={} copy_refusal_admission_evicted={} insert_entries_evicted={} refusals={refusals} fillers_after={} tail_retained_after={} {}",
+        run.resident_before,
+        run.filler_charge,
+        run.tail.tail_zero_budget_steps,
+        run.counts.clear_other_active,
+        run.counts.clear_entries_released,
+        run.counts.cursor_reservation_entries_evicted,
+        run.counts.copy_refusal_entries_evicted,
+        run.counts.copy_refusal_admission_evicted,
+        run.counts.insert_entries_evicted,
+        run.fillers_after,
+        run.tail_retained_after,
+        run.r0,
+    );
+    eprintln!("CACHE_POLICY test=M1_tail_growth_refusal {receipt}");
+    assert_eq!(
+        wipe_clears(&run.counts),
+        0,
+        "M1: a growing tail wiped the cache; {receipt}"
+    );
+    assert_eq!(
+        run.counts.clear_entries_released, 0,
+        "M1: a growing tail cleared entries; {receipt}"
+    );
+    assert_eq!(
+        run.counts.copy_refusal_entries_evicted
+            + run.counts.copy_refusal_admission_evicted
+            + run.counts.cursor_reservation_entries_evicted
+            + run.counts.insert_entries_evicted,
+        0,
+        "M1: a refused copy evicted residents; {receipt}"
+    );
+    assert_eq!(
+        run.fillers_after, FILLERS,
+        "M1: a refused copy did not keep every filler; {receipt}"
+    );
+    assert!(
+        !run.tail_retained_after,
+        "precondition: the grown tail's copy does not fit; {receipt}"
+    );
+    assert!(refusals >= 1, "M1: the refusal was not counted; {receipt}");
+}
+
+/// M1 test (ii), corrected (joint M1 (ii) disposition, Oct 22; StateMissing
+/// sign-off closed).
+///
+/// The same full cache, but the tailed file's append is
+/// `tail_growth_records` ordinary responses: the borrowed tail state grows
+/// past the room the fillers leave, a real overflow of the state budget.
+/// Main refused this copy at `retain_reduction`; R0 before M-a released
+/// fillers and then refused at finalization, an eviction without benefit.
+///
+/// Desired: an optional-copy refusal with zero eviction. No copy is
+/// retained, all `FILLERS` fillers stay, and the refusal is counted. A
+/// release runs only where an owned bound proves the clone, the finished
+/// output and the decode peak fit (M-a), and this growth never does.
+///
+/// Was `cache_policy_m1_tail_growth_releases_at_most_overflow_plus_one_entry`,
+/// which pinned two evictions: a release without benefit.
+#[test]
+fn terminal_off_on_cache_policy_m1_tail_growth_refuses_its_copy_without_eviction() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M1_tail_growth_refusal") {
@@ -836,6 +1062,37 @@ fn cache_policy_m1_tail_growth_refuses_its_copy_without_eviction() {
 /// only that nothing is wiped.
 #[test]
 fn cache_policy_r0_diagnostic_m1_tail_growth() {
+    if unexecuted("R0_diag_M1_tail_growth") {
+        return;
+    }
+    let run = tail_beside_full_cache(false, append_growth);
+    let receipt = format!(
+        "state_bytes={POLICY_STATE_BYTES} resident_before={} filler_charge={} tail_zero_budget_steps={} clear_other_active={} clear_entries_released={} cursor_reservation_entries_evicted={} copy_refusal_entries_evicted={} copy_refusal_admission_evicted={} insert_entries_evicted={} fillers_after={} tail_retained_after={}",
+        run.resident_before,
+        run.filler_charge,
+        run.tail.tail_zero_budget_steps,
+        run.counts.clear_other_active,
+        run.counts.clear_entries_released,
+        run.counts.cursor_reservation_entries_evicted,
+        run.counts.copy_refusal_entries_evicted,
+        run.counts.copy_refusal_admission_evicted,
+        run.counts.insert_entries_evicted,
+        run.fillers_after,
+        run.tail_retained_after,
+    );
+    eprintln!(
+        "CACHE_POLICY test=R0_diag_M1_tail_growth {receipt} {}",
+        run.r0
+    );
+    assert_eq!(wipe_clears(&run.counts), 0, "a wipe-all clear; {receipt}");
+}
+
+/// Diagnostic, not acceptance (parent ruling 2): M1 (ii)'s scenario, with
+/// R0's completion probe and decision in its receipt. The acceptance row is
+/// `cache_policy_m1_tail_growth_refuses_its_copy_without_eviction`. Asserts
+/// only that nothing is wiped.
+#[test]
+fn terminal_off_on_cache_policy_r0_diagnostic_m1_tail_growth() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("R0_diag_M1_tail_growth") {
@@ -949,6 +1206,131 @@ fn measure(resident: Option<usize>, active: Option<usize>) -> sampled_scan::Step
 /// records `ClearOtherActive` and wipes every filler.
 #[test]
 fn cache_policy_m1_refusal_decision_matrix_evicts_the_minimum() {
+    if unexecuted("M1_decision_matrix") {
+        return;
+    }
+    let full = full_cache_with_retained_file(true);
+    let mut scan = tail_active(&full, true);
+    let cache = &full.cache;
+    // Q-PR14 control: the same overflowing measures beside the shape-F tail
+    // release nothing and clear nothing.
+    {
+        let resident =
+            crate::heap_layout_bound::bound(scan.sampling.as_ref().unwrap(), POLICY_STATE_BYTES)
+                .expect("precondition: bounded residents");
+        let room = POLICY_STATE_BYTES - resident;
+        for step in [
+            measure(Some(resident), Some(room + 1)),
+            measure(Some(resident), Some(room + full.filler_charge + 1)),
+            measure(Some(resident), Some(POLICY_STATE_BYTES)),
+            measure(Some(resident), None),
+            measure(None, Some(room + 1)),
+        ] {
+            let (_, counts) = observe(|| {
+                sampled_scan::release_cache_to_fit(
+                    scan.sampling.as_ref(),
+                    scan.active_file.as_deref(),
+                    step,
+                )
+            });
+            assert_eq!(counts, Counts::default(), "shape F {step:?}");
+            assert_eq!(fillers_resident(cache), FILLERS, "shape F {step:?}");
+        }
+    }
+    make_non_f(&mut scan);
+    let measured = || {
+        crate::heap_layout_bound::bound(scan.sampling.as_ref().unwrap(), POLICY_STATE_BYTES)
+            .expect("precondition: bounded residents")
+    };
+    let release = |active: bool, step: sampled_scan::StepMeasure| {
+        observe(|| {
+            sampled_scan::release_cache_to_fit(
+                scan.sampling.as_ref(),
+                scan.active_file.as_deref().filter(|_| active),
+                step,
+            )
+        })
+        .1
+    };
+    // Wipe-all releases and evictions counted as a cursor reservation.
+    let wiped = |counts: &Counts| {
+        wipe_clears(counts)
+            + counts.clear_entries_released
+            + counts.cursor_reservation_entries_evicted
+    };
+    assert_eq!(
+        fillers_resident(cache),
+        FILLERS,
+        "precondition: the fillers"
+    );
+
+    let resident = measured();
+    let room = POLICY_STATE_BYTES - resident;
+    let counts = release(true, measure(Some(resident), Some(room)));
+    assert_eq!(
+        wiped(&counts),
+        0,
+        "(a) a merely full cache released; {counts:?}"
+    );
+    assert_eq!(fillers_resident(cache), FILLERS, "(a)");
+
+    let counts = release(false, measure(Some(resident), None));
+    assert_eq!(wiped(&counts), 0, "(b) no active released; {counts:?}");
+    assert_eq!(fillers_resident(cache), FILLERS, "(b)");
+
+    let counts = release(true, measure(None, Some(room / 2)));
+    assert_eq!(wiped(&counts), 0, "(c) contention released; {counts:?}");
+    assert_eq!(fillers_resident(cache), FILLERS, "(c)");
+
+    let counts = release(true, measure(Some(resident), Some(room + 1)));
+    assert_eq!(wiped(&counts), 0, "(d) an overflow wiped; {counts:?}");
+    assert_eq!(fillers_resident(cache), FILLERS - 1, "(d) not the minimum");
+
+    let resident = measured();
+    let room = POLICY_STATE_BYTES - resident;
+    let counts = release(
+        true,
+        measure(Some(resident), Some(room + full.filler_charge + 1)),
+    );
+    assert_eq!(wiped(&counts), 0, "(e) an overflow wiped; {counts:?}");
+    assert_eq!(fillers_resident(cache), FILLERS - 3, "(e) not the minimum");
+
+    let counts = release(true, measure(Some(measured()), Some(POLICY_STATE_BYTES)));
+    assert_eq!(counts.clear_other_active, 1, "(f) {counts:?}");
+    assert_eq!(counts.clear_entries_released, 1, "(f) {counts:?}");
+    assert_eq!(fillers_resident(cache), 0, "(f)");
+
+    let counts = release(true, measure(Some(measured()), None));
+    assert_eq!(counts.clear_other_active, 1, "(g) {counts:?}");
+    assert_eq!(
+        counts.cursor_reservation_entries_evicted, 0,
+        "(g) {counts:?}"
+    );
+}
+
+/// M1 test (iii), the refusal decision matrix (design §6 row M1; §2 L1-L3).
+///
+/// A sampled tail is active beside four fillers that fill the cache. The
+/// step-start release is called directly with injected step measurements:
+/// - (a) the residents fit beside the active's optional charge (a merely full
+///   cache): nothing is released;
+/// - (b) no active file and a full cache (`ClearNoActive` today): nothing is
+///   released;
+/// - (c) lock contention, an unknown resident: a blocking re-measure finds the
+///   residents bounded and releases nothing;
+/// - (d) a real overflow of one byte evicts exactly one entry, the minimum;
+/// - (e) an overflow of one entry and one byte evicts exactly two;
+/// - (f) an active charge that cannot fit beside even an empty cache, and
+///   (g) an unknown active charge, keep the conservative clear, counted as
+///   `ClearOtherActive`.
+///
+/// No case counts an eviction as a cursor reservation (review F7). The tail
+/// ranks below every filler, so Path A adds no eviction to any case.
+///
+/// Red on main: main ignores the active's charge, so case (a) already
+/// records `ClearOtherActive` and wipes every filler.
+#[test]
+fn terminal_off_on_cache_policy_m1_refusal_decision_matrix_evicts_the_minimum() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M1_decision_matrix") {
@@ -1060,6 +1442,71 @@ fn cache_policy_m1_refusal_decision_matrix_evicts_the_minimum() {
 /// Lands with the fix: the counters do not exist on main.
 #[test]
 fn cache_policy_m1_counts_copy_refusal_releases_by_cause() {
+    if unexecuted("M1_counters") {
+        return;
+    }
+    let full = full_cache_with_retained_file(true);
+    let mut scan = tail_active(&full, true);
+    make_non_f(&mut scan);
+    let context = scan.sampling.as_ref().unwrap();
+    assert!(
+        sampled_scan::context_overhead_covers(context),
+        "the context overhead undercounts the context"
+    );
+    let release = |step: sampled_scan::StepMeasure| {
+        observe(|| {
+            sampled_scan::release_cache_to_fit(Some(context), scan.active_file.as_deref(), step)
+        })
+        .1
+    };
+    let resident = crate::heap_layout_bound::bound(context, POLICY_STATE_BYTES)
+        .expect("precondition: bounded residents");
+    let room = POLICY_STATE_BYTES - resident;
+
+    let counts = release(measure(Some(resident), Some(room)));
+    assert_eq!(
+        (
+            counts.copy_refusal_kept,
+            counts.copy_refusal_remeasured,
+            counts.copy_refusal_entries_evicted,
+            counts.copy_refusal_bytes_released,
+        ),
+        (1, 0, 0, 0),
+        "a merely full cache"
+    );
+
+    let counts = release(measure(None, Some(room / 2)));
+    assert_eq!(
+        (
+            counts.copy_refusal_kept,
+            counts.copy_refusal_remeasured,
+            counts.copy_refusal_entries_evicted,
+        ),
+        (0, 1, 0),
+        "a blocking re-measure"
+    );
+
+    let before = optional_resident(&full.cache);
+    let counts = release(measure(Some(resident), Some(room + 1)));
+    let freed = before - optional_resident(&full.cache);
+    assert_eq!(counts.copy_refusal_entries_evicted, 1, "{counts:?}");
+    assert_eq!(counts.cursor_reservation_entries_evicted, 0, "{counts:?}");
+    assert_eq!(wipe_clears(&counts), 0, "{counts:?}");
+    assert!(
+        counts.copy_refusal_bytes_released > 0
+            && counts.copy_refusal_bytes_released <= freed as u64,
+        "released bytes {} of {freed} freed",
+        counts.copy_refusal_bytes_released
+    );
+}
+
+/// M1 counters (review F7) and the overhead bound the release fits against.
+/// A merely full cache and a blocking re-measure are counted. An overflow's
+/// evictions and charged bytes are counted under the copy refusal, never as a
+/// cursor reservation. `context_overhead` never undercounts `bound(context)`.
+/// Lands with the fix: the counters do not exist on main.
+#[test]
+fn terminal_off_on_cache_policy_m1_counts_copy_refusal_releases_by_cause() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M1_counters") {
@@ -1131,6 +1578,67 @@ fn cache_policy_m1_counts_copy_refusal_releases_by_cause() {
 /// No wipe-all clear; only older entries yield, at most two.
 #[test]
 fn cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full() {
+    if unexecuted("M1_hot_tail") {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let FullCache {
+        cache,
+        tailed,
+        index,
+        resident_before,
+        ..
+    } = full_cache_with_retained_file(false);
+    let ((full_reads, tails, zero_budget_steps), counts) = observe(|| {
+        let mut index = index;
+        let (mut full_reads, mut tails, mut zero_budget_steps) = (0, 0, 0);
+        for pass in 0..HOT_PASSES {
+            append_padded_usage_at(&tailed, 1 + pass);
+            let run = observed_scan(&tailed, source, index, &cache);
+            full_reads += run.modes.0;
+            tails += run.modes.1;
+            zero_budget_steps += run.tail_zero_budget_steps;
+            index = run.index;
+        }
+        (full_reads, tails, zero_budget_steps)
+    });
+    let fillers_after = fillers_resident(&cache);
+    let retained_after = cache.retained_checkpoint(&tailed.key()).is_some();
+    let receipt = format!(
+        "state_bytes={POLICY_STATE_BYTES} resident_before={resident_before} passes={HOT_PASSES} full_reads={full_reads} tails={tails} tail_zero_budget_steps={zero_budget_steps} clear_other_active={} copy_refusal_entries_evicted={} copy_refusal_admission_evicted={} fillers_after={fillers_after} tail_retained_after={retained_after}",
+        counts.clear_other_active,
+        counts.copy_refusal_entries_evicted,
+        counts.copy_refusal_admission_evicted,
+    );
+    eprintln!("CACHE_POLICY test=M1_hot_tail {receipt}");
+    assert!(
+        zero_budget_steps >= 1,
+        "precondition: a tail step meets a zero copy budget; {receipt}"
+    );
+    assert_eq!(
+        full_reads, 0,
+        "Path A: the hot file was read Full; {receipt}"
+    );
+    assert_eq!(tails, HOT_PASSES, "every pass reads a tail; {receipt}");
+    assert_eq!(wipe_clears(&counts), 0, "a wipe-all clear; {receipt}");
+    assert!(
+        fillers_after + 2 >= FILLERS,
+        "Path A: more than two older fillers lost; {receipt}"
+    );
+    assert!(retained_after, "the hot file is not retained; {receipt}");
+}
+
+/// M1 Path A, the hot file (review §3b model, regime B).
+///
+/// One actively tailing session beside `FILLERS` idle entries that fill the
+/// cache and are older than it. On each of `HOT_PASSES` passes it gains an
+/// append whose long record leaves a line buffer that meets a zero copy
+/// budget. Desired: the hot file is read as a tail on every pass and never
+/// `Full`: 0 Full reads, as main's wipe gave. Evict-to-fit alone (round 1)
+/// refused its copy at the first pass and read it `Full` on every later one.
+/// No wipe-all clear; only older entries yield, at most two.
+#[test]
+fn terminal_off_on_cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M1_hot_tail") {
@@ -1189,6 +1697,58 @@ fn cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full() {
 /// unchanged. Asserts only that nothing is wiped.
 #[test]
 fn cache_policy_r0_diagnostic_m1_hot_tail() {
+    if unexecuted("R0_diag_M1_hot_tail") {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let FullCache {
+        cache,
+        tailed,
+        index,
+        resident_before,
+        ..
+    } = full_cache_with_retained_file(false);
+    let ((full_reads, tails, zero_budget_steps), counts) = observe(|| {
+        let mut index = index;
+        let (mut full_reads, mut tails, mut zero_budget_steps) = (0, 0, 0);
+        for pass in 0..HOT_PASSES {
+            append_padded_usage_at(&tailed, 1 + pass);
+            sampled_scan::test_hooks::clear();
+            let run = observed_scan(&tailed, source, index, &cache);
+            eprintln!(
+                "CACHE_POLICY test=R0_diag_M1_hot_tail pass={pass} modes={:?} fillers_after={} probe={:?} decisions={:?}",
+                run.modes,
+                fillers_resident(&cache),
+                sampled_scan::test_hooks::last_probe(),
+                sampled_scan::test_hooks::decisions()
+            );
+            sampled_scan::test_hooks::clear();
+            full_reads += run.modes.0;
+            tails += run.modes.1;
+            zero_budget_steps += run.tail_zero_budget_steps;
+            index = run.index;
+        }
+        (full_reads, tails, zero_budget_steps)
+    });
+    let fillers_after = fillers_resident(&cache);
+    let retained_after = cache.retained_checkpoint(&tailed.key()).is_some();
+    let receipt = format!(
+        "state_bytes={POLICY_STATE_BYTES} resident_before={resident_before} passes={HOT_PASSES} full_reads={full_reads} tails={tails} tail_zero_budget_steps={zero_budget_steps} clear_other_active={} copy_refusal_entries_evicted={} copy_refusal_admission_evicted={} insert_entries_evicted={} fillers_after={fillers_after} tail_retained_after={retained_after}",
+        counts.clear_other_active,
+        counts.copy_refusal_entries_evicted,
+        counts.copy_refusal_admission_evicted,
+        counts.insert_entries_evicted,
+    );
+    eprintln!("CACHE_POLICY test=R0_diag_M1_hot_tail {receipt}");
+    assert_eq!(wipe_clears(&counts), 0, "a wipe-all clear; {receipt}");
+}
+
+/// Diagnostic, not acceptance (parent ruling 2): the hot-file model's
+/// passes, each with R0's completion probe and decision. The acceptance row
+/// is main's `cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full`,
+/// unchanged. Asserts only that nothing is wiped.
+#[test]
+fn terminal_off_on_cache_policy_r0_diagnostic_m1_hot_tail() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("R0_diag_M1_hot_tail") {
@@ -1252,6 +1812,123 @@ fn cache_policy_r0_diagnostic_m1_hot_tail() {
 /// and cleared every filler.
 #[test]
 fn cache_policy_m1_visit_limited_active_evicts_at_most_what_it_needs() {
+    if unexecuted("M1_visit_limit") {
+        return;
+    }
+    let full = full_cache_with_retained_file(true);
+    let mut scan = tail_active(&full, true);
+    make_non_f(&mut scan);
+    let cache = &full.cache;
+    let pad = |scan: &mut OwnedSourceScan, range: std::ops::Range<usize>, bytes: usize| {
+        let active = scan.active_file.as_deref_mut().expect("the tail active");
+        active
+            .parser
+            .accumulator
+            .provider_skills
+            .extend(range.map(|n| format!("visit-{n:05}-{}", "x".repeat(bytes))));
+    };
+    // The production step start: this step's walk, then its release.
+    let step_release = |scan: &mut OwnedSourceScan| {
+        let (budget, step) = scan.sampled_copy_step();
+        let counts = observe(|| {
+            sampled_scan::release_cache_to_fit(
+                scan.sampling.as_ref(),
+                scan.active_file.as_deref(),
+                step,
+            )
+        })
+        .1;
+        (budget, step, counts)
+    };
+    assert_eq!(
+        fillers_resident(cache),
+        FILLERS,
+        "precondition: the fillers"
+    );
+
+    pad(&mut scan, 0..VISIT_PADDING, 0);
+    assert!(
+        crate::heap_layout_bound::bound(scan.active_file.as_deref().unwrap(), usize::MAX).is_none(),
+        "precondition: the per-step walk exceeds the visit cap"
+    );
+    let (budget, step, counts) = step_release(&mut scan);
+    let receipt = format!("budget={budget} step={step:?} counts={counts:?}");
+    eprintln!("CACHE_POLICY test=M1_visit_limit fits {receipt}");
+    assert_eq!(budget, 0, "precondition: a zero copy budget; {receipt}");
+    assert!(
+        step.active.is_some() && step.used.is_none(),
+        "F1: the byte walk's charge, no budget charge; {receipt}"
+    );
+    assert!(
+        step.resident
+            .zip(step.active)
+            .is_some_and(|(resident, active)| resident + active <= POLICY_STATE_BYTES),
+        "precondition: the bytes fit; {receipt}"
+    );
+    assert_eq!(counts.copy_refusal_walk_visit_limit, 1, "{receipt}");
+    assert_eq!(wipe_clears(&counts), 0, "F1: a wipe-all clear; {receipt}");
+    assert_eq!(counts.copy_refusal_entries_evicted, 0, "{receipt}");
+    assert_eq!(fillers_resident(cache), FILLERS, "F1: {receipt}");
+
+    pad(
+        &mut scan,
+        VISIT_PADDING..VISIT_PADDING + OVERFLOW_PADDING,
+        1000,
+    );
+    let (budget, step, counts) = step_release(&mut scan);
+    let receipt = format!(
+        "budget={budget} step={step:?} filler_charge={} counts={counts:?}",
+        full.filler_charge
+    );
+    eprintln!("CACHE_POLICY test=M1_visit_limit overflow {receipt}");
+    let overflow = step
+        .resident
+        .zip(step.active)
+        .map(|(resident, active)| (resident + active).saturating_sub(POLICY_STATE_BYTES));
+    assert!(
+        step.used.is_none()
+            && overflow.is_some_and(|overflow| overflow > 0 && overflow < full.filler_charge),
+        "precondition: a visit-limited overflow below one entry; {receipt}"
+    );
+    assert_eq!(counts.copy_refusal_walk_visit_limit, 1, "{receipt}");
+    assert_eq!(wipe_clears(&counts), 0, "F1: a wipe-all clear; {receipt}");
+    assert_eq!(counts.copy_refusal_entries_evicted, 1, "{receipt}");
+    assert_eq!(fillers_resident(cache), FILLERS - 1, "F1: {receipt}");
+
+    // Q-PR14 control: the same visit-limited overflow beside a shape-F tail
+    // counts the visit limit and releases nothing.
+    make_shape_f(&mut scan);
+    let (_, step, counts) = step_release(&mut scan);
+    let receipt = format!("step={step:?} counts={counts:?}");
+    assert_eq!(counts.copy_refusal_walk_visit_limit, 1, "shape F {receipt}");
+    assert_eq!(wipe_clears(&counts), 0, "shape F {receipt}");
+    assert_eq!(
+        (
+            counts.copy_refusal_entries_evicted,
+            counts.copy_refusal_admission_evicted,
+            counts.clear_entries_released,
+        ),
+        (0, 0, 0),
+        "shape F {receipt}"
+    );
+    assert_eq!(fillers_resident(cache), FILLERS - 1, "shape F {receipt}");
+}
+
+/// M1 F1, the visit cap (brief addendum; review §2).
+///
+/// A sampled tail, ranked below four fillers that fill the cache, whose
+/// per-step walk exceeds the heap walk's 4,096-visit cap: thousands of small
+/// owned strings, as a long Codex tail's usage hours grow. That walk is
+/// refused, so the byte walk (`completed_bound`) supplies the refusal's
+/// charge while the copy budget stays zero; each such step counts
+/// `copy_refusal_walk_visit_limit`. Desired: never a wipe-all clear. Where
+/// the bytes fit, nothing is evicted. Where they overflow by less than one
+/// entry, exactly one entry is evicted and the others survive.
+///
+/// Red at round 1 (66e5315c): the unknown charge recorded `ClearOtherActive`
+/// and cleared every filler.
+#[test]
+fn terminal_off_on_cache_policy_m1_visit_limited_active_evicts_at_most_what_it_needs() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M1_visit_limit") {
@@ -1365,6 +2042,73 @@ fn cache_policy_m1_visit_limited_active_evicts_at_most_what_it_needs() {
 /// exemption never clears for want of a measurement.
 #[test]
 fn cache_policy_m1_exempt_unsampled_read_remeasures_an_unknown_resident() {
+    if unexecuted("M1_exempt_remeasure") {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let (cache, _) = filled_cache();
+    let fixture = ScanFixture::new(source);
+    fixture.append_usage(source, 0..150);
+    let mut scan = cached_scan(&fixture, source, ScanIndex::default(), &cache);
+    scan.sidecar_census_complete = false;
+    for _ in 0..10_000 {
+        if scan.active_file.is_some() {
+            break;
+        }
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete { .. } => panic!("precondition: the file opens"),
+        }
+    }
+    let active = scan
+        .active_file
+        .as_deref()
+        .expect("precondition: the file opens");
+    assert!(
+        active.sampling.is_none()
+            && active.cursor.is_none()
+            && active.group.is_none()
+            && active.aliases.is_empty()
+            && active.applied_receipts.is_empty()
+            && active.parser.reader.acquisition.is_none(),
+        "precondition: an unsampled native read"
+    );
+    let (_, step) = scan.sampled_copy_step();
+    assert!(
+        step.resident.is_some(),
+        "precondition: this step measured the residents"
+    );
+    let step = sampled_scan::StepMeasure {
+        resident: None,
+        ..step
+    };
+    let (_, counts) = observe(|| {
+        sampled_scan::release_cache_to_fit(
+            scan.sampling.as_ref(),
+            scan.active_file.as_deref(),
+            step,
+        )
+    });
+    assert_eq!(counts.copy_refusal_remeasured, 1, "{counts:?}");
+    assert_eq!(
+        wipe_clears(&counts),
+        0,
+        "F4: the exemption cleared; {counts:?}"
+    );
+    assert_eq!(counts.clear_entries_released, 0, "{counts:?}");
+    assert_eq!(counts.copy_refusal_entries_evicted, 0, "{counts:?}");
+    assert_eq!(fillers_resident(&cache), FILLERS);
+}
+
+/// M1 F4, the #654 exemption on the production path.
+///
+/// An unsampled native read (sidecar census incomplete) owns no optimization
+/// state. Its step-start release runs on this step's real measure, with the
+/// resident bound withheld as a contended walk leaves it. Desired: a
+/// blocking re-measure finds the residents bounded and releases nothing; the
+/// exemption never clears for want of a measurement.
+#[test]
+fn terminal_off_on_cache_policy_m1_exempt_unsampled_read_remeasures_an_unknown_resident() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M1_exempt_remeasure") {
@@ -1439,6 +2183,111 @@ fn cache_policy_m1_exempt_unsampled_read_remeasures_an_unknown_resident() {
 ///   entry, and no evict-to-fit (`CopyRefusalEntriesEvicted` 0).
 #[test]
 fn cache_policy_m1_path_a_admits_a_non_f_tail_from_older_entries_only() {
+    if unexecuted("M1_path_a") {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let now = unix_now();
+    let full = full_cache_in(source, false, Some(now - 600));
+    let cache = &full.cache;
+    let newer = ScanFixture::new(source);
+    newer.append(&usage(source, 100, 0, MODEL));
+    newer.set_modified(now - 100);
+    let newer_key = "cache-policy-newer".to_string();
+    let (admitted, counts) = observe(|| {
+        cache
+            .retained()
+            .expect("retained cache lock")
+            .insert(newer_key.clone(), retained_reduction(&newer))
+    });
+    assert!(admitted, "precondition: the newer entry is admitted");
+    assert_eq!(
+        counts.insert_entries_evicted, 0,
+        "precondition: no eviction"
+    );
+    let mut scan = tail_active_at(&full, None);
+    let resident =
+        crate::heap_layout_bound::bound(scan.sampling.as_ref().unwrap(), POLICY_STATE_BYTES)
+            .expect("precondition: bounded residents");
+    let room = POLICY_STATE_BYTES - resident;
+    let charge = 1024;
+    assert!(charge <= room, "precondition: the residents fit the charge");
+    // The residents fit beside `charge`, but the next step's copy room needs
+    // half a filler more than the room left.
+    let step = sampled_scan::StepMeasure {
+        resident: Some(resident),
+        active: Some(charge),
+        used: Some(room + full.filler_charge / 2),
+    };
+    let release = |scan: &OwnedSourceScan| {
+        observe(|| {
+            sampled_scan::release_cache_to_fit(
+                scan.sampling.as_ref(),
+                scan.active_file.as_deref(),
+                step,
+            )
+        })
+        .1
+    };
+    let newer_resident = || cache.retained_checkpoint(&newer_key).is_some();
+    let counts = release(&scan);
+    assert_eq!(counts, Counts::default(), "shape F control");
+    assert_eq!(fillers_resident(cache), FILLERS, "shape F control");
+
+    make_non_f(&mut scan);
+    let set_rank = |scan: &mut OwnedSourceScan, seconds: u64| {
+        let active = scan.active_file.as_deref_mut().expect("the tail active");
+        active.candidate.modified_unix_nanos = seconds * 1_000_000_000;
+    };
+    set_rank(&mut scan, now - 900);
+    let counts = release(&scan);
+    assert_eq!(
+        (
+            counts.copy_refusal_kept,
+            counts.copy_refusal_admission_evicted,
+            counts.copy_refusal_entries_evicted,
+            wipe_clears(&counts),
+        ),
+        (1, 0, 0, 0),
+        "no older entry: fit-or-nothing {counts:?}"
+    );
+    assert_eq!(fillers_resident(cache), FILLERS, "fit-or-nothing");
+
+    set_rank(&mut scan, now - 300);
+    let counts = release(&scan);
+    eprintln!("CACHE_POLICY test=M1_path_a resident={resident} room={room} counts={counts:?}");
+    assert_eq!(
+        (
+            counts.copy_refusal_kept,
+            counts.copy_refusal_admission_evicted,
+            counts.copy_refusal_entries_evicted,
+            counts.cursor_reservation_entries_evicted,
+            wipe_clears(&counts),
+        ),
+        (1, 1, 0, 0, 0),
+        "Path A {counts:?}"
+    );
+    assert_eq!(fillers_resident(cache), FILLERS - 1, "Path A: one filler");
+    assert!(
+        newer_resident(),
+        "Path A: a newer-ranked entry never leaves"
+    );
+}
+
+/// R2-B2, M1 Path A's positive pin on a non-F tail (a comparison target), at
+/// unit level on the decision-matrix fixture. Four fillers ranked older than
+/// the tailed file's current mtime fill the cache; one small entry ranks
+/// above it. One step measure whose residents fit beside the active's
+/// optional charge (`CopyRefusalKept`) but not beside the next step's copy
+/// room (`overhead + used + 2·charge`):
+/// - shape F (the Q-PR14 control), the same measure: nothing evicted;
+/// - non-F, the tailed file ranked below every filler: no older entry can
+///   make the room, so nothing is evicted (fit-or-nothing);
+/// - non-F, ranked between the fillers and the newer entry: Path A evicts
+///   exactly one filler (`CopyRefusalAdmissionEvicted` 1), never the newer
+///   entry, and no evict-to-fit (`CopyRefusalEntriesEvicted` 0).
+#[test]
+fn terminal_off_on_cache_policy_m1_path_a_admits_a_non_f_tail_from_older_entries_only() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M1_path_a") {
@@ -1668,6 +2517,21 @@ fn assert_regime_b_invariants(passes: &[RegimePass], label: &str) {
 /// `|P*| <= |P_C|` or `b_ins ≥ C`.
 #[test]
 fn cache_policy_r0_regime_b_claude_usage_tail_receipt() {
+    if unexecuted("R0_regime_b_claude_usage") {
+        return;
+    }
+    let passes = regime_b_hot(SnapshotSource::ClaudeCode, true, "claude_usage");
+    assert_regime_b_invariants(&passes, "claude usage");
+}
+
+/// Diagnostic, not acceptance (parent ruling 2). Regime B, Claude, usage
+/// appends: the hot-file model with idle fillers ranked below the tailed
+/// file's taken hint, each pass appending a usage record. The outcome is a
+/// receipt only (`CACHE_POLICY test=R0_regime_b_claude_usage`): M-a proves
+/// the release with the tail's measured X_out, so the copy is kept when
+/// `|P*| <= |P_C|` or `b_ins ≥ C`.
+#[test]
+fn terminal_off_on_cache_policy_r0_regime_b_claude_usage_tail_receipt() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("R0_regime_b_claude_usage") {
@@ -1684,6 +2548,21 @@ fn cache_policy_r0_regime_b_claude_usage_tail_receipt() {
 /// pass.
 #[test]
 fn cache_policy_r0_regime_b_claude_ignored_tail_is_retained() {
+    if unexecuted("R0_regime_b_claude_ignored") {
+        return;
+    }
+    let passes = regime_b_hot(SnapshotSource::ClaudeCode, false, "claude_ignored");
+    assert_regime_b_invariants(&passes, "claude ignored");
+    assert_regime_b_retained(&passes, "claude ignored");
+}
+
+/// Diagnostic, not acceptance (parent ruling 2). Regime B, Claude,
+/// ignored-line appends: R0's completion release replaces Path A. Every pass
+/// reads a tail (0 Full), only fillers ranked below the copy's re-admission
+/// rank leave, each by R0's release, and the copy is retained after every
+/// pass.
+#[test]
+fn terminal_off_on_cache_policy_r0_regime_b_claude_ignored_tail_is_retained() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("R0_regime_b_claude_ignored") {
@@ -1699,6 +2578,19 @@ fn cache_policy_r0_regime_b_claude_ignored_tail_is_retained() {
 /// ignored-line tail.
 #[test]
 fn cache_policy_r0_regime_b_codex_tail_is_retained() {
+    if unexecuted("R0_regime_b_codex") {
+        return;
+    }
+    let passes = regime_b_hot(SnapshotSource::Codex, true, "codex_usage");
+    assert_regime_b_invariants(&passes, "codex usage");
+    assert_regime_b_retained(&passes, "codex usage");
+}
+
+/// Diagnostic, not acceptance (parent ruling 2). Regime B, Codex, usage
+/// appends: R0's completion release replaces Path A, as for the Claude
+/// ignored-line tail.
+#[test]
+fn terminal_off_on_cache_policy_r0_regime_b_codex_tail_is_retained() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("R0_regime_b_codex") {
@@ -1966,6 +2858,44 @@ fn assert_no_victims(run: &MaRun, label: &str) {
 /// refused at its pre-release budget and every resident stays.
 #[test]
 fn cache_policy_m_a_unknown_or_overflowing_x_out_releases_nothing() {
+    if unexecuted("M_a_T2") {
+        return;
+    }
+    let now = unix_now();
+    for x_out in [
+        sampled_scan::XOut::Refused,
+        sampled_scan::XOut::Bound(usize::MAX),
+    ] {
+        let run = m_a_tail(
+            SnapshotSource::ClaudeCode,
+            now - OLD_SECONDS,
+            now - 600,
+            &[],
+            x_out,
+            None,
+        );
+        assert_no_victims(&run, &format!("{x_out:?}"));
+        assert!(
+            matches!(
+                run.decisions.as_slice(),
+                [sampled_scan::test_hooks::Decision::Granted { .. }]
+            ),
+            "{x_out:?}: no release is deferred; {}",
+            run.receipt()
+        );
+        assert!(
+            run.resident(&run.tail_key).is_none(),
+            "{x_out:?}: the tail's copy does not fit without a release; {}",
+            run.receipt()
+        );
+    }
+}
+
+/// M-a T2: a Claude completion without an owned X_out (`Refused`), or with
+/// one whose checked arithmetic overflows, releases nothing: the copy is
+/// refused at its pre-release budget and every resident stays.
+#[test]
+fn terminal_off_on_cache_policy_m_a_unknown_or_overflowing_x_out_releases_nothing() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M_a_T2") {
@@ -2131,6 +3061,21 @@ fn m_a_t8(x_out: Option<sampled_scan::XOut>) -> MaRun {
 /// copy is retained. An entry at the copy's rank and a newer one stay.
 #[test]
 fn cache_policy_m_a_provable_fit_releases_exactly_the_copy_only_prefix() {
+    if unexecuted("M_a_T8") {
+        return;
+    }
+    let run = m_a_t8(Some(sampled_scan::XOut::Bound(0)));
+    assert_eq!(run.probe.x_out, Some(0), "{}", run.receipt());
+    assert_exact_prefix_release(&run, "bound-0");
+}
+
+/// M-a T8, the positive provable-fit control, at the policy seam: an X_out
+/// within the clone's bound (`Bound(0)`, so `K' = C`) proves
+/// `|P*| = |P_C|`, so exactly the copy-only prefix of strictly older
+/// fillers leaves (its keys derived from the stored charges, R2-3) and the
+/// copy is retained. An entry at the copy's rank and a newer one stay.
+#[test]
+fn terminal_off_on_cache_policy_m_a_provable_fit_releases_exactly_the_copy_only_prefix() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M_a_T8") {
@@ -2146,6 +3091,20 @@ fn cache_policy_m_a_provable_fit_releases_exactly_the_copy_only_prefix() {
 /// headroom against `expected_victims`' `MARGIN` is about 54 KB (see there).
 #[test]
 fn cache_policy_m_a_measured_x_out_releases_exactly_the_copy_only_prefix() {
+    if unexecuted("M_a_T8_measured") {
+        return;
+    }
+    let run = m_a_t8(None);
+    let x_out = run.probe.x_out.expect("a measured X_out");
+    assert!(x_out > 0, "{}", run.receipt());
+    assert_exact_prefix_release(&run, "measured");
+}
+
+/// T8's measured companion (R2-3): the same fixture proving with the X_out
+/// `x_out_for` measures (no `set_x_out`), as production does. Its X_out
+/// headroom against `expected_victims`' `MARGIN` is about 54 KB (see there).
+#[test]
+fn terminal_off_on_cache_policy_m_a_measured_x_out_releases_exactly_the_copy_only_prefix() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M_a_T8_measured") {
@@ -2170,6 +3129,65 @@ const CHURN_X_OUT: usize = 2_500_000;
 /// no suspended Codex proof), and the refusal is counted.
 #[test]
 fn cache_policy_m_a_churn_bound_refuses_a_finite_x_out() {
+    if unexecuted("M_a_churn") {
+        return;
+    }
+    let now = unix_now();
+    let run = m_a_tail_with(
+        SnapshotSource::ClaudeCode,
+        now - OLD_SECONDS,
+        now - 600,
+        &[],
+        MaOpts {
+            x_out: Some(sampled_scan::XOut::Bound(CHURN_X_OUT)),
+            ..MaOpts::default()
+        },
+    );
+    let receipt = run.receipt();
+    let probe = run.probe;
+    eprintln!(
+        "CACHE_POLICY test=M_a_churn x_out={CHURN_X_OUT} C={:?} peak={:?} A={} remaining={} need_c={:?} need_prime={:?} prefixes={:?} refusals={} cursor_before={} cursor_after={}",
+        probe.clone,
+        probe.peak,
+        probe.a,
+        probe.remaining,
+        probe.need_c,
+        probe.need_prime,
+        probe.prefixes,
+        refusals(&run.counts),
+        run.cursor_before,
+        run.cursor_after,
+    );
+    let (victims, copy_only) = probe.prefixes.expect("the prefixes were measured");
+    assert!(victims > copy_only, "precondition: |P*| > |P_C|; {receipt}");
+    assert_eq!(probe.x_out, Some(CHURN_X_OUT), "{receipt}");
+    assert!(
+        matches!(
+            run.decisions.as_slice(),
+            [sampled_scan::test_hooks::Decision::Granted { .. }]
+        ),
+        "no release is deferred; {receipt}"
+    );
+    assert_no_victims(&run, "churn");
+    assert!(
+        run.resident(&run.tail_key).is_none(),
+        "no copy is retained; {receipt}"
+    );
+    assert_eq!(run.cursor_after, run.cursor_before, "{receipt}");
+    assert!(
+        refusals(&run.counts) >= 1,
+        "the refusal is counted; {receipt}"
+    );
+}
+
+/// M-a churn negative control (fresh-r2 R2-1) at real scale: a finite,
+/// owned X_out whose `need'` takes more victims than the copy alone needs
+/// (`|P*| > |P_C|`, asserted first) releases nothing. No release is
+/// deferred, nothing leaves, no copy is retained, every resident keeps its
+/// rank, the cache's cursor charge is unchanged (this Claude fixture holds
+/// no suspended Codex proof), and the refusal is counted.
+#[test]
+fn terminal_off_on_cache_policy_m_a_churn_bound_refuses_a_finite_x_out() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M_a_churn") {
@@ -2227,6 +3245,26 @@ fn cache_policy_m_a_churn_bound_refuses_a_finite_x_out() {
 /// rank are never victims, so a provable X_out still releases nothing.
 #[test]
 fn cache_policy_m_a_equal_rank_is_never_a_victim() {
+    if unexecuted("M_a_T9_equal") {
+        return;
+    }
+    let tail_modified = unix_now() - 600;
+    let run = m_a_tail(
+        SnapshotSource::ClaudeCode,
+        tail_modified,
+        tail_modified,
+        &[],
+        sampled_scan::XOut::Bound(0),
+        None,
+    );
+    assert_eq!(run.probe.rank, Some((tail_modified as i64, 0)));
+    assert_no_victims(&run, "equal rank");
+}
+
+/// M-a T9 (parent ruling 1), equal rank: fillers stamped at the copy's own
+/// rank are never victims, so a provable X_out still releases nothing.
+#[test]
+fn terminal_off_on_cache_policy_m_a_equal_rank_is_never_a_victim() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M_a_T9_equal") {
@@ -2250,6 +3288,47 @@ fn cache_policy_m_a_equal_rank_is_never_a_victim() {
 /// rank its release ranked residents against.
 #[test]
 fn cache_policy_m_a_future_mtime_is_clipped_once_and_ranks_agree() {
+    if unexecuted("M_a_T9_future") {
+        return;
+    }
+    let now = unix_now();
+    let run = m_a_tail(
+        SnapshotSource::ClaudeCode,
+        now - OLD_SECONDS,
+        now + 3600,
+        &[],
+        sampled_scan::XOut::Bound(0),
+        None,
+    );
+    let receipt = run.receipt();
+    let rank = run.probe.rank.expect("the copy's rank");
+    assert!(
+        rank.0 >= now as i64 && rank < ((now + 3600) as i64, 0),
+        "clipped to the admission clock; {receipt}"
+    );
+    assert!(
+        run.counts.copy_refusal_admission_evicted >= 1,
+        "the release ran; {receipt}"
+    );
+    assert_eq!(
+        run.resident(&run.tail_key),
+        Some(rank),
+        "admitted at the proof's rank, not a later clock; {receipt}"
+    );
+    assert!(
+        run.before
+            .iter()
+            .filter(|(key, _, _)| run.resident(key).is_none())
+            .all(|(_, hint, _)| *hint < rank),
+        "{receipt}"
+    );
+}
+
+/// M-a T9, a future mtime is clipped once, and the rank agrees across
+/// proof, release and insert: the copy is admitted at exactly the clipped
+/// rank its release ranked residents against.
+#[test]
+fn terminal_off_on_cache_policy_m_a_future_mtime_is_clipped_once_and_ranks_agree() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M_a_T9_future") {
@@ -2292,6 +3371,34 @@ fn cache_policy_m_a_future_mtime_is_clipped_once_and_ranks_agree() {
 /// so the stamp gate declines and the deferred release never runs.
 #[test]
 fn cache_policy_m_a_failed_gate_releases_nothing() {
+    if unexecuted("M_a_T9_gate") {
+        return;
+    }
+    let now = unix_now();
+    let tail_modified = now - 600;
+    let run = m_a_tail(
+        SnapshotSource::ClaudeCode,
+        now - OLD_SECONDS,
+        tail_modified,
+        &[],
+        sampled_scan::XOut::Bound(0),
+        Some(tail_modified + 7),
+    );
+    assert!(
+        matches!(
+            run.decisions.as_slice(),
+            [sampled_scan::test_hooks::Decision::Deferred { .. }]
+        ),
+        "precondition: the proof deferred a release; {}",
+        run.receipt()
+    );
+    assert_no_victims(&run, "failed stamp gate");
+}
+
+/// M-a T9, a failed gate mutates nothing: the file changes after the proof,
+/// so the stamp gate declines and the deferred release never runs.
+#[test]
+fn terminal_off_on_cache_policy_m_a_failed_gate_releases_nothing() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M_a_T9_gate") {
@@ -2323,6 +3430,38 @@ fn cache_policy_m_a_failed_gate_releases_nothing() {
 /// proof never runs for it.
 #[test]
 fn cache_policy_m_a_codex_keeps_the_legacy_release() {
+    if unexecuted("M_a_T10") {
+        return;
+    }
+    let now = unix_now();
+    let run = m_a_tail(
+        SnapshotSource::Codex,
+        now - OLD_SECONDS,
+        now - 600,
+        &[],
+        sampled_scan::XOut::Refused,
+        None,
+    );
+    let receipt = run.receipt();
+    assert_eq!(run.probe.x_out, None, "no M-a proof; {receipt}");
+    assert!(
+        matches!(
+            run.decisions.as_slice(),
+            [sampled_scan::test_hooks::Decision::Deferred { .. }]
+        ),
+        "the legacy release is deferred; {receipt}"
+    );
+    assert!(
+        run.counts.copy_refusal_admission_evicted >= 1,
+        "and runs; {receipt}"
+    );
+}
+
+/// M-a T10, Codex's explicit residual (ruling 5): a Codex completion keeps
+/// `K = max(C, F_prev)` and the Q-PR15 guard whatever X_out says; M-a's
+/// proof never runs for it.
+#[test]
+fn terminal_off_on_cache_policy_m_a_codex_keeps_the_legacy_release() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M_a_T10") {
@@ -2379,6 +3518,72 @@ fn u3_identity(tag: &str) -> crate::context_footprint::RepositoryIdentity {
 /// at its rank, the refusal counted.
 #[test]
 fn cache_policy_m_a_cold_repository_identity_releases_nothing() {
+    if unexecuted("M_a_U3_cold") {
+        return;
+    }
+    let now = unix_now();
+    let workspace = unique_workspace("cold");
+    assert_eq!(
+        peek_repository_identity(Path::new(&workspace)),
+        None,
+        "precondition: cold"
+    );
+    let run = m_a_tail_with(
+        SnapshotSource::ClaudeCode,
+        now - OLD_SECONDS,
+        now - 600,
+        &[],
+        MaOpts {
+            workspace: Some(workspace),
+            ..MaOpts::default()
+        },
+    );
+    let receipt = run.receipt();
+    eprintln!(
+        "CACHE_POLICY test=M_a_U3_cold refusals={} items={} {receipt}",
+        refusals(&run.counts),
+        run.snapshots.len()
+    );
+    let [item] = run.snapshots.as_slice() else {
+        panic!("precondition: one finished item; {receipt}");
+    };
+    assert!(
+        item.workspace_hash.is_some(),
+        "precondition: the tail read its workspace; {receipt}"
+    );
+    assert!(
+        run.probe.rank.is_some(),
+        "precondition: a release proof reached X_out; {receipt}"
+    );
+    assert_eq!(
+        run.probe.x_out, None,
+        "a cold identity has no X_out; {receipt}"
+    );
+    assert!(
+        matches!(
+            run.decisions.as_slice(),
+            [sampled_scan::test_hooks::Decision::Granted { .. }]
+        ),
+        "no release is deferred; {receipt}"
+    );
+    assert_no_victims(&run, "cold U3");
+    assert!(
+        run.resident(&run.tail_key).is_none(),
+        "no copy is retained; {receipt}"
+    );
+    assert!(
+        refusals(&run.counts) >= 1,
+        "the refusal is counted; {receipt}"
+    );
+}
+
+/// X_out U3 through the scan (fresh-r2 R2-2, fresh-r1 N2), cold: the tail's
+/// append first names its workspace (`cwd`), whose repository identity is
+/// not in the cache, so `x_out_for` measures no X_out (no `set_x_out`) and
+/// the release proof refuses: zero victims, no copy retained, every filler
+/// at its rank, the refusal counted.
+#[test]
+fn terminal_off_on_cache_policy_m_a_cold_repository_identity_releases_nothing() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M_a_U3_cold") {
@@ -2447,6 +3652,84 @@ fn cache_policy_m_a_cold_repository_identity_releases_nothing() {
 /// not a re-resolved or re-read one.
 #[test]
 fn cache_policy_m_a_warm_repository_identity_is_the_finished_one() {
+    if unexecuted("M_a_U3_warm") {
+        return;
+    }
+    let now = unix_now();
+    let workspace = unique_workspace("warm");
+    let path = PathBuf::from(&workspace);
+    repository_identity_cache()
+        .lock()
+        .unwrap()
+        .insert(path.clone(), (SystemTime::now(), u3_identity("warm")));
+    let replace = path.clone();
+    let run = m_a_tail_with(
+        SnapshotSource::ClaudeCode,
+        now - OLD_SECONDS,
+        now - 600,
+        &[],
+        MaOpts {
+            workspace: Some(workspace),
+            after_retain: Some(Box::new(move || {
+                repository_identity_cache().lock().unwrap().insert(
+                    replace.clone(),
+                    (SystemTime::now(), u3_identity("replaced")),
+                );
+            })),
+            ..MaOpts::default()
+        },
+    );
+    let receipt = run.receipt();
+    let [item] = run.snapshots.as_slice() else {
+        panic!("precondition: one finished item; {receipt}");
+    };
+    eprintln!(
+        "CACHE_POLICY test=M_a_U3_warm repository_hash={:?} cache_after={:?} {receipt}",
+        item.repository_hash,
+        peek_repository_identity(&path).and_then(|identity| identity.repository_hash),
+    );
+    assert!(
+        run.probe.x_out.is_some(),
+        "a warm identity proves with a measured X_out; {receipt}"
+    );
+    assert!(
+        matches!(
+            run.decisions.as_slice(),
+            [sampled_scan::test_hooks::Decision::Deferred { .. }]
+        ),
+        "the release is deferred; {receipt}"
+    );
+    assert!(
+        run.counts.copy_refusal_admission_evicted >= 1,
+        "and runs; {receipt}"
+    );
+    assert_eq!(
+        run.resident(&run.tail_key),
+        run.probe.rank,
+        "the copy is retained; {receipt}"
+    );
+    assert_eq!(
+        peek_repository_identity(&path),
+        Some(u3_identity("replaced")),
+        "precondition: the entry was replaced between proof and finish"
+    );
+    assert_eq!(
+        (
+            item.repository_hash.as_deref(),
+            item.repository_label.as_deref()
+        ),
+        (Some("hash-warm"), Some("label-warm")),
+        "the item carries the peeked identity; {receipt}"
+    );
+}
+
+/// X_out U3 through the scan, warm: the identity peeked for X_out is the one
+/// the finished item carries. The release runs on the measured X_out; the
+/// cache entry is then replaced between the proof and `finish`
+/// (`Point::AfterRetain`), and the item still carries the peeked identity,
+/// not a re-resolved or re-read one.
+#[test]
+fn terminal_off_on_cache_policy_m_a_warm_repository_identity_is_the_finished_one() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M_a_U3_warm") {
@@ -2526,6 +3809,55 @@ fn cache_policy_m_a_warm_repository_identity_is_the_finished_one() {
 /// release. T10 keeps the positive row (`F_prev < C`).
 #[test]
 fn cache_policy_m_a_codex_finalization_guard_releases_nothing() {
+    if unexecuted("M_a_T10_guard") {
+        return;
+    }
+    const F_PREV: usize = 1_000_000;
+    let now = unix_now();
+    let run = m_a_tail_with(
+        SnapshotSource::Codex,
+        now - OLD_SECONDS,
+        now - 600,
+        &[],
+        MaOpts {
+            x_out: Some(sampled_scan::XOut::Refused),
+            finalization_prev: Some(F_PREV),
+            codex_usage: true,
+            ..MaOpts::default()
+        },
+    );
+    let receipt = run.receipt();
+    let probe = run.probe;
+    assert_eq!(probe.finalization_prev, F_PREV, "precondition: {receipt}");
+    assert!(
+        probe.clone.is_some_and(|clone| clone < F_PREV),
+        "precondition: F_prev > C; {receipt}"
+    );
+    assert!(
+        probe.need.is_some_and(|need| need > 0),
+        "precondition: release pressure; {receipt}"
+    );
+    assert_eq!(probe.x_out, None, "no M-a proof; {receipt}");
+    assert!(
+        probe.finalization_guard,
+        "the guard branch was reached; {receipt}"
+    );
+    assert!(
+        matches!(
+            run.decisions.as_slice(),
+            [sampled_scan::test_hooks::Decision::Granted { .. }]
+        ),
+        "no release is deferred; {receipt}"
+    );
+    assert_no_victims(&run, "codex guard");
+}
+
+/// M-a T10's refusal arm (fresh-r2 R2-4): a Codex completion whose
+/// `F_prev` exceeds its clone's bound and whose read added usage meets
+/// Q-PR15's guard under release pressure: zero victims and no deferred
+/// release. T10 keeps the positive row (`F_prev < C`).
+#[test]
+fn terminal_off_on_cache_policy_m_a_codex_finalization_guard_releases_nothing() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if unexecuted("M_a_T10_guard") {

@@ -223,7 +223,81 @@ fn bare_builders_and_missing_object_identity_do_not_publish() {
 }
 
 #[test]
+fn terminal_off_on_bare_builders_and_missing_object_identity_do_not_publish() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+    let f = fixture();
+    let projection = feed(&f);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut scan = cached_scan(
+        &f,
+        SnapshotSource::Codex,
+        ScanIndex::default(),
+        &cache,
+        |s| {
+            assert!(
+                s.codex_versions.is_none(),
+                "one-shot and bare constructors opt out"
+            )
+        },
+    );
+    scan.codex_versions = Some(projection.clone());
+    let mut scan = step_until(scan, |s| s.active_file.is_some());
+    let active = scan.active_file.as_deref_mut().unwrap();
+    active.candidate.physical_identity = None;
+    while let OwnedSourceScanStep::Pending(next) = scan.step(None) {
+        scan = next;
+    }
+    assert!(
+        projection.snapshot().0.is_none(),
+        "no version without Unix identity"
+    );
+    assert_eq!(projection.snapshot().2, 1);
+}
+
+#[test]
 fn shared_role_gate_excludes_comparison_side_and_other_sources() {
+    let f = fixture();
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut scan = step_until(
+        cached_scan(
+            &f,
+            SnapshotSource::Codex,
+            ScanIndex::default(),
+            &cache,
+            |_| {},
+        ),
+        |s| s.active_file.is_some(),
+    );
+    let active = scan.active_file.as_deref_mut().unwrap();
+    assert!(active.is_primary_for(SnapshotSource::Codex));
+    assert!(!active.is_primary_for(SnapshotSource::ClaudeCode));
+    active.comparison_target = true;
+    assert!(!active.is_primary_for(SnapshotSource::Codex));
+    active.comparison_target = false;
+    active.side_origin = Some(SideOrigin {
+        guard: crate::local_resource_diagnostics::codex_side_lifecycle::SideReadGuard::start(1),
+        dev_ino: (0, 0),
+    });
+    assert!(!active.is_primary_for(SnapshotSource::Codex));
+    active.side_origin.take().unwrap().end();
+    assert!(active.is_primary_for(SnapshotSource::Codex));
+    // The publication itself can borrow a held accumulator while I/O is denied.
+    while !active.parser.step().unwrap() {}
+    let projection = feed(&f);
+    with_transcript_io_denied(|| projection.observe(active));
+    #[cfg(unix)]
+    assert_eq!(projection.snapshot().0.unwrap().version(), Some("0.148.9"));
+    with_transcript_io_denied(|| {
+        assert!(open_candidate_file(SnapshotSource::Codex, &mut active.candidate.clone()).is_err());
+        assert!(active.parser.step().is_err());
+    });
+}
+
+#[test]
+fn terminal_off_on_shared_role_gate_excludes_comparison_side_and_other_sources() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = fixture();
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut scan = step_until(

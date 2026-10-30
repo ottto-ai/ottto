@@ -2190,6 +2190,25 @@ mod cache_lifecycle_tests {
 
     #[test]
     fn cache_lifecycle_poisoned_lock_is_not_reported_as_absent() {
+        let cache = SharedCache::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.inner.lock().unwrap();
+            panic!("synthetic cache lock poison");
+        }));
+        assert!(result.is_err());
+        let (_, counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+            assert!(cache.take("synthetic").is_none());
+            cache.clear();
+        });
+        assert_eq!(counts.take_poisoned_lock, 1);
+        assert_eq!(counts.take_absent, 0);
+        assert_eq!(counts.take_hit, 0);
+        assert_eq!(counts.clear_poisoned_lock, 1);
+        assert_eq!(counts.clear_entries_released, 0);
+    }
+
+    #[test]
+    fn terminal_off_on_cache_lifecycle_poisoned_lock_is_not_reported_as_absent() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let cache = SharedCache::default();

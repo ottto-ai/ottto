@@ -66,6 +66,52 @@ impl E2ScanFixture {
         births: &BTreeMap<PathBuf, i128>,
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return self.terminal_off_on_scan(roots, support, index, limit, sampled, births, hints);
+        }
+        self.observed.lock().unwrap().clear();
+        let mut scan = OwnedSourceScan::new_with_identity_capture(
+            SnapshotSource::ClaudeCode,
+            roots,
+            index,
+            "2026-08-02T08:00:00Z",
+            183,
+            limit,
+            false,
+            Some(support),
+            hints,
+            false,
+            true,
+            CLAUDE_IDENTITY_CAPTURE,
+        );
+        if sampled {
+            let (scope, _) = durable_binding(SnapshotSource::ClaudeCode);
+            scan = scan.with_sampled_acquisition(self.cache.clone(), scope);
+        }
+        // The same synthetic root births reach the page's staged twin probes,
+        // which read metadata before the file is opened for parse.
+        let staged = births
+            .iter()
+            .filter(|(path, _)| {
+                claude_index_path_member_ref(path)
+                    .is_some_and(|member| member.subagent_stem.is_none())
+            })
+            .filter_map(|(path, birth)| Some((local_index_key(path), u64::try_from(*birth).ok()?)))
+            .collect();
+        claude_history_upgrade::with_staged_births_for_test(staged, || self.drive(scan, births))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn terminal_off_on_scan(
+        &self,
+        roots: &[PathBuf],
+        support: &Path,
+        index: ScanIndex,
+        limit: usize,
+        sampled: bool,
+        births: &BTreeMap<PathBuf, i128>,
+        hints: &[PathBuf],
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
         self.observed.lock().unwrap().clear();
         let relist = hints.is_empty() && index.scan_traversal_exhausted_for_test();
         let mut scan = OwnedSourceScan::new_with_identity_capture(

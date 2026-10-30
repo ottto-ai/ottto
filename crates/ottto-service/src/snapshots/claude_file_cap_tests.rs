@@ -101,6 +101,64 @@ fn assert_native(scan: &SourceScanResult, requests: u64) {
 
 #[test]
 fn oversized_claude_shrink_then_grow_keeps_unread_content_unproven() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    let mut file = File::create(&path).unwrap();
+    let valid_size = write_row(&mut file, &usage(0));
+    file.set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1).unwrap();
+    drop(file);
+    let key = local_index_key(&path);
+    let mut index = ScanIndex::default();
+    let skipped = fixture.scan(SnapshotSource::ClaudeCode, &mut index, 9);
+    assert_eq!(skipped.oversized_file_count, 1);
+    assert_eq!(skipped.scanned_file_count, 0);
+    assert!(skipped.snapshots.is_empty());
+    assert!(!skipped.census_complete);
+    assert!(
+        !index.files.contains_key(&key),
+        "no proof before native read"
+    );
+    assert!(!index.file_snapshot_fingerprints.contains_key(&key));
+
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(valid_size)
+        .unwrap();
+    let mut admitted = fixture.scan(SnapshotSource::ClaudeCode, &mut index, 11);
+    assert_native(&admitted, 1);
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut admitted, &mut index);
+    let prior = index.files[&key].source_file_fingerprint.clone();
+    assert!(!prior.is_empty());
+
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1)
+        .unwrap();
+    let grown = fixture.scan(SnapshotSource::ClaudeCode, &mut index, 13);
+    assert_eq!(grown.oversized_file_count, 1);
+    assert_eq!(grown.scanned_file_count, 0);
+    assert!(grown.snapshots.is_empty());
+    assert!(!grown.census_complete);
+    assert_eq!(
+        index.files[&key].source_file_fingerprint, prior,
+        "oversized content cannot replace prior read authority"
+    );
+
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(valid_size)
+        .unwrap();
+    assert_native(&fixture.scan(SnapshotSource::ClaudeCode, &mut index, 15), 1);
+}
+
+#[test]
+fn terminal_off_on_oversized_claude_shrink_then_grow_keeps_unread_content_unproven() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
@@ -162,6 +220,44 @@ fn oversized_claude_shrink_then_grow_keeps_unread_content_unproven() {
 
 #[test]
 fn each_source_admits_its_exact_file_cap_and_refuses_one_more_byte() {
+    for (source, limit) in [
+        (SnapshotSource::ClaudeCode, 512 * MIB),
+        (SnapshotSource::Pi, 256 * MIB),
+        (SnapshotSource::Codex, 2048 * MIB),
+    ] {
+        let fixture = Fixture::new();
+        let file = File::create(fixture.path()).unwrap();
+        for (bytes, admitted) in [(limit, true), (limit + 1, false)] {
+            file.set_len(bytes).unwrap();
+            let opened =
+                opened_object_identity_and_stat(source, &mut File::open(fixture.path()).unwrap());
+            assert_eq!(opened.is_ok(), admitted, "opened {source:?} at {bytes}");
+            let mut census = ScanCensus::default();
+            let candidate = candidate_from_traversal_path(
+                source,
+                ScanTraversalPath {
+                    scan_root: fixture.0.clone(),
+                    path: fixture.path(),
+                    census_member: true,
+                    watcher_hint: false,
+                },
+                &mut census,
+                None,
+                BACKFILL_WINDOW_DAYS,
+                &BTreeMap::new(),
+            );
+            assert_eq!(candidate.is_some(), admitted, "{source:?} at {bytes}");
+            assert_eq!(census.oversized_file_count, usize::from(!admitted));
+            if let Some(candidate) = candidate {
+                assert_eq!(candidate.size_bytes, limit);
+            }
+        }
+    }
+    assert_eq!(MAX_JSONL_LINE_BYTES, 16 * 1024 * 1024);
+}
+
+#[test]
+fn terminal_off_on_each_source_admits_its_exact_file_cap_and_refuses_one_more_byte() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     for (source, limit) in [
@@ -202,6 +298,48 @@ fn each_source_admits_its_exact_file_cap_and_refuses_one_more_byte() {
 
 #[test]
 fn three_hundred_mib_admission_is_claude_only() {
+    let fixture = Fixture::new();
+    File::create(fixture.path())
+        .unwrap()
+        .set_len(300 * MIB)
+        .unwrap();
+    for (source, admitted) in [
+        (SnapshotSource::ClaudeCode, true),
+        (SnapshotSource::Pi, false),
+    ] {
+        let mut census = ScanCensus::default();
+        let candidate = candidate_from_traversal_path(
+            source,
+            ScanTraversalPath {
+                scan_root: fixture.0.clone(),
+                path: fixture.path(),
+                census_member: true,
+                watcher_hint: false,
+            },
+            &mut census,
+            None,
+            BACKFILL_WINDOW_DAYS,
+            &BTreeMap::new(),
+        );
+        assert_eq!(candidate.is_some(), admitted);
+        assert_eq!(census.oversized_file_count, usize::from(!admitted));
+        assert_eq!(
+            opened_object_identity_and_stat(source, &mut File::open(fixture.path()).unwrap())
+                .is_ok(),
+            admitted
+        );
+    }
+    let mut index = ScanIndex::default();
+    let scan = fixture.scan(SnapshotSource::Pi, &mut index, 9);
+    assert_eq!(scan.oversized_file_count, 1);
+    assert_eq!(scan.scanned_file_count, 0);
+    assert!(scan.snapshots.is_empty());
+    assert!(!scan.census_complete);
+    assert!(index.files.is_empty());
+}
+
+#[test]
+fn terminal_off_on_three_hundred_mib_admission_is_claude_only() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let fixture = Fixture::new();
@@ -337,6 +475,48 @@ fn measured_child(root: PathBuf, requests: u64, bytes: u64) {
 #[cfg(target_os = "macos")]
 #[test]
 fn large_claude_native_memory() {
+    if let Some(root) = std::env::var_os(CHILD) {
+        measured_child(
+            root.into(),
+            std::env::var("OTTTO_CLAUDE_CAP_REQUESTS")
+                .unwrap()
+                .parse()
+                .unwrap(),
+            std::env::var("OTTTO_CLAUDE_CAP_BYTES")
+                .unwrap()
+                .parse()
+                .unwrap(),
+        );
+        return;
+    }
+    let mib = 500;
+    let fixture = Fixture::new();
+    let (bytes, requests) = write_mixed(&fixture, mib * MIB);
+    assert!(bytes >= mib * MIB && bytes < (mib + 1) * MIB);
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD, &fixture.0)
+        .env("OTTTO_CLAUDE_CAP_REQUESTS", requests.to_string())
+        .env("OTTTO_CLAUDE_CAP_BYTES", bytes.to_string())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(child.stdout).unwrap();
+    assert!(
+        child.status.success(),
+        "memory child failed: {stdout}\n{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let lines = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(RECEIPT))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "one actual native measurement per child");
+    println!("{RECEIPT}{}", lines[0]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn terminal_off_on_large_claude_native_memory() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if let Some(root) = std::env::var_os(CHILD) {

@@ -142,6 +142,73 @@ fn raw_scan_capturing(
     identity_capture: bool,
     mut after_start: impl FnMut(&mut OwnedSourceScan),
 ) -> Run {
+    if crate::snapshots::ClaudeTerminalOffForTest::active() {
+        return terminal_off_on_raw_scan_capturing(
+            fixture,
+            index,
+            cache,
+            identity_capture,
+            after_start,
+        );
+    }
+    let mut scan = OwnedSourceScan::new_with_identity_capture(
+        SOURCE,
+        std::slice::from_ref(&fixture.dir),
+        index,
+        COLLECTED,
+        BACKFILL_WINDOW_DAYS,
+        100,
+        false,
+        Some(&fixture.support),
+        &[],
+        false,
+        true,
+        identity_capture,
+    );
+    if let Some(cache) = cache {
+        scan = scan.with_sampled_acquisition(cache, Scope("sidecar-fixture".into()));
+    }
+    let mut injected = false;
+    // These fixtures contain at most three transcripts and four requests.
+    // Bound only the test driver so a scanner livelock fails explicitly.
+    let mut steps = 0;
+    loop {
+        steps += 1;
+        assert!(steps <= 10_000, "small synthetic scan did not complete");
+        if !injected && scan.active_file.is_some() {
+            injected = true;
+            after_start(&mut scan);
+        }
+        let (modes, reasons, native_bytes) =
+            scan.sampling.as_ref().map_or(((0, 0, 0), [0; 11], 0), |c| {
+                (
+                    (c.full_files, c.tail_files, c.unchanged_files),
+                    c.full_reasons,
+                    c.native_bytes,
+                )
+            });
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete { index, scan, .. } => {
+                return Run {
+                    index,
+                    result: scan,
+                    modes,
+                    reasons,
+                    native_bytes,
+                }
+            }
+        }
+    }
+}
+
+fn terminal_off_on_raw_scan_capturing(
+    fixture: &Fixture,
+    index: ScanIndex,
+    cache: Option<Arc<SharedCache>>,
+    identity_capture: bool,
+    mut after_start: impl FnMut(&mut OwnedSourceScan),
+) -> Run {
     // Each call compares a deliberately serviced native-reader page with a
     // cold Full oracle. Expire metadata cadence explicitly; these controls
     // exercise identity, reuse and exact bodies, not idle tick scheduling.
@@ -380,6 +447,43 @@ fn assert_layout_mode(actual: (usize, usize, usize), reuse: (usize, usize, usize
 
 #[test]
 fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let f = Fixture::new(2);
+    let cache = Arc::new(SharedCache::default());
+    let prior = seed_predecessor(&f, &cache);
+    f.evidence(2); // Includes req_1 from before the latest transcript response.
+    let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
+    assert_layout_mode(cached.modes, (0, 0, 1));
+    assert_eq!(
+        cached.native_bytes,
+        if crate::heap_layout_bound::layout_supported() {
+            0
+        } else {
+            fs::metadata(&f.path).unwrap().len()
+        }
+    );
+    assert!(!cached.result.snapshots.is_empty());
+    assert_eq!(
+        cached.result.snapshots[0]
+            .usage_accounting_contract
+            .as_deref(),
+        Some("session_exclusive_reported_usage:v1")
+    );
+    assert_oracle(&f, &cached, prior);
+    assert_eq!(
+        cached.result.snapshots[0]
+            .cost
+            .as_ref()
+            .unwrap()
+            .total_cost_usd
+            .as_deref(),
+        Some("2")
+    );
+}
+
+#[test]
+fn terminal_off_on_sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
@@ -420,6 +524,24 @@ fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
 
 #[test]
 fn transcript_and_sidecar_append_use_tail_without_changing_joined_body() {
+    let f = Fixture::new(1);
+    let cache = Arc::new(SharedCache::default());
+    let prior = seed_predecessor(&f, &cache);
+    f.append_transcript(1);
+    f.evidence(2);
+    let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
+    assert_layout_mode(cached.modes, (0, 1, 0));
+    assert_oracle(&f, &cached, prior);
+    assert_eq!(
+        cached.index.files[&local_index_key(&f.path)]
+            .audit_obligation(now_seconds())
+            .is_some(),
+        crate::heap_layout_bound::layout_supported()
+    );
+}
+
+#[test]
+fn terminal_off_on_transcript_and_sidecar_append_use_tail_without_changing_joined_body() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let f = Fixture::new(1);
@@ -440,6 +562,46 @@ fn transcript_and_sidecar_append_use_tail_without_changing_joined_body() {
 
 #[test]
 fn root_telemetry_reselects_every_child_without_invalidating_reduction() {
+    let mut f = Fixture::new(1);
+    let children = ["a4d1585d310070d0f", "b4d1585d310070d0f"];
+    let mut paths = vec![f.path.clone()];
+    for (offset, child) in children.iter().enumerate() {
+        let path = f
+            .dir
+            .join(&f.session)
+            .join("subagents")
+            .join(format!("agent-{child}.jsonl"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut line: Value = serde_json::from_str(&f.lines[offset + 1]).unwrap();
+        line["agentId"] = json!(child);
+        line["isSidechain"] = json!(true);
+        fs::write(&path, line.to_string() + "\n").unwrap();
+        f.trace[offset + 1].agent_id = (*child).into();
+        f.trace[offset + 1].fingerprint.clear();
+        f.trace[offset + 1].fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&f.trace[offset + 1]).unwrap())
+        );
+        paths.push(path);
+    }
+    let metadata = ClaudeTitleMetadata::default();
+    let before: Vec<_> = paths.iter().map(|p| f.fingerprints(p, &metadata)).collect();
+    let cache = Arc::new(SharedCache::default());
+    let prior = seed_predecessor(&f, &cache);
+    f.evidence(3);
+    for (path, old) in paths.iter().zip(before) {
+        let next = f.fingerprints(path, &metadata);
+        assert_ne!(next.0, old.0, "root evidence must select each member");
+        assert_eq!(next.1, old.1, "no evidence is retained in native reduction");
+    }
+    let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
+    assert_layout_mode(cached.modes, (0, 0, 3));
+    assert_eq!(cached.result.snapshots.len(), 3);
+    assert_oracle(&f, &cached, prior);
+}
+
+#[test]
+fn terminal_off_on_root_telemetry_reselects_every_child_without_invalidating_reduction() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let mut f = Fixture::new(1);
@@ -482,6 +644,45 @@ fn root_telemetry_reselects_every_child_without_invalidating_reduction() {
 
 #[test]
 fn mid_acquisition_telemetry_is_joined_freshly_in_both_modes() {
+    let f = Fixture::new(2);
+    let cache = Arc::new(SharedCache::default());
+    let prior = seed_predecessor(&f, &cache);
+    f.write_rows(false, &f.api[..2]);
+    let cached = enriched(
+        &f,
+        raw_scan(&f, prior.clone(), Some(cache.clone()), |_| {
+            f.write_rows(true, &f.trace[..2]);
+        }),
+    );
+    assert_layout_mode(cached.modes, (0, 0, 1));
+    assert!(cached.result.census_complete);
+    // Restore the same pre-acquisition evidence boundary for the Full oracle;
+    // API mtime and candidate selection material remain identical.
+    fs::remove_file(f.sidecar(true)).unwrap();
+    let full = enriched(
+        &f,
+        raw_scan(&f, prior, None, |_| {
+            f.write_rows(true, &f.trace[..2]);
+        }),
+    );
+    assert_eq!(exact_bodies(&cached), exact_bodies(&full));
+    let index = settle(cached);
+    let mut next = enriched(&f, raw_scan(&f, index, Some(cache), |_| {}));
+    assert_layout_mode(next.modes, (0, 0, 1));
+    finalize_scan_after_policy_with_body_witness(
+        SOURCE,
+        &mut next.result,
+        &mut next.index,
+        snapshot_upload_body_witness,
+    );
+    assert!(
+        next.result.snapshots.is_empty(),
+        "only the final joined body may be suppressed"
+    );
+}
+
+#[test]
+fn terminal_off_on_mid_acquisition_telemetry_is_joined_freshly_in_both_modes() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
@@ -524,6 +725,36 @@ fn mid_acquisition_telemetry_is_joined_freshly_in_both_modes() {
 
 #[test]
 fn child_metadata_and_desktop_identity_still_invalidate_native_scope() {
+    let f = Fixture::new(1);
+    let child = f
+        .dir
+        .join(&f.session)
+        .join("subagents/agent-a4d1585d310070d0f.jsonl");
+    fs::create_dir_all(child.parent().unwrap()).unwrap();
+    fs::write(&child, &f.lines[0]).unwrap();
+    let mut metadata = ClaudeTitleMetadata::default();
+    let old = f.fingerprints(&child, &metadata);
+    fs::write(
+        child.with_extension("meta.json"),
+        r#"{"description":"new synthetic label"}"#,
+    )
+    .unwrap();
+    let next = f.fingerprints(&child, &metadata);
+    assert_ne!(old.0, next.0);
+    assert_ne!(old.1, next.1);
+    let old = f.fingerprints(&f.path, &metadata);
+    metadata.titles.insert(
+        f.session.clone(),
+        ClaudeTitleCandidate {
+            title: "new title".into(),
+            user_set: true,
+        },
+    );
+    assert_ne!(old.1, f.fingerprints(&f.path, &metadata).1);
+}
+
+#[test]
+fn terminal_off_on_child_metadata_and_desktop_identity_still_invalidate_native_scope() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let f = Fixture::new(1);
@@ -556,6 +787,38 @@ fn child_metadata_and_desktop_identity_still_invalidate_native_scope() {
 
 #[test]
 fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let f = Fixture::new(2);
+    let cache = Arc::new(SharedCache::default());
+    f.evidence(2);
+    let prior = seed_predecessor(&f, &cache);
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(f.sidecar(false))
+        .unwrap();
+    serde_json::to_writer(&mut file, &f.api[0]).unwrap();
+    file.write_all(b"\n").unwrap();
+    drop(file);
+    let mut cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
+    assert_layout_mode(cached.modes, (0, 0, 1));
+    assert_oracle(&f, &cached, prior);
+    assert!(
+        !cached.result.snapshots.is_empty(),
+        "join must precede no-op"
+    );
+    finalize_scan_after_policy_with_body_witness(
+        SOURCE,
+        &mut cached.result,
+        &mut cached.index,
+        snapshot_upload_body_witness,
+    );
+    assert!(cached.result.snapshots.is_empty());
+    assert_eq!(cached.result.semantic_noop_count, 1);
+}
+
+#[test]
+fn terminal_off_on_duplicate_evidence_reselection_runs_post_join_noop_gate() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
@@ -590,6 +853,32 @@ fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
 
 #[test]
 fn restart_and_copy_budget_refusal_keep_full_fallback() {
+    for retained_budget in [false, true] {
+        let f = Fixture::new(1);
+        let cache = Arc::new(SharedCache::default());
+        let prior = seed_predecessor(&f, &cache);
+        let cache = if retained_budget {
+            Arc::new(SharedCache {
+                cap_pace: Default::default(),
+                inner: Mutex::new(TranscriptCache::with_byte_limit(0)),
+                cursor: Default::default(),
+                side: Default::default(),
+                #[cfg(unix)]
+                durable: Default::default(),
+            })
+        } else {
+            cache.clear();
+            cache
+        };
+        f.evidence(1);
+        let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
+        assert_eq!(cached.modes, (1, 0, 0));
+        assert_oracle(&f, &cached, prior);
+    }
+}
+
+#[test]
+fn terminal_off_on_restart_and_copy_budget_refusal_keep_full_fallback() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     for retained_budget in [false, true] {
@@ -618,6 +907,17 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
 
 #[test]
 fn missing_index_cannot_be_replaced_by_warm_cache_authority() {
+    let f = Fixture::new(1);
+    let cache = Arc::new(SharedCache::default());
+    seed_predecessor(&f, &cache);
+    f.evidence(1);
+    let cached = enriched(&f, raw_scan(&f, ScanIndex::default(), Some(cache), |_| {}));
+    assert_eq!(cached.modes, (1, 0, 0));
+    assert_oracle(&f, &cached, ScanIndex::default());
+}
+
+#[test]
+fn terminal_off_on_missing_index_cannot_be_replaced_by_warm_cache_authority() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let f = Fixture::new(1);
@@ -631,6 +931,19 @@ fn missing_index_cannot_be_replaced_by_warm_cache_authority() {
 
 #[test]
 fn true_scope_change_at_completion_still_refuses_cached_publication() {
+    let f = Fixture::new(1);
+    let cache = Arc::new(SharedCache::default());
+    let prior = seed_predecessor(&f, &cache);
+    f.evidence(1);
+    let cached = raw_scan(&f, prior, Some(cache), |scan| {
+        scan.index.active_upload_context_fingerprint = Some("changed-after-start".into());
+    });
+    assert!(cached.result.snapshots.is_empty());
+    assert!(!cached.result.census_complete);
+}
+
+#[test]
+fn terminal_off_on_true_scope_change_at_completion_still_refuses_cached_publication() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let f = Fixture::new(1);
@@ -646,6 +959,33 @@ fn true_scope_change_at_completion_still_refuses_cached_publication() {
 
 #[test]
 fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let f = Fixture::new(2);
+    let cache = Arc::new(SharedCache::default());
+    f.evidence(2);
+    let prior = seed_predecessor(&f, &cache);
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(f.sidecar(false))
+        .unwrap();
+    file.set_len(64 * 1024 * 1024).unwrap(); // Sparse; refused before decoding.
+    let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache.clone()), |_| {}));
+    assert_oracle(&f, &cached, prior);
+    assert!(!cached.index.claude_usage_authority_quarantine.is_empty());
+    let held = settle(cached);
+    f.evidence(2);
+    let recovered = enriched(&f, raw_scan(&f, held.clone(), Some(cache), |_| {}));
+    assert_eq!(
+        recovered.modes,
+        (1, 0, 0),
+        "quarantine still forces native Full"
+    );
+    assert_oracle(&f, &recovered, held);
+}
+
+#[test]
+fn terminal_off_on_sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
@@ -676,6 +1016,92 @@ fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
 
 #[test]
 fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
+    let f = Fixture::new(1);
+    let cache = Arc::new(SharedCache::default());
+    let prior = seed_predecessor(&f, &cache);
+    f.append_transcript(1);
+    f.evidence(2);
+    let tail = enriched(&f, raw_scan(&f, prior, Some(cache.clone()), |_| {}));
+    assert_layout_mode(tail.modes, (0, 1, 0));
+    let prior = settle(tail);
+    let key = local_index_key(&f.path);
+    let debt = prior.files[&key].audit_obligation(now_seconds());
+    assert_eq!(debt.is_some(), crate::heap_layout_bound::layout_supported());
+    let old_full = cache
+        .retained_checkpoint(&key)
+        .map(|c| c.last_full_verified());
+    f.write_rows(
+        false,
+        &[f.api[0].clone(), f.api[1].clone(), f.api[0].clone()],
+    );
+    let (unchanged, diagnostics) = crate::local_resource_diagnostics::capture(|| {
+        enriched(&f, raw_scan(&f, prior.clone(), Some(cache.clone()), |_| {}))
+    });
+    assert_layout_mode(unchanged.modes, (0, 0, 1));
+    assert_oracle(&f, &unchanged, prior);
+    let prior = settle(unchanged);
+    assert_eq!(prior.files[&key].audit_obligation(now_seconds()), debt);
+    assert_eq!(
+        cache.retained_checkpoint(&key).and_then(|c| c.audit_debt()),
+        debt
+    );
+    assert_eq!(
+        cache
+            .retained_checkpoint(&key)
+            .map(|c| c.last_full_verified()),
+        old_full
+    );
+    let page = diagnostics
+        .iter()
+        .find(|row| row["stage"] == "native_collection_page")
+        .unwrap();
+    assert_eq!(
+        page["counts"]["sampled_acquisition"]["index_state_at_page_end"]["audit_quiet_retired"], 0,
+        "telemetry refresh is not a scheduled audit retirement"
+    );
+    // Force a legitimately due existing obligation without changing intervals.
+    let mut due = prior;
+    let now = now_seconds();
+    let fingerprint = due.files[&key].source_file_fingerprint.clone();
+    assert!(due.stage_sampled_audit(
+        &key,
+        &fingerprint,
+        crate::transcript_acquisition::AuditDebt {
+            due_unix_seconds: now.saturating_sub(1)
+        }
+    ));
+    let (audited, diagnostics) = crate::local_resource_diagnostics::capture(|| {
+        raw_scan(&f, due, Some(cache.clone()), |_| {})
+    });
+    assert_layout_mode(audited.modes, (0, 0, 1));
+    assert_eq!(
+        audited.reasons[FullReason::AuditDue.slot()],
+        0,
+        "audit age never labels a native Full, even without a checkpoint"
+    );
+    let page = diagnostics
+        .iter()
+        .find(|row| row["stage"] == "native_collection_page")
+        .unwrap();
+    assert_eq!(
+        page["counts"]["sampled_acquisition"]["index_state_at_page_end"]["audit_quiet_retired"],
+        u64::from(crate::heap_layout_bound::layout_supported()),
+        "only the due, sampled validation retires the obligation"
+    );
+    assert_eq!(
+        cache.retained_checkpoint(&key).and_then(|c| c.audit_debt()),
+        None
+    );
+    assert_eq!(
+        cache
+            .retained_checkpoint(&key)
+            .map(|c| c.last_full_verified()),
+        old_full
+    );
+}
+
+#[test]
+fn terminal_off_on_cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
@@ -765,6 +1191,38 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
 
 #[test]
 fn missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    for conflict in [false, true] {
+        let f = Fixture::new(2);
+        let cache = Arc::new(SharedCache::default());
+        let prior = seed_predecessor(&f, &cache);
+        if conflict {
+            f.evidence(2);
+            let mut row = f.api[0].clone();
+            row.input_tokens += 1;
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&row).unwrap())
+            );
+            f.write_rows(false, &[f.api[0].clone(), f.api[1].clone(), row]);
+        } else {
+            f.write_rows(false, &f.api[..2]);
+        }
+        let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
+        assert_layout_mode(cached.modes, (0, 0, 1));
+        assert_oracle(&f, &cached, prior);
+        assert!(cached
+            .result
+            .snapshots
+            .iter()
+            .all(|s| s.usage_accounting_contract.is_none()));
+    }
+}
+
+#[test]
+fn terminal_off_on_missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
@@ -799,6 +1257,58 @@ fn missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
 
 #[test]
 fn cold_full_mid_read_sidecars_complete_but_true_scope_and_object_changes_refuse() {
+    for change in ["sidecars", "context", "object"] {
+        let f = Fixture::new(2);
+        f.write_rows(false, &f.api[..2]);
+        let empty_cache = Arc::new(SharedCache::default());
+        let candidate = raw_scan(
+            &f,
+            ScanIndex::default(),
+            Some(empty_cache),
+            |scan| match change {
+                "sidecars" => f.write_rows(true, &f.trace[..2]),
+                "context" => {
+                    scan.index.active_upload_context_fingerprint =
+                        Some("changed-after-start".into())
+                }
+                "object" => {
+                    let replacement = f.path.with_extension("replacement");
+                    fs::write(&replacement, f.lines[..2].join("\n") + "\n").unwrap();
+                    fs::rename(replacement, &f.path).unwrap();
+                }
+                _ => unreachable!(),
+            },
+        );
+        assert_eq!(
+            candidate.modes,
+            (1, 0, 0),
+            "cold acquisition is genuinely Full"
+        );
+        if change == "sidecars" {
+            let candidate = enriched(&f, candidate);
+            assert!(candidate.result.census_complete);
+            assert!(!candidate.result.snapshots.is_empty());
+            fs::remove_file(f.sidecar(true)).unwrap();
+            let full = enriched(
+                &f,
+                raw_scan(&f, ScanIndex::default(), None, |_| {
+                    f.write_rows(true, &f.trace[..2]);
+                }),
+            );
+            assert_eq!(exact_bodies(&candidate), exact_bodies(&full));
+            settle(candidate);
+        } else {
+            assert!(
+                candidate.result.snapshots.is_empty(),
+                "true dependency/object refusal remains"
+            );
+            assert!(!candidate.result.census_complete);
+        }
+    }
+}
+
+#[test]
+fn terminal_off_on_cold_full_mid_read_sidecars_complete_but_true_scope_and_object_changes_refuse() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
@@ -859,6 +1369,29 @@ fn cold_full_mid_read_sidecars_complete_but_true_scope_and_object_changes_refuse
 /// `durable_restart` covers a restart.
 #[test]
 fn constant_capture_tails_and_keeps_the_prefix_marker() {
+    let f = Fixture::new(1);
+    capture_marked(&f);
+    let cache = Arc::new(SharedCache::default());
+    let prior = settle(enriched(
+        &f,
+        raw_scan(&f, ScanIndex::default(), Some(cache.clone()), |_| {}),
+    ));
+    f.append_transcript(1);
+    let steady = raw_scan(&f, prior, Some(cache), |_| {});
+    assert_layout_mode(steady.modes, (0, 1, 0));
+    if crate::heap_layout_bound::layout_supported() {
+        assert_eq!(steady.reasons[FullReason::StateMissing.slot()], 0);
+    }
+    assert!(capture_markers_trusted(&steady, &f));
+}
+
+/// Contract 5 is always on, so capture is a function of the source and a
+/// retained reduction always continues in the capture mode its markers were
+/// built in (E1 S2: the retained capture-mode refusal is gone, not merely
+/// unreached). Appends tail, and the tailed body keeps the prefix's marker;
+/// `durable_restart` covers a restart.
+#[test]
+fn terminal_off_on_constant_capture_tails_and_keeps_the_prefix_marker() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let f = Fixture::new(1);
@@ -1045,6 +1578,39 @@ mod durable_restart {
     /// key's older record is invalidated, and a restart reads Full.
     #[test]
     fn a_held_reverted_selection_is_never_written_and_invalidates_the_old_record() {
+        let f = Fixture::new(1);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let key = transcript_key(&f, &prior);
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.append_transcript(1);
+        f.evidence(2);
+        let run = enriched(
+            &f,
+            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
+        );
+        let (scanned, held) = finalized_with_holds(run, &key);
+        assert_ne!(
+            scanned.files[&key].source_file_fingerprint,
+            prior.files[&key].source_file_fingerprint
+        );
+        let settled = scanned.into_locally_held_keys_reverted(&prior, &held, &BTreeSet::new());
+        assert_eq!(
+            settled.files[&key].source_file_fingerprint,
+            prior.files[&key].source_file_fingerprint
+        );
+        second.durable_write_after_save(state.lock, SOURCE, &settled);
+        assert_selection_refused(&second, &state);
+        assert_fresh_restart_reads_full(&f, &state, settled);
+    }
+
+    /// F2, local-hold settlement on the real path: a pass admits a newer
+    /// reduction, the file is held, settlement reverts its entry to the
+    /// committed one. The held reduction is never bound to that entry, the
+    /// key's older record is invalidated, and a restart reads Full.
+    #[test]
+    fn terminal_off_on_a_held_reverted_selection_is_never_written_and_invalidates_the_old_record() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let f = Fixture::new(1);
@@ -1080,6 +1646,62 @@ mod durable_restart {
     /// reads Full.
     #[test]
     fn a_cleared_fingerprint_never_restores_or_writes() {
+        let f = Fixture::new(1);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let key = transcript_key(&f, &prior);
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.append_transcript(1);
+        f.evidence(2);
+        let run = enriched(
+            &f,
+            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
+        );
+        let (scanned, held) = finalized_with_holds(run, &key);
+        let settled = scanned.into_locally_held_keys_reverted(&prior, &held, &held);
+        assert!(settled.files[&key].source_file_fingerprint.is_empty());
+        // The record of the committed selection is still on disk here; the
+        // cleared selection refuses before it is read.
+        let fresh = SharedCache::default();
+        state.begin(&fresh);
+        let namespace = Scope("sidecar-fixture".into());
+        let interpretation = crate::snapshots::sampled_scan::durable_tail::Interpretation::of(
+            SOURCE,
+            &key,
+            &settled,
+            capture_by_default(),
+            &namespace,
+        );
+        assert!(fresh
+            .durable_restore(
+                SOURCE,
+                &key,
+                &f.path,
+                &namespace,
+                &mut File::open(&f.path).unwrap(),
+                &settled,
+                &interpretation,
+            )
+            .into_test_option()
+            .is_none());
+        let (counters, store) = fresh.durable_counters(SOURCE).unwrap();
+        assert_eq!(counters.ineligible.get("selection_cleared"), Some(&1));
+        assert_eq!(
+            (counters.missing, store.records_read, counters.restored),
+            (0, 0, 0)
+        );
+        second.durable_write_after_save(state.lock, SOURCE, &settled);
+        assert_selection_refused(&second, &state);
+        assert_fresh_restart_reads_full(&f, &state, settled);
+    }
+
+    /// F2, the cleared-fingerprint reparse case: settlement clears the held
+    /// entry's fingerprint (reparse debt). A restore refuses it before any
+    /// record is read, the write refuses and invalidates, and a restart
+    /// reads Full.
+    #[test]
+    fn terminal_off_on_a_cleared_fingerprint_never_restores_or_writes() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let f = Fixture::new(1);
@@ -1138,6 +1760,38 @@ mod durable_restart {
     /// invalidated and a restart reads Full.
     #[test]
     fn a_reduction_ahead_of_the_saved_selection_is_never_written() {
+        let f = Fixture::new(1);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let key = transcript_key(&f, &prior);
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.append_transcript(1);
+        f.evidence(2);
+        let first_pass = enriched(
+            &f,
+            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
+        );
+        f.append_transcript(2);
+        f.evidence(3);
+        state.begin(&second);
+        let ahead = raw_scan(&f, first_pass.index.clone(), Some(second.clone()), |_| {});
+        assert_ne!(
+            ahead.index.files[&key].source_file_fingerprint,
+            first_pass.index.files[&key].source_file_fingerprint
+        );
+        let saved = settle(first_pass);
+        second.durable_write_after_save(state.lock, SOURCE, &saved);
+        assert_selection_refused(&second, &state);
+        assert_fresh_restart_reads_full(&f, &state, saved);
+    }
+
+    /// F2, a RAM reduction ahead of the saved selection: two passes in one
+    /// process, then the save commits the first pass's entry. The resident
+    /// reduction (second pass) is never bound to it; the older record is
+    /// invalidated and a restart reads Full.
+    #[test]
+    fn terminal_off_on_a_reduction_ahead_of_the_saved_selection_is_never_written() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
@@ -1172,6 +1826,30 @@ mod durable_restart {
     /// mismatch, and the tailed body keeps the prefix's marker.
     #[test]
     fn a_constant_capture_restart_reads_no_full() {
+        let f = Fixture::new(1);
+        capture_marked(&f);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.append_transcript(1);
+        let cached = raw_scan(&f, prior, Some(second.clone()), |_| {});
+        assert_layout_mode(cached.modes, (0, 1, 0));
+        if crate::heap_layout_bound::layout_supported() {
+            assert_eq!(cached.reasons[FullReason::StateMissing.slot()], 0);
+        }
+        assert_eq!(
+            restored(&second),
+            u64::from(crate::heap_layout_bound::layout_supported())
+        );
+        assert!(capture_markers_trusted(&cached, &f));
+    }
+
+    /// E1 S2: a restart under the same (constant) capture restores the
+    /// durable record and tails; nothing reads Full for a capture-mode
+    /// mismatch, and the tailed body keeps the prefix's marker.
+    #[test]
+    fn terminal_off_on_a_constant_capture_restart_reads_no_full() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let f = Fixture::new(1);
@@ -1195,6 +1873,30 @@ mod durable_restart {
 
     #[test]
     fn restart_restores_then_tails_and_matches_cold_full() {
+        let f = Fixture::new(1);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.append_transcript(1);
+        f.evidence(2);
+        let cached = enriched(
+            &f,
+            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
+        );
+        assert_layout_mode(cached.modes, (0, 1, 0));
+        assert_eq!(
+            restored(&second),
+            u64::from(crate::heap_layout_bound::layout_supported())
+        );
+        if let Some((counters, store)) = second.durable_counters(SOURCE) {
+            println!("{}", counters.summary(SOURCE, &store));
+        }
+        assert_oracle(&f, &cached, prior);
+    }
+
+    #[test]
+    fn terminal_off_on_restart_restores_then_tails_and_matches_cold_full() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let f = Fixture::new(1);
@@ -1255,6 +1957,97 @@ mod durable_restart {
 
     #[test]
     fn e2_restart_tail_and_quiet_late_sidecar_match_cold_full_emitted_body() {
+        let _gate = claude_request_money::e2::GateForTest::set(true);
+        claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+            for append_native in [true, false] {
+                let f = Fixture::new(if append_native { 1 } else { 2 });
+                // Quiet arm's LAST native request exists but is still on
+                // estimates. Only the first request has reported money.
+                f.evidence(1);
+                let state = State::new(&f);
+                let first = Arc::new(SharedCache::default());
+                state.begin(&first);
+                let seed = enriched_e2(
+                    &f,
+                    raw_scan(&f, ScanIndex::default(), Some(first.clone()), |_| {}),
+                );
+                let before = exact_bodies(&seed);
+                let mut prior = settle(seed);
+                prior.save(&state.index_path).unwrap();
+                first.durable_write_after_save(state.lock, SOURCE, &prior);
+                assert_eq!(
+                    state.store_records(),
+                    usize::from(crate::heap_layout_bound::layout_supported())
+                );
+                drop(first);
+                let native_before = fs::read(&f.path).unwrap();
+                if append_native {
+                    f.append_transcript(1);
+                }
+                // The second native request's late report replaces its
+                // estimate; req_3 is a side call without a native owner.
+                // Quiet arm changes neither transcript bytes nor extent.
+                f.evidence(3);
+                let prior = ScanIndex::load(&state.index_path).unwrap();
+                let restarted = Arc::new(SharedCache::default());
+                state.begin(&restarted);
+                let warm = enriched_e2(
+                    &f,
+                    raw_scan(&f, prior.clone(), Some(restarted.clone()), |_| {}),
+                );
+                let cold = enriched_e2(&f, raw_scan(&f, prior, None, |_| {}));
+                assert_layout_mode(
+                    warm.modes,
+                    if append_native { (0, 1, 0) } else { (0, 0, 1) },
+                );
+                assert_eq!(
+                    restored(&restarted),
+                    u64::from(crate::heap_layout_bound::layout_supported())
+                );
+                assert_eq!(exact_bodies(&warm), exact_bodies(&cold));
+                // These persist into the next replay and copy-proof pass.
+                // Compare the saved representation, not just today's body.
+                let money_state = |index: &ScanIndex| {
+                    serde_json::to_value((
+                        &index.claude_money_birth_store,
+                        &index.claude_usage_family_witnesses,
+                        &index.claude_usage_authority_quarantine,
+                        &index.accepted_snapshot_fingerprints,
+                        &index.file_snapshot_fingerprints,
+                        &index.quarantined_snapshot_fingerprints,
+                    ))
+                    .unwrap()
+                };
+                assert_eq!(money_state(&warm.index), money_state(&cold.index));
+                assert_ne!(
+                    before.0,
+                    exact_bodies(&warm).0,
+                    "late telemetry changes the emitted body"
+                );
+                assert_eq!(
+                    warm.result.snapshots[0]
+                        .cost
+                        .as_ref()
+                        .unwrap()
+                        .total_cost_usd
+                        .as_deref(),
+                    Some("3")
+                );
+                if !append_native {
+                    assert_eq!(fs::read(&f.path).unwrap(), native_before);
+                    if crate::heap_layout_bound::layout_supported() {
+                        assert_eq!(
+                            warm.native_bytes, 0,
+                            "quiet sidecar does not reacquire native records"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn terminal_off_on_e2_restart_tail_and_quiet_late_sidecar_match_cold_full_emitted_body() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let _gate = claude_request_money::e2::GateForTest::set(true);
@@ -1348,6 +2141,29 @@ mod durable_restart {
 
     #[test]
     fn restart_after_a_metadata_only_touch_restores_unchanged() {
+        let f = Fixture::new(2);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::set_permissions(&f.path, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(&f.path, fs::Permissions::from_mode(0o600)).unwrap();
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.evidence(2);
+        let cached = enriched(
+            &f,
+            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
+        );
+        assert_layout_mode(cached.modes, (0, 0, 1));
+        assert_eq!(
+            restored(&second),
+            u64::from(crate::heap_layout_bound::layout_supported())
+        );
+        assert_oracle(&f, &cached, prior);
+    }
+
+    #[test]
+    fn terminal_off_on_restart_after_a_metadata_only_touch_restores_unchanged() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let f = Fixture::new(2);
@@ -1373,6 +2189,29 @@ mod durable_restart {
 
     #[test]
     fn an_index_from_another_context_never_restores() {
+        let f = Fixture::new(1);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let second = Arc::new(SharedCache::default());
+        // Another account or destination: the pass binds another scope.
+        second.durable_begin_pass(
+            SOURCE,
+            &state.index_path,
+            &Scope("another-account".into()),
+            capture_by_default(),
+        );
+        f.append_transcript(1);
+        let cached = enriched(
+            &f,
+            raw_scan_with_namespace(&f, prior.clone(), second.clone(), "another-account"),
+        );
+        assert_layout_mode(cached.modes, (1, 0, 0));
+        assert_eq!(restored(&second), 0);
+        assert_oracle(&f, &cached, prior);
+    }
+
+    #[test]
+    fn terminal_off_on_an_index_from_another_context_never_restores() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let f = Fixture::new(1);
@@ -1397,6 +2236,49 @@ mod durable_restart {
     }
 
     fn raw_scan_with_namespace(
+        f: &Fixture,
+        index: ScanIndex,
+        cache: Arc<SharedCache>,
+        namespace: &str,
+    ) -> Run {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return terminal_off_on_raw_scan_with_namespace(f, index, cache, namespace);
+        }
+        let mut scan = OwnedSourceScan::new_with_identity_capture(
+            SOURCE,
+            std::slice::from_ref(&f.dir),
+            index,
+            COLLECTED,
+            BACKFILL_WINDOW_DAYS,
+            100,
+            false,
+            Some(&f.support),
+            &[],
+            false,
+            true,
+            capture_by_default(),
+        )
+        .with_sampled_acquisition(cache, Scope(namespace.into()));
+        loop {
+            let modes = scan.sampling.as_ref().map_or((0, 0, 0), |c| {
+                (c.full_files, c.tail_files, c.unchanged_files)
+            });
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => {
+                    return Run {
+                        index,
+                        result: scan,
+                        modes,
+                        reasons: [0; 11],
+                        native_bytes: 0,
+                    }
+                }
+            }
+        }
+    }
+
+    fn terminal_off_on_raw_scan_with_namespace(
         f: &Fixture,
         index: ScanIndex,
         cache: Arc<SharedCache>,

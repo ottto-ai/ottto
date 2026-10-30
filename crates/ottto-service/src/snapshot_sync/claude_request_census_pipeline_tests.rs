@@ -19,6 +19,78 @@ fn census_pipeline_window(census_window_end: &str) -> u64 {
 #[test]
 #[serial(source_manifests)]
 fn census_records_keep_the_held_revision_and_cover_it_in_window() {
+    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = PipelineFixture::new("claude-census-records-held");
+    let baseline = fixture.baseline();
+    let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
+    let baseline_record = baseline
+        .claude_request_census_for_test()
+        .get(&held_key)
+        .expect("baseline record")
+        .clone();
+    fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
+
+    let pages = fixture.traversal(9, &PIPELINE_HOLD_CYCLE);
+    let (first, last) = (&pages[0], pages.last().expect("terminal page"));
+    assert_eq!(
+        first.held.len(),
+        1,
+        "the changed owner-unproven body is held"
+    );
+    assert_eq!(first.index.claude_account_deferred_hold_count(), 1);
+    // TD1g: the reverted entry, the NEW record.
+    let record = first
+        .index
+        .claude_request_census_for_test()
+        .get(&held_key)
+        .expect("held key keeps a record");
+    assert_ne!(record, &baseline_record);
+    assert!(record
+        .request_hashes_for_test()
+        .contains(&crate::snapshots::claude_request_census::claude_request_hash("req_0_2")));
+    assert_ne!(
+        record.fingerprint_hex_for_test(),
+        first.index.files[&held_key].source_file_fingerprint,
+        "the entry reverted; the record did not"
+    );
+    assert_eq!(
+        record.window_for_test(),
+        census_pipeline_window(&first.scan.census_window_end)
+    );
+
+    // TD1h: covered in-window at the terminal of the same census window.
+    assert!(last.scan.census_complete);
+    assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
+    assert!(last.index.claude_account_deferred_hold_count() <= 1);
+    let shadow = last
+        .scan
+        .claude_request_census_shadow
+        .expect("complete Claude terminal measures the shadow");
+    assert_eq!(shadow.family_keys, PIPELINE_SESSIONS.len());
+    assert!(shadow.covered_by_window >= 1, "{shadow:?}");
+    assert_eq!(shadow.missing_account_hold, 0, "{shadow:?}");
+    assert_eq!(
+        shadow.covered_by_fingerprint + shadow.covered_by_window,
+        shadow.family_keys,
+        "{shadow:?}"
+    );
+    assert!(shadow.would_open, "{shadow:?}");
+    // Non-terminal pages measure nothing.
+    assert!(pages[..pages.len() - 1]
+        .iter()
+        .all(|page| page.scan.claude_request_census_shadow.is_none()));
+}
+
+/// TD1g and TD1h. An account-deferred key's entry reverts to its accepted
+/// revision, but its record stays the revision this window parsed (records
+/// follow `self`, never `previous`). At the complete terminal of the same
+/// census window that record covers the key by `window`, so the hold is not a
+/// missing record.
+#[test]
+#[serial(source_manifests)]
+fn terminal_off_on_census_records_keep_the_held_revision_and_cover_it_in_window() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
@@ -206,6 +278,24 @@ fn census_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Value>, usiz
 #[test]
 #[serial(source_manifests)]
 fn census_records_change_no_pipeline_decision() {
+    let (with_records, record_count) = census_parity_arm("claude-census-parity-records", true);
+    let (control, control_record_count) = census_parity_arm("claude-census-parity-control", false);
+    assert!(record_count > 0, "the records arm wrote records");
+    assert_eq!(control_record_count, 0, "the control arm wrote none");
+    assert!(with_records.len() >= 4, "{} pages", with_records.len());
+    assert_eq!(with_records.len(), control.len());
+    for (page, (records, control)) in with_records.iter().zip(&control).enumerate() {
+        assert_eq!(records, control, "page {page}");
+    }
+}
+
+/// Zero behavior change: the same corpus with records on and with records
+/// off makes the same scan, upload, hold, settlement, rearm, fence, pending,
+/// quarantine and manifest-feeding decisions on every page. Only the record
+/// map and the shadow counters differ.
+#[test]
+#[serial(source_manifests)]
+fn terminal_off_on_census_records_change_no_pipeline_decision() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let (with_records, record_count) = census_parity_arm("claude-census-parity-records", true);
@@ -248,6 +338,124 @@ fn census_body_facts(items: &[crate::snapshots::SnapshotItem]) -> Vec<(String, S
 /// index. The actual fixture page below then checks the same selection, hold
 /// set and surviving bodies while executing upload, settlement and persistence.
 fn census_pre_hold_bodies(
+    fixture: &PipelineFixture,
+    collected_at: &str,
+    cycle: &PipelineCycle<'_>,
+) -> CensusPreHoldBodies {
+    if crate::snapshots::ClaudeTerminalOffForTest::active() {
+        return terminal_off_on_census_pre_hold_bodies(fixture, collected_at, cycle);
+    }
+    let mut index = ScanIndex::load(&fixture.index_path).expect("preview index");
+    index.activate_upload_context(cycle.upload_context.to_owned());
+    let mut reset_owed_members = 0;
+    if cycle.historical_replay {
+        let before = index.claude_authority_record_for_test(PIPELINE_SESSIONS[2]);
+        index.prepare_historical_replay(cycle.replay_generation.to_owned());
+        if let Some(before) = before.filter(|debt| debt.correction.is_some()) {
+            let correction = before.correction.as_ref().expect("live correction");
+            assert!(!correction.1.is_empty(), "a member still owes correction");
+            let after = index
+                .claude_authority_record_for_test(PIPELINE_SESSIONS[2])
+                .expect("the actual page reset preserves its authority");
+            assert_eq!(after.correction, before.correction);
+            assert_eq!(
+                after.member_source_file_fingerprints,
+                before.member_source_file_fingerprints
+            );
+            assert_eq!(
+                after.proven_witness_fingerprint,
+                before.proven_witness_fingerprint
+            );
+            assert!(
+                after.bound_to_retained_witness,
+                "reset preserves the proof binding"
+            );
+            reset_owed_members = correction.1.len();
+        }
+    }
+    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
+        SnapshotSource::ClaudeCode,
+    ));
+    let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        collected_at,
+        183,
+        PIPELINE_PAGE_FILES,
+        true,
+    )
+    .expect("preview bounded page");
+    let (mut disposition, _, _) =
+        apply_claude_local_evidence_to_scan(&fixture.support, &mut scan, &mut index);
+    if let Some(owner) = cycle.proven_owner_session {
+        for item in scan
+            .snapshots
+            .iter_mut()
+            .filter(|item| item.source_session_id == owner)
+        {
+            for row in item.model_usage.iter_mut().chain(
+                item.usage_buckets
+                    .iter_mut()
+                    .flat_map(|bucket| bucket.model_usage.iter_mut()),
+            ) {
+                row.account_identifier_hash = Some("a".repeat(64));
+            }
+        }
+    }
+    let deferred = index.bind_session_accounts_with_mixed(
+        SnapshotSource::ClaudeCode,
+        PIPELINE_MACHINE_ID,
+        &mut scan.snapshots,
+        &[],
+        &disposition.mixed_uploads,
+    );
+    disposition.defer_sessions(deferred);
+    apply_upload_policy(
+        SnapshotSource::ClaudeCode,
+        &mut scan.snapshots,
+        SnapshotUploadPolicy::default(),
+    );
+    let progress = test_upload_progress();
+    exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
+    finalize_scan_after_policy_with_body_witness(
+        SnapshotSource::ClaudeCode,
+        &mut scan,
+        &mut index,
+        |item| {
+            effective_snapshot_upload_body_witness(
+                item,
+                &progress,
+                false,
+                false,
+                &BTreeSet::new(),
+                &disposition,
+            )
+        },
+    );
+    let offered = census_body_facts(&scan.snapshots);
+    let holds = LocalHoldSettlement::classify(
+        SnapshotSource::ClaudeCode,
+        &mut index,
+        &mut scan,
+        &disposition,
+    );
+    assert!(holds
+        .held_fingerprints
+        .iter()
+        .all(|held| offered.iter().any(|(fingerprint, _)| fingerprint == held)));
+    CensusPreHoldBodies {
+        offered,
+        held: holds.held_fingerprints,
+        uploadable: census_body_facts(&scan.snapshots),
+        discovered: scan.discovered_file_count,
+        scanned: scan.scanned_file_count,
+        complete: scan.census_complete,
+        reset_owed_members,
+    }
+}
+
+fn terminal_off_on_census_pre_hold_bodies(
     fixture: &PipelineFixture,
     collected_at: &str,
     cycle: &PipelineCycle<'_>,
@@ -452,6 +660,30 @@ fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Val
 #[test]
 #[serial(source_manifests)]
 fn census_every_offered_and_held_body_matches_control() {
+    // Pre-E2 invariant: E2 reads census records as copy-holder evidence.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let (records, records_held, records_reset_owed) =
+        census_pre_hold_parity_arm("census-all-bodies-records", true);
+    let (control, control_held, control_reset_owed) =
+        census_pre_hold_parity_arm("census-all-bodies-control", false);
+    assert!(
+        records_held > 0,
+        "the proof must observe actual held bodies"
+    );
+    assert_eq!(records_held, control_held);
+    assert!(
+        records_reset_owed > 0,
+        "the actual reset preserved nonempty correction debt"
+    );
+    assert_eq!(records_reset_owed, control_reset_owed);
+    assert_eq!(records, control);
+}
+
+/// Compare every candidate body before hold filtering, including candidates
+/// absent from the returned PipelinePage and its committed body witnesses.
+#[test]
+#[serial(source_manifests)]
+fn terminal_off_on_census_every_offered_and_held_body_matches_control() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     // Pre-E2 invariant: E2 reads census records as copy-holder evidence.

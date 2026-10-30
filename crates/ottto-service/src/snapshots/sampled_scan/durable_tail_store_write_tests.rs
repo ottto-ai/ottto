@@ -268,6 +268,20 @@ fn failed_write_after_save_costs_one_counted_full_after_restart() {
     }
 }
 
+/// The real path: a post-save write whose rename fails counts the offered
+/// record and keeps the predecessor; after a restart the next change reads
+/// Full, counted with the bytes that Full read. The fault-free control
+/// restores and Tails with both counters at 0.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS retained layout")]
+fn terminal_off_on_failed_write_after_save_costs_one_counted_full_after_restart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+    for fail in [true, false] {
+        failed_write_case(fail);
+    }
+}
+
 fn failed_write_case(fail: bool) {
     use std::io::Write;
     struct Reset;

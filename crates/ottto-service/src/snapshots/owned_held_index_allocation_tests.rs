@@ -300,3 +300,14 @@ fn owned_held_index_restoration_preserves_output_and_removes_clone_peak() {
         }
     }
 }
+
+#[test]
+fn terminal_off_on_owned_held_index_restoration_preserves_output_and_removes_clone_peak() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+    for roots in [32, 64] {
+        for debt in [false, true] {
+            compare(roots, debt);
+        }
+    }
+}

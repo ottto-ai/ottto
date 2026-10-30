@@ -101,6 +101,69 @@ fn page(
     cache: &Arc<sampled_scan::SharedCache>,
     mut before_step: impl FnMut(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult, Seen) {
+    if crate::snapshots::ClaudeTerminalOffForTest::active() {
+        return terminal_off_on_page(fixture, source, index, cache, before_step);
+    }
+    let mut scan = OwnedSourceScan::new(
+        source,
+        std::slice::from_ref(&fixture.root),
+        index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        true,
+    )
+    .with_sampled_acquisition(Arc::clone(cache), Scope(NAMESPACE.into()));
+    let mut seen = Seen::default();
+    loop {
+        if let Some(context) = scan.sampling.as_ref() {
+            seen.modes = (
+                context.full_files,
+                context.tail_files,
+                context.unchanged_files,
+            );
+            seen.full_reasons = context.full_reasons;
+        }
+        seen.unreadable = scan.census.unreadable_path_count;
+        seen.causes = causes(&scan.census);
+        before_step(&mut scan);
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete {
+                mut index, scan, ..
+            } => {
+                // As `production_scan_at_with_setup`: existing post-policy
+                // finalization and acceptance.
+                let mut projected = scan.clone();
+                apply_upload_policy(
+                    source,
+                    &mut projected.snapshots,
+                    SnapshotUploadPolicy::default(),
+                );
+                finalize_scan_after_policy(source, &mut projected, &mut index);
+                let accepted = projected
+                    .snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+                    .collect();
+                index.record_accepted_snapshot_fingerprints(&accepted);
+                return (index, scan, seen);
+            }
+        }
+    }
+}
+
+fn terminal_off_on_page(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: &Arc<sampled_scan::SharedCache>,
+    mut before_step: impl FnMut(&mut OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult, Seen) {
     let mut scan = OwnedSourceScan::new(
         source,
         std::slice::from_ref(&fixture.root),
@@ -357,6 +420,34 @@ fn assert_refused(
 /// independent; FE changes the formerly pinned Claude D1 failure.
 #[test]
 fn sp11_claude_in_page_tail_with_append_publishes_uncertified_prefix() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let base = baseline(source, 4, 2);
+    let path = base.path.clone();
+    let appended = row_bytes(source, 6..8);
+    let (_, tail, seen, _) = page_injecting(
+        &base.fixture,
+        source,
+        base.index,
+        &base.cache,
+        is_tail,
+        |_| append_raw(&path, &appended),
+    );
+    assert_eq!(seen.unreadable, 0, "SP-11 FE: causes={:?}", seen.causes);
+    assert!(!tail.snapshots.is_empty(), "SP-11 FE: prefix published");
+    assert!(
+        base.cache.retained_checkpoint(&base.key).is_none(),
+        "SP-11 FE: no copy"
+    );
+}
+
+/// SP-11, updated for FE: Claude's in-page Tail with an append publishes
+/// its sealed prefix uncertified and drops the copy. Codex Stage2-pre is
+/// independent; FE changes the formerly pinned Claude D1 failure.
+#[test]
+fn terminal_off_on_sp11_claude_in_page_tail_with_append_publishes_uncertified_prefix() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     if !crate::heap_layout_bound::layout_supported() {

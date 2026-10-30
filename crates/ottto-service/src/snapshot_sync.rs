@@ -8767,6 +8767,10 @@ pub struct ClaudeLocalEvidenceStats {
     pub own_request_complete_root_count: usize,
     pub own_request_unknown_root_count: usize,
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
+    /// Containment's withheld full re-arm; absent from the line while zero,
+    /// which it always is under the default OFF.
+    #[serde(skip_serializing_if = "claude_rearm_full_suppressed_is_zero")]
+    pub rearm_full_suppressed: u64,
     pub first_proof_hold: crate::snapshots::ClaudeFirstProofHoldCounts,
     /// RetryPending families whose returning root retains a retirement
     /// tombstone, separate from all other RetryPending causes. Local only.
@@ -8780,6 +8784,10 @@ pub struct ClaudeLocalEvidenceStats {
     /// the counts line and snapshot-audit stay unchanged.
     #[serde(skip)]
     pub context_file_birth: crate::snapshots::ClaudeContextFileBirthCounts,
+}
+
+fn claude_rearm_full_suppressed_is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 struct PreparedTraceRead {
@@ -9673,6 +9681,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         })
         .count();
     stats.duplicate_census = disposition.duplicate_census;
+    stats.rearm_full_suppressed = disposition.rearm_full_suppressed;
     stats.full_rearm_suppression = disposition.full_rearm_suppression;
     stats.context_file_birth = disposition.context_file_birth.clone();
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
@@ -12069,7 +12078,20 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 
 #[cfg(test)]
 pub(crate) fn terminal_off_traversal_ended_for_test(index: &ScanIndex) -> bool {
-    tests::p12_pipeline_original_tests::proof_rearm_idempotence_pipeline_tests::stale_family_carry_pipeline_tests::c1b_traversal_ended(index).0
+    // The containment form of the C1b criterion: physical discovery ended,
+    // with any already-observed held rereads still queued and unproven.
+    let saved = serde_json::to_value(index).expect("encode the saved index");
+    saved
+        .get("traversal")
+        .filter(|value| !value.is_null())
+        .is_none_or(|traversal| {
+            traversal["pending_directories"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+                && traversal["pending_candidates"]
+                    .as_array()
+                    .is_some_and(|paths| paths.iter().all(|path| path["census_member"] == false))
+        })
 }
 
 #[cfg(test)]
@@ -20373,6 +20395,41 @@ mod tests {
     #[test]
     #[serial(source_manifests)]
     fn exhausted_claude_authority_is_terminal_residue() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let exhausted = claude_usage_authority_census_counts(
+            "exhausted-claude-authority-receipt",
+            &[("unproven_terminal", 3)],
+        );
+        assert!(exhausted.census_complete);
+        assert!(!exhausted.scan_cap_hit);
+        assert_eq!(exhausted.ownership_incomplete_file_count, 3);
+        assert_eq!(exhausted.terminal_ownership_incomplete_file_count, 3);
+        assert_eq!(exhausted.zero_snapshot_usage_evidence_count, 0);
+        assert_eq!(exhausted.dropped_usage_record_count, 0);
+
+        let receipt = captured_terminal_receipt_for_source_under_hint(
+            SnapshotSource::ClaudeCode,
+            exhausted,
+            CollectorState::Success,
+            TerminalManifestSource::Withdraw,
+            183,
+            RESIDUE_ADMITTING_HINT,
+        );
+        assert_eq!(receipt["source"], "claude_code");
+        assert_eq!(receipt["last_error_code"], "census_residue");
+        assert_eq!(receipt["consecutive_failures"], 0);
+        assert!(receipt["last_success_at"].is_string());
+        assert_eq!(receipt["last_success_at"], receipt["last_scan_finished_at"]);
+        assert_eq!(
+            receipt["last_terminal_ownership_incomplete_file_count"],
+            receipt["last_ownership_incomplete_file_count"]
+        );
+        assert_eq!(receipt["last_terminal_ownership_incomplete_file_count"], 3);
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn terminal_off_on_exhausted_claude_authority_is_terminal_residue() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let _source_manifests = SourceManifestTestGuard::new();
@@ -20458,6 +20515,53 @@ mod tests {
     #[test]
     #[serial(source_manifests)]
     fn account_deferred_holds_keep_the_claude_receipt_unsettled() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let held = claude_index_with(serde_json::json!({
+            "claude_account_deferred_holds": {"/opaque/deferred.jsonl": "deferred-source"},
+        }));
+        assert_eq!(held.claude_account_deferred_hold_count(), 1);
+        let counts = claude_usage_authority_census_counts(
+            "account-deferred-hold-receipt",
+            &[("unproven_terminal", 1)],
+        )
+        .with_snapshot_terminal_counts(&held);
+        assert!(counts.census_complete);
+        assert_eq!(counts.ownership_incomplete_file_count, 2);
+        assert_eq!(counts.terminal_ownership_incomplete_file_count, 1);
+
+        let receipt = captured_terminal_receipt_for_source_under_hint(
+            SnapshotSource::ClaudeCode,
+            counts,
+            CollectorState::Success,
+            TerminalManifestSource::Withdraw,
+            183,
+            RESIDUE_ADMITTING_HINT,
+        );
+        assert_eq!(receipt["last_error_code"], "parse_error");
+        assert_eq!(receipt["consecutive_failures"], 1);
+        assert!(receipt["last_success_at"].is_null());
+        assert_eq!(receipt["last_ownership_incomplete_file_count"], 2);
+        assert_eq!(receipt["last_terminal_ownership_incomplete_file_count"], 1);
+
+        // Without a hold the same terminal residue settles.
+        let settled = claude_usage_authority_census_counts(
+            "account-deferred-hold-released-receipt",
+            &[("unproven_terminal", 1)],
+        )
+        .with_snapshot_terminal_counts(&ScanIndex::default());
+        assert_eq!(
+            settled.ownership_incomplete_file_count,
+            settled.terminal_ownership_incomplete_file_count
+        );
+    }
+
+    /// An account-deferred hold is retried every generation. It joins the
+    /// public ownership-incomplete count but never the settled share, so even
+    /// beside settled terminal authority residue the Claude receipt stays an
+    /// unsettled `parse_error` while the hold persists.
+    #[test]
+    #[serial(source_manifests)]
+    fn terminal_off_on_account_deferred_holds_keep_the_claude_receipt_unsettled() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let _source_manifests = SourceManifestTestGuard::new();
@@ -22259,6 +22363,78 @@ mod tests {
 
     #[test]
     fn backfill_and_curve_replay_keep_report_width_at_current_hint() {
+        let receipt_window_days = validated_receipt_window_days(183).expect("valid hint");
+        assert_eq!(
+            scan_request_window_days(receipt_window_days, false, false),
+            receipt_window_days,
+            "after replay the scan returns to the current policy width"
+        );
+
+        for (replay_name, backfill_pending, curve_replay_pending) in
+            [("backfill", true, false), ("curve", false, true)]
+        {
+            assert_eq!(
+                scan_request_window_days(
+                    receipt_window_days,
+                    backfill_pending,
+                    curve_replay_pending,
+                ),
+                u64::MAX,
+                "{replay_name} replay requests the scanner's broad local range"
+            );
+
+            for source in [
+                SnapshotSource::Codex,
+                SnapshotSource::ClaudeCode,
+                SnapshotSource::Pi,
+            ] {
+                let root = test_dir(&format!(
+                    "{replay_name}-replay-window-{}",
+                    source.api_slug()
+                ));
+                std::fs::create_dir_all(&root).expect("create empty source root");
+                let mut index = ScanIndex::default();
+                let result = crate::snapshots::scan_source_roots(
+                    source,
+                    std::slice::from_ref(&root),
+                    &mut index,
+                    "2026-08-30T12:00:00Z",
+                    scan_request_window_days(
+                        receipt_window_days,
+                        backfill_pending,
+                        curve_replay_pending,
+                    ),
+                )
+                .expect("broad replay scan");
+                assert_eq!(
+                    result.backfill_window_days,
+                    crate::snapshots::BACKFILL_WINDOW_DAYS,
+                    "the local scanner keeps its 730-day replay ceiling"
+                );
+                let counts = SyncCounts::from_scan_result(&result, 0, receipt_window_days);
+                assert_eq!(
+                    counts.backfill_window_days, receipt_window_days,
+                    "{replay_name} terminal status reports the exact hint"
+                );
+                let (window_start, window_end) =
+                    snapshot_manifest_window(&result.census_window_end, receipt_window_days)
+                        .expect("policy-width replay manifest");
+                let manifest = index
+                    .manifest_for_window(source, &window_start, &window_end)
+                    .expect("replay manifest");
+                assert_eq!(
+                    snapshot_manifest_window_days(&manifest).unwrap(),
+                    receipt_window_days,
+                    "{replay_name} terminal manifest reports the exact hint"
+                );
+                assert!(counts.census_complete);
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_off_on_backfill_and_curve_replay_keep_report_width_at_current_hint() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let receipt_window_days = validated_receipt_window_days(183).expect("valid hint");
@@ -23158,9 +23334,6 @@ mod tests {
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     // Main's original shared pipeline assertions run at the production OFF
     // default, independently of the explicit-ON containment fixtures above.
-    mod terminal_off_default_off_main_pipeline_tests {
-        include!("snapshot_sync/terminal_off_default_off_main_pipeline_tests.rs");
-    }
 
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
     mod history_upgrade_pipeline_tests {
@@ -23172,11 +23345,11 @@ mod tests {
     mod p12_base_exit_tests {
         include!("snapshot_sync/p12_base_exit_tests.rs");
     }
-    pub(in crate::snapshot_sync) mod p12_pipeline_original_tests {
+    mod p12_pipeline_original_tests {
         include!("snapshot_sync/p12_pipeline_original_tests.rs");
-        pub(in crate::snapshot_sync) mod proof_rearm_idempotence_pipeline_tests {
+        mod proof_rearm_idempotence_pipeline_tests {
             include!("snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs");
-            pub(in crate::snapshot_sync) mod stale_family_carry_pipeline_tests {
+            mod stale_family_carry_pipeline_tests {
                 include!("snapshot_sync/stale_family_carry_pipeline_tests.rs");
                 mod unhealthy_retry_reread_acceptance_tests {
                     include!("snapshot_sync/unhealthy_retry_reread_acceptance_tests.rs");
@@ -24261,6 +24434,167 @@ mod tests {
     }
     #[test]
     fn claude_p92_typed_mixed_uses_full_enrichment_order() {
+        // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+        let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
+        // Legacy session-account wire shape; E2 emits request-owned account partitions.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+        use crate::claude_local_otel::ClaudeIdentityDisposition;
+        use sha2::{Digest, Sha256};
+        let (dir, raw, api, trace) =
+            crate::snapshots::claude_request_account_mixed_fixture(4, false);
+        let mut index = ScanIndex::default();
+        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&dir),
+            &mut index,
+            "2026-08-02T07:10:00Z",
+            7,
+            100,
+            false,
+        )
+        .unwrap();
+        scan.snapshots = vec![raw.clone()];
+        assert!(scan.census_complete);
+        let support = dir.join("support");
+        let digest = format!("{:x}", Sha256::digest(raw.source_session_id.as_bytes()));
+        let write = |kind: &str, rows: Vec<serde_json::Value>| {
+            let path = support
+                .join("local-otel")
+                .join(kind)
+                .join(format!("{digest}.jsonl"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                rows.iter()
+                    .map(|row| row.to_string() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+        };
+        let base = scan.clone();
+        let before = raw.session_account_evidence.clone();
+        for case in [
+            "complete",
+            "creator_org_conflict",
+            "typed_conflict",
+            "typed_invalid",
+            "missing_trace",
+            "missing_api",
+            "original_conflict",
+        ] {
+            let mut api = api.clone();
+            let mut trace = trace.clone();
+            let rows = api.evidence.get_mut(&raw.source_session_id).unwrap();
+            match case {
+                "creator_org_conflict" => {
+                    rows[0]
+                        .request_identity
+                        .as_mut()
+                        .unwrap()
+                        .organization
+                        .log_record_hash = Some("d".repeat(64))
+                }
+                "typed_conflict" => {
+                    rows[3].request_identity.as_mut().unwrap().disposition =
+                        ClaudeIdentityDisposition::Conflict
+                }
+                "typed_invalid" => {
+                    rows[3].request_identity.as_mut().unwrap().disposition =
+                        ClaudeIdentityDisposition::Invalid
+                }
+                "missing_api" => {
+                    rows.pop();
+                }
+                "missing_trace" => {
+                    trace
+                        .evidence
+                        .get_mut(&raw.source_session_id)
+                        .unwrap()
+                        .pop();
+                }
+                _ => {}
+            }
+            for row in rows.iter_mut() {
+                row.fingerprint.clear();
+                row.fingerprint = format!(
+                    "sha256:{:x}",
+                    Sha256::digest(serde_json::to_vec(row).unwrap())
+                );
+            }
+            write(
+                "claude-code-effort",
+                rows.iter()
+                    .map(|row| serde_json::to_value(row).unwrap())
+                    .collect(),
+            );
+            write(
+                "claude-code-trace-ownership",
+                trace.evidence[&raw.source_session_id]
+                    .iter()
+                    .map(|row| serde_json::to_value(row).unwrap())
+                    .collect(),
+            );
+            let mut candidate = base.clone();
+            if case == "original_conflict" {
+                candidate.snapshots[0]
+                    .session_account_evidence
+                    .as_mut()
+                    .unwrap()
+                    .identity_disposition = Some("conflict");
+            }
+            let (proof, _, _) =
+                apply_claude_local_evidence_to_scan(&support, &mut candidate, &mut index.clone());
+            let item = &mut candidate.snapshots[0];
+            if case == "complete" {
+                assert_eq!(
+                    item.provenance.collector,
+                    "claude_code_jsonl:own_request_account_mixed:v1"
+                );
+                assert_eq!(item.session_account_evidence, before);
+                assert_eq!(
+                    item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+                    Some("4")
+                );
+                assert!(item
+                    .model_usage
+                    .iter()
+                    .chain(item.usage_buckets.iter().flat_map(|b| &b.model_usage))
+                    .all(|row| row.account_identifier_hash.is_none()));
+                let mut retained = ScanIndex::default();
+                let (prior_dir, mut prior, _, _) =
+                    crate::snapshots::claude_request_account_mixed_fixture(2, true);
+                retained.bind_session_accounts(
+                    SnapshotSource::ClaudeCode,
+                    "machine",
+                    std::slice::from_mut(&mut prior),
+                    &[],
+                );
+                assert!(retained
+                    .bind_session_accounts_with_mixed(
+                        SnapshotSource::ClaudeCode,
+                        "machine",
+                        std::slice::from_mut(item),
+                        &[],
+                        &proof.mixed_uploads
+                    )
+                    .is_empty());
+                crate::snapshots::claude_request_account_output(
+                    "native-mixed-production.json",
+                    item,
+                );
+                std::fs::remove_dir_all(prior_dir).unwrap();
+            } else {
+                assert_ne!(
+                    item.provenance.collector, "claude_code_jsonl:own_request_account_mixed:v1",
+                    "{case}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn terminal_off_on_claude_p92_typed_mixed_uses_full_enrichment_order() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         // Subject: the legacy account path contract 5 now leaves to untagged bodies.
@@ -24442,6 +24776,214 @@ mod tests {
     // A shed page records RatelimitBackoff in the shared client_report counters.
     #[serial(client_report)]
     fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
+        // Legacy session-account wire shape; E2 emits request-owned account partitions.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+        let (root, mut prior, _, _) =
+            crate::snapshots::claude_request_account_mixed_fixture(2, true);
+        let (candidate_root, mut candidate, api, trace) =
+            crate::snapshots::claude_request_account_mixed_fixture(4, true);
+        let mut index = ScanIndex::default();
+        index.bind_session_accounts(
+            SnapshotSource::ClaudeCode,
+            "machine",
+            std::slice::from_mut(&mut prior),
+            &[],
+        );
+        let owner = serde_json::to_value(&index).unwrap()["session_account_bindings"].clone();
+        let proof = crate::snapshots::claude_request_accounts::apply(
+            std::slice::from_mut(&mut candidate),
+            &api,
+            &trace,
+        );
+        assert!(index
+            .bind_session_accounts_with_mixed(
+                SnapshotSource::ClaudeCode,
+                "machine",
+                std::slice::from_mut(&mut candidate),
+                &[],
+                &proof.mixed
+            )
+            .is_empty());
+        let expected = serde_json::to_vec(&candidate).unwrap();
+        let semantic = candidate.snapshot_fingerprint.clone();
+        let body = snapshot_upload_body_witness(&candidate);
+        let path = root.join("progress.json");
+        let index_path = root.join("index.json");
+        index.save(&index_path).unwrap();
+        let namespace = format!("{:064x}", 99);
+        let mut progress = SnapshotUploadProgress::new(
+            namespace.clone(),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        );
+        let mut accepted = 0;
+        let scope = unique_poison_scope();
+        let result = upload_resumable_batches_with_body_witness(
+            &[candidate.clone()],
+            &scope,
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| {
+                assert_eq!(serde_json::to_vec(&items[0]).unwrap(), expected);
+                Err(anyhow::Error::new(UploadShed {
+                    status: 503,
+                    retry_after: Some(Duration::from_secs(60)),
+                    code: None,
+                }))
+            },
+            |state| state.save(&path),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ResumableUploadResult::Shed {
+                retry_after: Some(Duration::from_secs(60))
+            }
+        );
+        assert_eq!(accepted, 0);
+        assert!(!progress.accepted_fingerprints.contains(&semantic));
+        assert_eq!(
+            serde_json::to_value(&index).unwrap()["session_account_bindings"],
+            owner
+        );
+        // Save/reload the existing checkpoint domains. Fresh proof reconstructs
+        // the same body; a marker-only restarted binder cannot release it.
+        progress.save(&path).unwrap();
+        let mut restored = SnapshotUploadProgress::load(
+            &path,
+            &namespace,
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        let mut restarted = ScanIndex::load(&index_path).unwrap();
+        assert!(restarted
+            .bind_session_accounts(
+                SnapshotSource::ClaudeCode,
+                "machine",
+                &mut [candidate.clone()],
+                &[]
+            )
+            .contains(&candidate.source_session_id));
+        let (retry_root, mut retry, api, trace) =
+            crate::snapshots::claude_request_account_mixed_fixture(4, true);
+        let proof = crate::snapshots::claude_request_accounts::apply(
+            std::slice::from_mut(&mut retry),
+            &api,
+            &trace,
+        );
+        assert!(restarted
+            .bind_session_accounts_with_mixed(
+                SnapshotSource::ClaudeCode,
+                "machine",
+                std::slice::from_mut(&mut retry),
+                &[],
+                &proof.mixed
+            )
+            .is_empty());
+        assert_eq!(serde_json::to_vec(&retry).unwrap(), expected);
+        let lost = upload_resumable_batches_with_body_witness(
+            &[retry.clone()],
+            &scope,
+            &mut restored,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| {
+                assert_eq!(serde_json::to_vec(&items[0]).unwrap(), expected);
+                Err(anyhow!("synthetic response lost after server settlement"))
+            },
+            |state| state.save(&path),
+        );
+        assert!(lost.is_err());
+        assert_eq!(accepted, 0);
+        assert!(!restored.accepted_fingerprints.contains(&semantic));
+        restored.save(&path).unwrap();
+        let mut after_loss = SnapshotUploadProgress::load(
+            &path,
+            &namespace,
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        upload_resumable_batches_with_body_witness(
+            &[retry.clone()],
+            &scope,
+            &mut after_loss,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| {
+                assert_eq!(serde_json::to_vec(&items[0]).unwrap(), expected);
+                assert_eq!(snapshot_upload_body_witness(&items[0]), body);
+                let mut response = accepted_batch(1);
+                response.entity_ack_contract =
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                response
+                    .accepted_entities
+                    .push(crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: items[0].source_session_id.clone(),
+                        snapshot_fingerprint: semantic.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: Some(if items[0].cache_observations.is_some() {
+                            14
+                        } else {
+                            8
+                        }),
+                        body_witness_digest: Some(body.clone()),
+                        head_etag: Some("f".repeat(64)),
+                        head_challenge: None,
+                        unchanged_basis: None,
+                    });
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: "claude_code".into(),
+                    machine_id: "a".repeat(64),
+                    collector_version: Some(collector_version()),
+                    snapshots: items,
+                    upload_policy: SnapshotUploadPolicy::default(),
+                    client_report: crate::client_report::ClientReport::empty(),
+                };
+                response.validate_entity_ack_with_head_cas(&request, true)?;
+                Ok(response)
+            },
+            |state| state.save(&path),
+        )
+        .unwrap();
+        assert_eq!(accepted, 1);
+        assert!(after_loss.accepted_fingerprints.contains(&semantic));
+        assert_eq!(
+            serde_json::to_value(&restarted).unwrap()["session_account_bindings"],
+            owner,
+            "settlement does not rewrite creator/retained owner"
+        );
+        let mut calls = 0;
+        upload_resumable_batches_with_body_witness(
+            &[retry],
+            &scope,
+            &mut after_loss,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |_| {
+                calls += 1;
+                Ok(accepted_batch(1))
+            },
+            |state| state.save(&path),
+        )
+        .unwrap();
+        assert_eq!(calls, 0);
+        assert_eq!(accepted, 1, "same settled candidate is a no-op");
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(candidate_root).unwrap();
+        std::fs::remove_dir_all(retry_root).unwrap();
+    }
+
+    #[test]
+    // A shed page records RatelimitBackoff in the shared client_report counters.
+    #[serial(client_report)]
+    fn terminal_off_on_claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (root, mut prior, _, _) =

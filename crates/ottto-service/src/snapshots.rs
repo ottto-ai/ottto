@@ -5024,6 +5024,9 @@ pub(crate) struct ClaudeAuthorityRecordForTest {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeUsageAuthorityDisposition {
     pub(crate) duplicate_census: ClaudeDuplicateCensusCounts,
+    /// Containment only: 1 when terminal authority is off (and, at a due
+    /// full re-arm, the re-arm was withheld). Always 0 under the default OFF.
+    pub(crate) rearm_full_suppressed: u64,
     pub(crate) first_proof_hold: ClaudeFirstProofHoldCounts,
     pub(crate) full_rearm_suppression: ClaudeFullRearmSuppressionCounts,
     /// Local counters for how this fold's Claude scalars were decided.
@@ -7292,8 +7295,6 @@ pub struct ClaudeDuplicateCensusCounts {
     pub coverage_complete: bool,
     pub coverage_missing_member_count: usize,
     pub full_rearm: bool,
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub rearm_full_suppressed: u64,
     pub rearm_attempt: u8,
     pub full_rearm_deferred_until: Option<u64>,
     /// Slice D1 shadow, present only on a complete Claude terminal scan.
@@ -8771,7 +8772,6 @@ fn apply_claude_reported_usage_with_index_and_limits(
         None,
         None,
         &BTreeMap::new(),
-        true,
     )
 }
 
@@ -8893,7 +8893,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
             .map(|pending| pending.index_key.clone())
             .collect()
     };
-    let mut disposition = apply_claude_reported_usage_with_index_limits_and_current_files(
+    let mut disposition = apply_claude_reported_usage_with_negative_dependencies(
         &mut scan.snapshots,
         api_report,
         trace_report,
@@ -8968,6 +8968,43 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     observations: Option<ClaudeNativeObservations>,
     comparison: Option<claude_native_comparison::FoldView<'_>>,
     veto_api_rows: &ClaudeVetoApiRows,
+) -> ClaudeUsageAuthorityDisposition {
+    // Main's entry point: every negative dependency is present, as on main.
+    apply_claude_reported_usage_with_negative_dependencies(
+        snapshots,
+        api_report,
+        trace_report,
+        index,
+        census_complete,
+        census_window_end,
+        max_pending_occurrences,
+        max_duplicate_owners,
+        identity,
+        current_files,
+        observations,
+        comparison,
+        veto_api_rows,
+        true,
+    )
+}
+
+/// `negative_dependencies_complete` is false only while a containment
+/// strict cohort deferred a root; under the default OFF it is always true.
+#[allow(clippy::too_many_arguments)]
+fn apply_claude_reported_usage_with_negative_dependencies(
+    snapshots: &mut [SnapshotItem],
+    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    index: &mut ScanIndex,
+    census_complete: bool,
+    census_window_end: &str,
+    max_pending_occurrences: usize,
+    max_duplicate_owners: usize,
+    identity: Option<&claude_request_identity::ScanEvidence<'_>>,
+    current_files: &BTreeSet<String>,
+    observations: Option<ClaudeNativeObservations>,
+    comparison: Option<claude_native_comparison::FoldView<'_>>,
+    veto_api_rows: &ClaudeVetoApiRows,
     negative_dependencies_complete: bool,
 ) -> ClaudeUsageAuthorityDisposition {
     if !index.persistence_available() {
@@ -9009,7 +9046,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         ),
     };
     duplicate_census.census_complete = census_complete;
-    duplicate_census.rearm_full_suppressed = u64::from(claude_terminal_off());
+    let mut rearm_full_suppressed = u64::from(claude_terminal_off());
     duplicate_census.fence_before = claude_effective_duplicate_fence_closed(index);
     let reports_healthy = api_report.health.is_complete() && trace_report.is_complete();
     // The canonical ownership reducer validates semantic evidence too (row
@@ -10099,8 +10136,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 == Some(claude_request_identity::cycle_contract(identity.is_some()))
             && !index.claude_full_rearm_progress.other_invalidation_observed;
         let would_full_rearm = full_rearm_due && !full_rearm_suppressed && !post_rebuild_skipped;
-        duplicate_census.rearm_full_suppressed =
-            u64::from(would_full_rearm && claude_terminal_off());
+        rearm_full_suppressed = u64::from(would_full_rearm && claude_terminal_off());
         if would_full_rearm && claude_terminal_off() {
             eprintln!("ALARM rearm_full_suppressed=1: Claude corpus replay requires the paged reconstruction fold");
         }
@@ -10567,6 +10603,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     }
     duplicate_census.fence_after = claude_effective_duplicate_fence_closed(index);
     disposition.duplicate_census = duplicate_census;
+    disposition.rearm_full_suppressed = rearm_full_suppressed;
     #[cfg(test)]
     CLAUDE_FIRST_PROOF_HOLD_FOR_TEST.with(|cell| cell.set(disposition.first_proof_hold));
     disposition
@@ -46418,6 +46455,14 @@ impl ScanIndex {
 
     #[cfg(test)]
     pub(crate) fn claude_duplicate_fence_closed_for_test(&self) -> bool {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return self.terminal_off_on_claude_duplicate_fence_closed_for_test();
+        }
+        self.claude_duplicate_request_witness_overflowed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_off_on_claude_duplicate_fence_closed_for_test(&self) -> bool {
         claude_effective_duplicate_fence_closed(self)
     }
 
@@ -49130,6 +49175,138 @@ impl ScanIndex {
     /// fingerprint was explicitly cleared keeps that reparse debt as well.
     #[cfg(test)]
     pub(crate) fn with_locally_held_keys_reverted(
+        &self,
+        previous: &ScanIndex,
+        held: &BTreeSet<String>,
+        reparse_held: &BTreeSet<String>,
+    ) -> ScanIndex {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return self.terminal_off_on_with_locally_held_keys_reverted(
+                previous,
+                held,
+                reparse_held,
+            );
+        }
+        let empty_advances = self.claude_empty_map_advances(previous);
+        let held_keys = self.locally_held_keys(held);
+        let placeholders =
+            self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
+        let mut result = self.clone();
+        result
+            .claude_money_birth_store
+            .preserve_missing_from(&previous.claude_money_birth_store);
+        self.note_claude_history_not_accepted(previous, &held_keys);
+        for key in &held_keys {
+            let reparse = self
+                .files
+                .get(key)
+                .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
+                || self
+                    .file_snapshot_fingerprints
+                    .get(key)
+                    .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held));
+            match previous.files.get(key) {
+                Some(committed) => {
+                    let mut committed = committed.clone();
+                    if reparse {
+                        committed.source_file_fingerprint.clear();
+                    }
+                    result.files.insert(key.clone(), committed);
+                }
+                None if placeholders.contains(key) => {
+                    if let Some(entry) = result.files.get_mut(key) {
+                        entry.last_snapshot_fingerprint = None;
+                        entry.last_upload_body_witness = None;
+                    }
+                    result.re_owe_effective_upload_body_witness_revision(key, 0);
+                }
+                None => {
+                    result.files.remove(key);
+                }
+            }
+            if let Some(carried) = previous.accepted_rebuild_incidence.get(key) {
+                result
+                    .accepted_rebuild_incidence
+                    .insert(key.clone(), carried.clone());
+                result.preserve_carried_ack_clock(previous);
+            }
+            match previous.file_snapshot_fingerprints.get(key) {
+                Some(fingerprints) => {
+                    result
+                        .file_snapshot_fingerprints
+                        .insert(key.clone(), fingerprints.clone());
+                }
+                None => {
+                    result.file_snapshot_fingerprints.remove(key);
+                }
+            }
+            if previous.confirmed_empty_files.contains(key) {
+                result.confirmed_empty_files.insert(key.clone());
+            } else {
+                result.confirmed_empty_files.remove(key);
+            }
+            result.revert_codex_blocked_attribution(previous, key);
+            match previous.terminal_jsonl_dispositions.get(key) {
+                Some(disposition) => {
+                    result
+                        .terminal_jsonl_dispositions
+                        .insert(key.clone(), disposition.clone());
+                }
+                None => {
+                    result.terminal_jsonl_dispositions.remove(key);
+                }
+            }
+            if let Some((_, member)) = claude_index_path_family_member(Path::new(key)) {
+                match previous.claude_owned_start_census.get(&member) {
+                    Some(witness) => {
+                        result
+                            .claude_owned_start_census
+                            .insert(member, witness.clone());
+                    }
+                    None => {
+                        result.claude_owned_start_census.remove(&member);
+                    }
+                }
+            }
+        }
+        let mut restored = BTreeSet::new();
+        for key in &held_keys {
+            match result.file_snapshot_fingerprints.get(key) {
+                Some(fingerprints) => restored.extend(fingerprints.iter().cloned()),
+                None => restored.extend(
+                    result
+                        .files
+                        .get(key)
+                        .and_then(|entry| entry.last_snapshot_fingerprint.clone()),
+                ),
+            }
+        }
+        for fingerprint in &restored {
+            if let Some(activity_at) = previous.snapshot_activity_at.get(fingerprint) {
+                result
+                    .snapshot_activity_at
+                    .entry(fingerprint.clone())
+                    .or_insert_with(|| activity_at.clone());
+            }
+            if previous
+                .accepted_snapshot_fingerprints
+                .contains(fingerprint)
+            {
+                result
+                    .accepted_snapshot_fingerprints
+                    .insert(fingerprint.clone());
+            }
+        }
+        result.restore_claude_empty_map_advances(empty_advances);
+        let current = result.current_snapshot_fingerprints();
+        result
+            .snapshot_activity_at
+            .retain(|fingerprint, _| current.contains(fingerprint));
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_off_on_with_locally_held_keys_reverted(
         &self,
         previous: &ScanIndex,
         held: &BTreeSet<String>,
@@ -55327,6 +55504,189 @@ mod tests {
 
     #[test]
     fn claude_authority_quarantine_is_durable_and_retries_on_change_or_deadline() {
+        let root_session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let root = temp_dir("claude-authority-quarantine-retry");
+        let transcript = root.join(format!("{root_session_id}.jsonl"));
+        fs::write(&transcript, "{}\n").expect("write authority retry transcript");
+        let current_revision = "a".repeat(64);
+        let witness = ClaudeUsageFamilyWitness {
+            evidence_fingerprint: "provider-evidence".to_string(),
+            member_request_id_fingerprints: BTreeMap::from([(
+                root_session_id.to_string(),
+                "requests".to_string(),
+            )]),
+            member_occurrence_fingerprints: BTreeMap::from([(
+                root_session_id.to_string(),
+                "occurrences".to_string(),
+            )]),
+            assigned_request_id_fingerprints: BTreeMap::from([(
+                root_session_id.to_string(),
+                "assigned".to_string(),
+            )]),
+            legacy_excluded_request_id_hashes: BTreeMap::new(),
+            legacy_exclusion_evidence_fingerprint: None,
+            legacy_owner_roots: BTreeSet::new(),
+        };
+        let witness_fingerprint = claude_usage_family_witness_fingerprint(&witness);
+        let mut candidate = test_candidate(transcript.clone());
+        candidate.source_file_fingerprint = current_revision.clone();
+        let mut entry = manifest_index_entry(Some(&"b".repeat(64)));
+        entry.size_bytes = candidate.size_bytes;
+        entry.modified_unix_seconds = candidate.modified_unix_seconds;
+        entry.modified_unix_nanos = Some(candidate.modified_unix_nanos);
+        entry.source_file_fingerprint = current_revision.clone();
+        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string());
+        let mut index = ScanIndex::default();
+        index.files.insert(local_index_key(&transcript), entry);
+        index
+            .claude_usage_family_witnesses
+            .insert(root_session_id.to_string(), witness);
+        index.claude_usage_authority_quarantine.insert(
+            root_session_id.to_string(),
+            ClaudeUsageAuthorityQuarantineRecord {
+                proof_correction: None,
+                contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
+                proven_witness_fingerprint: witness_fingerprint.clone(),
+                member_source_file_fingerprints: BTreeMap::from([(
+                    root_session_id.to_string(),
+                    current_revision,
+                )]),
+                failed_reconstruction_count: 1,
+                disposition: ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+                retry_after_unix_seconds: claude_usage_authority_retry_deadline(
+                    root_session_id,
+                    &witness_fingerprint,
+                ),
+            },
+        );
+
+        index.claude_usage_family_pending.insert(
+            root_session_id.to_string(),
+            ClaudeUsageFamilyPending {
+                census_window_end: "2026-08-01T00:00:00Z".into(),
+                member_request_id_hashes: BTreeMap::new(),
+                member_occurrences: BTreeMap::new(),
+                invalid: false,
+                idless_revision: None,
+            },
+        );
+
+        assert_eq!(
+            index.candidate_decision(&candidate),
+            CandidateDecision::Skip
+        );
+        index.activate_effective_upload_body_witness_revision(1);
+        assert_eq!(
+            index.candidate_decision(&candidate),
+            CandidateDecision::Skip,
+            "held family retry gate takes precedence over projection adoption"
+        );
+        let index_path = root.join("scan-index.json");
+        index
+            .save(&index_path)
+            .expect("persist authority quarantine");
+        let mut loaded = ScanIndex::load(&index_path).expect("reload authority quarantine");
+        loaded.activate_effective_upload_body_witness_revision(1);
+        assert_eq!(
+            loaded.candidate_decision(&candidate),
+            CandidateDecision::Skip
+        );
+
+        for terminal in [false, true] {
+            let mut held = loaded.clone();
+            if terminal {
+                let record = held
+                    .claude_usage_authority_quarantine
+                    .get_mut(root_session_id)
+                    .unwrap();
+                record.failed_reconstruction_count = MAX_CLAUDE_USAGE_AUTHORITY_FAILURES;
+                record.disposition = ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal;
+                record.retry_after_unix_seconds = 0;
+            }
+            let original = held.files[&local_index_key(&transcript)]
+                .source_file_fingerprint
+                .clone();
+            for tick in 0..2 {
+                // Isolate two fresh-generation boundaries; actual census/usage
+                // fixtures below separately exercise queue completion.
+                held.traversal = None;
+                ensure_bounded_traversal(
+                    SnapshotSource::ClaudeCode,
+                    std::slice::from_ref(&root),
+                    &mut held,
+                    &format!("2026-08-20T10:0{tick}:00Z"),
+                    BACKFILL_WINDOW_DAYS,
+                );
+                assert_eq!(
+                    held.files[&local_index_key(&transcript)].source_file_fingerprint,
+                    original
+                );
+                assert_eq!(
+                    held.candidate_decision(&candidate),
+                    CandidateDecision::Skip,
+                    "fresh census must preserve authority quarantine retry/terminal gates"
+                );
+            }
+        }
+        let mut malformed = loaded.clone();
+        malformed
+            .claude_usage_authority_quarantine
+            .get_mut(root_session_id)
+            .unwrap()
+            .proven_witness_fingerprint = "f".repeat(64);
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut malformed,
+            "2026-08-20T10:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        assert!(
+            malformed.files[&local_index_key(&transcript)]
+                .source_file_fingerprint
+                .is_empty(),
+            "unbound stale authority proof must not bypass fresh census reconstruction"
+        );
+
+        let mut changed = candidate.clone();
+        changed.source_file_fingerprint = "d".repeat(64);
+        assert_eq!(
+            loaded.candidate_decision(&changed),
+            CandidateDecision::Parse
+        );
+        loaded
+            .claude_usage_authority_quarantine
+            .get_mut(root_session_id)
+            .expect("loaded authority quarantine")
+            .retry_after_unix_seconds = 0;
+        assert_eq!(
+            loaded.candidate_decision(&candidate),
+            CandidateDecision::Parse
+        );
+        let terminal = loaded
+            .claude_usage_authority_quarantine
+            .get_mut(root_session_id)
+            .expect("loaded authority quarantine");
+        terminal.failed_reconstruction_count = MAX_CLAUDE_USAGE_AUTHORITY_FAILURES;
+        terminal.disposition = ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal;
+        assert_eq!(
+            loaded.candidate_decision(&candidate),
+            CandidateDecision::Skip,
+            "terminal loss does not retry unchanged evidence forever"
+        );
+        assert_eq!(
+            loaded.candidate_decision(&changed),
+            CandidateDecision::Parse,
+            "terminal loss still retries immediately after family evolution"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_authority_quarantine_is_durable_and_retries_on_change_or_deadline() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let root_session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let root = temp_dir("claude-authority-quarantine-retry");
@@ -55551,6 +55911,155 @@ mod tests {
 
     #[test]
     fn claude_authority_family_evolution_reparses_every_quarantined_sibling() {
+        let root_session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let root = temp_dir("claude-authority-family-evolution");
+        let write_member = |agent_id: Option<&str>| {
+            let path = match agent_id {
+                Some(agent_id) => root
+                    .join(root_session_id)
+                    .join("subagents")
+                    .join(format!("agent-{agent_id}.jsonl")),
+                None => root.join(format!("{root_session_id}.jsonl")),
+            };
+            fs::create_dir_all(path.parent().expect("member parent"))
+                .expect("create family directory");
+            let request_id = agent_id.unwrap_or("root");
+            fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    json!({
+                        "timestamp": "2026-08-23T18:20:00Z",
+                        "type": "assistant",
+                        "sessionId": root_session_id,
+                        "agentId": agent_id,
+                        "isSidechain": agent_id.is_some(),
+                        "requestId": format!("request-{request_id}"),
+                        "message": {
+                            "id": format!("message-{request_id}"),
+                            "model": "claude-haiku-4-5",
+                            "usage": {"input_tokens": 10, "output_tokens": 1}
+                        }
+                    })
+                ),
+            )
+            .expect("write family member");
+            path
+        };
+        write_member(None);
+        let revised_member = write_member(Some("0000000000000001"));
+        write_member(Some("0000000000000002"));
+
+        let mut index = ScanIndex::default();
+        let initial = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-23T18:30:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("index initial family");
+        assert_eq!(initial.scanned_file_count, 3);
+        let members = index
+            .files
+            .iter()
+            .filter_map(|(index_key, entry)| {
+                let (family_root, member) = claude_index_path_family_member(Path::new(index_key))?;
+                (family_root == root_session_id)
+                    .then(|| (member, entry.source_file_fingerprint.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(members.len(), 3);
+        let witness = ClaudeUsageFamilyWitness {
+            evidence_fingerprint: "provider-evidence".to_string(),
+            member_request_id_fingerprints: members
+                .keys()
+                .map(|member| (member.clone(), "requests".to_string()))
+                .collect(),
+            member_occurrence_fingerprints: members
+                .keys()
+                .map(|member| (member.clone(), "occurrences".to_string()))
+                .collect(),
+            assigned_request_id_fingerprints: members
+                .keys()
+                .map(|member| (member.clone(), "assigned".to_string()))
+                .collect(),
+            legacy_excluded_request_id_hashes: BTreeMap::new(),
+            legacy_exclusion_evidence_fingerprint: None,
+            legacy_owner_roots: BTreeSet::new(),
+        };
+        let witness_fingerprint = claude_usage_family_witness_fingerprint(&witness);
+        index
+            .claude_usage_family_witnesses
+            .insert(root_session_id.to_string(), witness);
+        index.claude_usage_authority_quarantine.insert(
+            root_session_id.to_string(),
+            ClaudeUsageAuthorityQuarantineRecord {
+                proof_correction: None,
+                contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
+                proven_witness_fingerprint: witness_fingerprint,
+                member_source_file_fingerprints: members,
+                failed_reconstruction_count: 1,
+                disposition: ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+                retry_after_unix_seconds: u64::MAX,
+            },
+        );
+
+        let unchanged = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-23T18:31:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan unchanged quarantined family");
+        assert_eq!(unchanged.scanned_file_count, 0);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&revised_member)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, b"{}\n"))
+            .expect("revise one family member");
+        let revised = scan_source_roots_with_artifacts(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-23T18:31:30Z",
+            BACKFILL_WINDOW_DAYS,
+            true,
+        )
+        .expect("scan revised quarantined family");
+        assert_eq!(revised.scanned_file_count, 3);
+        assert_eq!(
+            revised.snapshots.len(),
+            3,
+            "one revision change reparses the changed member and every unchanged sibling"
+        );
+
+        write_member(Some("0000000000000003"));
+        let evolved = scan_source_roots_with_artifacts(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-23T18:32:00Z",
+            BACKFILL_WINDOW_DAYS,
+            true,
+        )
+        .expect("scan expanded quarantined family");
+        assert_eq!(evolved.scanned_file_count, 4);
+        assert_eq!(
+            evolved.snapshots.len(),
+            4,
+            "one membership change reparses the new member and every unchanged sibling"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_authority_family_evolution_reparses_every_quarantined_sibling() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let root_session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let root = temp_dir("claude-authority-family-evolution");
@@ -56425,7 +56934,21 @@ mod tests {
     }
 
     #[test]
+    fn terminal_off_on_claude_stable_owned_start_recovers_after_partial_conflict() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+        exercise_claude_partial_census_recovery(false, false);
+    }
+
+    #[test]
     fn claude_duplicate_across_pages_stays_refused_without_reparse_loop() {
+        exercise_claude_partial_census_recovery(true, false);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_duplicate_across_pages_stays_refused_without_reparse_loop() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         exercise_claude_partial_census_recovery(true, false);
     }
 
@@ -56435,11 +56958,270 @@ mod tests {
     }
 
     #[test]
+    fn terminal_off_on_claude_pending_census_recovers_without_releasing_future_quarantine() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+        exercise_claude_partial_census_recovery(false, true);
+    }
+
+    #[test]
     fn claude_future_quarantine_preserves_cross_page_duplicate_refusal() {
         exercise_claude_partial_census_recovery(true, true);
     }
 
+    #[test]
+    fn terminal_off_on_claude_future_quarantine_preserves_cross_page_duplicate_refusal() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+        exercise_claude_partial_census_recovery(true, true);
+    }
+
     fn exercise_claude_partial_census_recovery(duplicate: bool, future_quarantine: bool) {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return terminal_off_on_exercise_claude_partial_census_recovery(
+                duplicate,
+                future_quarantine,
+            );
+        }
+        let root = temp_dir("claude-stable-owned-start-conflict-census");
+        let stable = root.join("a-stable.jsonl");
+        fs::write(&stable, concat!(
+            "{\"timestamp\":\"2026-08-20T10:00:00Z\",\"sessionId\":\"a-stable\",\"type\":\"assistant\",\"forkedFrom\":{\"sessionId\":\"parent\",\"messageUuid\":\"parent-message\"},\"requestId\":\"req_parent\",\"message\":{\"id\":\"msg_parent\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":900000,\"output_tokens\":2}}}\n",
+            "{\"timestamp\":\"2026-08-20T10:01:00Z\",\"sessionId\":\"a-stable\",\"type\":\"assistant\",\"requestId\":\"req_owned\",\"message\":{\"id\":\"msg_owned\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":90000,\"cache_creation_input_tokens\":0,\"output_tokens\":2}}}\n",
+            "{\"timestamp\":\"2026-08-20T10:01:10Z\",\"sessionId\":\"a-stable\",\"type\":\"assistant\",\"requestId\":\"req_cold\",\"message\":{\"id\":\"msg_cold\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":2}}}\n",
+            "{\"timestamp\":\"2026-08-20T10:01:20Z\",\"sessionId\":\"a-stable\",\"type\":\"assistant\",\"requestId\":\"req_recovered\",\"message\":{\"id\":\"msg_recovered\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":90000,\"cache_creation_input_tokens\":0,\"output_tokens\":2}}}\n"
+        )).expect("stable fork fixture");
+        for member in ["b-conflict", "c-sibling", "d-sibling"] {
+            fs::write(root.join(format!("{member}.jsonl")), format!(
+                "{{\"timestamp\":\"2026-08-20T10:01:00Z\",\"sessionId\":\"{member}\",\"type\":\"assistant\",\"requestId\":\"req_{member}\",\"message\":{{\"id\":\"msg_{member}\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n"
+            )).expect("unrelated fixture");
+        }
+        if duplicate {
+            let path = root.join("d-sibling.jsonl");
+            let contents = String::from_utf8(fs::read(&path).expect("late duplicate fixture"))
+                .expect("UTF-8 duplicate fixture");
+            fs::write(path, contents.replace("req_d-sibling", "req_owned"))
+                .expect("duplicate request on final page");
+        }
+        let mut index = ScanIndex::default();
+        let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+        let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+        // Independent control proves that this exact stable fork fixture can
+        // establish owned-start through an ordinary conflict-free census.
+        let mut control = ScanIndex::default();
+        for tick in 0..2 {
+            let mut page = scan_source_roots_with_limit(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&root),
+                &mut control,
+                &format!("2026-08-20T10:0{}:00Z", 2 + tick),
+                BACKFILL_WINDOW_DAYS,
+                3,
+                true,
+            )
+            .expect("control page");
+            let held = apply_claude_reported_usage_with_index(
+                &mut page.snapshots,
+                &api,
+                &trace,
+                &mut control,
+                page.census_complete,
+                &page.census_window_end,
+            );
+            assert_eq!(
+                held.quarantined_entity_count(),
+                0,
+                "fixture must not manufacture local authority withholding"
+            );
+            assert!(!control.account_claude_usage_authority_census_health(&mut page));
+            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut page, &mut control);
+            assert_eq!(page.census_complete, tick == 1);
+        }
+        assert_eq!(
+            control.claude_owned_start_census["a-stable"]
+                .verified_source_file_fingerprint
+                .is_some(),
+            !duplicate,
+            "fresh no-conflict control verifies only globally unique requests"
+        );
+        let checkpoint = root.join("checkpoint.json");
+        let mut held_conflict = None;
+        for generation in 0..5 {
+            if generation == 4 {
+                // Change the file without changing its owned usage. This is the
+                // real source-fingerprint retry route, not a forced index replay.
+                let mut contents = String::from_utf8(fs::read(&stable).expect("stable fixture"))
+                    .expect("UTF-8 stable fixture");
+                contents.push_str("{\"timestamp\":\"2026-08-20T10:09:00Z\",\"sessionId\":\"a-stable\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"synthetic change\"}}\n");
+                fs::write(&stable, contents).expect("changed stable fixture");
+            }
+            let previous = index.clone();
+            let started = format!("2026-08-20T10:{:02}:00Z", 2 + generation * 2);
+            let mut first = scan_source_roots_with_limit(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&root),
+                &mut index,
+                &started,
+                BACKFILL_WINDOW_DAYS,
+                3,
+                true,
+            )
+            .expect("first bounded page");
+            if generation == 3 {
+                assert!(
+                    first
+                        .snapshots
+                        .iter()
+                        .all(|item| item.source_session_id != "a-stable"),
+                    "stable verified or refused ownership must return to no-op"
+                );
+            }
+            apply_claude_reported_usage_with_index(
+                &mut first.snapshots,
+                &api,
+                &trace,
+                &mut index,
+                first.census_complete,
+                &first.census_window_end,
+            );
+            if generation == 2 {
+                let stable_item = first
+                    .snapshots
+                    .iter()
+                    .find(|item| item.source_session_id == "a-stable")
+                    .expect("corrective stable snapshot");
+                if duplicate {
+                    assert!(stable_item.cache_observations.is_none());
+                } else {
+                    let cache = stable_item
+                        .cache_observations
+                        .as_ref()
+                        .expect("recovered cache evidence");
+                    assert_eq!(cache.coverage, "complete");
+                    assert_eq!(cache.operations.len(), 1);
+                    let cache_observations::Operation::Upsert { observation } =
+                        &cache.operations[0]
+                    else {
+                        panic!("expected recovered warm-cold-warm observation");
+                    };
+                    assert_eq!(observation.affected_request_ref, "req_cold");
+                    let previous = observation.previous.as_ref().expect("warm previous");
+                    let next = observation.immediate_next.as_ref().expect("warm recovery");
+                    assert_eq!(previous.request_ref, "req_owned");
+                    assert_eq!(next.request_ref, "req_recovered");
+                    for slot in [previous, &observation.affected, next] {
+                        assert_eq!(slot.prompt_tokens, Some(100_000));
+                        assert_eq!(slot.cache_creation_tokens, Some(0));
+                        assert_eq!(slot.output_tokens, Some(2));
+                        assert_ne!(slot.request_ref, "req_parent");
+                    }
+                    assert_eq!(previous.cache_read_tokens, Some(90_000));
+                    assert_eq!(observation.affected.cache_read_tokens, Some(0));
+                    assert_eq!(observation.affected.uncached_tokens, Some(100_000));
+                    assert_eq!(next.cache_read_tokens, Some(90_000));
+                    assert_eq!(
+                        stable_item
+                            .context_curve
+                            .as_ref()
+                            .unwrap()
+                            .total_owned_request_count,
+                        3
+                    );
+                }
+            }
+            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut first, &mut index);
+            assert!(!first.census_complete);
+            if generation == 0 {
+                let conflict = first
+                    .snapshots
+                    .iter()
+                    .find(|item| item.source_session_id == "b-conflict")
+                    .expect("unrelated conflict is on first page")
+                    .snapshot_fingerprint
+                    .clone();
+                let accepted = first
+                    .snapshots
+                    .iter()
+                    .filter(|item| item.source_session_id != "b-conflict")
+                    .map(|item| item.snapshot_fingerprint.clone())
+                    .collect::<BTreeSet<_>>();
+                assert!(first
+                    .snapshots
+                    .iter()
+                    .any(|item| item.source_session_id == "a-stable"
+                        && accepted.contains(&item.snapshot_fingerprint)));
+                let mut record = snapshot_quarantine_record(SnapshotSource::ClaudeCode);
+                // Fixed-clock retry metadata is synthetic and already due. No
+                // body witness or server ACK digest/version is manufactured.
+                if !future_quarantine {
+                    record.retry_after_unix_seconds = 1787227500;
+                }
+                held_conflict = Some((conflict.clone(), record.retry_after_unix_seconds));
+                let quarantine = BTreeMap::from([(conflict.clone(), record)]);
+                index = index.committable_subset(&previous, &accepted, &quarantine);
+                assert!(!index.accepted_snapshot_fingerprints.contains(&conflict));
+                assert!(accepted
+                    .iter()
+                    .all(|fp| index.accepted_snapshot_fingerprints.contains(fp)));
+                index.mark_bounded_sweep_unsettled();
+            }
+            index.save(&checkpoint).expect("persist partial page");
+            index = ScanIndex::load(&checkpoint).expect("reload partial page");
+            let finished = format!("2026-08-20T10:{:02}:00Z", 3 + generation * 2);
+            let mut last = scan_source_roots_with_limit(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&root),
+                &mut index,
+                &finished,
+                BACKFILL_WINDOW_DAYS,
+                3,
+                true,
+            )
+            .expect("last bounded page");
+            apply_claude_reported_usage_with_index(
+                &mut last.snapshots,
+                &api,
+                &trace,
+                &mut index,
+                last.census_complete,
+                &last.census_window_end,
+            );
+            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut last, &mut index);
+            assert!(index.traversal.is_none(), "directory census drained");
+            assert_eq!(last.census_complete, generation >= 1);
+            let witness = index
+                .claude_owned_start_census
+                .get("a-stable")
+                .expect("stable owned-start marker retained");
+            assert_eq!(
+                witness.verified_source_file_fingerprint.is_some(),
+                generation >= 1 && !duplicate,
+                "a clean census recovers unique ownership, but never duplicate ownership"
+            );
+            index.save(&checkpoint).expect("persist terminal page");
+            index = ScanIndex::load(&checkpoint).expect("reload terminal page");
+            if future_quarantine {
+                let (fingerprint, deadline) = held_conflict.as_ref().expect("future conflict");
+                let record = &index.quarantined_snapshot_fingerprints[fingerprint];
+                assert_eq!(record.retry_after_unix_seconds, *deadline);
+                assert_eq!(
+                    record.disposition,
+                    SnapshotQuarantineDisposition::RetryPending
+                );
+                assert!(!index.accepted_snapshot_fingerprints.contains(fingerprint));
+                assert!(
+                    !index.quarantine_requires_retry(fingerprint),
+                    "census reconstruction must not release future delivery quarantine"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn terminal_off_on_exercise_claude_partial_census_recovery(
+        duplicate: bool,
+        future_quarantine: bool,
+    ) {
         let root = temp_dir("claude-stable-owned-start-conflict-census");
         let stable = root.join("a-stable.jsonl");
         fs::write(&stable, concat!(
@@ -58871,6 +59653,78 @@ mod tests {
     /// non-Codex shape directly instead of inferring it from the Codex case.
     #[test]
     fn over_line_cap_is_terminal_with_disclosed_loss_for_non_codex_sources() {
+        let claude = "{\"type\":\"assistant\",\"sessionId\":\"019e2700-5555-7000-9000-555555555555\",\"uuid\":\"019e2700-5555-7000-9000-5555555555a1\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n";
+        let pi = concat!(
+            "{\"type\":\"session\",\"session_id\":\"019e2700-6666-7000-9000-666666666666\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+            "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n",
+        );
+        for (source, name, healthy) in [
+            (SnapshotSource::ClaudeCode, "over-cap-claude", claude),
+            (SnapshotSource::Pi, "over-cap-pi", pi),
+        ] {
+            let root = temp_dir(name);
+            let path = root.join("session.jsonl");
+            let mut bytes = healthy.as_bytes().to_vec();
+            bytes.extend_from_slice(b"{\"type\":\"assistant\",\"ignored\":\"");
+            bytes.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
+            bytes.extend_from_slice(b"\"}\n");
+            fs::write(&path, bytes).expect("write over-cap fixture");
+
+            let mut index = ScanIndex::default();
+            let mut first = scan_source_roots_with_limit(
+                source,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-07-22T08:02:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("over-cap line reaches a terminal disclosed result");
+            assert!(first.census_complete, "{name}");
+            assert!(!first.scan_cap_hit, "{name}");
+            assert_eq!(first.scanned_file_count, 1, "{name}");
+            assert_eq!(first.over_line_cap_count, 1, "{name}");
+            assert_eq!(first.recognized_usage_drop_count, 1, "{name}");
+            assert_eq!(first.dropped_usage_record_count, 1, "{name}");
+            assert_eq!(
+                first.snapshots.len(),
+                1,
+                "{name}: healthy sibling lines still commit"
+            );
+            finalize_scan_after_policy(source, &mut first, &mut index);
+
+            let second = scan_source_roots_with_limit(
+                source,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-07-22T08:07:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("unchanged terminal file uses its disposition");
+            assert_eq!(
+                second.scanned_file_count, 0,
+                "{name}: unchanged terminal file is not reparsed"
+            );
+            assert!(second.census_complete, "{name}");
+            assert_eq!(second.over_line_cap_count, 1, "{name}");
+            assert_eq!(second.recognized_usage_drop_count, 1, "{name}");
+            assert_eq!(second.dropped_usage_record_count, 1, "{name}");
+            assert!(second.snapshots.is_empty(), "{name}");
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    /// `terminal_line_loss_count` applies to every source, but the oversized
+    /// Codex envelope salvage does not: for Claude Code and Pi the whole
+    /// physical line - ordinal, timestamp and payload - is gone. Assert that
+    /// non-Codex shape directly instead of inferring it from the Codex case.
+    #[test]
+    fn terminal_off_on_over_line_cap_is_terminal_with_disclosed_loss_for_non_codex_sources() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let claude = "{\"type\":\"assistant\",\"sessionId\":\"019e2700-5555-7000-9000-555555555555\",\"uuid\":\"019e2700-5555-7000-9000-5555555555a1\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n";
         let pi = concat!(
@@ -58942,6 +59796,81 @@ mod tests {
     /// one dead key per lossy transcript the user ever moves.
     #[test]
     fn terminal_dispositions_are_pruned_when_their_file_moves_or_disappears() {
+        let source = SnapshotSource::ClaudeCode;
+        let root = temp_dir("terminal-disposition-prune");
+        let original = root.join("session-a.jsonl");
+        let moved = root.join("session-b.jsonl");
+        let mut bytes = b"{\"type\":\"assistant\",\"sessionId\":\"019e2700-7777-7000-9000-777777777777\",\"uuid\":\"019e2700-7777-7000-9000-7777777777a1\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n".to_vec();
+        bytes.extend_from_slice(b"{\"type\":\"assistant\",\"ignored\":\"");
+        bytes.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
+        bytes.extend_from_slice(b"\"}\n");
+        fs::write(&original, &bytes).expect("write over-cap fixture");
+
+        let traverse = |index: &mut ScanIndex, at: &str| {
+            let mut result = scan_source_roots_with_limit(
+                source,
+                std::slice::from_ref(&root),
+                index,
+                at,
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("traversal completes");
+            assert!(result.census_complete);
+            finalize_scan_after_policy(source, &mut result, index);
+            result
+        };
+
+        let mut index = ScanIndex::default();
+        let first = traverse(&mut index, "2026-07-22T08:02:00Z");
+        assert_eq!(first.scanned_file_count, 1);
+        assert_eq!(first.over_line_cap_count, 1);
+        assert_eq!(index.terminal_jsonl_dispositions.len(), 1);
+        assert!(index
+            .terminal_jsonl_dispositions
+            .contains_key(&local_index_key(&original)));
+
+        // Moved path: the same bytes are a new object. The new key is recorded
+        // and the old key must NOT be carried forward beside it.
+        fs::rename(&original, &moved).expect("rename terminal fixture");
+        let after_move = traverse(&mut index, "2026-07-22T08:07:00Z");
+        assert_eq!(
+            after_move.scanned_file_count, 1,
+            "moved object is read once"
+        );
+        assert_eq!(
+            after_move.over_line_cap_count, 1,
+            "loss is not double-counted"
+        );
+        assert_eq!(
+            index.terminal_jsonl_dispositions.len(),
+            1,
+            "the renamed-away key is pruned, not accumulated"
+        );
+        assert!(index
+            .terminal_jsonl_dispositions
+            .contains_key(&local_index_key(&moved)));
+        assert_eq!(index.files.len(), 1);
+
+        // Deleted path: nothing indexed corresponds to the disposition at all.
+        fs::remove_file(&moved).expect("remove terminal fixture");
+        let after_delete = traverse(&mut index, "2026-07-22T08:12:00Z");
+        assert_eq!(after_delete.scanned_file_count, 0);
+        assert!(
+            index.terminal_jsonl_dispositions.is_empty(),
+            "a deleted file leaves no durable disposition behind"
+        );
+        assert!(index.files.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The disposition map is durable, so a record whose file was renamed or
+    /// deleted must not outlive the `files` entry it was written beside.
+    /// Without pruning the map grows monotonically for the life of the index,
+    /// one dead key per lossy transcript the user ever moves.
+    #[test]
+    fn terminal_off_on_terminal_dispositions_are_pruned_when_their_file_moves_or_disappears() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let source = SnapshotSource::ClaudeCode;
@@ -59049,6 +59978,168 @@ mod tests {
     /// shape and asserts the file is read exactly once.
     #[test]
     fn terminal_dispositions_settle_for_a_corpus_larger_than_any_fixed_cap() {
+        use std::io::Write;
+
+        // Comfortably over the 256 records the removed cap allowed.
+        const FILES: usize = 300;
+        // Readers run under a scaled line cap so each over-cap file is 64 KiB,
+        // not 16 MiB; both stay under the cursor/singleton threshold, so
+        // routing is unchanged. If the override did not apply, a `LINE_CAP + 1`
+        // line would not be over the cap and `over_line_cap_count` would fail.
+        const LINE_CAP: usize = 64 * 1024;
+
+        // The oversized payload is written as a file hole. `read_bounded_jsonl_
+        // lines_impl` copies at most the reader's line cap of the line, marks
+        // it over-cap and then clears the buffer without inspecting the skipped
+        // bytes, so a zero-filled hole is byte-equivalent input for this path
+        // and keeps a 300-file over-cap corpus off disk.
+        let write_over_cap_file = |path: &Path, head: &str, prefix: &str, suffix: &str| {
+            let mut file = File::create(path).expect("create over-cap fixture");
+            file.write_all(head.as_bytes()).expect("write healthy head");
+            file.write_all(prefix.as_bytes())
+                .expect("write oversized line prefix");
+            file.seek(SeekFrom::Current((LINE_CAP + 1) as i64))
+                .expect("skip the oversized payload hole");
+            file.write_all(suffix.as_bytes())
+                .expect("close the oversized line");
+        };
+
+        with_test_line_cap(LINE_CAP, || {
+            for (source, name) in [
+                (SnapshotSource::Codex, "terminal-disposition-scale-codex"),
+                (
+                    SnapshotSource::ClaudeCode,
+                    "terminal-disposition-scale-claude",
+                ),
+            ] {
+                let root = temp_dir(name);
+                for slot in 0..FILES {
+                    let session_id = format!("019e2701-{slot:04x}-7000-9000-{slot:012x}");
+                    match source {
+                        SnapshotSource::Codex => {
+                            let head = format!(
+                            "{{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"ordinal\":0,\"payload\":{{\"id\":\"{session_id}\",\"session_id\":\"{session_id}\"}}}}\n"
+                        );
+                            // The Codex envelope salvage reads `ordinal` and
+                            // `timestamp` out of the prefix, so the ordinal chain
+                            // stays gap-free and the file parses complete.
+                            let prefix = "{\"timestamp\":\"2026-07-22T08:00:01Z\",\"type\":\"response_item\",\"ordinal\":1,\"payload\":{\"type\":\"message\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"";
+                            let suffix = format!(
+                                "\"}}]}}}}\n{}\n",
+                                codex_test_token_line(
+                                    "2026-07-22T08:00:02Z",
+                                    Some(2),
+                                    (40, 0, 8, 0),
+                                    Some((40, 0, 8, 0)),
+                                )
+                            );
+                            write_over_cap_file(
+                                &root.join(format!(
+                                    "rollout-2026-07-22T08-00-00-{session_id}.jsonl"
+                                )),
+                                &head,
+                                prefix,
+                                &suffix,
+                            );
+                        }
+                        _ => {
+                            let head = format!(
+                            "{{\"type\":\"assistant\",\"sessionId\":\"{session_id}\",\"uuid\":\"019e2702-{slot:04x}-7000-9000-{slot:012x}\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{{\"id\":\"msg_{slot}\",\"model\":\"claude-sonnet-4-6\",\"usage\":{{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}}}\n"
+                        );
+                            write_over_cap_file(
+                                &root.join(format!("{session_id}.jsonl")),
+                                &head,
+                                "{\"type\":\"assistant\",\"ignored\":\"",
+                                "\"}\n",
+                            );
+                        }
+                    }
+                }
+
+                let mut index = ScanIndex::default();
+                let mut observed = Vec::new();
+                for cycle in 0..4 {
+                    let mut scan = scan_source_roots_with_limit(
+                        source,
+                        std::slice::from_ref(&root),
+                        &mut index,
+                        "2026-07-22T09:00:00Z",
+                        BACKFILL_WINDOW_DAYS,
+                        MAX_BACKFILL_FILES_PER_SOURCE,
+                        true,
+                    )
+                    .unwrap_or_else(|error| panic!("{name} cycle {cycle} traversal: {error}"));
+                    assert!(scan.census_complete, "{name} cycle {cycle} census");
+                    assert!(!scan.scan_cap_hit, "{name} cycle {cycle} cap hit");
+                    assert_eq!(
+                        scan.ownership_incomplete_file_count, 0,
+                        "{name} cycle {cycle} ownership"
+                    );
+                    // Disclosed loss is recomputed from the dispositions on the
+                    // cycles that read nothing. One evicted record would show up
+                    // here as a silently smaller number.
+                    assert_eq!(
+                        scan.over_line_cap_count, FILES,
+                        "{name} cycle {cycle} over cap"
+                    );
+                    assert_eq!(
+                        scan.recognized_usage_drop_count, FILES,
+                        "{name} cycle {cycle} recognized drop"
+                    );
+                    assert_eq!(
+                        scan.dropped_usage_record_count, FILES as u64,
+                        "{name} cycle {cycle} dropped usage"
+                    );
+                    observed.push((scan.scanned_file_count, scan.snapshots.len()));
+                    finalize_scan_after_policy(source, &mut scan, &mut index);
+                    assert_eq!(
+                        index.terminal_jsonl_dispositions.len(),
+                        FILES,
+                        "{name} cycle {cycle} retains one disposition per live file"
+                    );
+                    assert_eq!(index.files.len(), FILES, "{name} cycle {cycle} files");
+                }
+                assert_eq!(
+                    observed,
+                    vec![(FILES, FILES), (0, 0), (0, 0), (0, 0)],
+                    "{name}: an over-cap corpus is read once, not once per cycle"
+                );
+                let _ = fs::remove_dir_all(root);
+            }
+        });
+        assert_eq!(
+            jsonl_line_cap(),
+            MAX_JSONL_LINE_BYTES,
+            "scaled cap is reset"
+        );
+    }
+
+    /// The disposition map is deliberately uncapped: pruning keeps it a subset
+    /// of `files`, and the live indexed-file population is the bound. A corpus
+    /// carrying more lossy transcripts than any fixed cap would allow must
+    /// still settle - every disposition recorded once on the first cycle, then
+    /// nothing re-read and no disclosed loss dropped on any later cycle.
+    ///
+    /// Traversing AFTER recording is the whole point of this test. A 256-record
+    /// cap satisfied a direct `prune_terminal_jsonl_dispositions` assertion and
+    /// still broke this: with that cap restored, both arms below record 300 on
+    /// cycle 0, keep only 256, and then disclose `over_line_cap_count` 256 - not
+    /// 300 - on every later cycle, because an evicted file's `files` entry,
+    /// fingerprint and snapshot fingerprints are all still valid so the
+    /// candidate falls to `Skip` and `terminal_jsonl_loss()` contributes
+    /// nothing. Any cap reintroduced here trips that assertion on cycle 1.
+    ///
+    /// The second, worse consequence of an eviction needs the parent/child
+    /// ordinal shape rather than this independent-session corpus: once
+    /// `terminal_jsonl_loss()` returns `None`, the child->parent reparse
+    /// override re-arms, the oversized rollout is fully re-read, re-records its
+    /// disposition, and the next prune evicts the same key again - forever.
+    /// `oversized_parent_of_ordinal_subagent_children_is_read_once` owns that
+    /// shape and asserts the file is read exactly once.
+    #[test]
+    fn terminal_off_on_terminal_dispositions_settle_for_a_corpus_larger_than_any_fixed_cap() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         use std::io::Write;
 
@@ -62121,6 +63212,66 @@ mod tests {
 
     #[test]
     fn codex_and_claude_partial_timestamp_loss_stays_visible() {
+        let codex_root = temp_dir("codex-partial-timestamp-loss");
+        let codex_path = codex_root.join("rollout-019e253c-6666-7000-9000-aaaaaaaaaaaa.jsonl");
+        fs::write(
+            &codex_path,
+            concat!(
+                "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-6666-7000-9000-aaaaaaaaaaaa\"}}\n",
+                "{\"timestamp\":\"not-a-time\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":2},\"model\":\"gpt-5.5\"}}}\n",
+                "{\"timestamp\":\"2026-07-22T08:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":15,\"output_tokens\":3},\"model\":\"gpt-5.5\"}}}\n",
+            ),
+        )
+        .expect("write Codex partial-loss fixture");
+        let mut codex_index = ScanIndex::default();
+        let codex = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&codex_root),
+            &mut codex_index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan Codex partial-loss fixture");
+        assert!(codex.snapshots.is_empty());
+        // Non-progressing residue: the census completes with the loss named
+        // while the file itself stays un-indexed and retryable.
+        assert!(codex.census_complete);
+        assert_eq!(codex.dropped_usage_record_count, 1);
+
+        let claude_root = temp_dir("claude-partial-timestamp-loss");
+        let claude_path = claude_root.join("019e2700-4444-7000-9000-444444444444.jsonl");
+        fs::write(
+            &claude_path,
+            concat!(
+                "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"system\"}\n",
+                "{\"timestamp\":\"not-a-time\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"assistant\",\"requestId\":\"bad\",\"message\":{\"id\":\"bad\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n",
+                "{\"timestamp\":\"2026-07-22T08:01:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"assistant\",\"requestId\":\"good\",\"message\":{\"id\":\"good\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n",
+            ),
+        )
+        .expect("write Claude partial-loss fixture");
+        let mut claude_index = ScanIndex::default();
+        let claude = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&claude_root),
+            &mut claude_index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan Claude partial-loss fixture");
+        assert!(claude.snapshots.is_empty());
+        // Non-progressing residue: the census completes with the loss named
+        // while the file itself stays un-indexed and retryable.
+        assert!(claude.census_complete);
+        assert_eq!(claude.dropped_usage_record_count, 1);
+
+        let _ = fs::remove_dir_all(codex_root);
+        let _ = fs::remove_dir_all(claude_root);
+    }
+
+    #[test]
+    fn terminal_off_on_codex_and_claude_partial_timestamp_loss_stays_visible() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let codex_root = temp_dir("codex-partial-timestamp-loss");
         let codex_path = codex_root.join("rollout-019e253c-6666-7000-9000-aaaaaaaaaaaa.jsonl");
@@ -62180,6 +63331,74 @@ mod tests {
 
     #[test]
     fn scan_checkpoints_claude_zero_parsed_file_until_it_changes() {
+        let root = temp_dir("claude-retry-zero-parsed");
+        let path = root.join("019e2700-4444-7000-9000-444444444444.jsonl");
+        let session_header = "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"system\"}\n";
+        fs::write(&path, session_header).expect("write empty usage fixture");
+
+        let mut index = ScanIndex::default();
+        let first_empty = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first empty scan");
+        assert_eq!(first_empty.snapshots.len(), 0);
+        assert_eq!(first_empty.scanned_file_count, 1);
+        assert_eq!(first_empty.scanned_session_count, 0);
+
+        let settled_empty = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled empty scan");
+        assert_eq!(settled_empty.snapshots.len(), 0);
+        assert_eq!(settled_empty.scanned_file_count, 0);
+        assert_eq!(settled_empty.scanned_session_count, 0);
+
+        fs::write(
+            &path,
+            format!(
+                "{session_header}{}",
+                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"assistant\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n"
+            ),
+        )
+        .expect("write usage fixture");
+
+        let populated = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("populated scan");
+        assert_eq!(populated.snapshots.len(), 1);
+        assert_eq!(populated.scanned_session_count, 1);
+
+        let settled = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:07:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert_eq!(settled.snapshots.len(), 0);
+        assert_eq!(settled.scanned_file_count, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_off_on_scan_checkpoints_claude_zero_parsed_file_until_it_changes() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let root = temp_dir("claude-retry-zero-parsed");
         let path = root.join("019e2700-4444-7000-9000-444444444444.jsonl");
@@ -66021,6 +67240,52 @@ mod tests {
 
     #[test]
     fn claude_cache_split_new_family_proves_at_healthy_terminal() {
+        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+        let (root, parent, mut items) = cache_split_fixture();
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), vec![cache_split_api_row(&parent, true)])]),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(
+                parent.clone(),
+                vec![complete_trace_row(&parent, "req_cache_split", "")],
+            )]),
+            ..Default::default()
+        };
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&root.join(format!("{parent}.jsonl"))),
+            manifest_index_entry(None),
+        );
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        assert_eq!(
+            items[0].usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        assert!(index.claude_usage_family_witnesses.contains_key(&parent));
+        assert_eq!(items[0].cache_creation_5m_tokens, 2014);
+        assert_eq!(items[0].unattributed_total_tokens, 0);
+        assert_eq!(
+            items[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0001")
+        );
+        validate_snapshot_item(0, &items[0]).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_off_on_claude_cache_split_new_family_proves_at_healthy_terminal() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -66131,6 +67396,269 @@ mod tests {
 
     #[test]
     fn claude_reported_usage_union_assigns_aux_and_preserves_graph() {
+        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+        let (root, parent, mut items) = claude_account_family_fixture();
+        let occurrences = items[0]
+            .claude_usage_occurrences
+            .iter()
+            .map(|(id, occurrence)| {
+                (
+                    format!("{:x}", Sha256::digest(id.as_bytes())),
+                    ClaudeTranscriptUsageOccurrenceWitness::from(occurrence),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let domain = b"claude_transcript_occurrence_map:v1\0";
+        let buffered = serde_json::to_vec(&occurrences).unwrap();
+        let mut previous = Sha256::new();
+        previous.update(domain);
+        previous.update(&buffered);
+        let (streamed, allocation) = crate::retry_allocation_probe::measure(|| {
+            serialized_json_digest(&occurrences, domain).unwrap()
+        });
+        assert_eq!(streamed.finalize(), previous.finalize());
+        assert_eq!(
+            allocation.allocations, 0,
+            "canonical hashing needs no temporary JSON byte buffer"
+        );
+        eprintln!("claude canonical occurrence hash: buffered_bytes={} streamed_allocations=0 identical_bytes_hash=true", buffered.len());
+        let graph_before = items
+            .iter()
+            .map(|item| item.attribution_facts.clone())
+            .collect::<Vec<_>>();
+        let child_agent = "a4d1585d310070d0f";
+        let mut api_rows = (1..=4)
+            .map(|index| complete_api_row(&parent, &format!("req_{index}"), index, 10, 10, 0))
+            .collect::<Vec<_>>();
+        api_rows.push(complete_api_row(&parent, "req_5", 5, 10, 1, 0));
+        // Prompt-suggestion/model-selection work is reported but has no
+        // transcript response. Its aggregate cache write is exact usage while
+        // the TTL split remains intentionally unknown.
+        let mut prompt_suggestion = complete_api_row(&parent, "req_prompt_suggestion", 6, 3, 2, 7);
+        prompt_suggestion.observed_at = "2026-08-02T08:14:00Z".to_string();
+        prompt_suggestion.fingerprint = String::new();
+        let prompt_suggestion_bytes =
+            serde_json::to_vec(&prompt_suggestion).expect("serialize moved API evidence");
+        prompt_suggestion.fingerprint =
+            format!("sha256:{:x}", Sha256::digest(prompt_suggestion_bytes));
+        api_rows.push(prompt_suggestion);
+        let mut trace_rows = (1..=4)
+            .map(|index| complete_trace_row(&parent, &format!("req_{index}"), ""))
+            .collect::<Vec<_>>();
+        trace_rows.push(complete_trace_row(&parent, "req_5", child_agent));
+        trace_rows.push(complete_trace_row(&parent, "req_prompt_suggestion", ""));
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), api_rows)]),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), trace_rows)]),
+            ..Default::default()
+        };
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&root.join(format!("{parent}.jsonl"))),
+            manifest_index_entry(None),
+        );
+        index.files.insert(
+            local_index_key(
+                &root
+                    .join(&parent)
+                    .join("subagents")
+                    .join(format!("agent-{child_agent}.jsonl")),
+            ),
+            manifest_index_entry(None),
+        );
+
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+
+        assert_eq!(items[0].request_count, 5);
+        assert_eq!(items[0].input_tokens, 43);
+        assert_eq!(items[0].output_tokens, 42);
+        assert_eq!(items[0].unattributed_total_tokens, 7);
+        assert_eq!(items[0].usage_buckets.len(), 2);
+        assert_eq!(
+            items[0].source_last_activity_at.as_deref(),
+            Some("2026-08-02T08:14:00Z")
+        );
+        assert_eq!(items[1].request_count, 1);
+        assert_eq!(items[1].input_tokens, 10);
+        assert_eq!(items[1].output_tokens, 1);
+        assert!(items.iter().all(|item| {
+            item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
+        }));
+        if crate::heap_layout_bound::layout_supported() {
+            // Reuse the exact canonical union fixture for the one private
+            // construction boundary: equality + exact credit + no-allocation
+            // one-byte refusal. No new source/identity/test permutation.
+            let family = reconstruct_claude_usage_family(
+                &parent,
+                index.claude_usage_family_witnesses.get(&parent).unwrap(),
+                &api_report,
+                &trace_report,
+                None,
+            )
+            .unwrap();
+            let witness = index.claude_usage_family_witnesses.get(&parent).unwrap();
+            let api = api_report.evidence.get(&parent).unwrap();
+            let trace = trace_report.evidence.get(&parent).unwrap();
+            let construction = claude_native_comparison::qualification_family_construction_peak(
+                &parent,
+                witness,
+                api,
+                trace,
+                &[&items[0], &items[1]],
+            )
+            .unwrap();
+            let (borrowed, allocation) = crate::retry_allocation_probe::measure(|| {
+                reconstruct_claude_usage_ledger_borrowed(&parent, witness, api, trace, None)
+                    .unwrap()
+            });
+            assert!(allocation.requested_peak_with_overlap <= construction);
+            assert_eq!(
+                borrowed.rows_by_member.get(&parent).unwrap().len(),
+                family.rows_by_member.get(&parent).unwrap().len()
+            );
+            eprintln!("native qualification ledger: actual_requested_peak={} prepaid_root_construction={construction} canonical_borrowed_rows=true not_full_frame_or_RSS=true", allocation.requested_peak_with_overlap);
+            drop(borrowed);
+            let rows = family.rows_by_member.get(&parent).unwrap();
+            let peak = reported_usage_construction_peak(&items[0], rows).unwrap();
+            let body = serde_json::to_vec(&items[0]).unwrap();
+            let mut exact =
+                crate::source_rotation::PaidReservation::from_remainder(Some(peak), 0, 0).unwrap();
+            assert_eq!(
+                validate_claude_reported_usage_paid(
+                    &items[0],
+                    rows,
+                    &BTreeSet::new(),
+                    0,
+                    &mut exact,
+                ),
+                Some(true)
+            );
+            assert_eq!(
+                exact.allocation_ceiling(),
+                0,
+                "all validation output dropped before refund"
+            );
+            let mut short =
+                crate::source_rotation::PaidReservation::from_remainder(Some(peak - 1), 0, 0)
+                    .unwrap();
+            let (refused, allocation) = crate::retry_allocation_probe::measure(|| {
+                validate_claude_reported_usage_paid(
+                    &items[0],
+                    rows,
+                    &BTreeSet::new(),
+                    0,
+                    &mut short,
+                )
+            });
+            assert_eq!(refused, None);
+            assert_eq!(allocation.allocations, 0);
+            assert_eq!(serde_json::to_vec(&items[0]).unwrap(), body);
+        }
+        let child_curve = items[1].context_curve.as_ref().expect("child curve");
+        assert_eq!(child_curve.coverage, "complete");
+        assert_eq!(child_curve.total_owned_request_count, 1);
+        assert_eq!(child_curve.points[0].effective_input_tokens, 10);
+        assert_eq!(child_curve.points[0].owned_request_ordinal, 1);
+        assert_eq!(
+            items[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0005")
+        );
+        assert_eq!(
+            items[1].cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0001")
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.attribution_facts.clone())
+                .collect::<Vec<_>>(),
+            graph_before
+        );
+        validate_snapshot_item(0, &items[0]).expect("root union satisfies wire invariants");
+        validate_snapshot_item(1, &items[1]).expect("child union satisfies wire invariants");
+        assert!(index.claude_usage_family_witnesses.contains_key(&parent));
+        let serialized_index = serde_json::to_string(&index).expect("serialize local index");
+        assert!(!serialized_index.contains("req_prompt_suggestion"));
+        assert!(!serialized_index.contains("req_5"));
+
+        // The terminal page mints a content-free family witness. A later
+        // child-only correction can reconstruct the same exact ledger without
+        // pretending the bounded page is a new complete census.
+        let (reparsed_root, _, mut reparsed) = claude_account_family_fixture();
+        let mut child_only = vec![reparsed.remove(1)];
+        apply_claude_reported_usage_with_index(
+            &mut child_only,
+            &api_report,
+            &trace_report,
+            &mut index,
+            false,
+            "2026-08-02T07:11:00Z",
+        );
+        assert_eq!(child_only[0].request_count, 1);
+        assert_eq!(
+            child_only[0].usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        let mut unchanged_page = Vec::new();
+        apply_claude_reported_usage_with_index(
+            &mut unchanged_page,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-02T07:11:30Z",
+        );
+        assert!(
+            index.claude_usage_family_witnesses.contains_key(&parent),
+            "an unchanged terminal census retains a revalidated witness"
+        );
+        let mut unhealthy_trace = trace_report.clone();
+        unhealthy_trace.malformed_lines = 1;
+        let (unhealthy_root, _, mut unhealthy_reparse) = claude_account_family_fixture();
+        let mut unhealthy_child = vec![unhealthy_reparse.remove(1)];
+        let disposition = apply_claude_reported_usage_with_index(
+            &mut unhealthy_child,
+            &api_report,
+            &unhealthy_trace,
+            &mut index,
+            false,
+            "2026-08-02T07:12:00Z",
+        );
+        assert_eq!(unhealthy_child[0].usage_accounting_contract, None);
+        assert_eq!(disposition.quarantined_entity_count(), 1);
+        let mut uploadable = unhealthy_child;
+        disposition.retain_uploadable(&mut uploadable);
+        assert!(
+            uploadable.is_empty(),
+            "the demoting body never reaches upload"
+        );
+        assert!(
+            index.claude_usage_family_witnesses.contains_key(&parent),
+            "reconstruction failure retains the last exact proven witness"
+        );
+        assert!(index
+            .claude_usage_authority_quarantine
+            .contains_key(&parent));
+        let _ = fs::remove_dir_all(unhealthy_root);
+        let _ = fs::remove_dir_all(reparsed_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_reported_usage_union_assigns_aux_and_preserves_graph() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -66393,6 +67921,332 @@ mod tests {
 
     #[test]
     fn exact_seven_entity_authority_demotion_cohort_reproves_before_upload() {
+        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshot-audit/claude-authority-demotion-cohort.v1.json"
+        ))
+        .expect("parse exact production cohort fixture");
+        assert_eq!(fixture["contract"], "claude_authority_demotion_cohort:v1");
+        assert_eq!(
+            fixture["reject_reason"],
+            "usage_accounting_authority_downgrade"
+        );
+        assert!(sha256_hex_is_well_formed(
+            fixture["root_session_id_sha256"]
+                .as_str()
+                .expect("fixture root session hash")
+        ));
+        let root_session_id = "11111111-2222-3333-4444-555555555555".to_string();
+        let members = fixture["members"]
+            .as_array()
+            .expect("fixture family members");
+        assert_eq!(members.len(), 7);
+
+        let root = temp_dir("claude-authority-demotion-seven");
+        let mut items = Vec::new();
+        let mut index = ScanIndex::default();
+        let mut api_rows = Vec::new();
+        let mut trace_rows = Vec::new();
+        for (offset, member) in members.iter().enumerate() {
+            assert!(sha256_hex_is_well_formed(
+                member["source_session_id_sha256"]
+                    .as_str()
+                    .expect("fixture source session hash")
+            ));
+            let source_session_id = if offset == 0 {
+                root_session_id.clone()
+            } else {
+                format!("{root_session_id}_agent-{offset:016x}")
+            };
+            let rejected_fingerprint = member["rejected_snapshot_fingerprint"]
+                .as_str()
+                .expect("fixture rejected fingerprint");
+            assert!(sha256_hex_is_well_formed(rejected_fingerprint));
+            let agent_id = source_session_id.strip_prefix(&format!("{root_session_id}_agent-"));
+            let path = match agent_id {
+                Some(agent_id) => root
+                    .join(&root_session_id)
+                    .join("subagents")
+                    .join(format!("agent-{agent_id}.jsonl")),
+                None => root.join(format!("{root_session_id}.jsonl")),
+            };
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create exact cohort member directory");
+            }
+            let request_id = format!("cohort-request-{offset}");
+            let line = json!({
+                "timestamp": format!("2026-08-23T18:20:{offset:02}Z"),
+                "type": "assistant",
+                "sessionId": root_session_id,
+                "agentId": agent_id,
+                "isSidechain": agent_id.is_some(),
+                "requestId": request_id,
+                "message": {
+                    "id": format!("cohort-message-{offset}"),
+                    "model": "claude-haiku-4-5",
+                    "usage": {"input_tokens": 10, "output_tokens": 1}
+                }
+            });
+            fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&line).expect("serialize cohort transcript row")
+                ),
+            )
+            .expect("write exact cohort member");
+            let mut parsed = parse_claude_code_jsonl_file(
+                &path,
+                "2026-08-23T18:40:00Z",
+                rejected_fingerprint.to_string(),
+            )
+            .expect("parse exact cohort member");
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].source_session_id, source_session_id);
+            items.append(&mut parsed);
+
+            let mut entry = manifest_index_entry(None);
+            entry.source_file_fingerprint = rejected_fingerprint.to_string();
+            index.files.insert(local_index_key(&path), entry);
+            api_rows.push(complete_api_row(
+                &root_session_id,
+                &request_id,
+                (offset + 1) as u64,
+                10,
+                1,
+                0,
+            ));
+            trace_rows.push(complete_trace_row(
+                &root_session_id,
+                &request_id,
+                agent_id.unwrap_or_default(),
+            ));
+        }
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(root_session_id.clone(), api_rows)]),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(root_session_id.clone(), trace_rows)]),
+            ..Default::default()
+        };
+
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-23T18:40:00Z",
+        );
+        assert!(items.iter().all(|item| {
+            item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
+        }));
+        let proven_witness = index
+            .claude_usage_family_witnesses
+            .get(&root_session_id)
+            .cloned()
+            .expect("seed exact proven family witness");
+
+        let mut weaker_revision = items.clone();
+        for (item, member) in weaker_revision.iter_mut().zip(members) {
+            item.snapshot_fingerprint = member["rejected_snapshot_fingerprint"]
+                .as_str()
+                .expect("fixture rejected fingerprint")
+                .to_string();
+        }
+        let missing_api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+        let missing_trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+        let disposition = apply_claude_reported_usage_with_index(
+            &mut weaker_revision,
+            &missing_api,
+            &missing_trace,
+            &mut index,
+            true,
+            "2026-08-23T18:45:00Z",
+        );
+        assert_eq!(disposition.quarantined_entity_count(), 7);
+        assert!(weaker_revision
+            .iter()
+            .all(|item| item.usage_accounting_contract.is_none()));
+        let rejected_hashes = weaker_revision
+            .iter()
+            .map(|item| item.snapshot_fingerprint.as_str())
+            .collect::<BTreeSet<_>>();
+        let fixture_hashes = members
+            .iter()
+            .map(|member| {
+                member["rejected_snapshot_fingerprint"]
+                    .as_str()
+                    .expect("fixture rejected fingerprint")
+            })
+            .collect::<BTreeSet<_>>();
+        assert_ne!(
+            rejected_hashes, fixture_hashes,
+            "v28 recomputes semantic identity after clearing unowned posture"
+        );
+        assert!(rejected_hashes
+            .iter()
+            .all(|fingerprint| sha256_hex_is_well_formed(fingerprint)));
+        // Design E: the root's only record predates its file, so its scalars
+        // stay cleared; subagent files keep their own. The demotion hold
+        // below still keeps every body from uploading (R7).
+        for item in &weaker_revision {
+            let tuple = (
+                item.first_turn_context_tokens,
+                item.peak_context_fill_tokens,
+                item.last_turn_context_tokens,
+                item.compaction_count,
+            );
+            if item.source_session_id == root_session_id {
+                assert_eq!(tuple, (None, None, None, None));
+            } else {
+                assert_eq!(tuple, (Some(10), Some(10), Some(10), Some(0)));
+            }
+        }
+        assert_eq!(
+            disposition
+                .context_file_birth
+                .demotion_quarantined_session_count,
+            7
+        );
+        // SOURCE condition 6 with a local witness: the six contract-less
+        // bodies carrying scalars are counted and held below, never sent.
+        assert_eq!(
+            disposition
+                .context_file_birth
+                .contractless_scalars_witness_present_session_count,
+            6
+        );
+        assert_eq!(
+            disposition
+                .context_file_birth
+                .contractless_scalars_witness_missing_session_count,
+            0
+        );
+        let mut uploadable = weaker_revision.clone();
+        disposition.retain_uploadable(&mut uploadable);
+        assert!(uploadable.is_empty(), "all seven demoting bodies are held");
+        assert_eq!(
+            index.claude_usage_family_witnesses.get(&root_session_id),
+            Some(&proven_witness),
+            "the exact proven ownership witness survives reconstruction failure"
+        );
+        let quarantine = index
+            .claude_usage_authority_quarantine
+            .get(&root_session_id)
+            .expect("family is durably quarantined");
+        assert_eq!(quarantine.member_source_file_fingerprints.len(), 7);
+        assert_eq!(quarantine.failed_reconstruction_count, 1);
+        assert_eq!(
+            quarantine.disposition,
+            ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+        );
+        assert_eq!(
+            quarantine
+                .member_source_file_fingerprints
+                .values()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            fixture_hashes.iter().copied().map(str::to_string).collect()
+        );
+
+        let mut exhausted_index = index.clone();
+        for expected_failure_count in 2..=MAX_CLAUDE_USAGE_AUTHORITY_FAILURES {
+            exhausted_index
+                .claude_usage_authority_quarantine
+                .get_mut(&root_session_id)
+                .expect("family remains accounted while retrying")
+                .retry_after_unix_seconds = 0;
+            let mut still_unproven = weaker_revision.clone();
+            let held = apply_claude_reported_usage_with_index(
+                &mut still_unproven,
+                &missing_api,
+                &missing_trace,
+                &mut exhausted_index,
+                true,
+                "2026-08-23T18:46:00Z",
+            );
+            assert_eq!(held.quarantined_entity_count(), 7);
+            let record = exhausted_index
+                .claude_usage_authority_quarantine
+                .get(&root_session_id)
+                .expect("unproven family remains explicitly accounted");
+            assert_eq!(record.failed_reconstruction_count, expected_failure_count);
+            assert_eq!(
+                record.disposition,
+                if expected_failure_count == MAX_CLAUDE_USAGE_AUTHORITY_FAILURES {
+                    ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+                } else {
+                    ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+                }
+            );
+        }
+        assert_eq!(exhausted_index.claude_usage_authority_pending_count(), 0);
+        assert_eq!(
+            exhausted_index.claude_usage_authority_terminal_entity_count(),
+            7
+        );
+        let health_root = temp_dir("claude-authority-terminal-health");
+        let mut health_index = ScanIndex::default();
+        let mut terminal_health = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&health_root),
+            &mut health_index,
+            "2026-08-23T18:47:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan healthy empty source");
+        assert!(terminal_health.census_complete);
+        assert!(!exhausted_index.account_claude_usage_authority_census_health(&mut terminal_health));
+        assert!(
+            terminal_health.census_complete,
+            "named terminal loss completes the census instead of deadlocking it"
+        );
+        assert_eq!(terminal_health.ownership_incomplete_file_count, 7);
+        assert_eq!(terminal_health.terminal_ownership_incomplete_file_count, 7);
+        assert_eq!(
+            terminal_health.terminal_ownership_incomplete_file_count,
+            terminal_health.ownership_incomplete_file_count,
+            "every exhausted authority entity is disclosed as terminal residue"
+        );
+        let _ = fs::remove_dir_all(health_root);
+
+        index
+            .claude_usage_authority_quarantine
+            .get_mut(&root_session_id)
+            .expect("original family remains retryable")
+            .retry_after_unix_seconds = 0;
+
+        let mut reconstructed_revision = weaker_revision;
+        let recovered = apply_claude_reported_usage_with_index(
+            &mut reconstructed_revision,
+            &api_report,
+            &trace_report,
+            &mut index,
+            false,
+            "2026-08-23T18:50:00Z",
+        );
+        assert_eq!(recovered.quarantined_entity_count(), 0);
+        assert!(reconstructed_revision.iter().all(|item| {
+            item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
+        }));
+        let mut uploadable = reconstructed_revision;
+        recovered.retain_uploadable(&mut uploadable);
+        assert_eq!(uploadable.len(), 7, "re-proven revisions reach upload");
+        assert!(!index
+            .claude_usage_authority_quarantine
+            .contains_key(&root_session_id));
+        assert!(!index
+            .claude_usage_family_pending
+            .contains_key(&root_session_id));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_off_on_exact_seven_entity_authority_demotion_cohort_reproves_before_upload() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
@@ -66741,6 +68595,158 @@ mod tests {
 
     #[test]
     fn claude_invalid_family_can_hide_copy_from_provider_owned_session() {
+        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+        let (root, parent, mut items) = claude_account_family_fixture();
+        let hidden_copy_id = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let hidden_copy_path = root.join(format!("{hidden_copy_id}.jsonl"));
+        fs::write(
+            &hidden_copy_path,
+            format!(
+                "{{\"timestamp\":\"2026-08-02T07:00:05Z\",\"type\":\"assistant\",\"sessionId\":\"{hidden_copy_id}\",\"requestId\":\"req_5\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":1}}}}}}\n"
+            ),
+        )
+        .expect("write hidden-copy fixture");
+        let mut hidden_copy = parse_claude_code_jsonl_file(
+            &hidden_copy_path,
+            "2026-08-02T07:01:00Z",
+            "hidden-copy-fp".to_string(),
+        )
+        .expect("parse hidden-copy family")
+        .remove(0);
+        assert_eq!(hidden_copy.claude_usage_request_ids.len(), 1);
+        assert!(hidden_copy.claude_usage_request_ids.contains("req_5"));
+
+        // Model a bounded family whose transcript request identity was retained
+        // but whose occurrence proof could not be completed. The copied req_5
+        // is therefore invisible to the ordinary duplicate fold: only the
+        // invalid-family guard can stop the apparently healthy provider-owned
+        // child from claiming the same request and emitting a false curve.
+        hidden_copy.claude_usage_occurrences.clear();
+        items.push(hidden_copy);
+
+        let child_agent = "a4d1585d310070d0f";
+        let mut api_rows = (1..=4)
+            .map(|index| complete_api_row(&parent, &format!("req_{index}"), index, 10, 10, 0))
+            .collect::<Vec<_>>();
+        api_rows.push(complete_api_row(&parent, "req_5", 5, 10, 1, 0));
+        let mut trace_rows = (1..=4)
+            .map(|index| complete_trace_row(&parent, &format!("req_{index}"), ""))
+            .collect::<Vec<_>>();
+        trace_rows.push(complete_trace_row(&parent, "req_5", child_agent));
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), api_rows)]),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), trace_rows)]),
+            ..Default::default()
+        };
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&root.join(format!("{parent}.jsonl"))),
+            manifest_index_entry(None),
+        );
+        index.files.insert(
+            local_index_key(
+                &root
+                    .join(&parent)
+                    .join("subagents")
+                    .join(format!("agent-{child_agent}.jsonl")),
+            ),
+            manifest_index_entry(None),
+        );
+        index.files.insert(
+            local_index_key(&hidden_copy_path),
+            manifest_index_entry(None),
+        );
+        // A subagent file is exempt from the birth rule and keeps its own
+        // full session-start split.
+        let expected_child_start = items[1].session_start.clone();
+
+        let disposition = apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+
+        let child = &items[1];
+        assert_eq!(
+            child.usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1"),
+            "the healthy family's provider ledger remains exact"
+        );
+        assert_eq!(
+            child
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("scalars_file_birth_only"),
+            "an invalid peer family can hide a copied request, so the curve stays closed"
+        );
+        assert_eq!(
+            child.claude_file_birth_verdict(),
+            Some(ClaudeFileBirthVerdict::Admitted)
+        );
+        assert_eq!(
+            child.context_curve,
+            Some(unavailable_context_curve(
+                CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+                CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
+                "scalars_file_birth_only",
+                0,
+                0,
+            ))
+        );
+        // The hidden family is the copier: telemetry assigns req_5 to the
+        // child's own root, so the file birth rule keeps the child's scalars.
+        assert_eq!(
+            disposition.posture_admission(&child.source_session_id),
+            Some("file_birth_rule")
+        );
+        assert_eq!(
+            (
+                child.first_turn_context_tokens,
+                child.peak_context_fill_tokens,
+                child.last_turn_context_tokens,
+                child.compaction_count,
+            ),
+            (Some(10), Some(10), Some(10), Some(0))
+        );
+        assert_eq!(child.session_start, expected_child_start);
+        assert!(child.cache_observations.is_none());
+        let hidden_copy = &items[2];
+        assert_eq!(hidden_copy.usage_accounting_contract, None);
+        // Every record predates the copy's file birth: nothing is its own.
+        assert_eq!(
+            disposition.posture_admission(hidden_copy_id),
+            Some("withheld_all_copied")
+        );
+        assert_eq!(
+            (
+                hidden_copy.first_turn_context_tokens,
+                hidden_copy.peak_context_fill_tokens,
+                hidden_copy.last_turn_context_tokens,
+                hidden_copy.compaction_count,
+            ),
+            (None, None, None, None)
+        );
+        assert!(index.claude_duplicate_request_witness_overflowed);
+        assert!(!index
+            .claude_usage_family_pending
+            .contains_key(hidden_copy_id));
+        assert!(index.claude_duplicate_request_owners.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_invalid_family_can_hide_copy_from_provider_owned_session() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -66975,6 +68981,267 @@ mod tests {
 
     #[test]
     fn claude_duplicate_census_counts_separate_complete_invalid_and_owner_bound() {
+        let (root, parent, items) = claude_account_family_fixture();
+
+        // The fixture census clock; a fresh closure schedules its next full
+        // re-arm one base backoff later.
+        let next_full_rearm = Some(1_785_654_600 + CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS);
+
+        // Complete valid census: fence stays clear and no cause fires.
+        let (_, _, counts) = claude_census_counts_run_twice(
+            &items,
+            &ScanIndex::default(),
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                pending_occurrence_count: 5,
+                coverage_complete: true,
+                ..Default::default()
+            }
+        );
+
+        // Invalid census from a family whose occurrence proof is incomplete.
+        let mut invalid_items = items.clone();
+        invalid_items[1].claude_usage_occurrences.clear();
+        let (_, invalid_index, counts) = claude_census_counts_run_twice(
+            &invalid_items,
+            &ScanIndex::default(),
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(invalid_index.claude_duplicate_request_witness_overflowed);
+        assert!(invalid_index.claude_duplicate_request_owners.is_empty());
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_after: true,
+                census_invalid: true,
+                invalid_current_window_family_count: 1,
+                page_invalidated_identity_count: 1,
+                coverage_complete: true,
+                full_rearm: true,
+                rearm_attempt: 1,
+                full_rearm_deferred_until: next_full_rearm,
+                ..Default::default()
+            }
+        );
+
+        // The same page before the terminal pass: invalid, but the fence and
+        // the terminal-only family count are untouched.
+        let (_, open_index, counts) = claude_census_counts_run_twice(
+            &invalid_items,
+            &ScanIndex::default(),
+            false,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(!open_index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_invalid: true,
+                page_invalidated_identity_count: 1,
+                ..Default::default()
+            }
+        );
+
+        // Invalid census from the pending-occurrence cap.
+        let (_, cap_index, counts) = claude_census_counts_run_twice(
+            &items,
+            &ScanIndex::default(),
+            true,
+            1,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(cap_index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_after: true,
+                census_invalid: true,
+                invalid_current_window_family_count: 1,
+                page_invalidated_cap_count: 1,
+                coverage_complete: true,
+                full_rearm: true,
+                rearm_attempt: 1,
+                full_rearm_deferred_until: next_full_rearm,
+                ..Default::default()
+            }
+        );
+
+        // Stale, unquarantined pending from an older window whose family has
+        // no indexed file left: a complete census proves it vanished, so it
+        // cannot hide a current request and does not poison the census.
+        let mut stale_index = ScanIndex::default();
+        stale_index.claude_usage_family_pending.insert(
+            "stale-root".to_string(),
+            ClaudeUsageFamilyPending {
+                census_window_end: "2026-08-01T00:00:00Z".to_string(),
+                member_request_id_hashes: BTreeMap::new(),
+                member_occurrences: BTreeMap::new(),
+                invalid: false,
+                idless_revision: None,
+            },
+        );
+        let (_, stale_after, counts) = claude_census_counts_run_twice(
+            &items,
+            &stale_index,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(!stale_after.claude_duplicate_request_witness_overflowed);
+        assert!(!stale_after
+            .claude_usage_family_pending
+            .contains_key("stale-root"));
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                pending_occurrence_count: 5,
+                coverage_complete: true,
+                ..Default::default()
+            }
+        );
+
+        // The same stale pending while one of its files is still indexed is
+        // an invalid census: no current-window family is invalid, and the
+        // unobserved member also leaves coverage incomplete.
+        stale_index.files.insert(
+            "/opaque/stale-root.jsonl".to_string(),
+            manifest_index_entry(Some("stale-settled")),
+        );
+        let (_, stale_after, counts) = claude_census_counts_run_twice(
+            &items,
+            &stale_index,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(stale_after.claude_duplicate_request_witness_overflowed);
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_after: true,
+                census_invalid: true,
+                pending_occurrence_count: 5,
+                coverage_missing_member_count: 1,
+                full_rearm: true,
+                rearm_attempt: 1,
+                full_rearm_deferred_until: next_full_rearm,
+                ..Default::default()
+            }
+        );
+
+        // The same stale member pending, also only in the old window, keeps
+        // it fail closed even without a root file.
+        let mut stale_member_index = ScanIndex::default();
+        stale_member_index.claude_usage_family_pending.insert(
+            "stale-root".to_string(),
+            ClaudeUsageFamilyPending {
+                census_window_end: "2026-08-01T00:00:00Z".to_string(),
+                member_request_id_hashes: BTreeMap::from([(
+                    "stale-member".to_string(),
+                    BTreeSet::new(),
+                )]),
+                member_occurrences: BTreeMap::new(),
+                invalid: false,
+                idless_revision: None,
+            },
+        );
+        stale_member_index.files.insert(
+            "/opaque/stale-member.jsonl".to_string(),
+            manifest_index_entry(Some("stale-member-settled")),
+        );
+        let (_, stale_member_after, counts) = claude_census_counts_run_twice(
+            &items,
+            &stale_member_index,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(stale_member_after.claude_duplicate_request_witness_overflowed);
+        assert!(counts.census_invalid);
+
+        // Owner bound: a valid census whose cross-family duplicates exceed
+        // the owner limit sets the fence without any invalid cause.
+        let copy_id = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let mut copy = items[0].clone();
+        copy.source_session_id = copy_id.to_string();
+        for fact in &mut copy.attribution_facts {
+            if fact.value == parent {
+                fact.value = copy_id.to_string();
+            }
+        }
+        assert_eq!(claude_snapshot_family_root(&copy), copy_id);
+        let mut bound_items = items.clone();
+        bound_items.push(copy);
+        let (_, bound_index, counts) = claude_census_counts_run_twice(
+            &bound_items,
+            &ScanIndex::default(),
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            1,
+        );
+        assert!(bound_index.claude_duplicate_request_witness_overflowed);
+        assert!(bound_index.claude_duplicate_request_owners.is_empty());
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_after: true,
+                pending_occurrence_count: 9,
+                coverage_complete: true,
+                full_rearm: true,
+                rearm_attempt: 1,
+                full_rearm_deferred_until: next_full_rearm,
+                ..Default::default()
+            }
+        );
+
+        // Once the copy is gone, the next valid, fully covered terminal pass
+        // clears the fence, re-emits posture once, and resets the backoff.
+        let (_, cleared_index, counts) = claude_census_counts_run_twice(
+            &items,
+            &bound_index,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            1,
+        );
+        assert!(!cleared_index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(cleared_index.claude_duplicate_fence_rearm_attempt, 0);
+        assert_eq!(
+            cleared_index.claude_duplicate_fence_next_full_rearm_unix_seconds,
+            None
+        );
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_before: true,
+                pending_occurrence_count: 5,
+                coverage_complete: true,
+                full_rearm: true,
+                ..Default::default()
+            }
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_duplicate_census_counts_separate_complete_invalid_and_owner_bound() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (root, parent, items) = claude_account_family_fixture();
 
@@ -67329,6 +69596,49 @@ mod tests {
 
     #[test]
     fn claude_duplicate_census_counts_encoding_is_bounded() {
+        let max = ClaudeDuplicateCensusCounts {
+            census_complete: true,
+            fence_before: true,
+            fence_after: true,
+            census_invalid: true,
+            invalid_current_window_family_count: usize::MAX,
+            pending_occurrence_count: usize::MAX,
+            page_invalidated_identity_count: usize::MAX,
+            page_invalidated_occurrence_mismatch_count: usize::MAX,
+            page_invalidated_cap_count: usize::MAX,
+            page_invalidated_member_changed_count: usize::MAX,
+            coverage_complete: true,
+            coverage_missing_member_count: usize::MAX,
+            full_rearm: true,
+            rearm_attempt: u8::MAX,
+            full_rearm_deferred_until: Some(u64::MAX),
+            request_census: None,
+        };
+        let encoded = serde_json::to_string(&max).expect("encode counters");
+        assert!(encoded.len() <= 589, "{} bytes", encoded.len());
+
+        let stats = crate::snapshot_sync::ClaudeLocalEvidenceStats {
+            duplicate_census: max,
+            ..Default::default()
+        };
+        let line = serde_json::to_string(&stats).expect("encode stats");
+        let mut without = serde_json::to_value(&stats).expect("stats value");
+        let nested = without
+            .as_object_mut()
+            .expect("stats object")
+            .remove("duplicate_census")
+            .expect("nested counters");
+        assert_eq!(nested, serde_json::to_value(max).expect("counters value"));
+        let baseline = serde_json::to_string(&without).expect("encode baseline");
+        assert!(
+            line.len() - baseline.len() <= 589 + r#","duplicate_census":"#.len(),
+            "line grew by {} bytes",
+            line.len() - baseline.len()
+        );
+    }
+
+    #[test]
+    fn terminal_off_on_claude_duplicate_census_counts_encoding_is_bounded() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let max = ClaudeDuplicateCensusCounts {
@@ -67345,7 +69655,6 @@ mod tests {
             coverage_complete: true,
             coverage_missing_member_count: usize::MAX,
             full_rearm: true,
-            rearm_full_suppressed: u64::MAX,
             rearm_attempt: u8::MAX,
             full_rearm_deferred_until: Some(u64::MAX),
             request_census: None,
@@ -67484,6 +69793,272 @@ mod tests {
 
     #[test]
     fn claude_legacy_fork_prefix_is_excluded_only_with_exact_external_owner() {
+        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+        let root = temp_dir("claude-legacy-fork-prefix");
+        let parent = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let child = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+        let parent_path = root.join(format!("{parent}.jsonl"));
+        let child_path = root.join(format!("{child}.jsonl"));
+        fs::write(
+            &parent_path,
+            format!(
+                concat!(
+                    "{{\"uuid\":\"shared-assistant\",\"timestamp\":\"2026-08-02T07:00:01Z\",\"type\":\"assistant\",\"sessionId\":\"{parent}\",\"requestId\":\"req_shared\",\"message\":{{\"id\":\"msg_shared\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2,\"cache_read_input_tokens\":895000}}}}}}\n",
+                    "{{\"uuid\":\"parent-assistant\",\"timestamp\":\"2026-08-02T07:00:02Z\",\"type\":\"assistant\",\"sessionId\":\"{parent}\",\"requestId\":\"req_parent\",\"message\":{{\"id\":\"msg_parent\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":11,\"output_tokens\":3}}}}}}\n"
+                ),
+                parent = parent,
+            ),
+        )
+        .expect("write parent branch");
+        fs::write(
+            &child_path,
+            format!(
+                concat!(
+                    "{{\"uuid\":\"shared-assistant\",\"timestamp\":\"2026-08-02T07:00:01Z\",\"type\":\"assistant\",\"sessionId\":\"{child}\",\"requestId\":\"req_shared\",\"message\":{{\"id\":\"msg_shared\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2,\"cache_read_input_tokens\":895000}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-02T07:00:01.500Z\",\"sessionId\":\"{child}\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{{\"preTokens\":895010,\"postTokens\":100000,\"durationMs\":20}}}}\n",
+                    "{{\"uuid\":\"child-assistant\",\"timestamp\":\"2026-08-02T07:00:03Z\",\"type\":\"assistant\",\"sessionId\":\"{child}\",\"requestId\":\"req_child\",\"message\":{{\"id\":\"msg_child\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":100}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-02T07:00:03.500Z\",\"sessionId\":\"{child}\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{{\"preTokens\":112,\"postTokens\":50,\"durationMs\":10}}}}\n",
+                    "{{\"uuid\":\"child-assistant-2\",\"timestamp\":\"2026-08-02T07:00:04Z\",\"type\":\"assistant\",\"sessionId\":\"{child}\",\"requestId\":\"req_child_2\",\"message\":{{\"id\":\"msg_child_2\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":14,\"output_tokens\":5,\"cache_read_input_tokens\":200}}}}}}\n"
+                ),
+                child = child,
+            ),
+        )
+        .expect("write legacy child branch");
+        let mut items = parse_claude_code_jsonl_file(
+            &parent_path,
+            "2026-08-02T07:10:00Z",
+            "parent-fp".to_string(),
+        )
+        .expect("parse parent");
+        items.extend(
+            parse_claude_code_jsonl_file(
+                &child_path,
+                "2026-08-02T07:10:00Z",
+                "child-fp".to_string(),
+            )
+            .expect("parse child"),
+        );
+        assert_eq!(items[1].request_count, 3, "raw child double-counts prefix");
+        assert_eq!(items[1].first_turn_context_tokens, Some(895_010));
+        assert_eq!(items[1].peak_context_fill_tokens, Some(895_010));
+        assert_eq!(items[1].compaction_count, Some(2));
+
+        let with_cache_read = |mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence,
+                               tokens| {
+            row.cache_read_tokens = tokens;
+            row.fingerprint.clear();
+            let bytes = serde_json::to_vec(&row).expect("serialize API evidence");
+            row.fingerprint = format!("sha256:{:x}", Sha256::digest(bytes));
+            row
+        };
+        let shared_api =
+            with_cache_read(complete_api_row(parent, "req_shared", 1, 10, 2, 0), 895_000);
+        let child_api = with_cache_read(complete_api_row(child, "req_child", 3, 12, 4, 0), 100);
+        let child_api_2 = with_cache_read(complete_api_row(child, "req_child_2", 4, 14, 5, 0), 200);
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([
+                (
+                    parent.to_string(),
+                    vec![
+                        shared_api,
+                        complete_api_row(parent, "req_parent", 2, 11, 3, 0),
+                    ],
+                ),
+                (child.to_string(), vec![child_api, child_api_2]),
+            ]),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([
+                (
+                    parent.to_string(),
+                    vec![
+                        complete_trace_row(parent, "req_shared", ""),
+                        complete_trace_row(parent, "req_parent", ""),
+                    ],
+                ),
+                (
+                    child.to_string(),
+                    vec![
+                        complete_trace_row(child, "req_child", ""),
+                        complete_trace_row(child, "req_child_2", ""),
+                    ],
+                ),
+            ]),
+            ..Default::default()
+        };
+        let mut index = ScanIndex::default();
+        index
+            .files
+            .insert(local_index_key(&parent_path), manifest_index_entry(None));
+        index
+            .files
+            .insert(local_index_key(&child_path), manifest_index_entry(None));
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        assert_eq!(items[0].request_count, 2);
+        assert_eq!(items[1].request_count, 2);
+        assert_eq!(items[1].input_tokens, 26);
+        assert_eq!(items[1].output_tokens, 9);
+        assert_eq!(items[1].first_turn_context_tokens, Some(112));
+        assert_eq!(items[1].peak_context_fill_tokens, Some(214));
+        assert_eq!(items[1].last_turn_context_tokens, Some(214));
+        assert_eq!(items[1].compaction_count, Some(1));
+        assert_eq!(
+            items[1].compaction_timestamps,
+            vec!["2026-08-02T07:00:03.500Z".to_string()]
+        );
+        assert_eq!(items[1].compaction_total_pre_tokens, Some(112));
+        assert_eq!(items[1].compaction_total_post_tokens, Some(50));
+        assert_eq!(items[1].compaction_total_duration_ms, Some(10));
+        assert!(items.iter().all(|item| {
+            item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
+        }));
+        let child_curve = items[1]
+            .context_curve
+            .as_ref()
+            .expect("legacy child owned curve");
+        assert_eq!(child_curve.coverage, "complete");
+        assert_eq!(child_curve.total_owned_request_count, 2);
+        assert_eq!(child_curve.points[0].effective_input_tokens, 112);
+        assert_eq!(child_curve.total_compaction_boundary_count, 1);
+        let child_witness = index
+            .claude_usage_family_witnesses
+            .get(child)
+            .expect("legacy child witness");
+        assert_eq!(
+            child_witness.legacy_owner_roots,
+            BTreeSet::from([parent.to_string()])
+        );
+        let serialized = serde_json::to_string(&index).expect("serialize index");
+        assert!(!serialized.contains("req_shared"));
+
+        // A later child-only correction must revalidate the exact external
+        // owner evidence, not trust the persisted prefix decision by itself.
+        let mut child_only = parse_claude_code_jsonl_file(
+            &child_path,
+            "2026-08-02T07:11:00Z",
+            "child-fp-2".to_string(),
+        )
+        .expect("reparse child");
+        apply_claude_reported_usage_with_index(
+            &mut child_only,
+            &api_report,
+            &trace_report,
+            &mut index,
+            false,
+            "2026-08-02T07:11:00Z",
+        );
+        assert_eq!(child_only[0].request_count, 2);
+        assert_eq!(child_only[0].first_turn_context_tokens, Some(112));
+        assert_eq!(child_only[0].peak_context_fill_tokens, Some(214));
+        assert_eq!(child_only[0].compaction_count, Some(1));
+        assert_eq!(
+            child_only[0].usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        let child_only_api =
+            with_cache_read(complete_api_row(child, "req_child", 3, 12, 4, 0), 100);
+        let child_only_api_2 =
+            with_cache_read(complete_api_row(child, "req_child_2", 4, 14, 5, 0), 200);
+        let child_only_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(child.to_string(), vec![child_only_api, child_only_api_2])]),
+            health: Default::default(),
+        };
+        let child_only_trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(
+                child.to_string(),
+                vec![
+                    complete_trace_row(child, "req_child", ""),
+                    complete_trace_row(child, "req_child_2", ""),
+                ],
+            )]),
+            ..Default::default()
+        };
+        let mut unproven =
+            parse_claude_code_jsonl_file(&child_path, "2026-08-02T07:12:00Z", "3".repeat(64))
+                .expect("reparse unproven child");
+        let unproven_disposition = apply_claude_reported_usage_with_index(
+            &mut unproven,
+            &child_only_report,
+            &child_only_trace,
+            &mut index,
+            false,
+            "2026-08-02T07:12:00Z",
+        );
+        assert_eq!(unproven[0].request_count, 3);
+        assert_eq!(unproven[0].usage_accounting_contract, None);
+        assert_eq!(unproven_disposition.quarantined_entity_count(), 1);
+        assert_eq!(unproven[0].first_turn_context_tokens, None);
+        assert_eq!(unproven[0].peak_context_fill_tokens, None);
+        assert_eq!(unproven[0].last_turn_context_tokens, None);
+        assert_eq!(unproven[0].compaction_count, None);
+        assert!(unproven[0].compaction_timestamps.is_empty());
+        assert_eq!(unproven[0].compaction_total_pre_tokens, None);
+        assert_eq!(unproven[0].compaction_total_post_tokens, None);
+        assert_eq!(unproven[0].compaction_total_duration_ms, None);
+        assert_eq!(
+            unproven[0]
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("ownership_unresolved")
+        );
+        let mut unhealthy_terminal = Vec::new();
+        apply_claude_reported_usage_with_index(
+            &mut unhealthy_terminal,
+            &child_only_report,
+            &child_only_trace,
+            &mut index,
+            true,
+            "2026-08-02T07:12:30Z",
+        );
+        assert!(index.claude_usage_family_witnesses.contains_key(child));
+        assert!(index.claude_usage_authority_quarantine.contains_key(child));
+        assert!(
+            !index.claude_duplicate_request_witness_overflowed,
+            "a bounded stale quarantine is outside the new census and cannot poison all posture"
+        );
+        assert!(
+            index
+                .files
+                .get(&local_index_key(&child_path))
+                .is_some_and(|entry| entry.source_file_fingerprint.is_empty()),
+            "the durable duplicate-owner correction keeps the quarantined revision re-armed"
+        );
+
+        let retained_pending = index
+            .claude_usage_family_pending
+            .get_mut(child)
+            .expect("quarantined family retains pending proof");
+        retained_pending.census_window_end = "2026-08-02T07:13:00Z".to_string();
+        retained_pending.invalid = true;
+        apply_claude_reported_usage_with_index(
+            &mut [],
+            &child_only_report,
+            &child_only_trace,
+            &mut index,
+            true,
+            "2026-08-02T07:13:00Z",
+        );
+        assert!(
+            index.claude_duplicate_request_witness_overflowed,
+            "a current-window invalid quarantine must remain globally fail closed"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_legacy_fork_prefix_is_excluded_only_with_exact_external_owner() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -68380,6 +70955,142 @@ mod tests {
 
     #[test]
     fn claude_account_hash_stamps_request_complete_parent_subagent_family() {
+        let (root, parent, mut items) = claude_account_family_fixture();
+        let account_hash = "a".repeat(64);
+        let mut evidence = claude_account_family_evidence(&parent, &vec![account_hash.clone(); 5]);
+        evidence.get_mut(&parent).expect("family evidence").push(
+            crate::claude_local_otel::ClaudeLocalOtelEvidence {
+                fingerprint: "family-prompt-suggestion".to_string(),
+                session_id: parent.clone(),
+                request_id: "req_prompt_suggestion".to_string(),
+                model: "claude-haiku-4-5".to_string(),
+                input_tokens: 50_000,
+                output_tokens: 1_000,
+                request_count: 1,
+                account_identity_checked: true,
+                account_identifier_hash: Some(account_hash.clone()),
+                ..Default::default()
+            },
+        );
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&root.join(format!("{parent}.jsonl"))),
+            manifest_index_entry(None),
+        );
+        index.files.insert(
+            local_index_key(
+                &root
+                    .join(&parent)
+                    .join("subagents")
+                    .join("agent-a4d1585d310070d0f.jsonl"),
+            ),
+            manifest_index_entry(None),
+        );
+
+        apply_claude_effort_evidence_with_index(
+            &mut items,
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:01:00Z",
+        );
+
+        assert!(items.iter().all(|item| item
+            .model_usage
+            .iter()
+            .chain(
+                item.usage_buckets
+                    .iter()
+                    .flat_map(|bucket| bucket.model_usage.iter())
+            )
+            .all(|row| row.account_identifier_hash.as_deref() == Some(account_hash.as_str()))));
+        assert!(index.claude_account_family_witnesses.contains_key(&parent));
+
+        apply_upload_policy(
+            SnapshotSource::ClaudeCode,
+            &mut items,
+            SnapshotUploadPolicy::default(),
+        );
+        assert!(items.iter().all(|item| item.attribution_facts.is_empty()));
+        assert!(items
+            .iter()
+            .all(|item| item.model_usage.iter().all(|row| {
+                row.account_identifier_hash.as_deref() == Some(account_hash.as_str())
+            })));
+
+        // A later child-only reparse still loads root evidence and may reuse
+        // the durable, request-complete witness without pretending the current
+        // page is the whole family.
+        let (reparsed_root, _, mut reparsed) = claude_account_family_fixture();
+        let mut child_only = vec![reparsed.remove(1)];
+        apply_claude_effort_evidence_with_index(
+            &mut child_only,
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:02:00Z",
+        );
+        assert!(child_only[0]
+            .model_usage
+            .iter()
+            .all(|row| { row.account_identifier_hash.as_deref() == Some(account_hash.as_str()) }));
+        let mut changed_ids_index = index.clone();
+
+        // An observed request-count change invalidates the witness before any
+        // unchanged sibling can be stamped from stale family proof. The root
+        // remains independently provable from its exact request ids.
+        let (changed_root, _, mut changed_family) = claude_account_family_fixture();
+        changed_family[1].request_count += 1;
+        apply_claude_effort_evidence_with_index(
+            &mut changed_family,
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:03:00Z",
+        );
+        assert!(changed_family[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.as_deref() == Some(account_hash.as_str())));
+        assert!(changed_family[1]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.is_none()));
+        assert!(!index.claude_account_family_witnesses.contains_key(&parent));
+
+        // A request-id change with the same count must also invalidate the
+        // witness. Counts alone cannot authorize a changed child request.
+        let (changed_ids_root, _, mut changed_ids_family) = claude_account_family_fixture();
+        changed_ids_family[1].claude_usage_request_ids =
+            BTreeSet::from(["req_changed".to_string()]);
+        apply_claude_effort_evidence_with_index(
+            &mut changed_ids_family,
+            &evidence,
+            &mut changed_ids_index,
+            false,
+            "2026-08-02T07:04:00Z",
+        );
+        assert!(changed_ids_family[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.as_deref() == Some(account_hash.as_str())));
+        assert!(changed_ids_family[1]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.is_none()));
+        assert!(!changed_ids_index
+            .claude_account_family_witnesses
+            .contains_key(&parent));
+        let _ = fs::remove_dir_all(changed_ids_root);
+        let _ = fs::remove_dir_all(changed_root);
+        let _ = fs::remove_dir_all(reparsed_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_hash_stamps_request_complete_parent_subagent_family() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (root, parent, mut items) = claude_account_family_fixture();
         let account_hash = "a".repeat(64);
@@ -68582,6 +71293,142 @@ mod tests {
 
     #[test]
     fn claude_account_pending_v2_parity_and_old_index_upgrade() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        let mut index = d2_family_index(&dir, &root);
+        index.session_account_bindings.insert(
+            "retained-owner".into(),
+            SessionAccountBinding {
+                account_identifier_hash: "a".repeat(64),
+                workspace_identifier_hash: Some("b".repeat(64)),
+            },
+        );
+        index.claude_request_identity_contract_changed = true;
+        index.resume_census_window_end = Some("2026-08-02T07:10:00Z".into());
+        let mut observed = items.clone();
+        apply_claude_effort_evidence_with_index(
+            &mut observed,
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:10:00Z",
+        );
+        let mut old = serde_json::to_value(&index).unwrap();
+        let record = old["claude_account_family_pending"][&root]
+            .as_object_mut()
+            .unwrap();
+        for key in ["v", "w", "a", "e", "r", "i"] {
+            record.remove(key);
+        }
+        record.insert("census_window_end".into(), json!("2026-08-02T07:10:00Z"));
+        record.insert("account_identifier_hash".into(), json!("a".repeat(64)));
+        record.insert("evidence_request_count".into(), json!(5));
+        record.insert("invalid".into(), json!(false));
+        record.insert(
+            "members".into(),
+            serde_json::to_value(
+                items
+                    .iter()
+                    .map(|item| (item.source_session_id.clone(), item.request_count))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+            .unwrap(),
+        );
+        record.insert(
+            "member_request_id_hashes".into(),
+            serde_json::to_value(
+                items
+                    .iter()
+                    .map(|item| {
+                        (
+                            item.source_session_id.clone(),
+                            claude_snapshot_request_id_hashes(item).unwrap(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+            )
+            .unwrap(),
+        );
+        let bytes = serde_json::to_vec_pretty(&old).unwrap();
+        let plain: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+        let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+        let path = dir.join("upgrade-index.json");
+        fs::write(&path, &bytes).unwrap();
+        let streamed =
+            lenient_decode::read_file(File::open(&path).unwrap(), "test", "claude_code").unwrap();
+        for mut upgraded in [plain, bounded, streamed] {
+            assert!(!upgraded.decode_holds_family(&root));
+            assert_eq!(
+                upgraded.session_account_bindings,
+                index.session_account_bindings
+            );
+            assert_eq!(
+                upgraded.accepted_snapshot_fingerprints,
+                index.accepted_snapshot_fingerprints
+            );
+            assert_eq!(
+                serde_json::to_value(&upgraded.files).unwrap(),
+                serde_json::to_value(&index.files).unwrap()
+            );
+            assert_eq!(
+                upgraded.claude_request_identity_contract_changed,
+                index.claude_request_identity_contract_changed
+            );
+            assert_eq!(
+                upgraded.resume_census_window_end,
+                index.resume_census_window_end
+            );
+            assert_eq!(
+                upgraded.claude_account_family_pending,
+                index.claude_account_family_pending
+            );
+            let saved = serde_json::to_value(&upgraded).unwrap();
+            assert!(saved["claude_account_family_pending"][&root]
+                .get("member_request_id_hashes")
+                .is_none());
+            assert_eq!(
+                saved["claude_account_family_pending"][&root]["v"],
+                CLAUDE_ACCOUNT_REQUEST_SET_VERSION
+            );
+            let again: ScanIndex = serde_json::from_value(saved).unwrap();
+            assert_eq!(
+                again.claude_account_family_pending,
+                upgraded.claude_account_family_pending
+            );
+            let mut replay = items.clone();
+            apply_claude_effort_evidence_with_index(
+                &mut replay,
+                &evidence,
+                &mut upgraded,
+                true,
+                "2026-08-02T07:10:00Z",
+            );
+            assert_eq!(upgraded.claude_account_family_witnesses, {
+                let mut expected = index.clone();
+                apply_claude_effort_evidence_with_index(
+                    &mut items.clone(),
+                    &evidence,
+                    &mut expected,
+                    true,
+                    "2026-08-02T07:10:00Z",
+                );
+                expected.claude_account_family_witnesses
+            });
+            assert_eq!(
+                replay
+                    .iter()
+                    .map(exact_session_account_hash)
+                    .collect::<Vec<_>>(),
+                vec![Some("a".repeat(64)); 2]
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_pending_v2_parity_and_old_index_upgrade() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -68719,6 +71566,43 @@ mod tests {
 
     #[test]
     fn claude_account_pending_storage_upgrade_keeps_canonical_witness_without_reread() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        let mut index = d2_family_index(&dir, &root);
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        let witness = index.claude_account_family_witnesses[&root].clone();
+        for item in &items {
+            assert_eq!(
+                witness.member_request_id_fingerprints[&item.source_session_id],
+                claude_request_id_set_fingerprint(
+                    &claude_snapshot_request_id_hashes(item).unwrap()
+                )
+            );
+        }
+        let files = serde_json::to_value(&index.files).unwrap();
+        apply_claude_effort_evidence_with_index(
+            &mut [],
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:11:00Z",
+        );
+        assert_eq!(index.claude_account_family_witnesses[&root], witness);
+        assert_eq!(serde_json::to_value(&index.files).unwrap(), files);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_pending_storage_upgrade_keeps_canonical_witness_without_reread(
+    ) {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -68778,6 +71662,87 @@ mod tests {
 
     #[test]
     fn claude_account_pending_v2_old_fingerprint_is_unknown_and_collision_revokes_family_proof() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        let mut index = d2_family_index(&dir, &root);
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        let mut old_version = index.clone();
+        for fingerprint in old_version
+            .claude_account_family_witnesses
+            .get_mut(&root)
+            .unwrap()
+            .member_request_id_fingerprints
+            .values_mut()
+        {
+            *fingerprint = format!("unsupported_account_set:v0:{}", "b".repeat(64));
+        }
+        let acks = old_version.accepted_snapshot_fingerprints.clone();
+        let bindings = old_version.session_account_bindings.clone();
+        apply_claude_effort_evidence_with_index(
+            &mut [],
+            &evidence,
+            &mut old_version,
+            false,
+            "2026-08-02T07:11:00Z",
+        );
+        assert!(!old_version
+            .claude_account_family_witnesses
+            .contains_key(&root));
+        assert!(old_version
+            .files
+            .values()
+            .all(|entry| entry.source_file_fingerprint.is_empty()));
+        assert_eq!(old_version.accepted_snapshot_fingerprints, acks);
+        assert_eq!(old_version.session_account_bindings, bindings);
+        let pending = index.claude_account_family_pending.get_mut(&root).unwrap();
+        let first = pending.member_requests[&items[0].source_session_id]
+            .unpack()
+            .unwrap()[..8]
+            .to_vec();
+        use base64::Engine as _;
+        pending
+            .member_requests
+            .get_mut(&items[1].source_session_id)
+            .unwrap()
+            .prefixes = base64::engine::general_purpose::STANDARD_NO_PAD.encode(first);
+        // A collision arriving from an old index or an earlier page invalidates
+        // the old family witness as well, never allowing its reuse on a child.
+        let mut restarted: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        assert!(restarted.claude_account_family_pending[&root].invalid);
+        apply_claude_effort_evidence_with_index(
+            &mut [],
+            &evidence,
+            &mut restarted,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        assert!(!restarted
+            .claude_account_family_witnesses
+            .contains_key(&root));
+        let mut child = [items[1].clone()];
+        apply_claude_effort_evidence_with_index(
+            &mut child,
+            &evidence,
+            &mut restarted,
+            false,
+            "2026-08-02T07:10:00Z",
+        );
+        assert_eq!(exact_session_account_hash(&child[0]), None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_pending_v2_old_fingerprint_is_unknown_and_collision_revokes_family_proof(
+    ) {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -68857,6 +71822,146 @@ mod tests {
 
     #[test]
     fn claude_account_pending_old_windows_survive_held_incomplete_and_retry_save() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        let mut index = d2_family_index(&dir, &root);
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:10:00Z",
+        );
+        let old = index.claude_account_family_pending[&root].current.clone();
+        // Missing identity cannot remove old pending.
+        let conflicting = claude_account_family_evidence(&root, &["a".repeat(64), "b".repeat(64)]);
+        apply_claude_effort_evidence_with_index(
+            &mut [],
+            &conflicting,
+            &mut index,
+            false,
+            "2026-08-02T07:11:00Z",
+        );
+        assert_eq!(index.claude_account_family_pending[&root].current, old);
+        apply_claude_effort_evidence_with_index(
+            &mut items[..1].to_vec(),
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:11:00Z",
+        );
+        assert_eq!(
+            index.claude_account_family_pending[&root].previous_windows,
+            vec![old.clone()]
+        );
+        let path = dir.join("held-index.json");
+        index.save(&path).unwrap();
+        let mut reloaded =
+            lenient_decode::read_file(File::open(&path).unwrap(), "test", "claude_code").unwrap();
+        assert_eq!(
+            reloaded.claude_account_family_pending[&root].previous_windows,
+            vec![old]
+        );
+        apply_claude_effort_evidence_with_index(
+            &mut items[1..].to_vec(),
+            &evidence,
+            &mut reloaded,
+            true,
+            "2026-08-02T07:11:00Z",
+        );
+        assert!(reloaded.claude_account_family_witnesses.contains_key(&root));
+        d2_finalize_identity_revisions(&mut reloaded);
+        assert!(!reloaded.accepted_snapshot_fingerprints.is_empty());
+        // Every blocker must retain the old window, even though proof exists.
+        for blocker in [
+            "withheld",
+            "retry",
+            "authority_retry",
+            "identity",
+            "unacked",
+        ] {
+            let mut held = reloaded.clone();
+            let key = held.files.keys().next().unwrap().clone();
+            match blocker {
+                "withheld" => {
+                    held.claude_account_deferred_holds
+                        .insert(key.clone(), "fixture".into());
+                }
+                "identity" => {
+                    held.claude_owned_start_census.insert(
+                        root.clone(),
+                        ClaudeOwnedStartCensusWitness {
+                            marker_source_file_fingerprint: "fixture".into(),
+                            verified_source_file_fingerprint: None,
+                            emitted_source_file_fingerprint: None,
+                        },
+                    );
+                }
+                "unacked" => {
+                    held.accepted_snapshot_fingerprints.clear();
+                }
+                "authority_retry" => {
+                    held.insert_claude_authority_for_test(
+                        &root,
+                        &"f".repeat(64),
+                        ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+                    );
+                }
+                "retry" => {
+                    let fingerprint = held.file_snapshot_fingerprints[&key]
+                        .iter()
+                        .next()
+                        .unwrap()
+                        .clone();
+                    held.quarantined_snapshot_fingerprints.insert(
+                        fingerprint,
+                        snapshot_quarantine_record(SnapshotSource::ClaudeCode),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let partial = held.committable_subset(&reloaded, &BTreeSet::new(), &BTreeMap::new());
+            assert_eq!(
+                partial.claude_account_family_pending[&root]
+                    .previous_windows
+                    .len(),
+                1
+            );
+            held.generation = 0;
+            let held_path = dir.join(format!("held-{blocker}.json"));
+            held.save(&held_path).unwrap();
+            let held =
+                lenient_decode::read_file(File::open(held_path).unwrap(), "test", "claude_code")
+                    .unwrap();
+            assert_eq!(
+                held.claude_account_family_pending[&root]
+                    .previous_windows
+                    .len(),
+                1,
+                "{blocker}"
+            );
+        }
+        // Only this family's fully accepted newer proof retires old pending.
+        let retained_other = reloaded.claude_account_family_pending[&root].clone();
+        reloaded.claude_account_family_pending.insert(
+            "identity-incomplete-other-family".into(),
+            retained_other.clone(),
+        );
+        reloaded.save(&path).unwrap();
+        let reloaded =
+            lenient_decode::read_file(File::open(path).unwrap(), "test", "claude_code").unwrap();
+        assert_eq!(
+            reloaded.claude_account_family_pending["identity-incomplete-other-family"],
+            retained_other
+        );
+        assert!(!reloaded.claude_account_family_pending.contains_key(&root));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_pending_old_windows_survive_held_incomplete_and_retry_save() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -69080,30 +72185,68 @@ mod tests {
 
     #[test]
     fn claude_account_pending_current_held_keeps_older_unfinished_window() {
+        d2_assert_current_window_blocks_older_unfinished_retirement("held");
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_pending_current_held_keeps_older_unfinished_window() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         d2_assert_current_window_blocks_older_unfinished_retirement("held");
     }
 
     #[test]
     fn claude_account_pending_current_withheld_keeps_older_unfinished_window() {
+        d2_assert_current_window_blocks_older_unfinished_retirement("withheld");
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_pending_current_withheld_keeps_older_unfinished_window() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         d2_assert_current_window_blocks_older_unfinished_retirement("withheld");
     }
 
     #[test]
     fn claude_account_pending_current_retry_pending_keeps_older_unfinished_window() {
+        d2_assert_current_window_blocks_older_unfinished_retirement("retry_pending");
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_pending_current_retry_pending_keeps_older_unfinished_window()
+    {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         d2_assert_current_window_blocks_older_unfinished_retirement("retry_pending");
     }
 
     #[test]
     fn claude_account_pending_current_identity_incomplete_keeps_older_unfinished_window() {
+        d2_assert_current_window_blocks_older_unfinished_retirement("identity_incomplete");
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_pending_current_identity_incomplete_keeps_older_unfinished_window(
+    ) {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         d2_assert_current_window_blocks_older_unfinished_retirement("identity_incomplete");
     }
 
     #[test]
     fn claude_account_pending_current_census_incomplete_keeps_older_unfinished_window() {
+        d2_assert_current_window_blocks_older_unfinished_retirement("census_incomplete");
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_pending_current_census_incomplete_keeps_older_unfinished_window(
+    ) {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         d2_assert_current_window_blocks_older_unfinished_retirement("census_incomplete");
     }
@@ -69173,6 +72316,61 @@ mod tests {
 
     #[test]
     fn claude_account_pending_new_identity_cannot_retire_using_prior_revision_acks() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        let mut previous = d2_family_index(&dir, &root);
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut previous,
+            false,
+            "2026-08-02T07:10:00Z",
+        );
+        let mut working = previous.clone();
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut working,
+            true,
+            "2026-08-02T07:11:00Z",
+        );
+        d2_finalize_identity_revisions(&mut working);
+        let newer_entities = working
+            .file_snapshot_fingerprints
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for accepted_count in 0..newer_entities.len() {
+            let accepted = newer_entities
+                .iter()
+                .take(accepted_count)
+                .cloned()
+                .collect();
+            let mut partial = working.committable_subset(&previous, &accepted, &BTreeMap::new());
+            let path = dir.join(format!("partial-{accepted_count}.json"));
+            partial.save(&path).unwrap();
+            let loaded =
+                lenient_decode::read_file(File::open(path).unwrap(), "test", "claude_code")
+                    .unwrap();
+            assert_eq!(
+                loaded.claude_account_family_pending[&root]
+                    .previous_windows
+                    .len(),
+                1
+            );
+        }
+        let mut accepted = working.committable_subset(&previous, &newer_entities, &BTreeMap::new());
+        accepted.save(&dir.join("all-accepted.json")).unwrap();
+        assert!(!accepted.claude_account_family_pending.contains_key(&root));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_pending_new_identity_cannot_retire_using_prior_revision_acks()
+    {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -69226,6 +72424,49 @@ mod tests {
 
     #[test]
     fn claude_account_pending_accepted_singleton_and_completed_owned_start_do_not_grow() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 4]);
+        let mut index = d2_family_index(&dir, &root);
+        index.files.retain(|key, _| {
+            claude_index_path_family_member(Path::new(key))
+                .is_some_and(|(_, member)| member == root)
+        });
+        index
+            .file_snapshot_fingerprints
+            .retain(|key, _| index.files.contains_key(key));
+        index.claude_owned_start_census.insert(
+            root.clone(),
+            ClaudeOwnedStartCensusWitness {
+                marker_source_file_fingerprint: "completed".into(),
+                verified_source_file_fingerprint: Some("completed".into()),
+                emitted_source_file_fingerprint: Some("completed".into()),
+            },
+        );
+        let path = dir.join("singleton.json");
+        for window in 0..5 {
+            apply_claude_effort_evidence_with_index(
+                &mut [items[0].clone()],
+                &evidence,
+                &mut index,
+                true,
+                &format!("2026-08-02T07:1{window}:00Z"),
+            );
+            d2_finalize_identity_revisions(&mut index);
+            index.save(&path).unwrap();
+            index = lenient_decode::read_file(File::open(&path).unwrap(), "test", "claude_code")
+                .unwrap();
+            assert!(!index.claude_account_family_witnesses.contains_key(&root));
+            assert!(!claude_pending_family_session_ids(&index).contains(&root));
+            assert!(index.claude_account_family_pending.is_empty());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_pending_accepted_singleton_and_completed_owned_start_do_not_grow(
+    ) {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 4]);
@@ -69267,6 +72508,51 @@ mod tests {
 
     #[test]
     fn claude_account_pending_finalizer_records_exact_account_bearing_upload_revision() {
+        let (dir, root, _) = claude_account_family_fixture();
+        let mut index = ScanIndex::default();
+        let mut result = scan_source_roots_with_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&dir),
+            &mut index,
+            "2026-08-02T07:01:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .unwrap();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        apply_claude_effort_evidence_with_index(
+            &mut result.snapshots,
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:01:00Z",
+        );
+        assert!(index.claude_account_family_pending[&root]
+            .member_requests
+            .values()
+            .all(|set| set.identity_revision.is_none()));
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+        for (key, entry) in &index.files {
+            let (_, member) = claude_index_path_family_member(Path::new(key)).unwrap();
+            let expected = claude_account_identity_revision(
+                &entry.source_file_fingerprint,
+                entry.last_snapshot_fingerprint.as_deref(),
+                entry.last_upload_body_witness.as_deref(),
+            );
+            assert!(expected.is_some());
+            assert_eq!(
+                index.claude_account_family_pending[&root].member_requests[&member]
+                    .identity_revision,
+                expected
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_pending_finalizer_records_exact_account_bearing_upload_revision(
+    ) {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let (dir, root, _) = claude_account_family_fixture();
@@ -69331,6 +72617,87 @@ mod tests {
 
     #[test]
     fn claude_account_pending_root_only_windows_and_cross_window_members_settle() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        let mut index = d2_family_index(&dir, &root);
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        d2_finalize_identity_revisions(&mut index);
+        let path = dir.join("multi-window.json");
+        index.save(&path).unwrap();
+        assert!(index.claude_account_family_pending.is_empty());
+        for window in 1..5 {
+            apply_claude_effort_evidence_with_index(
+                &mut [items[0].clone()],
+                &evidence,
+                &mut index,
+                true,
+                &format!("2026-08-02T07:1{window}:00Z"),
+            );
+            d2_finalize_identity_revisions(&mut index);
+            index.save(&path).unwrap();
+            index = lenient_decode::read_file(File::open(&path).unwrap(), "test", "claude_code")
+                .unwrap();
+            assert!(index.claude_account_family_pending.is_empty());
+            assert!(!claude_pending_family_session_ids(&index).contains(&root));
+        }
+        // Retain genuinely incomplete old evidence until the missing member
+        // itself finalizes; the two latest proofs need not share a window.
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:20:00Z",
+        );
+        d2_finalize_identity_revisions(&mut index);
+        index
+            .claude_account_family_pending
+            .get_mut(&root)
+            .unwrap()
+            .member_requests
+            .get_mut(&items[1].source_session_id)
+            .unwrap()
+            .identity_revision = None;
+        index.save(&path).unwrap();
+        assert!(index.claude_account_family_pending.contains_key(&root));
+        apply_claude_effort_evidence_with_index(
+            &mut [items[0].clone()],
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:21:00Z",
+        );
+        d2_finalize_identity_revisions(&mut index);
+        index.save(&path).unwrap();
+        assert_eq!(
+            index.claude_account_family_pending[&root]
+                .previous_windows
+                .len(),
+            1
+        );
+        apply_claude_effort_evidence_with_index(
+            &mut [items[1].clone()],
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:22:00Z",
+        );
+        d2_finalize_identity_revisions(&mut index);
+        index.save(&path).unwrap();
+        assert!(index.claude_account_family_pending.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_pending_root_only_windows_and_cross_window_members_settle() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -69411,6 +72778,127 @@ mod tests {
 
     #[test]
     fn claude_account_pending_disappearance_and_empty_members_respect_partial_checkpoints() {
+        for removal in ["guarded", "bounded", "empty"] {
+            let empty = removal == "empty";
+            let (dir, root, items) = claude_account_family_fixture();
+            let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+            let mut previous = d2_family_index(&dir, &root);
+            apply_claude_effort_evidence_with_index(
+                &mut items.clone(),
+                &evidence,
+                &mut previous,
+                true,
+                "2026-08-02T07:10:00Z",
+            );
+            d2_finalize_identity_revisions(&mut previous);
+            previous
+                .claude_account_family_pending
+                .get_mut(&root)
+                .unwrap()
+                .member_requests
+                .get_mut(&items[1].source_session_id)
+                .unwrap()
+                .identity_revision = None;
+            let path = dir.join("vanished-index.json");
+            previous.save(&path).unwrap();
+            let mut working = previous.clone();
+            apply_claude_effort_evidence_with_index(
+                &mut [items[0].clone()],
+                &evidence,
+                &mut working,
+                true,
+                "2026-08-02T07:11:00Z",
+            );
+            d2_finalize_identity_revisions(&mut working);
+            let child_key = working
+                .files
+                .keys()
+                .find(|key| {
+                    claude_index_path_family_member(Path::new(key))
+                        .is_some_and(|(_, member)| member == items[1].source_session_id)
+                })
+                .unwrap()
+                .clone();
+            if empty {
+                working.confirmed_empty_files.insert(child_key.clone());
+                working
+                    .file_snapshot_fingerprints
+                    .insert(child_key.clone(), BTreeSet::new());
+                working
+                    .files
+                    .get_mut(&child_key)
+                    .unwrap()
+                    .last_snapshot_fingerprint = None;
+                let mut held = working.clone();
+                held.claude_account_deferred_holds
+                    .insert(child_key.clone(), "held".into());
+                held.retire_committed_claude_account_pending_windows();
+                assert!(held.claude_account_family_pending.contains_key(&root));
+            } else if removal == "bounded" {
+                working.traversal = Some(ScanTraversalCheckpoint {
+                    context_fingerprint: "c".repeat(64),
+                    census_window_end: "2026-08-02T07:11:00Z".into(),
+                    scan_roots: vec![dir.clone()],
+                    pending_directories: VecDeque::new(),
+                    pending_candidates: VecDeque::new(),
+                    observed_index_keys: working
+                        .files
+                        .keys()
+                        .filter(|key| *key != &child_key)
+                        .cloned()
+                        .collect(),
+                    oversized_discovery: BTreeMap::new(),
+                    codex_rollout_paths: BTreeSet::new(),
+                    codex_join_directory_census: None,
+                    reconciliation_upper_bound: working.files.keys().next_back().cloned(),
+                    reconciliation_after: None,
+                    reconciliation_started: false,
+                    watcher_hint_seen: false,
+                    codex_freshness_yield: false,
+                    codex_parent_resolution_retry_required: false,
+                    unhealthy_retry_attempt: 0,
+                    unhealthy_retry_not_before_unix_seconds: None,
+                    counts: ScanTraversalCounts::default(),
+                    residue: ScanTraversalResidue::default(),
+                });
+                assert!(reconcile_missing_index_entries_with_limit(
+                    &mut working,
+                    usize::MAX
+                ));
+                working.traversal = None;
+                assert!(!working.files.contains_key(&child_key));
+            } else {
+                working.remove_file_entry(&child_key);
+            }
+            if !empty {
+                assert!(working.claude_account_family_pending[&root]
+                    .confirmed_absent_members
+                    .contains(&items[1].source_session_id));
+            }
+            let accepted = working
+                .file_snapshot_fingerprints
+                .values()
+                .flatten()
+                .cloned()
+                .collect();
+            let mut partial = working.committable_subset(&previous, &accepted, &BTreeMap::new());
+            partial.generation = 0;
+            partial.save(&dir.join("partial-index.json")).unwrap();
+            assert!(partial.claude_account_family_pending.contains_key(&root));
+            working.save(&path).unwrap();
+            let loaded =
+                lenient_decode::read_file(File::open(path).unwrap(), "test", "claude_code")
+                    .unwrap();
+            assert!(!loaded.claude_account_family_pending.contains_key(&root));
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_pending_disappearance_and_empty_members_respect_partial_checkpoints(
+    ) {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         for removal in ["guarded", "bounded", "empty"] {
             let empty = removal == "empty";
@@ -69571,6 +73059,88 @@ mod tests {
 
     #[test]
     fn claude_account_pending_new_unaccepted_child_omission_is_not_disappearance() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        let full = d2_family_index(&dir, &root);
+        let child_key = full
+            .files
+            .keys()
+            .find(|key| {
+                claude_index_path_family_member(Path::new(key))
+                    .is_some_and(|(_, member)| member == items[1].source_session_id)
+            })
+            .unwrap()
+            .clone();
+        let mut previous = full.clone();
+        previous.remove_file_entry(&child_key);
+        apply_claude_effort_evidence_with_index(
+            &mut [items[0].clone()],
+            &evidence,
+            &mut previous,
+            false,
+            "2026-08-02T07:10:00Z",
+        );
+        let mut working = previous.clone();
+        working
+            .files
+            .insert(child_key.clone(), full.files[&child_key].clone());
+        working.file_snapshot_fingerprints.insert(
+            child_key.clone(),
+            full.file_snapshot_fingerprints[&child_key].clone(),
+        );
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut working,
+            true,
+            "2026-08-02T07:11:00Z",
+        );
+        d2_finalize_identity_revisions(&mut working);
+        let child_entities = working.file_snapshot_fingerprints[&child_key].clone();
+        working
+            .accepted_snapshot_fingerprints
+            .retain(|fp| !child_entities.contains(fp));
+        let accepted = working
+            .file_snapshot_fingerprints
+            .iter()
+            .filter(|(key, _)| *key != &child_key)
+            .flat_map(|(_, fps)| fps.iter().cloned())
+            .collect();
+        for explicit_hold in [false, true] {
+            let mut held = working.clone();
+            if explicit_hold {
+                held.claude_account_deferred_holds
+                    .insert(child_key.clone(), "held".into());
+            }
+            let mut partial = held.committable_subset(&previous, &accepted, &BTreeMap::new());
+            assert!(!partial.files.contains_key(&child_key));
+            let path = dir.join(format!("new-child-{explicit_hold}.json"));
+            partial.save(&path).unwrap();
+            let loaded =
+                lenient_decode::read_file(File::open(path).unwrap(), "test", "claude_code")
+                    .unwrap();
+            assert_eq!(
+                loaded.claude_account_family_pending[&root]
+                    .previous_windows
+                    .len(),
+                1
+            );
+            assert!(!loaded.claude_account_family_pending[&root]
+                .confirmed_absent_members
+                .contains(&items[1].source_session_id));
+        }
+        working
+            .accepted_snapshot_fingerprints
+            .extend(child_entities);
+        working.save(&dir.join("new-child-accepted.json")).unwrap();
+        assert!(!working.claude_account_family_pending.contains_key(&root));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_pending_new_unaccepted_child_omission_is_not_disappearance() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -69730,6 +73300,102 @@ mod tests {
 
     #[test]
     fn claude_account_family_legacy_witness_schedules_reparse_and_rebuilds() {
+        let (root, parent, items) = claude_account_family_fixture();
+        let account_hash = "a".repeat(64);
+        let evidence = claude_account_family_evidence(&parent, &vec![account_hash.clone(); 5]);
+        let parent_index_key = local_index_key(&root.join(format!("{parent}.jsonl")));
+        let child_index_key = local_index_key(
+            &root
+                .join(&parent)
+                .join("subagents")
+                .join("agent-a4d1585d310070d0f.jsonl"),
+        );
+        let members = items
+            .iter()
+            .map(|item| (item.source_session_id.clone(), item.request_count))
+            .collect::<BTreeMap<_, _>>();
+        let mut legacy = ScanIndex::default();
+        legacy.files.insert(
+            parent_index_key.clone(),
+            manifest_index_entry(Some("parent")),
+        );
+        legacy
+            .files
+            .insert(child_index_key.clone(), manifest_index_entry(Some("child")));
+        legacy.claude_account_family_witnesses.insert(
+            parent.clone(),
+            ClaudeAccountFamilyWitness {
+                account_identifier_hash: account_hash.clone(),
+                evidence_request_count: 5,
+                members,
+                // v29 serialized no field here.
+                member_request_id_fingerprints: BTreeMap::new(),
+            },
+        );
+        let serialized = serde_json::to_value(&legacy).expect("serialize legacy index");
+        assert!(serialized["claude_account_family_witnesses"][&parent]
+            .get("member_request_id_fingerprints")
+            .is_none());
+        let mut index: ScanIndex =
+            serde_json::from_value(serialized).expect("load v29-compatible index");
+
+        apply_claude_effort_evidence_with_index(
+            &mut [],
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        assert!(!index.claude_account_family_witnesses.contains_key(&parent));
+        assert!(index.files[&parent_index_key]
+            .source_file_fingerprint
+            .is_empty());
+        assert!(index.files[&child_index_key]
+            .source_file_fingerprint
+            .is_empty());
+
+        // The scheduled bounded replay reconstructs request-set proof across
+        // pages and mints a v30 witness at the terminal census.
+        let mut parent_page = vec![items[0].clone()];
+        apply_claude_effort_evidence_with_index(
+            &mut parent_page,
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:11:00Z",
+        );
+        let mut child_page = vec![items[1].clone()];
+        apply_claude_effort_evidence_with_index(
+            &mut child_page,
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:11:00Z",
+        );
+        apply_claude_effort_evidence_with_index(
+            &mut [],
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:11:00Z",
+        );
+        let rebuilt = &index.claude_account_family_witnesses[&parent];
+        assert_eq!(rebuilt.member_request_id_fingerprints.len(), 2);
+        assert_eq!(
+            rebuilt
+                .member_request_id_fingerprints
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            rebuilt.members.keys().cloned().collect::<BTreeSet<_>>()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_family_legacy_witness_schedules_reparse_and_rebuilds() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (root, parent, items) = claude_account_family_fixture();
         let account_hash = "a".repeat(64);
@@ -69825,6 +73491,89 @@ mod tests {
 
     #[test]
     fn claude_account_hash_converges_family_split_across_census_pages() {
+        let (root, parent, mut items) = claude_account_family_fixture();
+        let account_hash = "a".repeat(64);
+        let evidence = claude_account_family_evidence(&parent, &vec![account_hash.clone(); 5]);
+        let parent_index_key = local_index_key(&root.join(format!("{parent}.jsonl")));
+        let child_index_key = local_index_key(
+            &root
+                .join(&parent)
+                .join("subagents")
+                .join("agent-a4d1585d310070d0f.jsonl"),
+        );
+        let mut index = ScanIndex::default();
+        index
+            .files
+            .insert(parent_index_key.clone(), manifest_index_entry(None));
+        index
+            .files
+            .insert(child_index_key.clone(), manifest_index_entry(None));
+
+        let mut parent_page = vec![items.remove(0)];
+        apply_claude_effort_evidence_with_index(
+            &mut parent_page,
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:10:00Z",
+        );
+        assert!(parent_page[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.as_deref() == Some(account_hash.as_str())));
+
+        let mut child_page = items;
+        apply_claude_effort_evidence_with_index(
+            &mut child_page,
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:10:00Z",
+        );
+        assert!(child_page[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.is_none()));
+
+        // The terminal page may contain no member of this family. Pending root
+        // ids are loaded explicitly so the complete census can still mint the
+        // witness and reselect both earlier pages.
+        apply_claude_effort_evidence_with_index(
+            &mut [],
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        assert!(index.claude_account_family_witnesses.contains_key(&parent));
+        assert!(index.files[&parent_index_key]
+            .source_file_fingerprint
+            .is_empty());
+        assert!(index.files[&child_index_key]
+            .source_file_fingerprint
+            .is_empty());
+
+        let (reparsed_root, _, mut reparsed) = claude_account_family_fixture();
+        let mut retried_parent = vec![reparsed.remove(0)];
+        apply_claude_effort_evidence_with_index(
+            &mut retried_parent,
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:11:00Z",
+        );
+        assert!(retried_parent[0]
+            .model_usage
+            .iter()
+            .all(|row| { row.account_identifier_hash.as_deref() == Some(account_hash.as_str()) }));
+        let _ = fs::remove_dir_all(reparsed_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_account_hash_converges_family_split_across_census_pages() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (root, parent, mut items) = claude_account_family_fixture();
         let account_hash = "a".repeat(64);
@@ -69985,6 +73734,132 @@ mod tests {
 
     #[test]
     fn launched_session_stays_out_of_its_starters_account_family() {
+        let parent_hash = "a".repeat(64);
+        let launched_hash = "b".repeat(64);
+        let launched = "5b0d8f3e-2a71-4c55-9e0b-7d1f4c2a9e61";
+        let hashes = |item: &SnapshotItem| {
+            item.model_usage
+                .iter()
+                .chain(
+                    item.usage_buckets
+                        .iter()
+                        .flat_map(|bucket| bucket.model_usage.iter()),
+                )
+                .map(|row| row.account_identifier_hash.clone())
+                .collect::<BTreeSet<_>>()
+        };
+        // Each case is the lineage the separately started session C carries
+        // naming the starter P, and whether P's Task family still proves.
+        let cases: [(&[Option<&str>], bool); 5] = [
+            (&[Some("launcher_event:v1")], true),
+            (&[Some("claude_desktop_spawn:v1")], true),
+            // `None` keeps the nested subagent's own parser: genuine sub-work.
+            (&[None], false),
+            (&[Some("claude_desktop_spawner:v1")], false),
+            (&[Some("claude_desktop_spawn:v1"), None], false),
+        ];
+        for (source_versions, family_proves) in cases {
+            let (root, parent, mut items) = claude_account_family_fixture();
+            let nested_fact = items[1]
+                .attribution_facts
+                .iter()
+                .find(|fact| fact.field == "parent_session_ref")
+                .cloned()
+                .expect("subagent names its parent");
+            let launched_path = root.join(format!("{launched}.jsonl"));
+            fs::write(
+                &launched_path,
+                format!(
+                    "{{\"timestamp\":\"2026-08-02T07:00:05Z\",\"type\":\"assistant\",\"sessionId\":\"{launched}\",\"requestId\":\"req_c1\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":1}}}}}}\n"
+                ),
+            )
+            .expect("write launched fixture");
+            let mut child = parse_claude_code_jsonl_file(
+                &launched_path,
+                "2026-08-02T07:01:00Z",
+                "launched-fp".to_string(),
+            )
+            .expect("parse launched")
+            .remove(0);
+            for source_version in source_versions {
+                let mut fact = nested_fact.clone();
+                if let Some(source_version) = source_version {
+                    fact.evidence.source_version = source_version.to_string();
+                }
+                child.attribution_facts.push(fact);
+            }
+            items.push(child);
+            let mut evidence =
+                claude_account_family_evidence(&parent, &vec![parent_hash.clone(); 5]);
+            evidence.insert(
+                launched.to_string(),
+                vec![crate::claude_local_otel::ClaudeLocalOtelEvidence {
+                    fingerprint: "launched-0".to_string(),
+                    session_id: launched.to_string(),
+                    request_id: "req_c1".to_string(),
+                    observed_at: "2026-08-02T07:00:05Z".to_string(),
+                    model: "claude-haiku-4-5".to_string(),
+                    output_tokens: 11,
+                    request_count: 1,
+                    account_identity_checked: true,
+                    account_identifier_hash: Some(launched_hash.clone()),
+                    ..Default::default()
+                }],
+            );
+            let mut index = ScanIndex::default();
+            for path in [
+                root.join(format!("{parent}.jsonl")),
+                root.join(&parent)
+                    .join("subagents")
+                    .join("agent-a4d1585d310070d0f.jsonl"),
+                launched_path,
+            ] {
+                index
+                    .files
+                    .insert(local_index_key(&path), manifest_index_entry(None));
+            }
+
+            apply_claude_effort_evidence_with_index(
+                &mut items,
+                &evidence,
+                &mut index,
+                true,
+                "2026-08-02T07:01:00Z",
+            );
+
+            let case = format!("{source_versions:?}");
+            // P is always proven by its own exact request ids, and C only ever
+            // carries its own account, never P's.
+            assert_eq!(
+                hashes(&items[0]),
+                BTreeSet::from([Some(parent_hash.clone())]),
+                "{case}"
+            );
+            assert_eq!(
+                hashes(&items[2]),
+                BTreeSet::from([Some(launched_hash.clone())]),
+                "{case}"
+            );
+            // P's subagent keeps family stamping unless C is family to P.
+            let subagent = if family_proves {
+                Some(parent_hash.clone())
+            } else {
+                None
+            };
+            assert_eq!(hashes(&items[1]), BTreeSet::from([subagent]), "{case}");
+            assert_eq!(
+                index.claude_account_family_witnesses.contains_key(&parent),
+                family_proves,
+                "{case}"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn terminal_off_on_launched_session_stays_out_of_its_starters_account_family() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let parent_hash = "a".repeat(64);
         let launched_hash = "b".repeat(64);
@@ -73076,6 +76951,83 @@ mod tests {
 
     #[test]
     fn claude_context_curve_waits_for_complete_local_ownership_census() {
+        let path = temp_file("claude-context-curve-owned");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-20T10:00:00Z\",\"sessionId\":\"claude-curve-owned\",\"type\":\"assistant\",\"forkedFrom\":{\"sessionId\":\"claude-curve-parent\",\"messageUuid\":\"parent-message\"},\"requestId\":\"req_parent\",\"message\":{\"id\":\"msg_parent\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":900000,\"output_tokens\":2}}}\n",
+                "{\"timestamp\":\"2026-08-20T10:01:00Z\",\"sessionId\":\"claude-curve-owned\",\"type\":\"assistant\",\"requestId\":\"req_curve_1\",\"message\":{\"id\":\"msg_curve_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-08-20T10:01:01Z\",\"sessionId\":\"claude-curve-owned\",\"type\":\"assistant\",\"requestId\":\"req_curve_1\",\"message\":{\"id\":\"msg_curve_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":9,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-08-20T10:02:00Z\",\"sessionId\":\"claude-curve-owned\",\"type\":\"assistant\",\"requestId\":\"req_curve_2\",\"message\":{\"id\":\"msg_curve_2\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":20,\"output_tokens\":3,\"cache_read_input_tokens\":200}}}\n",
+                "{\"timestamp\":\"2026-08-20T10:02:30Z\",\"sessionId\":\"claude-curve-owned\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\"}}\n",
+                "{\"timestamp\":\"2026-08-20T10:03:00Z\",\"sessionId\":\"claude-curve-owned\",\"type\":\"assistant\",\"requestId\":\"req_curve_3\",\"message\":{\"id\":\"msg_curve_3\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":30,\"output_tokens\":4,\"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":7}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let mut items = parse_claude_code_jsonl_file(
+            &path,
+            "2026-08-20T10:04:00Z",
+            "curve-fingerprint".to_string(),
+        )
+        .expect("parse");
+        assert_eq!(
+            items[0]
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("ownership_unresolved")
+        );
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::new(),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+        let mut index = ScanIndex::default();
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-20T10:04:00Z",
+        );
+        let curve = items[0].context_curve.as_ref().expect("owned curve");
+        assert_eq!(curve.coverage, "complete");
+        assert_eq!(curve.total_owned_request_count, 3);
+        assert_eq!(curve.points[0].observed_at, "2026-08-20T10:01:01Z");
+        assert_eq!(
+            curve
+                .points
+                .iter()
+                .map(|point| point.effective_input_tokens)
+                .collect::<Vec<_>>(),
+            vec![115, 220, 337]
+        );
+        assert_eq!(curve.boundaries[0].before_owned_request_ordinal, 2);
+        assert_eq!(curve.boundaries[0].after_owned_request_ordinal, 3);
+        assert_eq!(curve.model_windows[0].model, "claude-opus-4-8");
+        assert_eq!(curve.model_windows[0].context_window_tokens, None);
+        assert_eq!(
+            curve.model_windows[0].evidence_kind,
+            "provider_reported_model"
+        );
+        assert_eq!(items[0].usage_accounting_contract, None);
+        assert_eq!(items[0].first_turn_context_tokens, Some(115));
+        assert_eq!(items[0].peak_context_fill_tokens, Some(337));
+        assert_eq!(items[0].last_turn_context_tokens, Some(337));
+        assert_eq!(items[0].compaction_count, Some(1));
+        assert_eq!(
+            items[0].compaction_timestamps,
+            vec!["2026-08-20T10:02:30Z".to_string()]
+        );
+        validate_context_curve(0, curve).expect("Claude curve validates");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_context_curve_waits_for_complete_local_ownership_census() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let path = temp_file("claude-context-curve-owned");
         fs::write(
@@ -73152,6 +77104,123 @@ mod tests {
 
     #[test]
     fn claude_forked_owned_start_rearms_an_earlier_bounded_page() {
+        let path = temp_file("claude-forked-owned-start-page");
+        let source_session_id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .expect("fixture stem")
+            .to_string();
+        fs::write(
+            &path,
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-08-20T10:00:00Z\",\"sessionId\":\"{source_session_id}\",\"type\":\"assistant\",\"forkedFrom\":{{\"sessionId\":\"parent\",\"messageUuid\":\"parent-message\"}},\"requestId\":\"req_parent\",\"message\":{{\"id\":\"msg_parent\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":900000,\"output_tokens\":2}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-20T10:01:00Z\",\"sessionId\":\"{source_session_id}\",\"type\":\"assistant\",\"requestId\":\"req_owned\",\"message\":{{\"id\":\"msg_owned\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n"
+                ),
+                source_session_id = source_session_id,
+            ),
+        )
+        .expect("write fixture");
+        let parse = || {
+            parse_claude_code_jsonl_file(&path, "2026-08-20T10:02:00Z", "source".to_string())
+                .expect("parse")
+        };
+        let mut first_page = parse();
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&path),
+            manifest_index_entry(Some("unresolved")),
+        );
+        index.claude_owned_start_census.insert(
+            source_session_id.clone(),
+            ClaudeOwnedStartCensusWitness {
+                marker_source_file_fingerprint: "source".to_string(),
+                verified_source_file_fingerprint: None,
+                emitted_source_file_fingerprint: None,
+            },
+        );
+        apply_claude_reported_usage_with_index(
+            &mut first_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut index,
+            false,
+            "2026-08-20T10:02:00Z",
+        );
+        assert_eq!(
+            first_page[0]
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("ownership_unresolved")
+        );
+
+        apply_claude_reported_usage_with_index(
+            &mut [],
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut index,
+            true,
+            "2026-08-20T10:02:00Z",
+        );
+        assert!(index.files[&local_index_key(&path)]
+            .source_file_fingerprint
+            .is_empty());
+        let durable_before_corrective_upload = index.clone();
+
+        let corrective_entry = index.files.get_mut(&local_index_key(&path)).unwrap();
+        corrective_entry.source_file_fingerprint = "source".to_string();
+        corrective_entry.last_snapshot_fingerprint = Some("complete".to_string());
+        let mut corrective_page = parse();
+        apply_claude_reported_usage_with_index(
+            &mut corrective_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut index,
+            false,
+            "2026-08-20T10:03:00Z",
+        );
+        assert_eq!(
+            corrective_page[0]
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("complete")
+        );
+        assert_eq!(
+            index.claude_owned_start_census[&source_session_id]
+                .emitted_source_file_fingerprint
+                .as_deref(),
+            Some("source")
+        );
+        let shed = index.committable_subset(
+            &durable_before_corrective_upload,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            shed.claude_owned_start_census[&source_session_id].emitted_source_file_fingerprint,
+            None,
+            "a shed corrective upload must remain re-armed"
+        );
+        let accepted = index.committable_subset(
+            &durable_before_corrective_upload,
+            &BTreeSet::from(["complete".to_string()]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            accepted.claude_owned_start_census[&source_session_id]
+                .emitted_source_file_fingerprint
+                .as_deref(),
+            Some("source")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_forked_owned_start_rearms_an_earlier_bounded_page() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let path = temp_file("claude-forked-owned-start-page");
         let source_session_id = path
@@ -73268,6 +77337,79 @@ mod tests {
 
     #[test]
     fn claude_nonforked_owned_start_accepts_minimal_paired_request_evidence() {
+        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+        let path = temp_file("claude-nonforked-paired-owned-start");
+        let source_session_id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .expect("fixture stem")
+            .to_string();
+        fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"{source_session_id}\",\"type\":\"assistant\",\"requestId\":\"req_owned\",\"message\":{{\"id\":\"msg_owned\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let mut items =
+            parse_claude_code_jsonl_file(&path, "2026-08-20T11:02:00Z", "source".to_string())
+                .expect("parse");
+        let mut api = complete_api_row(&source_session_id, "req_owned", 1, 10, 2, 0);
+        api.client_request_id.clear();
+        api.cost_usd_micros = None;
+        api.event_sequence = None;
+        api.app_version.clear();
+        api.fingerprint.clear();
+        api.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&api).expect("serialize API evidence"))
+        );
+        let mut trace = complete_trace_row(&source_session_id, "req_owned", "");
+        trace.client_request_id.clear();
+        trace.fingerprint.clear();
+        trace.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&trace).expect("serialize trace evidence"))
+        );
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&path),
+            manifest_index_entry(Some("unresolved")),
+        );
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::from([(source_session_id.clone(), vec![api])]),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+                evidence: BTreeMap::from([(source_session_id, vec![trace])]),
+                ..Default::default()
+            },
+            &mut index,
+            true,
+            "2026-08-20T11:02:00Z",
+        );
+        assert_eq!(
+            items[0].usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        assert_eq!(items[0].cost, None);
+        assert_eq!(
+            items[0]
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("complete")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_nonforked_owned_start_accepts_minimal_paired_request_evidence() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -73456,6 +77598,554 @@ mod tests {
 
     #[test]
     fn claude_explicit_fork_duplicate_owned_request_fails_posture_closed() {
+        let root = temp_dir("claude-explicit-fork-duplicate");
+        let child_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let sibling_id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+        let child_path = root.join(format!("{child_id}.jsonl"));
+        let sibling_path = root.join(format!("{sibling_id}.jsonl"));
+        fs::write(
+            &child_path,
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-08-20T11:00:00Z\",\"sessionId\":\"{child_id}\",\"type\":\"assistant\",\"forkedFrom\":{{\"sessionId\":\"explicit-parent\",\"messageUuid\":\"parent-message\"}},\"requestId\":\"req_parent\",\"message\":{{\"id\":\"msg_parent\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":900000,\"output_tokens\":2}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"{child_id}\",\"type\":\"assistant\",\"requestId\":\"req_ambiguous\",\"message\":{{\"id\":\"msg_child\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":10,\"cache_read_input_tokens\":895000,\"output_tokens\":2}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-20T11:01:30Z\",\"sessionId\":\"{child_id}\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{{\"trigger\":\"auto\",\"preTokens\":895010,\"postTokens\":100000}}}}\n"
+                ),
+                child_id = child_id,
+            ),
+        )
+        .expect("write explicit child fixture");
+        fs::write(
+            &sibling_path,
+            format!(
+                "{{\"timestamp\":\"2026-08-20T11:02:00Z\",\"sessionId\":\"{sibling_id}\",\"type\":\"assistant\",\"requestId\":\"req_ambiguous\",\"message\":{{\"id\":\"msg_sibling\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":20,\"cache_read_input_tokens\":100,\"output_tokens\":3}}}}}}\n"
+            ),
+        )
+        .expect("write duplicate sibling fixture");
+        let child = parse_claude_code_jsonl_file(
+            &child_path,
+            "2026-08-20T11:04:00Z",
+            "child-fingerprint".to_string(),
+        )
+        .expect("parse child")
+        .remove(0);
+        let sibling = parse_claude_code_jsonl_file(
+            &sibling_path,
+            "2026-08-20T11:04:00Z",
+            "sibling-fingerprint".to_string(),
+        )
+        .expect("parse sibling")
+        .remove(0);
+        let mut items = vec![child.clone(), sibling.clone()];
+        assert!(items[0].claude_context_curve_owned_start_proven);
+        assert_eq!(items[0].peak_context_fill_tokens, Some(895_010));
+        assert_eq!(items[0].compaction_count, Some(1));
+
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut ScanIndex::default(),
+            true,
+            "2026-08-20T11:04:00Z",
+        );
+
+        assert_eq!(items[0].first_turn_context_tokens, None);
+        assert_eq!(items[0].peak_context_fill_tokens, None);
+        assert_eq!(items[0].last_turn_context_tokens, None);
+        assert_eq!(items[0].compaction_count, None);
+        assert!(items[0].compaction_timestamps.is_empty());
+        assert_eq!(
+            items[0]
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("ownership_unresolved")
+        );
+
+        let mut paged_index = ScanIndex::default();
+        paged_index.files.insert(
+            local_index_key(&child_path),
+            manifest_index_entry(Some("child-settled")),
+        );
+        paged_index.files.insert(
+            local_index_key(&sibling_path),
+            manifest_index_entry(Some("sibling-settled")),
+        );
+        let mut child_page = vec![child];
+        apply_claude_reported_usage_with_index(
+            &mut child_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut paged_index,
+            false,
+            "2026-08-20T11:04:00Z",
+        );
+        assert_eq!(child_page[0].peak_context_fill_tokens, Some(895_010));
+
+        let mut sibling_page = vec![sibling];
+        apply_claude_reported_usage_with_index(
+            &mut sibling_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut paged_index,
+            true,
+            "2026-08-20T11:04:00Z",
+        );
+        assert!(paged_index
+            .files
+            .get(&local_index_key(&child_path))
+            .expect("child index entry")
+            .source_file_fingerprint
+            .is_empty());
+        assert!(paged_index
+            .files
+            .get(&local_index_key(&sibling_path))
+            .expect("sibling index entry")
+            .source_file_fingerprint
+            .is_empty());
+        assert_eq!(paged_index.claude_duplicate_request_owners.len(), 1);
+
+        paged_index
+            .files
+            .get_mut(&local_index_key(&child_path))
+            .expect("child index entry")
+            .source_file_fingerprint = "child-corrective".to_string();
+        paged_index
+            .files
+            .get_mut(&local_index_key(&sibling_path))
+            .expect("sibling index entry")
+            .source_file_fingerprint = "sibling-corrective".to_string();
+
+        // The corrective traversal reparses every duplicate owner. Its
+        // complete census must keep the inherited 895K context and compaction
+        // tombstoned instead of treating the lone re-armed child as unique.
+        let mut corrective_page = vec![child_page.remove(0), sibling_page.remove(0)];
+        apply_claude_reported_usage_with_index(
+            &mut corrective_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut paged_index,
+            true,
+            "2026-08-20T11:04:00Z",
+        );
+        assert_eq!(corrective_page[0].first_turn_context_tokens, None);
+        assert_eq!(corrective_page[0].peak_context_fill_tokens, None);
+        assert_eq!(corrective_page[0].last_turn_context_tokens, None);
+        assert_eq!(corrective_page[0].compaction_count, None);
+        assert!(corrective_page[0].compaction_timestamps.is_empty());
+        assert_eq!(
+            corrective_page[0]
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("ownership_unresolved")
+        );
+        assert_eq!(
+            paged_index
+                .files
+                .get(&local_index_key(&child_path))
+                .expect("child index entry")
+                .source_file_fingerprint,
+            "child-corrective"
+        );
+        assert_eq!(
+            paged_index
+                .files
+                .get(&local_index_key(&sibling_path))
+                .expect("sibling index entry")
+                .source_file_fingerprint,
+            "sibling-corrective"
+        );
+
+        // A deleted or aged-out duplicate owner is absent from both pending
+        // evidence and the complete current file universe. Intersecting the
+        // durable witness with that universe removes the stale owner, re-arms
+        // the survivor once, and then permits owned posture without looping.
+        let mut deletion_index = paged_index.clone();
+        deletion_index.files.remove(&local_index_key(&sibling_path));
+        let mut deletion_pass = vec![corrective_page[0].clone()];
+        apply_claude_reported_usage_with_index(
+            &mut deletion_pass,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut deletion_index,
+            true,
+            "2026-08-20T11:05:00Z",
+        );
+        assert!(deletion_index.claude_duplicate_request_owners.is_empty());
+        assert_eq!(deletion_pass[0].peak_context_fill_tokens, None);
+        assert!(deletion_index
+            .files
+            .get(&local_index_key(&child_path))
+            .expect("deletion child index entry")
+            .source_file_fingerprint
+            .is_empty());
+        deletion_index
+            .files
+            .get_mut(&local_index_key(&child_path))
+            .expect("deletion child index entry")
+            .source_file_fingerprint = "deletion-corrected".to_string();
+        let mut deletion_recovery = vec![corrective_page[0].clone()];
+        apply_claude_reported_usage_with_index(
+            &mut deletion_recovery,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut deletion_index,
+            true,
+            "2026-08-20T11:05:00Z",
+        );
+        assert_eq!(deletion_recovery[0].peak_context_fill_tokens, Some(895_010));
+        assert_eq!(deletion_recovery[0].compaction_count, Some(1));
+        assert_eq!(
+            deletion_index
+                .files
+                .get(&local_index_key(&child_path))
+                .expect("deletion child index entry")
+                .source_file_fingerprint,
+            "deletion-corrected"
+        );
+
+        // If every recorded owner disappears and a different session becomes
+        // the sole current owner, changing the request-hash witness must re-arm
+        // that replacement too. It was conservatively cleared against the old
+        // durable duplicate on this pass and needs one correction pass after
+        // the witness is removed.
+        let replacement_id = "cccccccc-dddd-eeee-ffff-000000000000";
+        let replacement_path = root.join(format!("{replacement_id}.jsonl"));
+        fs::write(
+            &replacement_path,
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-08-20T11:05:00Z\",\"sessionId\":\"{replacement_id}\",\"type\":\"assistant\",\"forkedFrom\":{{\"sessionId\":\"explicit-parent\",\"messageUuid\":\"parent-message\"}},\"requestId\":\"req_parent\",\"message\":{{\"id\":\"msg_parent\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":900000,\"output_tokens\":2}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-20T11:05:59Z\",\"sessionId\":\"{replacement_id}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"owned prompt\"}}}}\n",
+                    "{{\"timestamp\":\"2026-08-20T11:06:00Z\",\"sessionId\":\"{replacement_id}\",\"type\":\"assistant\",\"requestId\":\"req_ambiguous\",\"message\":{{\"id\":\"msg_replacement\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":30,\"cache_read_input_tokens\":300,\"output_tokens\":4}}}}}}\n"
+                ),
+                replacement_id = replacement_id,
+            ),
+        )
+        .expect("write replacement owner fixture");
+        let replacement = parse_claude_code_jsonl_file(
+            &replacement_path,
+            "2026-08-20T11:07:00Z",
+            "replacement-fingerprint".to_string(),
+        )
+        .expect("parse replacement owner")
+        .remove(0);
+        assert_eq!(replacement.peak_context_fill_tokens, Some(330));
+        let mut replacement_index = paged_index.clone();
+        replacement_index.files.clear();
+        replacement_index.files.insert(
+            local_index_key(&replacement_path),
+            manifest_index_entry(Some("replacement-settled")),
+        );
+        let mut replacement_pass = vec![replacement.clone()];
+        apply_claude_reported_usage_with_index(
+            &mut replacement_pass,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut replacement_index,
+            true,
+            "2026-08-20T11:07:00Z",
+        );
+        assert_eq!(replacement_pass[0].peak_context_fill_tokens, None);
+        assert!(replacement_index.claude_duplicate_request_owners.is_empty());
+        assert!(replacement_index
+            .files
+            .get(&local_index_key(&replacement_path))
+            .expect("replacement index entry")
+            .source_file_fingerprint
+            .is_empty());
+        replacement_index
+            .files
+            .get_mut(&local_index_key(&replacement_path))
+            .expect("replacement index entry")
+            .source_file_fingerprint = "replacement-corrected".to_string();
+        let mut replacement_recovery = vec![replacement];
+        apply_claude_reported_usage_with_index(
+            &mut replacement_recovery,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut replacement_index,
+            true,
+            "2026-08-20T11:07:00Z",
+        );
+        assert_eq!(replacement_recovery[0].peak_context_fill_tokens, Some(330));
+        assert_eq!(
+            replacement_index
+                .files
+                .get(&local_index_key(&replacement_path))
+                .expect("replacement index entry")
+                .source_file_fingerprint,
+            "replacement-corrected"
+        );
+
+        // Overflow never stores a partial owner map. A complete corrective
+        // census rebuilds the bounded witness, re-arms once, and the following
+        // stable pass does not create a hot replay loop.
+        paged_index.claude_duplicate_request_owners.clear();
+        paged_index.claude_duplicate_request_witness_overflowed = true;
+        let mut overflow_recovery = corrective_page.clone();
+        apply_claude_reported_usage_with_index(
+            &mut overflow_recovery,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut paged_index,
+            true,
+            "2026-08-20T11:04:00Z",
+        );
+        assert!(!paged_index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(paged_index.claude_duplicate_request_owners.len(), 1);
+        assert!(paged_index
+            .files
+            .get(&local_index_key(&child_path))
+            .expect("child index entry")
+            .source_file_fingerprint
+            .is_empty());
+        paged_index
+            .files
+            .get_mut(&local_index_key(&child_path))
+            .expect("child index entry")
+            .source_file_fingerprint = "child-after-overflow".to_string();
+        paged_index
+            .files
+            .get_mut(&local_index_key(&sibling_path))
+            .expect("sibling index entry")
+            .source_file_fingerprint = "sibling-after-overflow".to_string();
+        let mut stable_after_overflow = corrective_page.clone();
+        apply_claude_reported_usage_with_index(
+            &mut stable_after_overflow,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut paged_index,
+            true,
+            "2026-08-20T11:04:00Z",
+        );
+        assert_eq!(
+            paged_index
+                .files
+                .get(&local_index_key(&child_path))
+                .expect("child index entry")
+                .source_file_fingerprint,
+            "child-after-overflow"
+        );
+
+        // Exercise the real pending-occurrence cap with a tiny injected limit:
+        // page one fits exactly, page two crosses in another family and is
+        // discarded, yet the terminal pass still installs the durable global
+        // fail-closed fence. A later complete below-cap census clears the fence
+        // but re-arms once before owned posture may return.
+        let mut cap_index = ScanIndex::default();
+        cap_index.files.insert(
+            local_index_key(&child_path),
+            manifest_index_entry(Some("cap-child-settled")),
+        );
+        cap_index.files.insert(
+            local_index_key(&sibling_path),
+            manifest_index_entry(Some("cap-sibling-settled")),
+        );
+        let mut cap_child_page = vec![corrective_page[0].clone()];
+        apply_claude_reported_usage_with_index_and_limits(
+            &mut cap_child_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut cap_index,
+            false,
+            "2026-08-20T11:04:00Z",
+            1,
+            10,
+            None,
+        );
+        assert_eq!(cap_child_page[0].peak_context_fill_tokens, Some(895_010));
+        let mut cap_sibling_page = vec![corrective_page[1].clone()];
+        apply_claude_reported_usage_with_index_and_limits(
+            &mut cap_sibling_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut cap_index,
+            true,
+            "2026-08-20T11:04:00Z",
+            1,
+            10,
+            None,
+        );
+        assert!(cap_index.claude_duplicate_request_witness_overflowed);
+        assert!(cap_index.claude_duplicate_request_owners.is_empty());
+        assert_eq!(cap_sibling_page[0].peak_context_fill_tokens, None);
+        assert!(cap_index
+            .files
+            .values()
+            .all(|entry| entry.source_file_fingerprint.is_empty()));
+
+        cap_index.files.remove(&local_index_key(&sibling_path));
+        let mut cap_recovery = vec![corrective_page[0].clone()];
+        apply_claude_reported_usage_with_index_and_limits(
+            &mut cap_recovery,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut cap_index,
+            true,
+            "2026-08-20T11:06:00Z",
+            1,
+            10,
+            None,
+        );
+        assert!(!cap_index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(cap_recovery[0].peak_context_fill_tokens, None);
+        cap_index
+            .files
+            .get_mut(&local_index_key(&child_path))
+            .expect("cap child index entry")
+            .source_file_fingerprint = "cap-recovered".to_string();
+        let mut cap_restored = vec![corrective_page[0].clone()];
+        apply_claude_reported_usage_with_index_and_limits(
+            &mut cap_restored,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut cap_index,
+            true,
+            "2026-08-20T11:06:00Z",
+            1,
+            10,
+            None,
+        );
+        assert_eq!(cap_restored[0].peak_context_fill_tokens, Some(895_010));
+        assert_eq!(
+            cap_index
+                .files
+                .get(&local_index_key(&child_path))
+                .expect("cap child index entry")
+                .source_file_fingerprint,
+            "cap-recovered"
+        );
+
+        // When one owner removes the duplicated request, the durable witness
+        // is reconciled away and both former owners re-arm. The next complete
+        // census may then restore only actually owned posture.
+        fs::write(
+            &child_path,
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-08-20T11:00:00Z\",\"sessionId\":\"{child_id}\",\"type\":\"assistant\",\"forkedFrom\":{{\"sessionId\":\"explicit-parent\",\"messageUuid\":\"parent-message\"}},\"requestId\":\"req_parent\",\"message\":{{\"id\":\"msg_parent\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":900000,\"output_tokens\":2}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"{child_id}\",\"type\":\"assistant\",\"requestId\":\"req_child_unique\",\"message\":{{\"id\":\"msg_child\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":10,\"cache_read_input_tokens\":895000,\"output_tokens\":2}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-20T11:01:30Z\",\"sessionId\":\"{child_id}\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{{\"trigger\":\"auto\",\"preTokens\":895010,\"postTokens\":100000}}}}\n"
+                ),
+                child_id = child_id,
+            ),
+        )
+        .expect("rewrite child fixture");
+        let changed_child = parse_claude_code_jsonl_file(
+            &child_path,
+            "2026-08-20T11:05:00Z",
+            "child-changed".to_string(),
+        )
+        .expect("parse changed child")
+        .remove(0);
+        let unchanged_sibling = parse_claude_code_jsonl_file(
+            &sibling_path,
+            "2026-08-20T11:05:00Z",
+            "sibling-unchanged".to_string(),
+        )
+        .expect("parse unchanged sibling")
+        .remove(0);
+        let mut resolved_child_page = vec![changed_child];
+        apply_claude_reported_usage_with_index(
+            &mut resolved_child_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut paged_index,
+            false,
+            "2026-08-20T11:05:00Z",
+        );
+        assert_eq!(paged_index.claude_duplicate_request_owners.len(), 1);
+        let mut resolved_sibling_page = vec![unchanged_sibling];
+        apply_claude_reported_usage_with_index(
+            &mut resolved_sibling_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut paged_index,
+            true,
+            "2026-08-20T11:05:00Z",
+        );
+        assert!(paged_index.claude_duplicate_request_owners.is_empty());
+        assert!(paged_index
+            .files
+            .get(&local_index_key(&child_path))
+            .expect("child index entry")
+            .source_file_fingerprint
+            .is_empty());
+        let mut resolved_correction = vec![
+            resolved_child_page.remove(0),
+            resolved_sibling_page.remove(0),
+        ];
+        apply_claude_reported_usage_with_index(
+            &mut resolved_correction,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut paged_index,
+            true,
+            "2026-08-20T11:05:00Z",
+        );
+        assert!(resolved_correction[0].peak_context_fill_tokens.is_some());
+        assert_eq!(resolved_correction[0].compaction_count, Some(1));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_explicit_fork_duplicate_owned_request_fails_posture_closed() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let root = temp_dir("claude-explicit-fork-duplicate");
         let child_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -76458,6 +81148,79 @@ mod tests {
     /// `roots` Claude families (a root transcript plus one subagent each),
     /// indexed and accepted under the released body-witness revision 1.
     fn claude_context_backfill_fixture(name: &str, roots: usize) -> (PathBuf, PathBuf, ScanIndex) {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return terminal_off_on_claude_context_backfill_fixture(name, roots);
+        }
+        let home = temp_dir(name);
+        let root = home.join("project");
+        for slot in 0..roots {
+            let session = format!("aaaaaaaa-bbbb-4ccc-8ddd-{slot:012x}");
+            for agent in [None, Some(format!("{slot:016x}"))] {
+                let path = match &agent {
+                    Some(agent) => root
+                        .join(&session)
+                        .join("subagents")
+                        .join(format!("agent-{agent}.jsonl")),
+                    None => root.join(format!("{session}.jsonl")),
+                };
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let request_id = agent.as_deref().unwrap_or("root");
+                fs::write(
+                    &path,
+                    format!(
+                        "{}\n",
+                        json!({
+                            "timestamp": "2026-08-23T18:20:00Z",
+                            "type": "assistant",
+                            "sessionId": session,
+                            "agentId": agent,
+                            "isSidechain": agent.is_some(),
+                            "requestId": format!("request-{slot}-{request_id}"),
+                            "message": {
+                                "id": format!("message-{slot}-{request_id}"),
+                                "model": "claude-haiku-4-5",
+                                "usage": {"input_tokens": 10, "output_tokens": 1}
+                            }
+                        })
+                    ),
+                )
+                .unwrap();
+            }
+        }
+        let mut index = ScanIndex::default();
+        index.activate_upload_context("already-admitted-context".into());
+        index.activate_effective_upload_body_witness_revision(1);
+        let baseline = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-23T18:30:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .unwrap();
+        assert_eq!(baseline.snapshots.len(), roots * 2);
+        index.record_accepted_snapshot_fingerprints(
+            &baseline
+                .snapshots
+                .iter()
+                .map(|item| item.snapshot_fingerprint.clone())
+                .collect(),
+        );
+        index.save(&home.join("scan-index.json")).unwrap();
+        let mut loaded = ScanIndex::load(&home.join("scan-index.json")).unwrap();
+        loaded.activate_upload_context("already-admitted-context".into());
+        assert_eq!(loaded.files.len(), roots * 2);
+        assert!(loaded
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 1));
+        (home, root, loaded)
+    }
+
+    fn terminal_off_on_claude_context_backfill_fixture(
+        name: &str,
+        roots: usize,
+    ) -> (PathBuf, PathBuf, ScanIndex) {
         let home = temp_dir(name);
         let root = home.join("project");
         for slot in 0..roots {
@@ -76529,6 +81292,33 @@ mod tests {
         index: &mut ScanIndex,
         limit: usize,
     ) -> SourceScanResult {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return terminal_off_on_claude_context_backfill_scan(root, index, limit);
+        }
+        index.activate_upload_context("already-admitted-context".into());
+        index.activate_effective_upload_body_witness_revision(
+            crate::snapshot_sync::effective_upload_body_witness_revision(
+                SnapshotSource::ClaudeCode,
+            ),
+        );
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+        scan_source_roots_with_limit(
+            SnapshotSource::ClaudeCode,
+            &[root.to_path_buf()],
+            index,
+            "2026-08-23T18:40:00Z",
+            BACKFILL_WINDOW_DAYS,
+            limit,
+            true,
+        )
+        .unwrap()
+    }
+
+    fn terminal_off_on_claude_context_backfill_scan(
+        root: &Path,
+        index: &mut ScanIndex,
+        limit: usize,
+    ) -> SourceScanResult {
         index.activate_file_upload_context(
             SnapshotSource::ClaudeCode,
             "already-admitted-context".into(),
@@ -76564,6 +81354,26 @@ mod tests {
         scan: &mut SourceScanResult,
         index: &mut ScanIndex,
     ) -> ScanIndex {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return terminal_off_on_claude_context_backfill_settle(home, previous, scan, index);
+        }
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, scan, index);
+        let accepted = scan
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let mut settled = index.committable_subset(previous, &accepted, &BTreeMap::new());
+        settled.save(&home.join("scan-index.json")).unwrap();
+        ScanIndex::load(&home.join("scan-index.json")).unwrap()
+    }
+
+    fn terminal_off_on_claude_context_backfill_settle(
+        home: &Path,
+        previous: &ScanIndex,
+        scan: &mut SourceScanResult,
+        index: &mut ScanIndex,
+    ) -> ScanIndex {
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, scan, index);
         let accepted = scan
             .snapshots
@@ -76588,6 +81398,62 @@ mod tests {
 
     #[test]
     fn claude_context_backfill_selects_every_root_and_subagent_once() {
+        assert_eq!(
+            crate::snapshot_sync::effective_upload_body_witness_revision(
+                SnapshotSource::ClaudeCode
+            ),
+            3
+        );
+        let (home, root, index) =
+            claude_context_backfill_fixture("claude-context-backfill-once", 2);
+        let mut released = index.clone();
+        released.activate_effective_upload_body_witness_revision(1);
+        let stable = scan_source_roots_with_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut released,
+            "2026-08-23T18:35:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .unwrap();
+        assert_eq!(stable.scanned_file_count, 0, "revision 1 stays settled");
+        // With no adoption budget every file is deferred, so the revision is
+        // the only gate that selects these unchanged root and subagent files.
+        let mut unbudgeted = index.clone();
+        let deferred = with_body_witness_adoption_page_budget(0, || {
+            claude_context_backfill_scan(&root, &mut unbudgeted, MAX_BACKFILL_FILES_PER_SOURCE)
+        });
+        assert_eq!(deferred.scanned_file_count, 0);
+        assert!(deferred.census_complete, "deferral never holds the census");
+        assert!(unbudgeted
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 1));
+
+        let mut index = index;
+        let previous = index.clone();
+        let mut scan =
+            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(scan.scanned_file_count, 4, "every root and subagent file");
+        assert_eq!(
+            scan.snapshots.len(),
+            4,
+            "an adopting file re-sends its body even when it is unchanged"
+        );
+        let mut loaded = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
+        assert!(loaded
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 3));
+        let again = claude_context_backfill_scan(&root, &mut loaded, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!((again.scanned_file_count, again.snapshots.len()), (0, 0));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_context_backfill_selects_every_root_and_subagent_once() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         assert_eq!(
@@ -76649,6 +81515,36 @@ mod tests {
 
     #[test]
     fn claude_context_backfill_resumes_after_restart_without_rereading_settled_files() {
+        let (home, root, mut index) =
+            claude_context_backfill_fixture("claude-context-backfill-resume", 2);
+        let mut parsed = 0;
+        for page in 1..=2 {
+            let previous = index.clone();
+            let mut scan = claude_context_backfill_scan(&root, &mut index, 2);
+            assert_eq!(scan.scanned_file_count, 2);
+            assert_eq!(scan.census_complete, page == 2);
+            parsed += scan.scanned_file_count;
+            // Restart between pages: only the settled index survives.
+            index = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
+            assert_eq!(
+                index
+                    .files
+                    .values()
+                    .filter(|entry| entry.effective_upload_body_witness_revision == 3)
+                    .count(),
+                page * 2
+            );
+        }
+        assert_eq!(parsed, 4, "no file was read twice");
+        let stable = claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!((stable.scanned_file_count, stable.snapshots.len()), (0, 0));
+        assert!(stable.census_complete);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_context_backfill_resumes_after_restart_without_rereading_settled_files(
+    ) {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let (home, root, mut index) =
@@ -76684,6 +81580,57 @@ mod tests {
     /// exact comparison.
     #[test]
     fn claude_context_backfill_compares_revisions_monotonically() {
+        let (home, root, index) =
+            claude_context_backfill_fixture("claude-context-backfill-monotone", 1);
+        let mut newer = index.clone();
+        for entry in newer.files.values_mut() {
+            entry.effective_upload_body_witness_revision = 3;
+        }
+        let skipped =
+            claude_context_backfill_scan(&root, &mut newer, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(
+            skipped.scanned_file_count, 0,
+            "stored 3, active 2: no re-read"
+        );
+        // The exact comparison Codex and Pi keep would select the same files.
+        let mut exact = newer.clone();
+        exact.activate_effective_upload_body_witness_revision(2);
+        assert!(exact
+            .files
+            .keys()
+            .all(|key| exact.effective_upload_body_witness_revision_requires_adoption(key)));
+        let mut unstamped = newer.clone();
+        for entry in unstamped.files.values_mut() {
+            entry.effective_upload_body_witness_revision = 0;
+        }
+        assert!(unstamped
+            .files
+            .keys()
+            .all(|key| unstamped.effective_upload_body_witness_revision_requires_adoption(key)));
+
+        let mut index = index;
+        assert!(index
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 1));
+        let previous = index.clone();
+        let mut scan =
+            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(scan.scanned_file_count, 2, "stored 1, active 2: re-read");
+        let mut loaded = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
+        let again = claude_context_backfill_scan(&root, &mut loaded, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(again.scanned_file_count, 0, "once");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// MONEY P2: Claude re-reads a file only when its stored revision is
+    /// below the active one (a missing stored value is 0). A newer stored
+    /// revision, as after a downgrade, is not re-read; Codex and Pi keep the
+    /// exact comparison.
+    #[test]
+    fn terminal_off_on_claude_context_backfill_compares_revisions_monotonically() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let (home, root, index) =
             claude_context_backfill_fixture("claude-context-backfill-monotone", 1);
         let mut newer = index.clone();
@@ -76796,6 +81743,43 @@ mod tests {
 
     #[test]
     fn claude_context_backfill_spreads_adoption_only_files_over_pages() {
+        assert_eq!(BODY_WITNESS_ADOPTION_ONLY_PARSES_PER_PAGE, 2_000);
+        let (home, root, mut index) =
+            claude_context_backfill_fixture("claude-context-backfill-pace", 3);
+        // A changed file is selected for its change too, so it is never deferred.
+        let changed = index
+            .files
+            .keys()
+            .find(|key| !key.contains("/subagents/"))
+            .unwrap()
+            .clone();
+        let mut bytes = fs::read(&changed).unwrap();
+        bytes.extend_from_slice(b"{}\n");
+        fs::write(&changed, bytes).unwrap();
+        let parsed_per_page = with_body_witness_adoption_page_budget(2, || {
+            let mut parsed_per_page = Vec::new();
+            loop {
+                let previous = index.clone();
+                let mut scan =
+                    claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+                assert!(scan.census_complete, "deferral never holds the census");
+                parsed_per_page.push(scan.scanned_file_count);
+                index = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
+                if scan.scanned_file_count == 0 || parsed_per_page.len() > 5 {
+                    break parsed_per_page;
+                }
+            }
+        });
+        assert_eq!(parsed_per_page, vec![3, 2, 1, 0]);
+        assert!(index
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 3));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_context_backfill_spreads_adoption_only_files_over_pages() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         assert_eq!(BODY_WITNESS_ADOPTION_ONLY_PARSES_PER_PAGE, 2_000);
@@ -76838,6 +81822,61 @@ mod tests {
 
     #[test]
     fn claude_context_backfill_caps_adoption_only_bytes_per_page() {
+        assert_eq!(
+            BODY_WITNESS_ADOPTION_ONLY_BYTES_PER_PAGE,
+            1024 * 1024 * 1024
+        );
+        let pages = |byte_budget: u64, name: &str| {
+            let (home, root, mut index) = claude_context_backfill_fixture(name, 3);
+            let mut sizes = index
+                .files
+                .values()
+                .map(|entry| entry.size_bytes)
+                .collect::<Vec<_>>();
+            sizes.sort_unstable();
+            let parsed_per_page = with_body_witness_adoption_byte_budget(byte_budget, || {
+                let mut parsed_per_page = Vec::new();
+                loop {
+                    let previous = index.clone();
+                    let mut scan = claude_context_backfill_scan(
+                        &root,
+                        &mut index,
+                        MAX_BACKFILL_FILES_PER_SOURCE,
+                    );
+                    assert!(scan.census_complete, "deferral never holds the census");
+                    parsed_per_page.push(scan.scanned_file_count);
+                    index = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
+                    if scan.scanned_file_count == 0 || parsed_per_page.len() > 7 {
+                        break parsed_per_page;
+                    }
+                }
+            });
+            let revisions = index
+                .files
+                .values()
+                .map(|entry| entry.effective_upload_body_witness_revision)
+                .collect::<BTreeSet<_>>();
+            let _ = fs::remove_dir_all(home);
+            (sizes, parsed_per_page, revisions)
+        };
+        // Every file is larger than the byte budget: there is no first-file
+        // exception, so no history is re-read and every file stays owed.
+        let (_, oversized, revisions) = pages(1, "claude-context-backfill-bytes-oversized");
+        assert_eq!(oversized, vec![0]);
+        assert_eq!(revisions, BTreeSet::from([1]));
+        // A budget that holds any two files but no three spreads six files
+        // over three pages, under a file budget that would admit all six.
+        let (sizes, _, revisions) = pages(u64::MAX, "claude-context-backfill-bytes-sizes");
+        assert_eq!(revisions, BTreeSet::from([3]));
+        let two = sizes[4] + sizes[5];
+        assert!(sizes[0] + sizes[1] + sizes[2] > two, "{sizes:?}");
+        let (_, paired, revisions) = pages(two, "claude-context-backfill-bytes-paired");
+        assert_eq!(paired, vec![2, 2, 2, 0]);
+        assert_eq!(revisions, BTreeSet::from([3]));
+    }
+
+    #[test]
+    fn terminal_off_on_claude_context_backfill_caps_adoption_only_bytes_per_page() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         assert_eq!(
@@ -76898,6 +81937,86 @@ mod tests {
 
     #[test]
     fn claude_context_backfill_quarantined_family_keeps_its_own_retry_gate() {
+        let (home, root, mut index) =
+            claude_context_backfill_fixture("claude-context-backfill-quarantine", 1);
+        let (root_session_id, members) = {
+            let mut root_session_id = String::new();
+            let members = index
+                .files
+                .iter()
+                .filter_map(|(key, entry)| {
+                    let (family_root, member) = claude_index_path_family_member(Path::new(key))?;
+                    root_session_id = family_root;
+                    Some((member, entry.source_file_fingerprint.clone()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            (root_session_id, members)
+        };
+        assert_eq!(members.len(), 2);
+        let witness = ClaudeUsageFamilyWitness {
+            evidence_fingerprint: "provider-evidence".to_string(),
+            member_request_id_fingerprints: members
+                .keys()
+                .map(|member| (member.clone(), "requests".to_string()))
+                .collect(),
+            member_occurrence_fingerprints: members
+                .keys()
+                .map(|member| (member.clone(), "occurrences".to_string()))
+                .collect(),
+            assigned_request_id_fingerprints: members
+                .keys()
+                .map(|member| (member.clone(), "assigned".to_string()))
+                .collect(),
+            legacy_excluded_request_id_hashes: BTreeMap::new(),
+            legacy_exclusion_evidence_fingerprint: None,
+            legacy_owner_roots: BTreeSet::new(),
+        };
+        let witness_fingerprint = claude_usage_family_witness_fingerprint(&witness);
+        index
+            .claude_usage_family_witnesses
+            .insert(root_session_id.clone(), witness);
+        index.claude_usage_authority_quarantine.insert(
+            root_session_id.clone(),
+            ClaudeUsageAuthorityQuarantineRecord {
+                proof_correction: None,
+                contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
+                proven_witness_fingerprint: witness_fingerprint,
+                member_source_file_fingerprints: members,
+                failed_reconstruction_count: 1,
+                disposition: ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+                retry_after_unix_seconds: u64::MAX,
+            },
+        );
+        with_body_witness_adoption_page_budget(0, || {
+            let held =
+                claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+            assert_eq!(
+                held.scanned_file_count, 0,
+                "the held family is neither adopted nor retried before its gate opens"
+            );
+            let subagent = index
+                .files
+                .keys()
+                .find(|key| key.contains("/subagents/"))
+                .unwrap()
+                .clone();
+            let mut bytes = fs::read(&subagent).unwrap();
+            bytes.extend_from_slice(b"{}\n");
+            fs::write(&subagent, bytes).unwrap();
+            let retried =
+                claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+            assert_eq!(
+                retried.scanned_file_count, 2,
+                "its own retry reparses every member even with no adoption budget"
+            );
+        });
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_context_backfill_quarantined_family_keeps_its_own_retry_gate() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let (home, root, mut index) =
             claude_context_backfill_fixture("claude-context-backfill-quarantine", 1);
         let (root_session_id, members) = {
@@ -77107,7 +82226,205 @@ mod tests {
     }
 
     #[test]
+    fn terminal_off_on_claude_context_backfill_skips_sessions_on_the_local_reemission_list() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+        let (home, root, mut index) =
+            claude_context_backfill_fixture("claude-context-backfill-exclusions", 3);
+        let support = crate::test_scratch::ScratchDir::new("claude-reemission-exclusions");
+        let list = ReemissionExclusions::path(&support);
+        fs::create_dir_all(list.parent().unwrap()).unwrap();
+        let session = |slot: usize| format!("aaaaaaaa-bbbb-4ccc-8ddd-{slot:012x}");
+        let digest = |id: &str| format!("{:x}", Sha256::digest(id.as_bytes()));
+        // Slot 0 by its family root (root and subagent), slot 1 by its
+        // subagent member only. The list is closed over family roots, so
+        // slot 1's root is excluded too (N1). Slot 2 is not listed.
+        let listed_member = index
+            .files
+            .keys()
+            .filter_map(|key| claude_index_path_family_member(Path::new(key)))
+            .find(|(family_root, member)| *family_root == session(1) && *member != session(1))
+            .map(|(_, member)| member)
+            .unwrap();
+        fs::write(
+            &list,
+            format!(
+                "# local only\n{}\n\n{}\n",
+                digest(&session(0)),
+                digest(&listed_member)
+            ),
+        )
+        .unwrap();
+        let excluded = |key: &str| {
+            claude_index_path_family_member(Path::new(key)).is_some_and(|(family_root, _)| {
+                family_root == session(0) || family_root == session(1)
+            })
+        };
+        let revisions = |index: &ScanIndex| {
+            index
+                .files
+                .iter()
+                .map(|(key, entry)| {
+                    (
+                        excluded(key.as_str()),
+                        entry.effective_upload_body_witness_revision,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // A malformed list defers every adoption-only file; a changed file
+        // is still read.
+        fs::write(&list, "not-a-digest\n").unwrap();
+        let mut refused = index.clone();
+        refused.load_claude_reemission_exclusions(&support);
+        assert!(
+            !ReemissionExclusions::seen_marker_path(&support).exists(),
+            "a malformed list never counts as installed"
+        );
+        let deferred =
+            claude_context_backfill_scan(&root, &mut refused, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(
+            deferred.scanned_file_count, 0,
+            "an unreadable list adopts nothing"
+        );
+        assert!(deferred.census_complete);
+        let changed = index
+            .files
+            .keys()
+            .find(|key| !excluded(key.as_str()))
+            .unwrap()
+            .clone();
+        let mut appended = refused.clone();
+        appended.files.get_mut(&changed).unwrap().size_bytes += 1;
+        let changed_scan =
+            claude_context_backfill_scan(&root, &mut appended, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert!(
+            changed_scan.scanned_file_count >= 1,
+            "the list only gates adoption, never a changed file"
+        );
+
+        fs::write(
+            &list,
+            format!(
+                "# local only\n{}\n\n{}\n",
+                digest(&session(0)),
+                digest(&listed_member)
+            ),
+        )
+        .unwrap();
+        index.load_claude_reemission_exclusions(&support);
+        let previous = index.clone();
+        // Listed files never use the budget: the two unlisted files fit in it.
+        let mut scan = with_body_witness_adoption_page_budget(2, || {
+            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE)
+        });
+        assert_eq!(
+            scan.scanned_file_count, 2,
+            "only the unlisted family adopts"
+        );
+        assert!(scan.census_complete);
+        let mut index = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
+        let mut settled = revisions(&index);
+        settled.sort();
+        assert_eq!(
+            settled,
+            vec![
+                (false, 3),
+                (false, 3),
+                (true, 1),
+                (true, 1),
+                (true, 1),
+                (true, 1)
+            ],
+            "listed families keep the old stamp, including a member-only line's root"
+        );
+        index.load_claude_reemission_exclusions(&support);
+        let held = claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(held.scanned_file_count, 0, "listed files stay unread");
+
+        // Once their recovery settles their lines are removed (the file
+        // stays), and the old stamp lets them adopt with no new revision.
+        fs::write(&list, "# local only\n").unwrap();
+        index.load_claude_reemission_exclusions(&support);
+        let previous = index.clone();
+        let mut released =
+            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(released.scanned_file_count, 4);
+        let index = claude_context_backfill_settle(&home, &previous, &mut released, &mut index);
+        assert!(index
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 3));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn claude_context_backfill_holds_old_entities_until_the_list_is_installed() {
+        use claude_reemission_exclusions::with_no_list_cutoff;
+        let (home, root, mut index) =
+            claude_context_backfill_fixture("claude-context-backfill-no-list", 2);
+        let support = crate::test_scratch::ScratchDir::new("claude-reemission-no-list");
+        index.load_claude_reemission_exclusions(&support);
+        assert_eq!(
+            index.claude_reemission_exclusions.state(),
+            ListState::NotInstalled
+        );
+        // The no-list hold applies on an unverified Mac (StateMissing N1).
+        index.claude_no_list_policy = NoListPolicy::HoldUnverified;
+        let stamps = |index: &ScanIndex| {
+            index
+                .files
+                .values()
+                .map(|entry| entry.effective_upload_body_witness_revision)
+                .collect::<Vec<_>>()
+        };
+
+        // The fixtures are born now. A cutoff after them makes every entity
+        // old: held with its old stamp, and the census still completes.
+        let mut old = index.clone();
+        let held = with_no_list_cutoff(u64::MAX, || {
+            claude_context_backfill_scan(&root, &mut old, MAX_BACKFILL_FILES_PER_SOURCE)
+        });
+        assert_eq!(
+            held.scanned_file_count, 0,
+            "old entities are not re-emitted"
+        );
+        assert!(held.census_complete);
+        assert_eq!(stamps(&old), vec![1; 4]);
+        let changed = old.files.keys().next().unwrap().clone();
+        let mut appended = old.clone();
+        appended.files.get_mut(&changed).unwrap().size_bytes += 1;
+        let changed_scan = with_no_list_cutoff(u64::MAX, || {
+            claude_context_backfill_scan(&root, &mut appended, MAX_BACKFILL_FILES_PER_SOURCE)
+        });
+        assert!(
+            changed_scan.scanned_file_count >= 1,
+            "the hold only gates adoption, never a changed file"
+        );
+        // Where no list is intended on a verified Mac, the same old
+        // entities are paced through the budget instead (N1).
+        let mut paced = index.clone();
+        paced.claude_no_list_policy = NoListPolicy::Pace;
+        let paced_scan = with_no_list_cutoff(u64::MAX, || {
+            claude_context_backfill_scan(&root, &mut paced, MAX_BACKFILL_FILES_PER_SOURCE)
+        });
+        assert_eq!(paced_scan.scanned_file_count, 4, "paced, not held");
+
+        // A cutoff before them makes every entity new: they adopt.
+        let previous = index.clone();
+        let mut fresh = with_no_list_cutoff(0, || {
+            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE)
+        });
+        assert_eq!(fresh.scanned_file_count, 4, "newer entities proceed");
+        let index = claude_context_backfill_settle(&home, &previous, &mut fresh, &mut index);
+        assert_eq!(stamps(&index), vec![3; 4]);
+        assert!(!ReemissionExclusions::seen_marker_path(&support).exists());
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_context_backfill_holds_old_entities_until_the_list_is_installed() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         use claude_reemission_exclusions::with_no_list_cutoff;
@@ -77174,6 +82491,40 @@ mod tests {
 
     #[test]
     fn claude_context_backfill_empty_list_installs_the_marker_and_adopts_old_entities() {
+        use claude_reemission_exclusions::with_no_list_cutoff;
+        let (home, root, mut index) =
+            claude_context_backfill_fixture("claude-context-backfill-empty-list", 2);
+        let support = crate::test_scratch::ScratchDir::new("claude-reemission-empty-list");
+        let list = ReemissionExclusions::path(&support);
+        fs::create_dir_all(list.parent().unwrap()).unwrap();
+        fs::write(&list, "").unwrap();
+        index.load_claude_reemission_exclusions(&support);
+        assert_eq!(
+            index.claude_reemission_exclusions.state(),
+            ListState::Installed
+        );
+        assert!(ReemissionExclusions::seen_marker_path(&support).exists());
+        let previous = index.clone();
+        let mut scan = with_no_list_cutoff(u64::MAX, || {
+            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE)
+        });
+        assert_eq!(
+            scan.scanned_file_count, 4,
+            "an installed list, even empty, ends the old-entity hold"
+        );
+        let index = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
+        assert!(index
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 3));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn terminal_off_on_claude_context_backfill_empty_list_installs_the_marker_and_adopts_old_entities(
+    ) {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         use claude_reemission_exclusions::with_no_list_cutoff;
         let (home, root, mut index) =
             claude_context_backfill_fixture("claude-context-backfill-empty-list", 2);
@@ -77271,7 +82622,113 @@ mod tests {
         let _ = fs::remove_dir_all(home);
     }
 
+    #[test]
+    fn terminal_off_on_claude_context_backfill_pauses_with_an_alarm_when_an_installed_list_goes_missing(
+    ) {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+        use claude_reemission_exclusions::with_no_list_cutoff;
+        let (home, root, mut index) =
+            claude_context_backfill_fixture("claude-context-backfill-list-missing", 2);
+        let support = crate::test_scratch::ScratchDir::new("claude-reemission-list-missing");
+        let list = ReemissionExclusions::path(&support);
+        fs::create_dir_all(list.parent().unwrap()).unwrap();
+        fs::write(&list, "# nothing listed\n").unwrap();
+        index.load_claude_reemission_exclusions(&support);
+        assert_eq!(
+            index.claude_reemission_exclusions.state(),
+            ListState::Installed
+        );
+        fs::remove_file(&list).unwrap();
+
+        let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+            index.load_claude_reemission_exclusions(&support)
+        });
+        let state = index.claude_reemission_exclusions.state();
+        assert_eq!(state, ListState::MissingAfterInstall);
+        assert_eq!(state.as_str(), "missing_after_install");
+        assert_eq!(alarms.len(), 1);
+        assert_eq!(
+            alarms[0]["stage"],
+            "claude_reemission_list_missing_after_install"
+        );
+        assert_eq!(alarms[0]["source"], "claude_code");
+        assert_eq!(alarms[0]["counts"]["cause"], "seen_marker");
+        // Paused: even entities newer than the cutoff wait, with old stamps.
+        let paused = with_no_list_cutoff(0, || {
+            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE)
+        });
+        assert_eq!(paused.scanned_file_count, 0);
+        assert!(paused.census_complete);
+        assert!(index
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 1));
+
+        // A restart reloads the saved index; an index rebuild starts from an
+        // empty one. Neither carries the list state, and both still pause:
+        // the marker lives beside the list, not in the index.
+        index.save(&home.join("scan-index.json")).unwrap();
+        for mut reloaded in [
+            ScanIndex::load(&home.join("scan-index.json")).unwrap(),
+            ScanIndex::default(),
+        ] {
+            let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+                reloaded.load_claude_reemission_exclusions(&support)
+            });
+            assert_eq!(
+                reloaded.claude_reemission_exclusions.state(),
+                ListState::MissingAfterInstall
+            );
+            assert_eq!(alarms.len(), 1);
+        }
+
+        // Putting the file back resumes adoption.
+        fs::write(&list, "").unwrap();
+        index.load_claude_reemission_exclusions(&support);
+        let resumed = with_no_list_cutoff(u64::MAX, || {
+            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE)
+        });
+        assert_eq!(resumed.scanned_file_count, 4);
+        let _ = fs::remove_dir_all(home);
+    }
+
     fn body_witness_finalizer_scan(
+        root: &Path,
+        index: &mut ScanIndex,
+        revision: usize,
+    ) -> SourceScanResult {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return terminal_off_on_body_witness_finalizer_scan(root, index, revision);
+        }
+        let base = "{\"timestamp\":\"2026-08-20T12:00:01Z\",\"sessionId\":\"curve-session\",\"requestId\":\"req_curve_1\",\"message\":{\"id\":\"msg_curve_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100,\"output_tokens\":5}}}\n";
+        fs::write(
+            root.join("curve-session.jsonl"),
+            format!("{base}{}", "{}\n".repeat(revision)),
+        )
+        .expect("write forced-parse fixture");
+        let mut result = scan_source_roots_with_limit(
+            SnapshotSource::ClaudeCode,
+            &[root.to_path_buf()],
+            index,
+            "2026-08-20T12:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .expect("scan forced-parse fixture");
+        assert_eq!(result.snapshots.len(), 1);
+        result.snapshots[0].context_curve = Some(unavailable_context_curve(
+            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+            "claude_owned_request_start_proof:v1",
+            "ownership_unresolved",
+            0,
+            0,
+        ));
+        result
+    }
+
+    fn terminal_off_on_body_witness_finalizer_scan(
         root: &Path,
         index: &mut ScanIndex,
         revision: usize,
@@ -77347,7 +82804,90 @@ mod tests {
     }
 
     #[test]
+    fn terminal_off_on_body_witness_finalizer_default_wrapper_preserves_bytes_and_noops() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+        let root = temp_dir("body-witness-finalizer-default");
+        let mut index = ScanIndex::default();
+        for (revision, expected_count) in [(1, 1), (2, 0)] {
+            let mut wrapped = body_witness_finalizer_scan(&root, &mut index, revision);
+            let mut explicit = wrapped.clone();
+            let mut explicit_index = index.clone();
+            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut wrapped, &mut index);
+            finalize_scan_after_policy_with_body_witness(
+                SnapshotSource::ClaudeCode,
+                &mut explicit,
+                &mut explicit_index,
+                snapshot_upload_body_witness,
+            );
+            assert_eq!(wrapped.snapshots.len(), expected_count);
+            assert_eq!(wrapped.semantic_noop_count, 1 - expected_count);
+            assert_eq!(format!("{wrapped:?}"), format!("{explicit:?}"));
+            assert_eq!(
+                serde_json::to_vec(&wrapped.snapshots).unwrap(),
+                serde_json::to_vec(&explicit.snapshots).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_vec(&index).unwrap(),
+                serde_json::to_vec(&explicit_index).unwrap()
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn body_witness_finalizer_effective_projection_changes_only_delivery() {
+        let root = temp_dir("body-witness-finalizer-effective");
+        let mut index = ScanIndex::default();
+        let mut first = body_witness_finalizer_scan(&root, &mut index, 1);
+        let mut raw = first.snapshots[0].clone();
+        raw.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &raw);
+        let raw_bytes = serde_json::to_vec(&raw).unwrap();
+        first.snapshots[0].snapshot_fingerprint = "provisional".into();
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::ClaudeCode,
+            &mut first,
+            &mut index,
+            curve_omitted_body_witness,
+        );
+        assert_eq!(serde_json::to_vec(&first.snapshots[0]).unwrap(), raw_bytes);
+        let semantic_state = index.file_snapshot_fingerprints.clone();
+        let activity_state = index.snapshot_activity_at.clone();
+        for (revision, omitted, expected_count) in [(2, true, 0), (3, false, 1), (4, false, 0)] {
+            let mut scan = body_witness_finalizer_scan(&root, &mut index, revision);
+            let mut local_item = scan.snapshots[0].clone();
+            local_item.snapshot_fingerprint =
+                snapshot_fingerprint(SnapshotSource::ClaudeCode, &local_item);
+            let local_bytes = serde_json::to_vec(&local_item).unwrap();
+            scan.snapshots[0].snapshot_fingerprint = "provisional".into();
+            finalize_scan_after_policy_with_body_witness(
+                SnapshotSource::ClaudeCode,
+                &mut scan,
+                &mut index,
+                |item| {
+                    if omitted {
+                        curve_omitted_body_witness(item)
+                    } else {
+                        assert_eq!(item.snapshot_fingerprint, raw.snapshot_fingerprint);
+                        snapshot_upload_body_witness(item)
+                    }
+                },
+            );
+            assert_eq!(scan.snapshots.len(), expected_count);
+            assert_eq!(scan.semantic_noop_count, 1 - expected_count);
+            assert_eq!(index.file_snapshot_fingerprints, semantic_state);
+            assert_eq!(index.snapshot_activity_at, activity_state);
+            if expected_count == 1 {
+                assert_eq!(serde_json::to_vec(&scan.snapshots[0]).unwrap(), local_bytes);
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_off_on_body_witness_finalizer_effective_projection_changes_only_delivery() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let root = temp_dir("body-witness-finalizer-effective");
         let mut index = ScanIndex::default();
         let mut first = body_witness_finalizer_scan(&root, &mut index, 1);
@@ -77438,7 +82978,131 @@ mod tests {
     }
 
     #[test]
+    fn terminal_off_on_body_witness_finalizer_quarantine_uses_effective_projection() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+        let root = temp_dir("body-witness-finalizer-quarantine");
+        let mut index = ScanIndex::default();
+        let mut first = body_witness_finalizer_scan(&root, &mut index, 1);
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::ClaudeCode,
+            &mut first,
+            &mut index,
+            curve_omitted_body_witness,
+        );
+        let item = &first.snapshots[0];
+        let raw_witness = snapshot_upload_body_witness(item);
+        let effective_witness = curve_omitted_body_witness(item);
+        assert_ne!(raw_witness, effective_witness);
+        let scan = body_witness_finalizer_scan(&root, &mut index, 2);
+        for (witness, expected_count) in [(effective_witness, 0), (raw_witness, 1)] {
+            let mut retry_index = index.clone();
+            let mut retry = scan.clone();
+            let mut record = snapshot_quarantine_record(SnapshotSource::ClaudeCode);
+            record.upload_body_witness = Some(witness);
+            retry_index
+                .quarantined_snapshot_fingerprints
+                .insert(item.snapshot_fingerprint.clone(), record);
+            retry.snapshots[0].snapshot_fingerprint = "provisional".into();
+            let calls = std::cell::Cell::new(0);
+            finalize_scan_after_policy_with_body_witness(
+                SnapshotSource::ClaudeCode,
+                &mut retry,
+                &mut retry_index,
+                |item| {
+                    calls.set(calls.get() + 1);
+                    curve_omitted_body_witness(item)
+                },
+            );
+            assert_eq!(calls.get(), 2, "file fold and quarantine share the witness");
+            assert_eq!(retry.snapshots.len(), expected_count);
+            assert_eq!(retry.semantic_noop_count, 1 - expected_count);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn context_curve_body_witness_uploads_absent_present_corrections_once() {
+        let root = temp_dir("context-curve-body-witness");
+        let path = root.join("curve-session.jsonl");
+        let base = "{\"timestamp\":\"2026-08-20T12:00:01Z\",\"sessionId\":\"curve-session\",\"requestId\":\"req_curve_1\",\"message\":{\"id\":\"msg_curve_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100,\"output_tokens\":5}}}\n";
+        let point = |tokens| ContextCurveCandidatePoint {
+            observed_at: Some("2026-08-20T12:00:01Z".to_string()),
+            effective_input_tokens: tokens,
+            model: Some("claude-opus-4-8".to_string()),
+            context_window_tokens: None,
+        };
+        let curve_a = build_context_curve(
+            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+            "claude_owned_request_start_proof:v1",
+            "claude_transcript_model:v1",
+            &[point(100)],
+            &[],
+            "ownership_unresolved",
+        );
+        let curve_b = build_context_curve(
+            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+            "claude_owned_request_start_proof:v1",
+            "claude_transcript_model:v1",
+            &[point(125)],
+            &[],
+            "ownership_unresolved",
+        );
+        let mut index = ScanIndex::default();
+        let mut revision = 0_usize;
+        let mut run = |curve: Option<SnapshotContextCurve>| {
+            revision += 1;
+            fs::write(&path, format!("{base}{}", "{}\n".repeat(revision)))
+                .expect("write forced-parse fixture");
+            let mut result = scan_source_roots_with_limit(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-08-20T12:05:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("scan forced-parse fixture");
+            assert_eq!(result.snapshots.len(), 1);
+            result.snapshots[0].context_curve = curve;
+            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+            (
+                result.snapshots.len(),
+                result.semantic_noop_count,
+                index
+                    .files
+                    .get(&local_index_key(&path))
+                    .and_then(|entry| entry.last_upload_body_witness.clone())
+                    .expect("body witness persisted"),
+            )
+        };
+
+        let (baseline_count, _, baseline_witness) = run(None);
+        assert_eq!(baseline_count, 1);
+        let (present_count, _, curve_a_witness) = run(Some(curve_a.clone()));
+        assert_eq!(present_count, 1, "absent -> present uploads once");
+        assert_ne!(baseline_witness, curve_a_witness);
+        let (identical_count, identical_noops, identical_witness) = run(Some(curve_a.clone()));
+        assert_eq!((identical_count, identical_noops), (0, 1));
+        assert_eq!(curve_a_witness, identical_witness);
+        let (corrected_count, _, curve_b_witness) = run(Some(curve_b));
+        assert_eq!(corrected_count, 1, "curve A -> B uploads");
+        assert_ne!(curve_a_witness, curve_b_witness);
+        let (restored_count, _, restored_witness) = run(Some(curve_a));
+        assert_eq!(restored_count, 1, "curve B -> A uploads");
+        assert_eq!(restored_witness, curve_a_witness);
+        let (rollback_count, _, rollback_witness) = run(None);
+        assert_eq!(rollback_count, 1, "rollback omission uploads once");
+        assert_eq!(rollback_witness, baseline_witness);
+        let (settled_count, settled_noops, _) = run(None);
+        assert_eq!((settled_count, settled_noops), (0, 1));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_off_on_context_curve_body_witness_uploads_absent_present_corrections_once() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let root = temp_dir("context-curve-body-witness");
@@ -78202,6 +83866,212 @@ mod tests {
 
     #[test]
     fn claude_original_carrier_source_generated_wire_corpus() {
+        // Released pre-flip bytes built without e2::finish_page, which emits the hours gate on.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+        let complete = claude_original_carrier_fixture(&claude_original_carrier_metadata(), "");
+        assert!(complete
+            .tool_usage
+            .as_ref()
+            .is_some_and(|rows| rows.iter().any(|row| row.name == "Read" && row.count == 1)));
+        let mut cases = Vec::new();
+        let mut declared_cases = Vec::new();
+        for disposition in ["complete", "missing", "conflict"] {
+            for cache in [false, true] {
+                for curve in [false, true] {
+                    let mut item = complete.clone();
+                    if disposition == "missing" {
+                        item = claude_original_carrier_fixture(
+                            &claude_original_carrier_missing_metadata(),
+                            "",
+                        );
+                    } else if disposition == "conflict" {
+                        let mut metadata = claude_original_carrier_metadata();
+                        let mut other = metadata.original_identity_evidence["native-session"]
+                            .first()
+                            .unwrap()
+                            .clone();
+                        other.provider_workspace_hash = Some("c".repeat(64));
+                        metadata
+                            .original_identity_evidence
+                            .get_mut("native-session")
+                            .unwrap()
+                            .insert(other);
+                        item = claude_original_carrier_fixture(&metadata, "");
+                    }
+                    prepare_cache_observations(&mut item, None);
+                    if !cache {
+                        item.cache_observations = None;
+                        item.cache_observations_state = None;
+                    }
+                    if !curve {
+                        item.context_curve = None;
+                    }
+                    let source_item = item;
+                    for tools in [
+                        "omitted",
+                        "empty_default_only",
+                        "nonempty",
+                        "truncated_only",
+                    ] {
+                        let mut item = source_item.clone();
+                        match tools {
+                            "omitted" | "truncated_only" => item.tool_usage = None,
+                            "empty_default_only" => item.tool_usage = Some(vec![]),
+                            _ => {}
+                        }
+                        item.tool_usage_truncated = tools == "truncated_only";
+                        let mut request = valid_v6_batch_request();
+                        request.source = "claude_code".into();
+                        request.snapshots = vec![item];
+                        apply_upload_policy(
+                            SnapshotSource::ClaudeCode,
+                            &mut request.snapshots,
+                            request.upload_policy,
+                        );
+                        request.snapshots[0].snapshot_fingerprint =
+                            snapshot_fingerprint(SnapshotSource::ClaudeCode, &request.snapshots[0]);
+                        let item = &request.snapshots[0];
+                        assert_eq!(
+                            item.session_account_evidence
+                                .as_ref()
+                                .unwrap()
+                                .identity_disposition,
+                            Some(disposition)
+                        );
+                        assert_eq!(snapshot_upload_body_witness_version(item), Some(23));
+                        assert_eq!(item.cache_observations.is_some(), cache);
+                        assert_eq!(
+                            item.session_account_evidence,
+                            source_item.session_account_evidence
+                        );
+                        assert_eq!(
+                            (item.input_tokens, item.output_tokens, item.request_count),
+                            (
+                                source_item.input_tokens,
+                                source_item.output_tokens,
+                                source_item.request_count
+                            )
+                        );
+                        assert_eq!(item.model_usage, source_item.model_usage);
+                        assert_eq!(item.usage_buckets, source_item.usage_buckets);
+                        let bytes = serde_json::to_vec(&request).unwrap();
+                        let wire: Value = serde_json::from_slice(&bytes).unwrap();
+                        let projection = snapshot_upload_body_witness_payload(item);
+                        for field in [
+                            "session_account_evidence",
+                            "context_curve",
+                            "tool_usage",
+                            "tool_usage_truncated",
+                        ] {
+                            assert_eq!(
+                                projection.get(field),
+                                wire["snapshots"][0].get(field),
+                                "original Claude declared presence: {field}/{tools}"
+                            );
+                        }
+                        assert_eq!(
+                            wire["snapshots"][0].get("tool_usage_truncated"),
+                            (tools == "truncated_only").then_some(&Value::Bool(true))
+                        );
+                        let canonical = crate::canonical_json::canonicalize(&projection).unwrap();
+                        let digest = snapshot_upload_body_witness(item);
+                        assert_eq!(digest, format!("{:x}", Sha256::digest(&canonical)));
+                        let public = if cache { 13 } else { 7 };
+                        let response = |version, proof, unchanged| {
+                            let reference = crate::snapshot_client::SnapshotEntityRef {
+                                source_session_id: item.source_session_id.clone(),
+                                snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                                occurrence_count: 1,
+                                body_witness_version: version,
+                                body_witness_digest: proof,
+                                head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
+                                head_challenge: None,
+                                unchanged_basis: None,
+                            };
+                            crate::snapshot_client::SnapshotBatchResponse {
+                                accepted: 1,
+                                sessions_reconciled: 0,
+                                session_ids: vec![],
+                                disabled: false,
+                                disabled_reason: None,
+                                entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
+                                accepted_entities: if unchanged {
+                                    vec![]
+                                } else {
+                                    vec![reference.clone()]
+                                },
+                                unchanged_entities: if unchanged {
+                                    vec![reference]
+                                } else {
+                                    vec![]
+                                },
+                                rejected_entities: vec![],
+                                conflict_entities: vec![],
+                            }
+                        };
+                        for unchanged in [false, true] {
+                            response(Some(public), Some(digest.clone()), unchanged)
+                                .validate_entity_ack(&request)
+                                .unwrap();
+                            for (version, proof) in [
+                                (Some(public), Some("0".repeat(64))),
+                                (None, None),
+                                (Some(23), Some(digest.clone())),
+                                (Some(if cache { 7 } else { 13 }), Some(digest.clone())),
+                            ] {
+                                assert!(response(version, proof, unchanged)
+                                    .validate_entity_ack(&request)
+                                    .is_err());
+                            }
+                        }
+                        let case = json!({"disposition":disposition,"cache":cache,"curve":curve,
+                        "provenance":"actual Claude transcript parser, original Desktop index and normal HTTP serializer",
+                        "wire":wire,
+                        "wire_body_utf8":String::from_utf8(bytes).unwrap(),
+                        "internal_version":snapshot_upload_body_witness_version(item),
+                        "released_ack_version":public,
+                        "digest":digest,
+                        "body_projection":projection,
+                        "cache_observations_state":item.cache_observations_state});
+                        if tools == "nonempty" {
+                            cases.push(case.clone());
+                        }
+                        let mut declared_case = case;
+                        declared_case["tools"] = json!(tools);
+                        declared_case["body_projection_canonical_utf8"] =
+                            json!(String::from_utf8(canonical).unwrap());
+                        declared_cases.push(declared_case);
+                    }
+                }
+            }
+        }
+        assert_eq!(cases.len(), 12);
+        let bytes = serde_json::to_vec_pretty(
+            &json!({"contract_version":"claude_original_wire_corpus:v1", "cases":cases}),
+        )
+        .unwrap();
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/snapshot-audit/claude-original-source-corpus-v1.json");
+        if std::env::var_os("UPDATE_CLAUDE_ORIGINAL_CORPUS").is_some() {
+            fs::write(&fixture, &bytes).unwrap();
+        }
+        assert_eq!(fs::read(&fixture).unwrap(), bytes,
+            "regenerate only from the actual Claude source/index/HTTP path with UPDATE_CLAUDE_ORIGINAL_CORPUS=1");
+        if let Ok(output) = std::env::var("OTTTO_CLAUDE_ORIGINAL_CORPUS_OUT") {
+            fs::write(output, &bytes).unwrap();
+        }
+        assert_eq!(declared_cases.len(), 48);
+        if let Ok(output) = std::env::var("OTTTO_CLAUDE_ORIGINAL_DECLARED_CORPUS_OUT") {
+            fs::write(output, serde_json::to_vec_pretty(
+                &json!({"contract_version":"claude_original_declared_wire_corpus:v1", "cases":declared_cases})
+            ).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn terminal_off_on_claude_original_carrier_source_generated_wire_corpus() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Released pre-flip bytes built without e2::finish_page, which emits the hours gate on.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -79511,6 +85381,82 @@ mod tests {
 
     #[test]
     fn late_claude_desktop_account_mapping_escapes_semantic_noop_suppression() {
+        let session_id = "33333333-4444-5555-6666-777777777777";
+        let home = temp_dir("claude-desktop-account-late-mapping");
+        let projects_root = home.join(".claude").join("projects");
+        let project_dir = projects_root.join("-Users-dev-repo");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            project_dir.join(format!("{session_id}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-07-31T10:01:00Z\",\"sessionId\":\"{session_id}\",\"message\":{{\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":35,\"output_tokens\":8}}}}}}\n"
+            ),
+        )
+        .expect("write transcript");
+
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-31T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first scan");
+        assert_eq!(first.snapshots.len(), 1);
+        assert!(first.snapshots[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.is_none()));
+
+        let store_dir = home
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude-code-sessions")
+            .join("account-late")
+            .join("workspace");
+        fs::create_dir_all(&store_dir).expect("create Desktop store");
+        fs::write(
+            store_dir.join("local_desktop-late.json"),
+            format!("{{\"cliSessionId\":\"{session_id}\"}}"),
+        )
+        .expect("write late account mapping");
+
+        let second = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-31T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("second scan");
+        assert_eq!(second.scanned_file_count, 1);
+        assert_eq!(second.semantic_noop_count, 0);
+        assert_eq!(second.snapshots.len(), 1);
+        let expected_hash =
+            ottto_core::billing_identity_hash("anthropic", "account", "account-late")
+                .expect("account hash");
+        assert!(second.snapshots[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.as_deref() == Some(expected_hash.as_str())));
+
+        let settled = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-31T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert!(settled.snapshots.is_empty());
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn terminal_off_on_late_claude_desktop_account_mapping_escapes_semantic_noop_suppression() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let session_id = "33333333-4444-5555-6666-777777777777";
@@ -79592,6 +85538,105 @@ mod tests {
 
     #[test]
     fn late_claude_otel_account_evidence_reselects_unchanged_transcript() {
+        let session_id = "44444444-5555-6666-7777-888888888888";
+        let home = temp_dir("claude-otel-account-late-mapping");
+        let support_dir = home.join("support");
+        let projects_root = home.join(".claude").join("projects");
+        let project_dir = projects_root.join("-Users-dev-repo");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            project_dir.join(format!("{session_id}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-07-31T10:01:00Z\",\"sessionId\":\"{session_id}\",\"message\":{{\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":35,\"output_tokens\":8}}}}}}\n"
+            ),
+        )
+        .expect("write transcript");
+
+        let mut index = ScanIndex::default();
+        let mut first = scan_source_roots_with_attribution_and_claude_effort(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-31T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+            true,
+            None,
+            Some(&support_dir),
+        )
+        .expect("first scan");
+        assert_eq!(first.snapshots.len(), 1);
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut first, &mut index);
+
+        let body = format!(
+            "{{\"resourceLogs\":[{{\"scopeLogs\":[{{\"logRecords\":[{{\"timeUnixNano\":\"1785492120000000000\",\"body\":{{\"stringValue\":\"claude_code.api_request\"}},\"attributes\":[{{\"key\":\"session.id\",\"value\":{{\"stringValue\":\"{session_id}\"}}}},{{\"key\":\"user.account_uuid\",\"value\":{{\"stringValue\":\"123E4567-E89B-12D3-A456-426614174000\"}}}},{{\"key\":\"model\",\"value\":{{\"stringValue\":\"claude-opus-4-8\"}}}},{{\"key\":\"input_tokens\",\"value\":{{\"intValue\":\"35\"}}}},{{\"key\":\"output_tokens\",\"value\":{{\"intValue\":\"8\"}}}}]}}]}}]}}]}}"
+        );
+        assert_eq!(
+            crate::claude_local_otel::capture_claude_api_request_logs(
+                &support_dir,
+                body.as_bytes(),
+                "application/json",
+            )
+            .expect("capture account evidence"),
+            1
+        );
+
+        let mut second = scan_source_roots_with_attribution_and_claude_effort(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-31T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+            true,
+            None,
+            Some(&support_dir),
+        )
+        .expect("second scan");
+        assert_eq!(second.scanned_file_count, 1);
+        assert_eq!(second.semantic_noop_count, 0);
+        assert_eq!(second.snapshots.len(), 1);
+
+        let evidence = crate::claude_local_otel::load_claude_effort_evidence(
+            &support_dir,
+            [session_id.to_string()],
+        )
+        .expect("load account evidence");
+        apply_claude_effort_evidence(&mut second.snapshots, &evidence);
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut second, &mut index);
+        let expected_hash = ottto_core::billing_identity_hash(
+            "anthropic",
+            "account",
+            "123e4567-e89b-12d3-a456-426614174000",
+        )
+        .expect("account hash");
+        assert!(second.snapshots[0]
+            .model_usage
+            .iter()
+            .chain(
+                second.snapshots[0]
+                    .usage_buckets
+                    .iter()
+                    .flat_map(|bucket| bucket.model_usage.iter())
+            )
+            .all(|row| row.account_identifier_hash.as_deref() == Some(expected_hash.as_str())));
+
+        let settled = scan_source_roots_with_attribution_and_claude_effort(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-31T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+            true,
+            None,
+            Some(&support_dir),
+        )
+        .expect("settled scan");
+        assert!(settled.snapshots.is_empty());
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn terminal_off_on_late_claude_otel_account_evidence_reselects_unchanged_transcript() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let session_id = "44444444-5555-6666-7777-888888888888";
@@ -80009,6 +86054,97 @@ mod tests {
 
     #[test]
     fn malformed_claude_title_file_preserves_prior_title_and_marks_census_incomplete() {
+        let (home, _transcript_path, projects_root) = claude_desktop_fixture(
+            "claude-desktop-malformed-retain",
+            "retain-session",
+            "{\"cliSessionId\":\"retain-session\",\"title\":\"Known durable title\",\"titleSource\":\"user\"}",
+            "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"retain-session\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
+        );
+        let store_file = home
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude-code-sessions")
+            .join("account-ctx")
+            .join("workspace")
+            .join("local_desktop-1.json");
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-10T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("seed durable title");
+        assert_eq!(
+            first.snapshots[0].session_display_name.as_deref(),
+            Some("Known durable title")
+        );
+
+        fs::write(&store_file, b"{not valid json}").expect("corrupt title sidecar");
+        let second = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-10T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("malformed title is isolated");
+        assert!(!second.sidecar_census_complete);
+        assert!(!second.census_complete);
+        assert!(
+            second.snapshots.is_empty(),
+            "the retained title keeps the transcript a semantic no-op"
+        );
+        assert_eq!(
+            index
+                .claude_desktop_title_files
+                .values()
+                .next()
+                .and_then(|entry| entry.title.as_deref()),
+            Some("Known durable title")
+        );
+
+        fs::write(
+            &store_file,
+            "{\"cliSessionId\":\"retain-session\",\"title\":\"Recovered durable title\",\"titleSource\":\"user\"}",
+        )
+        .expect("repair title sidecar");
+        let backed_off = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-10T10:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("sidecar retry remains bounded");
+        assert!(!backed_off.sidecar_census_complete);
+        assert!(backed_off.snapshots.is_empty());
+
+        let recovered = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-10T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("sidecar retry recovers on deadline");
+        assert!(recovered.sidecar_census_complete);
+        assert!(recovered.census_complete);
+        assert_eq!(recovered.snapshots.len(), 1);
+        assert_eq!(
+            recovered.snapshots[0].session_display_name.as_deref(),
+            Some("Recovered durable title")
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn terminal_off_on_malformed_claude_title_file_preserves_prior_title_and_marks_census_incomplete(
+    ) {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (home, _transcript_path, projects_root) = claude_desktop_fixture(
             "claude-desktop-malformed-retain",
@@ -80098,6 +86234,51 @@ mod tests {
 
     #[test]
     fn one_sided_claude_title_shapes_preserve_account_only_mapping() {
+        let (home, _transcript_path, projects_root) = claude_desktop_fixture(
+            "claude-desktop-one-sided",
+            "no-title-session",
+            "{\"cliSessionId\":\"no-title-session\",\"sessionId\":\"desktop-session\"}",
+            "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"no-title-session\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
+        );
+        let store_dir = home
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude-code-sessions")
+            .join("account-ctx")
+            .join("workspace");
+        fs::write(
+            store_dir.join("desktop-only.json"),
+            "{\"sessionId\":\"desktop-only\",\"title\":\"Desktop only title\"}",
+        )
+        .expect("write desktop-only title");
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-10T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan one-sided optional title shapes");
+        assert!(scan.sidecar_census_complete);
+        assert!(scan.census_complete);
+        assert_eq!(index.claude_desktop_title_files.len(), 1);
+        assert_eq!(scan.snapshots.len(), 1);
+        assert!(scan.snapshots[0].session_display_name.is_none());
+        let expected_hash =
+            ottto_core::billing_identity_hash("anthropic", "account", "account-ctx")
+                .expect("account hash");
+        assert!(scan.snapshots[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.as_deref() == Some(expected_hash.as_str())));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn terminal_off_on_one_sided_claude_title_shapes_preserve_account_only_mapping() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let (home, _transcript_path, projects_root) = claude_desktop_fixture(
@@ -90550,6 +96731,76 @@ mod tests {
 
     #[test]
     fn corrective_clear_diagnostics_distinguish_new_invalidation_from_existing_debt() {
+        use crate::local_resource_diagnostics::claude_reread::Scope;
+        let root = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let key = format!("/opaque/{root}.jsonl");
+        let mut account = ScanIndex::default();
+        account
+            .files
+            .insert(key.clone(), manifest_index_entry(Some("entity")));
+        let scope = Scope::begin(true);
+        for _ in 0..2 {
+            account.claude_account_family_witnesses.insert(
+                root.into(),
+                ClaudeAccountFamilyWitness {
+                    account_identifier_hash: "a".repeat(64),
+                    evidence_request_count: 1,
+                    members: BTreeMap::from([(root.into(), 1)]),
+                    member_request_id_fingerprints: BTreeMap::from([(
+                        root.into(),
+                        "invalid-version".into(),
+                    )]),
+                },
+            );
+            apply_claude_effort_evidence_with_index(
+                &mut [],
+                &BTreeMap::new(),
+                &mut account,
+                false,
+                "2026-08-20T10:02:00Z",
+            );
+        }
+        let counts = scope.finish().claude_reread;
+        assert_eq!(counts.account_reproof_calls, 2);
+        assert_eq!(counts.account_reproof_cleared, 1);
+        assert!(account.files[&key].source_file_fingerprint.is_empty());
+        assert!(!account.claude_account_family_witnesses.contains_key(root));
+
+        let mut owned = ScanIndex::default();
+        owned
+            .files
+            .insert(key.clone(), manifest_index_entry(Some("entity")));
+        owned.claude_owned_start_census.insert(
+            root.into(),
+            ClaudeOwnedStartCensusWitness {
+                marker_source_file_fingerprint: "source".into(),
+                verified_source_file_fingerprint: Some("source".into()),
+                emitted_source_file_fingerprint: None,
+            },
+        );
+        let scope = Scope::begin(true);
+        for _ in 0..2 {
+            apply_claude_reported_usage_with_index(
+                &mut [],
+                &Default::default(),
+                &Default::default(),
+                &mut owned,
+                false,
+                "2026-08-20T10:02:00Z",
+            );
+        }
+        let counts = scope.finish().claude_reread;
+        assert_eq!(counts.owned_start_calls, 2);
+        assert_eq!(counts.owned_start_cleared, 1);
+        assert!(owned.files[&key].source_file_fingerprint.is_empty());
+        assert!(owned.claude_owned_start_census[root]
+            .emitted_source_file_fingerprint
+            .is_none());
+    }
+
+    #[test]
+    fn terminal_off_on_corrective_clear_diagnostics_distinguish_new_invalidation_from_existing_debt(
+    ) {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         use crate::local_resource_diagnostics::claude_reread::Scope;
@@ -92117,6 +98368,68 @@ pub(crate) mod cache_adapter_tests {
     }
     #[test]
     fn cache_claude_owned_fixture_is_independent_of_curve_sampling() {
+        // Released pre-flip bytes built without e2::finish_page, which emits the hours gate on.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+        let session = "00000000-0000-7000-8000-000000000002";
+        let mut parser = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+        parser.context_curve_enabled = false;
+        apply_claude_code_line(
+            &json!({"type":"assistant","sessionId":session,"forkedFrom":{"sessionId":"parent","messageUuid":"copied"},"timestamp":"2026-09-30T09:59:00Z","requestId":"copied","message":{"id":"copied","model":"claude-opus-4-8","usage":{"input_tokens":100_000,"output_tokens":1}}}),
+            &mut parser,
+        );
+        for (index, read) in [90_000, 0, 90_000].into_iter().enumerate() {
+            for output in [1, 2] {
+                apply_claude_code_line(
+                    &json!({"type":"assistant","sessionId":session,"requestId":format!("req_cache_fixture_{index}"),"timestamp":format!("2026-09-30T10:00:0{index}Z"),"message":{"id":format!("msg_cache_fixture_{index}"),"model":"claude-opus-4-8","usage":{"input_tokens":100_000-read,"cache_read_input_tokens":read,"cache_creation_input_tokens":0,"output_tokens":output}}}),
+                    &mut parser,
+                );
+            }
+        }
+        parser.finalize_claude_responses();
+        let mut items = parser.into_items(
+            Path::new("cache-claude-fixture.jsonl"),
+            "2026-09-30T10:00:03Z",
+            "f".repeat(64),
+            None,
+        );
+        let mut index = ScanIndex::default();
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut index,
+            true,
+            "2026-09-30T10:00:03Z",
+        );
+        let item = &mut items[0];
+        // Freeze the released cache-only producer fixture. The actual new
+        // identity+cache HTTP bytes are independently covered by the original
+        // Claude source corpus, not silently substituted for installed wires.
+        item.session_account_evidence = None;
+        assert!(item.context_curve.is_none());
+        assert_eq!(
+            item.cache_observations.as_ref().unwrap().operations.len(),
+            1
+        );
+        prepare_cache_observations(item, None);
+        let fixture = json!({"snapshot":cache_fixture_snapshot_value(SnapshotSource::ClaudeCode,item),"cache_observations_state":item.cache_observations_state,"body_witness_version":snapshot_upload_body_witness_version(item),"body_witness_digest":snapshot_upload_body_witness(item)});
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshot-audit/cache_observation_claude_v1.json"
+        ))
+        .unwrap();
+        if let Ok(output) = std::env::var("OTTTO_CACHE_CLAUDE_FIXTURE_OUT") {
+            std::fs::write(output, serde_json::to_string_pretty(&fixture).unwrap()).unwrap();
+        }
+        assert_eq!(
+            fixture, golden,
+            "production claude cache fixture must remain exact"
+        );
+    }
+
+    #[test]
+    fn terminal_off_on_cache_claude_owned_fixture_is_independent_of_curve_sampling() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Released pre-flip bytes built without e2::finish_page, which emits the hours gate on.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -93012,6 +99325,107 @@ mod census_unreadable_tests {
     #[cfg(unix)]
     #[test]
     fn unreadable_native_metadata_directory_and_open_failures_name_existing_branch() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "ottto-unreadable-causes-{}",
+            ottto_core::generate_control_token().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let path = root.join("one.jsonl");
+        fs::write(&path, b"{}\n").unwrap();
+        // Metadata fails below an inaccessible owned directory.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+        let mut census = ScanCensus::default();
+        assert!(candidate_from_traversal_path(
+            SnapshotSource::Codex,
+            ScanTraversalPath {
+                scan_root: root.clone(),
+                path: path.clone(),
+                census_member: true,
+                watcher_hint: false
+            },
+            &mut census,
+            None,
+            30,
+            &BTreeMap::new(),
+        )
+        .is_none());
+        assert_eq!(
+            serde_json::to_value(
+                census
+                    .unreadable_causes
+                    .projection(census.unreadable_path_count as u64)
+            )
+            .unwrap()["counts"],
+            json!([1, 0, 0, 0, 0, 0, 0, 0])
+        );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let candidate = candidate_from_traversal_path(
+            SnapshotSource::Codex,
+            ScanTraversalPath {
+                scan_root: root.clone(),
+                path: path.clone(),
+                census_member: true,
+                watcher_hint: false,
+            },
+            &mut census,
+            None,
+            30,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(open_and_identify_scan_candidate(
+            SnapshotSource::Codex,
+            candidate,
+            &mut census,
+            None,
+            30,
+            &BTreeMap::new()
+        )
+        .is_none());
+        assert_eq!(
+            serde_json::to_value(
+                census
+                    .unreadable_causes
+                    .projection(census.unreadable_path_count as u64)
+            )
+            .unwrap()["counts"],
+            json!([1, 0, 1, 0, 0, 0, 0, 0])
+        );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o100)).unwrap();
+        let mut index = ScanIndex::default();
+        ensure_bounded_traversal(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-10-12T00:00:00Z",
+            30,
+        );
+        advance_bounded_directory_traversal(
+            SnapshotSource::Codex,
+            index.traversal.as_mut().unwrap(),
+            30,
+            &index.files,
+        );
+        assert_eq!(
+            projection(&index.traversal.as_ref().unwrap().counts)["counts"],
+            json!([0, 1, 0, 0, 0, 0, 0, 0])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_off_on_unreadable_native_metadata_directory_and_open_failures_name_existing_branch()
+    {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         use std::os::unix::fs::PermissionsExt;
@@ -93116,7 +99530,7 @@ mod census_unreadable_tests {
 crate::heap_layout_bound::fields!(ProvenClaudeUsageFamily; witness, rows_by_member);
 
 crate::heap_layout_bound::fields!(ClaudeNativeObservations; counts, census_window_end, index_generation);
-crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_full_suppressed, rearm_attempt, full_rearm_deferred_until, request_census);
+crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until, request_census);
 crate::heap_layout_bound::fields!(ClaudeFullRearmSuppressionCounts; full_rearm_suppressed, full_rearm_skipped_invalid_unchanged, full_rearm_post_rebuild_skipped, structural_invalid_family_count, suppressed_since_unix_seconds);
 crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, hash_budget_warning, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
 

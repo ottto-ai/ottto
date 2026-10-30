@@ -3,6 +3,80 @@ use crate::snapshots::terminal_contract_retry::with_contract;
 
 #[test]
 fn terminal_contract_v1_to_v2_one_paced_attempt_then_terminal_on_failure() {
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-contract-progress");
+    let path = scratch.join("progress.json");
+    let fingerprint = "a".repeat(64);
+    let body = "b".repeat(64);
+    let mut progress = test_upload_progress();
+    for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
+        progress.quarantine_body(&fingerprint, &body);
+    }
+    progress.save(&path).unwrap();
+    let stale_index = progress.quarantined_fingerprints.clone();
+    let namespace = progress.destination_namespace_hash.clone();
+    let mut same_version =
+        SnapshotUploadProgress::load(&path, &namespace, test_quarantine_witness()).unwrap();
+    assert!(!same_version.prepare_quarantine_retries(&stale_index));
+    assert_eq!(same_version.quarantined_fingerprints, stale_index);
+    with_contract(2, || {
+        // Even a simultaneous witness change must wait for the paced retry.
+        let mut witness = test_quarantine_witness();
+        witness.collector_version = "synthetic-v2".into();
+        let before = current_unix_seconds();
+        let mut loaded = SnapshotUploadProgress::load(&path, &namespace, witness.clone()).unwrap();
+        let record = &loaded.quarantined_fingerprints[&fingerprint];
+        assert_eq!(record.reconstruction_contract, 2);
+        assert_eq!(
+            record.failed_reconstruction_count,
+            MAX_SNAPSHOT_RECONSTRUCTION_FAILURES - 1
+        );
+        assert_eq!(record.witness, witness);
+        assert!(record.retry_after_unix_seconds >= before + SNAPSHOT_QUARANTINE_RETRY_SECONDS);
+        assert!(
+            loaded.prepare_quarantine_retries(&stale_index),
+            "migration must be saved even before any lease is due"
+        );
+        assert!(loaded.active_quarantine_retries.is_empty());
+        loaded.save(&path).unwrap();
+        let record = loaded.quarantined_fingerprints[&fingerprint].clone();
+        loaded = SnapshotUploadProgress::load(&path, &namespace, witness.clone()).unwrap();
+        assert!(!loaded.prepare_quarantine_retries(&stale_index));
+        assert_eq!(loaded.quarantined_fingerprints[&fingerprint], record);
+        loaded
+            .quarantined_fingerprints
+            .get_mut(&fingerprint)
+            .unwrap()
+            .retry_after_unix_seconds = 0;
+        assert!(loaded.prepare_quarantine_retries(&stale_index));
+        assert_eq!(
+            loaded.active_quarantine_retries,
+            BTreeSet::from([fingerprint.clone()])
+        );
+        loaded.save(&path).unwrap();
+        // The same failed reconstruction boundary used by rejected uploads.
+        loaded.quarantine_body(&fingerprint, &body);
+        let terminal = &loaded.quarantined_fingerprints[&fingerprint];
+        assert_eq!(terminal.reconstruction_contract, 2);
+        assert_eq!(
+            terminal.failed_reconstruction_count,
+            MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+        );
+        assert_eq!(
+            terminal.disposition,
+            SnapshotQuarantineDisposition::UnprovenTerminal
+        );
+        assert_eq!(terminal.retry_after_unix_seconds, 0);
+        loaded.save(&path).unwrap();
+        for _ in 0..3 {
+            loaded = SnapshotUploadProgress::load(&path, &namespace, witness.clone()).unwrap();
+            assert!(!loaded.prepare_quarantine_retries(&stale_index));
+            assert!(loaded.active_quarantine_retries.is_empty());
+        }
+    });
+}
+
+#[test]
+fn terminal_off_on_terminal_contract_v1_to_v2_one_paced_attempt_then_terminal_on_failure() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let scratch = crate::test_scratch::ScratchDir::new("terminal-contract-progress");
@@ -79,6 +153,43 @@ fn terminal_contract_v1_to_v2_one_paced_attempt_then_terminal_on_failure() {
 
 #[test]
 fn terminal_contract_current_and_future_versions_and_superseded_never_rearm() {
+    let mut progress = test_upload_progress();
+    let fingerprint = "a".repeat(64);
+    for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
+        progress.quarantine_body(&fingerprint, &fingerprint);
+    }
+    for version in [1, 2] {
+        progress
+            .quarantined_fingerprints
+            .get_mut(&fingerprint)
+            .unwrap()
+            .reconstruction_contract = version;
+        assert_eq!(
+            crate::snapshots::terminal_contract_retry::rearm(
+                &mut progress.quarantined_fingerprints,
+                progress.active_quarantine_witness.as_ref()
+            ),
+            0
+        );
+    }
+    progress
+        .quarantined_fingerprints
+        .get_mut(&fingerprint)
+        .unwrap()
+        .disposition = SnapshotQuarantineDisposition::SupersededTerminal;
+    with_contract(3, || {
+        assert_eq!(
+            crate::snapshots::terminal_contract_retry::rearm(
+                &mut progress.quarantined_fingerprints,
+                progress.active_quarantine_witness.as_ref()
+            ),
+            0
+        );
+    });
+}
+
+#[test]
+fn terminal_off_on_terminal_contract_current_and_future_versions_and_superseded_never_rearm() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let mut progress = test_upload_progress();
@@ -118,6 +229,28 @@ fn terminal_contract_current_and_future_versions_and_superseded_never_rearm() {
 
 #[test]
 fn terminal_contract_newer_index_assessment_dominates_stale_progress() {
+    let mut progress = test_upload_progress();
+    let fingerprint = "a".repeat(64);
+    for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
+        progress.quarantine_body(&fingerprint, &fingerprint);
+    }
+    let mut upgraded = progress.quarantined_fingerprints.clone();
+    with_contract(2, || {
+        assert_eq!(
+            crate::snapshots::terminal_contract_retry::rearm(
+                &mut upgraded,
+                progress.active_quarantine_witness.as_ref()
+            ),
+            1
+        );
+        assert!(progress.prepare_quarantine_retries(&upgraded));
+        assert_eq!(progress.quarantined_fingerprints, upgraded);
+        assert!(progress.active_quarantine_retries.is_empty());
+    });
+}
+
+#[test]
+fn terminal_off_on_terminal_contract_newer_index_assessment_dominates_stale_progress() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let mut progress = test_upload_progress();
@@ -142,6 +275,41 @@ fn terminal_contract_newer_index_assessment_dominates_stale_progress() {
 
 #[test]
 fn terminal_contract_permanent_refusal_keeps_its_existing_gate() {
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-contract-permanent");
+    let path = scratch.join("progress.json");
+    let fingerprint = "a".repeat(64);
+    let body = "b".repeat(64);
+    let mut progress = test_upload_progress();
+    progress.quarantine_permanent_body(&fingerprint, &body, "usage_accounting_authority_downgrade");
+    let namespace = progress.destination_namespace_hash.clone();
+    progress.save(&path).unwrap();
+    let mut index_records = progress.quarantined_fingerprints.clone();
+    with_contract(2, || {
+        crate::snapshots::terminal_contract_retry::rearm(
+            &mut index_records,
+            progress.active_quarantine_witness.as_ref(),
+        );
+        let mut loaded =
+            SnapshotUploadProgress::load(&path, &namespace, test_quarantine_witness()).unwrap();
+        assert_eq!(
+            loaded.quarantined_fingerprints[&fingerprint].disposition,
+            SnapshotQuarantineDisposition::UnprovenTerminal
+        );
+        assert!(
+            loaded.prepare_quarantine_retries(&index_records),
+            "persist the newer assessment inherited from the index"
+        );
+        assert!(loaded.active_quarantine_retries.is_empty());
+        assert_eq!(
+            loaded.quarantined_fingerprints[&fingerprint].disposition,
+            SnapshotQuarantineDisposition::UnprovenTerminal
+        );
+        assert_eq!(loaded.permanent_rejections, progress.permanent_rejections);
+    });
+}
+
+#[test]
+fn terminal_off_on_terminal_contract_permanent_refusal_keeps_its_existing_gate() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let scratch = crate::test_scratch::ScratchDir::new("terminal-contract-permanent");
@@ -344,6 +512,99 @@ impl RetainedRetryFixture {
 
 #[test]
 fn terminal_contract_malformed_values_keep_both_checkpoints_and_one_paced_debt() {
+    let malformed = [
+        serde_json::Value::Null,
+        serde_json::json!("2"),
+        serde_json::json!(-1),
+        serde_json::json!(65536),
+        serde_json::json!(1.5),
+        serde_json::json!(false),
+        serde_json::json!([1, {"nested": true}]),
+        serde_json::json!({"nested": [1, 2]}),
+    ];
+    for bad in malformed {
+        for repair_count in [false, true] {
+            for pending in [false, true] {
+                let fixture = RetainedRetryFixture::new();
+                for (path, field) in [
+                    (&fixture.index_path, "quarantined_snapshot_fingerprints"),
+                    (&fixture.progress_path, "quarantined_fingerprints"),
+                ] {
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                    let record = &mut value[field][held_fingerprint()];
+                    record["reconstruction_contract"] = bad.clone();
+                    if pending {
+                        record["disposition"] = serde_json::json!("retry_pending");
+                        record["failed_reconstruction_count"] = serde_json::json!(1);
+                    }
+                    // Force ScanIndex's separate scalar-repair representation.
+                    if repair_count && field == "quarantined_snapshot_fingerprints" {
+                        record["failed_reconstruction_count"] = serde_json::Value::Null;
+                    }
+                    std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                let before = current_unix_seconds();
+                let (mut index, mut progress) = fixture.load();
+                for record in [
+                    &index.quarantined_snapshot_fingerprints[&held_fingerprint()],
+                    &progress.quarantined_fingerprints[&held_fingerprint()],
+                ] {
+                    assert_eq!(
+                        record.reconstruction_contract,
+                        crate::snapshots::terminal_contract_retry::current_contract()
+                    );
+                    assert_eq!(
+                        record.failed_reconstruction_count,
+                        MAX_SNAPSHOT_RECONSTRUCTION_FAILURES - 1
+                    );
+                    assert_eq!(
+                        record.disposition,
+                        SnapshotQuarantineDisposition::RetryPending
+                    );
+                    assert_eq!(
+                        record.upload_body_witness.as_deref(),
+                        Some(held_body().as_str())
+                    );
+                    assert!(
+                        record.retry_after_unix_seconds
+                            >= before + SNAPSHOT_QUARANTINE_RETRY_SECONDS
+                    );
+                    assert!(
+                        record.retry_after_unix_seconds
+                            < current_unix_seconds() + 2 * SNAPSHOT_QUARANTINE_RETRY_SECONDS
+                    );
+                }
+                assert!(
+                    progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints)
+                );
+                assert!(
+                    progress.active_quarantine_retries.is_empty(),
+                    "unknown waits for pacing"
+                );
+                index.save(&fixture.index_path).unwrap();
+                progress.save(&fixture.progress_path).unwrap();
+                let (restarted_index, mut restarted_progress) = fixture.load();
+                assert_eq!(
+                    restarted_index.quarantined_snapshot_fingerprints[&held_fingerprint()],
+                    index.quarantined_snapshot_fingerprints[&held_fingerprint()]
+                );
+                assert_eq!(
+                    restarted_progress.quarantined_fingerprints[&held_fingerprint()],
+                    progress.quarantined_fingerprints[&held_fingerprint()]
+                );
+                assert!(!restarted_progress.prepare_quarantine_retries(
+                    &restarted_index.quarantined_snapshot_fingerprints
+                ));
+                assert!(restarted_progress.active_quarantine_retries.is_empty());
+                fixture.assert_retained(&restarted_index, &restarted_progress);
+            }
+        }
+    }
+}
+
+#[test]
+fn terminal_off_on_terminal_contract_malformed_values_keep_both_checkpoints_and_one_paced_debt() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let malformed = [
@@ -604,6 +865,11 @@ fn successful_contract_retry(restart_after_selection: bool) {
 
 #[test]
 fn terminal_contract_bump_successful_ack_settles_once_with_stale_index() {
+    successful_contract_retry(false);
+}
+
+#[test]
+fn terminal_off_on_terminal_contract_bump_successful_ack_settles_once_with_stale_index() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     successful_contract_retry(false);
@@ -611,6 +877,11 @@ fn terminal_contract_bump_successful_ack_settles_once_with_stale_index() {
 
 #[test]
 fn terminal_contract_restart_after_saved_lease_keeps_owed_attempt_and_identity() {
+    successful_contract_retry(true);
+}
+
+#[test]
+fn terminal_off_on_terminal_contract_restart_after_saved_lease_keeps_owed_attempt_and_identity() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     successful_contract_retry(true);
@@ -694,6 +965,20 @@ impl ReadBudgetFixture {
     }
 
     fn scan_root(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return Self::terminal_off_on_scan_root(root, index);
+        }
+        crate::snapshots::scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            &[root.to_owned()],
+            index,
+            "2026-10-25T07:01:00Z",
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+        )
+        .unwrap()
+    }
+
+    fn terminal_off_on_scan_root(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
         let mut scan = crate::snapshots::scan_source_roots_with_attribution_and_hints(
             SnapshotSource::ClaudeCode,
             &[root.to_owned()],
@@ -901,18 +1186,33 @@ fn contract_read_cap(outcome: InterruptedOutcome, unbound_body: bool) {
 
 #[test]
 fn terminal_contract_restart_before_outcome_allows_one_more_paced_source_read() {
+    contract_read_cap(InterruptedOutcome::Restart, false);
+}
+
+#[test]
+fn terminal_off_on_terminal_contract_restart_before_outcome_allows_one_more_paced_source_read() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     contract_read_cap(InterruptedOutcome::Restart, false);
 }
 #[test]
 fn terminal_contract_repeated_conflicts_cap_actual_source_reads_at_two() {
+    contract_read_cap(InterruptedOutcome::Conflict, false);
+}
+
+#[test]
+fn terminal_off_on_terminal_contract_repeated_conflicts_cap_actual_source_reads_at_two() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     contract_read_cap(InterruptedOutcome::Conflict, false);
 }
 #[test]
 fn terminal_contract_failed_outcome_save_caps_actual_source_reads_at_two() {
+    contract_read_cap(InterruptedOutcome::SaveFailure, false);
+}
+
+#[test]
+fn terminal_off_on_terminal_contract_failed_outcome_save_caps_actual_source_reads_at_two() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     contract_read_cap(InterruptedOutcome::SaveFailure, false);
@@ -920,6 +1220,53 @@ fn terminal_contract_failed_outcome_save_caps_actual_source_reads_at_two() {
 
 #[test]
 fn terminal_contract_stale_index_and_same_generation_cas_keep_maximum_claim() {
+    let fixture = ReadBudgetFixture::new();
+    with_contract(2, || {
+        let (_, progress) = fixture.due_claim();
+        let stale = progress.quarantined_fingerprints.clone();
+        let (mut index, mut progress) = fixture.due_claim();
+        assert_eq!(
+            progress.quarantined_fingerprints[&fixture.fingerprint].contract_retry_claims,
+            Some(2)
+        );
+        index.retain_quarantined_fingerprints(&stale);
+        assert_eq!(
+            index.quarantined_snapshot_fingerprints[&fixture.fingerprint].contract_retry_claims,
+            Some(2)
+        );
+        // Older records embedded in a current generation cannot lower either
+        // CAS, including an index copy from before this contract version.
+        for old_version in [2, 1] {
+            let mut old = stale[&fixture.fingerprint].clone();
+            old.reconstruction_contract = old_version;
+            index
+                .quarantined_snapshot_fingerprints
+                .insert(fixture.fingerprint.clone(), old.clone());
+            index.save(&fixture.retained.index_path).unwrap();
+            progress
+                .quarantined_fingerprints
+                .insert(fixture.fingerprint.clone(), old);
+            progress.save(&fixture.retained.progress_path).unwrap();
+        }
+        (index, progress) = fixture.retained.load();
+        for record in [
+            &index.quarantined_snapshot_fingerprints[&fixture.fingerprint],
+            &progress.quarantined_fingerprints[&fixture.fingerprint],
+        ] {
+            assert_eq!(record.contract_retry_claims, Some(2));
+        }
+        assert!(progress.prepare_quarantine_retries(&stale)); // Exhaustion must be saved.
+        assert!(progress.active_quarantine_retries.is_empty());
+        progress.save(&fixture.retained.progress_path).unwrap();
+        save_terminal_contract_claims_for_scan(&mut index, &progress, &fixture.retained.index_path)
+            .unwrap();
+        assert!(fixture.scan(&index).is_empty());
+        fixture.retained.assert_retained(&index, &progress);
+    });
+}
+
+#[test]
+fn terminal_off_on_terminal_contract_stale_index_and_same_generation_cas_keep_maximum_claim() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let fixture = ReadBudgetFixture::new();
@@ -969,6 +1316,61 @@ fn terminal_contract_stale_index_and_same_generation_cas_keep_maximum_claim() {
 
 #[test]
 fn terminal_contract_malformed_claims_exhaust_without_reset_or_opaque_hold() {
+    for bad in [
+        serde_json::Value::Null,
+        serde_json::json!("1"),
+        serde_json::json!(-1),
+        serde_json::json!(65536),
+        serde_json::json!([1]),
+        serde_json::json!({"claim":1}),
+    ] {
+        for repair in [false, true] {
+            let fixture = RetainedRetryFixture::new();
+            for (path, field) in [
+                (&fixture.index_path, "quarantined_snapshot_fingerprints"),
+                (&fixture.progress_path, "quarantined_fingerprints"),
+            ] {
+                let mut wire: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                let record = &mut wire[field][held_fingerprint()];
+                record["contract_retry_claims"] = bad.clone();
+                record["disposition"] = serde_json::json!("retry_pending");
+                record["failed_reconstruction_count"] =
+                    serde_json::json!(MAX_SNAPSHOT_RECONSTRUCTION_FAILURES - 1);
+                record["retry_after_unix_seconds"] =
+                    serde_json::json!(quarantine_retry_after(&held_fingerprint()));
+                if repair && field == "quarantined_snapshot_fingerprints" {
+                    record["failed_reconstruction_count"] = serde_json::Value::Null;
+                }
+                std::fs::write(path, serde_json::to_vec(&wire).unwrap()).unwrap();
+            }
+            let (mut index, mut progress) = fixture.load();
+            assert_eq!(
+                index.quarantined_snapshot_fingerprints[&held_fingerprint()].contract_retry_claims,
+                Some(2)
+            );
+            assert_eq!(
+                progress.quarantined_fingerprints[&held_fingerprint()].contract_retry_claims,
+                Some(2)
+            );
+            assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+            assert!(progress.active_quarantine_retries.is_empty());
+            progress.save(&fixture.progress_path).unwrap();
+            save_terminal_contract_claims_for_scan(&mut index, &progress, &fixture.index_path)
+                .unwrap();
+            let (index, mut progress) = fixture.load();
+            assert!(!progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+            assert_eq!(
+                progress.quarantined_fingerprints[&held_fingerprint()].disposition,
+                SnapshotQuarantineDisposition::UnprovenTerminal
+            );
+            fixture.assert_retained(&index, &progress);
+        }
+    }
+}
+
+#[test]
+fn terminal_off_on_terminal_contract_malformed_claims_exhaust_without_reset_or_opaque_hold() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     for bad in [
@@ -1026,6 +1428,46 @@ fn terminal_contract_malformed_claims_exhaust_without_reset_or_opaque_hold() {
 
 #[test]
 fn terminal_contract_next_version_starts_a_distinct_paced_budget() {
+    let mut progress = test_upload_progress();
+    let fp = "a".repeat(64);
+    for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
+        progress.quarantine_body(&fp, &fp);
+    }
+    with_contract(2, || {
+        crate::snapshots::terminal_contract_retry::rearm(
+            &mut progress.quarantined_fingerprints,
+            progress.active_quarantine_witness.as_ref(),
+        );
+        let record = progress.quarantined_fingerprints.get_mut(&fp).unwrap();
+        record.retry_after_unix_seconds = 0;
+        assert!(progress.prepare_quarantine_retries(&BTreeMap::new()));
+        assert_eq!(
+            progress.quarantined_fingerprints[&fp].contract_retry_claims,
+            Some(1)
+        );
+    });
+    with_contract(3, || {
+        assert_eq!(
+            crate::snapshots::terminal_contract_retry::rearm(
+                &mut progress.quarantined_fingerprints,
+                progress.active_quarantine_witness.as_ref()
+            ),
+            1
+        );
+        let record = &progress.quarantined_fingerprints[&fp];
+        assert_eq!(record.reconstruction_contract, 3);
+        assert_eq!(record.contract_retry_claims, Some(0));
+        assert!(
+            record.retry_after_unix_seconds
+                >= current_unix_seconds() + SNAPSHOT_QUARANTINE_RETRY_SECONDS - 1
+        );
+        assert!(!progress.prepare_quarantine_retries(&BTreeMap::new()));
+        assert!(progress.active_quarantine_retries.is_empty());
+    });
+}
+
+#[test]
+fn terminal_off_on_terminal_contract_next_version_starts_a_distinct_paced_budget() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let mut progress = test_upload_progress();
@@ -1068,6 +1510,11 @@ fn terminal_contract_next_version_starts_a_distinct_paced_budget() {
 
 #[test]
 fn terminal_contract_legacy_unknown_body_conflicts_keep_the_two_source_read_cap() {
+    contract_read_cap(InterruptedOutcome::Conflict, true);
+}
+
+#[test]
+fn terminal_off_on_terminal_contract_legacy_unknown_body_conflicts_keep_the_two_source_read_cap() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     contract_read_cap(InterruptedOutcome::Conflict, true);
@@ -1247,12 +1694,22 @@ fn contract_ack_saved_before_index_restart(unrelated: bool) {
 
 #[test]
 fn terminal_contract_ack_saved_before_index_restart_survives_empty_delta() {
+    contract_ack_saved_before_index_restart(false);
+}
+
+#[test]
+fn terminal_off_on_terminal_contract_ack_saved_before_index_restart_survives_empty_delta() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     contract_ack_saved_before_index_restart(false);
 }
 #[test]
 fn terminal_contract_ack_saved_before_index_restart_survives_unrelated_only_delta() {
+    contract_ack_saved_before_index_restart(true);
+}
+
+#[test]
+fn terminal_off_on_terminal_contract_ack_saved_before_index_restart_survives_unrelated_only_delta() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     contract_ack_saved_before_index_restart(true);
