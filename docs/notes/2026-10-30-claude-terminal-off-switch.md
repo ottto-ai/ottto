@@ -113,13 +113,38 @@ ON is **not ready anywhere**, including the M4. Lead B's pending labels remain:
 
 - **BLOCKS-RELEASE before ON:** R2 (correction settlement against wrong revision),
   R10 (unproven money-harness coverage), R7/R8/R9 (held-page custody, manifest
-  membership and accepted-body differences), R5/R11 (repeating re-reads), and R1
-  if still red after B1. None is relabelled fixture-only without evidence.
+  membership and accepted-body differences). R5/R11 have the L3 fixes below;
+  closure still requires their runtime controls. R1 needs the six B1 twins green
+  on the branch Mac. None is relabelled fixture-only without evidence.
 - **SHIP-WITH-DISCLOSURE for M4 ON, fix before fleet default-ON:** R3's bounded,
-  counted page-0 correction drain; R4's counted one-time history-upgrade burst
-  above one file/page, which still needs an M4 measurement.
+  counted page-0 correction drain. R4 pacing is closed by B1; its remaining
+  latch-clear premise is P5 (the completion migration). Actual history reads
+  beyond the upgrade budget remain counted for the M4 measurement.
 - **R13:** repair the fixture phase (START before RESUME) and obtain a green
   production-path result. This is still pending, not an asserted pass.
+
+L3's held-context memo is RAM scheduling state only. A complete history-held
+parse suppresses only that file's UploadContext selection in its exact path,
+context, fingerprint, replay epoch, revision and history policy/list scope.
+Every complete non-held parse forgets it. Context/fingerprint mismatches forget
+the previous hit. It grants no receipt, ACK, absence, census or usage proof.
+**Restart or eviction permits one extra held re-read per file, with no upload.**
+The cap is 10,000; `upload_context_held_memo_evicted` counts evictions.
+
+R11's ON semantic stale clear skips a member only when main's independent
+acceptance predicate and the current per-file context receipt both hold.
+ACK-less, held, listed and no-list-held members retain the clear. Destination
+changes invalidate the receipt. The full money/BASE matrix is Mac-only; Linux
+cannot close it. The C6 held-correction adapter now activates real file context
+and uses validated uploader ACK receipts; its strict `[2,0]` assertion stays.
+If that twin remains red it returns to R5.
+
+`history_upgrade_page.history_upgrade_page` diagnostics expose `admitted_files`,
+`budget` and `extra_files` (actual history files read beyond that page's upgrade
+budget). The shared ON history fixture uses the collected-at audit clock and
+retains the serialized upload ledger across cycles. The held → index rebuild →
+release control counts resend bytes and requires zero second acceptance.
+These controls need runtime evidence before ON readiness can be claimed.
 
 Additional accepted containment disclosures, S3–S8:
 
@@ -132,8 +157,10 @@ Additional accepted containment disclosures, S3–S8:
   Walk interval and oldest-unscanned age are diagnostics; ordinary read budgets
   and backoff still apply. Discovery itself consumes zero transcript body bytes.
 - S7: prior review estimated about 14 MB worst-case observation RAM, plus at
-  most 640 KB for the new optional served-at values. This is a planning estimate,
-  not measured RSS; runtime heap accounting includes every scheduling field.
+  most 640 KB for the new optional served-at values, plus approximately 1.3 MB
+  for the 10,000-entry held-context memo. These are planning estimates, not
+  measured RSS; runtime heap accounting includes the added page count and list
+  digest. The process-global memo is capped independently of the scan index.
 - S8: the directory walk's scratch pending map clones paths each page. It now
   keeps the **first** duplicate, matching main's previous `.find()` semantics;
   it is not persisted or carried across pages.
