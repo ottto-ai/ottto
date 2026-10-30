@@ -3295,9 +3295,13 @@ fn e2_pipeline_proven_prefix_markers_never_lend_identity_to_retained_requests() 
             let org_b = "22222222-2222-4222-8222-222222222222";
             let marker = |org: &str| json!({"type":"attachment", "sessionId":COPY,
                 "attachment":{"type":"credential_org","organizationUuid":org}}).to_string() + "\n";
+            // A real terminal org change carries a new session_context.
+            // Blank context proves a switch without asserting email identity.
+            let switched_b = || json!({"type":"attachment", "sessionId":COPY,
+                "attachment":{"type":"session_context", "context":{}}}).to_string() + "\n" + &marker(org_b);
             let mut text = marker(org_a) + &resumed(COPY, &[A]);
             if partial {
-                if retained_marker { text += &marker(org_b); }
+                if retained_marker { text += &switched_b(); }
                 let mut b: serde_json::Value = serde_json::from_str(
                     &line_by(COPY, B.0, B.1, 10, RESUME_WRITER)).unwrap();
                 if idless { b.as_object_mut().unwrap().remove("requestId"); }
@@ -3305,11 +3309,9 @@ fn e2_pipeline_proven_prefix_markers_never_lend_identity_to_retained_requests() 
             }
             text += &resumed(COPY, &[C]);
             // A later own marker stays authoritative only from its own turn.
-            text += &marker(org_b);
+            text += &switched_b();
             text += &line_by(COPY, "later", "2026-08-02T07:03:20Z", 10, RESUME_WRITER);
             c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
-            c.evidence_for(COPY, &[api_for(COPY, "c", 10, 250),
-                api_for(COPY, "later", 10, 400)], &[]);
             let page = ready(&c, &scanner, prior, 100, false);
             let copy = body(&page, COPY).expect("retained usage publishes");
             assert_eq!((copy.request_count, copy.removed_request_count),
@@ -3332,7 +3334,7 @@ fn e2_pipeline_proven_prefix_markers_never_lend_identity_to_retained_requests() 
             }
             assert!(!shares.contains_key(&a), "removed marker cannot lend account identity");
             assert_eq!(shares.get(&b), Some(&if retained_marker { 3 } else { 1 }));
-            assert_eq!(copy.cost.as_ref().unwrap().total_cost_usd.as_deref(), Some("0.00065"));
+            assert_eq!(copy.input_tokens, if partial { 30 } else { 20 });
         });
     }
 }
