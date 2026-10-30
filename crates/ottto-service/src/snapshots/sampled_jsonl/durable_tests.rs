@@ -2477,3 +2477,144 @@ fn bounded_plan_refuses_unsupported_codex_boundaries_and_oversized_marks_without
         Some((HEAD_BOUND + 1, TITLE_LINE_BOUND + 1));
     assert_eq!(decoded.rederive_plan().err(), Some("title"));
 }
+
+// F4: each H class fails atomically, and diagnostics identify only the class.
+#[test]
+fn bounded_fence_refuses_each_content_class_before_adoption() {
+    let root = Scratch::new("all-content-fences");
+    let source = SnapshotSource::Codex;
+    let mut lines = codex_lines();
+    let mut header: Value = serde_json::from_str(&lines[0]).unwrap();
+    header["payload"]["source"] =
+        json!({"subagent":{"thread_spawn":{"agent_path":"/agents/PRIVATE-AGENT-FENCE"}}});
+    lines[0] = header.to_string();
+    let path = root.write("source.jsonl", &lines);
+    let (native, _) = full_read(&path, source);
+    let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
+    // Retain the ordinary corpus's supported plan; each injected digest is
+    // deliberately impossible, including absent-class versus present mismatch.
+    for class in 0..5 {
+        let mut decoded = decode(&body, source).unwrap();
+        let digest = match class {
+            0 => &mut decoded.rederive.first_prompt,
+            1 => &mut decoded.rederive.title,
+            2 => &mut decoded.rederive.agent_label,
+            3 => &mut decoded.rederive.session_start,
+            4 => &mut decoded.rederive.workspace,
+            _ => unreachable!(),
+        };
+        *digest = Some([0; 32]);
+        let (result, rows) = crate::local_resource_diagnostics::capture(|| {
+            decoded.rederive_content(&File::open(&path).unwrap())
+        });
+        assert!(matches!(
+            result,
+            Err(Refuse::NotRederivable("content_fence"))
+        ));
+        let counts = rows
+            .iter()
+            .find_map(|row| row["counts"].get("rederive_fence_mismatch"))
+            .expect("fence alarm");
+        assert_eq!(counts[class], 1);
+        assert!(!serde_json::to_string(&rows)
+            .unwrap()
+            .contains("PRIVATE-AGENT-FENCE"));
+    }
+}
+
+// F7: concurrent appends at the physical sample/head/title read boundaries
+// preserve bounded replay and leave the appended suffix to ordinary Tail.
+#[test]
+fn bounded_restore_append_injection_at_samples_head_and_title_matches_cold_body() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for edge in [
+            "before_samples",
+            "between_samples",
+            "after_samples",
+            "head",
+            "title",
+        ] {
+            let root = Scratch::new("bounded-append-stages");
+            let lines = if source == SnapshotSource::ClaudeCode {
+                claude_lines(20, 20)
+            } else {
+                codex_lines()
+            };
+            let path = root.write("source.jsonl", &lines);
+            let (native, checkpoint) = full_read(&path, source);
+            let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
+            let certificate = checkpoint
+                .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
+                .unwrap();
+            let append = |path: &Path| {
+                writeln!(
+                    fs::OpenOptions::new().append(true).open(path).unwrap(),
+                    "{{\"type\":\"progress\",\"data\":\"append-injection\"}}"
+                )
+                .unwrap();
+            };
+            append(&path); // scoped restore is growth-only
+            if edge == "before_samples" {
+                append(&path);
+            }
+            let hook_path = path.clone();
+            let mut samples = 0;
+            let target_sample = match edge {
+                "between_samples" => 1,
+                "after_samples" => 2,
+                _ => 0,
+            };
+            let (checkpoint, _) = crate::transcript_acquisition::with_sample_read_hook(
+                move || {
+                    samples += 1;
+                    if samples == target_sample {
+                        append(&hook_path);
+                    }
+                },
+                || certificate.restore_grown(&mut File::open(&path).unwrap(), scope()),
+            )
+            .unwrap();
+            let decoded = decode(&body, source).unwrap();
+            let plan = decoded.rederive_plan().unwrap();
+            let title_offset = plan.title.map(|(offset, _)| offset);
+            if edge == "title" {
+                assert!(title_offset.is_some(), "fixture must read a named title");
+            }
+            let hook_path = path.clone();
+            let mut fired = false;
+            let (restored, receipt, _) = content::with_read_hook(
+                move |offset| {
+                    let target = (edge == "head" && offset == 0)
+                        || (edge == "title" && Some(offset) == title_offset);
+                    if target && !fired {
+                        fired = true;
+                        append(&hook_path);
+                    }
+                },
+                || decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan),
+            )
+            .unwrap();
+            assert_eq!(receipt.head_bytes + receipt.line_bytes, plan.input_bytes());
+            let mut tail = parser(&path, source);
+            assert_eq!(
+                tail.prepare_acquisition(
+                    Some(Retained {
+                        checkpoint,
+                        state: restored
+                    }),
+                    &scope(),
+                    None,
+                    NOW
+                )
+                .unwrap(),
+                ReadMode::Tail
+            );
+            while !tail.step().unwrap() {}
+            assert_eq!(
+                items(tail, &path, source),
+                cold_items(&path, source),
+                "{source:?}/{edge}"
+            );
+        }
+    }
+}

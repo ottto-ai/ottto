@@ -401,6 +401,29 @@ impl ClaudeResponseWindow {
         }
     }
 }
+#[cfg(test)]
+type ContentReadHook = Option<Box<dyn FnMut(u64)>>;
+#[cfg(test)]
+thread_local! {
+    static AFTER_CONTENT_READ: std::cell::RefCell<ContentReadHook> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn with_read_hook<T>(hook: impl FnMut(u64) + 'static, run: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            AFTER_CONTENT_READ.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    AFTER_CONTENT_READ.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+    let _reset = Reset;
+    run()
+}
+
 fn read_at(file: &File, source: SnapshotSource, bytes: &mut [u8], at: u64) -> Result<(), Refuse> {
     let mut offset = 0;
     while offset < bytes.len() {
@@ -412,6 +435,12 @@ fn read_at(file: &File, source: SnapshotSource, bytes: &mut [u8], at: u64) -> Re
             Ok(n) => n,
         };
         sampled_scan::durable_tail::record_rederive_input(source, n as u64);
+        #[cfg(test)]
+        AFTER_CONTENT_READ.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(at + offset as u64);
+            }
+        });
         offset += n;
     }
     Ok(())

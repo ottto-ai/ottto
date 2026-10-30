@@ -27445,6 +27445,11 @@ for line in sys.stdin:
             .open(record)
             .unwrap();
         file.write_all(&body).unwrap();
+        // F8: the support collector must also omit transient replay input,
+        // including raw-value magic keys and malformed-selector material.
+        std::fs::write(support.join("bounded-replay-private.jsonl"), format!(
+            "{{\"$serde_json::private::RawValue\":\"{CANARY}\"}}\n{{\"selector\":{{\"model\":[\"{CANARY}\"]}},\"content\":\"{CANARY}\"}}\n"
+        )).unwrap();
         CANARY
     }
 

@@ -5171,3 +5171,68 @@ fn exact_retirement_verifies_changed_survivor_and_never_deletes_unknown_bytes() 
         assert_eq!(fs::read(&disk).unwrap(), before);
     }
 }
+
+// F11: an exact retirement witness never converts a pending successor or a
+// retained exact completion into absence/ACK credit for its predecessor.
+#[test]
+fn exact_retirement_preserves_pending_and_retained_receipt_successors() {
+    let _reset = ResetFaults;
+    for retained_receipt in [false, true] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("pending-retire.jsonl", b"{}\n");
+        let b = binding("pending-retire", "scope", ("fp", None));
+        let mut store = scratch.store();
+        store
+            .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+            .unwrap();
+        let record = found(store.read(&b.key));
+        let expected = Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        };
+        store.authorize(&record, &expected);
+        let proof = store.mutation_witness(&record, &expected).unwrap();
+        let dir = store.dir().to_owned();
+        test_hooks::set_before_dir_sync(Some(Box::new(move |path| {
+            if path == dir {
+                Err(io::Error::other("synthetic pending successor sync"))
+            } else {
+                Ok(())
+            }
+        })));
+        let failed = store
+            .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
+            .unwrap();
+        test_hooks::set_before_dir_sync(None);
+        assert_eq!(failed.written, 0);
+        assert!(store.pending.contains_key(&b.key));
+        if retained_receipt {
+            let ReconcileOutcome::Receipted(receipt) =
+                store.reconcile_pending(&lock, &b.key).unwrap()
+            else {
+                panic!("exact successor receipt");
+            };
+            store.retain_receipt(receipt).unwrap();
+            assert!(store.receipt_pending(&b.key));
+        }
+        let before = fs::read(record_file(&store, &b.key)).unwrap();
+        let invalidated = store.counters().records_invalidated;
+        assert!(matches!(
+            store.retire_exact(&lock, &proof, &mut false),
+            RetireOutcome::Retry
+        ));
+        assert_eq!(fs::read(record_file(&store, &b.key)).unwrap(), before);
+        assert_eq!(store.counters().records_invalidated, invalidated);
+        assert!(store.pending.contains_key(&b.key));
+        // A cold reader sees the published successor; the old witness cannot
+        // delete it even when process-local pending custody is gone.
+        drop(store);
+        let mut cold = scratch.store();
+        assert!(matches!(
+            cold.retire_exact(&lock, &proof, &mut false),
+            RetireOutcome::Superseded
+        ));
+        assert_eq!(fs::read(record_file(&cold, &b.key)).unwrap(), before);
+    }
+}
