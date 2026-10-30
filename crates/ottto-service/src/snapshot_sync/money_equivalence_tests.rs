@@ -1,5 +1,5 @@
-// Compare emitted upload envelopes, never pre-finalization reductions. All input
-// files are synthetic. The dispatch overlays only this test harness on the base.
+// Compare emitted upload envelopes; inspect pre-finalization candidates only to
+// prove ledger no-ops. All inputs are synthetic. Dispatch overlays this harness.
 use super::*;
 use serde_json::Value;
 
@@ -238,7 +238,13 @@ impl Disk {
         index: &mut ScanIndex,
     ) -> ScanIndex {
         index.save(&self.index).unwrap();
-        crate::snapshots::durable_after_save(cache, &self.dir, source, index);
+        crate::snapshots::durable_after_save_and_retire(
+            cache,
+            &self.dir,
+            source,
+            index,
+            &self.index,
+        );
         ScanIndex::load(&self.index).unwrap()
     }
     fn records(&self) -> usize {
@@ -669,6 +675,16 @@ fn other_page(
     source: SnapshotSource,
     prior: ScanIndex,
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    other_page_observing(c, scanner, source, prior, |_| {})
+}
+
+fn other_page_observing(
+    c: &Corpus,
+    scanner: &E2ScanFixture,
+    source: SnapshotSource,
+    prior: ScanIndex,
+    observe: impl FnOnce(&[SnapshotItem]),
+) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
     let (mut index, mut scan, modes) = scanner.scan_other(
         source,
         std::slice::from_ref(&c.root),
@@ -678,6 +694,7 @@ fn other_page(
     );
     index.bind_session_accounts(source, "e2-synthetic-machine", &mut scan.snapshots, &[]);
     apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
+    observe(&scan.snapshots);
     finalize_scan_after_policy(source, &mut scan, &mut index);
     scan.finish_codex_capture_boundary(&mut index);
     (index, scan, modes)
@@ -1118,6 +1135,117 @@ fn pi_grow(path: &Path, value: Value) {
     input_clock(path);
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PiLedgerStep {
+    Emit(u64, u64),
+    Noop(u64, u64),
+    ConflictDrop(u64, u64),
+}
+
+impl PiLedgerStep {
+    fn totals(self) -> (u64, u64) {
+        match self {
+            Self::Emit(requests, input)
+            | Self::Noop(requests, input)
+            | Self::ConflictDrop(requests, input) => (requests, input),
+        }
+    }
+}
+
+fn pi_ledger_totals(items: &[SnapshotItem]) -> (u64, u64) {
+    assert_eq!(items.len(), 1, "ledger fixture has one cumulative session");
+    (
+        items.iter().map(|s| s.request_count).sum(),
+        items.iter().map(|s| s.input_tokens).sum(),
+    )
+}
+
+struct PiLedgerCheck<'a> {
+    step: PiLedgerStep,
+    accepted: &'a [SnapshotItem],
+}
+
+impl PiLedgerCheck<'_> {
+    fn page(
+        &self,
+        c: &Corpus,
+        scanner: &E2ScanFixture,
+        prior: ScanIndex,
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+        let previous_files = prior.files.clone();
+        let previous_entities = prior.file_snapshot_fingerprints.clone();
+        let mut candidates = Vec::new();
+        let (index, scan, modes) =
+            other_page_observing(c, scanner, SnapshotSource::Pi, prior, |items| {
+                candidates = items.to_vec();
+            });
+        match self.step {
+            PiLedgerStep::Emit(..) => {
+                assert_eq!(pi_ledger_totals(&scan.snapshots), self.step.totals());
+                assert_eq!(scan.semantic_noop_count, 0);
+                assert_eq!(scan.dropped_usage_record_count, 0);
+            }
+            PiLedgerStep::Noop(..) | PiLedgerStep::ConflictDrop(..) => {
+                assert!(scan.snapshots.is_empty());
+                assert_eq!(pi_ledger_totals(self.accepted), self.step.totals());
+                assert_eq!(index.files.len(), 1);
+                assert_eq!(previous_files.len(), 1);
+                for (key, before) in &previous_files {
+                    let after = &index.files[key];
+                    assert!(before.last_snapshot_fingerprint.is_some());
+                    assert!(before.last_upload_body_witness.is_some());
+                    assert_eq!(
+                        after.last_snapshot_fingerprint,
+                        before.last_snapshot_fingerprint
+                    );
+                    assert_eq!(
+                        after.last_upload_body_witness,
+                        before.last_upload_body_witness
+                    );
+                    match self.step {
+                        PiLedgerStep::Noop(..) => {
+                            assert_eq!(scan.semantic_noop_count, 1);
+                            assert_eq!(scan.dropped_usage_record_count, 0);
+                            assert_eq!(pi_ledger_totals(&candidates), self.step.totals());
+                            let candidate = &candidates[0];
+                            let accepted = &self.accepted[0];
+                            // The copy precedes finalization's fingerprint
+                            // recomputation and suppression of the candidate.
+                            assert_eq!(
+                                (
+                                    crate::snapshots::snapshot_fingerprint(
+                                        SnapshotSource::Pi,
+                                        candidate
+                                    ),
+                                    snapshot_upload_body_witness(candidate),
+                                ),
+                                (
+                                    accepted.snapshot_fingerprint.clone(),
+                                    snapshot_upload_body_witness(accepted),
+                                ),
+                            );
+                            assert!(after.size_bytes > before.size_bytes);
+                        }
+                        PiLedgerStep::ConflictDrop(..) => {
+                            assert_eq!(scan.semantic_noop_count, 0);
+                            assert_eq!(scan.dropped_usage_record_count, 1);
+                            // The incomplete parse must not advance the file
+                            // checkpoint: the resolving append remains retryable.
+                            assert_eq!(
+                                serde_json::to_value(after).unwrap(),
+                                serde_json::to_value(before).unwrap()
+                            );
+                        }
+                        PiLedgerStep::Emit(..) => unreachable!(),
+                    }
+                }
+                assert_eq!(index.file_snapshot_fingerprints, previous_entities);
+            }
+        }
+        (index, scan, modes)
+    }
+}
+
 // Return each arm's own finished index, so a later page cannot borrow another
 // arm's settlement. Quarantined files have no emitted body; compare their
 // disposition and retryability instead of inventing a successful upload.
@@ -1132,18 +1260,38 @@ fn pi_pages(
     disk_mode: (usize, usize, usize),
     restores: u64,
 ) -> ([ScanIndex; 3], SourceScanResult) {
+    pi_pages_checked(
+        proof, c, retained, restart, priors, ram_mode, disk_mode, restores, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pi_pages_checked(
+    proof: &mut PiProof,
+    c: &Corpus,
+    retained: &E2ScanFixture,
+    restart: &E2ScanFixture,
+    priors: [ScanIndex; 3],
+    ram_mode: (usize, usize, usize),
+    disk_mode: (usize, usize, usize),
+    restores: u64,
+    ledger: Option<&PiLedgerCheck<'_>>,
+) -> ([ScanIndex; 3], SourceScanResult) {
     save_inputs(c);
+    let page = |scanner: &E2ScanFixture, prior| match ledger {
+        Some(check) => check.page(c, scanner, prior),
+        None => other_page(c, scanner, SnapshotSource::Pi, prior),
+    };
     let [tail_prior, full_prior, disk_prior] = priors;
-    let (tail_index, tail, mode) = other_page(c, retained, SnapshotSource::Pi, tail_prior);
+    let (tail_index, tail, mode) = page(retained, tail_prior);
     assert_eq!(
         mode,
         if proof.sampled { ram_mode } else { (0, 0, 0) },
         "Pi retained acquisition"
     );
-    let (full_index, full, mode) =
-        other_page(c, &E2ScanFixture::default(), SnapshotSource::Pi, full_prior);
+    let (full_index, full, mode) = page(&E2ScanFixture::default(), full_prior);
     assert_eq!(mode.1 + mode.2, 0, "cold Pi cannot reuse a reduction");
-    let (disk_index, restored, mode) = other_page(c, restart, SnapshotSource::Pi, disk_prior);
+    let (disk_index, restored, mode) = page(restart, disk_prior);
     assert_eq!(
         mode,
         if proof.sampled {
@@ -1219,6 +1367,63 @@ fn pi_splits(name: &str, prefix: &str, suffix: Vec<Value>, requests: u64) -> Sou
     );
     proof.finish(&c, &disk);
     scan
+}
+
+fn pi_ledger_splits(
+    name: &str,
+    prefix: &str,
+    initial: PiLedgerStep,
+    suffix: Vec<(Value, PiLedgerStep)>,
+    final_totals: (u64, u64),
+) {
+    let (c, disk, path, scanner, prior, mut proof) = pi_disk_corpus(name, prefix);
+    assert!(matches!(initial, PiLedgerStep::Emit(..)));
+    let mut accepted = proof.bodies[0].items.clone();
+    assert_eq!(pi_ledger_totals(&accepted), initial.totals());
+    // The shared initial prefix is accepted by all three arms. Check cold and
+    // recordless restart against the retained arm's actual captured body too.
+    for initial_scanner in [E2ScanFixture::default(), disk.owner(SnapshotSource::Pi)] {
+        let (_, scan, _) = PiLedgerCheck {
+            step: initial,
+            accepted: &[],
+        }
+        .page(&c, &initial_scanner, ScanIndex::default());
+        assert_eq!(other_wire(SnapshotSource::Pi, &scan), proof.bodies[0].raw);
+    }
+    let mut priors = [prior.clone(), prior.clone(), prior];
+    let mut ram_mode = (0, 1, 0);
+    for (value, step) in suffix {
+        pi_grow(&path, value);
+        let restart = disk.owner(SnapshotSource::Pi);
+        let ([tail, full, mut restored], scan) = pi_pages_checked(
+            &mut proof,
+            &c,
+            &scanner,
+            &restart,
+            priors,
+            ram_mode,
+            (0, 1, 0),
+            1,
+            Some(&PiLedgerCheck {
+                step,
+                accepted: &accepted,
+            }),
+        );
+        if matches!(step, PiLedgerStep::Emit(..)) {
+            accepted = scan.snapshots;
+        }
+        let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
+        priors = [tail, full, next];
+        // A conflict consumes the retained reduction without reinserting it.
+        // The NEXT append must therefore acquire Full, not Tail.
+        ram_mode = if matches!(step, PiLedgerStep::ConflictDrop(..)) {
+            (1, 0, 0)
+        } else {
+            (0, 1, 0)
+        };
+    }
+    assert_eq!(pi_ledger_totals(&accepted), final_totals, "{name}");
+    proof.finish(&c, &disk);
 }
 
 #[test]
@@ -1336,6 +1541,7 @@ fn pi_ledger_seal_boundaries() {
     if !supported("pi_ledger_seal_boundaries") {
         return;
     }
+    use PiLedgerStep::{ConflictDrop, Emit, Noop};
     let message = pi_turn(
         "message",
         Some("synthetic-reused"),
@@ -1346,21 +1552,27 @@ fn pi_ledger_seal_boundaries() {
     end["type"] = json!("message_end");
     // SOURCE duplicate on both sides of the seal; count > 1 must survive.
     let prefix = pi_seed() + &pi_json(message.clone()) + &pi_json(message.clone());
-    let scan = pi_splits(
+    pi_ledger_splits(
         "pi_ledger_count_above_one",
         &prefix,
-        vec![end.clone(), end.clone(), message.clone(), end.clone()],
-        4,
+        Emit(3, 50),
+        vec![
+            (end.clone(), Noop(3, 50)),
+            (end.clone(), Noop(3, 50)),
+            (message.clone(), Emit(4, 70)),
+            (end.clone(), Noop(4, 70)),
+        ],
+        (4, 70),
     );
-    assert_eq!(scan.snapshots[0].input_tokens, 70);
     // SOURCE paired_digests is nonempty at commit, before another exact pair.
-    pi_splits(
+    pi_ledger_splits(
         "pi_ledger_paired_digest",
         &(pi_seed() + &pi_json(message.clone()) + &pi_json(end.clone())),
-        vec![message.clone(), end.clone()],
-        3,
+        Emit(2, 30),
+        vec![(message.clone(), Emit(3, 50)), (end.clone(), Noop(3, 50))],
+        (3, 50),
     );
-    // Distinct occurrences of a reused id pair independently, in either order.
+    // Reused-id pairing temporarily conflicts until both digests have paired.
     let mut later = pi_turn(
         "message",
         Some("synthetic-reused"),
@@ -1369,12 +1581,19 @@ fn pi_ledger_seal_boundaries() {
     );
     let prefix = pi_seed() + &pi_json(message.clone()) + &pi_json(later.clone());
     later["type"] = json!("message_end");
-    pi_splits("pi_ledger_reused_id", &prefix, vec![later, end.clone()], 3);
-    pi_splits(
+    pi_ledger_splits(
+        "pi_ledger_reused_id",
+        &prefix,
+        Emit(3, 60),
+        vec![(later, ConflictDrop(3, 60)), (end.clone(), Noop(3, 60))],
+        (3, 60),
+    );
+    pi_ledger_splits(
         "pi_ledger_reverse_pair",
         &(pi_seed() + &pi_json(end)),
-        vec![message],
-        2,
+        Emit(2, 30),
+        vec![(message, Noop(2, 30))],
+        (2, 30),
     );
 }
 

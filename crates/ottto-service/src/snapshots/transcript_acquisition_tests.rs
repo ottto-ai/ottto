@@ -221,7 +221,9 @@ fn oracle(fixture: &Fixture, source: SnapshotSource) -> Value {
             false,
         )
         .unwrap(),
-        _ => unreachable!(),
+        SnapshotSource::Pi => {
+            parse_pi_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap()
+        }
     };
     apply_upload_policy(source, &mut items, SnapshotUploadPolicy::default());
     serde_json::to_value(items).unwrap()
@@ -546,6 +548,44 @@ fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
         assert_ne!(later, oracle(&fixture, source));
     }
 }
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_hidden_middle_edit_remains_an_accepted_sampled_residual() {
+    let source = SnapshotSource::Pi;
+    let fixture = Fixture::new(source);
+    fixture.append(&json!({"type":"ignored", "padding":"a".repeat(12 * 1024)}));
+    fixture.append(&usage(source, 100, 0, "fixture-model"));
+    fixture.append(&json!({"type":"ignored", "padding":"b".repeat(12 * 1024)}));
+    let (old, mode, _, initial) = acquire(&fixture, source, None, 100);
+    assert!(old.is_some());
+    assert!(matches!(mode, ReadMode::Full(_)));
+    assert_eq!(initial, oracle(&fixture, source));
+    let original = fs::read_to_string(&fixture.0).unwrap();
+    let edited = original.replace("\"input\":100", "\"input\":900");
+    assert_ne!(original, edited);
+    assert_eq!(original.len(), edited.len());
+    fs::write(&fixture.0, edited).unwrap();
+    fixture.append(&usage(source, 140, 1, "fixture-model"));
+    let (tail, mode, _, interim) = acquire(&fixture, source, old, 101);
+    assert_eq!(mode, ReadMode::Tail);
+    assert!(tail.is_some());
+    let full = oracle(&fixture, source);
+    assert_eq!(interim[0]["input_tokens"], 240);
+    assert_eq!(full[0]["input_tokens"], 1040);
+    assert_ne!(interim, full, "accepted sampled limitation must be visible");
+    let (_, mode, guards, later) = acquire(
+        &fixture,
+        source,
+        tail,
+        101 + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
+    );
+    assert_eq!(mode, ReadMode::Unchanged);
+    assert_eq!(guards, 0);
+    assert_eq!(later, interim);
+    assert_ne!(later, full);
+}
+
 #[test]
 fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
@@ -1167,6 +1207,15 @@ fn production_scan_page_at_with_setup(
         scan = scan.with_sampled_acquisition(cache, Scope(namespace.into()));
     }
     setup(&mut scan);
+    finish_production_scan_page(scan, source)
+}
+
+// Also drive scans constructed with multiple roots through the same native
+// finalization and acceptance path as the ordinary single-root fixtures.
+fn finish_production_scan_page(
+    mut scan: OwnedSourceScan,
+    source: SnapshotSource,
+) -> ProductionScanPage {
     let mut modes = (0, 0, 0);
     let mut metrics = (0, 0);
     loop {
@@ -1702,7 +1751,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
         }
     }
     let _clock = ResetClock;
-    const START: u64 = 1_800_000_000;
+    const START: u64 = 1_700_000_000;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         for (arm, pending) in [
             ("old_append", 0),
@@ -1721,7 +1770,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             let quiet = arm.starts_with("due_quiet");
             let missing = matches!(arm, "restore_miss_debt" | "cleared_selection_debt");
             let full = arm == "real_edit" || missing;
-            let owes = arm.starts_with("due_") || arm == "real_edit" || missing;
+            let owes = arm.starts_with("due_") || arm == "real_edit" || missing || pending > 0;
             sampled_scan::set_test_now(Some(START));
             let fixture = ScanFixture::new(source);
             fixture.file.append(&usage(source, 100, 0, "fixture-model"));
@@ -1842,7 +1891,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                 *second.retained().unwrap() = TranscriptCache::with_byte_limit(0);
             }
             sampled_scan::test_hooks::clear();
-            let (((warm, result, modes, bytes), diagnostics), sample_reads) =
+            let (((mut warm, result, modes, bytes), diagnostics), sample_reads) =
                 crate::transcript_acquisition::capture_sample_reads(|| {
                     crate::local_resource_diagnostics::capture(|| {
                         production_scan_at_with_setup(
@@ -1856,7 +1905,10 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                                 let context = scan.sampling.as_ref().unwrap();
                                 if pending > 0 {
                                     assert_eq!(context.audit_slots, 0);
-                                    assert_eq!(context.audit_metadata_supported, pending <= 256);
+                                    assert_eq!(
+                                        context.audit_metadata_supported,
+                                        pending + usize::from(owes) <= 256
+                                    );
                                     let (budget, step) = sampled_scan::copy_budget_step(
                                         scan.sampling.as_ref(),
                                         None,
@@ -1914,11 +1966,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             // from the completed context metrics below.
             let window = before.min(crate::transcript_acquisition::SAMPLE_BYTES as u64) as usize;
             let pairs = if !full {
-                if quiet {
-                    1
-                } else {
-                    2
-                }
+                2 // restore + prepare (Tail), or restore + quiet validation
             } else {
                 usize::from(arm == "restore_miss_debt")
             };
@@ -1968,11 +2016,39 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                 production_body(source, cold),
                 "{source:?}/{arm}"
             );
+            if quiet {
+                assert!(
+                    warm.files[&key].has_unverified_source(),
+                    "receipt still owed"
+                );
+                warm.save(&index_path).unwrap();
+                second
+                    .durable_write_after_save(lock, source, &warm)
+                    .unwrap();
+                assert_eq!(
+                    second.durable_reconcile_retirements(lock, source, &mut warm, &index_path),
+                    1
+                );
+            }
             assert_eq!(
                 warm.files[&key].has_unverified_source(),
-                !full,
-                "only an actual native Full verifies the source"
+                !full && !quiet,
+                "quiet sampling retires scheduling debt without Full credit"
             );
+            let state = &pages[0]["counts"]["sampled_acquisition"]["index_state_at_page_end"];
+            assert_eq!(
+                state["audit_quiet_retired"], 0,
+                "durable retirement awaits the post-save receipt"
+            );
+            if quiet {
+                let checkpoint = second.retained_checkpoint(&key).unwrap();
+                assert_eq!(checkpoint.audit_debt(), None);
+                assert_eq!(checkpoint.last_full_verified(), START);
+                assert_eq!(
+                    pages[0]["counts"]["sampled_acquisition"]["page_events"]["audits_completed"],
+                    0
+                );
+            }
             if pending > 0 {
                 // E3 C2: index debt population is not resident-cache capacity.
                 // Inspect the actual retained copy and the real retention
@@ -2031,7 +2107,7 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
         }
     }
     let _clock = ResetClock;
-    const START: u64 = 1_800_000_000;
+    const START: u64 = 1_700_000_000;
     const PAGE_BYTES: u64 = 1024;
     let due = START + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
     sampled_scan::codex_cursor::with_test_limits(PAGE_BYTES, PAGE_BYTES, 128, || {
@@ -2075,13 +2151,12 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
                 1
             );
             let durable_source = sampled_scan::durable_tail::durable_source(source).unwrap();
-            let allowlist = sampled_jsonl::durable::allowlist_digest(source);
             let read_record = || {
                 let mut disk = store::DurableTailStore::new(
                     store::store_dir_for_index(&index_path),
                     durable_source,
                 );
-                match disk.read(&store::key_digest(durable_source, &key), &allowlist) {
+                match disk.read(&store::key_digest(durable_source, &key)) {
                     store::ReadOutcome::Found(record) => record,
                     other => panic!("{other:?}"),
                 }
@@ -2204,15 +2279,18 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             third.durable_begin_pass(source, &index_path, &namespace, true);
             let restart_index = ScanIndex::load(&index_path).unwrap();
             let mut correction_index = restart_index.clone();
-            let (next, raw, result, modes, bytes) = production_scan_page_at_with_setup(
-                &fixture,
-                source,
-                restart_index,
-                Some(third.clone()),
-                &namespace.0,
-                NOW,
-                |_| {},
-            );
+            let ((mut next, raw, result, modes, bytes), retirement_diagnostics) =
+                crate::local_resource_diagnostics::capture(|| {
+                    production_scan_page_at_with_setup(
+                        &fixture,
+                        source,
+                        restart_index,
+                        Some(third.clone()),
+                        &namespace.0,
+                        NOW,
+                        |_| {},
+                    )
+                });
             assert_eq!(third.durable_counters(source).unwrap().0.restored, 1);
             assert_eq!(modes, (0, 0, 1));
             assert_eq!(bytes.0, 0, "second restart reads zero native suffix bytes");
@@ -2246,10 +2324,108 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             );
             assert_eq!(correction.snapshots[0].snapshot_fingerprint, fingerprint);
             assert_eq!(third.counters_for_test().jobs_started, 0);
-            assert_eq!(next.files[&key].unverified_deadline(), Some(due));
+            assert!(
+                next.files[&key].has_unverified_source(),
+                "writer receipt still owed"
+            );
             let reused = third.retained_checkpoint(&key).unwrap();
             assert_eq!(reused.last_full_verified(), START);
-            assert_eq!(reused.audit_debt(), checkpoint.audit_debt());
+            assert_eq!(reused.audit_debt(), None);
+            let page = retirement_diagnostics
+                .iter()
+                .find(|record| record["stage"] == "native_collection_page")
+                .unwrap();
+            assert_eq!(
+                page["counts"]["sampled_acquisition"]["index_state_at_page_end"]
+                    ["audit_quiet_retired"],
+                0
+            );
+            assert_eq!(
+                page["counts"]["sampled_acquisition"]["page_events"]["audits_completed"],
+                0
+            );
+            if source == SnapshotSource::ClaudeCode {
+                assert!(
+                    next.claude_request_census
+                        .get(&key)
+                        .unwrap()
+                        .unverified_or_twin(),
+                    "quiet retirement grants no census verification"
+                );
+                // Force an existing selection reason without changing file,
+                // scope, provenance or the debt-free retired RAM checkpoint.
+                let mut forced = next.clone();
+                forced
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .last_snapshot_fingerprint = None;
+                let (forced, _, forced_modes) =
+                    production_scan(&fixture, source, forced, Some(third.clone()), &namespace.0);
+                assert_eq!(forced_modes, (0, 0, 1));
+                assert!(
+                    forced
+                        .claude_request_census
+                        .get(&key)
+                        .unwrap()
+                        .unverified_or_twin(),
+                    "a later debt-free Unchanged read still grants no Full credit"
+                );
+                assert_eq!(
+                    third
+                        .retained_checkpoint(&key)
+                        .unwrap()
+                        .last_full_verified(),
+                    START
+                );
+            }
+            next.save(&index_path).unwrap();
+            assert_eq!(
+                third
+                    .durable_write_after_save(lock, source, &next)
+                    .unwrap()
+                    .written,
+                1
+            );
+            assert_eq!(
+                third.durable_reconcile_retirements(lock, source, &mut next, &index_path),
+                1
+            );
+            assert_eq!(next.files[&key].unverified_deadline(), None);
+            let retired_record = read_record();
+            let (retired, _) = retired_record
+                .record
+                .certificate
+                .restore(
+                    &mut File::open(&fixture.file.0).unwrap(),
+                    reused.scope().clone(),
+                )
+                .unwrap();
+            assert_eq!(
+                retired.audit_debt(),
+                None,
+                "disk certificate keeps the retirement"
+            );
+            assert_eq!(retired.last_full_verified(), START);
+            drop(third);
+            let fourth = Arc::new(sampled_scan::SharedCache::default());
+            fourth.durable_begin_pass(source, &index_path, &namespace, true);
+            let loaded = ScanIndex::load(&index_path).unwrap();
+            assert_eq!(loaded.files[&key].unverified_deadline(), None);
+            let (final_index, final_raw, final_candidates, modes, bytes) =
+                production_scan_page_at_with_setup(
+                    &fixture,
+                    source,
+                    loaded,
+                    Some(fourth),
+                    &namespace.0,
+                    NOW,
+                    |_| {},
+                );
+            assert_eq!(modes, (0, 0, 0), "retired quiet file is skipped on restart");
+            assert_eq!(bytes.0, 0);
+            assert!(final_raw.snapshots.is_empty() && final_candidates.snapshots.is_empty());
+            assert_eq!(final_index.files[&key].unverified_deadline(), None);
         }
     });
 }
@@ -3773,8 +3949,12 @@ fn resource_diagnostics_acquisition_absence_preserves_unknown_and_short_circuit(
         );
         let encoded = serde_json::to_string(pages[0]).unwrap();
         assert!(!encoded.contains(f.dir.to_str().unwrap()));
-        assert!(!encoded.contains("expired"));
-        assert!(!encoded.contains("evicted"));
+        let admission = serde_json::to_string(counts).unwrap();
+        assert!(!admission.contains("expired"));
+        assert!(!admission.contains("evicted"));
+        assert!(rows
+            .iter()
+            .all(|row| row["stage"] != "sampled_audit_pace_alarm"));
     }
 }
 
@@ -4201,6 +4381,131 @@ fn codex_compaction_events_and_points_match_full_read_at_every_tail_split() {
     }
 }
 
+/// V1 bootstrap uses the golden-checked old serializer and production
+/// expected/scope/restore/write seams. Each restart has zero Fulls.
+#[cfg(unix)]
+#[test]
+fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() {
+    use crate::durable_tail_store as store;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    // OwnedSourceScan::new enables identity capture for both sources in tests.
+    // Bind every durable pass to that same mode, including Codex.
+    let identity_capture = true;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let namespace = Scope("v1-upgrade-production".into());
+        let state = fixture.dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let lock = crate::locked_state_dir::test_locks::hold(&state);
+        let index_path = state.join("index.json");
+        let first = Arc::new(sampled_scan::SharedCache::default());
+        first.durable_begin_pass(source, &index_path, &namespace, identity_capture);
+        let (mut index, _, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(first.clone()),
+            &namespace.0,
+        );
+        assert_eq!(modes.0, 1);
+        index.save(&index_path).unwrap();
+        assert_eq!(
+            first
+                .durable_write_after_save(lock, source, &index)
+                .unwrap()
+                .written,
+            1
+        );
+        let key = local_index_key(&fixture.file.0);
+        let old = sampled_scan::durable_tail::seed_pinned_v1(&first, source, &key, &index);
+        let record_path = fs::read_dir(store::store_dir_for_index(&index_path))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(u16::from_le_bytes(old[8..10].try_into().unwrap()), 1);
+        drop(first);
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        let second = Arc::new(sampled_scan::SharedCache::default());
+        second.durable_begin_pass(source, &index_path, &namespace, identity_capture);
+        let loaded = ScanIndex::load(&index_path).unwrap();
+        let (mut warm, scan, modes) = production_scan(
+            &fixture,
+            source,
+            loaded.clone(),
+            Some(second.clone()),
+            &namespace.0,
+        );
+        let (cold, full, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
+        assert_eq!(modes, (0, 1, 0), "{source:?}");
+        assert_eq!(second.durable_counters(source).unwrap().0.restored, 1);
+        assert_eq!(production_body(source, scan), production_body(source, full));
+        assert_eq!(
+            warm.files[&key].codex_counting_v2,
+            cold.files[&key].codex_counting_v2
+        );
+        assert_eq!(fs::read(&record_path).unwrap(), old, "no eager migration");
+        let due = unix_seconds(SystemTime::now()).unwrap() + 120;
+        let fingerprint = warm.files[&key].source_file_fingerprint.clone();
+        assert!(warm.stage_sampled_audit(
+            &key,
+            &fingerprint,
+            crate::transcript_acquisition::AuditDebt {
+                due_unix_seconds: due
+            }
+        ));
+        let written_due = sampled_audit::debt_for_key(&warm, &key, due - 120)
+            .unwrap()
+            .due_unix_seconds;
+        warm.save(&index_path).unwrap();
+        assert_eq!(
+            second
+                .durable_write_after_save(lock, source, &warm)
+                .unwrap()
+                .written,
+            1
+        );
+        let before_gc = second.durable_counters(source).unwrap().1;
+        second.durable_gc(lock, source, &warm).unwrap();
+        let after_gc = second.durable_counters(source).unwrap().1;
+        assert_eq!(after_gc.guard_header_bytes, before_gc.guard_header_bytes);
+        assert_eq!(after_gc.guard_verify_bytes, before_gc.guard_verify_bytes);
+        assert!(after_gc.gc_bytes_read > before_gc.gc_bytes_read);
+        let mut disk = store::DurableTailStore::new(
+            store::store_dir_for_index(&index_path),
+            sampled_scan::durable_tail::durable_source(source).unwrap(),
+        );
+        let record = match disk.read(&store::key_digest(
+            sampled_scan::durable_tail::durable_source(source).unwrap(),
+            &key,
+        )) {
+            store::ReadOutcome::Found(r) => r,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            record.envelope_audit_debt,
+            Some(written_due),
+            "actual post-save adapter takes CURRENT index debt"
+        );
+        assert_eq!(record.record.certificate.audit_debt_unix_seconds, None);
+        assert_eq!(record.format, crate::durable_tail_store::FORMAT_VERSION);
+        drop(second);
+        fixture.file.append(&usage(source, 160, 2, "fixture-model"));
+        let third = Arc::new(sampled_scan::SharedCache::default());
+        third.durable_begin_pass(source, &index_path, &namespace, identity_capture);
+        let loaded = ScanIndex::load(&index_path).unwrap();
+        let (_, scan, modes) =
+            production_scan(&fixture, source, loaded.clone(), Some(third), &namespace.0);
+        let (_, full, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
+        assert_eq!(modes, (0, 1, 0), "second restart {source:?}");
+        assert_eq!(production_body(source, scan), production_body(source, full));
+    }
+}
+
 fn codex_cache_break_lines(index: usize) -> [Value; 2] {
     let timestamp = format!("2026-10-07T10:{:02}:{:02}Z", index / 60, index % 60);
     let read = if index % 2 == 0 { 90_000 } else { 0 };
@@ -4268,6 +4573,853 @@ fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
     assert_eq!(mode, ReadMode::Tail);
     assert_eq!(body, oracle(&fixture, source));
     assert_eq!(uploaded_cache_breaks(&body), (first, &json!(6)));
+}
+
+#[cfg(unix)]
+mod audit_retirement_tests;
+/// A persisted index can legitimately have no record (capacity, deferral or GC).
+/// Enabling the durable cache must preserve main's Full-on-miss admission.
+#[cfg(unix)]
+#[test]
+fn no_record_keys_keep_existing_full_admission_after_restart() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let namespace = Scope("no-record-admission".into());
+        let (mut index, _, _) =
+            production_scan(&fixture, source, ScanIndex::default(), None, &namespace.0);
+        let key = local_index_key(&fixture.file.0);
+        assert!(!index.files[&key].source_file_fingerprint.is_empty());
+        let index_path = fixture.dir.join("index.json");
+        index.save(&index_path).unwrap();
+        assert!(!crate::durable_tail_store::store_dir_for_index(&index_path).exists());
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        cache.durable_begin_pass(
+            source,
+            &index_path,
+            &namespace,
+            source == SnapshotSource::ClaudeCode,
+        );
+        let loaded = ScanIndex::load(&index_path).unwrap();
+        let (_, scan, modes) = production_scan(
+            &fixture,
+            source,
+            loaded.clone(),
+            Some(cache.clone()),
+            &namespace.0,
+        );
+        let (_, cold, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
+        assert_eq!(modes, (1, 0, 0));
+        assert_eq!(production_body(source, scan), production_body(source, cold));
+        assert_eq!(
+            cache.durable_counters(source).unwrap().0.durable_held,
+            [0; 5]
+        );
+    }
+}
+
+/// Index save may clear a completed audit before its durable replacement.
+/// Restart must re-arm the audit, not freeze the old debt-bearing record.
+#[cfg(unix)]
+#[test]
+fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    // OwnedSourceScan::new enables identity capture for both sources in tests.
+    // Bind every durable pass to that same mode, including Codex.
+    let identity_capture = true;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let namespace = Scope("audit-replacement-crash".into());
+        let state = fixture.dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let lock = crate::locked_state_dir::test_locks::hold(&state);
+        let index_path = state.join("index.json");
+        let begin = || {
+            let cache = Arc::new(sampled_scan::SharedCache::default());
+            cache.durable_begin_pass(source, &index_path, &namespace, identity_capture);
+            cache
+        };
+        let cache = begin();
+        let (mut index, _, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            &namespace.0,
+        );
+        assert_eq!(modes.0, 1);
+        index.save(&index_path).unwrap();
+        assert_eq!(
+            cache
+                .durable_write_after_save(lock, source, &index)
+                .unwrap()
+                .written,
+            1
+        );
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        let (mut index, _, modes) =
+            production_scan(&fixture, source, index, Some(cache.clone()), &namespace.0);
+        assert_eq!(modes, (0, 1, 0));
+        let key = local_index_key(&fixture.file.0);
+        assert!(index.files[&key].has_unverified_source());
+        index.save(&index_path).unwrap();
+        assert_eq!(
+            cache
+                .durable_write_after_save(lock, source, &index)
+                .unwrap()
+                .written,
+            1
+        );
+        drop(cache);
+        let record_path = fs::read_dir(crate::durable_tail_store::store_dir_for_index(&index_path))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let old = fs::read(&record_path).unwrap();
+        assert_eq!(old[311], 1, "predecessor owes an audit");
+        let now = unix_seconds(SystemTime::now()).unwrap();
+        let fingerprint = index.files[&key].source_file_fingerprint.clone();
+        assert!(index.stage_sampled_audit(
+            &key,
+            &fingerprint,
+            crate::transcript_acquisition::AuditDebt {
+                due_unix_seconds: now
+            }
+        ));
+        // A real head change, not AuditDue, authorizes this Full. JSON leading
+        // whitespace preserves the native body while changing both samples.
+        let mut changed = fs::read(&fixture.file.0).unwrap();
+        changed.insert(0, b' ');
+        fs::write(&fixture.file.0, changed).unwrap();
+        let audit = begin();
+        let (mut audited, _, modes) =
+            production_scan(&fixture, source, index, Some(audit.clone()), &namespace.0);
+        assert_eq!(modes.0, 1);
+        assert!(
+            !audited.files[&key].has_unverified_source(),
+            "completed actual Full cleared carrier"
+        );
+        audited.save(&index_path).unwrap();
+        // Crash/failure/deferral before durable_write_after_save: old bytes survive.
+        drop(audit);
+        assert_eq!(fs::read(&record_path).unwrap(), old);
+        fixture.file.append(&usage(source, 160, 2, "fixture-model"));
+        let restart = begin();
+        let loaded = ScanIndex::load(&index_path).unwrap();
+        let (mut repaired, scan, modes) = production_scan(
+            &fixture,
+            source,
+            loaded.clone(),
+            Some(restart.clone()),
+            &namespace.0,
+        );
+        let (_, cold, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
+        assert_eq!(modes.0, 1, "immediate re-armed audit progresses");
+        assert_eq!(
+            restart
+                .durable_counters(source)
+                .unwrap()
+                .0
+                .ineligible
+                .get("audit_carrier"),
+            Some(&1)
+        );
+        assert_eq!(
+            restart.durable_counters(source).unwrap().0.durable_held,
+            [0; 5]
+        );
+        assert_eq!(production_body(source, scan), production_body(source, cold));
+        assert!(!repaired.files[&key].has_unverified_source());
+        repaired.save(&index_path).unwrap();
+        assert_eq!(
+            restart
+                .durable_write_after_save(lock, source, &repaired)
+                .unwrap()
+                .written,
+            1
+        );
+        assert_eq!(fs::read(&record_path).unwrap()[311], 0);
+        drop(restart);
+        fixture.file.append(&usage(source, 190, 3, "fixture-model"));
+        let (_, _, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::load(&index_path).unwrap(),
+            Some(begin()),
+            &namespace.0,
+        );
+        assert_eq!(
+            modes,
+            (0, 1, 0),
+            "successful replacement does not renew repair"
+        );
+    }
+}
+
+/// Missing carrier is a counted miss before sampling admission: real Full
+/// publishes, establishes custody and permits ordinary post-save replacement.
+#[cfg(unix)]
+#[test]
+fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
+    use crate::durable_tail_store as store;
+    use crate::transcript_acquisition::ReadPlan;
+    use std::io::Read;
+    // Match production_scan's cfg(test) capture mode for both sources.
+    let identity_capture = true;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let namespace = Scope("missing-carrier-common-guard".into());
+        let index_path = fixture.dir.join("index.json");
+        let lock = crate::locked_state_dir::test_locks::hold(&fixture.dir);
+        let key = local_index_key(&fixture.file.0);
+        let ds = sampled_scan::durable_tail::durable_source(source).unwrap();
+        let record_key = store::key_digest(ds, &key);
+        let now = unix_seconds(SystemTime::now()).unwrap();
+        let mut file = File::open(&fixture.file.0).unwrap();
+        let mut plan = ReadPlan::prepare(&mut file, None, &namespace, None, now).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        plan.observe_complete_records(&bytes).unwrap();
+        let checkpoint = plan
+            .commit_after_native_completion(&file, &namespace, now)
+            .unwrap();
+        let mut certificate = checkpoint.durable_certificate(0).unwrap();
+        certificate.audit_debt_unix_seconds = Some(now + 60);
+        let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+        let pending = store::PendingRecord {
+            binding: store::Binding {
+                source: ds,
+                key: record_key,
+                context: store::context_digest(&namespace.0, None),
+                scope: [0; 32],
+                entry: [0; 32],
+            },
+            certificate,
+            body: durable_store_fixture_body(source, 0, 0),
+            allowlist: sampled_jsonl::durable::allowlist_digest(source),
+        };
+        assert_eq!(
+            disk.write_after_save(lock, 1, vec![pending])
+                .unwrap()
+                .written,
+            1
+        );
+        let record_path = fs::read_dir(store::store_dir_for_index(&index_path))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let original = fs::read(&record_path).unwrap();
+        assert!(
+            matches!(disk.read(&record_key), store::ReadOutcome::Found(r) if r.envelope_audit_debt.is_some())
+        );
+        drop(disk);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        cache.durable_begin_pass(source, &index_path, &namespace, identity_capture);
+        begin_durable_pass(
+            &cache,
+            &fixture.dir,
+            source,
+            &index_path,
+            true,
+            &namespace,
+            identity_capture,
+        );
+        assert_eq!(
+            fs::read(&record_path).unwrap(),
+            original,
+            "fresh-index cleanup preserves missing debt carrier"
+        );
+        // Append after the predecessor was written: the reset must not lose it.
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        let reset = ScanIndex::default();
+        cache.durable_gc(lock, source, &reset).unwrap();
+        assert_eq!(
+            fs::read(&record_path).unwrap(),
+            original,
+            "GC before Full preserves evidence"
+        );
+        assert!(!reset.files.contains_key(&key));
+        let ((mut index, scan, modes, bytes), diagnostics) =
+            crate::local_resource_diagnostics::capture(|| {
+                production_scan_with_metrics(
+                    &fixture,
+                    source,
+                    reset,
+                    Some(cache.clone()),
+                    &namespace.0,
+                )
+            });
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|row| row["stage"] == "native_collection_page")
+                .map(|row| {
+                    row["counts"]["sampled_acquisition"]["page_events"]["audits_completed"]
+                        .as_u64()
+                        .expect("production page_events exposes the completion counter")
+                })
+                .sum::<u64>(),
+            1,
+            "verified-first recovery uses the existing completion counter"
+        );
+        assert_eq!(
+            modes,
+            (1, 0, 0),
+            "missing custody requires Full, never restore"
+        );
+        assert_eq!(bytes.0, fixture.file.0.metadata().unwrap().len());
+        assert!(scan.census_complete, "one pass completes the census");
+        assert!(
+            !scan.snapshots.is_empty(),
+            "Full publishes the growing file"
+        );
+        assert!(
+            index.files.contains_key(&key),
+            "only the actual Full creates membership"
+        );
+        assert!(
+            !index.files[&key].has_unverified_source(),
+            "completed Full satisfies debt"
+        );
+        let (_, cold, _) =
+            production_scan(&fixture, source, ScanIndex::default(), None, &namespace.0);
+        assert_eq!(production_body(source, scan), production_body(source, cold));
+        let (counts, _) = cache.durable_counters(source).unwrap();
+        assert_eq!(counts.ineligible.get("audit_carrier"), Some(&1));
+        assert_eq!(
+            counts.ineligible.get("audit_carrier_staged_unverified"),
+            None,
+            "verified-first Full never stages recovered debt"
+        );
+        assert_eq!(counts.durable_held, [0; 5]);
+        assert_eq!(
+            counts.restore_attempts, 0,
+            "missing membership never reaches restore"
+        );
+        assert_eq!(counts.restored, 0);
+        assert_eq!(
+            fs::read(&record_path).unwrap(),
+            original,
+            "no pre-save replacement"
+        );
+        // Linux also exercises the real Full/census/counter path above. Native
+        // cache retention and disk replacement require a supported heap layout.
+        if !crate::heap_layout_bound::layout_supported() {
+            continue;
+        }
+        index.save(&index_path).unwrap();
+        let before = cache.durable_counters(source).unwrap().1.records_written;
+        durable_after_save(&cache, &fixture.dir, source, &index);
+        assert_eq!(
+            cache.durable_counters(source).unwrap().1.records_written - before,
+            1
+        );
+        assert_ne!(
+            fs::read(&record_path).unwrap(),
+            original,
+            "Full replaces the predecessor"
+        );
+        let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+        let store::ReadOutcome::Found(replacement) = disk.read(&record_key) else {
+            panic!("Full replacement must remain on disk");
+        };
+        assert_eq!(replacement.envelope_audit_debt, None);
+        assert_eq!(
+            replacement.record.certificate.length,
+            fixture.file.0.metadata().unwrap().len()
+        );
+        drop(disk);
+        drop(replacement);
+        // The next append Tails normally. Its new audit deadline is independent
+        // of the retired missing-carrier debt and cannot re-trigger recovery.
+        fixture.file.append(&usage(source, 160, 2, "fixture-model"));
+        let (mut index, scan, modes, bytes) = production_scan_with_metrics(
+            &fixture,
+            source,
+            index,
+            Some(cache.clone()),
+            &namespace.0,
+        );
+        assert_eq!(modes, (0, 1, 0));
+        assert!(bytes.0 > 0);
+        let (_, cold, _) =
+            production_scan(&fixture, source, ScanIndex::default(), None, &namespace.0);
+        assert_eq!(production_body(source, scan), production_body(source, cold));
+        assert_eq!(
+            cache
+                .durable_counters(source)
+                .unwrap()
+                .0
+                .ineligible
+                .get("audit_carrier"),
+            Some(&1)
+        );
+        index.save(&index_path).unwrap();
+        durable_after_save(&cache, &fixture.dir, source, &index);
+        // Advance discovery beyond its age window without advancing the audit
+        // clock: the acquired suffix remains indexed and idle needs no reads.
+        let idle_at = (time::OffsetDateTime::now_utc()
+            + time::Duration::days(BACKFILL_WINDOW_DAYS as i64 + 1))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+        let (mut index, idle, modes, bytes) = production_scan_at(
+            &fixture,
+            source,
+            index,
+            Some(cache.clone()),
+            &namespace.0,
+            &idle_at,
+        );
+        assert_eq!(modes, (0, 0, 0));
+        assert_eq!(
+            bytes,
+            (0, 0),
+            "idle has zero native and sample transcript bytes"
+        );
+        assert!(idle.snapshots.is_empty());
+        assert!(idle.census_complete);
+        assert!(index.files.contains_key(&key));
+        index.save(&index_path).unwrap();
+        drop(cache);
+        let restart = Arc::new(sampled_scan::SharedCache::default());
+        restart.durable_begin_pass(source, &index_path, &namespace, identity_capture);
+        let (index, idle, modes, bytes) = production_scan_at(
+            &fixture,
+            source,
+            ScanIndex::load(&index_path).unwrap(),
+            Some(restart.clone()),
+            &namespace.0,
+            &idle_at,
+        );
+        assert_eq!(modes, (0, 0, 0));
+        assert_eq!(bytes, (0, 0), "quiet restart has zero transcript reads");
+        assert!(idle.snapshots.is_empty());
+        assert!(idle.census_complete);
+        assert!(index.files.contains_key(&key));
+        let (counts, _) = restart.durable_counters(source).unwrap();
+        assert_eq!(counts.ineligible.get("audit_carrier"), None);
+        assert_eq!(counts.restore_attempts, 0);
+        assert_eq!(counts.durable_held, [0; 5]);
+        // Quiet restart alone never probes the record. A new suffix must
+        // restore the ordinary replacement under the same capture binding.
+        fixture.file.append(&usage(source, 190, 3, "fixture-model"));
+        let (_, warm, modes) = production_scan(
+            &fixture,
+            source,
+            index.clone(),
+            Some(restart.clone()),
+            &namespace.0,
+        );
+        let (_, cold, _) = production_scan(&fixture, source, index, None, &namespace.0);
+        assert_eq!(modes, (0, 1, 0), "replacement restart {source:?}");
+        assert_eq!(restart.durable_counters(source).unwrap().0.restored, 1);
+        assert_eq!(production_body(source, warm), production_body(source, cold));
+    }
+}
+
+/// Terminal settlement may publish without source verification. Recovered
+/// envelope debt must become the existing marker on native-created membership.
+#[cfg(unix)]
+#[test]
+fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_both_sources() {
+    use crate::durable_tail_store as store;
+    use crate::transcript_acquisition::ReadPlan;
+    use std::io::Read;
+    // Match production_scan's cfg(test) capture mode for both sources.
+    let identity_capture = true;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let namespace = Scope("missing-carrier-terminal-loss".into());
+        let index_path = fixture.dir.join("index.json");
+        let lock = crate::locked_state_dir::test_locks::hold(&fixture.dir);
+        let key = local_index_key(&fixture.file.0);
+        let ds = sampled_scan::durable_tail::durable_source(source).unwrap();
+        let record_key = store::key_digest(ds, &key);
+        let now = unix_seconds(SystemTime::now()).unwrap();
+        let mut file = File::open(&fixture.file.0).unwrap();
+        let mut plan = ReadPlan::prepare(&mut file, None, &namespace, None, now).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        plan.observe_complete_records(&bytes).unwrap();
+        let checkpoint = plan
+            .commit_after_native_completion(&file, &namespace, now)
+            .unwrap();
+        let mut certificate = checkpoint.durable_certificate(0).unwrap();
+        certificate.audit_debt_unix_seconds = Some(now);
+        let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+        let pending = store::PendingRecord {
+            binding: store::Binding {
+                source: ds,
+                key: record_key,
+                context: store::context_digest(&namespace.0, None),
+                scope: [0; 32],
+                entry: [0; 32],
+            },
+            certificate,
+            body: durable_store_fixture_body(source, 0, 0),
+            allowlist: sampled_jsonl::durable::allowlist_digest(source),
+        };
+        assert_eq!(
+            disk.write_after_save(lock, 1, vec![pending])
+                .unwrap()
+                .written,
+            1
+        );
+        let record_path = fs::read_dir(store::store_dir_for_index(&index_path))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let original = fs::read(&record_path).unwrap();
+        assert!(
+            matches!(disk.read(&record_key), store::ReadOutcome::Found(r) if r.envelope_audit_debt.is_some())
+        );
+        drop(disk);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        cache.durable_begin_pass(source, &index_path, &namespace, identity_capture);
+        begin_durable_pass(
+            &cache,
+            &fixture.dir,
+            source,
+            &index_path,
+            true,
+            &namespace,
+            identity_capture,
+        );
+        assert_eq!(
+            fs::read(&record_path).unwrap(),
+            original,
+            "fresh-index cleanup preserves missing debt carrier"
+        );
+        fixture
+            .file
+            .append(&json!({"type":"ignored", "padding":"x".repeat(MAX_JSONL_LINE_BYTES + 1024)}));
+        fixture.file.append(&usage(source, 140, 1, "fixture-model"));
+        let (mut index, scan, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            &namespace.0,
+        );
+        assert_eq!(modes, (1, 0, 0));
+        assert!(scan.over_line_cap_count > 0, "terminal loss is disclosed");
+        assert!(
+            !scan.snapshots.is_empty(),
+            "native terminal settlement publishes"
+        );
+        assert!(index.files[&key].has_unverified_source());
+        assert_eq!(
+            index.files[&key].unverified_deadline(),
+            Some(now),
+            "keep the validated debt value"
+        );
+        assert!(sampled_audit::path_requires_verification(
+            &index.files,
+            &fixture.file.0
+        ));
+        let (counts, store) = cache.durable_counters(source).unwrap();
+        assert!(
+            counts
+                .summary(source, &store)
+                .contains("audit_carrier_staged_unverified:1"),
+            "the staged transition is visible on the production durable_tail line"
+        );
+        assert_eq!(counts.ineligible.get("audit_carrier"), Some(&1));
+        assert_eq!(
+            counts.ineligible.get("audit_carrier_staged_unverified"),
+            Some(&1)
+        );
+        assert_eq!(counts.restored, 0);
+        assert_eq!(counts.restore_attempts, 0);
+        assert_eq!(counts.durable_held, [0; 5]);
+        let (_, cold, _) =
+            production_scan(&fixture, source, ScanIndex::default(), None, &namespace.0);
+        assert_eq!(production_body(source, scan), production_body(source, cold));
+        // No verified copy exists to replace the predecessor. Post-save GC must
+        // keep it despite a decided scope different from the reset record.
+        index.save(&index_path).unwrap();
+        let before = cache.durable_counters(source).unwrap().1.gc_records_read;
+        durable_after_save(&cache, &fixture.dir, source, &index);
+        assert!(cache.durable_counters(source).unwrap().1.gc_records_read > before);
+        assert_eq!(
+            fs::read(&record_path).unwrap(),
+            original,
+            "unverified entry keeps predecessor"
+        );
+        assert_eq!(
+            cache.durable_counters(source).unwrap().1.gc_records_deleted,
+            0
+        );
+        drop(cache);
+        let loaded = ScanIndex::load(&index_path).unwrap();
+        assert!(loaded.files[&key].has_unverified_source());
+        assert_eq!(loaded.files[&key].unverified_deadline(), Some(now));
+        // Repair only the synthetic terminal row; no manual record deletion.
+        let text = fs::read_to_string(&fixture.file.0)
+            .unwrap()
+            .lines()
+            .filter(|line| line.len() <= MAX_JSONL_LINE_BYTES)
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        fs::write(&fixture.file.0, text).unwrap();
+        let aged = (time::OffsetDateTime::now_utc()
+            + time::Duration::days(BACKFILL_WINDOW_DAYS as i64 + 1))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+        let restart = Arc::new(sampled_scan::SharedCache::default());
+        restart.durable_begin_pass(source, &index_path, &namespace, identity_capture);
+        let (mut verified, clean, modes, _) = production_scan_at(
+            &fixture,
+            source,
+            loaded,
+            Some(restart.clone()),
+            &namespace.0,
+            &aged,
+        );
+        let (clean, modes) = if modes == (0, 0, 0) {
+            assert!(
+                verified.traversal.is_none(),
+                "finish the already consumed census first"
+            );
+            assert_eq!(verified.files[&key].unverified_deadline(), Some(now));
+            assert_eq!(fs::read(&record_path).unwrap(), original);
+            let (next, clean, modes, _) = production_scan_at(
+                &fixture,
+                source,
+                verified,
+                Some(restart.clone()),
+                &namespace.0,
+                &aged,
+            );
+            verified = next;
+            (clean, modes)
+        } else {
+            (clean, modes)
+        };
+        assert_eq!(
+            modes,
+            (1, 0, 0),
+            "aged discovery selects the owed verified Full"
+        );
+        assert_eq!(clean.over_line_cap_count, 0);
+        assert!(!verified.files[&key].has_unverified_source());
+        assert_eq!(verified.files[&key].unverified_deadline(), None);
+        assert_eq!(
+            restart
+                .durable_counters(source)
+                .unwrap()
+                .0
+                .ineligible
+                .get("audit_carrier"),
+            None,
+            "the original recovered miss is counted once, not on audit retry"
+        );
+        // Verification and marker retirement are portable. Replacement needs
+        // native heap-layout support for retention, as in the clean-path test.
+        if crate::heap_layout_bound::layout_supported() {
+            verified.save(&index_path).unwrap();
+            let before = restart.durable_counters(source).unwrap().1.records_written;
+            durable_after_save(&restart, &fixture.dir, source, &verified);
+            assert_eq!(
+                restart.durable_counters(source).unwrap().1.records_written - before,
+                1
+            );
+            assert_ne!(fs::read(&record_path).unwrap(), original);
+            let mut disk =
+                store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+            let store::ReadOutcome::Found(record) = disk.read(&record_key) else {
+                panic!("verified Full must replace the old debt record");
+            };
+            assert_eq!(record.envelope_audit_debt, None);
+            // Verify the replacement can actually restore after restart;
+            // merely inspecting its envelope misses a capture-mode mismatch.
+            fixture.file.append(&usage(source, 170, 2, "fixture-model"));
+            let fresh = Arc::new(sampled_scan::SharedCache::default());
+            fresh.durable_begin_pass(source, &index_path, &namespace, identity_capture);
+            let loaded = ScanIndex::load(&index_path).unwrap();
+            let (_, warm, modes) = production_scan(
+                &fixture,
+                source,
+                loaded.clone(),
+                Some(fresh.clone()),
+                &namespace.0,
+            );
+            let (_, cold, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
+            assert_eq!(modes, (0, 1, 0), "verified replacement restart {source:?}");
+            assert_eq!(fresh.durable_counters(source).unwrap().0.restored, 1);
+            assert_eq!(production_body(source, warm), production_body(source, cold));
+        }
+    }
+}
+
+/// Import requires live account context; a future deadline clamps once before
+/// terminal settlement stages the existing marker. No foreign scheduling credit.
+#[cfg(unix)]
+#[test]
+fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
+    use crate::durable_tail_store as store;
+    use crate::transcript_acquisition::ReadPlan;
+    use std::io::Read;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for matching in [true, false] {
+            let fixture = ScanFixture::new(source);
+            fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+            let namespace = Scope("missing-carrier-terminal-loss".into());
+            let index_path = fixture.dir.join("index.json");
+            let lock = crate::locked_state_dir::test_locks::hold(&fixture.dir);
+            let key = local_index_key(&fixture.file.0);
+            let ds = sampled_scan::durable_tail::durable_source(source).unwrap();
+            let record_key = store::key_digest(ds, &key);
+            let now = unix_seconds(SystemTime::now()).unwrap();
+            let mut file = File::open(&fixture.file.0).unwrap();
+            let mut plan = ReadPlan::prepare(&mut file, None, &namespace, None, now).unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            plan.observe_complete_records(&bytes).unwrap();
+            let checkpoint = plan
+                .commit_after_native_completion(&file, &namespace, now)
+                .unwrap();
+            let mut certificate = checkpoint.durable_certificate(0).unwrap();
+            certificate.audit_debt_unix_seconds = Some(now + 600);
+            let mut disk =
+                store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+            let pending = store::PendingRecord {
+                binding: store::Binding {
+                    source: ds,
+                    key: record_key,
+                    context: store::context_digest(
+                        &namespace.0,
+                        Some(if matching {
+                            "live-account"
+                        } else {
+                            "foreign-account"
+                        }),
+                    ),
+                    scope: [0; 32],
+                    entry: [0; 32],
+                },
+                certificate,
+                body: durable_store_fixture_body(source, 0, 0),
+                allowlist: sampled_jsonl::durable::allowlist_digest(source),
+            };
+            assert_eq!(
+                disk.write_after_save(lock, 1, vec![pending])
+                    .unwrap()
+                    .written,
+                1
+            );
+            let record_path = fs::read_dir(store::store_dir_for_index(&index_path))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let original = fs::read(&record_path).unwrap();
+            assert!(
+                matches!(disk.read(&record_key), store::ReadOutcome::Found(r) if r.envelope_audit_debt.is_some())
+            );
+            drop(disk);
+            let cache = Arc::new(sampled_scan::SharedCache::default());
+            cache.durable_begin_pass(
+                source,
+                &index_path,
+                &namespace,
+                source == SnapshotSource::ClaudeCode,
+            );
+            begin_durable_pass(
+                &cache,
+                &fixture.dir,
+                source,
+                &index_path,
+                true,
+                &namespace,
+                source == SnapshotSource::ClaudeCode,
+            );
+            assert_eq!(
+                fs::read(&record_path).unwrap(),
+                original,
+                "fresh-index cleanup preserves missing debt carrier"
+            );
+
+            fixture.file.append(
+                &json!({"type":"ignored", "padding":"x".repeat(MAX_JSONL_LINE_BYTES + 1024)}),
+            );
+            fixture.file.append(&usage(source, 140, 1, "fixture-model"));
+            let live = ScanIndex {
+                active_upload_context_fingerprint: Some("live-account".into()),
+                ..ScanIndex::default()
+            };
+            let before = sampled_scan::now_seconds();
+            let (mut index, scan, modes) =
+                production_scan(&fixture, source, live, Some(cache.clone()), &namespace.0);
+            let after = sampled_scan::now_seconds();
+            assert_eq!(modes, (1, 0, 0));
+            assert!(scan.over_line_cap_count > 0);
+            assert!(!scan.snapshots.is_empty());
+            let (counts, _) = cache.durable_counters(source).unwrap();
+            assert_eq!(counts.restored, 0);
+            assert_eq!(counts.restore_attempts, 0);
+            assert_eq!(counts.durable_held, [0; 5]);
+            if matching {
+                assert!(index.files[&key].has_unverified_source());
+                let due = index.files[&key].unverified_deadline().unwrap();
+                assert!(
+                    (before..=after).contains(&due),
+                    "clamp to the recovery boundary's now"
+                );
+                assert!(due < now + 600, "the future envelope cannot postpone audit");
+                assert_eq!(counts.ineligible.get("audit_carrier"), Some(&1));
+                assert_eq!(
+                    counts.ineligible.get("audit_carrier_staged_unverified"),
+                    Some(&1)
+                );
+                let fingerprint = index.files[&key].source_file_fingerprint.clone();
+                assert!(index.stage_sampled_audit(
+                    &key,
+                    &fingerprint,
+                    crate::transcript_acquisition::AuditDebt {
+                        due_unix_seconds: now + 1200
+                    }
+                ));
+                assert_eq!(
+                    index.files[&key].unverified_deadline(),
+                    Some(due),
+                    "later offers cannot renew the clamped debt"
+                );
+                index.save(&index_path).unwrap();
+                assert_eq!(
+                    ScanIndex::load(&index_path).unwrap().files[&key].unverified_deadline(),
+                    Some(due)
+                );
+            } else {
+                assert!(
+                    !index.files[&key].has_unverified_source(),
+                    "foreign envelope contributes no obligation"
+                );
+                assert_eq!(index.files[&key].unverified_deadline(), None);
+                assert_eq!(counts.ineligible.get("audit_carrier"), None);
+                assert_eq!(
+                    counts.ineligible.get("audit_carrier_staged_unverified"),
+                    None
+                );
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -4346,7 +5498,7 @@ fn pi_h_keys_preserve_the_legacy_reducer_body() {
 
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_ram_tail_ignores_age_clock_and_audit_slot_pressure() {
+fn pi_ram_tail_ignores_age_and_clock_and_audit_cap_reads_full() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
     struct Reset;
     impl Drop for Reset {
@@ -4408,13 +5560,20 @@ fn pi_ram_tail_ignores_age_clock_and_audit_slot_pressure() {
                 },
             )
         });
-        assert_eq!(
-            modes,
-            (0, 1, 0),
-            "{label}: no AuditDue or ClockChanged Full"
-        );
-        assert_eq!(bytes.0, suffix, "only appended body bytes are consumed");
-        assert_eq!(counts.pi, 0);
+        if pending == 0 {
+            assert_eq!(
+                modes,
+                (0, 1, 0),
+                "{label}: no AuditDue or ClockChanged Full"
+            );
+            assert_eq!(bytes.0, suffix, "only appended body bytes are consumed");
+        } else {
+            // #870's shared audit cap: with no audit slot left, an unmarked
+            // change funds no new debt and reads Full instead of Tail.
+            assert_eq!(modes, (1, 0, 0), "{label}: cap Full, not Tail");
+            assert!(bytes.0 > suffix, "{label}: the whole file is read");
+        }
+        assert_eq!(counts.pi, 0, "{label}: a RAM copy existed; not the pi leaf");
         let (_, full, _) = production_scan(&fixture, source, quiet, None, label);
         assert_eq!(production_body(source, tail), production_body(source, full));
     }
@@ -4600,3 +5759,81 @@ fn pi_retention_refusal_is_cache_only_and_counts_bytes() {
 }
 
 mod codex_mcp_version_tests;
+
+#[test]
+fn rearm_full_cause_counts_native_bytes_without_changing_selection_or_uploads() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use rearm_cause::Cause;
+    let source = SnapshotSource::ClaudeCode;
+    for (cause, label) in [
+        (Cause::NoRetainedTraversal, "no_retained_traversal"),
+        (Cause::ContextChanged, "context_changed"),
+        (Cause::TerminalUnhealthyRetry, "terminal_unhealthy_retry"),
+        (Cause::CarryInvalidation, "carry_invalidation"),
+    ] {
+        let f = ScanFixture::new(source);
+        f.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (mut index, _, _) =
+            production_scan(&f, source, ScanIndex::default(), None, "rearm-cause");
+        let key = local_index_key(&f.file.0);
+        rearm_cause::retain(&index);
+        rearm_cause::clear(&key, index.files.get_mut(&key).unwrap(), cause);
+        // The actual sync path reloads an index between pages in one process.
+        let encoded = serde_json::to_vec(&index).unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("rearm_cleared"));
+        let loaded: ScanIndex = serde_json::from_slice(&encoded).unwrap();
+        let ((next, tagged, tagged_modes, tagged_bytes), records) =
+            crate::local_resource_diagnostics::capture(|| {
+                production_scan_with_metrics(
+                    &f,
+                    source,
+                    loaded.clone(),
+                    Some(Arc::new(sampled_scan::SharedCache::default())),
+                    "rearm-cause",
+                )
+            });
+        assert_eq!(tagged_modes, (1, 0, 0));
+        assert_eq!(tagged_bytes.0, fs::metadata(&f.file.0).unwrap().len());
+        let page = records
+            .iter()
+            .find(|row| row["stage"] == "native_collection_page")
+            .unwrap();
+        assert_eq!(
+            page["counts"]["sampled_acquisition"]["page_events"]["full_cause"],
+            json!({format!("rearm_cleared{{{label}}}"): {
+                "count": 1, "completed_native_bytes": tagged_bytes.0,
+            }})
+        );
+        // Completion consumed the process-local tag. Same cleared index,
+        // identical Full selection/read/body, with no clear-cause annotation.
+        let ((plain_next, plain, modes, bytes), records) =
+            crate::local_resource_diagnostics::capture(|| {
+                production_scan_with_metrics(
+                    &f,
+                    source,
+                    loaded,
+                    Some(Arc::new(sampled_scan::SharedCache::default())),
+                    "rearm-cause",
+                )
+            });
+        assert_eq!(modes, tagged_modes);
+        assert_eq!(bytes, tagged_bytes);
+        assert_eq!(
+            serde_json::to_value(next).unwrap(),
+            serde_json::to_value(plain_next).unwrap()
+        );
+        let tagged_body = production_body(source, tagged);
+        assert_eq!(tagged_body, production_body(source, plain));
+        let wire = tagged_body.to_string();
+        assert!(!wire.contains("full_cause") && !wire.contains("rearm_cleared"));
+        let page = records
+            .iter()
+            .find(|row| row["stage"] == "native_collection_page")
+            .unwrap();
+        assert!(page["counts"]["sampled_acquisition"]["page_events"]
+            .get("full_cause")
+            .is_none());
+    }
+}

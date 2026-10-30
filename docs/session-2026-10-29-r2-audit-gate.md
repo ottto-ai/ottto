@@ -94,3 +94,274 @@ requirements and pins ScopeObject as the sole refusal: a frozen read with growth
 and no H3c grant fails completion object revalidation. No local Cargo execution;
 E1 must rerun Linux, native macOS contracts and money, then obtain exact-head
 review. Prior money and review receipts do not qualify the new head.
+
+
+Round 7 pairs gate removal with bounded sampled-obligation retention. A complete
+`c` entry may retire only on an ordinary Unchanged read whose scope/object and
+checkpoint content stamp still match, with both <=4 KiB head/boundary samples
+and held-FD EOF/stamp revalidation. Native completion must remain complete,
+loss-free and sealed, and the replacement copy must be admitted. That produces a pending retirement. With a durable slot the index marker
+remains until the existing writer persists a debt-free record and a second
+index CAS clears the marker. Full verification time stays old,
+and source_verified, census and Full-audit credit still see the owed debt.
+Deferred/failed persistence remains owed on the older disk certificate; a disk
+retirement is asserted only after its writer receipt.
+
+At 256 marked entries, only an unmarked file needing fresh debt takes its native
+Full fallback (`audit_cap_full`); already-marked files still Tail, and quiet
+debt-free checkpoint reuse remains available. Existing/imported obligations are
+never evicted; positively proven absence may retire them without read credit. New prefix/lossy obligations without a slot
+are refused before publication and retained in the existing traversal retry queue
+with the age-window bypass. Quiet retirement releases capacity for the next
+committed scan, while this page reserves it against partial-save restoration.
+Central staging
+and prefix-marking checks enforce the cap, including unavailable Codex cohorts.
+`audit_quiet_retired` and `audit_cap_full` sit beside pending/overdue diagnostics;
+a positive cap count emits the local `sampled_audit_cap_alarm`.
+
+Prefix `p`, malformed/legacy tags, growing or changed files, partial/lossy reads,
+cursor fragments, failed samples/final revalidation and refused retention keep
+their obligation. No new representation, store/codec, proof rule, cap increase,
+Full cause enum or global sampling switch is introduced. Native/money CI and
+SOURCE/Lead B sign-off remain owner gates; no local Cargo execution.
+
+Round 8 excludes keys in `claude_account_deferred_holds` from quiet retirement
+and both `audit_cap_full` decisions. Their withheld-body retry remains owned by
+the account-hold path, with no double count against `withheld_reparse`.
+Checkpoint debt is retained; central marker admission still refuses marker 257.
+Fresh held markers also require a slot reserved before this scan, including
+ordinary debt, sealed prefixes and cursor fragments; a working retirement cannot
+fund them before a partial save restores the old obligation.
+After release, normal quiet validation and per-file cap policy resume. Held-key
+partial saves preserve the obligation; retirement still releases capacity only
+for the next scan of the committed index.
+
+The cap remains `CACHE_ENTRIES = 256`. Marker storage is at most 64 bytes per
+marked entry, so scheduling payload is at most 16,384 bytes (16 KiB) per index
+copy, within the existing 1 MiB marker-and-scratch reserve. This derived bound
+covers marker payload, not existing entry/key/map/receipt memory or daemon RSS.
+The existing cache count is reused without raising a resource limit. The
+`sampled_audit_cap_alarm` fires on the first cap event (`audit_cap_full > 0`),
+with no minimum event count or cooldown. Held quiet/release and saturated held
+retry fixtures complement the partial-save slot-reservation regression; native
+execution and fresh money/SOURCE/selection reviews remain owed.
+
+Round 10 preserves acquisition debt when account classification releases a hold
+AFTER scanning. With committed capacity it keeps the sampled marker; otherwise
+it queues the existing exact retry and clears the existing source fingerprint
+as an explicit reparse witness. That witness survives traversal resets and
+bypasses activity filtering, including for a quiet equal-size file. On its next
+nonheld visit the ordinary per-file cap policy applies; no marker 257 is minted
+and working retirements never refund a committed slot. Missing retained custody
+keeps a retry rather than implying that an obligation was discharged. This
+changes scheduling, not account attribution, accepted bodies or audit credit.
+
+Release pairing uses #865's debt-carrying writer, merged first on main; this
+branch merges main without rebasing. Required native cases exercise that writer:
+record-present quiet restart with zero Full, and the legacy index-saved/old-record
+crash window with at most one counted Full. Both changes ship in the same
+release; exact-head execution remains required before merge. The previous 0.1.201 map/default decoder
+contract is pinned for the ordinary identity written by marker retirement.
+
+Same-size interior rewrites (or truncate/regrow) completed before opening, with
+restored mtime and matching head/boundary samples, may retire stale scheduling
+debt: this is the existing #819/§13 same-stat forgery residual, not whole-content
+verification. No ctime-based reread or additional Full authority is introduced.
+
+The cap stays 256 and cap Full must stay exceptional. After release the release
+owner reports the highest pending-marker count observed on the M4 using existing
+diagnostics. A nonzero audit_cap_full in normal use requires named Ron approval
+or a cap redesign; never silently raise it. Exact-head Linux and macOS native
+fixtures must pass before merge; local Clippy compilation is not test execution.
+
+
+Round11 merges main after #865, preserving both appended-test sets in the two
+merge conflicts. Quiet retirement now keeps its scheduling marker through the
+first index save, writer deferral/error and restart. A pending RAM candidate
+contains only fixed key/fingerprint digests; the original marker is the durable
+obligation. Only a fully accounted successful #865 write/clean receipt permits
+a second index CAS to clear that marker. Its record carries no debt, and the
+old Full verification time stays unchanged. Dropping a stale RAM proof candidate
+never removes the marker; it must revalidate on its next visit. Index-new/record-old
+legacy crash recovery remains at most one counted Full on the next visit.
+
+Cap fallback now uses a separate fixed 256-slot RAM pace keyed by path digest,
+six hours by SystemTime. Backwards clocks and jumps beyond 30 days expire toward
+reading. At overflow it evicts the oldest stamp, enrolls the candidate and emits
+pace_evicted with its own immediate alarm. Within the pace it counts a delay,
+keeps committed size old and persists an age-bypassing retry. Already-marked
+files keep Tailing and held files remain excluded. Restart permits at most one
+extra cap Full per key. This table is to unify with P2's shared paced_full map at
+integration. A first read without an index entry uses its ordinary A1 path,
+without acquiring a cap label. Refused prefix/lossy output counts a delay, not
+a Full that never happened.
+
+The existing audit cap remains 256: each marker reserves at most 64 bytes,
+16384 bytes per index copy inside the existing 1 MiB audit/scratch reserve. The
+new pace and pending-retirement tables have 256 fixed inline slots with no
+copied paths/fingerprints; existing SharedCache/Arc/context size accounting
+charges their complete inline layouts, including empty slots.
+
+Absence uses E3/#876's exact proven_absent(Path, &[PathBuf]) seam: NotFound with
+both immediate parent and configured root readable. The bounded reconciliation
+path retires marked obligations and counts audit_retired_absent without Full,
+source or census credit. Unsafe ancestors/root permission uncertainty keep debt;
+round18 below strengthens the proof for a missing intermediate directory.
+Codex-protected entries keep their history; only audit scheduling ends. The
+account-hold carve-out has the same helper name and two call sites as #876;
+whichever lands second must retain both paths and the three-producer vanished
+diagnostic inventory. Reappearance after removal is an ordinary new-object
+FirstRead. #876's full withheld counter carrier is still an integration seam.
+
+New fixtures cover paced growth/expiry/backwards clock/overflow alarm, durable
+pre-writer crash/deferral/rename failure/receipt-before-index crash/legacy carrier
+mismatch, proven deletion/missing-parent/recreation and protected Codex retention.
+Synthetic acquisition clocks precede wall time so #865's deadline clamp cannot
+turn fixture timing into a carrier mismatch. Fixtures remain unexecuted until
+E1's exact-head Linux and one native macOS contracts run; only serialized local
+package Clippy is authorized here. Existing raw/finalized money equality stays.
+
+
+Round12 repairs the five Linux contract failures from round11. The dense native
+resource record keeps its existing 4 KiB limit: cap delays emit their exact count
+as sampled_audit_cap_delay on the existing carrier, while pace_evicted stays on
+its existing immediate alarm. The origin-unknown acquisition test checks its
+admission block rather than treating an unrelated pacing field as cache history.
+The deleted forced-member test now requires its proven-absent account hold to
+be released while retaining SOURCE N3 fingerprint incidence. #865's discarded
+envelope debt is explicitly absent from decoded checkpoints; live index debt
+still wins, remains due across Unchanged sampling and is never Full permission.
+The standalone acquisition fixture supplies that live debt at the prepare seam.
+Missing-entry and foreign-context write-only descriptor controls mirror P3;
+this branch already classified the same-context carrier before membership.
+
+The hardened absence predicate and helper are an exact round18 copy from E3's
+#876 while it is unmerged, to be replaced by #876's implementation at merge.
+Every parent below the configured root opens by no-follow openat; final
+fstatat(AT_SYMLINK_NOFOLLOW) must report precisely ENOENT; the pinned chain is
+revalidated. A missing intermediate component beneath a securely opened readable
+ancestor is positive absence. Intermediate/dangling links, non-directory or
+unreadable ancestors and missing/unreadable roots keep debt; non-Unix always
+returns false. This supersedes round11's immediate-parent-only predicate.
+The existing 4096-hold bound also limits the held-new absence inventory; omission
+from the index or observed set alone cannot release a hold. The account item
+stops reconciliation after retirement, preserving SOURCE N3 incidence. Request-
+census removal now counts through the same shared seam. Native cohort controls
+use non-directory unavailable ancestors, so no valid absence proof frees them.
+
+The new platform/held-new/missing-intermediate controls remain unexecuted until
+E1's exact-head Linux and supported-layout macOS contracts. Local Clippy compiles
+all targets but does not execute them. No version/field, money, proof, codec,
+allowlist, audit-cap value or Full admission rule changes in this round.
+
+
+Round14 repairs the two remaining Linux fixture expectations without changing
+production. A reset carrier still re-arms current-index scheduling debt before
+restoration, while a missing checkpoint selects StateMissing independently of
+that debt; the fixture now asserts both the read reason and the exact carried
+deadline, retaining its real clean-record replacement checks. Account-hold
+pruning now uses the same rooted-filesystem premises as the shared hardened
+absence helper: no proof root or a still-present file retains the hold, and
+actual deletion beneath a readable configured root permits release. Existing
+persistence, resolving-parse, partial-page and population-bound assertions stay.
+Local all-target Clippy is required; runtime qualification remains CI-only.
+
+Round15 gives cap delays durable custody through the existing empty source
+fingerprint witness. Both paced and unfunded completions preserve committed
+size and stay age-exempt even when a changed root configuration replaces the
+watcher queue. The production-scanner regression delays real growth, commits a
+partial subset, saves/reloads, advances beyond the activity window, adds a root
+and verifies counted catch-up with no lost entry or marker and cold Full body
+parity. A separate control serializes the retry without any traversal present.
+
+The hardened absence predicate matches the shared account-hold implementation;
+its diagnostic carriers do not. Both audit retirement and deleted-account-hold
+release currently emit temporary traversal-point counts. Integration with the
+shared diagnostics must preserve both carve-outs and replace those emitters
+without duplicate counts. No new persisted field or cap increase is introduced.
+
+Round16 pins the accepted temporary diagnostic contract through the actual
+deleted-account-hold scan: audit_retired_absent{events} and
+withheld_hold_released{deleted} each emit once, with the shared source/schema
+and count meaning, and neither emits on the next generation. Counting all
+records makes duplicate carriers fail the fixture. The temporary audit count
+now uses the same events object as the integrated diagnostics. Deleted-hold
+tokens remain unreported until shared withheld-account bookkeeping lands.
+Whichever implementation integrates second must unify onto one emitter per
+count and retain the exactly-once fixture; both retirement paths stay present.
+
+Round17 composes with main's rearm attribution, optional Codex header facts and
+development replay harness. Incidental telemetry-only Unchanged reads before
+the audit deadline preserve index and checkpoint debt exactly; only a due,
+eligible sampled quiet validation can retire it. Cap Full fallback keeps the
+ordinary frozen acquisition extent while existing prefix/marker refusals stay.
+Cap-delay clears use the shared rearm wrapper with the audit_cap_delay cause,
+attributing the later Full and completed native bytes without changing its
+read permission or persisted retry witness.
+
+The multi-file fixtures now seed the held key before arming its quiet sibling,
+and temporarily park the cohort control beneath an uncertain non-directory
+ancestor while building other cohorts. Original mode, marker-population,
+pacing, partial-save and Tail assertions remain. The partial-save regression
+retains its original quiet-before-growing order check. Optional header and
+decoder admission rules are unchanged. Local Clippy compiles all targets;
+runtime tests remain CI-only.
+
+
+Round18 captures one pinnable clock sample per selecting page and carries it
+through audit priority, candidate selection, adoption-only comparison and quiet
+retirement, including yields. The due-edge fixture moves the clock across the
+deadline after construction in both directions: selection and retirement must
+still agree, with no Full or verification-time credit.
+
+A provisionally retired quiet path stays in the existing deduplicated traversal
+queue with its original scan root. Partial-save reconciliation can restore the
+marker after consuming the path; a queued paced sibling must not strand that
+obligation until another traversal. A committed retirement makes the queued
+quiet visit skip without body reads. This queue entry is not a census member
+and grants no census credit. The original multi-pass partial-save fixture and
+its order assertions remain byte-identical. Exact-head native execution and a
+fresh money delta review are required; all-target Clippy is compilation only.
+
+
+Round19 passes the captured page clock into held-deadline restoration,
+held-slot preparation and grown-prefix held-debt classification. Constructor
+and attachment can straddle the due edge without spending a pre-due slot or
+postponing its original deadline. A native fixture crosses that edge before
+attachment in both directions, checks save/reload preserves the unspent turn,
+and checks free-slot restoration uses the captured time too. Certificate
+verification timestamps, cap pacing and frozen census age time stay separate.
+
+Integration must retain the age-aware selection API with the captured audit
+argument and the separate census clock/window. Held due-carry integration must
+keep the rescue key, both secure-open callbacks, the earliest due deadline and
+attempted only after successful open, while using the captured audit time in
+rescue and attachment. These are later-integrator obligations; the corresponding
+unmerged implementation is not imported here. The exact-root quiet retry and
+its original partial-save assertions remain unchanged.
+
+
+Round20 composes the merged held-audit due-carry and failed-open backoff with
+this page's captured clock. Rescue keeps its key and both secure-open callbacks;
+rescue classification and failed-open handling use the same audit_now as held
+preparation and selection. Earliest-due transfer, parking/eviction policy and
+attempted only after successful open remain unchanged. Diagnostic ages can use
+current time; they do not judge when a turn is due.
+
+A separate native fixture captures exactly at D, then rolls the live clock
+before D ahead of rescue: the owed native read still runs. Its failed-open arm
+jumps the live clock forward, dates backoff by captured D, saves/reloads the
+original unattempted D and retries successfully with another post-capture
+rollback. Earlier audit-gate fixture bodies and the exact-root quiet retry are
+unchanged. Future age-aware selection integration must still preserve its frozen
+census clock separately from captured audit time.
+
+
+Round21 merges current main with mechanical composition only. Durable store
+state keeps both the pending quiet-retirement receipts and the new restart-Full
+counter/alarm state, with their existing empty defaults. A failed post-save
+write counts its offered records and returns before any retirement receipt is
+accepted. Successful receipts still pass the unchanged complete-offer and
+budget/deferred-key checks before advancing quiet retirement. Captured audit
+time, the quiet due gate, exact-root partial-save retry and both held-audit
+open callbacks remain unchanged. No read, retirement or credit policy is added.

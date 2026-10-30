@@ -19,6 +19,8 @@ def output(args):
 
 
 PI_DURABLE_EXPECTED = False
+# Flip to True once the comparison base contains Pi-a (the release after Pi-a, or Pi-b2).
+PI_RAM_IN_BASE = False
 
 # Pi writes cross-build receipts even when the base has no durable Pi store.
 PI_FIXTURES = (
@@ -83,7 +85,7 @@ def main():
             env = dict(os.environ, CARGO_TARGET_DIR=str(root / f"{arm}-target"),
                        OTTTO_MONEY_EQUIVALENCE_ROOT=str(root / "inputs"),
                        OTTTO_MONEY_EQUIVALENCE_OUTPUT=str(receipts / arm),
-                       OTTTO_MONEY_EQUIVALENCE_PI_RAM_EXPECTED="1" if arm == "head" else "0")
+                       OTTTO_MONEY_EQUIVALENCE_PI_RAM_EXPECTED="1" if arm == "head" or PI_RAM_IN_BASE else "0")
             build = receipts / f"{arm}-build.jsonl"
             with build.open("w") as log:
                 command(["cargo", "test", "-p", "ottto-service", "--lib", "--locked",

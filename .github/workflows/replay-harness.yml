@@ -1,0 +1,87 @@
+name: Replay harness
+
+# Advisory synthetic output equivalence; Linux does not qualify native restore.
+on:
+  pull_request:
+    paths:
+      - "crates/ottto-service/src/snapshots*"
+      - "crates/ottto-service/src/snapshots*/**"
+      - "crates/ottto-service/src/snapshot_sync*"
+      - "crates/ottto-service/src/snapshot_sync*/**"
+      - "crates/ottto-service/src/durable_tail*"
+      - "crates/ottto-service/src/durable_tail*/**"
+      - "crates/ottto-service/src/transcript_*"
+      - "crates/ottto-service/src/transcript_*/**"
+      - "crates/ottto-service/src/replay*"
+      - "crates/ottto-service/src/replay*/**"
+      - "crates/ottto-service/src/agent_status_refresh.rs"
+      - "crates/ottto-service/src/local_resource_diagnostics*"
+      - "crates/ottto-service/src/local_resource_diagnostics*/**"
+      - "crates/ottto-service/src/main.rs"
+      - "crates/ottto-service/src/snapshot_client.rs"
+      - "crates/ottto-service/src/snapshot_roots.rs"
+      - "crates/ottto-service/tests/replay_harness*"
+      - "tools/replay_harness/**"
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain*"
+      - ".github/workflows/replay-harness.yml"
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: replay-harness-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  replay-harness:
+    name: Replay harness (Linux, advisory)
+    timeout-minutes: 35
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.95.0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Install system packages
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libsqlite3-dev zsh
+
+      - name: Private temp directory
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/tmp"
+          echo "TMPDIR=$RUNNER_TEMP/tmp" >> "$GITHUB_ENV"
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Compiler receipt
+        run: rustc -Vv && cargo -V
+
+      # PRs only restore. Schedules and dispatches may save on main only.
+      - name: Replay Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: replay-harness
+          workspaces: |
+            . -> target
+            crates -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Replay harness (feature)
+        run: |
+          replay_status=0
+          cargo test -p ottto-service --test replay_harness --features replay-harness --locked -- --nocapture || replay_status=$?
+          cargo test -p ottto-service --lib --features replay-harness --locked snapshot_sync::replay_harness::oracle_tests -- --nocapture || replay_status=$?
+          exit "$replay_status"

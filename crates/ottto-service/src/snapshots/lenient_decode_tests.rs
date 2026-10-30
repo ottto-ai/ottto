@@ -2038,6 +2038,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
             "claude_desktop_census_witness" => {
                 serde_json::json!({"completed_at_unix_seconds":1,"process_id":1,"inventory":"inventory"})
             }
+            "claude_desktop_store_inventory" => serde_json::json!("a".repeat(64)),
             "accepted_rebuild_incidence" => {
                 serde_json::json!({"/synthetic/carried.jsonl":["a".repeat(64)]})
             }
@@ -2131,15 +2132,20 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
     let current = serde_json::to_value(&seed).unwrap();
     let fields = lenient_decode::FIELDS;
     assert_eq!(
-        &fields[fields.len() - 3..],
+        &fields[fields.len() - 4..],
         &[
             "upload_ack_retirement_handoff",
             "held_audit_progress",
             "claude_money_birth_store",
+            "claude_desktop_store_inventory",
         ]
     );
     for earlier_e2 in [false, true] {
         let mut legacy = current.clone();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("claude_desktop_store_inventory");
         legacy.as_object_mut().unwrap().remove(if earlier_e2 {
             "held_audit_progress"
         } else {
@@ -2150,7 +2156,7 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
             // The main positional schema ends at audit progress; appending E2
             // must leave every already-shipped position intact.
             forms.push(Value::Array(
-                fields[..fields.len() - 1]
+                fields[..fields.len() - 2]
                     .iter()
                     .map(|name| legacy[*name].clone())
                     .collect(),
@@ -2171,6 +2177,29 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
                     "legacy writer earlier_e2={earlier_e2}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn desktop_inventory_keeps_existing_positional_index_slots() {
+    let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
+    let mut legacy = current.clone();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("claude_desktop_store_inventory");
+    let fields = lenient_decode::FIELDS;
+    assert_eq!(fields.last(), Some(&"claude_desktop_store_inventory"));
+    for (expected, slots) in [(&legacy, &fields[..fields.len() - 1]), (&current, fields)] {
+        let array = Value::Array(slots.iter().map(|name| expected[*name].clone()).collect());
+        let bytes = serde_json::to_vec(&array).unwrap();
+        let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+        let streaming =
+            lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+        let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+        for decoded in [native, streaming, bounded] {
+            assert_eq!(serde_json::to_value(decoded).unwrap(), *expected);
         }
     }
 }
@@ -4716,5 +4745,64 @@ fn retired_reread_new_writer_keeps_previous_default_contract() {
     assert_eq!(
         serde_json::to_vec(&old.claude_request_census).unwrap(),
         serde_json::to_vec(&seed.claude_request_census).unwrap()
+    );
+}
+
+/// Pin the previous 0.1.201 map/default entry contract cited by
+/// retired_reread_new_writer_keeps_previous_default_contract. Quiet retirement
+/// writes the existing plain identity, not an unknown field or marker shape.
+#[test]
+fn quiet_retired_index_loads_under_previous_entry_defaults() {
+    #[derive(Default, serde::Deserialize)]
+    #[serde(default)]
+    struct PreviousEntry {
+        size_bytes: u64,
+        modified_unix_seconds: u64,
+        source_file_fingerprint: String,
+        last_snapshot_fingerprint: Option<String>,
+        scan_identity_version: Option<String>,
+    }
+    #[derive(Default, serde::Deserialize)]
+    #[serde(default)]
+    struct PreviousIndex {
+        schema_version: u16,
+        files: BTreeMap<String, PreviousEntry>,
+    }
+    let mut index = fixture();
+    let key = "/synthetic/0.jsonl";
+    let before = index.files[key].clone();
+    assert!(index.stage_sampled_audit(
+        key,
+        &before.source_file_fingerprint,
+        crate::transcript_acquisition::AuditDebt {
+            due_unix_seconds: 100
+        }
+    ));
+    assert!(index.retire_quiet_audit(key, &before.source_file_fingerprint));
+    let scratch = crate::test_scratch::ScratchDir::new("retired-previous-index");
+    let path = scratch.join("index.json");
+    index.save(&path).unwrap();
+    let old: PreviousIndex = serde_json::from_slice(&fs::read(&path).unwrap())
+        .expect("previous default map decoder accepts cleared marker");
+    assert_eq!(old.schema_version, SCAN_INDEX_SCHEMA_VERSION);
+    assert_eq!(old.files.len(), index.files.len());
+    let entry = &old.files[key];
+    assert_eq!(
+        entry.scan_identity_version.as_deref(),
+        Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+    );
+    assert_eq!(entry.size_bytes, before.size_bytes);
+    assert_eq!(entry.modified_unix_seconds, before.modified_unix_seconds);
+    assert_eq!(
+        entry.source_file_fingerprint,
+        before.source_file_fingerprint
+    );
+    assert_eq!(
+        entry.last_snapshot_fingerprint,
+        before.last_snapshot_fingerprint
+    );
+    assert_eq!(
+        ScanIndex::load(&path).unwrap().files[key].unverified_deadline(),
+        None
     );
 }

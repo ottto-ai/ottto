@@ -12,6 +12,7 @@ pub(crate) mod claude_contract;
 pub(crate) mod claude_reread;
 pub(crate) mod codex_memo_lifecycle;
 pub(crate) mod codex_side_lifecycle;
+pub(crate) mod rearm_cause;
 
 /// Closed, content-free refusal labels; cumulative process counters on #799.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -40,8 +41,12 @@ pub(crate) enum CodexZstCause {
     CompatibilityUnfunded,
     #[serde(rename = "CompressedAdmissionRefused")]
     AdmissionRefused,
+    // Subset of decoder refusals: the unchanged free-only floor would fit
+    // without optional header entries. Attempts, not files or lost usage.
+    #[serde(rename = "decoder_refused_header_occupancy")]
+    DecoderRefusedHeaderOccupancy,
 }
-const CODEX_ZST_CAUSES: usize = CodexZstCause::AdmissionRefused as usize + 1;
+const CODEX_ZST_CAUSES: usize = CodexZstCause::DecoderRefusedHeaderOccupancy as usize + 1;
 static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
     [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 
@@ -58,6 +63,34 @@ pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
             BTreeMap::from([(cause, previous.saturating_add(1))]),
         )]),
     );
+}
+
+/// Per-pass observations, not distinct entries/files or a lifetime counter.
+pub(crate) fn codex_state_only_ambiguous_identity(observations: u64, tokens: u64) {
+    if observations > 0 {
+        traversal_point(
+            "codex_state_only_ambiguous_identity",
+            "codex",
+            &BTreeMap::from([
+                ("codex_state_only_ambiguous_identity", observations),
+                ("codex_state_only_ambiguous_identity_tokens", tokens),
+            ]),
+        );
+    }
+}
+
+/// One terminal append call, before later policy/no-op suppression; never wire data.
+pub(crate) fn codex_state_only(scanned: usize, emitted: usize, noops: usize) {
+    if scanned != 0 || emitted != 0 || noops != 0 {
+        traversal_point(
+            "codex_state_only",
+            "codex",
+            &BTreeMap::from([(
+                "codex_state_only",
+                BTreeMap::from([("scanned", scanned), ("emitted", emitted), ("noops", noops)]),
+            )]),
+        );
+    }
 }
 
 /// Nonzero-only counters on the existing native_collection_page line.
@@ -158,6 +191,16 @@ fn line_unselected(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u6
 /// One skip decision, recorded after the gate decided; never a gate input.
 pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
     line_unselected(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
+}
+
+// Same public seam as E3/#876. Its merged withheld carrier can keep this
+// signature; this branch emits the count on the existing diagnostics carrier.
+pub(crate) fn audit_retired_absent(source: &str) {
+    traversal_point(
+        "audit_retired_absent",
+        source,
+        &serde_json::json!({"audit_retired_absent": {"events": 1}}),
+    );
 }
 
 const SCHEMA_VERSION: u8 = 2;
@@ -363,8 +406,33 @@ pub(crate) struct Probe {
     pub(crate) page_events: claude_reread::Counts,
     pub(crate) full_causes: FullCauses,
     pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
+    #[cfg(feature = "replay-harness")]
+    index_reuse_skips: std::cell::Cell<u64>,
+}
+impl Drop for Probe {
+    fn drop(&mut self) {
+        rearm_cause::finish_page(self.started);
+    }
 }
 impl Probe {
+    pub(crate) fn rearm_full_selected(
+        &self,
+        key: &str,
+        mode: crate::transcript_acquisition::ReadMode,
+    ) {
+        rearm_cause::selected(self.started, key, mode);
+    }
+    pub(crate) fn rearm_full_completed(
+        &self,
+        key: &str,
+        mode: crate::transcript_acquisition::ReadMode,
+        bytes: u64,
+    ) {
+        rearm_cause::completed(self.started, key, mode, bytes);
+    }
+    pub(crate) fn rearm_fulls(&self) -> rearm_cause::Counts {
+        rearm_cause::page(self.started)
+    }
     pub(crate) fn start() -> Self {
         Self {
             started: Instant::now(),
@@ -372,7 +440,14 @@ impl Probe {
             page_events: Default::default(),
             full_causes: Default::default(),
             line_delivery: None,
+            #[cfg(feature = "replay-harness")]
+            index_reuse_skips: std::cell::Cell::new(0),
         }
+    }
+    #[cfg(feature = "replay-harness")]
+    pub(crate) fn index_reuse_skip(&self) {
+        self.index_reuse_skips
+            .set(self.index_reuse_skips.get().saturating_add(1));
     }
     fn observation(&self) -> Observation {
         Observation::between(
@@ -395,6 +470,8 @@ impl Probe {
         struct Counts {
             #[serde(flatten)]
             collection: CollectionCounts,
+            #[cfg(feature = "replay-harness")]
+            index_reuse_skips: u64,
             #[serde(flatten)]
             pending: Option<ClaudeAccountRetainedPending>,
             #[serde(flatten)]
@@ -412,6 +489,8 @@ impl Probe {
         }
         let claude = source == "claude_code";
         let counts = Counts {
+            #[cfg(feature = "replay-harness")]
+            index_reuse_skips: self.index_reuse_skips.replace(0),
             line_delivery: self
                 .line_delivery
                 .filter(|(_, counts)| *counts != LineDeliveryCounts::default())
@@ -490,6 +569,8 @@ pub(crate) struct ClaudeAccountRetainedPending {
     pub(crate) claude_account_retained_pending_families: usize,
     /// Pretty JSON bytes of the retained field, including its field wrapper.
     pub(crate) claude_account_retained_pending_bytes: u64,
+    #[serde(flatten)]
+    pub(crate) retention: crate::snapshots::account_pending_retention::Counts,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for Probe {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
@@ -528,12 +609,29 @@ impl Observation {
     }
 }
 
+// Final upload candidates compared with their retained accepted bodies on this worker.
+// Drained by the existing finish record; no identifiers reach the log.
+thread_local! {
+    static ACCOUNT_HASH_CHANGED: std::cell::RefCell<std::collections::BTreeSet<String>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+pub(crate) fn account_hash_changed(session_key: &str) {
+    ACCOUNT_HASH_CHANGED.with(|sessions| {
+        sessions.borrow_mut().insert(session_key.to_string());
+    });
+}
+
 /// Observe only a normally returned finish; move its value/error through unchanged.
 /// A panic drops the probe silently. Outcome reporting remains with the caller.
 pub(crate) fn source_finish<T>(
     source: &str,
     inner: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    #[derive(Serialize)]
+    struct Counts {
+        account_hash_changed: u64,
+    }
+    ACCOUNT_HASH_CHANGED.with(|sessions| sessions.borrow_mut().clear());
     let probe = Probe::start();
     let result = inner();
     emit(&Record {
@@ -542,7 +640,13 @@ pub(crate) fn source_finish<T>(
         stage: "source_finish",
         source: Source::from_slug(source),
         observation: probe.observation(),
-        counts: EmptyCounts {},
+        counts: Counts {
+            account_hash_changed: ACCOUNT_HASH_CHANGED.with(|sessions| {
+                let count = sessions.borrow().len() as u64;
+                sessions.borrow_mut().clear();
+                count
+            }),
+        },
     });
     result
 }
@@ -585,9 +689,6 @@ pub(crate) fn codex_census_fence(
     });
 }
 
-#[derive(Serialize)]
-struct EmptyCounts {}
-
 /// Fixed-schema traversal decisions only; no CPU/RSS sample or wire event.
 pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {
     traversal_point("bounded_traversal_transition", source, counts);
@@ -618,6 +719,12 @@ pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) 
         "claude_code",
         counts,
     );
+}
+/// Local alarm, once per park: a held Claude key's progress audit failed its
+/// secure open 8 times in a row and is parked, its audit debt still owed.
+/// Counts only; no path, id or wire event.
+pub(crate) fn claude_held_audit_open_parked(counts: &impl Serialize) {
+    traversal_point("claude_held_audit_open_parked", "claude_code", counts);
 }
 /// Local alarm, at most hourly: a complete Claude terminal kept the retired
 /// family tombstone uncertainty fence up, because more absent witnessed roots
@@ -724,6 +831,21 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
 /// disabled store, as [since last, total] counts. No path, id or wire event.
 pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {
     traversal_point("durable_tail_alarm", source, counts);
+}
+/// At most once per 24 h while restart Fulls caused by a failed store write persist.
+pub(crate) fn durable_tail_restart_full_alarm(source: &str, counts: &impl Serialize) {
+    traversal_point("durable_tail_restart_full_alarm", source, counts);
+}
+pub(crate) fn codex_continuation(held: Option<&'static str>) {
+    let counts = serde_json::json!({
+        "continuation_pages_run": u8::from(held.is_none()),
+        "continuation_held": held.map(|reason| BTreeMap::from([(reason, 1u8)])).unwrap_or_default(),
+    });
+    traversal_point("codex_continuation", "codex", &counts);
+}
+pub(crate) fn codex_continuation_mint(outcome: &'static str) {
+    let counts = serde_json::json!({"continuation_mint": BTreeMap::from([(outcome, 1u8)])});
+    traversal_point("codex_continuation_mint", "codex", &counts);
 }
 pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
     emit(&Record {
@@ -1131,6 +1253,8 @@ pub(crate) fn sampled_audit_comparison(
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct PageEvents {
+    #[serde(skip_serializing_if = "rearm_cause::Counts::is_empty")]
+    pub(crate) full_cause: rearm_cause::Counts,
     pub(crate) full_reasons: FullReasons,
     pub(crate) priority_full_replays: usize,
     pub(crate) audits_started: usize,
@@ -1140,6 +1264,8 @@ pub(crate) struct PageEvents {
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct IndexState {
+    pub(crate) audit_quiet_retired: usize,
+    pub(crate) audit_cap_full: usize,
     pub(crate) pending_audits: usize,
     pub(crate) overdue_audits: usize,
     pub(crate) oldest_due_age_seconds: u64,
@@ -1240,7 +1366,7 @@ struct Record<T: Serialize> {
 }
 fn emit(record: &impl Serialize) {
     if let Ok(json) = serde_json::to_string(record) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "replay-harness"))]
         if TEST_OUTPUT.with(|output| {
             if let Some(output) = output.borrow_mut().as_mut() {
                 output.push(json.clone());
@@ -1260,11 +1386,11 @@ fn write_line(json: &str, writer: &mut impl Write) {
     let _ = writeln!(writer, "ottto-service: local_resources {json}");
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "replay-harness"))]
 thread_local! {
     static TEST_OUTPUT: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "replay-harness"))]
 pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
     struct Reset;
     impl Drop for Reset {
@@ -1306,8 +1432,13 @@ mod tests {
             HeaderUnfunded,
             CompatibilityUnfunded,
             AdmissionRefused,
+            DecoderRefusedHeaderOccupancy,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
+        assert_eq!(
+            serde_json::to_value(DecoderRefusedHeaderOccupancy).unwrap(),
+            "decoder_refused_header_occupancy"
+        );
         for (index, cause) in ALL.iter().enumerate() {
             assert_eq!(*cause as usize, index);
         }
@@ -1547,6 +1678,7 @@ mod tests {
                 prepare_failed: usize::MAX,
             },
             page_events: PageEvents {
+                full_cause: Default::default(),
                 full_reasons: FullReasons([usize::MAX / 11; 11]),
                 priority_full_replays: usize::MAX,
                 audits_started: usize::MAX,
@@ -1555,6 +1687,8 @@ mod tests {
                 max_completion_overdue_seconds: u64::MAX,
             },
             index_state_at_page_end: IndexState {
+                audit_quiet_retired: usize::MAX,
+                audit_cap_full: usize::MAX,
                 pending_audits: usize::MAX,
                 overdue_audits: usize::MAX,
                 oldest_due_age_seconds: u64::MAX,
@@ -1610,7 +1744,10 @@ mod tests {
         assert_eq!(record["schema_version"], SCHEMA_VERSION);
         assert_eq!(record["stage"], "source_finish");
         assert_eq!(record["source"], source);
-        assert_eq!(record["counts"], serde_json::json!({}));
+        assert_eq!(
+            record["counts"],
+            serde_json::json!({"account_hash_changed": 0})
+        );
         assert!(record.get("result").is_none());
         println!("RESOURCE_V2_FINISH_FIXTURE {record}");
     }
@@ -2347,6 +2484,70 @@ mod tests {
             assert!(!text.contains("secret/path"));
             assert!(!text.contains("cycle_peak"));
             assert_eq!(record["schema_version"], SCHEMA_VERSION);
+        }
+    }
+}
+#[cfg(test)]
+mod continuation_tests {
+    #[test]
+    fn continuation_mint_counts_have_closed_fixed_keys() {
+        let outcomes = [
+            "minted",
+            "inventory_incomplete",
+            "groups_completed",
+            "no_remaining",
+            "over_bound",
+        ];
+        let (_, rows) = super::capture(|| {
+            for outcome in outcomes {
+                super::codex_continuation_mint(outcome);
+            }
+        });
+        assert_eq!(rows.len(), outcomes.len());
+        for (row, outcome) in rows.iter().zip(outcomes) {
+            assert_eq!(row["stage"], "codex_continuation_mint");
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["source"], "codex");
+            assert_eq!(
+                row["counts"],
+                serde_json::json!({"continuation_mint":{outcome:1}})
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_counts_use_fixed_point_schema() {
+        let (_, rows) = super::capture(|| {
+            super::codex_continuation(None);
+            for cause in [
+                "roster_changed",
+                "context_changed",
+                "policy_changed",
+                "group_job",
+                "other",
+            ] {
+                super::codex_continuation(Some(cause));
+            }
+        });
+        assert_eq!(rows.len(), 6);
+        assert_eq!(rows[0]["counts"]["continuation_pages_run"], 1);
+        assert_eq!(
+            rows[0]["counts"]["continuation_held"],
+            serde_json::json!({})
+        );
+        for row in rows {
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["source"], "codex");
+            assert_eq!(row["stage"], "codex_continuation");
+            assert!(row["observation"]["shared_process_cpu_delta_us"].is_null());
+            assert_eq!(row["counts"].as_object().unwrap().len(), 2);
+            assert!(
+                row["counts"]["continuation_held"]
+                    .as_object()
+                    .unwrap()
+                    .len()
+                    <= 1
+            );
         }
     }
 }

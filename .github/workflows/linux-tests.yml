@@ -1,12 +1,15 @@
 name: Linux tests
 
-# Early, free signal for the portable test surface. macOS "Rust contracts" in
-# ci.yml stays the authority: it owns clippy, layout coverage, and native
-# behavior. A green Linux run is never merge evidence on its own.
+# Early, free signal for portable tests and clippy. macOS "Rust contracts" in
+# ci.yml stays authoritative for macOS-only cfg code, layout coverage, and
+# native behavior. A green Linux run is never merge evidence on its own.
 
 on:
   pull_request:
   workflow_dispatch:
+  # Daily main run that refreshes the shared Linux cache; PR refs only restore.
+  schedule:
+    - cron: "0 4 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -68,21 +71,27 @@ jobs:
           echo "TMPDIR=$RUNNER_TEMP/tmp" >> "$GITHUB_ENV"
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
 
       - name: Compiler receipt
         run: rustc -Vv && cargo -V
 
-      # Pull request caches are scoped to their own merge ref, so a PR cannot
-      # seed another PR's restore. Fork PRs never save.
+      # Only main saves. A save per PR merge ref (~331 MB each) filled the 10 GB
+      # repo cache and evicted the macOS main cache. PRs restore main's entry.
       - name: Rust cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: linux-tests
           workspaces: |
             . -> target
-            crates -> crates/target
-          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+            crates -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Runtime clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Connector clippy
+        run: cargo clippy --manifest-path crates/Cargo.toml --workspace --all-targets --locked -- -D warnings
 
       - name: Runtime tests
         # Print a failing assertion when it happens, not only after the suite.

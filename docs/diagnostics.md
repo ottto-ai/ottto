@@ -80,9 +80,11 @@ Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
 full/tail/unchanged selection counts describe acquisition decisions, including
 repeated or subsequently failed plans; they are not distinct file counts.
-`completed_native_bytes` and `completed_guard_bytes` count only completed
-sampled JSONL read plans. Failed reads, joined-file replay, discovery, headers,
-sidecars and independent identity reads are excluded. Zero here does not prove
+`completed_native_bytes` counts completed sampled JSONL read plans.
+`completed_guard_bytes` also includes actual returned head/boundary bytes from
+quiet-retirement validation attempts, including attempts that keep their debt.
+Other failed reads, joined-file replay, discovery, headers, sidecars and
+independent identity reads are excluded. Zero here does not prove
 zero filesystem work. Collection timing covers native initialization and steps,
 including time parked between steps, and ends before post-policy finalization
 and upload. A capped/partial page is still a completed page.
@@ -95,8 +97,59 @@ Their sum equals `full_selections`. It also records `priority_full_replays`,
 `audits_started`, `audits_completed`, `max_start_overdue_seconds` and
 `max_completion_overdue_seconds`. Separate `index_state_at_page_end` gauges
 record `pending_audits`, `overdue_audits` and `oldest_due_age_seconds` using the
-existing index calculations. These are state, not events; overdue work remains
-owed until full verification. Both objects are absent when sampling is null.
+existing index calculations. These three fields are state gauges. The same
+object adds page-event counts `audit_quiet_retired` and `audit_cap_full`.
+To keep the existing native page under its 4 KiB budget, `audit_cap_delay`
+emits a separate nonzero-only `sampled_audit_cap_delay` record on this carrier;
+`pace_evicted` is emitted by `sampled_audit_pace_alarm`. Values remain exact.
+Full counts actual per-file cap fallbacks; refused prefix/lossy completions and
+paced candidates count as delays. The RAM
+pace is six hours per key, 256 fixed slots, oldest-evicted on overflow. Its
+SystemTime clock expires on backwards time or jumps beyond 30 days. A restart
+allows at most one extra cap Full per key. Existing marked Tails stay enabled.
+A positive Full count emits `sampled_audit_cap_alarm` immediately (`> 0`);
+positive `pace_evicted` emits its own `sampled_audit_pace_alarm` immediately.
+Delayed paths keep their committed size and clear the existing source
+fingerprint as a durable reparse witness. It remains age-exempt across partial
+saves, restarts and context-changing traversal replacements; the watcher queue
+alone is not its custody.
+The clear uses the process-local rearm wrapper: a later Full reports
+`rearm_cleared{audit_cap_delay}` with its count and completed native bytes.
+That tag survives an index reload in the same process; a process restart loses
+the diagnostic tag while retaining the persisted retry witness.
+
+Due complete-c quiet retirement requires both samples, stable EOF/stamp and native
+completion/RAM admission. With an active durable store the scheduling marker
+remains until the same writer durably stores no debt and a second index CAS
+clears the marker. The existing diagnostics carrier then emits
+`sampled_audit_retirement` with `audit_quiet_retired` and `pending_audits`.
+The page's retirement count is zero while that receipt remains outstanding.
+Writer errors, skipped records and deferrals keep the obligation scheduled.
+Freed slots become usable on the next committed scan; the current page reserves
+them because partial-save reconciliation can restore an unacknowledged marker.
+Quiet retirement keeps the old Full verification time and grants no
+`audits_completed`, source, census or ACK credit.
+Before the deadline, incidental telemetry-only Unchanged reuse keeps the exact
+index and checkpoint debt. A cap Full keeps its frozen acquisition extent even
+though it cannot sample; independent grown-prefix/marker refusals still apply.
+
+`audit_retired_absent{events}` counts an obligation retired on positively proven absence:
+ENOENT on a no-follow descriptor chain from a readable configured root.
+A missing intermediate directory counts only beneath the nearest securely
+opened readable ancestor; all pinned directories are revalidated. Symlinks,
+dangling links, unreadable/missing roots and other errors keep it owed. Codex-protected history
+remains retained; this counter grants no Full or source/census credit. Account
+removal also emits `withheld_hold_released{deleted}`. Ordinary unavailable audit
+markers are never evicted.
+The absence predicate is shared with the hardened account-hold proof. The
+`audit_retired_absent` and deleted-hold counts currently use temporary traversal
+point carriers; integration must replace them with the shared account/absence
+diagnostics, preserving both retirement paths without double counting.
+Both keys and their count meanings are shared with the integrated diagnostics.
+Deleted-hold tokens aren't reported until the shared withheld-account
+bookkeeping lands. Whichever change integrates second must use one emitter for
+each count; the deletion fixture pins one emission per key, then none on retry.
+The sampled acquisition objects are absent when sampling is null.
 
 Additive version 2 Claude counts on the existing page/check-in carrier classify
 refused census-member NotFounds by the **existing immediate-parent metadata
@@ -113,6 +166,43 @@ scope. A live non-symlink parent still authorizes removal and adds no refusal
 count. Codex/Pi, watcher hints and nonmember candidate losses add none. No new
 filesystem probe, event stream, path/key/name output or authority decision is
 introduced; diagnostics only, no behaviour change.
+
+The `codex_continuation` stage uses the same version 2 `local_resources`
+point carrier, with source `codex` and no CPU/RSS measurement. Each admission
+record has `continuation_pages_run` (1 when a prepared page enters the scan
+step loop, otherwise 0) and a sparse `continuation_held` object whose single
+nonzero count is 1. Its closed reason keys are `roster_changed`,
+`context_changed`, `policy_changed`, `group_job`, and `other`. Sum these point
+counts over the desired window; they are not persisted process totals.
+
+Roster/context/policy holds occur before prepare or transcript reads. Context
+wins if both context and policy changed; missing carried evidence, prepare
+errors/refusals and step-admission refusals use `other`. Group refusals are
+counted at resume or when a group would otherwise mint (exhausted cursor
+budget and accelerated), before taking the job. Ordinary ineligible group
+pauses add no continuation hold. A stepped page can
+later produce an additional hold record; the two counters are not exclusive.
+Timer wakes without a ready page and platform/QoS skips are outside these scan
+admission counts. No path, session id, digest, error text or transcript content
+is included, and the counts grant no authority.
+
+The `codex_continuation_mint` stage uses the same point carrier and source,
+with one sparse `continuation_mint` count: `minted`, `inventory_incomplete`,
+`groups_completed`, `no_remaining`, or `over_bound`. Each record counts one
+mint decision for a paused, accelerated ticket candidate. Completed joins take
+precedence over incomplete/missing inventory. With valid evidence, missing
+rotation allowance is `no_remaining`; unknown/over-limit retained layout is
+`over_bound`; `minted` means inputs were admitted, before ordinary finish,
+contention and cadence may still discard the candidate. These counters grant
+no authority and do not imply a continuation page ran. No raw ticket means no
+mint decision; authority/lifetime refusals remain outside these five outcomes.
+
+The inventory check performs at most one `lstat` per carried rollout path
+(up to 32,768), stopping on the first mismatch. It includes ledger parents and
+the held file. Any changed rollout holds continuation, so active Codex sessions
+usually leave it idle. Additions wait for the ordinary census; an EOF park that
+cannot fit becomes strict StateBound debt for the ordinary pass to disclose,
+keeping the prior body rather than emitting a zero replacement.
 
 A `source_finish` record wraps rotation finish, including its validation,
 post-policy finalization and upload work. It exists exactly when finish was
@@ -163,8 +253,8 @@ calling these measurements installed evidence.
 
 A `durable_tail_alarm` record (schema 2 additive) follows a post-save pass
 whose durable-store counts for that source changed. Each count is
-`[since the last alarm, process total]`: `held_keys` (files held because their
-record has an unknown or newer format), `t14_rebuild` (known corrupt records
+`[since the last alarm, process total]`: `held_keys` (unknown, newer,
+undecodable or unbindable records), `t14_rebuild` (known corrupt records
 read Full once and replaced after the save) and `mode_repaired` (store
 directory or records restored to owner-only). `store_disabled` appears once,
 with `foreign_owner`, `not_directory`, `mode_unrepairable` or `t14_breaker`
@@ -173,6 +263,98 @@ memory-only for the process. While a key is held, its source's census stays
 retryable (red) for the whole hold, so census close, retirement and
 account-family proof wait for that source; a held key is not yet terminal
 disclosed residue.
+
+The `durable_tail` line also carries `store_write_after_save_failed[files]`
+(records offered to a post-save batch that returned an error; the store keeps
+their predecessors) and **`store_write_failed_restart_full[files,bytes]`
+(upper bound)**: Fulls whose restore refused the record as
+`ineligible.entry_changed`, with the completed native bytes those Fulls read.
+It is not an exact count of write failures. It reuses the existing
+`entry_changed` refusal, and no persisted marker records that a write failed,
+so it also counts a record that was never offered (deferred or evicted before
+the write) and any RAM-miss restore of such a record. Both are process totals.
+On the first counted file in a process, a `durable_tail_restart_full_alarm`
+record (`store_write_failed_restart_full` `[files, bytes]` and the
+write-failure total) is emitted at once, then at most once per 24 h in that
+process; a restarted process alarms again on its own first file. The counter
+remains the persistent signal. The mark and the alarm time are RAM-only;
+nothing is persisted.
+
+An absent record is a restore `missing` outcome and keeps the existing Full
+admission; it is not a held key. There is no `upgrade_state_missing` counter or
+alarm in this format-1 bootstrap. Audit deadlines remain owned by the index,
+and the v1 writer takes compatibility debt from the current committed index at
+write time, including after a restore dropped the envelope field. Unknown debt
+tags, absent-with-nonzero deadlines and present-with-zero deadlines are
+`unbindable` holds, preserved byte for byte. A debt-bearing record whose index
+entry is absent is a miss counted once by the common acquisition guard as
+`ineligible.audit_carrier`, including when sampling admission skips restore.
+It does not increment `durable_held` or the held-key alarm. The guard uses the
+already classified store header and adds no read. The old reduction is never
+restored as audit-clean: normal acquisition reads Full. The validated envelope
+deadline travels with that acquisition independently of sampling admission.
+Import requires the record's binding context to equal the live namespace/account
+digest and clamps the deadline once to min(envelope due, recovery time). Foreign
+contexts and malformed/unknown records supply no deadline. A direct restore
+carrier check likewise cannot import a foreign context's scheduling authority.
+Native parsing creates the index entry; only source-verified Full completion
+satisfies the audit and supplies the post-save replacement. Terminal row loss
+may publish without verification: the native-created entry then receives the
+existing unverified-source marker with the recovered deadline. That marker
+survives save/restart and keeps discovery eligible beyond the age window until
+a verified Full retires the obligation. No index membership is inferred from a
+record, and no persisted field or acquisition cause is introduced.
+The production `durable_tail` pass summary emits `ineligible={...}` with static
+class names and process-total counts, including
+`audit_carrier_staged_unverified:1` after the first staged transition.
+`ineligible.audit_carrier_staged_unverified` counts only the successful transition
+to the native-created entry's unverified marker; the earlier
+`ineligible.audit_carrier` counts recovery misses. A verified-first Full has zero
+staged transitions and uses the existing `audits_completed` counter. Later retries
+and later deadline offers cannot renew the recovered obligation.
+Grouped Codex members, aliases included, take the same live-context, once-clamped
+deadline at group job start (not at the preflight hold check); a paused paged job
+carries it, while a deferred group recaptures at its later start. At settlement
+each member's native-created entry stages the existing marker when the group
+publishes unverified; a verified group Full retires each recovered or marked
+member through `audits_completed`. Group retirements have no `audits_started`
+counterpart (groups never plan a sampled mode), so `audits_completed` may exceed
+`audits_started`. A paged group member or singleton that captured no deadline but
+has no index entry at settlement (a fresh index loaded while the job was parked)
+re-probes the same handoff before recording; the job is not invalidated. The
+re-probe only reads the record header: it applies the live-context gate and the
+once clamp, but takes no hold, T14 rebuild authorization, breaker accounting or
+RAM-corrupt count. A re-probed singleton retired by a verified Full counts
+`audits_completed` once, like a captured deadline. Both
+carrier counters advance once per settled member, never on preflight or pause.
+Post-save GC preserves same-context debt-bearing records whose key is absent
+from the index; fresh-index cleanup without a trusted context preserves their
+debt evidence too, until acquisition establishes custody. These preservation
+decisions keep counting `format_hold.unbindable`. Once the real entry carries
+unverified-source debt, GC keeps its same-context predecessor regardless of a
+decided scope change until verification permits ordinary replacement/collection.
+Proven foreign-context records remain ordinary GC candidates. An existing entry with reset/postponed
+debt instead re-arms an immediate index audit and plans Full(`audit_due`), also
+recovering an index-new/record-old crash after a successful audit. Direct restore
+misses also count `ineligible.audit_carrier`, without becoming held exits.
+Re-arming changes no accepted body, witness or ACK; native completion alone can
+clear the obligation. No record means ordinary Full-on-miss admission.
+The `format_hold` and `durable_held` arrays keep five slots:
+`newer,unknown,undecodable,unbindable,known_corrupt`.
+
+Store header reads for GC (including representation lookup for a decided key)
+are counted in `gc_records_read` / `gc_bytes_read`, using actual bytes read;
+GC trailer/body verification uses `delete_verify_bytes`. They do not inflate
+`guard_header_bytes` / `guard_verify_bytes`. A decided key currently needs two
+bounded header reads (each at most 324 bytes); the verification memo avoids a
+second full verification. Representation lookup opens only the durable record,
+never a transcript. A direct fixture removes the synthetic transcript, rejects
+body reads after verification, observes both header accesses and asserts exactly
+648 additional GC bytes, no guard/verification bytes and an unchanged record.
+These are store bytes, separate from transcript re-derivation bytes. Counters
+on the durable pass summary are process totals; `take_pass` store receipts reset
+their flows while retaining disk levels. Alarm counts retain the delta/total
+contract above.
 
 ## Credential File Cap Refusals
 
@@ -472,6 +654,34 @@ older than 7 are deleted. A day holds at most 30,000 lines and 8 MiB, and the
 directory at most 32 MiB; a day that reaches its bound ends with one
 `log_full` line and the summary marks it. Logging is best effort: it never
 fails a provider call, and a line it cannot write promptly is dropped.
+
+## Claude Relay Endpoint Mismatch
+
+When the relay is connected but approved Claude telemetry settings name a
+different loopback port, `ottto doctor` reports both ports. `ottto status --json`
+and `ottto doctor --json` expose `relay.last_error.code` as
+`claude_relay_endpoint_mismatch`; `relay.state` remains `connected`. The
+`claude_local_evidence` diagnostics section includes the same finding.
+Canonical local health carries it as a `Warning` blocker with the same code
+(owner `source`), so the machine reads `degraded` and the existing machine-health
+upload reports it to Ottto the same day. Its uploaded text carries no ports.
+To avoid flapping on a restart or rebind, the finding and blocker appear only
+once the same mismatch is seen again at least 60 seconds after first sight; the
+first agreeing check clears both. The support diagnostics item is not delayed.
+
+This compares current approved settings with the daemon's listener state; it
+does not probe exporters or prove that a running Claude process reloaded its
+settings. It clears when ports agree or Claude telemetry approval is absent
+or disabled. It does not rewrite settings or change account identity.
+
+After a listener failure, the relay re-reads approved settings on each retry
+and tries an approved candidate port up to three times using its existing
+capped backoff. If all three attempts fail, recovery immediately uses the
+old-port, default-port and per-user fallback order so control, health and all
+OTLP sources can serve again. A busy approved port can then produce the mismatch
+finding above. Without an approved candidate, the fallback chain applies immediately.
+Startup retains its existing behavior of falling back if the approved port is
+busy.
 
 ## Common Diagnostics Flow
 
@@ -866,12 +1076,22 @@ explicit release, including real durable I/O paths.
 
 Pi joins the shared sampled RAM reader. Its `native_collection_page` acquisition
 counts report Full, Tail and Unchanged decisions with the actual planner reasons.
-Audit age, clock changes and audit-slot pressure do not gate checkpoint reuse.
+Pi inherits the accepted sampled residual: an interior same-length rewrite plus
+growth can Tail a stale prefix until the next Full; Pi's writer is append-only,
+and its header rewrite reads Full.
+Age and clock changes do not invalidate checkpoints. Admission of a new sampled
+obligation follows the shared audit cap: with no slot left, an unmarked change
+reads a counted cap Full (or waits); already-marked files keep Tailing.
 Until Pi durable records are enabled, an already-indexed file that changes
 without a RAM reduction still reads Full: the transitional `pi` leaf in
 `retained_cache_page_events` counts that attempt once at read start, alongside
 `state_missing`. A newly discovered file's first Full read does not increment
-that leaf. Restart or RAM eviction never triggers a read of an idle file.
+that leaf. A no-RAM-copy cap Full on a changed indexed file can increment both
+`pi` and `audit_cap_full` for one read. Audit, upload-context and other non-content
+reparse reasons do not increment `pi`; a change that an earlier gate (such as a
+due audit) selects first is counted under that reason, not `pi`. After a restart or eviction, an idle Pi
+file whose 1 h verification marker falls due is read once (audit); Pi-b2's durable
+record removes this. The verified Full retires the marker without re-staging it.
 This is a staged exception; it does not turn a cache miss into a first-read
 authorization.
 
@@ -882,10 +1102,18 @@ the completed reduction's measured allocation charge, summed across refusals.
 not be measured; zero bytes with that count is unavailable, not a zero-sized
 copy. These counters do not mean a durable write was attempted or refused.
 `cache_evicted_by_pi_claude_code` and `cache_evicted_by_pi_codex` count respective
-victims removed by Pi cache insertion. They also appear on the existing
+insert-time capacity victims (excludes `Release::CopyAdmission` releases).
+They also appear on the existing
 `process_retained_cache_lifecycle_totals` line (source `unknown`): cumulative,
 saturating process totals since startup, shared across namespaces. They are
 counts and bytes only, with no file names, response ids or content.
+
+The tag-1 audit-safe bootstrap core is a hard release pair with the grouped
+custody and stored-representation binding completion. The first part preserves
+main's narrower current-representation binding formula. Grouped Codex members
+still have main's index-reset recovery gap there; the paired completion closes
+it for every member/alias. Both parts must ship in the same release, in order;
+the first is not a standalone recovery-complete release.
 
 ## Codex ownership-incomplete causes
 
@@ -969,3 +1197,37 @@ and drops the split on save; re-upgrade preserves S as all-unattributed, without
 backfill. Existing old-object/old-array decoding stays supported. No format,
 parser or scan-identity bump, new reader, hold, selection, admission or upload
 behavior is introduced.
+
+## Codex state-only identity coverage
+
+Prior coverage retains both the uniquely resolved filename identity and the
+existing committed header/counting or protected owner hash, including a header
+outside both filename candidates. Accepted-owner coverage requires nonempty
+exact file incidence whose entities are accepted, not quarantined or decode-held;
+a permanent refusal or local wire-size rejection grants no new coverage.
+
+Checkpoint retention and expiry follow the existing rules; local retention
+changes are deferred. The backend downgrade fence
+(`usage_accounting_authority_downgrade`) protects attributed usage floors against
+an uncontracted state-only successor. Local coverage reduces redundant emission;
+it does not replace that backend money protection.
+
+With a prior snapshot fingerprint, exactly two evidence-supported filename
+identities, and no committed owner coverage, both candidates are withheld from
+state-only output. No fingerprint preserves ordinary fallback; zero supported
+candidates are not counted. The existing `local_resources` carrier emits at most
+one `codex_state_only_ambiguous_identity` line per state-only pass, whose
+`counts.codex_state_only_ambiguous_identity` is the number of ambiguous entry
+observations in that pass. Repeated passes observe the same entries again: this
+is NOT a distinct-entry/file/session count, and sums must not be reported as
+files. Alongside the count, `counts.codex_state_only_ambiguous_identity_tokens`
+is the saturating sum of the supported state threads' `tokens_used` per observed
+ambiguous entry in that pass (units: tokens). The token sum is an UPPER BOUND on
+possibly withheld state-only usage: repeated candidates and already-covered
+usage can contribute again. A zero-token observation reports zero tokens. Only
+aggregate counts and token sums are logged, with no paths, ids or per-session
+values.
+
+A later complete native parse still emits its exclusive body for a session with
+an earlier state-only row. An emitted total alone does not prove a server-side
+overwrite; backend authority rules independently govern successor acceptance.
