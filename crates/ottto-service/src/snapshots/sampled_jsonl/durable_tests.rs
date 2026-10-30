@@ -1528,24 +1528,42 @@ fn archived_tag(source: SnapshotSource) -> u8 {
     }
 }
 
+/// A spawned Codex session: the only transcript shape with an agent label.
+fn codex_subagent_lines() -> Vec<String> {
+    let mut lines = codex_lines();
+    let meta = lines[0].replacen(
+        "\"source\":\"cli\"",
+        "\"source\":{\"subagent\":{\"thread_spawn\":{\"agent_path\":\"/root/CANARY_AGENT\"}}}",
+        1,
+    );
+    assert_ne!(meta, lines[0], "subagent premise");
+    lines[0] = meta;
+    lines
+}
+
 /// The seed's archive comparison runs only in the native rows, and it passes
 /// stored digests through. This covers the rewrite for populated bodies on every
 /// platform and refuses digest drift through the archived functions themselves.
 #[test]
 fn populated_bodies_match_the_archived_v1_writer() {
-    for case in cases() {
+    let mut covered = [false; 4];
+    let inputs = cases()
+        .into_iter()
+        .map(|case| (case.source, case.lines))
+        .chain([(SnapshotSource::Codex, codex_subagent_lines())]);
+    for (source, lines) in inputs {
         let scratch = Scratch::new("archived-writer");
-        let path = scratch.write("t.jsonl", &case.lines);
-        let (reduction, _) = full_read(&path, case.source);
+        let path = scratch.write("t.jsonl", &lines);
+        let (reduction, _) = full_read(&path, source);
         let body = encode(
             &reduction,
             crate::durable_tail_store::RECORD_BYTES,
             line_cap(),
         )
         .unwrap();
-        let tag = archived_tag(case.source);
+        let tag = archived_tag(source);
         assert_eq!(W_53d05a43::encode_body(tag, &body).as_ref(), Ok(&body));
-        let stored = decode(&body, case.source).unwrap().rederive;
+        let stored = decode(&body, source).unwrap().rederive;
         let acc = &reduction.accumulator;
         let content = ArchivedContent {
             title: acc.title.clone(),
@@ -1559,19 +1577,28 @@ fn populated_bodies_match_the_archived_v1_writer() {
         assert_eq!(archived.workspace, stored.workspace);
         assert_eq!(archived.agent_label, stored.agent_label);
         assert_eq!(archived.title, stored.title);
-        assert!(
-            [archived.first_prompt, archived.workspace]
-                .iter()
-                .any(Option::is_some),
-            "a populated case must exercise the digests"
-        );
-        let mut renamed = content.clone();
-        renamed.workspace_path = Some(PathBuf::from("/fixture/other-workspace"));
-        renamed.title = Some("other title".to_string());
+        for (seen, digest) in covered.iter_mut().zip([
+            archived.first_prompt,
+            archived.workspace,
+            archived.agent_label,
+            archived.title,
+        ]) {
+            *seen |= digest.is_some();
+        }
+        let renamed = ArchivedContent {
+            title: Some("other title".to_string()),
+            first_prompt_material: Some("other prompt".to_string()),
+            workspace_path: Some(PathBuf::from("/fixture/other-workspace")),
+            agent_label: Some("other-agent".to_string()),
+            ..content
+        };
         let moved = W_53d05a43::content_digests(tag, &renamed).unwrap();
+        assert_ne!(moved.first_prompt, stored.first_prompt);
         assert_ne!(moved.workspace, stored.workspace);
+        assert_ne!(moved.agent_label, stored.agent_label);
         assert_ne!(moved.title, stored.title);
     }
+    assert_eq!(covered, [true; 4], "every content digest must be exercised");
 }
 
 #[test]
