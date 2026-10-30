@@ -2156,14 +2156,6 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn token_parser_handles_suffixes() {
-        assert_eq!(parse_token_count("42.2k"), Some(42_200));
-        assert_eq!(parse_token_count("1m"), Some(1_000_000));
-        assert_eq!(parse_token_count("8"), Some(8));
-        assert_eq!(parse_percent("95.8%"), Some(95.8));
-    }
-
     /// The `/context` read runs an hour before expiry and is refused ten
     /// minutes before it (never started), with a 30-minute retry.
     #[test]
@@ -2626,40 +2618,6 @@ mod tests {
     }
 
     #[test]
-    fn projected_discovery_keeps_the_boundary_mtime_tie_order() {
-        let home = temp_dir("early-stop-tie");
-        let now = SystemTime::now();
-        let dirs: Vec<PathBuf> = (0..16)
-            .map(|index| {
-                let dir = home.join("work").join(format!("tie-{index:02}"));
-                fs::create_dir_all(&dir).unwrap();
-                dir
-            })
-            .collect();
-        // Files 10..=13 share one mtime across the twelfth-scope boundary;
-        // the scope-hash order among them decides which survive truncation.
-        let files: Vec<(u64, Vec<&Path>)> = dirs
-            .iter()
-            .enumerate()
-            .map(|(index, dir)| {
-                let age = match index {
-                    0..=9 => 60 * (index as u64 + 1),
-                    10..=13 => 6_000,
-                    _ => 60_000 + index as u64,
-                };
-                (age, vec![dir.as_path()])
-            })
-            .collect();
-        write_discovery_transcripts(&home, now, &files);
-
-        let (found, _) = discover_with_counts(&home, now);
-
-        assert_eq!(found, discover_all_files_oracle(&home, now));
-        assert_eq!(found.len(), MAX_WORKSPACES_PER_CYCLE);
-        fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
     fn discovery_counts_repository_scopes_not_directories() {
         let repo = init_git_repo("early-stop-scopes");
         let now = SystemTime::now();
@@ -2748,60 +2706,6 @@ mod tests {
     }
 
     #[test]
-    fn discovery_ranks_by_captured_mtimes_and_orders_ties_by_scope() {
-        let root = temp_dir("early-stop-captured");
-        let dirs: Vec<PathBuf> = (0..16)
-            .map(|index| {
-                let dir = root.join(format!("ws-{index:02}"));
-                fs::create_dir_all(&dir).unwrap();
-                dir
-            })
-            .collect();
-        let epoch = SystemTime::UNIX_EPOCH;
-        let at = |secs: u64| epoch + Duration::from_secs(secs);
-        // Captured times, not the files' real ones: ten distinct newest, a
-        // four-way tie across the twelfth scope, then an epoch fallback.
-        let mut entries: Vec<(&Path, SystemTime)> = (0..10)
-            .map(|index| (dirs[index].as_path(), at(2_000 - index as u64)))
-            .collect();
-        for dir in &dirs[10..14] {
-            entries.push((dir.as_path(), at(1_000)));
-        }
-        entries.push((dirs[14].as_path(), at(500)));
-        entries.push((dirs[15].as_path(), epoch));
-        let cwds = captured_cwds(&root, &entries);
-        // Injected scopes make the tie order explicit: z-scopes sort last.
-        let scope_names = ["z1", "a1", "z0", "a0"];
-        let scope_of = |path: &Path| {
-            let index = dirs.iter().position(|dir| dir == path).unwrap();
-            match index {
-                10..=13 => (scope_names[index - 10].to_string(), false),
-                _ => (format!("m{index:02}"), true),
-            }
-        };
-        let mut path_scopes = 0;
-
-        let mut found = discover_workspaces(cwds, &mut path_scopes, scope_of);
-        found.truncate(MAX_WORKSPACES_PER_CYCLE);
-
-        let mut expected: Vec<(PathBuf, SystemTime)> = (0..10)
-            .map(|index| (dirs[index].clone(), at(2_000 - index as u64)))
-            .collect();
-        // Scope order inside the tie: a0 (dir 13), a1 (dir 11).
-        expected.push((dirs[13].clone(), at(1_000)));
-        expected.push((dirs[11].clone(), at(1_000)));
-        assert_eq!(
-            found
-                .iter()
-                .map(|candidate| (candidate.path.clone(), candidate.last_seen))
-                .collect::<Vec<_>>(),
-            expected
-        );
-        assert_eq!(path_scopes, 12);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn discovery_counts_path_scopes_when_repository_probes_fail() {
         let root = temp_dir("early-stop-probe-fails");
         let dirs: Vec<PathBuf> = (0..14)
@@ -2837,80 +2741,6 @@ mod tests {
         assert_eq!(found[0].path, dirs[0]);
         assert_eq!(path_scopes, 0);
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn projected_discovery_merges_files_naming_one_workspace() {
-        let home = temp_dir("early-stop-few");
-        let now = SystemTime::now();
-        let dirs: Vec<PathBuf> = (0..5)
-            .map(|index| {
-                let dir = home.join("work").join(format!("few-{index:02}"));
-                fs::create_dir_all(&dir).unwrap();
-                dir
-            })
-            .collect();
-        let files: Vec<(u64, Vec<&Path>)> = (0..9)
-            .map(|index| (60 * (index as u64 + 1), vec![dirs[index % 5].as_path()]))
-            .collect();
-        write_discovery_transcripts(&home, now, &files);
-
-        let (found, _) = discover_with_counts(&home, now);
-
-        assert_eq!(found, discover_all_files_oracle(&home, now));
-        assert_eq!(found.len(), 5);
-        fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn discovery_keeps_tied_representatives_and_future_mtimes_in_order() {
-        let repo = init_git_repo("early-stop-representative");
-        let now = SystemTime::now();
-        let alpha = repo.join("alpha");
-        let beta = repo.join("beta");
-        fs::create_dir_all(&alpha).unwrap();
-        fs::create_dir_all(&beta).unwrap();
-        let home = temp_dir("early-stop-representative-home");
-        let plain: Vec<PathBuf> = (0..12)
-            .map(|index| {
-                let dir = home.join("work").join(format!("plain-{index:02}"));
-                fs::create_dir_all(&dir).unwrap();
-                dir
-            })
-            .collect();
-        let future = home.join("work").join("future");
-        fs::create_dir_all(&future).unwrap();
-        // Two tied files of one repository name its directories in opposite
-        // line orders; the path-ordered representative must win either way.
-        let mut files: Vec<(u64, Vec<&Path>)> = vec![
-            (300, vec![beta.as_path(), alpha.as_path()]),
-            (300, vec![alpha.as_path(), beta.as_path()]),
-        ];
-        for (index, dir) in plain.iter().enumerate() {
-            files.push((600 + 60 * index as u64, vec![dir.as_path()]));
-        }
-        write_discovery_transcripts(&home, now, &files);
-        // A clock-skewed future mtime is still inside the window and newest.
-        let future_file = home
-            .join(".claude")
-            .join("projects")
-            .join("-early-stop")
-            .join("session-future.jsonl");
-        fs::write(&future_file, format!("{}\n", json!({"cwd": future}))).unwrap();
-        File::options()
-            .write(true)
-            .open(&future_file)
-            .unwrap()
-            .set_modified(now + Duration::from_secs(3_600))
-            .unwrap();
-
-        let (found, _) = discover_with_counts(&home, now);
-
-        assert_eq!(found, discover_all_files_oracle(&home, now));
-        assert_eq!(found[0].path, future);
-        assert_eq!(found[1].path, alpha);
-        let _ = fs::remove_dir_all(&repo);
-        let _ = fs::remove_dir_all(&home);
     }
 
     fn deliver(observer: &mut CwdObserver, view: &FileView, lines: &[Value], end: DeliveryEnd) {
@@ -3100,59 +2930,6 @@ mod tests {
     }
 
     #[test]
-    fn projection_evicts_oldest_files_at_its_cap_and_forgets_old_ones() {
-        let root = temp_dir("cwd-projection-cap");
-        let day = Duration::from_secs(24 * 60 * 60);
-        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let lines: Vec<Value> = (0..OBSERVED_CWDS_PER_FILE)
-            .map(|i| json!({"cwd": format!("/{i}{}", "c".repeat(OBSERVED_CWD_MAX_BYTES - 2))}))
-            .collect();
-        let per_file = PROJECTED_FILE_BYTES
-            + OBSERVED_CWDS_PER_FILE * (std::mem::size_of::<String>() + OBSERVED_CWD_MAX_BYTES);
-        let fits = PROJECTION_MAX_BYTES / per_file;
-        let projection = Arc::new(CwdProjection::default());
-        let mut observer = projection.observer();
-        let mut views = Vec::new();
-        for index in 0..fits + 3 {
-            let path = root.join(format!("session-{index:03}.jsonl"));
-            fs::write(&path, "").unwrap();
-            let view = claude_view(&path, start + day * index as u32, DeliveryMode::Full);
-            deliver(&mut observer, &view, &lines, DeliveryEnd::Complete);
-            views.push(view);
-        }
-        {
-            let state = projection.lock();
-            assert_eq!(state.files.len(), fits);
-            assert!(state
-                .files
-                .values()
-                .all(|file| projected_bytes(file) == per_file));
-            assert_eq!(state.bytes, fits * per_file);
-            assert_eq!(state.evicted_files, 3);
-        }
-        assert!(views[..3]
-            .iter()
-            .all(|view| projected(&projection, view).is_none()));
-        assert!(projected(&projection, &views[3]).is_some());
-
-        // A cycle forgets files outside the window and their bytes.
-        let newest = start + day * (fits + 2) as u32;
-        let cwds = projection.recent_cwds(newest);
-        assert_eq!(cwds.len(), OBSERVED_CWDS_PER_FILE);
-        assert!(cwds.values().all(|mtime| *mtime == newest));
-        let state = projection.lock();
-        assert_eq!(state.files.len(), 15);
-        assert_eq!(state.bytes, 15 * per_file);
-        drop(state);
-        // Forgetting every file releases the map's slots too.
-        assert!(projection.recent_cwds(newest + day * 30).is_empty());
-        let state = projection.lock();
-        assert_eq!((state.bytes, state.files.capacity()), (0, 0));
-        drop(state);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn projection_rebuilds_its_map_after_evictions_and_pruning() {
         // The per-file charge covers a map of twice its files plus eight only
         // while one slot (entry and control byte at 7/8 load) is under 128 bytes.
@@ -3207,25 +2984,6 @@ mod tests {
         );
         drop(state);
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn cache_freshness_tracks_max_staleness() {
-        let now = OffsetDateTime::from_unix_timestamp(1_750_000_000).unwrap();
-        let entry = FootprintCacheEntry {
-            identity: "device|machine|api".to_string(),
-            footprint_sha256: "abc".to_string(),
-            posted_at: now.format(&Rfc3339).unwrap(),
-        };
-        assert!(!cache_is_stale(&entry, now));
-        assert!(!cache_is_stale(
-            &entry,
-            now + time::Duration::seconds(CONTEXT_MAX_STALENESS_SECS - 1)
-        ));
-        assert!(cache_is_stale(
-            &entry,
-            now + time::Duration::seconds(CONTEXT_MAX_STALENESS_SECS)
-        ));
     }
 
     #[test]

@@ -840,44 +840,21 @@ mod tests {
 
     #[test]
     fn full_policy_for_same_user_keeps_cutoff() {
-        // Same-user re-claim: backend answers "full", but the daemon must NOT
-        // resurrect pre-cutoff history it skipped earlier.
-        let dir = temp_dir("policy-same-user");
-        apply_claim_backfill_policy(&dir, Some("from"), Some("2026-07-06T10:00:00Z"), "user_b")
-            .expect("apply from policy");
-        apply_claim_backfill_policy(&dir, Some("full"), None, "user_b").expect("re-claim");
-        let state = load_backfill_state(&dir);
-        assert_eq!(
-            state.backfill_cutoff_at.as_deref(),
-            Some("2026-07-06T10:00:00Z")
-        );
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn full_policy_for_different_user_clears_cutoff() {
-        let dir = temp_dir("policy-other-user");
-        apply_claim_backfill_policy(&dir, Some("from"), Some("2026-07-06T10:00:00Z"), "user_b")
-            .expect("apply from policy");
-        apply_claim_backfill_policy(&dir, Some("full"), None, "user_c").expect("full for user_c");
-        let state = load_backfill_state(&dir);
-        assert_eq!(state.backfill_cutoff_at, None);
-        assert_eq!(state.backfill_cutoff_user_id, None);
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn absent_policy_behaves_like_full() {
-        // Old backend: no policy field. Different user connecting means
-        // today's full-backfill behavior, clearing the previous user's cutoff.
-        let dir = temp_dir("policy-absent");
-        apply_claim_backfill_policy(&dir, Some("from"), Some("2026-07-06T10:00:00Z"), "user_b")
-            .expect("apply from policy");
-        apply_claim_backfill_policy(&dir, None, None, "user_b").expect("old backend, same user");
-        assert!(load_backfill_state(&dir).backfill_cutoff_at.is_some());
-        apply_claim_backfill_policy(&dir, None, None, "user_c").expect("old backend, other user");
-        assert!(load_backfill_state(&dir).backfill_cutoff_at.is_none());
-        fs::remove_dir_all(&dir).ok();
+        for policy in [Some("full"), None] {
+            let dir = temp_dir("policy-full-or-absent");
+            apply_claim_backfill_policy(&dir, Some("from"), Some("2026-07-06T10:00:00Z"), "user_b")
+                .unwrap();
+            apply_claim_backfill_policy(&dir, policy, None, "user_b").unwrap();
+            assert_eq!(
+                load_backfill_state(&dir).backfill_cutoff_at.as_deref(),
+                Some("2026-07-06T10:00:00Z")
+            );
+            apply_claim_backfill_policy(&dir, policy, None, "user_c").unwrap();
+            let state = load_backfill_state(&dir);
+            assert_eq!(state.backfill_cutoff_at, None);
+            assert_eq!(state.backfill_cutoff_user_id, None);
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

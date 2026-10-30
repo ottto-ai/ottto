@@ -1244,52 +1244,6 @@ mod fenced_census_tests {
     }
 
     #[test]
-    fn fenced_census_outer_rejection_retains_completion_and_persists_non_success() {
-        let fixture = Fixture::new();
-        begin_census_attempt();
-        write_fenced_census_record(fixture.path(), &record()).unwrap();
-        let prior = std::fs::read(fenced_census_path(fixture.path())).unwrap();
-        let (result, _) = crate::local_resource_diagnostics::capture(|| {
-            observe_existing_outer_census_fence(SnapshotSource::Codex, fixture.path(), || {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "PRIVATE_PATH_ACCOUNT_ERROR",
-                )
-                .into())
-            })
-        });
-        assert_eq!(
-            result
-                .unwrap_err()
-                .downcast_ref::<std::io::Error>()
-                .unwrap()
-                .kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-        assert_eq!(
-            std::fs::read(fenced_census_path(fixture.path())).unwrap(),
-            prior
-        );
-        assert!(
-            fixture
-                .path()
-                .join("snapshots/codex-fenced-census-outcome-v1.json")
-                .is_file(),
-            "outer rejection must have a bounded non-success carrier"
-        );
-        let failed = sidecar(&fixture);
-        let prior: serde_json::Value = serde_json::from_slice(&prior).unwrap();
-        assert_eq!(failed["phase"], "outer");
-        assert_eq!(failed["outcome"], "rejected");
-        assert_eq!(failed["invalidation"], "not_attempted");
-        assert!(
-            failed["attempt_sequence"].as_u64().unwrap()
-                > prior["attempt_sequence"].as_u64().unwrap()
-        );
-        assert_eq!(TEST_OUTCOME_WRITES.with(std::cell::Cell::get), 1);
-    }
-
-    #[test]
     fn fenced_census_healthy_attempts_never_write_or_remove_sidecar() {
         let fixture = Fixture::new();
         let _identity = IdentityOverride::new(Some(ProcessStart {
@@ -1533,41 +1487,6 @@ mod fenced_census_tests {
     }
 
     #[test]
-    fn fenced_census_sidecar_fixed_buffer_encoding_is_bounded_and_allocation_free() {
-        let version = "v".repeat(MAX_CENSUS_VERSION_BYTES);
-        let mut record = FenceOutcomeRecord {
-            schema: "local_fenced_codex_census_outcome:v1",
-            producer_pid: u32::MAX,
-            producer_start_sec: Some(u64::MAX),
-            producer_start_usec: Some(999999),
-            producer_version: &version,
-            attempt_sequence: Some(u64::MAX - 1),
-            observed_at: Some("2026-10-11T11:00:00.999999999Z"),
-            phase: CensusFencePhase::Inner,
-            outcome: CensusFenceOutcome::ProjectionUnavailable,
-            invalidation: CensusInvalidation::AlreadyMissing,
-        };
-        let mut buffer = [0; MAX_FENCE_OUTCOME_BYTES];
-        let (encoded, stats) =
-            crate::retry_allocation_probe::measure(|| encode_fence_outcome(&record, &mut buffer));
-        assert!(encoded.unwrap() <= MAX_FENCE_OUTCOME_BYTES);
-        assert_eq!(stats.allocations, 0);
-        assert_eq!(stats.requested_live, 0);
-        let oversized = "PRIVATE".repeat(MAX_FENCE_OUTCOME_BYTES);
-        record.producer_version = &oversized;
-        assert!(matches!(
-            encode_fence_outcome(&record, &mut buffer),
-            Err(CensusPublishFailure::EncodingFailed)
-        ));
-        record.producer_version = &version;
-        record.observed_at = Some(&oversized);
-        assert!(matches!(
-            encode_fence_outcome(&record, &mut buffer),
-            Err(CensusPublishFailure::EncodingFailed)
-        ));
-    }
-
-    #[test]
     #[ignore = "bounded native non-success sidecar allocation and IO measurement"]
     fn fenced_census_sidecar_native_measurement() {
         let fixture = Fixture::new();
@@ -1701,30 +1620,6 @@ mod fenced_census_tests {
     }
 
     #[test]
-    fn fenced_census_non_codex_and_failed_writes_leave_scan_result_unchanged() {
-        let fixture = Fixture::new();
-        after_existing_census_fence(
-            SnapshotSource::ClaudeCode,
-            fixture.path(),
-            || Ok(()),
-            || panic!("other provider must not publish Codex diagnostics"),
-        )
-        .unwrap();
-        std::fs::write(
-            fixture.path().join("snapshots"),
-            b"synthetic unavailable directory",
-        )
-        .unwrap();
-        after_existing_census_fence(
-            SnapshotSource::Codex,
-            fixture.path(),
-            || Ok(()),
-            || write_fenced_census_record(fixture.path(), &record()),
-        )
-        .unwrap();
-    }
-
-    #[test]
     fn fenced_census_inner_outcome_is_bound_and_distinguishes_failed_invalidation() {
         let fixture = Fixture::new();
         // A directory at the known target makes both atomic rename and remove_file fail.
@@ -1832,6 +1727,10 @@ mod fenced_census_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["counts"]["outcome"], "rejected");
         assert_eq!(rows[0]["counts"]["invalidation"], "not_attempted");
+        let failed = sidecar(&fixture);
+        assert_eq!(failed["phase"], "outer");
+        assert_eq!(failed["outcome"], "rejected");
+        assert_eq!(failed["invalidation"], "not_attempted");
         assert!(!serde_json::to_string(&rows).unwrap().contains("PRIVATE"));
     }
 

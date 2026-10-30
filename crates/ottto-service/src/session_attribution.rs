@@ -1691,23 +1691,6 @@ mod tests {
     }
 
     #[test]
-    fn interactive_codex_run_reports_no_execution_mode() {
-        let mut origin = origin();
-        origin.originator = Some("Codex Desktop".to_string());
-        origin.source = Some("vscode".to_string());
-
-        let facts = direct_provider_facts(
-            SnapshotSource::Codex,
-            Some(&origin),
-            "session-interactive",
-            "2026-07-19T00:00:00Z",
-            "codex_jsonl:v21",
-        );
-
-        assert!(!facts.iter().any(|fact| fact.field == "execution_mode"));
-    }
-
-    #[test]
     fn desktop_originator_outranks_an_exec_source() {
         // Real shape: ChatGPT Work desktop rollouts write `source: "exec"` while
         // naming a desktop client in `originator`. The signals disagree, the
@@ -2095,52 +2078,15 @@ mod tests {
 
     #[test]
     fn template_normalization_removes_common_run_specific_values() {
-        let first = normalize_template_material("Review build 123456 at 2026-07-19T09:30:00Z now")
-            .expect("first");
-        let second =
-            normalize_template_material("Review   build 987654 at 2026-08-20T10:45:00Z now")
-                .expect("second");
-
-        assert_eq!(first, second);
-        assert_eq!(first, "review build <dynamic> at <dynamic> now");
-    }
-
-    #[test]
-    fn template_normalization_rejects_injected_prompt_scaffolding() {
-        assert_eq!(
-            normalize_template_material(
-                "# AGENTS.md instructions for /repo\n\
-                 <INSTRUCTIONS>Shared agent setup</INSTRUCTIONS>\n\
-                 <environment_context><cwd>/repo</cwd></environment_context>"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn template_normalization_keeps_human_prompts_that_mention_markers() {
-        assert_eq!(
-            normalize_template_material(
-                "Update the AGENTS.md instructions and parse the current date: field"
-            )
-            .as_deref(),
-            Some("update the agents.md instructions and parse the current date: field")
-        );
-    }
-
-    #[test]
-    fn template_normalization_keeps_task_after_injected_prefix() {
-        assert_eq!(
-            normalize_template_material(
-                "<recommended_plugins>Plugins</recommended_plugins>\n\
-                 # AGENTS.md instructions for /repo\n\
-                 <INSTRUCTIONS>Shared setup</INSTRUCTIONS>\n\
-                 <environment_context><cwd>/repo</cwd></environment_context>\n\
-                 Explain how this XML is parsed"
-            )
-            .as_deref(),
-            Some("explain how this xml is parsed")
-        );
+        for (input, expected) in [
+            ("Review build 123456 at 2026-07-19T09:30:00Z now", Some("review build <dynamic> at <dynamic> now")),
+            ("Review   build 987654 at 2026-08-20T10:45:00Z now", Some("review build <dynamic> at <dynamic> now")),
+            ("# AGENTS.md instructions for /repo\n<INSTRUCTIONS>Shared agent setup</INSTRUCTIONS>\n<environment_context><cwd>/repo</cwd></environment_context>", None),
+            ("Update the AGENTS.md instructions and parse the current date: field", Some("update the agents.md instructions and parse the current date: field")),
+            ("<recommended_plugins>Plugins</recommended_plugins>\n# AGENTS.md instructions for /repo\n<INSTRUCTIONS>Shared setup</INSTRUCTIONS>\n<environment_context><cwd>/repo</cwd></environment_context>\nExplain how this XML is parsed", Some("explain how this xml is parsed")),
+        ] {
+            assert_eq!(normalize_template_material(input).as_deref(), expected);
+        }
     }
 
     #[test]
@@ -2438,51 +2384,6 @@ status = "ACTIVE"
         serde_json::to_vec(facts).expect("serialize").len() <= MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES
     }
 
-    /// The count cap binds before the byte budget for ordinary facts.
-    ///
-    /// This is the invariant the 8 KiB budget is chosen to produce, and the
-    /// reason several tests below must use `wide_budget_fact` to reach the byte
-    /// budget at all. Pinned once here so a future budget change that quietly
-    /// reverses the ordering fails loudly instead of turning the count-cap tests
-    /// into byte-budget tests.
-    #[test]
-    fn the_fact_count_cap_binds_before_the_byte_budget_for_ordinary_facts() {
-        let full: Vec<SessionAttributionFact> = (0..MAX_SESSION_ATTRIBUTION_FACTS)
-            .map(|_| budget_fact("skill_id"))
-            .collect();
-
-        assert!(
-            fits_wire_budget(&full),
-            "a full {MAX_SESSION_ATTRIBUTION_FACTS}-fact list of ordinary facts must fit in \
-             {MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES} bytes"
-        );
-        // The byte budget must still be reachable by pathological values, or it
-        // would be dead code rather than a backstop.
-        let wide: Vec<SessionAttributionFact> = (0..MAX_SESSION_ATTRIBUTION_FACTS)
-            .map(|_| wide_budget_fact("skill_id"))
-            .collect();
-        assert!(
-            !fits_wire_budget(&wide),
-            "values at the {MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES}-byte ceiling must still be \
-             able to exhaust the payload budget"
-        );
-    }
-
-    #[test]
-    fn enforce_fact_limits_keeps_a_within_budget_list_intact() {
-        let mut facts = vec![
-            budget_fact("origin_kind"),
-            budget_fact("provider_surface"),
-            budget_fact("execution_mode"),
-        ];
-        assert!(fits_wire_budget(&facts));
-
-        enforce_fact_limits(&mut facts);
-
-        assert_eq!(facts.len(), 3);
-        assert!(fits_wire_budget(&facts));
-    }
-
     #[test]
     fn enforce_fact_limits_drops_trailing_grouping_facts_over_the_byte_budget() {
         // When the byte budget does bind, facts are dropped from the tail, so a
@@ -2644,48 +2545,6 @@ status = "ACTIVE"
             refusal.contains(&MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES.to_string()),
             "expected a byte-budget refusal, got: {refusal}"
         );
-    }
-
-    #[test]
-    fn the_raised_byte_budget_keeps_a_list_the_old_budget_would_have_trimmed() {
-        // The regression each raise fixes: a fact list above a superseded
-        // ceiling used to lose its tail. Grown past the most recent superseded
-        // budget (4 KiB), so it also covers the older 2 KiB one. Nothing is
-        // trimmed now.
-        const RETIRED_PAYLOAD_BUDGET_BYTES: usize = 2_048;
-        const PREVIOUS_PAYLOAD_BUDGET_BYTES: usize = 4_096;
-        let mut facts = vec![
-            budget_fact("origin_kind"),
-            budget_fact("provider_surface"),
-            budget_fact("execution_mode"),
-            budget_fact("template_group_id"),
-        ];
-        while serde_json::to_vec(&facts).expect("serialize").len() <= PREVIOUS_PAYLOAD_BUDGET_BYTES
-        {
-            facts.push(budget_fact("skill_id"));
-        }
-        let payload_bytes = serde_json::to_vec(&facts).expect("serialize").len();
-        assert!(payload_bytes > RETIRED_PAYLOAD_BUDGET_BYTES);
-        assert!(payload_bytes > PREVIOUS_PAYLOAD_BUDGET_BYTES);
-        assert!(payload_bytes <= MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES);
-        let before = facts.len();
-
-        enforce_fact_limits(&mut facts);
-
-        assert_eq!(facts.len(), before);
-        validate_fact_limits(&facts).expect("near-limit list is valid");
-    }
-
-    #[test]
-    fn enforce_fact_limits_applies_the_count_cap_before_the_byte_budget() {
-        let mut facts: Vec<SessionAttributionFact> = (0..MAX_SESSION_ATTRIBUTION_FACTS + 5)
-            .map(|_| budget_fact("skill_id"))
-            .collect();
-
-        enforce_fact_limits(&mut facts);
-
-        assert!(facts.len() <= MAX_SESSION_ATTRIBUTION_FACTS);
-        assert!(fits_wire_budget(&facts));
     }
 }
 

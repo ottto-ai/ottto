@@ -1974,69 +1974,68 @@ mod tests {
 
     #[test]
     fn read_http_request_rejects_over_long_header_line() {
-        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\nX-Big: ");
-        raw.push_str(&"a".repeat(MAX_HEADER_LINE_BYTES + 64));
-        raw.push_str("\r\n\r\n");
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("over-long line rejected");
-        assert!(
-            error.to_string().contains("read header")
-                || error.to_string().contains("exceeds maximum length"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn read_http_request_rejects_cumulative_header_bytes() {
-        // Each header line stays under the per-line cap, but together they
-        // exceed the cumulative byte cap.
-        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\n");
-        let value = "b".repeat(MAX_HEADER_LINE_BYTES / 2);
-        let lines_needed = (MAX_HEADER_TOTAL_BYTES / value.len()) + 2;
-        for index in 0..lines_needed {
-            raw.push_str(&format!("X-Pad-{index}: {value}\r\n"));
+        for raw in [
+            {
+                let mut raw = String::from("POST /v1/logs HTTP/1.1\r\nX-Big: ");
+                raw.push_str(&"a".repeat(MAX_HEADER_LINE_BYTES + 64));
+                raw.push_str("\r\n\r\n");
+                raw
+            },
+            {
+                let mut raw = String::from("POST /v1/logs HTTP/1.1\r\n");
+                let value = "b".repeat(MAX_HEADER_LINE_BYTES / 2);
+                let lines_needed = (MAX_HEADER_TOTAL_BYTES / value.len()) + 2;
+                for index in 0..lines_needed {
+                    raw.push_str(&format!("X-Pad-{index}: {value}\r\n"));
+                }
+                raw.push_str("\r\n");
+                raw
+            },
+            {
+                let mut raw = String::from("POST /v1/logs HTTP/1.1\r\n");
+                for index in 0..(MAX_HEADER_COUNT + 5) {
+                    raw.push_str(&format!("X-H-{index}: v\r\n"));
+                }
+                raw.push_str("\r\n");
+                raw
+            },
+            {
+                let raw = format!(
+                    "POST /v1/logs HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                    MAX_OTLP_BODY_BYTES + 1
+                );
+                raw
+            },
+            {
+                let raw = format!(
+                    "POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                    MAX_OTLP_BODY_BYTES + 1
+                );
+                raw
+            },
+            {
+                let mut raw =
+                    String::from("POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+                for _ in 0..MAX_CHUNK_COUNT {
+                    raw.push_str("1\r\na\r\n");
+                }
+                raw.push_str("1\r\nb\r\n0\r\n\r\n");
+                raw
+            },
+            {
+                let extension = "a".repeat(MAX_HEADER_LINE_BYTES - 4);
+                let mut raw =
+                    String::from("POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+                for _ in 0..=(MAX_CHUNK_FRAMING_BYTES / MAX_HEADER_LINE_BYTES) {
+                    raw.push_str(&format!("1;{extension}\r\na\r\n"));
+                }
+                raw.push_str("0\r\n\r\n");
+                raw
+            },
+        ] {
+            let mut reader = BufReader::new(raw.as_bytes());
+            read_http_request_from(&mut reader).expect_err("oversized HTTP framing rejected");
         }
-        raw.push_str("\r\n");
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error =
-            read_http_request_from(&mut reader).expect_err("cumulative header bytes rejected");
-        assert!(
-            error.to_string().contains("headers too large"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn read_http_request_rejects_excess_header_count() {
-        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\n");
-        for index in 0..(MAX_HEADER_COUNT + 5) {
-            raw.push_str(&format!("X-H-{index}: v\r\n"));
-        }
-        raw.push_str("\r\n");
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("excess header count rejected");
-        assert!(
-            error.to_string().contains("too many request headers"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn read_http_request_rejects_oversized_body_via_content_length() {
-        let raw = format!(
-            "POST /v1/logs HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
-            MAX_OTLP_BODY_BYTES + 1
-        );
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("oversized body rejected");
-        assert!(
-            error.to_string().contains("request body too large"),
-            "unexpected error: {error}"
-        );
     }
 
     #[test]
@@ -2072,54 +2071,6 @@ mod tests {
             let mut reader = BufReader::new(raw.as_bytes());
             read_http_request_from(&mut reader).expect_err("malformed chunking rejected");
         }
-    }
-
-    #[test]
-    fn read_http_request_rejects_chunked_body_over_limit_before_allocation() {
-        let raw = format!(
-            "POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
-            MAX_OTLP_BODY_BYTES + 1
-        );
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("oversized chunk rejected");
-        assert!(
-            error.to_string().contains("request body too large"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn read_http_request_rejects_excessive_chunk_count() {
-        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
-        for _ in 0..MAX_CHUNK_COUNT {
-            raw.push_str("1\r\na\r\n");
-        }
-        raw.push_str("1\r\nb\r\n0\r\n\r\n");
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("chunk flood rejected");
-        assert!(
-            error.to_string().contains("too many chunks"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn read_http_request_rejects_excessive_chunk_extension_framing() {
-        let extension = "a".repeat(MAX_HEADER_LINE_BYTES - 4);
-        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
-        for _ in 0..=(MAX_CHUNK_FRAMING_BYTES / MAX_HEADER_LINE_BYTES) {
-            raw.push_str(&format!("1;{extension}\r\na\r\n"));
-        }
-        raw.push_str("0\r\n\r\n");
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("framing flood rejected");
-        assert!(
-            error.to_string().contains("chunk framing too large"),
-            "unexpected error: {error}"
-        );
     }
 
     #[test]

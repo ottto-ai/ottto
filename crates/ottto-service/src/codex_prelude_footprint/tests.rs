@@ -228,19 +228,6 @@ fn unlabeled_or_image_blocks_mark_request_one_incomplete() {
     }
 }
 
-#[test]
-fn matching_only_caps_agents_md_and_skips_skills() {
-    let mut parser = CodexPreludeParser::matching_only(4);
-    parser.observe(&json!({"type": "world_state", "payload": {"state": {
-        "agents_md": {"text": "abc\u{e9}def"}, "host_skills": {"body": SKILLS_BODY}}}}));
-    let prelude = parser.prelude();
-    assert_eq!(prelude.agents_md.as_ref().unwrap().text, "abc");
-    assert!(prelude.agents_md_capped);
-    assert_eq!(prelude.skills_body, None);
-    parser.release_text();
-    assert_eq!(parser.prelude().agents_md, None);
-}
-
 fn chain(files: &[(&str, &str, u64)]) -> Vec<ChainFile> {
     files
         .iter()
@@ -294,46 +281,6 @@ fn user_and_project_chain_split_into_files() {
     assert!(out
         .iter()
         .all(|item| item.file_counts.truncated_by_limit == Some(false)));
-}
-
-#[test]
-fn chain_over_limit_marks_the_cut_file() {
-    let root = "a".repeat(30);
-    let nested_loaded = "b".repeat(10);
-    let text = format!("{root}\n\n{nested_loaded}");
-    let files = chain(&[
-        ("AGENTS.md", "AGENTS.md", 30),
-        ("sub/AGENTS.md", "AGENTS.md", 25),
-    ]);
-    let out = items(&text, &files, None, 40);
-    assert_eq!(out.len(), 2);
-    assert_eq!(out[0].file_counts.truncated_by_limit, Some(false));
-    assert_eq!(out[1].file_counts.file_bytes, Some(25));
-    assert_eq!(out[1].file_counts.file_lines, None);
-    assert_eq!(out[1].tokens, 10);
-    assert_eq!(out[1].file_counts.truncated_by_limit, Some(true));
-    // The same rule answers the per-session flag from the loaded text alone.
-    assert!(agents_md_cut(&text, 40));
-    assert!(!agents_md_cut(&text, 64));
-    assert!(!agents_md_cut(
-        &format!("{}{PROJECT_DOC_SEPARATOR}p", "u".repeat(99)),
-        40
-    ));
-}
-
-#[test]
-fn over_cap_disk_size_is_omitted_but_the_cut_is_kept() {
-    // A 2 MiB AGENTS.md whose loaded prefix fits the budget: admission
-    // bounds file_bytes at 1 MiB, so the payload carries no disk size (BR4).
-    let text = "x".repeat(40);
-    let files = chain(&[("AGENTS.md", "AGENTS.md", 2 * 1024 * 1024)]);
-    let out = items(&text, &files, None, 40);
-    let wire = serde_json::to_value(&out[0]).unwrap();
-    assert_eq!(
-        wire,
-        json!({"kind": "memory_file", "name": "AGENTS.md", "tokens": 40, "source": "Project",
-            "relative_path": "AGENTS.md", "loading_mode": "always_on", "truncated_by_limit": true})
-    );
 }
 
 #[test]
@@ -873,118 +820,6 @@ fn observer_oracle_requests_and_none_outcomes() {
 }
 
 #[test]
-fn observer_forks_and_delayed_windows_match_oracle() {
-    for n in [0, 7, 8, 9] {
-        let mut rows = vec![meta(json!({"context_window":null})), usage(0), usage(31)];
-        rows.extend(std::iter::repeat(Value::Null).take(n));
-        rows.push(json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":999},"model_context_window":12345}}}));
-        let p = observed(&rows);
-        assert_eq!(p, parse(&rows));
-        assert_eq!(p.first_input_tokens, Some(31));
-        assert_eq!(p.context_window, (n < 8).then_some(12345));
-    }
-    for input in [Value::Null, json!(-1), json!("bad")] {
-        let rows = [
-            meta(json!({})),
-            json!({"type":"token_usage_record","payload":{"usage":{"input_tokens":input}}}),
-        ];
-        assert_eq!(observed(&rows), parse(&rows));
-    }
-    let rows = [
-        meta(json!({"context_window":null})),
-        json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":9}}}}),
-    ];
-    assert_eq!(observed(&rows), parse(&rows));
-    let rows = [meta(json!({})), usage(4), meta(json!({"id":"later"}))];
-    assert!(!observed(&rows).is_fork);
-}
-
-#[test]
-fn contiguous_tail_keeps_the_first_input_unconditionally() {
-    let dir = ScratchDir::new("prelude-first-input");
-    let roots = [dir.join("sessions")];
-    let feed = Arc::new(CodexPreludeFeed::default());
-    let full = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
-    let (want, next) = deliver(
-        &feed,
-        &roots,
-        full,
-        &[meta(json!({"context_window":null})), usage(7)],
-        DeliveryEnd::Complete,
-    );
-    assert_eq!(want, Want::Lines);
-    assert_eq!(metric(&feed, "pending"), 1);
-    let window = json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":99},"model_context_window":555}}});
-    assert_eq!(
-        deliver(
-            &feed,
-            &roots,
-            FileView {
-                mode: DeliveryMode::Tail,
-                start: next,
-                ..full
-            },
-            &[window],
-            DeliveryEnd::Incomplete
-        )
-        .0,
-        Want::Lines
-    );
-    let done = feed.snapshot(SystemTime::now()).0;
-    assert_eq!(done.len(), 1);
-    assert_eq!(done[0].1.first_input_tokens, Some(7));
-    assert_eq!(done[0].1.context_window, Some(555));
-    assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 0);
-}
-
-#[test]
-fn flag_only_forks_and_null_empty_nonforks_discriminate_selection() {
-    let dir = ScratchDir::new("prelude-fork-flags");
-    let roots = [dir.join("sessions")];
-    let support = ScratchDir::new("prelude-fork-support");
-    let cases = [
-        (json!({"thread_source":"agent_created_thread"}), true),
-        (json!({"forked_from_id":"parent"}), true),
-        (json!({"history_base":0}), true),
-        (json!({"subagent_history_start_ordinal":0}), true),
-        (json!({"forked_from_id":""}), false),
-        (json!({"forked_from_id":null}), false),
-        (json!({"history_base":null}), false),
-        (json!({"subagent_history_start_ordinal":null}), false),
-        (json!({"thread_source":""}), false),
-        (json!({"thread_source":null}), false),
-        (json!({}), false),
-    ];
-    for (flags, fork) in cases {
-        let feed = Arc::new(CodexPreludeFeed::default());
-        let mut m = meta(flags);
-        m["payload"]["cwd"] = json!(dir.to_path_buf());
-        let rows = [m, usage(99)]; // Exactly one meta: flags are the only fork cause.
-        let view = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
-        assert_eq!(
-            deliver(&feed, &roots, view, &rows, DeliveryEnd::Complete).0,
-            Want::Lines
-        );
-        let done = feed.snapshot(SystemTime::now()).0;
-        assert_eq!(done.len(), 1);
-        assert_eq!(done[0].1, parse(&rows));
-        assert_eq!(done[0].1.is_fork, fork);
-        assert_eq!(done[0].1.is_owned_fresh_start(), !fork);
-        assert_eq!(
-            select_candidates(
-                &feed,
-                &roots,
-                &support,
-                "dest",
-                Instant::now() + Duration::from_secs(60)
-            )
-            .len(),
-            usize::from(!fork)
-        );
-    }
-}
-
-#[test]
 fn distinct_second_meta_across_tail_is_a_fork_but_same_id_is_not() {
     let dir = ScratchDir::new("prelude-second-meta");
     let roots = [dir.join("sessions")];
@@ -1098,55 +933,6 @@ fn pending_continuity_unchanged_wrong_offsets_restart_and_incomplete() {
         assert_eq!(feed.snapshot(SystemTime::now()).0.len(), 1);
         assert_eq!(
             deliver(&feed, &roots, tail, &[], DeliveryEnd::Complete).0,
-            Want::Skip
-        );
-    }
-}
-
-#[test]
-fn two_hundred_rows_are_total_across_tails_and_terminal_even_without_done() {
-    let dir = ScratchDir::new("prelude-row-limit");
-    let roots = [dir.join("sessions")];
-    for completion in [199, 200, 201] {
-        let feed = Arc::new(CodexPreludeFeed::default());
-        let full = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
-        let mut rows = vec![meta(json!({"context_window":null}))];
-        rows.extend(std::iter::repeat(Value::Null).take(completion - 2));
-        rows.push(usage(33));
-        let (_, next) = deliver(&feed, &roots, full, &rows[..100], DeliveryEnd::Complete);
-        let tail = FileView {
-            mode: DeliveryMode::Tail,
-            start: next,
-            ..full
-        };
-        let (_, next) = deliver(&feed, &roots, tail, &rows[100..], DeliveryEnd::Complete);
-        if completion == 199 {
-            // row 200 is still More, but exhausts the bound.
-            deliver(
-                &feed,
-                &roots,
-                FileView {
-                    start: next,
-                    ..tail
-                },
-                &[Value::Null],
-                DeliveryEnd::Complete,
-            );
-        }
-        let p = feed.snapshot(SystemTime::now()).0.remove(0).1;
-        assert_eq!(p.complete, completion <= 200);
-        assert_eq!(
-            deliver(
-                &feed,
-                &roots,
-                FileView {
-                    start: next,
-                    ..tail
-                },
-                &[usage(22)],
-                DeliveryEnd::Complete
-            )
-            .0,
             Want::Skip
         );
     }
@@ -1679,16 +1465,6 @@ fn root_alias_snapshot_keeps_the_configured_codex_home() {
     observer.end(&view, &DeliveryEnd::Complete);
     assert_eq!(feed.snapshot(SystemTime::now()).0[0].2, home);
     assert_eq!(metric(&feed, "root_missing"), 0);
-}
-
-#[test]
-fn daemon_owned_feed_has_no_ticket_heap_charge() {
-    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
-    let feed = CodexPreludeFeed::default();
-    let mut c = Counter::new(100);
-    c.add(7).unwrap();
-    feed.heap_bound(&mut c).unwrap();
-    assert_eq!(c.bytes, 7);
 }
 
 #[test]

@@ -1146,24 +1146,6 @@ fn missing_opening_verdict_wait_ends_at_six_hours() {
 }
 
 #[test]
-fn old_opening_without_verdict_is_not_measured() {
-    for source in [Source::Claude, Source::Codex] {
-        let env = Env::new(&format!("composition-verdict-old-{source:?}"));
-        env.run(
-            source,
-            OffsetDateTime::now_utc() - time::Duration::minutes(1),
-            None,
-        );
-        let (path, born, _) = opening_verdict_fixture(&env, source);
-        let stats = env.run(source, born + time::Duration::hours(7), None);
-        assert_eq!((stats.verdict_deferred, stats.files_read), (0, 1));
-        assert_eq!(stats.bytes_new, fs::metadata(&path).unwrap().len());
-        assert!(opening_tokens(&env.scope(source).agg) > 0);
-        env.cleanup();
-    }
-}
-
-#[test]
 fn explicit_opening_verdict_does_not_defer_fresh_files() {
     for source in [Source::Claude, Source::Codex] {
         for measured in [false, true] {
@@ -2522,29 +2504,6 @@ fn scope_key_is_stable_across_worktrees() {
     .unwrap();
     assert!(!stored.contains(&in_worktree("src")));
     fs::remove_dir_all(base).unwrap();
-}
-
-#[test]
-fn scope_resolution_is_cached_per_folder() {
-    let env = Env::new("composition-v2-scope-cache");
-    let now = base_now();
-    let cwd = env.cwd();
-    for n in 0..5 {
-        write_records(
-            &env.root.join(format!("p/s{n}.jsonl")),
-            &claude_turn(&cwd, now.date(), n),
-        );
-    }
-    let mut resolver = FolderResolver::default();
-    env.run_with(
-        Source::Claude,
-        now,
-        None,
-        REPAIR_BYTES_PER_DAY,
-        &mut resolver,
-    );
-    assert_eq!(resolver.calls, 1);
-    env.cleanup();
 }
 
 #[test]

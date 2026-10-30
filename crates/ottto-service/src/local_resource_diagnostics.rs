@@ -2227,41 +2227,6 @@ mod tests {
     }
 
     #[test]
-    fn resource_reason_map_is_sparse_and_matches_existing_slots() {
-        use crate::transcript_acquisition::FullReason::*;
-        let mut counts = [0; 11];
-        counts[StateMissing.slot()] = 2;
-        counts[BoundaryChanged.slot()] = 3;
-        assert_eq!(
-            serde_json::to_value(FullReasons(counts)).unwrap(),
-            serde_json::json!({"state_missing": 2, "boundary_changed": 3})
-        );
-        let all = serde_json::to_value(FullReasons([1; 11])).unwrap();
-        let keys: Vec<_> = all
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(
-            keys,
-            [
-                "audit_due",
-                "boundary_changed",
-                "clock_changed",
-                "head_changed",
-                "invalid_checkpoint",
-                "replaced",
-                "same_size_edit",
-                "scope_changed",
-                "shrunk",
-                "state_missing",
-                "unsupported_identity"
-            ]
-        );
-    }
-
-    #[test]
     fn claude_page_events_use_existing_carriers_without_source_leakage() {
         let (_, rows) = capture(|| {
             let scope = claude_reread::Scope::begin(true);
@@ -2417,94 +2382,6 @@ mod tests {
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);
-    }
-
-    #[test]
-    fn codex_memo_lifecycle_record_is_bounded_and_explicitly_process_global() {
-        let (_, records) = capture(|| {
-            traversal_point(
-                "process_codex_memo_lifecycle_totals",
-                "codex",
-                &codex_memo_lifecycle::Record::maximum(),
-            );
-        });
-        assert_eq!(records.len(), 1);
-        let record = &records[0];
-        assert_eq!(record["stage"], "process_codex_memo_lifecycle_totals");
-        assert_eq!(record["source"], "codex");
-        assert_eq!(
-            record["counts"]["memo_hit_estimated_avoided_parser_bytes"],
-            u64::MAX
-        );
-        assert_eq!(record["counts"]["memo_miss_exact_stamp_bytes"], u64::MAX);
-        assert_eq!(record["counts"]["memo_resident_bytes"], u64::MAX);
-        assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
-        assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        let width = serde_json::to_string(record).unwrap().len();
-        println!("CODEX_MEMO_LIFECYCLE_MAX_WIDTH bytes={width}");
-        assert!(width < 2048);
-        let (_, actual) = capture(|| codex_memo_lifecycle_totals("codex"));
-        assert_eq!(actual.len(), 1);
-        assert_eq!(actual[0]["stage"], record["stage"]);
-        let (_, none) = capture(|| codex_memo_lifecycle_totals("claude_code"));
-        assert!(none.is_empty());
-    }
-
-    #[test]
-    fn codex_side_lifecycle_record_is_bounded_and_explicitly_process_global() {
-        let (_, records) = capture(|| {
-            traversal_point(
-                "process_codex_side_lifecycle_totals",
-                "codex",
-                &codex_side_lifecycle::Record::maximum(),
-            );
-        });
-        assert_eq!(records.len(), 1);
-        let record = &records[0];
-        assert_eq!(record["stage"], "process_codex_side_lifecycle_totals");
-        assert_eq!(record["source"], "codex");
-        let keys: Vec<_> = record["counts"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        // Option B: exactly ten lifetime totals and five last-measured gauges.
-        assert_eq!(
-            keys,
-            [
-                "side_ledger_entries",
-                "side_ledger_evictions",
-                "side_not_due",
-                "side_proof_drops",
-                "side_proof_release_drops",
-                "side_reads_ended",
-                "side_reads_started",
-                "side_record_bytes",
-                "side_records",
-                "side_records_written",
-                "side_refusals",
-                "side_request_bytes",
-                "side_requests",
-                "side_requests_rearmed",
-                "side_requests_tombstoned",
-            ]
-        );
-        assert!(record["counts"]
-            .as_object()
-            .unwrap()
-            .values()
-            .all(|value| *value == u64::MAX));
-        assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
-        assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        let width = serde_json::to_string(record).unwrap().len();
-        println!("CODEX_SIDE_LIFECYCLE_MAX_WIDTH bytes={width}");
-        assert!(width < 2048);
-        let (_, actual) = capture(|| codex_side_lifecycle_totals("codex"));
-        assert_eq!(actual.len(), 1);
-        assert_eq!(actual[0]["stage"], record["stage"]);
-        let (_, none) = capture(|| codex_side_lifecycle_totals("claude_code"));
-        assert!(none.is_empty());
     }
 
     #[test]

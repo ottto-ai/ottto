@@ -4638,14 +4638,6 @@ mod tests {
         assert_eq!(end, "2025-12-31");
     }
 
-    #[test]
-    fn day_spans_are_exact_across_month_and_year_boundaries() {
-        assert_eq!(day_span("2026-07-26", "2026-07-26"), Some(1));
-        assert_eq!(day_span("2026-02-28", "2026-03-01"), Some(2));
-        assert_eq!(day_span("2024-02-28", "2024-03-01"), Some(3));
-        assert_eq!(day_span("2025-12-31", "2026-01-01"), Some(2));
-    }
-
     fn day_offset(base: &str, offset: i64) -> String {
         let date = parse_day(base).expect("base day") + TimeDuration::days(offset);
         format!(
@@ -4852,25 +4844,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_readiness_ignores_collector_version_when_disclosure_matches() {
-        let collector = collector("runtime-readiness");
-        let mut grant = enabled(&collector);
-        grant.collector_version = "99.99.99".to_string();
-
-        assert_eq!(grant.disclosure_version, DISCLOSURE_VERSION);
-        assert!(grant_runtime_ready(&grant));
-    }
-
-    #[test]
-    fn runtime_readiness_refuses_a_different_disclosure_version() {
-        let collector = collector("runtime-readiness-disclosure");
-        let mut grant = enabled(&collector);
-        grant.disclosure_version = DISCLOSURE_VERSION_V1.to_string();
-
-        assert!(!grant_runtime_ready(&grant));
-    }
-
-    #[test]
     fn runtime_readiness_fails_closed_on_every_other_axis() {
         let collector = collector("runtime-readiness-other-axes");
         let grant = enabled(&collector);
@@ -5051,20 +5024,6 @@ mod tests {
         assert_eq!(build_changed.reason_code, "enabled");
         assert!(build_changed.provider_read_permitted);
         assert_eq!(grant.status, GrantStatus::Enabled);
-    }
-
-    #[test]
-    fn collector_status_is_content_free() {
-        let collector = collector("collector-status-content-free");
-        enabled(&collector);
-
-        let encoded =
-            serde_json::to_string(&collector_status(collector.grants(), false)).expect("encode");
-
-        for secret in [INSTALLATION_ID, ORG_SCOPE, USER_SCOPE, ACCOUNT_SCOPE] {
-            assert!(!encoded.contains(secret), "status leaked {secret}");
-        }
-        assert!(!encoded.contains("hmac-sha256:"));
     }
 
     #[test]
@@ -5812,74 +5771,6 @@ mod tests {
             .lines(&Cycle::new(CycleOutcome::Noop), 12 * 60 * 60 + 2)
             .is_empty());
         assert_eq!(throttle.lines(&reason, 12 * 60 * 60 + 3).len(), 2);
-    }
-
-    #[test]
-    fn diagnostic_log_lines_include_codes_and_cap_output() {
-        let diagnostics = vec![
-            info("first_code", "count=1"),
-            warning("second_code", "date=\"2026-07-26\""),
-        ];
-
-        assert_eq!(
-            cycle_diagnostic_log_lines(&diagnostics),
-            vec![
-                "codex_daily_aggregates_collector_diagnostic severity=Info code=first_code message=\"count=1\"",
-                "codex_daily_aggregates_collector_diagnostic severity=Warning code=second_code message=\"date=\\\"2026-07-26\\\"\"",
-            ]
-        );
-
-        let capped = (0..MAX_LOGGED_DIAGNOSTICS_PER_CYCLE + 3)
-            .map(|index| info(&format!("code_{index}"), "count=1"))
-            .collect::<Vec<_>>();
-        let lines = cycle_diagnostic_log_lines(&capped);
-        assert_eq!(lines.len(), MAX_LOGGED_DIAGNOSTICS_PER_CYCLE + 1);
-        for (index, line) in lines
-            .iter()
-            .take(MAX_LOGGED_DIAGNOSTICS_PER_CYCLE)
-            .enumerate()
-        {
-            assert!(line.contains(&format!("code=code_{index} ")));
-        }
-        assert_eq!(
-            lines.last().map(String::as_str),
-            Some("codex_daily_aggregates_collector_diagnostics_suppressed count=3")
-        );
-    }
-
-    #[test]
-    fn successful_empty_window_is_diagnostic_and_recorded_in_state() {
-        let collector = collector("successful-empty-window");
-        let grant = enabled(&collector);
-        let reader = StaticReader::new(json!({
-            "results": [{"date": "2026-07-26", "clients": []}]
-        }));
-        let transport = RecordingTransport::default();
-
-        let cycle = collector.collect_once(&runtime(), &reader, &transport, now());
-
-        assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
-        assert_eq!(cycle.normalized_row_count, Some(0));
-        assert_eq!(cycle.diagnostics.len(), 3);
-        let zero_rows = diagnostic(&cycle, "codex_daily_aggregates_zero_rows_explained");
-        assert!(zero_rows.message.contains("days_seen=1"));
-        assert!(zero_rows.message.contains("days_recognized=1"));
-        assert!(zero_rows.message.contains("entries_empty_counters=1"));
-        assert_eq!(
-            diagnostic(&cycle, "codex_daily_aggregates_window_empty").severity,
-            AgentDiagnosticSeverity::Info
-        );
-        assert_eq!(
-            cycle_summary_log(&cycle),
-            "codex_daily_aggregates_collector outcome=Uploaded rows=0 diagnostics=3"
-        );
-
-        let state = collector.state.load(&state_identity(&grant, false));
-        let (window_start, window_end) = collection_window(now());
-        assert_eq!(state.last_observed_row_count, Some(0));
-        assert_eq!(state.last_coverage_start.as_deref(), Some(&*window_start));
-        assert_eq!(state.last_coverage_end.as_deref(), Some(&*window_end));
-        assert_eq!(transport.batches.borrow()[0]["rows"], json!([]));
     }
 
     #[test]

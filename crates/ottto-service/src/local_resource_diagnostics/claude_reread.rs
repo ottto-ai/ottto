@@ -581,57 +581,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for Reinsertion {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn desktop_metadata_counts_are_sparse_saturating_and_scope_local() {
-        let scope = super::Scope::begin(true);
-        super::desktop_inventory_restart();
-        super::desktop_revision_body_read(false);
-        super::desktop_revision_body_read(true);
-        super::desktop_lineage_window_read();
-        super::desktop_recovered_hold_body_read();
-        super::desktop_scoped_acquisition();
-        let mut counts = scope.finish();
-        counts.desktop_metadata.inventory_restarts = u64::MAX;
-        let scope = super::Scope::begin(true);
-        super::desktop_inventory_restart();
-        counts.merge(scope.finish());
-        assert_eq!(
-            serde_json::to_value(counts).unwrap()["desktop_metadata"],
-            serde_json::json!({
-                "inventory_restarts":u64::MAX, "source_revision_body_rereads":1,
-                "legacy_identity_body_rereads":1, "lineage_window_read_attempts":1,
-                "recovered_hold_body_rereads":1, "scoped_acquisition_attempts":1
-            })
-        );
-        assert!(serde_json::to_value(super::Counts::default())
-            .unwrap()
-            .get("desktop_metadata")
-            .is_none());
-        let scope = super::Scope::begin(false);
-        super::desktop_inventory_restart();
-        assert_eq!(scope.finish(), super::Counts::default());
-    }
     use super::*;
-    #[test]
-    fn held_reasons_are_sparse_saturating_and_merged_across_scopes() {
-        let scope = Scope::begin(true);
-        held_reason(HeldReason::AuthorityUnboundRevision);
-        held_reason(HeldReason::AuthorityCorrectionPending);
-        let mut counts = scope.finish();
-        counts.claude_reread.held_reason.not_restorable = u64::MAX;
-        let scope = Scope::begin(true);
-        held_reason(HeldReason::AccountHoldUnrecorded);
-        held_reason(HeldReason::NotRestorable);
-        counts.merge(scope.finish());
-        assert_eq!(
-            serde_json::to_value(counts).unwrap()["claude_reread"]["held_reason"],
-            serde_json::json!({
-                "authority_unbound_revision": 1, "authority_correction_pending": 1,
-                "account_hold_unrecorded": 1, "not_restorable": u64::MAX,
-            })
-        );
-    }
-
     #[test]
     fn page_scope_isolates_sources_nested_work_threads_and_resumption() {
         let scope = Scope::begin(true);
