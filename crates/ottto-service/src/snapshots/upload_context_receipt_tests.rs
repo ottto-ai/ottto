@@ -259,12 +259,16 @@ impl Fixture {
 
 #[test]
 fn codex_incomplete_census_exact_ack_stops_upload_context_for_three_passes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     assert_eq!(f.adopt().files, 1);
     f.assert_quiet();
 }
 #[test]
 fn claude_fresh_index_and_context_change_are_quiet_after_adoption() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     assert_eq!(f.adopt().files, 1);
     f.assert_quiet();
@@ -281,6 +285,8 @@ fn claude_fresh_index_and_context_change_are_quiet_after_adoption() {
 }
 #[test]
 fn claude_source_context_matched_without_receipts_is_quiet_for_three_relists() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     let (_, items) = f.pending();
     f.index.record_accepted_snapshot_fingerprints(
@@ -303,6 +309,8 @@ fn claude_source_context_matched_without_receipts_is_quiet_for_three_relists() {
 }
 #[test]
 fn claude_source_context_matched_mixed_file_is_quiet_for_three_relists() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     let (mut scan, _) = f.walk(false);
     // Model a post-policy file group with two distinct entities, through the
@@ -343,18 +351,24 @@ fn claude_source_context_matched_mixed_file_is_quiet_for_three_relists() {
 }
 #[test]
 fn upload_context_receipt_parse_refused() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.walk(false);
     assert!(f.entry().upload_context_receipt.is_none());
 }
 #[test]
 fn upload_context_receipt_finalize_refused() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.walk(true);
     assert!(f.entry().upload_context_receipt.is_none());
 }
 #[test]
 fn upload_context_receipt_quarantine_refused() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     let (candidates, items) = f.pending();
     let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
@@ -372,6 +386,8 @@ fn upload_context_receipt_quarantine_refused() {
 }
 #[test]
 fn upload_context_receipt_c_ack_after_switch_to_d_refused() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.index
         .activate_file_upload_context(f.source, "c".repeat(64));
@@ -389,6 +405,8 @@ fn upload_context_receipt_c_ack_after_switch_to_d_refused() {
 }
 #[test]
 fn upload_context_receipt_stale_source_witness_refused() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     let (candidates, items) = f.pending();
     let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
@@ -403,6 +421,8 @@ fn upload_context_receipt_stale_source_witness_refused() {
 }
 #[test]
 fn upload_context_receipt_stale_body_witness_refused() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     let (candidates, items) = f.pending();
     let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
@@ -421,6 +441,8 @@ fn upload_context_receipt_stale_body_witness_refused() {
 }
 #[test]
 fn upload_context_receipt_stale_generation_refused() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     let (candidates, items) = f.pending();
     let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
@@ -434,6 +456,8 @@ fn upload_context_receipt_stale_generation_refused() {
 }
 #[test]
 fn upload_context_receipt_partial_entity_ack_refused() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     let (candidates, _) = f.pending();
     assert_eq!(
@@ -445,6 +469,8 @@ fn upload_context_receipt_partial_entity_ack_refused() {
 }
 #[test]
 fn codex_refused_body_backoff_reads_zero_bytes_over_three_relists() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     let (_, items) = f.pending();
     let mut refusal = snapshot_quarantine_record(f.source);
@@ -458,6 +484,8 @@ fn codex_refused_body_backoff_reads_zero_bytes_over_three_relists() {
 }
 #[test]
 fn claude_held_family_backoff_reads_zero_bytes_over_three_relists() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     f.pending();
     let revision = f.entry().source_file_fingerprint.clone();
@@ -468,6 +496,8 @@ fn claude_held_family_backoff_reads_zero_bytes_over_three_relists() {
 }
 #[test]
 fn upload_context_receipt_restart_and_generation_rearm_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     let size = fs::metadata(&f.path).unwrap().len();
     let counts = f.adopt();
@@ -511,6 +541,8 @@ fn upload_context_receipt_restart_and_generation_rearm_once() {
 }
 #[test]
 fn upload_context_receipt_historical_replay_rearms_retained_entry() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.adopt();
     let key = f.key();
@@ -553,14 +585,20 @@ fn legacy_round_trip(version: &str) {
 }
 #[test]
 fn upload_context_receipt_decoder_0_1_201_ignores_field() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     legacy_round_trip("0.1.201");
 }
 #[test]
 fn upload_context_receipt_decoder_0_1_202_round_trip_rearms_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     legacy_round_trip("0.1.202");
 }
 #[test]
 fn upload_context_receipt_current_round_trip_and_size() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.adopt();
     let entry = f.entry();
@@ -579,6 +617,8 @@ fn upload_context_receipt_current_round_trip_and_size() {
 
 #[test]
 fn upload_context_receipt_wrong_ack_body_refused() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     let (candidates, items) = f.pending();
     let mut exact =
@@ -594,6 +634,8 @@ fn upload_context_receipt_wrong_ack_body_refused() {
 }
 #[test]
 fn upload_context_receipt_withheld_after_capture_refused() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     let (candidates, items) = f.pending();
     let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
@@ -611,6 +653,8 @@ fn upload_context_receipt_withheld_after_capture_refused() {
 }
 #[test]
 fn upload_context_receipt_destination_policy_precedes_admission() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     let (mut scan, _) = f.walk(false);
     scan.snapshots[0].session_display_name = Some("Synthetic private title".into());
@@ -638,6 +682,8 @@ fn upload_context_receipt_destination_policy_precedes_admission() {
 
 #[test]
 fn upload_context_receipt_partial_checkpoint_accepts_runtime_fields_and_persists_receipt() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     let previous = f.index.clone();
     let (_, items) = f.pending();
@@ -649,6 +695,8 @@ fn upload_context_receipt_partial_checkpoint_accepts_runtime_fields_and_persists
 }
 #[test]
 fn upload_context_receipt_partial_checkpoint_old_ack_refused() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     let previous = f.index.clone();
     let (_, items) = f.pending();
@@ -659,6 +707,8 @@ fn upload_context_receipt_partial_checkpoint_old_ack_refused() {
 }
 #[test]
 fn upload_context_legacy_activation_preserves_identical_body_noop() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.adopt();
     // The legacy/Pi activation path does not enable file receipts.
@@ -671,6 +721,8 @@ fn upload_context_legacy_activation_preserves_identical_body_noop() {
 }
 #[test]
 fn upload_context_policy_change_reprojects_old_refusal_then_keeps_backoff() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.index
         .activate_file_upload_context(f.source, "c".repeat(64));
@@ -717,6 +769,8 @@ fn upload_context_policy_change_reprojects_old_refusal_then_keeps_backoff() {
 
 #[test]
 fn upload_context_policy_suppressed_file_rearms_on_context_change() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     f.index
         .activate_file_upload_context(f.source, "c".repeat(64));
@@ -736,6 +790,8 @@ fn upload_context_policy_suppressed_file_rearms_on_context_change() {
 
 #[test]
 fn real_uploader_identical_context_change_resends_once_then_three_quiet_relists() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let mut f = Fixture::new(source);
         f.adopt();
@@ -780,6 +836,8 @@ fn uploader_group(f: &mut Fixture, count: usize) -> Vec<SnapshotItem> {
 }
 #[test]
 fn real_uploader_restart_mid_context_catchup_never_resends_reacked_entities() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     let empty = f.index.clone();
     let items = uploader_group(&mut f, 51);
@@ -832,6 +890,8 @@ fn real_uploader_restart_mid_context_catchup_never_resends_reacked_entities() {
 }
 #[test]
 fn real_uploader_same_context_transport_retry_has_zero_context_resends() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     let previous = f.index.clone();
     let items = uploader_group(&mut f, 51);
@@ -859,6 +919,8 @@ fn real_uploader_same_context_transport_retry_has_zero_context_resends() {
 }
 #[test]
 fn real_uploader_old_unstamped_progress_with_equal_source_context_resends_nothing() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     let previous = f.index.clone();
     let (_, items) = f.pending();
@@ -888,6 +950,8 @@ fn real_uploader_old_unstamped_progress_with_equal_source_context_resends_nothin
 }
 #[test]
 fn real_uploader_new_usage_precedes_pending_context_catchup() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     f.adopt();
     let previous = f.index.clone();
@@ -912,6 +976,8 @@ fn real_uploader_new_usage_precedes_pending_context_catchup() {
 }
 #[test]
 fn real_uploader_not_stored_backs_off_but_growth_earns_receipt() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     f.adopt();
     f.index
@@ -962,6 +1028,8 @@ fn real_uploader_not_stored_backs_off_but_growth_earns_receipt() {
 }
 #[test]
 fn real_uploader_duplicate_refusal_mints_nothing_and_does_not_loop() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     f.adopt();
     f.index
@@ -993,6 +1061,8 @@ fn real_uploader_duplicate_refusal_mints_nothing_and_does_not_loop() {
 }
 #[test]
 fn real_uploader_privacy_reducing_context_uses_destination_policy() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     let previous = f.index.clone();
     let (mut scan, _) = f.walk(false);
@@ -1041,6 +1111,8 @@ fn real_uploader_privacy_reducing_context_uses_destination_policy() {
 
 #[test]
 fn real_uploader_context_catchup_spends_only_budget_left_after_new_usage() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let mut f = Fixture::new(source);
         let empty = f.index.clone();
@@ -1119,6 +1191,8 @@ fn real_uploader_context_catchup_spends_only_budget_left_after_new_usage() {
 /// file must get its real ACK/receipt in the same page as its sole body parse.
 #[test]
 fn real_scan_context_catchup_reads_each_file_once_across_many_passes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let mut f = Fixture::new(source);
         let template = fs::read_to_string(&f.path).unwrap();
@@ -1273,6 +1347,8 @@ fn real_scan_context_catchup_reads_each_file_once_across_many_passes() {
 
 #[test]
 fn real_scan_joined_codex_context_catchup_admits_the_whole_alias_unit() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (root, _) = codex_file_join::tests::counting_v2_fixture();
     let _cutover = codex_counting_version::TestCutover::set(0);
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -1338,6 +1414,8 @@ fn real_scan_joined_codex_context_catchup_admits_the_whole_alias_unit() {
 
 #[test]
 fn real_scan_oversized_context_unit_gets_all_fresh_acks_without_reparse() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     let previous = f.index.clone();
     let (mut scan, _) = f.walk(false);
@@ -1420,6 +1498,8 @@ fn real_scan_oversized_context_unit_gets_all_fresh_acks_without_reparse() {
 
 #[test]
 fn real_scan_ordinary_codex_group_precedes_context_group_under_read_cap() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (root, _) = codex_file_join::tests::counting_v2_fixture();
     let _cutover = codex_counting_version::TestCutover::set(0);
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -1684,15 +1764,21 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
 }
 #[test]
 fn real_scan_new_unhinted_singleton_precedes_context_group_at_file_limit_two() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     ordinary_singleton_precedes_context_group(false);
 }
 #[test]
 fn real_scan_same_size_rewrite_precedes_context_group_at_file_limit_two() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     ordinary_singleton_precedes_context_group(true);
 }
 
 #[test]
 fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_group() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (root, _) = codex_file_join::tests::counting_v2_fixture();
     let _cutover = codex_counting_version::TestCutover::set(0);
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -1999,6 +2085,8 @@ fn c1_retained_mixed_file() -> (Fixture, SnapshotItem) {
 
 #[test]
 fn c1_mixed_current_context_holds_three_relists_with_zero_body_reads() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (mut f, refused) = c1_retained_mixed_file();
     let persisted = serde_json::to_value(&f.index).unwrap();
     f.uploader
@@ -2021,6 +2109,8 @@ fn c1_mixed_current_context_holds_three_relists_with_zero_body_reads() {
 
 #[test]
 fn c1_privacy_reduction_never_holds_old_context_siblings() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (mut f, refused) = c1_retained_mixed_file();
     f.uploader.policy = SnapshotUploadPolicy {
         session_titles_enabled: false,
@@ -2059,6 +2149,8 @@ fn c1_privacy_reduction_never_holds_old_context_siblings() {
 
 #[test]
 fn c1_terminal_ends_hold_and_destination_siblings_rearm_once_then_quiet() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (mut f, refused) = c1_retained_mixed_file();
     f.uploader.hold_body(&mut f.index, &refused, true);
     f.uploader
@@ -2093,6 +2185,8 @@ fn c1_terminal_ends_hold_and_destination_siblings_rearm_once_then_quiet() {
 
 #[test]
 fn c1_missing_current_stamp_or_cleared_source_never_holds_a_context_move() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (mut f, _) = c1_retained_mixed_file();
     f.uploader.forget_stamps();
     f.uploader
@@ -2116,6 +2210,8 @@ fn c1_missing_current_stamp_or_cleared_source_never_holds_a_context_move() {
 
 #[test]
 fn c1_hold_count_uses_prepared_cooldown_and_lease_views() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (mut f, refused) = c1_retained_mixed_file();
     let entity = refused.snapshot_fingerprint.clone();
     let record = f
@@ -2158,6 +2254,8 @@ fn c1_hold_count_uses_prepared_cooldown_and_lease_views() {
 
 #[test]
 fn terminal_off_receipt_context_move_uses_paced_catchup_then_three_quiet_walks() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     let original = fs::read_to_string(&f.path).unwrap();
     for session in [
@@ -2222,6 +2320,8 @@ fn terminal_off_receipt_context_move_uses_paced_catchup_then_three_quiet_walks()
 
 #[test]
 fn terminal_off_context_mismatch_cannot_wake_parked_key_until_stat_change() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     sampled_audit::reset_open_backoff_for_test();
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     assert_eq!(f.adopt().files, 1);
@@ -2343,6 +2443,8 @@ fn b1_quiet_preparations(f: &mut Fixture, now: u64) {
 
 #[test]
 fn terminal_off_empty_and_three_normal_files_stay_quiet_then_context_rereads_empty_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     f.index.upload_context_fingerprint = None; // Actual fresh source-wide context.
     let empty = f.root.join("019fa111-2222-7333-8444-888888888888.jsonl");
@@ -2400,40 +2502,72 @@ fn terminal_off_empty_and_three_normal_files_stay_quiet_then_context_rereads_emp
         TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST.with(std::cell::Cell::get),
         reparses
     );
+    let original_bodies = scan
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                snapshot_upload_body_witness(item),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     f.uploader
         .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
     assert!(!terminal_off_empty_context_seen(&f.index, &key));
-    let previous = f.index.clone();
-    let ((changed, _), reads) = terminal_contract_retry::source_acquisitions(|| {
-        sampled_scan::with_test_now(now + 6, || f.walk(true))
-    });
-    assert_eq!(
-        reads
+    let mut accepted = 0;
+    let mut inputs = 0;
+    let mut outputs = 0;
+    let mut seen = BTreeSet::new();
+    let mut empty_reads = 0;
+    // #901's existing context-read/wire allowance services one ordinary
+    // catch-up file per page here. Drain real pages; do not widen the budget.
+    for pass in 0..3 {
+        f.uploader
+            .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
+        let previous = f.index.clone();
+        let ((changed, _), reads) = terminal_contract_retry::source_acquisitions(|| {
+            sampled_scan::with_test_now(now + 6 + pass, || f.walk(true))
+        });
+        empty_reads += reads
             .iter()
             .filter(|(path, _)| *path == &empty)
-            .map(|(_, count)| count)
-            .sum::<usize>(),
-        1,
-        "one empty read under E"
-    );
+            .map(|(_, n)| n)
+            .sum::<usize>();
+        for item in &changed.snapshots {
+            assert!(
+                seen.insert(item.source_session_id.clone()),
+                "each ordinary body once under E"
+            );
+            assert_eq!(
+                snapshot_upload_body_witness(item),
+                original_bodies[&item.source_session_id],
+                "context pacing never changes the body"
+            );
+            inputs += item.input_tokens;
+            outputs += item.output_tokens;
+        }
+        accepted += f
+            .uploader
+            .send(f.source, &mut f.index, &previous, &changed.snapshots)
+            .unwrap()
+            .0;
+        assert!(!changed.census_complete);
+    }
+    assert_eq!(accepted, 3, "all three real exact ACKs, across paced pages");
+    assert_eq!(seen.len(), 3);
+    assert_eq!((inputs, outputs), (36, 12));
+    assert_eq!(empty_reads, 1, "one empty read under E across the drain");
     assert_eq!(
         TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST.with(std::cell::Cell::get) - reparses,
         1
     );
-    assert_eq!(
-        f.uploader
-            .send(f.source, &mut f.index, &previous, &changed.snapshots)
-            .unwrap()
-            .0,
-        3
-    );
-    b1_quiet_preparations(&mut f, now + 6);
+    b1_quiet_preparations(&mut f, now + 8);
     assert!(
         f.index.upload_context_fingerprint.is_none(),
         "source context still unadopted"
     );
     assert!(f.index.files[&key].upload_context_receipt.is_none());
-    assert!(!changed.census_complete);
     assert_eq!(
         with_terminal_off_empty_contexts(|memo| memo.evictions),
         saved_evictions
@@ -2442,6 +2576,8 @@ fn terminal_off_empty_and_three_normal_files_stay_quiet_then_context_rereads_emp
 
 #[test]
 fn terminal_off_held_history_without_body_witness_does_not_force_rediscovery() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     f.index.upload_context_fingerprint = None;
     f.index.activate_effective_upload_body_witness_revision(2);
@@ -2484,6 +2620,8 @@ fn terminal_off_held_history_without_body_witness_does_not_force_rediscovery() {
 
 #[test]
 fn terminal_off_empty_memo_requires_finalization_and_cannot_mask_cleared_debt() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     fs::write(
         &f.path,
