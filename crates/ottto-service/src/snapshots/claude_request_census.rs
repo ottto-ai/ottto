@@ -843,6 +843,18 @@ fn walk_deadline_forced(walk: u8) -> bool {
     WALK_DEADLINE_FOR_TEST.with(std::cell::Cell::get) & walk != 0
 }
 
+// Test seam: derive scans (`release_aged` calls) on this thread.
+#[cfg(test)]
+thread_local! {
+    static DERIVE_SCANS_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Derive scans (`release_aged` calls) run on this thread so far.
+#[cfg(test)]
+pub(crate) fn derive_scans_for_test() -> u64 {
+    DERIVE_SCANS_FOR_TEST.with(std::cell::Cell::get)
+}
+
 /// Why an insert did not store the record as given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClaudeRequestCensusInsert {
@@ -1197,6 +1209,8 @@ impl ClaudeRequestCensus {
         cutoff: u64,
         fits: &dyn Fn(usize, usize) -> bool,
     ) -> (u64, u64) {
+        #[cfg(test)]
+        DERIVE_SCANS_FOR_TEST.with(|scans| scans.set(scans.get() + 1));
         let count = self
             .records
             .iter()
@@ -2852,6 +2866,9 @@ fn insert_transcript_record(
     if census.records.len() >= MAX_CLAUDE_REQUEST_CENSUS_RECORDS
         && !census.records.contains_key(key)
     {
+        // Under #915 this refusal must mark the key lost (~lost), as an
+        // insert `Refused` does, so the #915 merge must keep it here.
+        note_record_limit_refused();
         return ClaudeRequestCensusInsert::Refused;
     }
     let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
@@ -2977,10 +2994,21 @@ fn note_kept_overlap(retirement: TranscriptRetirement, missing_over_budget: usiz
                 hashes: retirement.kept_overlap_hashes,
                 overflow_occupancy: retirement.overflow_occupancy,
                 overflow_admission: 0,
+                record_limit_refused: 0,
                 missing_over_budget: Some(missing_over_budget as u64),
             },
         );
     }
+}
+
+/// Records a new key refused at the live census record bound.
+fn note_record_limit_refused() {
+    crate::local_resource_diagnostics::claude_census_retire_kept_overlap(
+        crate::local_resource_diagnostics::CensusRetireKeptOverlapCounts {
+            record_limit_refused: 1,
+            ..Default::default()
+        },
+    );
 }
 
 /// Records an insert released for admission (`release_aged`): aged

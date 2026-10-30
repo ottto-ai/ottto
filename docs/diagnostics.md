@@ -396,7 +396,11 @@ record that does not fit whole first retires, oldest first, the records the
 age rule would retire at that window but that still hold their hashes, only
 as many as it needs. Each such insert emits a row with zero kept counts, no
 `census_missing_over_budget`, and the records it retired as admission
-overflow. A positive overflow, by either reason, also emits
+overflow. The census holds at most 65,536 records, live as on load: a new
+transcript key past that gets no record (read as missing) and emits a row
+with `census_record_limit_refused` = 1 and no `census_missing_over_budget`.
+Every row carries `census_record_limit_refused` and its `_total`. A positive
+overflow, by either reason, also emits
 `claude_census_retire_kept_overlap_alarm` with the same counts. Each terminal
 decides again, so a kept record retires once its partner is pruned or
 retired. Counts only; no path, id or wire event.

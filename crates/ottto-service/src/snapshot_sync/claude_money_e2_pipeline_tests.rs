@@ -2676,6 +2676,9 @@ fn e2_pipeline_kept_stock_yields_to_a_growing_holder() {
             census.hash_total_for_test(),
             crate::snapshots::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_HASHES
         );
+        // The next page loads the saved index from disk, as production does:
+        // nothing the terminal derived survives in memory.
+        let prior = c.reload(&mut prior);
 
         // 2. and 3. The young holder grows by one request: the oldest kept
         // record retires so its record fits whole.

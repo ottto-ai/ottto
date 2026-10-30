@@ -3,11 +3,12 @@
 use super::*;
 use crate::snapshots::claude_request_census::{
     claude_census_disjointness_complete, claude_census_member_status, decode_ledger_shard,
-    is_ledger_key, message_key, telemetry_key, ClaudeCensusMemberStatus, ClaudeFamilyMemo,
-    ClaudeLedgerSweep, ClaudeRequestBirth, ClaudeRequestCensus, ClaudeRequestCensusInsert,
-    ClaudeRequestCensusRecord, ClaudeRequestCensusShape, ClaudeTelemetryAudit,
-    ClaudeTelemetryTailState, MAX_CLAUDE_REQUEST_CENSUS_HASHES, MAX_CLAUDE_REQUEST_CENSUS_RECORDS,
-    MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES, TELEMETRY_KEY_PREFIX,
+    derive_scans_for_test, is_ledger_key, message_key, telemetry_key, ClaudeCensusMemberStatus,
+    ClaudeFamilyMemo, ClaudeLedgerSweep, ClaudeRequestBirth, ClaudeRequestCensus,
+    ClaudeRequestCensusInsert, ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+    ClaudeTelemetryAudit, ClaudeTelemetryTailState, MAX_CLAUDE_REQUEST_CENSUS_HASHES,
+    MAX_CLAUDE_REQUEST_CENSUS_RECORDS, MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES,
+    TELEMETRY_KEY_PREFIX,
 };
 const MONEY_WINDOW: &str = "2026-08-02T09:00:00Z";
 
@@ -400,6 +401,7 @@ fn kept_overlap(rows: &[serde_json::Value], stage: &str) -> Option<(u64, u64, u6
         counts["census_retire_kept_overflow"],
         counts["census_retire_kept_overflow_occupancy"]
     );
+    assert_eq!(counts["census_record_limit_refused"], 0);
     assert!(counts.values().all(serde_json::Value::is_u64));
     assert!(
         !row.to_string().contains("/money/"),
@@ -415,9 +417,12 @@ fn kept_overlap(rows: &[serde_json::Value], stage: &str) -> Option<(u64, u64, u6
 
 /// A terminal row's counts: the kept records, the overflow (occupancy and
 /// admission) and the terminal's census-full tombstones, with process
-/// totals. An admission row has all but `census_missing_over_budget`.
-const KEPT_OVERLAP_COUNTS: [&str; 11] = [
+/// totals, and the new keys refused at the live record bound. An admission
+/// or refusal row has all but `census_missing_over_budget`.
+const KEPT_OVERLAP_COUNTS: [&str; 13] = [
     "census_missing_over_budget",
+    "census_record_limit_refused",
+    "census_record_limit_refused_total",
     "census_retire_kept_overflow",
     "census_retire_kept_overflow_admission",
     "census_retire_kept_overflow_admission_total",
@@ -709,6 +714,7 @@ fn admission_overflow(rows: &[serde_json::Value], stage: &str) -> u64 {
         counts["census_retire_kept_overflow"],
         counts["census_retire_kept_overflow_admission"]
     );
+    assert_eq!(counts["census_record_limit_refused"], 0);
     counts["census_retire_kept_overflow_admission"]
         .as_u64()
         .unwrap()
@@ -723,10 +729,12 @@ fn census_admission_releases_kept_records_oldest_first() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     let (mut index, [holder, copy, young]) = admission_index(60, false, true);
+    let scans = derive_scans_for_test();
     let (outcome, rows) = crate::local_resource_diagnostics::capture(|| {
         index.insert_transcript_record_for_test(&young, young_parse(vec![100, 101]), window)
     });
     assert_eq!(outcome, ClaudeRequestCensusInsert::Stored);
+    assert_eq!(derive_scans_for_test(), scans + 1, "one derive scan");
     for stage in [
         "claude_census_retire_kept_overlap",
         "claude_census_retire_kept_overlap_alarm",
@@ -884,10 +892,16 @@ fn census_admission_with_room_releases_nothing() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     let (mut index, [holder, copy, young]) = admission_index(60, false, false);
+    let scans = derive_scans_for_test();
     let (outcome, rows) = crate::local_resource_diagnostics::capture(|| {
         index.insert_transcript_record_for_test(&young, young_parse(vec![100, 101]), window)
     });
     assert_eq!(outcome, ClaudeRequestCensusInsert::Stored);
+    assert_eq!(
+        derive_scans_for_test(),
+        scans,
+        "a record that fits runs no derive scan"
+    );
     assert!(rows.is_empty(), "counts 0: nothing released");
     let census = index.claude_request_census_for_test();
     for (key, hashes) in [(&holder, [1, 2]), (&copy, [2, 3])] {
@@ -896,6 +910,66 @@ fn census_admission_with_room_releases_nothing() {
         assert_eq!(record.request_hashes_for_test(), &hashes);
     }
     assert_eq!(census.hash_total_for_test(), KEEP_OCCUPANCY + 1);
+}
+
+/// Round 5 condition 3: the release needs no state from the terminal's
+/// page. The index is saved after the terminal and loaded back from disk,
+/// as the next page does (`ScanIndex::load`) and as a restarted daemon does
+/// (the source-aware load); the holder is still released at admission and
+/// the grown record fits.
+#[test]
+fn census_admission_release_survives_reload_and_restart() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
+    for restart in [false, true] {
+        let (mut index, [holder, copy, young]) = admission_index(60, false, true);
+        let scratch = crate::test_scratch::ScratchDir::new("census-admission-reload");
+        let path = scratch.join("index.json");
+        index.save(&path).expect("save index");
+        drop(index);
+        let mut index = if restart {
+            ScanIndex::load_for_snapshot_source_with_origin(
+                &path,
+                SnapshotSource::ClaudeCode,
+                &scratch,
+            )
+            .expect("restart load")
+            .0
+        } else {
+            ScanIndex::load(&path).expect("page load")
+        };
+        assert_eq!(
+            index.claude_request_census_for_test().hash_total_for_test(),
+            MAX_CLAUDE_REQUEST_CENSUS_HASHES,
+            "restart {restart}"
+        );
+        let (outcome, rows) = crate::local_resource_diagnostics::capture(|| {
+            index.insert_transcript_record_for_test(&young, young_parse(vec![100, 101]), window)
+        });
+        assert_eq!(
+            outcome,
+            ClaudeRequestCensusInsert::Stored,
+            "restart {restart}"
+        );
+        assert_eq!(
+            admission_overflow(&rows, "claude_census_retire_kept_overlap_alarm"),
+            1,
+            "restart {restart}"
+        );
+        let census = index.claude_request_census_for_test();
+        let record = |key: &str| census.record_for_test(key).unwrap();
+        assert_eq!(
+            record(&holder).retired_for_test(),
+            Some(2),
+            "restart {restart}"
+        );
+        assert_eq!(record(&copy).retired_for_test(), None, "restart {restart}");
+        assert_eq!(
+            record(&young).request_hashes_for_test(),
+            &[100, 101],
+            "restart {restart}"
+        );
+    }
 }
 
 /// Lead B NO-GO item 6: kept stock is bounded by occupancy, not by a fixed
@@ -965,15 +1039,32 @@ fn census_live_insert_mirrors_the_decoder_record_bound() {
         );
     }
     let new = "/money/projects/new.jsonl";
-    assert_eq!(
-        index.insert_transcript_record_for_test(new, money_record('b', vec![7]), window),
-        ClaudeRequestCensusInsert::Refused
+    let (outcome, rows) = crate::local_resource_diagnostics::capture(|| {
+        index.insert_transcript_record_for_test(new, money_record('b', vec![7]), window)
+    });
+    assert_eq!(outcome, ClaudeRequestCensusInsert::Refused);
+    let [row] = rows.as_slice() else {
+        panic!("one refusal row: {rows:?}");
+    };
+    assert_eq!(row["stage"], "claude_census_retire_kept_overlap");
+    let counts = row["counts"].as_object().expect("counts");
+    let mut names = counts.keys().map(String::as_str).collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names.as_slice(), &KEPT_OVERLAP_COUNTS[1..]);
+    assert_eq!(counts["census_record_limit_refused"], 1);
+    assert!(
+        counts["census_record_limit_refused_total"]
+            .as_u64()
+            .unwrap()
+            >= 1
     );
+    assert_eq!(counts["census_retire_kept_overflow"], 0, "no alarm");
     let held = "/money/projects/r0.jsonl";
-    assert_eq!(
-        index.insert_transcript_record_for_test(held, money_record('b', vec![7]), window),
-        ClaudeRequestCensusInsert::Stored
-    );
+    let (outcome, rows) = crate::local_resource_diagnostics::capture(|| {
+        index.insert_transcript_record_for_test(held, money_record('b', vec![7]), window)
+    });
+    assert_eq!(outcome, ClaudeRequestCensusInsert::Stored);
+    assert!(rows.is_empty(), "a held key is not refused");
     let census = index.claude_request_census_for_test();
     assert!(census.record_for_test(new).is_none(), "read as missing");
     assert_eq!(
