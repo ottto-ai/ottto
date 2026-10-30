@@ -284,6 +284,7 @@ fn preexisting_v3_on_unsupported_layout_reads_only_selected_key_and_keeps_active
             "the settled quiet key is not selected"
         );
         assert_eq!(quiet.bytes, 0, "unselected quiet key reads nothing");
+        assert_eq!(fs::read(&record).unwrap(), original);
         f.select_audit(&mut read.index);
         let mut next = f.scan(read.index, Some(cache.clone()));
         assert_eq!(
@@ -294,10 +295,11 @@ fn preexisting_v3_on_unsupported_layout_reads_only_selected_key_and_keeps_active
         f.settle(&cache, &mut next);
         let (counts, disk) = cache.durable_counters(SOURCE).unwrap();
         assert_eq!(
-            counts.ineligible["restore_unavailable.layout"], 1,
-            "no second unavailable-A fallback"
+            counts.ineligible["restore_unavailable.layout"], 2,
+            "the active record survives; each real selection counts its unavailable-layout fallback"
         );
         assert_eq!(disk.restore_unavailable_layout_gc, 0);
+        assert_eq!(fs::read(&record).unwrap(), original);
     });
 }
 
