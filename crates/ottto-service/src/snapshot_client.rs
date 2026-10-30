@@ -3626,6 +3626,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn context_curve_capability_defaults_off_and_requires_exact_contract() {
+        let old_backend: ActivityHintResponse =
+            serde_json::from_str(&activity_hint_json("")).expect("old activity hint");
+        assert_eq!(old_backend.session_context_curve_contract, None);
+
+        let admitted: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
+            r#", "session_context_curve_contract":"session_context_curve:v1""#,
+        ))
+        .expect("curve-capable activity hint");
+        assert_eq!(
+            admitted.session_context_curve_contract.as_deref(),
+            Some("session_context_curve:v1")
+        );
+    }
+
+    /// The `census_residue` admission follows the same fail-closed contract
+    /// shape as the curve capability: absent, null, and any other token all
+    /// read as "not admitted", and only the exact token admits.
+    #[test]
+    fn census_residue_status_admission_defaults_off_and_requires_exact_contract() {
+        let old_backend: ActivityHintResponse =
+            serde_json::from_str(&activity_hint_json("")).expect("old activity hint");
+        assert_eq!(old_backend.census_residue_status_contract, None);
+
+        let explicit_null: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
+            r#", "census_residue_status_contract":null"#,
+        ))
+        .expect("null admission");
+        assert_eq!(explicit_null.census_residue_status_contract, None);
+
+        let admitted: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
+            r#", "census_residue_status_contract":"census_residue_status:v1""#,
+        ))
+        .expect("residue-admitting activity hint");
+        assert_eq!(
+            admitted.census_residue_status_contract.as_deref(),
+            Some(CENSUS_RESIDUE_STATUS_CONTRACT)
+        );
+        assert_eq!(CENSUS_RESIDUE_STATUS_CONTRACT, "census_residue_status:v1");
+        assert_eq!(CENSUS_RESIDUE_ERROR_CODE, "census_residue");
+    }
+
+    /// The retired contract-5 cohort token still decodes as sent: absent and
+    /// null read as none, any string is kept verbatim (and never read).
+    #[test]
+    fn request_identity_cohort_token_defaults_off_and_is_kept_verbatim() {
+        for extra in ["", r#", "session_request_identity_contract":null"#] {
+            let hint: ActivityHintResponse =
+                serde_json::from_str(&activity_hint_json(extra)).expect("activity hint");
+            assert_eq!(hint.session_request_identity_contract, None);
+        }
+        for token in [
+            "own_request_identity_rows:v1",
+            "claude_code_jsonl:own_request_identity_rows:v1",
+            "unknown",
+        ] {
+            let hint: ActivityHintResponse = serde_json::from_str(&activity_hint_json(&format!(
+                r#", "session_request_identity_contract":"{token}""#
+            )))
+            .expect("token-bearing activity hint");
+            assert_eq!(
+                hint.session_request_identity_contract.as_deref(),
+                Some(token)
+            );
+        }
+    }
+
     /// An older daemon's terminal-status journal predates the residue fields.
     /// It must still reload — with the residue absent, not as a parse error —
     /// so a daemon upgrade never strands the last committed receipt.
