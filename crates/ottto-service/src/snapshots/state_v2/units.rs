@@ -243,6 +243,7 @@ pub(super) struct Planner {
     keys: BTreeSet<RowKey>,
     scope_count: usize,
     metadata_bytes: usize,
+    custody_reserve: Charge,
 }
 impl Planner {
     pub(super) fn new(identity: Identity, generation: u64, schedule: Schedule) -> Self {
@@ -254,7 +255,14 @@ impl Planner {
             keys: BTreeSet::new(),
             scope_count: 0,
             metadata_bytes: 0,
+            custody_reserve: Charge::default(),
         }
+    }
+    /// Reserve bounded manifest replacement before selecting semantic work.
+    /// Payloads are already durably staged; their future deletion is separate GC.
+    pub(super) fn reserve_custody(&mut self, change: Change) -> Result<()> {
+        self.custody_reserve = change.charge()?;
+        Ok(())
     }
     /// All resources joined by a fragment are inseparable. File advancement,
     /// shared family evidence, census and ACK transitions declare every scope.
@@ -379,7 +387,12 @@ impl Planner {
         let mut cursor = self.schedule.cursor;
         let mut holds = BTreeMap::new();
         for unit in &ordered {
-            if !unit.charge.add(Charge::reserve())?.fits(Charge::hard()) {
+            if !unit
+                .charge
+                .add(Charge::reserve())?
+                .add(self.custody_reserve)?
+                .fits(Charge::hard())
+            {
                 holds.insert(unit.token, UnitHold::HardCeiling);
             }
         }
@@ -387,7 +400,10 @@ impl Planner {
         let mut stage_bytes = 0;
         let mut selected_units = 0;
         for unit in ordered {
-            let alone = unit.charge.add(Charge::reserve())?;
+            let alone = unit
+                .charge
+                .add(Charge::reserve())?
+                .add(self.custody_reserve)?;
             if !alone.fits(Charge::hard()) {
                 if selected_units == 0 {
                     cursor = Some(unit.token);
@@ -395,7 +411,7 @@ impl Planner {
                 continue;
             }
             let proposed = charge.add(unit.charge)?;
-            if !proposed.fits(Charge::target()) && selected_units != 0 {
+            if !proposed.add(self.custody_reserve)?.fits(Charge::target()) && selected_units != 0 {
                 break;
             }
             let data_bytes = unit.changes.iter().try_fold(0_u64, |n, c| -> Result<u64> {
@@ -409,7 +425,7 @@ impl Planner {
             for change in unit.changes {
                 selected.insert(change.key()?.clone(), change);
             }
-            if !charge.fits(Charge::target()) {
+            if !charge.add(self.custody_reserve)?.fits(Charge::target()) {
                 break;
             }
         }

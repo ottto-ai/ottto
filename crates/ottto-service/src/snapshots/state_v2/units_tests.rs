@@ -513,3 +513,33 @@ fn journal_off_import_cannot_borrow_rollback_based_unit_admission() {
     let mut db = sqlite::Sqlite::create_import(&scratch.path()).unwrap();
     assert!(db.begin_selected(plan().select().unwrap()).is_err());
 }
+
+#[test]
+fn named_hard_hold_survives_schedule_reopen_without_starving_independent_work() {
+    let s = Scratch::new();
+    let mut db = s.store();
+    for generation in 0..2 {
+        let schedule = Schedule::read(&mut db.begin(TxnMode::Read).unwrap()).unwrap();
+        let mut planner = Planner::new(identity(), generation, schedule);
+        add(&mut planner, "oversized", vec![scope(1)], HARD_BYTES);
+        let safe = format!("safe-{generation}");
+        add(&mut planner, &safe, vec![scope(3)], 0);
+        let selection = planner.select().unwrap();
+        assert_eq!(
+            selection.holds().values().copied().collect::<Vec<_>>(),
+            [UnitHold::HardCeiling]
+        );
+        assert_eq!(selection.selected_units, 1);
+        let mut tx = db.begin_selected(selection).unwrap();
+        write(&mut tx, &header(&safe, 1));
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+        drop(db);
+        db = sqlite::Sqlite::open(&s.path(), &identity()).unwrap();
+        db.path_extractor(|_, _, _| Ok(()));
+        let schedule = Schedule::read(&mut db.begin(TxnMode::Read).unwrap()).unwrap();
+        assert_eq!((schedule.held, schedule.deferred), (1, 1));
+    }
+}

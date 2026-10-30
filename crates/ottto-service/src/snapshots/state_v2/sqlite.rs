@@ -1076,6 +1076,26 @@ impl Sqlite {
     }
 }
 impl Sqlite {
+    /// Durable inert payload staging under the existing owner. Generation and
+    /// semantic controls stay unchanged; the manifest is the activation point.
+    pub(super) fn stage_custody(
+        &mut self,
+        selection: units::Selection,
+        rows: &super::units_graph::RowPlan,
+    ) -> Result<()> {
+        ensure!(rows.inert(), "state_v2_inert_custody_only");
+        let generation = selection.generation;
+        self.validate_selection(&selection)?;
+        let mut tx = self.begin_selected_inner(selection, true)?;
+        rows.apply(&mut tx)?;
+        ensure!(
+            tx.commit_inner(generation, generation, true)
+                == DurableCommitOutcome::Committed(generation),
+            "state_v2_inert_custody_requires_reload"
+        );
+        telemetry::event("unit_custody_staged", &1);
+        Ok(())
+    }
     pub(super) fn validate_selection(&mut self, selection: &units::Selection) -> Result<()> {
         ensure!(
             self.stamp()?.0 == selection.generation,
@@ -1097,6 +1117,13 @@ impl Sqlite {
     /// Ordinary callers keep their existing conservative transaction limits.
     #[allow(dead_code)] // Complete mapper plans are required before enabling publication.
     pub(super) fn begin_selected(&mut self, selection: units::Selection) -> Result<Txn<'_>> {
+        self.begin_selected_inner(selection, false)
+    }
+    fn begin_selected_inner(
+        &mut self,
+        selection: units::Selection,
+        inert: bool,
+    ) -> Result<Txn<'_>> {
         ensure!(!self.import, "state_v2_unit_requires_live_store");
         let mut tx = self.begin(TxnMode::Write)?;
         ensure!(
@@ -1108,17 +1135,24 @@ impl Sqlite {
             units::Schedule::read(&mut tx)? == selection.prior_schedule,
             "state_v2_unit_stale_schedule"
         );
-        telemetry::event("unit_selected", &selection.selected_units);
-        telemetry::event("unit_deferred", &selection.deferred());
-        telemetry::event(
-            "unit_charge_rows_bytes_pages",
-            &selection.diagnostic_charge(),
-        );
-        if selection.held != 0 {
-            telemetry::event("unit_oversize_alarm", &selection.held);
-        }
-        if selection.windows_alarm != 0 {
-            telemetry::event("account_windows_alarm", &selection.windows_alarm);
+        if inert {
+            telemetry::event(
+                "unit_custody_charge_rows_bytes_pages",
+                &selection.diagnostic_charge(),
+            );
+        } else {
+            telemetry::event("unit_selected", &selection.selected_units);
+            telemetry::event("unit_deferred", &selection.deferred());
+            telemetry::event(
+                "unit_charge_rows_bytes_pages",
+                &selection.diagnostic_charge(),
+            );
+            if selection.held != 0 {
+                telemetry::event("unit_oversize_alarm", &selection.held);
+            }
+            if selection.windows_alarm != 0 {
+                telemetry::event("account_windows_alarm", &selection.windows_alarm);
+            }
         }
         tx.admission = Some(selection.admission());
         Ok(tx)
@@ -1576,17 +1610,35 @@ impl Transaction for Txn<'_> {
             limit,
         )
     }
-    fn commit(mut self, expected: u64, next: u64) -> DurableCommitOutcome {
+    fn commit(self, expected: u64, next: u64) -> DurableCommitOutcome {
+        self.commit_inner(expected, next, false)
+    }
+}
+
+impl Txn<'_> {
+    fn commit_inner(mut self, expected: u64, next: u64, inert: bool) -> DurableCommitOutcome {
         let result = (|| -> Result<()> {
             ensure!(
                 self.write
                     && !self.failed
-                    && next
-                        == expected
-                            .checked_add(1)
-                            .ok_or_else(|| anyhow::anyhow!("state_v2_generation_overflow"))?,
+                    && (inert && next == expected
+                        || next
+                            == expected
+                                .checked_add(1)
+                                .ok_or_else(|| anyhow::anyhow!("state_v2_generation_overflow"))?),
                 "state_v2_generation_order"
             );
+            if inert {
+                ensure!(
+                    !self.changed.is_empty()
+                        && self
+                            .changed
+                            .iter()
+                            .all(|(key, after)| super::units_graph::is_payload(key)
+                                && after.is_some()),
+                    "state_v2_inert_custody_only"
+                );
+            }
             if let Some(admission) = self.admission.take() {
                 ensure!(
                     expected == admission.generation(),
@@ -1595,12 +1647,14 @@ impl Transaction for Txn<'_> {
                 admission.complete(&mut self)?;
                 let schedule = admission.schedule().clone();
                 self.admission = Some(admission);
-                self.put(RowInput {
-                    value_version: 1,
-                    key: &RowKey::Meta("unit_schedule".into()),
-                    fixed: &Fixed::None,
-                    value: &ControlJson(&schedule),
-                })?;
+                if !inert {
+                    self.put(RowInput {
+                        value_version: 1,
+                        key: &RowKey::Meta("unit_schedule".into()),
+                        fixed: &Fixed::None,
+                        value: &ControlJson(&schedule),
+                    })?;
+                }
             }
             let actual = self.store.read_control::<u64>("generation")?.unwrap_or(0);
             ensure!(actual == expected, "state_v2_concurrent_change");
@@ -1634,18 +1688,20 @@ impl Transaction for Txn<'_> {
                     value: &ControlJson(&next),
                 })?;
             }
-            self.put(RowInput {
-                value_version: 1,
-                key: &RowKey::Meta("minimum_writer_capability".into()),
-                fixed: &Fixed::None,
-                value: &ControlJson(&migrations::WRITER_CAPABILITY),
-            })?;
-            self.put(RowInput {
-                value_version: 1,
-                key: &RowKey::Meta("generation".into()),
-                fixed: &Fixed::None,
-                value: &ControlJson(&next),
-            })?;
+            if !inert {
+                self.put(RowInput {
+                    value_version: 1,
+                    key: &RowKey::Meta("minimum_writer_capability".into()),
+                    fixed: &Fixed::None,
+                    value: &ControlJson(&migrations::WRITER_CAPABILITY),
+                })?;
+                self.put(RowInput {
+                    value_version: 1,
+                    key: &RowKey::Meta("generation".into()),
+                    fixed: &Fixed::None,
+                    value: &ControlJson(&next),
+                })?;
+            }
             Ok(())
         })();
         if result.is_err() {
@@ -1711,6 +1767,10 @@ impl Transaction for Txn<'_> {
             Ok(generation)
         })();
         let outcome = match generation {
+            _ if inert => {
+                store.reload = true;
+                DurableCommitOutcome::Ambiguous
+            }
             Ok(g) if g == expected => DurableCommitOutcome::NotPublished,
             Ok(g) if g == next => {
                 store.reload = true;

@@ -227,26 +227,9 @@ impl Serialize for Payload {
         seq.end()
     }
 }
-impl<'de> Deserialize<'de> for Payload {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
-        struct Bytes;
-        impl<'de> serde::de::Visitor<'de> for Bytes {
-            type Value = Payload;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("bounded custody bytes")
-            }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> std::result::Result<Payload, A::Error> {
-                use serde::de::Error;
-                let mut writer = Builder::new(VALUE_BYTES).map_err(A::Error::custom)?;
-                while let Some(byte) = seq.next_element::<u8>()? {
-                    writer.write_all(&[byte]).map_err(A::Error::custom)?;
-                }
-                writer.finish().map_err(A::Error::custom)
-            }
-        }
-        de.deserialize_seq(Bytes)
+#[cfg(test)]
+impl Payload {
+    pub(super) fn shares_arena(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.file, &other.file)
     }
 }

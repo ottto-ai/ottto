@@ -439,3 +439,293 @@ fn streamed_family_units_preserve_more_than_eight_mib_of_deferred_payload() {
     assert_eq!(base.claude_account_family_witnesses, expected);
     assert!(restore(&mut db, &f.1, &base).unwrap().is_none());
 }
+
+#[test]
+fn legacy_many_small_payloads_reopen_in_one_arena() {
+    let (f, mut db, prev, _) = Fixture::new();
+    let mut arena = Arena::default();
+    let mut mutations = Vec::new();
+    for n in 0..4_096 {
+        let key = RowKey::record(
+            "proof.deferred_account",
+            format!("root-{n}").into_bytes(),
+            0,
+        )
+        .unwrap();
+        let value = Arc::new(
+            arena
+                .append(1, |out| {
+                    out.write_all(b"0")?;
+                    Ok(())
+                })
+                .unwrap(),
+        );
+        let h = preflight(&RowInput {
+            key: &key,
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: value.as_ref(),
+        })
+        .unwrap();
+        mutations.push(Mutation {
+            key,
+            before: None,
+            after: Some(h),
+            value: Some(value),
+        });
+    }
+    let pending = Deferred {
+        version: 1,
+        identity: f.1.clone(),
+        generation: prev.generation + 1,
+        mutations,
+    };
+    admit_json(&pending, SCRATCH).unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    tx.put(RowInput {
+        key: &carry_key().unwrap(),
+        fixed: &Fixed::None,
+        value_version: 1,
+        value: &packed::Json(&pending),
+    })
+    .unwrap();
+    assert_eq!(
+        tx.commit(prev.generation, pending.generation),
+        DurableCommitOutcome::Committed(pending.generation)
+    );
+    drop(pending);
+    drop(arena);
+    drop(db);
+    let mut db = f.open();
+    let pending = carry(
+        &mut db.begin(TxnMode::Read).unwrap(),
+        &f.1,
+        prev.generation + 1,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(pending.mutations.len(), 4_096);
+    let first = pending.mutations[0].value.as_ref().unwrap();
+    for m in &pending.mutations {
+        let value = m.value.as_ref().unwrap();
+        assert!(first.shares_arena(value));
+        let mut bytes = Vec::new();
+        value.write(&mut bytes).unwrap();
+        assert_eq!(bytes, b"0");
+    }
+}
+
+#[test]
+fn custody_above_transaction_ceiling_reopens_and_drains_with_persisted_fairness() {
+    struct Repeat;
+    impl Value for Repeat {
+        fn write(&self, out: &mut dyn Write) -> Result<()> {
+            let block = [b'x'; 64 * 1024];
+            for _ in 0..960 {
+                out.write_all(&block)?;
+            }
+            Ok(())
+        }
+    }
+    let (f, mut db, prev, _) = Fixture::new();
+    // Backend custody fixture: six independent 60 MiB opaque values, with the
+    // production arena, inert staging, carry decoder and selected admission.
+    // Opaque payloads deliberately bypass semantic codecs in this fixture.
+    db.path_extractor(|_, _, _| Ok(()));
+    db.reference_extractor(|_, _, _| Ok(()));
+    let mut manifest = Manifest {
+        version: 2,
+        identity: f.1.clone(),
+        generation: prev.generation + 1,
+        mutations: Vec::new(),
+    };
+    for n in 1..=6 {
+        let value = Arc::new(Payload::capture(&Repeat, VALUE_BYTES).unwrap());
+        let key = RowKey::record("raw_hold.files", vec![n], 0).unwrap();
+        let h = preflight(&RowInput {
+            key: &key,
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: value.as_ref(),
+        })
+        .unwrap();
+        manifest.mutations.push(StoredMutation {
+            key,
+            before: None,
+            after: Some(h),
+            payload_position: Some(u64::from(n)),
+        });
+        let key = payload_key(u64::from(n)).unwrap();
+        let h = preflight(&RowInput {
+            key: &key,
+            fixed: &Fixed::None,
+            value_version: 2,
+            value: value.as_ref(),
+        })
+        .unwrap();
+        let m = Mutation {
+            key: key.clone(),
+            before: None,
+            after: Some(h),
+            value: Some(value),
+        };
+        let mut planner = Planner::new(f.1.clone(), prev.generation, Schedule::default());
+        planner
+            .add([Scope::File(vec![n])], vec![m.change()], 0, 0)
+            .unwrap();
+        db.stage_custody(
+            planner.select().unwrap(),
+            &RowPlan {
+                rows: BTreeMap::from([(key, m)]),
+            },
+        )
+        .unwrap();
+    }
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    tx.put(RowInput {
+        key: &carry_key().unwrap(),
+        fixed: &Fixed::None,
+        value_version: 2,
+        value: &packed::Json(&manifest),
+    })
+    .unwrap();
+    assert_eq!(
+        tx.commit(prev.generation, manifest.generation),
+        DurableCommitOutcome::Committed(manifest.generation)
+    );
+    drop(db);
+    let mut completed = 0;
+    for pass in 0..16 {
+        let mut db = f.open();
+        db.path_extractor(|_, _, _| Ok(()));
+        db.reference_extractor(|_, _, _| Ok(()));
+        let generation = db.stamp().unwrap().0;
+        let mut read = db.begin(TxnMode::Read).unwrap();
+        let Some(pending) = carry(&mut read, &f.1, generation).unwrap() else {
+            break;
+        };
+        let schedule = Schedule::read(&mut read).unwrap();
+        if pass == 0 {
+            assert!(
+                pending
+                    .mutations
+                    .iter()
+                    .map(|m| m.value.as_ref().unwrap().len())
+                    .sum::<u64>()
+                    > 256 * 1024 * 1024
+            );
+        }
+        let mut planner = Planner::new(f.1.clone(), generation, schedule);
+        for m in &pending.mutations {
+            let RowKey::Record { key_bytes, .. } = &m.key else {
+                unreachable!()
+            };
+            planner
+                .add([Scope::File(key_bytes.clone())], vec![m.change()], 0, 0)
+                .unwrap();
+        }
+        // Renewed small work may win one pass; the persisted cursor must then
+        // select the older large units rather than reset to the small prefix.
+        let key =
+            RowKey::record("raw_hold.files", format!("fresh-{pass}").into_bytes(), 0).unwrap();
+        let value = Arc::new(Payload::capture(&Bytes(b"y"), 1).unwrap());
+        let h = preflight(&RowInput {
+            key: &key,
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: value.as_ref(),
+        })
+        .unwrap();
+        let fresh = Mutation {
+            key,
+            before: None,
+            after: Some(h),
+            value: Some(value),
+        };
+        planner
+            .add([Scope::File(vec![100])], vec![fresh.change()], 0, 0)
+            .unwrap();
+        let mut selection = planner.select().unwrap();
+        let selected: BTreeSet<_> = selection.keys().cloned().collect();
+        let mut rows = BTreeMap::new();
+        for m in pending.mutations {
+            if selected.contains(&m.key) {
+                completed += 1;
+                rows.insert(m.key.clone(), m);
+            }
+        }
+        if selected.contains(&fresh.key) {
+            rows.insert(fresh.key.clone(), fresh);
+        }
+        manifest.mutations.retain(|m| !selected.contains(&m.key));
+        manifest.generation = generation + 1;
+        let key = carry_key().unwrap();
+        let value = (!manifest.mutations.is_empty())
+            .then(|| Arc::new(Payload::capture(&packed::Json(&manifest), SCRATCH as u64).unwrap()));
+        let after = value.as_ref().map(|v| {
+            preflight(&RowInput {
+                key: &key,
+                fixed: &Fixed::None,
+                value_version: 2,
+                value: v.as_ref(),
+            })
+            .unwrap()
+        });
+        let m = Mutation {
+            key: key.clone(),
+            before: read.get(&key).unwrap(),
+            after,
+            value,
+        };
+        drop(read);
+        selection.add_custody(m.change()).unwrap();
+        rows.insert(key, m);
+        let mut tx = db.begin_selected(selection).unwrap();
+        RowPlan { rows }.apply(&mut tx).unwrap();
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+    }
+    assert_eq!(
+        completed, 6,
+        "older custody starved despite persisted fair cursor"
+    );
+}
+
+#[test]
+fn interrupted_inert_staging_never_restores_unpublished_work() {
+    let (f, mut db, prev, _) = Fixture::new();
+    let key = payload_key(9).unwrap();
+    let bytes = Arc::new(Payload::capture(&Bytes(b"synthetic-inert"), 64).unwrap());
+    let h = preflight(&RowInput {
+        key: &key,
+        fixed: &Fixed::None,
+        value_version: 2,
+        value: bytes.as_ref(),
+    })
+    .unwrap();
+    let m = Mutation {
+        key: key.clone(),
+        before: None,
+        after: Some(h),
+        value: Some(bytes),
+    };
+    let mut planner = Planner::new(f.1.clone(), prev.generation, Schedule::default());
+    planner
+        .add([Scope::File(vec![])], vec![m.change()], 0, 0)
+        .unwrap();
+    db.stage_custody(
+        planner.select().unwrap(),
+        &RowPlan {
+            rows: BTreeMap::from([(key, m)]),
+        },
+    )
+    .unwrap();
+    assert_eq!(db.stamp().unwrap().0, prev.generation);
+    drop(db);
+    let mut db = f.open();
+    assert!(restore(&mut db, &f.1, &prev).unwrap().is_none());
+    let (saved, _) = kinds::hydrate(&mut db, f.1.binding.clone()).unwrap();
+    assert_eq!(saved.generation, prev.generation);
+}
