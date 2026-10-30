@@ -479,7 +479,9 @@ fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
                     entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into())
                 }
                 "future_revision" => entry.effective_upload_body_witness_revision = revision + 1,
-                "not_due" => entry.set_unverified_deadline(now_unix() + 30 * 86_400),
+                "not_due" => entry.set_unverified_deadline(
+                    now_unix() + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS / 2,
+                ),
                 _ => unreachable!(),
             }
             rig.index.save(&rig.index_path).unwrap();
