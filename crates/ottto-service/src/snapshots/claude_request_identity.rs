@@ -2596,6 +2596,12 @@ impl OrgMarkers {
 // E2 consumes this compact, native-sequence-ordered placement before any
 // requests aggregate. Marker state is bounded independently of request count.
 pub(crate) type AccountPartition = Option<Arc<AuthorityKey>>;
+/// A request's grain slot (live key, origin) and the account lent to it.
+pub(crate) type LentSlot = (
+    super::claude_request_money::body::ClaudeLiveKey,
+    Option<super::claude_request_money::body::ClaudeRequestUsageOrigin>,
+    Arc<AuthorityKey>,
+);
 
 #[derive(Clone, Debug)]
 struct AccountRun {
@@ -2623,13 +2629,11 @@ pub(crate) struct RequestAccounts {
     reconciled: bool,
     /// Root start known, but the native Unknown grains are not filled yet.
     root_fallback_pending: bool,
-    /// Copy-prefix switch on: (grain live key, account) a copied marker had
-    /// lent to a counted request the copy decision re-derived without it
-    /// (see `copy_derived_rows`).
-    pub(crate) copied_marker_lent: BTreeSet<(
-        super::claude_request_money::body::ClaudeLiveKey,
-        Arc<AuthorityKey>,
-    )>,
+    /// Copy-prefix switch on: per counted request whose account a copied
+    /// marker had lent (the copy decision re-derived it without the marker),
+    /// its grain slot, kept current through telemetry placement, and that
+    /// account (see `copy_derived_rows`).
+    pub(crate) copied_marker_lent: BTreeMap<u64, LentSlot>,
 }
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
 crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, copied_marker_lent);

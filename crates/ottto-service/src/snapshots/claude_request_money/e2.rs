@@ -2319,7 +2319,7 @@ fn finish_holder_identity(item: &mut SnapshotItem) {
                 if own.account(o.sequence).as_ref() == Some(&lent) {
                     return None;
                 }
-                Some((fold.occurrence_key(o)?, lent))
+                Some((o.sequence, (fold.occurrence_key(o)?, None, lent)))
             })
             .collect();
         own.copied_marker_lent = lent;
@@ -3191,6 +3191,14 @@ fn attach_one(
         .flatten();
     fold.entity
         .add_slot(reported, &tokens, requests, row.cost_usd_micros, at);
+    // A copied marker's lent account follows its request to the reported slot.
+    if let Some(lent) = fold
+        .accounts
+        .as_mut()
+        .and_then(|accounts| accounts.copied_marker_lent.get_mut(&occurrence.sequence))
+    {
+        (lent.0, lent.1) = (reported.0.clone(), reported.1);
+    }
     if let Some(cost) = row.cost_usd_micros {
         if fold.resumed_prefix && fold.unproven_copy(occurrence) {
             fold.prefix.priced_requests += requests;
@@ -4227,33 +4235,31 @@ fn record_decided(held: bool, counts: Counts) {
     }
 }
 
-/// Visit the exact final placement; account classification belongs to identity.
-/// Copy-prefix switch on: each identity row of `item` holding usage a copied
-/// marker had lent an account to, as `visit_identity_rows` builds it:
+/// Copy-prefix switch on: the identity row of each request a copied marker
+/// had lent an account to, as `visit_identity_rows` builds rows:
 /// (bucket start, row, lent account).
 pub(crate) fn copied_marker_lent_rows(
     item: &SnapshotItem,
 ) -> Vec<(&str, super::super::SnapshotModelUsage, Arc<AuthorityKey>)> {
-    let Some(fold) = item.claude_money.as_deref() else {
+    let Some(accounts) = item
+        .claude_money
+        .as_deref()
+        .and_then(|fold| fold.accounts.as_deref())
+    else {
         return Vec::new();
     };
-    let Some(accounts) = fold.accounts.as_deref() else {
-        return Vec::new();
-    };
-    let mut rows = Vec::new();
-    for ((key, origin, _), grain) in &fold.entity.grains {
-        for (_, account) in accounts
-            .copied_marker_lent
-            .iter()
-            .filter(|(lent, _)| lent == key)
-        {
-            let row = super::emit::grain_row(key, *origin, grain, None);
-            rows.push((key.0.as_str(), row, account.clone()));
-        }
-    }
-    rows
+    // Row identity fields come from the slot alone, never from its money.
+    accounts
+        .copied_marker_lent
+        .values()
+        .map(|(key, origin, account)| {
+            let row = super::emit::grain_row(key, *origin, &Default::default(), None);
+            (key.0.as_str(), row, account.clone())
+        })
+        .collect()
 }
 
+/// Visit the exact final placement; account classification belongs to identity.
 pub(crate) fn visit_identity_rows(
     item: &SnapshotItem,
     mut visit: impl FnMut(
