@@ -93,3 +93,7 @@ pub use token_store::{
     OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT, OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT,
     OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
+
+#[cfg(unix)]
+#[doc(hidden)]
+pub mod service_lifecycle;

@@ -1,0 +1,269 @@
+use super::*;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+struct Fixture(PathBuf);
+impl Fixture {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ottto-bootstrap-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+    fn lock(&self) -> ServiceLifecycleTransaction {
+        ServiceLifecycleTransaction::acquire(&self.0, Duration::from_secs(1)).unwrap()
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+struct Reap(Child);
+impl Drop for Reap {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn hanging_command_is_bounded_killed_and_reaped() {
+    let fixture = Fixture::new();
+    let lock = fixture.lock();
+    // A single process and shell builtins: no surviving sleep/grandchild.
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "while :; do :; done"]);
+    let child = lock.spawn(command.stdout(Stdio::piped())).unwrap();
+    let pid = child.id();
+    let mut reap = Reap(child);
+    let start = Instant::now();
+    assert!(complete(&mut reap.0, Duration::from_millis(50)).is_err());
+    assert!(start.elapsed() < Duration::from_secs(3));
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
+#[test]
+fn inherited_child_keeps_lock_after_owner_close() {
+    let fixture = Fixture::new();
+    let lock = fixture.lock();
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "printf ready; read release"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut child = Reap(lock.spawn(&mut command).unwrap());
+    let mut ready = [0; 5];
+    child
+        .0
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut ready)
+        .unwrap();
+    assert_eq!(&ready, b"ready");
+    drop(lock);
+    assert!(ServiceLifecycleTransaction::acquire(&fixture.0, Duration::from_millis(50)).is_err());
+    child
+        .0
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"release\n")
+        .unwrap();
+    assert!(child.0.wait().unwrap().success());
+    drop(fixture.lock());
+}
+
+#[test]
+fn competing_transaction_waits_until_owner_finishes() {
+    let fixture = Fixture::new();
+    let lock = fixture.lock();
+    let path = fixture.0.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let other = std::thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        let acquired = ServiceLifecycleTransaction::acquire(&path, Duration::from_secs(3)).unwrap();
+        done_tx.send(()).unwrap();
+        drop(acquired);
+    });
+    ready_rx.recv().unwrap();
+    assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+    drop(lock);
+    done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    other.join().unwrap();
+}
+
+#[test]
+fn symlink_lock_is_refused_without_touching_target() {
+    let fixture = Fixture::new();
+    let target = fixture.0.join("target");
+    fs::write(&target, b"keep").unwrap();
+    fs::create_dir_all(fixture.0.join("Library/LaunchAgents")).unwrap();
+    std::os::unix::fs::symlink(
+        &target,
+        fixture.0.join(format!(
+            "Library/LaunchAgents/.{}.lifecycle.lock",
+            crate::MACOS_LAUNCH_AGENT_LABEL
+        )),
+    )
+    .unwrap();
+    assert!(ServiceLifecycleTransaction::acquire(&fixture.0, Duration::ZERO).is_err());
+    assert_eq!(fs::read(target).unwrap(), b"keep");
+}
+
+// Exact harness entries used only by the subprocess test below. Filesystem
+// gates keep readiness independent of shell stdin and libtest output handling.
+#[test]
+fn bootstrap_child_fixture() {
+    let Some(directory) = std::env::var_os("OTTTO_BOOTSTRAP_TEST_CHILD_DIR") else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    fs::write(directory.join("child-ready"), b"ready").unwrap();
+    let start = Instant::now();
+    while !directory.join("release-child").exists() && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(POLL);
+    }
+    assert!(
+        directory.join("release-child").exists(),
+        "child gate was not released"
+    );
+    fs::write(directory.join("child-finished"), b"finished").unwrap();
+}
+
+#[test]
+fn bootstrap_owner_fixture() {
+    let Some(directory) = std::env::var_os("OTTTO_BOOTSTRAP_TEST_OWNER_DIR") else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    let lock = ServiceLifecycleTransaction::acquire(&directory, Duration::from_secs(1)).unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "service_lifecycle::tests::bootstrap_child_fixture",
+            "--nocapture",
+        ])
+        .env("OTTTO_BOOTSTRAP_TEST_CHILD_DIR", &directory);
+    let mut child = lock.spawn(&mut command).unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn abrupt_helper_death_leaves_child_owning_transaction() {
+    let fixture = Fixture::new();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "service_lifecycle::tests::bootstrap_owner_fixture",
+            "--nocapture",
+        ])
+        .env("OTTTO_BOOTSTRAP_TEST_OWNER_DIR", &fixture.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
+    let mut owner = Reap(command.spawn().unwrap());
+    let start = Instant::now();
+    while !fixture.0.join("child-ready").exists() && start.elapsed() < Duration::from_secs(5) {
+        assert!(
+            owner.0.try_wait().unwrap().is_none(),
+            "helper exited before child readiness"
+        );
+        std::thread::sleep(POLL);
+    }
+    assert!(
+        fixture.0.join("child-ready").exists(),
+        "child did not start"
+    );
+    assert!(
+        owner.0.try_wait().unwrap().is_none(),
+        "helper did not wait for its gated child"
+    );
+    owner.0.kill().unwrap();
+    owner.0.wait().unwrap();
+    assert!(ServiceLifecycleTransaction::acquire(&fixture.0, Duration::from_millis(50)).is_err());
+    fs::write(fixture.0.join("release-child"), b"release").unwrap();
+    drop(fixture.lock());
+    assert!(fixture.0.join("child-finished").exists());
+}
+
+#[test]
+fn principal_identity_fixture() {
+    let Some(output) = std::env::var_os("OTTTO_LIFECYCLE_PRINCIPAL_OUT") else {
+        return;
+    };
+    // Resolve only: never acquire a lock or write in the real account home.
+    let principal = ServiceLifecyclePrincipal::current().unwrap();
+    fs::write(
+        output,
+        serde_json::to_vec(&(
+            principal.home,
+            principal.uid,
+            crate::user_launchctl_domain(),
+            crate::macos_launch_agent_target(),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn home_and_uid_overrides_cannot_split_production_lock_principal() {
+    let fixture = Fixture::new();
+    let expected = ServiceLifecyclePrincipal::current().unwrap();
+    let lock = fixture.lock();
+    for variant in ["alternate-home-one", "alternate-home-two"] {
+        let output = fixture.0.join(variant);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "service_lifecycle::tests::principal_identity_fixture",
+                "--nocapture",
+            ])
+            .env("HOME", fixture.0.join(variant))
+            .env("UID", expected.uid.wrapping_add(1).to_string())
+            .env("OTTTO_LIFECYCLE_PRINCIPAL_OUT", &output);
+        assert!(lock
+            .run(&mut command, Duration::from_secs(5))
+            .unwrap()
+            .0
+            .success());
+        let (home, uid, domain, target): (PathBuf, u32, String, String) =
+            serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+        assert_eq!(home, expected.home);
+        assert_eq!(uid, expected.uid);
+        assert_eq!(domain, format!("gui/{}", expected.uid));
+        assert_eq!(
+            target,
+            format!("{domain}/{}", crate::MACOS_LAUNCH_AGENT_LABEL)
+        );
+    }
+}
+
+#[test]
+fn foreign_owned_directory_refuses_before_creating_any_lock_folders() {
+    let fixture = Fixture::new();
+    // Inject a different effective uid into the real directory check, without
+    // chown, privilege changes, or touching another account's home.
+    let foreign_uid = unsafe { libc::geteuid() }.wrapping_add(1);
+    assert!(owned_lock_directory(&fixture.0, foreign_uid).is_err());
+    assert!(!fixture.0.join("Library").exists());
+    assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 0);
+}

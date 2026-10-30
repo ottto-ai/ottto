@@ -211,6 +211,22 @@ retryable (red) for the whole hold, so census close, retirement and
 account-family proof wait for that source; a held key is not yet terminal
 disclosed residue.
 
+The `durable_tail` line also carries `store_write_after_save_failed[files]`
+(records offered to a post-save batch that returned an error; the store keeps
+their predecessors) and **`store_write_failed_restart_full[files,bytes]`
+(upper bound)**: Fulls whose restore refused the record as
+`ineligible.entry_changed`, with the completed native bytes those Fulls read.
+It is not an exact count of write failures. It reuses the existing
+`entry_changed` refusal, and no persisted marker records that a write failed,
+so it also counts a record that was never offered (deferred or evicted before
+the write) and any RAM-miss restore of such a record. Both are process totals.
+On the first counted file in a process, a `durable_tail_restart_full_alarm`
+record (`store_write_failed_restart_full` `[files, bytes]` and the
+write-failure total) is emitted at once, then at most once per 24 h in that
+process; a restarted process alarms again on its own first file. The counter
+remains the persistent signal. The mark and the alarm time are RAM-only;
+nothing is persisted.
+
 An absent record is a restore `missing` outcome and keeps the existing Full
 admission; it is not a held key. There is no `upgrade_state_missing` counter or
 alarm in this format-1 bootstrap. Audit deadlines remain owned by the index,
@@ -585,6 +601,34 @@ older than 7 are deleted. A day holds at most 30,000 lines and 8 MiB, and the
 directory at most 32 MiB; a day that reaches its bound ends with one
 `log_full` line and the summary marks it. Logging is best effort: it never
 fails a provider call, and a line it cannot write promptly is dropped.
+
+## Claude Relay Endpoint Mismatch
+
+When the relay is connected but approved Claude telemetry settings name a
+different loopback port, `ottto doctor` reports both ports. `ottto status --json`
+and `ottto doctor --json` expose `relay.last_error.code` as
+`claude_relay_endpoint_mismatch`; `relay.state` remains `connected`. The
+`claude_local_evidence` diagnostics section includes the same finding.
+Canonical local health carries it as a `Warning` blocker with the same code
+(owner `source`), so the machine reads `degraded` and the existing machine-health
+upload reports it to Ottto the same day. Its uploaded text carries no ports.
+To avoid flapping on a restart or rebind, the finding and blocker appear only
+once the same mismatch is seen again at least 60 seconds after first sight; the
+first agreeing check clears both. The support diagnostics item is not delayed.
+
+This compares current approved settings with the daemon's listener state; it
+does not probe exporters or prove that a running Claude process reloaded its
+settings. It clears when ports agree or Claude telemetry approval is absent
+or disabled. It does not rewrite settings or change account identity.
+
+After a listener failure, the relay re-reads approved settings on each retry
+and tries an approved candidate port up to three times using its existing
+capped backoff. If all three attempts fail, recovery immediately uses the
+old-port, default-port and per-user fallback order so control, health and all
+OTLP sources can serve again. A busy approved port can then produce the mismatch
+finding above. Without an approved candidate, the fallback chain applies immediately.
+Startup retains its existing behavior of falling back if the approved port is
+busy.
 
 ## Common Diagnostics Flow
 

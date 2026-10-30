@@ -1,3 +1,9 @@
+#[cfg(any(test, feature = "replay-harness"))]
+mod loopback_backend;
+/// Isolated, advisory replay of production snapshot pages.
+#[doc(hidden)]
+#[cfg(feature = "replay-harness")]
+pub mod replay_harness;
 use crate::adaptive_collector::{CadenceConfig, SourceCadence};
 use crate::agent_status::AgentStatusCollection;
 #[cfg(test)]
@@ -48,6 +54,7 @@ use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use zeroize::Zeroize;
 
+mod account_hash_changes;
 mod continuation;
 mod reason_reoffer;
 mod rejection_log;
@@ -1197,6 +1204,12 @@ struct SnapshotUploadProgress {
     /// fingerprint.
     #[serde(default)]
     accepted_body_witnesses: BTreeMap<String, String>,
+    /// Diagnostic-only last stored billing-account projection; never admission proof.
+    #[serde(
+        default,
+        skip_serializing_if = "account_hash_changes::AcceptedAccounts::is_empty"
+    )]
+    accepted_account_hashes: account_hash_changes::AcceptedAccounts,
     /// Admission only: current live incidence plus bounded unsettled ACK debt.
     #[serde(skip, default = "ack_retention::default_ack_capacity")]
     ack_capacity: usize,
@@ -1261,6 +1274,7 @@ impl SnapshotUploadProgress {
             historical_replay_generation: None,
             accepted_fingerprints: BTreeSet::new(),
             accepted_body_witnesses: BTreeMap::new(),
+            accepted_account_hashes: Default::default(),
             ack_capacity: ack_retention::default_ack_capacity(),
             retained_stale_ack_count: 0,
             accepted_cache_states: BTreeMap::new(),
@@ -1928,6 +1942,7 @@ impl SnapshotUploadProgress {
         else {
             return Ok(());
         };
+        self.accepted_account_hashes.record(&value);
         let key = cache_session_key(session);
         // Count-only legacy ACKs cannot distinguish changed from unchanged.
         // Recover authority through the same bootstrap rather than retaining
@@ -1940,7 +1955,8 @@ impl SnapshotUploadProgress {
         };
         let patch = serde_json::from_value(patch.clone())?;
         let state =
-            crate::snapshots::cache_state_from_patch(self.accepted_cache_states.get(&key), &patch);
+            crate::snapshots::cache_state_from_patch(self.accepted_cache_states.get(&key), &patch)
+                .ok_or_else(|| anyhow!("cache observations have unparseable accepted state"))?;
         self.accepted_cache_states.insert(key, state);
         Ok(())
     }
@@ -2463,6 +2479,7 @@ impl SnapshotUploadProgress {
             && self.accepted_cache_states.is_empty()
             && self.accepted_cache_heads.is_empty()
             && self.pending_cache_heads.is_empty()
+            && self.accepted_account_hashes.is_empty()
         {
             return self.clear(path);
         }
@@ -5766,6 +5783,9 @@ fn prepare_sync_source_inner(
         });
         diagnostic.emit();
     }
+    #[cfg(feature = "replay-harness")]
+    let scan_started_at = replay_harness::collection_timestamp().unwrap_or_else(current_rfc3339);
+    #[cfg(not(feature = "replay-harness"))]
     let scan_started_at = current_rfc3339();
     let relay_token = client.issue_status_relay_token(device, device_secret, source)?;
     let mut activity_hint = client.get_activity_hint(&relay_token)?;
@@ -6517,6 +6537,9 @@ fn prepare_continuation_source(
     deadline: Instant,
 ) -> Result<std::result::Result<SourcePreparation, ContinuationRefusal>> {
     let source = SnapshotSource::Codex;
+    #[cfg(feature = "replay-harness")]
+    let scan_started_at = replay_harness::collection_timestamp().unwrap_or_else(current_rfc3339);
+    #[cfg(not(feature = "replay-harness"))]
     let scan_started_at = current_rfc3339();
     let mut upload_progress = SnapshotUploadProgress::load(
         &inputs.upload_progress_path,
@@ -9699,6 +9722,13 @@ where
                 .saturating_add(snapshot_packing_json_length(item)?);
         }
     }
+    // Observe the final emitted candidates. Only stored-body ACK handling below
+    // advances the baseline; a rejected or unstored offer cannot replace it.
+    for item in &batch {
+        progress
+            .accepted_account_hashes
+            .observe(&serde_json::to_value(item)?);
+    }
     let response = upload(batch)?;
     if response.disabled {
         return Ok(SnapshotPageOutcome::Disabled(response.disabled_reason));
@@ -9796,11 +9826,17 @@ where
             let item = &items[*index];
             let item_fingerprint = fingerprint(item);
             if let Some(rejection) = rejected.get(item_fingerprint) {
-                progress.quarantine_permanent_body(
-                    item_fingerprint,
-                    &body_witness(item),
-                    rejection.safe_reason(),
-                );
+                if rejection.permanent {
+                    progress.quarantine_permanent_body(
+                        item_fingerprint,
+                        &body_witness(item),
+                        rejection.safe_reason(),
+                    );
+                } else {
+                    // A validated money-decrease hold: the backend kept the
+                    // old head. Retry this or a newer body like a conflict.
+                    progress.quarantine_retryable_body(item_fingerprint, &body_witness(item));
+                }
             } else if conflicted.contains(item_fingerprint) {
                 progress.quarantine_retryable_body(item_fingerprint, &body_witness(item));
             }
@@ -9819,7 +9855,14 @@ where
         // complete scan" that recovery waited on could never
         // happen. One conflicting entity deadlocked its whole
         // source permanently, across restarts.
-        conflicted_entities = response.conflict_entities.len();
+        // A held body is pending the same way.
+        conflicted_entities = response.conflict_entities.len().saturating_add(
+            response
+                .rejected_entities
+                .iter()
+                .filter(|entity| !entity.permanent)
+                .count(),
+        );
     } else {
         for index in indices {
             let item = &items[*index];
@@ -9836,7 +9879,9 @@ where
     })?;
     if entity_ack {
         for entity in &response.rejected_entities {
-            record_poison_loss_once(poison_scope, &entity.snapshot_fingerprint);
+            if entity.permanent {
+                record_poison_loss_once(poison_scope, &entity.snapshot_fingerprint);
+            }
             eprintln!(
                 "local snapshot entity rejected for {poison_scope}: reason={} permanent={} session_hash={}; \
                  accepted siblings checkpointed, rejected body retained in bounded quarantine",
@@ -14306,7 +14351,7 @@ mod tests {
         );
         let wire = network.cache_observations.as_ref().unwrap();
         assert!(wire.validate());
-        let expected = crate::snapshots::cache_state_from_patch(Some(&prior), wire);
+        let expected = crate::snapshots::cache_state_from_patch(Some(&prior), wire).unwrap();
         assert_eq!(network.cache_observations_state.as_ref(), Some(&expected));
         assert!(
             crate::canonical_json::canonicalize(&expected)
@@ -15261,6 +15306,66 @@ mod tests {
             rejected_entities: Vec::new(),
             conflict_entities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn account_change_baseline_updates_only_for_stored_body_acks() {
+        use crate::local_resource_diagnostics::{capture, source_finish};
+        use serde_json::{json, Value};
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let mut send =
+            |n: u64, account: &str, stored: bool, progress: &mut SnapshotUploadProgress| {
+                let fingerprint = format!("{n:064x}");
+                let items = [json!({
+                    "source_session_id":"session",
+                    "snapshot_fingerprint":fingerprint,
+                    "model_usage":[{"account_identifier_hash":account}]
+                })];
+                let (result, lines) = capture(|| {
+                    source_finish("claude_code", || {
+                        attempt_snapshot_page(
+                            &items,
+                            &[0],
+                            &unique_poison_scope(),
+                            progress,
+                            &mut accepted,
+                            &|item: &Value| item["snapshot_fingerprint"].as_str().unwrap(),
+                            &|_: &Value| format!("{n:064x}"),
+                            &|_: &Value| Some("session"),
+                            &mut |_| {
+                                let mut response = accepted_batch(usize::from(stored));
+                                if !stored {
+                                    response.entity_ack_contract =
+                                        Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                                    let mut entity = entity_ack_ref(&fingerprint);
+                                    entity.source_session_id = "session".into();
+                                    entity.unchanged_basis = Some("usage_identical".into());
+                                    response.unchanged_entities.push(entity);
+                                }
+                                Ok(response)
+                            },
+                            &mut |_| Ok(()),
+                        )
+                    })
+                });
+                assert!(result.is_ok(), "{result:?}");
+                lines.last().unwrap()["counts"]["account_hash_changed"]
+                    .as_u64()
+                    .unwrap()
+            };
+        assert_eq!(send(1, "account-a", true, &mut progress), 0);
+        let saved = serde_json::to_vec(&progress).unwrap();
+        progress = serde_json::from_slice(&saved).unwrap();
+        progress.active_quarantine_witness = Some(test_quarantine_witness());
+        assert_eq!(send(2, "account-b", false, &mut progress), 1);
+        assert_eq!(
+            send(3, "account-a", true, &mut progress),
+            0,
+            "unstored body must not replace the accepted account baseline"
+        );
+        assert_eq!(send(4, "account-b", true, &mut progress), 1);
+        assert_eq!(send(5, "account-b", true, &mut progress), 0);
     }
 
     fn entity_ack_ref(fingerprint: &str) -> crate::snapshot_client::SnapshotEntityRef {
@@ -24073,13 +24178,17 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_account_hashes, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 
 #[cfg(test)]
 #[path = "snapshot_sync/h357_ack_tests.rs"]
 mod h357_ack_tests;
+
+#[cfg(test)]
+#[path = "snapshot_sync/usage_decrease_hold_tests.rs"]
+mod usage_decrease_hold_tests;
 
 crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason, reoffer);
 
