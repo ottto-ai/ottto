@@ -47934,9 +47934,14 @@ impl ScanIndex {
             ));
         }
         let _lock = CheckpointLock::acquire(path)?;
-        if let Some(index) = state_v2::load_locked(path, support_dir)? {
+        if let Some(mut index) = state_v2::load_locked(path, support_dir)? {
             let file = File::open(path)?;
             let opened = sampled_scan::codex_cursor::OpenStamp::capture(&file)?;
+            if !index.finish_decoded_load(source) {
+                return Err(anyhow::anyhow!(
+                    "scan_index_storage_generation_requires_repair"
+                ));
+            }
             return Ok((index, LoadOrigin::Loaded(opened)));
         }
         let v1_gauge = state_v2::telemetry::Stage::v1(path);
@@ -47977,7 +47982,7 @@ impl ScanIndex {
                 ))
             }
             Ok(mut index) => {
-                if !index.canonicalize_codex_identity_keys() {
+                if !index.finish_decoded_load(source) {
                     if index
                         .persistence_root
                         .as_ref()
@@ -47997,18 +48002,6 @@ impl ScanIndex {
                         now,
                     )
                     .map(|index| (index, LoadOrigin::Quarantined));
-                }
-                let active_witness = source.map(snapshot_quarantine_witness);
-                if index.persistence_available() {
-                    terminal_contract_retry::rearm(
-                        &mut index.quarantined_snapshot_fingerprints,
-                        active_witness.as_ref(),
-                    );
-                }
-                index.codex_parent_proof_parents_live =
-                    codex_parent_proof_parents_live(&index.codex_parent_prefix_proofs);
-                if index.persistence_available() {
-                    index.collapse_account_pending_windows();
                 }
                 if let Some(gauge) = v1_gauge {
                     gauge.finish();
@@ -48030,6 +48023,27 @@ impl ScanIndex {
                 Err(error).with_context(|| format!("parse scan index {}", path.display()))
             }
         }
+    }
+
+    // Shared by v1 and v2 after the raw-dependent decoder tail. A collision is
+    // handled by the caller: v1 may quarantine; published v2 custody must hold.
+    fn finish_decoded_load(&mut self, source: Option<SnapshotSource>) -> bool {
+        if !self.canonicalize_codex_identity_keys() {
+            return false;
+        }
+        let active_witness = source.map(snapshot_quarantine_witness);
+        if self.persistence_available() {
+            terminal_contract_retry::rearm(
+                &mut self.quarantined_snapshot_fingerprints,
+                active_witness.as_ref(),
+            );
+        }
+        self.codex_parent_proof_parents_live =
+            codex_parent_proof_parents_live(&self.codex_parent_prefix_proofs);
+        if self.persistence_available() {
+            self.collapse_account_pending_windows();
+        }
+        true
     }
 
     fn claude_account_pending_file_is_empty(&self, key: &str, entry: &ScanIndexEntry) -> bool {

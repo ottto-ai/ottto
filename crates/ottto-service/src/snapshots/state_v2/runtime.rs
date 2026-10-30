@@ -227,9 +227,12 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
                         telemetry::event("hydrate_count", &1);
                         let (mut index, mut cx) = mapper.hydrate_context(&mut session.db)?;
+                        ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+                        normalize_hydrated(&mut index)?;
                         mapper.restore_selected(&mut session.db, &mut index, &mut cx)?;
                         session.stamp = session.db.stamp()?;
                         ensure!(index.generation == session.stamp.0, Hold::DbUnavailable);
+                        normalize_hydrated(&mut index)?;
                         session.cx = cx;
                         index.persistence_v2 = Some(runtime.clone());
                         state.cached = Some(index.clone());
@@ -254,6 +257,7 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
             mapper.restore_selected(&mut db, &mut index, &mut cx)?;
             let stamp = db.stamp()?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+            normalize_hydrated(&mut index)?;
             db.prime_headers()?;
             index.persistence_v2 = Some(Arc::new(Runtime {
                 active: true,
@@ -316,6 +320,18 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
     }
     result
 }
+fn normalize_hydrated(index: &mut ScanIndex) -> Result<()> {
+    use super::super::lenient_decode;
+    lenient_decode::post_decode_hydrated(index, "load", "claude_code").map_err(
+        |error| match error {
+            lenient_decode::Error::Refused("schema_version" | "accepted-ledger version") => {
+                Hold::Future.into()
+            }
+            error => error.into(),
+        },
+    )
+}
+
 fn pause(state: &mut RouteState, now: Instant, class: Pause) {
     state.inventory_ready = false;
     state.original = None;
