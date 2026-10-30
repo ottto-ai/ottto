@@ -44,8 +44,8 @@ the remaining deadline. Successful runs normally have a 24-hour cadence, which
 yields to the forced maintenance pause and overdue recovery.
 
 Preparation and every acquisition continuation check maintenance before normal
-collection. After sleep or space recovery, overdue VACUUM plus verified TRUNCATE
-runs before collection resumes, overriding retry and successful-run cooldowns.
+collection. After sleep or space recovery, overdue VACUUM plus verified TRUNCATE,
+and any previously failed idle purge, run before collection resumes, overriding retry and successful-run cooldowns.
 If it cannot complete, collection remains paused and debt remains visible;
 previously committed data remains committed. A missing or regressed deletion
 clock uses the same conservative overdue posture, rather than postponing purge.

@@ -1566,3 +1566,23 @@ fn external_owner_lock_is_counted_without_clearing_overdue_debt() {
     assert_eq!(stats["erasure_vacuum_failed"]["external_lock"], 1);
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(1));
 }
+
+#[test]
+fn failed_idle_purge_recovers_before_collection_even_inside_the_deadline() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    db.control("erasure_pending", &1_u64).unwrap();
+    age_erasure(&mut db, 13 * 3600);
+    {
+        let _full = sqlite::space_for_test(Some(0));
+        db.maintenance(true).unwrap();
+        assert!(db.before_collection().is_err());
+    }
+    // Space recovery takes precedence over the recent failure's retry clock.
+    db.before_collection().unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
+    assert_eq!(
+        serde_json::to_value(db.maintenance_stats()).unwrap()["erasure_late_completions"],
+        0
+    );
+}

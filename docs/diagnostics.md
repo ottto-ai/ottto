@@ -110,7 +110,8 @@ at 20 hours, after idle attempts from 12 hours. Another process's lock that
 prevents timely purge is a breach. A due pause reserves the next checkpoint-lock
 turn ahead of this process's new normal work and waits up to two seconds for
 an existing owner; own-lock refusal remains a failure and an overdue breach.
-Overdue recovery runs before preparation continues or acquisition resumes; retry/cadence cooldowns cannot defer it.
+Overdue recovery and recovery from a failed idle purge run before preparation
+continues or acquisition resumes; retry/cadence cooldowns cannot defer them.
 Failure keeps debt and pauses collection. Prior committed data remains committed.
 
 Erasure measurements include `erasure_pending_age_s`, `oldest_pending_age_s`,

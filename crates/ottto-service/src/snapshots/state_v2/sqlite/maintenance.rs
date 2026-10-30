@@ -320,18 +320,21 @@ impl Sqlite {
         Ok(())
     }
     pub(in super::super) fn maintenance(&mut self, idle: bool) -> Result<()> {
-        self.maintain(idle.then_some(true))
+        self.maintain(idle.then_some(true), false)
     }
     /// Acquisition yields our connection and transactions at this boundary.
     /// Own work never takes priority over a due privacy maintenance pause.
     pub(in super::super) fn between_cycles(&mut self, quiet: bool) -> Result<()> {
-        self.maintain(Some(quiet))
+        self.maintain(Some(quiet), false)
     }
     /// Run before each collection continuation, including the first after sleep
     /// or disk recovery. Never resume normal collection with overdue debt.
     pub(in super::super) fn collection_pause_due(&self) -> Result<bool> {
         if self.read_control::<u64>("erasure_pending")?.unwrap_or(0) == 0 {
             return Ok(false);
+        }
+        if self.read_control::<u64>("erasure_failures")?.unwrap_or(0) != 0 {
+            return Ok(true);
         }
         let age = self
             .read_control::<u64>("erasure_since")?
@@ -350,8 +353,11 @@ impl Sqlite {
         if !self.collection_pause_due()? {
             return Ok(());
         }
-        self.maintain(Some(false))?;
-        if self.stats.erasure_overdue {
+        self.maintain(Some(false), true)?;
+        if self.stats.erasure_overdue
+            || self.read_control::<u64>("erasure_pending")?.unwrap_or(0) != 0
+                && self.read_control::<u64>("erasure_failures")?.unwrap_or(0) != 0
+        {
             self.stats.erasure_resume_refusals =
                 self.stats.erasure_resume_refusals.saturating_add(1);
             crate::local_resource_diagnostics::claude_state_v2(&self.stats);
@@ -389,8 +395,8 @@ impl Sqlite {
             crate::local_resource_diagnostics::claude_state_v2(&self.stats);
         }
     }
-    fn maintain(&mut self, window: Option<bool>) -> Result<()> {
-        let result = self.maintenance_inner(window);
+    fn maintain(&mut self, window: Option<bool>, resume: bool) -> Result<()> {
+        let result = self.maintenance_inner(window, resume);
         self.stats.db_bytes = self
             .logical_bytes()
             .ok()
@@ -417,7 +423,7 @@ impl Sqlite {
         crate::local_resource_diagnostics::claude_state_v2(&self.stats);
         result
     }
-    fn maintenance_inner(&mut self, window: Option<bool>) -> Result<()> {
+    fn maintenance_inner(&mut self, window: Option<bool>, resume: bool) -> Result<()> {
         migrations::check_current(self.conn()?)?;
         if self.import {
             return Ok(());
@@ -446,6 +452,7 @@ impl Sqlite {
         self.stats.erasure_overdue = overdue;
         let last = self.read_control::<u64>("erasure_attempt")?;
         let failures = self.read_control::<u64>("erasure_failures")?.unwrap_or(0);
+        let recovering = resume && failures != 0;
         let success = self.read_control::<u64>("erasure_success")?;
         let success_due =
             success.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 86400));
@@ -467,14 +474,15 @@ impl Sqlite {
         let early = age.map_or(true, |a| a >= (deadline / 2).min(12 * 3600));
         let pause_due = age.map_or(true, |a| a >= (deadline * 5 / 6).min(20 * 3600));
         let idle = window.is_some();
-        let opportunity =
-            window.is_some_and(|quiet| overdue || if quiet { early } else { pause_due });
+        let opportunity = window
+            .is_some_and(|quiet| overdue || recovering || if quiet { early } else { pause_due });
         // A forced pause may override successful-run cadence, but ordinary
         // failures still back off within the remaining deadline. After the
-        // deadline, recovery attempts take precedence over both cooldowns.
+        // deadline, or when resuming after a failed idle purge, recovery
+        // attempts take precedence over both cooldowns.
         if pending
             && opportunity
-            && (overdue || (success_due || pause_due) && wall_due && monotonic_due)
+            && (overdue || recovering || (success_due || pause_due) && wall_due && monotonic_due)
         {
             if window == Some(false) {
                 self.stats.maintenance_pauses = self.stats.maintenance_pauses.saturating_add(1);

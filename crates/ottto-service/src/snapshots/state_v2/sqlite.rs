@@ -284,7 +284,7 @@ fn read_piece(conn: &Connection, h: &Header, part: u64) -> Result<Vec<u8>> {
     } else {
         let o = chunk_owner(&h.key)?;
         Ok(conn.prepare_cached("SELECT chunk FROM value_chunks WHERE owner_table=?1 AND owner_kind=?2 AND owner_key=?3 AND position=?4 AND chunk_no=?5")?
-        .query_row(params![o.table,o.kind,o.key,o.position,part],|r|{let b=r.get_ref(0)?.as_blob()?;if b.len()>PART_BYTES{return Err(rusqlite::Error::InvalidQuery);}Ok(b.to_vec())})?)
+        .query_row(params![o.table,o.kind,o.key,o.position,part],|r|{let b=r.get_ref(0)?.as_blob()?;if b.len()>PART_BYTES{return Err(rusqlite::Error::InvalidQuery);}Ok(b.to_vec())}).inspect(|_| super::telemetry::decoded(0, 0, 1))?)
     }
 }
 
