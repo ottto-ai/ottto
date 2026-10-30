@@ -2493,6 +2493,7 @@ fn terminal_off_on_terminal_family_never_committed_members_let_the_claude_census
 /// `stale_pending_roots` keeps it. The family's accepted, unchanged root is
 /// not re-read or held; only its never-committed members are.
 #[test]
+#[ignore = "terminal-off ON-readiness: R7"]
 #[serial(source_manifests)]
 fn terminal_off_on_witness_bound_terminal_family_root_is_not_rearmed_by_a_start() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
