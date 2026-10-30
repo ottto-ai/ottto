@@ -280,6 +280,25 @@ impl Checkpoint {
     pub(crate) fn audit_debt(&self) -> Option<AuditDebt> {
         self.audit_debt
     }
+    /// Whether `ReadPlan::prepare` would choose `ReadMode::Unchanged` for
+    /// `file` with this checkpoint: the same `select_mode` rule, from metadata
+    /// only (Unchanged never compares samples), so no native byte is read.
+    pub(crate) fn reuses_unchanged(
+        &self,
+        file: &File,
+        scope: &Scope,
+        durable_debt: Option<AuditDebt>,
+        now: u64,
+    ) -> bool {
+        let Ok(stamp) = file.metadata().and_then(FileStamp::capture) else {
+            return false;
+        };
+        let debt = earlier_debt(durable_debt, self.audit_debt);
+        matches!(
+            select_mode(Some(self.view()), debt, &stamp, scope, now, |_| Ok(false)),
+            Ok(ReadMode::Unchanged)
+        )
+    }
     #[cfg(test)]
     pub(crate) fn last_full_verified(&self) -> u64 {
         self.last_full_verified_unix_seconds

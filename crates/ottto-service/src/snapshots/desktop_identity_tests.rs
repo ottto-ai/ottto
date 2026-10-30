@@ -318,10 +318,23 @@ fn desktop_identity_adoption_waits_when_uncached_and_unchanged_body_sends_nothin
     assert!(cold.result.snapshots.is_empty());
     assert_eq!((cold.native_bytes, counts), (0, Reoffers::default()));
     assert_eq!(f.latch(&cold.index), None);
+    // A retained copy that acquisition would NOT reuse unchanged (here a
+    // different scope) selects nothing: a matching extent is not enough.
+    let mut rescoped = ack(cold);
+    let context = rescoped.active_upload_context_fingerprint.clone();
+    rescoped.active_upload_context_fingerprint = Some("other-context".into());
+    rescoped.upload_context_fingerprint = Some("other-context".into());
+    let (refused, counts) = f.run_with(rescoped, cache.clone(), "2026-08-02T07:12:30Z");
+    assert!(refused.result.snapshots.is_empty());
+    assert_eq!((refused.native_bytes, counts), (0, Reoffers::default()));
+    assert_eq!(f.latch(&refused.index), None);
+    let mut index = ack(refused);
+    index.active_upload_context_fingerprint = context.clone();
+    index.upload_context_fingerprint = context;
     // Cached: one adoption pass from the retained reduction; the body is
     // unchanged, so nothing new is sent and the child settles.
     let supported = u64::from(crate::heap_layout_bound::layout_supported());
-    let (warm, counts) = f.run_with(ack(cold), cache.clone(), "2026-08-02T07:13:00Z");
+    let (warm, counts) = f.run_with(index, cache.clone(), "2026-08-02T07:13:00Z");
     assert!(warm.result.snapshots.is_empty(), "fingerprint dedupe");
     assert_eq!(warm.native_bytes, 0);
     assert_eq!(counts.adoption, [0, supported, 0, 0]);

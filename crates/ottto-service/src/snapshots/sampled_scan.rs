@@ -282,6 +282,21 @@ impl SharedCache {
     pub(super) fn retained_sealed_offset(&self, key: &str) -> Option<u64> {
         self.retained().ok()?.sealed_offset(key)
     }
+    /// A retained reduction that acquisition would reuse as Unchanged now.
+    pub(super) fn reuses_unchanged(
+        &self,
+        key: &str,
+        file: &std::fs::File,
+        scope: &crate::transcript_acquisition::Scope,
+        debt: Option<crate::transcript_acquisition::AuditDebt>,
+        now: u64,
+    ) -> bool {
+        self.retained().ok().is_some_and(|cache| {
+            cache.peek(key).is_some_and(|retained| {
+                retained.checkpoint.reuses_unchanged(file, scope, debt, now)
+            })
+        })
+    }
     /// Stage 1 K8 (iii), tests only: panic on this thread while holding
     /// `lock`, as a continuation worker would (W9).
     #[cfg(test)]

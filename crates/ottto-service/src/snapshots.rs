@@ -27131,6 +27131,10 @@ impl OwnedSourceScan {
                     ) {
                         Some((twin, _)) => {
                             index.candidate_decision(&twin) == CandidateDecision::Parse
+                                // A recovering identity re-offer reads this twin
+                                // once; cache-only adoption never selects twins.
+                                || index.desktop_identity_reoffer(&twin, &claude_title_metadata)
+                                    == Some(desktop_identity::IdentityReoffer::Recovered)
                         }
                         None => true,
                     }
@@ -30641,12 +30645,15 @@ impl OwnedSourceScan {
                     )
                 });
                 // Recheck: an abandoned or since-changed selection is ordinary.
-                let desktop_identity_reoffer = desktop_identity_reoffers
-                    .remove(&index_key)
-                    .filter(|_| {
-                        index
-                            .desktop_identity_reoffer(&candidate, &claude_title_metadata)
-                            .is_some()
+                // An unchanged pending child read for another reason (a forced
+                // twin family, audit) is that same one recovery re-offer.
+                let selected = desktop_identity_reoffers.remove(&index_key);
+                let desktop_identity_reoffer = (source == SnapshotSource::ClaudeCode)
+                    .then(|| index.desktop_identity_reoffer(&candidate, &claude_title_metadata))
+                    .flatten()
+                    .filter(|kind| {
+                        selected == Some(*kind)
+                            || *kind == desktop_identity::IdentityReoffer::Recovered
                     })
                     .map(|kind| (kind, lineage_native_bytes));
                 pending_finalization.push(PendingIndexFinalization {
@@ -31993,26 +32000,6 @@ impl OwnedSourceScan {
                     ),
                     None => index.candidate_decision_with_reason(&candidate),
                 };
-            if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Skip {
-                // Selection only, through the ordinary source-revision path.
-                // Adoption never reads: only a RAM reduction of exactly this
-                // unchanged extent qualifies; otherwise it waits for a natural read.
-                let key = local_index_key(&candidate.path);
-                let reoffer = index
-                    .desktop_identity_reoffer(&candidate, &claude_title_metadata)
-                    .filter(|kind| {
-                        *kind == desktop_identity::IdentityReoffer::Recovered
-                            || sampling.as_ref().is_some_and(|context| {
-                                context.cache.retained_sealed_offset(&key)
-                                    == Some(candidate.size_bytes)
-                            })
-                    });
-                if let Some(kind) = reoffer {
-                    decision = CandidateDecision::Parse;
-                    parse_reason = Some(CandidateParseReason::SourceChanged);
-                    desktop_identity_reoffers.insert(key, kind);
-                }
-            }
             let target_match = native_comparison
                 .as_ref()
                 .and_then(|phase| phase.target_revision_matches(&candidate));
@@ -32030,6 +32017,67 @@ impl OwnedSourceScan {
             let comparison_target = target_match == Some(true);
             if comparison_target {
                 decision = CandidateDecision::Parse;
+            }
+            if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Skip {
+                // Selection only, through the ordinary source-revision path.
+                let key = local_index_key(&candidate.path);
+                let now = sampled_scan::now_seconds();
+                let reoffer =
+                    index
+                        .desktop_identity_reoffer(&candidate, &claude_title_metadata)
+                        .filter(|kind| {
+                            *kind == desktop_identity::IdentityReoffer::Recovered || {
+                                // SOURCE: adoption never reads. Only a retained
+                                // reduction that acquisition below reuses as
+                                // Unchanged (0 native bytes) qualifies, and never an
+                                // E2 path twin whose absent sibling would withhold
+                                // it. Otherwise it waits for a natural read.
+                                let twin = claude_request_money::e2::enabled()
+                                    && history_upgrade.twin_groups().get().map_or(true, |groups| {
+                                        !claude_request_money::e2::selected_twin_roots(
+                                            std::iter::once(candidate.path.as_path()),
+                                            groups,
+                                        )
+                                        .is_empty()
+                                    });
+                                !twin
+                                    && state_census_complete
+                                    && sampling.as_ref().is_some_and(|context| {
+                                        let debt = sampled_audit::debt_for_key(index, &key, now);
+                                        context.audit_metadata_supported
+                                            && (debt.is_some() || context.audit_slots > 0)
+                                            && sampled_scan::reduction_dependencies(
+                                                source,
+                                                &candidate,
+                                                &codex_title_metadata,
+                                                &claude_title_metadata,
+                                                claude_effort_support_dir_ref,
+                                            )
+                                            .is_some_and(|sidecar| {
+                                                let scope = context.file_scope(
+                                                    source,
+                                                    &candidate,
+                                                    &sidecar,
+                                                    artifacts_enabled,
+                                                    context_curve_enabled,
+                                                    index,
+                                                );
+                                                context.cache.reuses_unchanged(
+                                                    &key,
+                                                    &opened_file,
+                                                    &scope,
+                                                    debt,
+                                                    now,
+                                                )
+                                            })
+                                    })
+                            }
+                        });
+                if let Some(kind) = reoffer {
+                    decision = CandidateDecision::Parse;
+                    parse_reason = Some(CandidateParseReason::SourceChanged);
+                    desktop_identity_reoffers.insert(key, kind);
+                }
             }
             // History-upgrade gate (SOURCE P1), whatever selected the file:
             // unchanged Claude history that would carry a new body-witness
