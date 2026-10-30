@@ -41,8 +41,12 @@ pub(crate) enum CodexZstCause {
     CompatibilityUnfunded,
     #[serde(rename = "CompressedAdmissionRefused")]
     AdmissionRefused,
+    // Subset of decoder refusals: the unchanged free-only floor would fit
+    // without optional header entries. Attempts, not files or lost usage.
+    #[serde(rename = "decoder_refused_header_occupancy")]
+    DecoderRefusedHeaderOccupancy,
 }
-const CODEX_ZST_CAUSES: usize = CodexZstCause::AdmissionRefused as usize + 1;
+const CODEX_ZST_CAUSES: usize = CodexZstCause::DecoderRefusedHeaderOccupancy as usize + 1;
 static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
     [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 
@@ -392,6 +396,8 @@ pub(crate) struct Probe {
     pub(crate) page_events: claude_reread::Counts,
     pub(crate) full_causes: FullCauses,
     pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
+    #[cfg(feature = "replay-harness")]
+    index_reuse_skips: std::cell::Cell<u64>,
 }
 impl Drop for Probe {
     fn drop(&mut self) {
@@ -424,7 +430,14 @@ impl Probe {
             page_events: Default::default(),
             full_causes: Default::default(),
             line_delivery: None,
+            #[cfg(feature = "replay-harness")]
+            index_reuse_skips: std::cell::Cell::new(0),
         }
+    }
+    #[cfg(feature = "replay-harness")]
+    pub(crate) fn index_reuse_skip(&self) {
+        self.index_reuse_skips
+            .set(self.index_reuse_skips.get().saturating_add(1));
     }
     fn observation(&self) -> Observation {
         Observation::between(
@@ -447,6 +460,8 @@ impl Probe {
         struct Counts {
             #[serde(flatten)]
             collection: CollectionCounts,
+            #[cfg(feature = "replay-harness")]
+            index_reuse_skips: u64,
             #[serde(flatten)]
             pending: Option<ClaudeAccountRetainedPending>,
             #[serde(flatten)]
@@ -464,6 +479,8 @@ impl Probe {
         }
         let claude = source == "claude_code";
         let counts = Counts {
+            #[cfg(feature = "replay-harness")]
+            index_reuse_skips: self.index_reuse_skips.replace(0),
             line_delivery: self
                 .line_delivery
                 .filter(|(_, counts)| *counts != LineDeliveryCounts::default())
@@ -582,12 +599,29 @@ impl Observation {
     }
 }
 
+// Final upload candidates compared with their retained accepted bodies on this worker.
+// Drained by the existing finish record; no identifiers reach the log.
+thread_local! {
+    static ACCOUNT_HASH_CHANGED: std::cell::RefCell<std::collections::BTreeSet<String>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+pub(crate) fn account_hash_changed(session_key: &str) {
+    ACCOUNT_HASH_CHANGED.with(|sessions| {
+        sessions.borrow_mut().insert(session_key.to_string());
+    });
+}
+
 /// Observe only a normally returned finish; move its value/error through unchanged.
 /// A panic drops the probe silently. Outcome reporting remains with the caller.
 pub(crate) fn source_finish<T>(
     source: &str,
     inner: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    #[derive(Serialize)]
+    struct Counts {
+        account_hash_changed: u64,
+    }
+    ACCOUNT_HASH_CHANGED.with(|sessions| sessions.borrow_mut().clear());
     let probe = Probe::start();
     let result = inner();
     emit(&Record {
@@ -596,7 +630,13 @@ pub(crate) fn source_finish<T>(
         stage: "source_finish",
         source: Source::from_slug(source),
         observation: probe.observation(),
-        counts: EmptyCounts {},
+        counts: Counts {
+            account_hash_changed: ACCOUNT_HASH_CHANGED.with(|sessions| {
+                let count = sessions.borrow().len() as u64;
+                sessions.borrow_mut().clear();
+                count
+            }),
+        },
     });
     result
 }
@@ -639,9 +679,6 @@ pub(crate) fn codex_census_fence(
     });
 }
 
-#[derive(Serialize)]
-struct EmptyCounts {}
-
 /// Fixed-schema traversal decisions only; no CPU/RSS sample or wire event.
 pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {
     traversal_point("bounded_traversal_transition", source, counts);
@@ -672,6 +709,12 @@ pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) 
         "claude_code",
         counts,
     );
+}
+/// Local alarm, once per park: a held Claude key's progress audit failed its
+/// secure open 8 times in a row and is parked, its audit debt still owed.
+/// Counts only; no path, id or wire event.
+pub(crate) fn claude_held_audit_open_parked(counts: &impl Serialize) {
+    traversal_point("claude_held_audit_open_parked", "claude_code", counts);
 }
 /// Local alarm, at most hourly: a complete Claude terminal kept the retired
 /// family tombstone uncertainty fence up, because more absent witnessed roots
@@ -778,6 +821,10 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
 /// disabled store, as [since last, total] counts. No path, id or wire event.
 pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {
     traversal_point("durable_tail_alarm", source, counts);
+}
+/// At most once per 24 h while restart Fulls caused by a failed store write persist.
+pub(crate) fn durable_tail_restart_full_alarm(source: &str, counts: &impl Serialize) {
+    traversal_point("durable_tail_restart_full_alarm", source, counts);
 }
 pub(crate) fn codex_continuation(held: Option<&'static str>) {
     let counts = serde_json::json!({
@@ -1328,7 +1375,7 @@ struct Record<T: Serialize> {
 }
 fn emit(record: &impl Serialize) {
     if let Ok(json) = serde_json::to_string(record) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "replay-harness"))]
         if TEST_OUTPUT.with(|output| {
             if let Some(output) = output.borrow_mut().as_mut() {
                 output.push(json.clone());
@@ -1348,11 +1395,11 @@ fn write_line(json: &str, writer: &mut impl Write) {
     let _ = writeln!(writer, "ottto-service: local_resources {json}");
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "replay-harness"))]
 thread_local! {
     static TEST_OUTPUT: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "replay-harness"))]
 pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
     struct Reset;
     impl Drop for Reset {
@@ -1394,8 +1441,13 @@ mod tests {
             HeaderUnfunded,
             CompatibilityUnfunded,
             AdmissionRefused,
+            DecoderRefusedHeaderOccupancy,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
+        assert_eq!(
+            serde_json::to_value(DecoderRefusedHeaderOccupancy).unwrap(),
+            "decoder_refused_header_occupancy"
+        );
         for (index, cause) in ALL.iter().enumerate() {
             assert_eq!(*cause as usize, index);
         }
@@ -1706,7 +1758,10 @@ mod tests {
         assert_eq!(record["schema_version"], SCHEMA_VERSION);
         assert_eq!(record["stage"], "source_finish");
         assert_eq!(record["source"], source);
-        assert_eq!(record["counts"], serde_json::json!({}));
+        assert_eq!(
+            record["counts"],
+            serde_json::json!({"account_hash_changed": 0})
+        );
         assert!(record.get("result").is_none());
         println!("RESOURCE_V2_FINISH_FIXTURE {record}");
     }

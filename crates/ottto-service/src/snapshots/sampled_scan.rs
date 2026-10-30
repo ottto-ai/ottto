@@ -19,11 +19,16 @@ const RETAIL_RESERVE_BYTES: usize = 0;
 const KEY_RESERVE_BYTES: usize = durable_tail::KEY_RESERVE_BYTES;
 #[cfg(not(unix))]
 const KEY_RESERVE_BYTES: usize = 0;
+#[cfg(unix)]
+const STALE_PREDECESSOR_RESERVE_BYTES: usize = durable_tail::STALE_PREDECESSOR_RESERVE_BYTES;
+#[cfg(not(unix))]
+const STALE_PREDECESSOR_RESERVE_BYTES: usize = 0;
 const STATE_BYTES: usize = CACHE_BYTES
     - crate::source_rotation::OVERLAP_BUDGET
     - AUDIT_AND_SCRATCH_BYTES
     - RETAIL_RESERVE_BYTES
-    - KEY_RESERVE_BYTES;
+    - KEY_RESERVE_BYTES
+    - STALE_PREDECESSOR_RESERVE_BYTES;
 
 pub(super) mod codex_cursor;
 #[cfg(unix)]
@@ -183,15 +188,16 @@ impl SharedCache {
             ))),
         }
     }
-    /// Copy-refusal release: evicts retained copies only. The paused cursor
-    /// job, the held-singleton memo, parked records and rotation state are
-    /// charged and bounded in `heap_bound`, and survive (K6).
+    /// Copy-refusal release: evicts retained copies and optional header facts.
+    /// The paused cursor job, held-singleton memo, parked records and rotation
+    /// state are charged and bounded in `heap_bound`, and survive (K6).
     pub(super) fn clear(&self) {
         if let Ok(mut cache) = self.retained() {
             cache.clear();
         } else {
             record(Event::ClearPoisonedLock);
         }
+        self.with_cursor(|cursor| cursor.headers.clear());
     }
     /// M1: evict retained copies in victim order until they fit the state
     /// budget beside the cursor state and `pinned` bytes, measured under
@@ -403,9 +409,13 @@ impl SharedCache {
             return Err(incoming);
         };
         let live_bytes = taken.finalization_charge;
-        let reserved = live_bytes
-            .saturating_add(self.cursor_resident_for_main())
-            .saturating_add(side_ledger::SIDE_LEDGER_BYTES);
+        let reserved = self.retained_reservation(
+            &cache,
+            &key,
+            &taken.retained,
+            live_bytes,
+            taken.modified_hint,
+        );
         let touched = key.clone();
         let result = cache.insert_taken_reserving(key, incoming, reserved);
         self.drop_suspended_proof_if_over(&cache, live_bytes);
@@ -1210,6 +1220,9 @@ pub(super) fn copy_budget_step(
     let room = remaining
         .zip(used)
         .and_then(|(remaining, used)| remaining.checked_sub(used));
+    if let Some(room) = room {
+        context.cache.retire_headers_over_room(room);
+    }
     let budget = room.map_or(0, |room| room / 2);
     (
         budget,

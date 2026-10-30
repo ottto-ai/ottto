@@ -73,7 +73,8 @@ pub(crate) const WRITE_PASS_BYTES: usize = store::WRITE_PASS_BYTES;
 /// - M3 per-key debt/D3-hold and P1-1 restore-pending maps, 2*257 nodes of
 ///   <=1024 bytes = 526,336 bytes (`KEY_RESERVE_BYTES`).
 ///
-/// Total 1,978,368 bytes supersedes the earlier 1,452,032 map estimate.
+/// Plus the 225,720-byte fixed-digest diagnostic set (512 entries + root).
+/// Total 2,204,088 bytes; the previous canonical pin was 1,978,368 bytes.
 /// The 526,336-byte M3 key reserve is debited from STATE_BYTES, within the
 /// existing cache budget. Native/container evidence remains required; this
 /// explicit prepayment is separate from the retained graph's heap walk.
@@ -81,7 +82,8 @@ pub(crate) const WRITE_PASS_BYTES: usize = store::WRITE_PASS_BYTES;
 pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 256
     + 2 * (store::MAX_BATCH + 1) * 4096
     + super::RETAIL_RESERVE_BYTES
-    + KEY_RESERVE_BYTES;
+    + KEY_RESERVE_BYTES
+    + STALE_PREDECESSOR_RESERVE_BYTES;
 
 /// M3 per-key maps outside the A0-h custody node, each with its own prepaid
 /// capacity of `MAX_RECORDS` nodes (plus the retained root) of <=1024 bytes:
@@ -202,6 +204,15 @@ pub(crate) struct Counters {
     /// M3 D3 Claude holds: [growth bytes, released by write, released by
     /// content change, unfunded hold marker].
     pub(crate) d3: [u64; write_ahead::D3_COUNTS],
+    /// Records offered to a post-save batch that returned an error. The
+    /// store keeps each one's predecessor until a later write replaces it.
+    pub(crate) store_write_after_save_failed: u64,
+    /// [files, bytes], an UPPER BOUND: Fulls whose restore refused the
+    /// record as behind the committed entry (`entry_changed`), and the native
+    /// bytes those Fulls read. It reuses that refusal with no persisted
+    /// marker of a failed write, so it also counts a record never offered
+    /// (deferred or evicted).
+    pub(crate) store_write_failed_restart_full: [u64; 2],
 }
 
 impl Counters {
@@ -229,7 +240,9 @@ impl Counters {
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
              records_invalidated={} mutation_unproved={} peak_codec_bytes={} t14_rebuild_full_started={} \
-             d3_hold[growth_bytes,released_write,released_content,unfunded]={:?}",
+             d3_hold[growth_bytes,released_write,released_content,unfunded]={:?} \
+             store_write_after_save_failed[files]={} \
+             store_write_failed_restart_full[files,bytes]={:?}",
             source.api_slug(),
             self.original_v1_mapped,
             self.durable_restore_after_selection_clear,
@@ -284,9 +297,25 @@ impl Counters {
             store.peak_codec_bytes,
             store.t14_rebuild_full_started,
             self.d3,
+            self.store_write_after_save_failed,
+            self.store_write_failed_restart_full,
         )
     }
 }
+
+/// Diagnostic only: a u64 collision can mis-attribute the UPPER-BOUND
+/// counter; it never grants admission, owed, reads or money authority.
+fn stale_predecessor_key(key: &str) -> u64 {
+    let digest = crate::codex_scan_diagnostics::digest(key);
+    u64::from_le_bytes(digest[..8].try_into().expect("fixed digest prefix"))
+}
+const STALE_PREDECESSOR_KEYS: usize = 2 * store::MAX_RECORDS;
+// Same conservative full B-tree node per entry PLUS retained root as
+// heap_layout_bound::tree_nodes::<u64, ()>: 256 + 12*8 + 11*8 = 440B.
+const STALE_PREDECESSOR_ENTRY_BYTES: usize =
+    256 + 12 * std::mem::size_of::<usize>() + 11 * std::mem::size_of::<u64>();
+pub(crate) const STALE_PREDECESSOR_RESERVE_BYTES: usize =
+    (STALE_PREDECESSOR_KEYS + 1) * STALE_PREDECESSOR_ENTRY_BYTES;
 
 /// Per-pass decisions share the existing index-bounded map. Layout GC is
 /// authorized only by the actual selected read's settlement, never its probe.
@@ -304,6 +333,9 @@ impl ScopeDecision {
         }
     }
 }
+/// The least spacing between two restart-Full alarms in one process.
+pub(crate) const RESTART_FULL_ALARM_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
 
 struct Slot {
     dir: PathBuf,
@@ -439,6 +471,11 @@ pub(crate) struct Stores {
     /// committed entry with this same fingerprint; local-hold settlement that
     /// reverts or clears the entry makes it refuse (F2).
     selected: BTreeMap<String, String>,
+    /// Keys whose restore refused the record as `entry_changed`, until their
+    /// next acquisition completes. Process-local, never persisted.
+    stale_predecessor: BTreeSet<u64>,
+    /// When this process last emitted the restart-Full alarm.
+    restart_full_alarmed: Option<std::time::Instant>,
     counters: Counters,
     // Source+key only: never clear on passes, scope changes or cache eviction.
     // A node without authority is freed (`release_idle_custody`).
@@ -2832,7 +2869,7 @@ impl SharedCache {
             &mut lease,
         );
         // The common guard held U/T14 before acquisition; this sees class changes since.
-        match result {
+        let outcome = match result {
             Ok(Ok(completed)) => {
                 // Admission and take share one retained lock and this paid owner.
                 match self.insert_with_custody(key.to_string(), completed, 0, false, true, true) {
@@ -2910,6 +2947,39 @@ impl SharedCache {
                 lease.release();
                 outcome
             }
+        };
+        if matches!(
+            outcome,
+            RestoreOutcome::Miss(MissClass::Failure(Failure::Ineligible(
+                store::Ineligible::EntryChanged
+            )))
+        ) {
+            if let Some(mut stores) = self.durable() {
+                if stores.stale_predecessor.len() < STALE_PREDECESSOR_KEYS {
+                    stores.stale_predecessor.insert(stale_predecessor_key(key));
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Count only a completed Full after an entry_changed refusal; any
+    /// completion clears this process-local diagnostic mark, never authority.
+    pub(crate) fn durable_acquisition_completed(
+        &self,
+        key: &str,
+        mode: crate::transcript_acquisition::ReadMode,
+        native_bytes: u64,
+    ) {
+        let Some(mut stores) = self.durable() else {
+            return;
+        };
+        if stores.stale_predecessor.remove(&stale_predecessor_key(key))
+            && matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
+        {
+            let counts = &mut stores.counters.store_write_failed_restart_full;
+            counts[0] += 1;
+            counts[1] = counts[1].saturating_add(native_bytes);
         }
     }
 
@@ -4264,6 +4334,7 @@ impl SharedCache {
                 return None;
             }
         };
+        let offered_files = pending.len() as u64;
         let before = slot.store.counters().store_write_failed;
         let result = slot
             .store
@@ -4272,6 +4343,7 @@ impl SharedCache {
         let receipt = match result {
             Ok(receipt) => receipt,
             Err(_) => {
+                stores.counters.store_write_after_save_failed += offered_files;
                 let stage = ["setup", "inventory", "statvfs"]
                     .into_iter()
                     .enumerate()
@@ -4501,6 +4573,11 @@ impl SharedCache {
     /// report (with totals), and once, the cause that disabled the store.
     /// A U hold keeps the source census retryable; T14 holds keep it healthy.
     pub(crate) fn durable_alarm(&self, snapshot_source: SnapshotSource) {
+        self.durable_alarm_at(snapshot_source, std::time::Instant::now());
+    }
+
+    pub(crate) fn durable_alarm_at(&self, snapshot_source: SnapshotSource, at: std::time::Instant) {
+        self.durable_restart_full_alarm(snapshot_source, at);
         #[derive(serde::Serialize)]
         struct HoldAlarm {
             keys: u64,
@@ -4696,6 +4773,41 @@ impl SharedCache {
         }
     }
 
+    /// One alarm at this process's first `store_write_failed_restart_full`
+    /// file, then at most one per `RESTART_FULL_ALARM_WINDOW`: the once-per-
+    /// 24 h throttle of the accepted rebuild alarm (`load_containment.rs`),
+    /// kept process-local so no persisted field is added. The counter on the
+    /// `durable_tail` line stays the persistent signal. Counts only.
+    fn durable_restart_full_alarm(&self, snapshot_source: SnapshotSource, at: std::time::Instant) {
+        #[derive(serde::Serialize)]
+        struct Alarm {
+            store_write_failed_restart_full: [u64; 2],
+            store_write_after_save_failed: u64,
+        }
+        let Some(mut stores) = self.durable() else {
+            return;
+        };
+        if stores.counters.store_write_failed_restart_full[0] == 0 {
+            return;
+        }
+        if stores
+            .restart_full_alarmed
+            .is_some_and(|last| at.saturating_duration_since(last) < RESTART_FULL_ALARM_WINDOW)
+        {
+            return;
+        }
+        stores.restart_full_alarmed = Some(at);
+        let alarm = Alarm {
+            store_write_failed_restart_full: stores.counters.store_write_failed_restart_full,
+            store_write_after_save_failed: stores.counters.store_write_after_save_failed,
+        };
+        drop(stores);
+        crate::local_resource_diagnostics::durable_tail_restart_full_alarm(
+            snapshot_source.api_slug(),
+            &alarm,
+        );
+    }
+
     /// This process's durable counts and the source's store counters.
     pub(crate) fn durable_counters(
         &self,
@@ -4720,6 +4832,20 @@ impl SharedCache {
         counters.retail_full[2] = counters.pace_evicted[source as usize];
         let store = stores.slot(source).as_ref()?.store.counters();
         Some((counters, store))
+    }
+
+    /// Dev-only inspection of an existing slot. Never initializes a store or
+    /// opens records; the caller inventories its own scratch after releasing
+    /// this lock. The path must never enter aggregate output.
+    #[cfg(feature = "replay-harness")]
+    pub(crate) fn durable_replay_store(
+        &self,
+        snapshot_source: SnapshotSource,
+    ) -> Option<(PathBuf, Option<&'static str>)> {
+        let source = durable_source(snapshot_source)?;
+        let mut stores = self.durable()?;
+        let slot = stores.slot(source).as_ref()?;
+        Some((slot.dir.clone(), slot.store.disabled()))
     }
 }
 
@@ -5028,6 +5154,10 @@ pub(crate) mod tests;
 #[cfg(test)]
 #[path = "transition_seed.rs"]
 pub(crate) mod transition_seed;
+
+#[cfg(test)]
+#[path = "durable_tail_store_write_tests.rs"]
+mod store_write_tests;
 
 #[cfg(test)]
 pub(crate) use tests::seed_pinned_v1;

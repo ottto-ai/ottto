@@ -42,8 +42,8 @@ Normal no-old-byte restores use a separate bounded pending-authority map,
 not `retail_spent`; overflow is counted and falls toward the existing paced
 read. Owed/hold metadata has its own funded map. Restored head re-reads have a
 2 MiB per-source/pass budget reserved before input. The canonical resident-map
-pin is **1,978,368 bytes**: 131,072 memo + 270,336 compact pending + 1,050,624
-spent/witness/pacing + 526,336 new key maps. The new reserve is subtracted from
+pin is **2,204,088 bytes**: 131,072 memo + 270,336 compact pending + 1,050,624
+spent/witness/pacing + 526,336 new key maps + 225,720 fixed-digest restart diagnostics. The new reserve is subtracted from
 the existing retained-state budget; cache, record and active caps were not raised.
 Full receipt/stage identities stay outside compact pending and are actively funded.
 
@@ -181,3 +181,14 @@ The missing-carrier GC negative control commits its own index generation.
 Qualification explicitly checks stale-writer rejection, reloads that committed
 index, and carries only the completed read's audit obligation before saving its
 finalized body. It never stamps an invented generation onto stale state.
+
+Merging main composes the #904 counter and alarm names with M3's existing
+post-save retry path. A bounded u64 digest set replaces copied key strings.
+Its conservative charge is 512 entries plus one retained root, each 440 bytes:
+225,720 bytes are subtracted from the existing retained-state allowance. The
+canonical Stores pin becomes 1,978,368 + 225,720 = 2,204,088 bytes. Collisions
+can only mis-attribute the upper-bound diagnostic; they grant no admission,
+receipt, owed, read or money authority. Existing store-failure retries and
+predecessor protection remain authoritative. The alarm fires on the process's
+first counted restart Full, then at most once per 24 hours. No persisted field
+or Full cause is added.
