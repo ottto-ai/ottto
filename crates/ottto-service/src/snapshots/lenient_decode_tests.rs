@@ -4747,3 +4747,62 @@ fn retired_reread_new_writer_keeps_previous_default_contract() {
         serde_json::to_vec(&seed.claude_request_census).unwrap()
     );
 }
+
+/// Pin the previous 0.1.201 map/default entry contract cited by
+/// retired_reread_new_writer_keeps_previous_default_contract. Quiet retirement
+/// writes the existing plain identity, not an unknown field or marker shape.
+#[test]
+fn quiet_retired_index_loads_under_previous_entry_defaults() {
+    #[derive(Default, serde::Deserialize)]
+    #[serde(default)]
+    struct PreviousEntry {
+        size_bytes: u64,
+        modified_unix_seconds: u64,
+        source_file_fingerprint: String,
+        last_snapshot_fingerprint: Option<String>,
+        scan_identity_version: Option<String>,
+    }
+    #[derive(Default, serde::Deserialize)]
+    #[serde(default)]
+    struct PreviousIndex {
+        schema_version: u16,
+        files: BTreeMap<String, PreviousEntry>,
+    }
+    let mut index = fixture();
+    let key = "/synthetic/0.jsonl";
+    let before = index.files[key].clone();
+    assert!(index.stage_sampled_audit(
+        key,
+        &before.source_file_fingerprint,
+        crate::transcript_acquisition::AuditDebt {
+            due_unix_seconds: 100
+        }
+    ));
+    assert!(index.retire_quiet_audit(key, &before.source_file_fingerprint));
+    let scratch = crate::test_scratch::ScratchDir::new("retired-previous-index");
+    let path = scratch.join("index.json");
+    index.save(&path).unwrap();
+    let old: PreviousIndex = serde_json::from_slice(&fs::read(&path).unwrap())
+        .expect("previous default map decoder accepts cleared marker");
+    assert_eq!(old.schema_version, SCAN_INDEX_SCHEMA_VERSION);
+    assert_eq!(old.files.len(), index.files.len());
+    let entry = &old.files[key];
+    assert_eq!(
+        entry.scan_identity_version.as_deref(),
+        Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+    );
+    assert_eq!(entry.size_bytes, before.size_bytes);
+    assert_eq!(entry.modified_unix_seconds, before.modified_unix_seconds);
+    assert_eq!(
+        entry.source_file_fingerprint,
+        before.source_file_fingerprint
+    );
+    assert_eq!(
+        entry.last_snapshot_fingerprint,
+        before.last_snapshot_fingerprint
+    );
+    assert_eq!(
+        ScanIndex::load(&path).unwrap().files[key].unverified_deadline(),
+        None
+    );
+}

@@ -1,0 +1,294 @@
+//! Per-file delivery evidence, independent of source census authority.
+use super::*;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Receipt {
+    pub context_fingerprint: String,
+    /// Existing numeric capability replay epoch. Historical replay resets
+    /// delivery authority (including this receipt) even for retained entries.
+    pub replay_generation: u64,
+    pub source_witness: String,
+    pub body_witness: String,
+}
+
+/// Captured from the final admitted bodies under their own context, before POST.
+/// Never serialized; restored ACK ledgers cannot create these acknowledgements.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Candidate {
+    key: String,
+    receipt: Receipt,
+    historical_replay_generation: Option<String>,
+    bodies: BTreeMap<String, String>,
+    wire_bytes: BTreeMap<String, u64>,
+}
+
+impl Candidate {
+    pub(crate) fn entities(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.bodies.iter()
+    }
+    pub(crate) fn previous_body_matches(&self, previous: &ScanIndex) -> bool {
+        // The additive witness deliberately omits semantic/policy fields
+        // such as titles. Equal additive evidence is not an identical body
+        // when D changed the semantic entity set.
+        previous.file_snapshot_fingerprints.get(&self.key)
+            == Some(&self.bodies.keys().cloned().collect())
+            && previous
+                .files
+                .get(&self.key)
+                .and_then(|entry| entry.last_upload_body_witness.as_ref())
+                == Some(&self.receipt.body_witness)
+    }
+    pub(crate) fn has_accepted_predecessor(&self, previous: &ScanIndex) -> bool {
+        previous
+            .files
+            .get(&self.key)
+            .is_some_and(|entry| entry.source_file_fingerprint == self.receipt.source_witness)
+            && previous
+                .file_snapshot_fingerprints
+                .get(&self.key)
+                .is_some_and(|entities| {
+                    entities
+                        .iter()
+                        .any(|fp| previous.accepted_snapshot_fingerprints.contains(fp))
+                })
+    }
+    pub(crate) fn file_bytes(&self, index: &ScanIndex) -> u64 {
+        index
+            .files
+            .get(&self.key)
+            .map_or(0, |entry| entry.size_bytes)
+    }
+}
+
+#[derive(Default, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct RearmCounts {
+    pub files: u64,
+    pub bytes: u64,
+    pub local_bytes: u64,
+}
+impl RearmCounts {
+    pub(crate) fn emit(&self, source: SnapshotSource) {
+        if self.files > 0 || self.local_bytes > 0 {
+            crate::local_resource_diagnostics::traversal_point(
+                "upload_context_rearm",
+                source.api_slug(),
+                &BTreeMap::from([("upload_context_rearm", self)]),
+            );
+        }
+    }
+}
+
+impl ScanIndex {
+    pub(crate) fn source_upload_context_matches(&self) -> bool {
+        self.upload_context_fingerprint == self.active_upload_context_fingerprint
+    }
+    pub(crate) fn activate_file_upload_context(&mut self, source: SnapshotSource, context: String) {
+        self.activate_upload_context(context);
+        self.file_upload_context_enabled =
+            matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex);
+        self.activate_quarantine_witness(source);
+    }
+
+    fn receipt_matches(&self, entry: &ScanIndexEntry) -> bool {
+        entry
+            .upload_context_receipt
+            .as_ref()
+            .is_some_and(|receipt| {
+                self.active_upload_context_fingerprint.as_ref()
+                    == Some(&receipt.context_fingerprint)
+                    && receipt.replay_generation == self.context_curve_replay_epoch
+                    && receipt.source_witness == entry.source_file_fingerprint
+                    && entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
+            })
+    }
+
+    pub(super) fn file_upload_context_requires_adoption(&self, key: &str) -> bool {
+        // Per-file evidence narrows the existing source-wide debt. An already
+        // adopted source stays quiet even without receipts (including upgrades).
+        if self.upload_context_fingerprint == self.active_upload_context_fingerprint {
+            return false;
+        }
+        if !self.file_upload_context_enabled || self.confirmed_empty_files.contains(key) {
+            // A suppressed/empty result has no ACK receipt. Keep its existing
+            // census-context gate so a new policy can make it uploadable.
+            return self.upload_context_fingerprint != self.active_upload_context_fingerprint;
+        }
+        self.files
+            .get(key)
+            .map_or(true, |entry| !self.receipt_matches(entry))
+    }
+
+    pub(super) fn file_upload_context_backoff_holds(&self, candidate: &CandidateFile) -> bool {
+        if !self.file_upload_context_enabled {
+            return false;
+        }
+        let key = local_index_key(&candidate.path);
+        self.files.get(&key).is_some_and(|entry| {
+            entry.source_file_fingerprint == candidate.source_file_fingerprint
+                && entry.size_bytes == candidate.size_bytes
+                && entry.modified_unix_seconds == candidate.modified_unix_seconds
+                && entry
+                    .modified_unix_nanos
+                    .map_or(true, |nanos| nanos == candidate.modified_unix_nanos)
+        }) && self
+            .file_snapshot_fingerprints
+            .get(&key)
+            .is_some_and(|entities| {
+                !entities.is_empty()
+                    && entities
+                        .iter()
+                        .any(|entity| self.quarantined_snapshot_fingerprints.contains_key(entity))
+                    && entities.iter().all(|entity| {
+                        self.accepted_snapshot_fingerprints.contains(entity)
+                            || self
+                                .quarantined_snapshot_fingerprints
+                                .get(entity)
+                                .is_some_and(|record| {
+                                    self.active_quarantine_witness.as_ref() == Some(&record.witness)
+                                        && !self.quarantine_retry_selects_file(entity, &key)
+                                })
+                    })
+            })
+    }
+
+    pub(crate) fn file_upload_context_ack_candidates(
+        &self,
+        items: &[SnapshotItem],
+    ) -> Vec<Candidate> {
+        if !self.file_upload_context_enabled {
+            return Vec::new();
+        }
+        let Some(context) = self.active_upload_context_fingerprint.as_ref() else {
+            return Vec::new();
+        };
+        let mut by_source: BTreeMap<&str, BTreeMap<String, String>> = BTreeMap::new();
+        let mut by_source_bytes = BTreeMap::<&str, BTreeMap<String, u64>>::new();
+        for item in items {
+            if let Some(source) = item.source_file_fingerprint.as_deref() {
+                if !by_source
+                    .get(source)
+                    .is_some_and(|bodies| bodies.contains_key(&item.snapshot_fingerprint))
+                {
+                    let bytes = crate::snapshot_sync::snapshot_packing_json_length(item)
+                        .unwrap_or(0) as u64;
+                    by_source_bytes
+                        .entry(source)
+                        .or_default()
+                        .insert(item.snapshot_fingerprint.clone(), bytes);
+                }
+                by_source.entry(source).or_default().insert(
+                    item.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(item),
+                );
+            }
+        }
+        self.files
+            .iter()
+            .filter_map(|(key, entry)| {
+                if self.receipt_matches(entry)
+                    || self.decode_holds_file(key)
+                    || self
+                        .effective_upload_body_witness_revision_excluded_source_files
+                        .contains(&entry.source_file_fingerprint)
+                {
+                    return None;
+                }
+                let bodies = by_source.get(entry.source_file_fingerprint.as_str())?;
+                let entities = self.file_snapshot_fingerprints.get(key)?;
+                if bodies.len() != entities.len()
+                    || !entities.iter().all(|fp| bodies.contains_key(fp))
+                {
+                    return None;
+                }
+                let body_witness =
+                    snapshot_file_upload_body_set_hex(bodies.values().collect::<BTreeSet<_>>());
+                if entry.last_upload_body_witness.as_ref() != Some(&body_witness) {
+                    return None;
+                }
+                Some(Candidate {
+                    key: key.clone(),
+                    receipt: Receipt {
+                        context_fingerprint: context.clone(),
+                        replay_generation: self.context_curve_replay_epoch,
+                        source_witness: entry.source_file_fingerprint.clone(),
+                        body_witness,
+                    },
+                    historical_replay_generation: self.historical_replay_generation.clone(),
+                    bodies: bodies.clone(),
+                    wire_bytes: by_source_bytes
+                        .get(entry.source_file_fingerprint.as_str())
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
+    /// Called on the final selected index, using only this cycle's exact ACKs.
+    /// No parse/finalize/quarantine/old-context path has this authority.
+    pub(crate) fn accept_file_upload_context_acks(
+        &mut self,
+        candidates: &[Candidate],
+        fresh_acks: &BTreeMap<String, String>,
+    ) -> RearmCounts {
+        let mut counts = RearmCounts {
+            local_bytes: self.context_read_counts.local_bytes,
+            ..RearmCounts::default()
+        };
+        // Joined file aliases can earn separate receipts for one wire entity.
+        let mut counted_entities = BTreeSet::new();
+        for candidate in candidates {
+            if self.active_upload_context_fingerprint.as_ref()
+                != Some(&candidate.receipt.context_fingerprint)
+                || self.context_curve_replay_epoch != candidate.receipt.replay_generation
+                || self.historical_replay_generation != candidate.historical_replay_generation
+                || self.decode_holds_file(&candidate.key)
+                || self
+                    .effective_upload_body_witness_revision_excluded_source_files
+                    .contains(&candidate.receipt.source_witness)
+                || candidate.bodies.iter().any(|(entity, body)| {
+                    fresh_acks.get(entity) != Some(body)
+                        || self.quarantined_snapshot_fingerprints.contains_key(entity)
+                })
+                || self
+                    .file_snapshot_fingerprints
+                    .get(&candidate.key)
+                    .map_or(true, |entities| {
+                        entities.len() != candidate.bodies.len()
+                            || !entities.iter().all(|fp| candidate.bodies.contains_key(fp))
+                    })
+            {
+                continue;
+            }
+            let Some(entry) = self.files.get_mut(&candidate.key) else {
+                continue;
+            };
+            if entry.source_file_fingerprint != candidate.receipt.source_witness
+                || entry.last_upload_body_witness.as_ref() != Some(&candidate.receipt.body_witness)
+                || entry.upload_context_receipt.as_ref() == Some(&candidate.receipt)
+            {
+                continue;
+            }
+            let rearmed = entry
+                .upload_context_receipt
+                .as_ref()
+                .map_or(true, |receipt| {
+                    receipt.context_fingerprint != candidate.receipt.context_fingerprint
+                        || receipt.replay_generation != candidate.receipt.replay_generation
+                });
+            entry.upload_context_receipt = Some(candidate.receipt.clone());
+            if rearmed {
+                counts.files += 1;
+                for (entity, bytes) in &candidate.wire_bytes {
+                    if counted_entities.insert(entity) {
+                        counts.bytes = counts.bytes.saturating_add(*bytes);
+                    }
+                }
+            }
+        }
+        counts
+    }
+}
+crate::heap_layout_bound::fields!(Receipt; context_fingerprint, replay_generation, source_witness, body_witness);
+
+crate::heap_layout_bound::fields!(Candidate; key, receipt, historical_replay_generation, bodies, wire_bytes);
