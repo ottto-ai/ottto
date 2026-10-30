@@ -494,3 +494,109 @@ fn e2_pipeline_exact_telemetry_over_cap_uses_the_existing_counted_start_fallback
     assert_eq!(disposition.quarantined_entity_count(), 0);
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// The real evidence stage with the gate on, returning its evidence counters.
+fn e2_page_with_stats(
+    dir: &Path,
+    support: &Path,
+) -> (Vec<SnapshotItem>, crate::snapshot_sync::ClaudeLocalEvidenceStats) {
+    claude_request_money::e2::with_enabled(|| {
+        let mut index = ScanIndex::default();
+        let mut scan = scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            &[dir.to_path_buf()],
+            &mut index,
+            "2026-08-02T07:10:00Z",
+            7,
+            100,
+            false,
+        )
+        .unwrap();
+        claude_request_identity::retain_root_accounts(
+            &mut scan.snapshots,
+            &index,
+            "e2-identity-machine",
+        );
+        let (_, _, stats) =
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, &mut scan, &mut index);
+        (scan.snapshots, stats)
+    })
+}
+
+/// A strict trace read dropped because the sidecar grew mid-read leaves every
+/// request of the family unbound (no login), never bound to the other login.
+#[test]
+fn e2_pipeline_discarded_trace_read_leaves_requests_unbound_never_another_account() {
+    for discard in [false, true] {
+        let (dir, root, _) = claude_account_family_fixture();
+        let support = dir.join("support");
+        let (mut api, trace) = e2_family_evidence(&root);
+        api[4].account_identifier_hash = Some("b".repeat(64));
+        e2_resign(&mut api[4]);
+        e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
+        e2_write_rows(
+            &support,
+            "local-otel/claude-code-trace-ownership",
+            &root,
+            &trace,
+        );
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        if discard {
+            let expected = support
+                .join("local-otel/claude-code-trace-ownership")
+                .join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
+            let extra = serde_json::to_string(&complete_trace_row(&root, "req_6", "")).unwrap();
+            let fired = fired.clone();
+            crate::claude_local_otel::before_next_trace_read_for_test(move |path| {
+                assert_eq!(path, expected, "the family root's strict trace read");
+                // A concurrent exporter appends one more valid row.
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .unwrap()
+                    .write_all(format!("{extra}\n").as_bytes())
+                    .unwrap();
+                fired.set(true);
+            });
+        }
+        let (items, stats) = e2_page_with_stats(&dir, &support);
+        assert_eq!(fired.get(), discard, "discard={discard}");
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            e2_assert_identity_consistent(item, &format!("discard={discard}"));
+            let (login, requests) = if item.source_session_id == root {
+                ("a", 4)
+            } else {
+                ("b", 1)
+            };
+            let expected = if discard {
+                BTreeMap::from([(None, requests)])
+            } else {
+                BTreeMap::from([(Some(login.repeat(64)), requests)])
+            };
+            assert_eq!(e2_login_counts(item), expected, "discard={discard}");
+        }
+        if discard {
+            assert_eq!(stats.trace_incomplete_root_count, 1);
+            assert_eq!(
+                stats.trace_rows_discarded,
+                crate::claude_local_otel::ClaudeTraceRowsDiscarded {
+                    cap: 1,
+                    cap_rows: 5,
+                    ..Default::default()
+                }
+            );
+            let line = serde_json::to_value(&stats).unwrap();
+            assert_eq!(line["trace_rows_discarded"]["cap"], 1);
+            assert_eq!(line["trace_rows_discarded"]["generation"], 0);
+        } else {
+            assert_eq!(stats.trace_incomplete_root_count, 0);
+            assert!(stats.trace_rows_discarded.is_empty());
+            assert!(serde_json::to_value(&stats)
+                .unwrap()
+                .get("trace_rows_discarded")
+                .is_none());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

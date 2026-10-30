@@ -30,6 +30,8 @@ pub(crate) mod support_health;
 mod bounded_read;
 #[cfg(test)]
 mod decoder_tests;
+#[cfg(test)]
+mod trace_read_bound_tests;
 
 pub(crate) const STORE_DIR: &str = "local-otel/claude-code-effort";
 const TRACE_STORE_DIR: &str = "local-otel/claude-code-trace-ownership";
