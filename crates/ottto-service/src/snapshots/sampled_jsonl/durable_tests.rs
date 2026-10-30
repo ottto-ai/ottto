@@ -1533,7 +1533,7 @@ fn codex_subagent_lines() -> Vec<String> {
     let mut lines = codex_lines();
     let meta = lines[0].replacen(
         "\"source\":\"cli\"",
-        "\"source\":{\"subagent\":{\"thread_spawn\":{\"agent_path\":\"/root/CANARY_AGENT\"}}}",
+        "\"source\":{\"subagent\":{\"thread_spawn\":{\"agent_path\":\"/root/explorer\"}}}",
         1,
     );
     assert_ne!(meta, lines[0], "subagent premise");
