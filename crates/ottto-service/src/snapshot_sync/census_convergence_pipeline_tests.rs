@@ -486,6 +486,32 @@ impl PipelineFixture {
         before_classify: impl FnOnce(&mut ScanIndex),
         reoffers: bool,
     ) -> PipelinePage {
+        assert!(crate::snapshots::claude_terminal_off());
+        let audit_now = time::OffsetDateTime::parse(
+            collected_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("fixture clock")
+        .unix_timestamp() as u64;
+        crate::snapshots::with_terminal_off_audit_now_for_test(audit_now, || {
+            self.terminal_off_on_page_with_reoffers_born_at_clock(
+                collected_at,
+                cycle,
+                upload,
+                before_classify,
+                reoffers,
+            )
+        })
+    }
+
+    fn terminal_off_on_page_with_reoffers_born_at_clock(
+        &self,
+        collected_at: &str,
+        cycle: &PipelineCycle<'_>,
+        upload: PipelineUpload,
+        before_classify: impl FnOnce(&mut ScanIndex),
+        reoffers: bool,
+    ) -> PipelinePage {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
         index.activate_upload_context(cycle.upload_context.to_string());
         if cycle.historical_replay {

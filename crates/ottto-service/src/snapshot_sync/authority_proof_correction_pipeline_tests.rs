@@ -907,6 +907,19 @@ impl ApcFixture {
     }
 
     fn terminal_off_on_page_born(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
+        assert!(crate::snapshots::claude_terminal_off());
+        let audit_now = time::OffsetDateTime::parse(
+            collected_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("fixture clock")
+        .unix_timestamp() as u64;
+        crate::snapshots::with_terminal_off_audit_now_for_test(audit_now, || {
+            self.terminal_off_on_page_born_at_clock(collected_at, upload)
+        })
+    }
+
+    fn terminal_off_on_page_born_at_clock(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
         let before_bytes = std::fs::read(&self.index_path).unwrap_or_default();
         let before = ScanIndex::load(&self.index_path).expect("load scan index");
         let mut index = before.clone();

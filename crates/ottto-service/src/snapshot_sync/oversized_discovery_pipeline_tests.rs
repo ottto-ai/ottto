@@ -979,11 +979,11 @@ fn terminal_off_on_oversized_blocking_hold_is_reoffered_once_per_six_hour_floor(
         let mut parsed = BTreeSet::new();
         for number in 0..C1B_MAX_PAGES {
             let (page, rows) = crate::local_resource_diagnostics::capture(|| {
-                fixture.page(
+                crate::snapshots::with_terminal_off_audit_now_for_test(now + number as u64, || fixture.page(
                     &oversized_clock(now + number as u64),
                     &cycle,
                     PipelineUpload::Accept,
-                )
+                ))
             });
             if let Some(start) = transition_row(&rows, "starting") {
                 starts.push(start);
@@ -1000,12 +1000,8 @@ fn terminal_off_on_oversized_blocking_hold_is_reoffered_once_per_six_hour_floor(
         }
         panic!("hold floor traversal must exhaust");
     };
-    let at = time::OffsetDateTime::parse(
-        "2026-08-02T09:00:00Z",
-        &time::format_description::well_known::Rfc3339,
-    )
-    .unwrap()
-    .unix_timestamp() as u64;
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let (seed, starts) = walk(at);
     assert_eq!(starts.len(), 1);
     assert_eq!(seed.iter().map(|page| page.held.len()).sum::<usize>(), 1);

@@ -79,6 +79,7 @@ struct HistoryOutcome {
 }
 
 struct HistoryFixture {
+    audit_clock: std::cell::Cell<Option<(i64, u64)>>,
     pending_hints: std::cell::RefCell<Vec<PathBuf>>,
     base: PathBuf,
     root: PathBuf,
@@ -104,6 +105,7 @@ impl HistoryFixture {
             .expect("write synthetic Claude transcript");
         }
         Self {
+            audit_clock: Default::default(),
             index_path: base.join("claude-scan-index.json"),
             base,
             root,
@@ -126,6 +128,7 @@ impl HistoryFixture {
             .expect("write synthetic Claude transcript");
         }
         Self {
+            audit_clock: Default::default(),
             pending_hints: Default::default(),
             index_path: base.join("claude-scan-index.json"),
             base,
@@ -461,6 +464,33 @@ impl HistoryFixture {
     }
 
     fn terminal_off_on_cycle_at_gate(
+        &self,
+        collected_at: &str,
+        cycle: HistoryCycle<'_>,
+        before_evidence: impl FnOnce(&mut crate::snapshots::SourceScanResult),
+    ) -> HistoryOutcome {
+        assert!(crate::snapshots::claude_terminal_off());
+        let fixture_now = time::OffsetDateTime::parse(
+            collected_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("fixture clock")
+        .unix_timestamp();
+        let (first, base) = self.audit_clock.get().unwrap_or_else(|| {
+            let base = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            self.audit_clock.set(Some((fixture_now, base)));
+            (fixture_now, base)
+        });
+        let audit_now = base.saturating_add_signed(fixture_now - first);
+        crate::snapshots::with_terminal_off_audit_now_for_test(audit_now, || {
+            self.terminal_off_on_cycle_at_gate_at_clock(collected_at, cycle, before_evidence)
+        })
+    }
+
+    fn terminal_off_on_cycle_at_gate_at_clock(
         &self,
         collected_at: &str,
         cycle: HistoryCycle<'_>,

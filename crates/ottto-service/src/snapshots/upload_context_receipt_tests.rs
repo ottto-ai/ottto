@@ -1708,6 +1708,7 @@ fn terminal_off_on_real_uploader_not_stored_backs_off_but_growth_earns_receipt()
     let mut body = fs::read_to_string(&f.path).unwrap();
     body.push_str(&format!("{}\n",json!({"type":"assistant","sessionId":SESSION,"timestamp":"2026-10-29T10:02:01Z","requestId":"grown-request","message":{"id":"grown-message","model":"claude-sonnet-4-6","usage":{"input_tokens":30,"output_tokens":10}}})));
     fs::write(&f.path, body).unwrap();
+    expire_terminal_off_discovery_for_test(&f.index);
     f.uploader.not_stored = false;
     assert_eq!(f.adopt().files, 1);
     assert_eq!(f.uploader.posts.len(), posts + 1);

@@ -1990,6 +1990,7 @@ fn terminal_off_on_census_derivation_drift_tripwire_counts_changed_ids_at_one_re
         .expect("entry")
         .source_file_fingerprint
         .clear();
+    expire_terminal_off_discovery_for_test(&index);
     census_scan(&root, &mut index, "2026-08-04T09:00:00Z");
     assert_eq!(
         index
@@ -2014,6 +2015,7 @@ fn terminal_off_on_census_derivation_drift_tripwire_counts_changed_ids_at_one_re
         .expect("entry")
         .source_file_fingerprint
         .clear();
+    expire_terminal_off_discovery_for_test(&index);
     census_scan(&root, &mut index, "2026-08-05T09:00:00Z");
     assert_eq!(
         index
