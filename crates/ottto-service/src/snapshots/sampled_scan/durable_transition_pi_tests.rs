@@ -1688,3 +1688,122 @@ fn pi_restored_tail_publishes_the_first_prompt_title_of_a_cold_full() {
     assert_eq!(f.counters(Mode::Restart).1, 0);
     whole_body(&cold, &restored);
 }
+
+/// A first prompt beyond the head bound cannot create a durable content proof.
+/// The next growing restart therefore takes a counted native Full.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "Pi restore requires qualified native heap layout"
+)]
+fn pi_prompt_beyond_head_bound_uses_counted_growth_full() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !supported("pi_transition_head_bound") {
+        return;
+    }
+    let c = corpus("transition-pi-head-bound");
+    let disk = Disk::new(&c);
+    let path = c.root.join("session.jsonl");
+    let seed = pi_seed();
+    let (header, rest) = seed.split_once('\n').unwrap();
+    let padding = pi_json(json!({"type":"progress", "padding":"x".repeat(1024 * 1024)}));
+    std::fs::write(&path, format!("{header}\n{padding}{rest}")).unwrap();
+    input_clock(&path);
+    let scanner = E2ScanFixture::default();
+    disk.begin(&scanner, SOURCE);
+    let (warm, mut index, _) = pi_route(&c, &scanner, ScanIndex::default(), Mode::ColdFull);
+    assert_eq!(warm.modes, (1, 0, 0));
+    let prior = disk.commit(&scanner.cache, SOURCE, &mut index);
+    assert!(
+        store_records(&disk).is_empty(),
+        "over-bound head is never persisted"
+    );
+    assert_eq!(
+        scanner
+            .cache
+            .durable_counters(SOURCE)
+            .unwrap()
+            .0
+            .not_persisted
+            .get("wa.codec"),
+        Some(&1)
+    );
+    pi_grow(
+        &path,
+        pi_turn("message", Some("after-bound"), 20, "2026-10-27T06:02:00Z"),
+    );
+    let restart = disk.owner(SOURCE);
+    let ((grown, _, _), rows) =
+        crate::local_resource_diagnostics::capture(|| pi_route(&c, &restart, prior, Mode::Restart));
+    let (cold, _, _) = pi_route(
+        &c,
+        &E2ScanFixture::default(),
+        ScanIndex::default(),
+        Mode::ColdFull,
+    );
+    assert_eq!((grown.modes, grown.restored), ((1, 0, 0), 0));
+    assert_eq!(
+        page_reads(&rows),
+        (1, 0, std::fs::metadata(&path).unwrap().len())
+    );
+    whole_body(&cold, &grown);
+}
+
+/// Rewrite only unsampled head bytes, with unchanged length, then append.
+/// Certificate samples still match; the first-prompt H fence denies the record.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "Pi restore requires qualified native heap layout"
+)]
+fn pi_same_length_prompt_rewrite_hits_the_rederive_fence() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !supported("pi_transition_content_fence") {
+        return;
+    }
+    let padding = pi_json(json!({"type":"progress", "padding":"x".repeat(8192)}));
+    let seed = pi_seed();
+    let initial: String = seed
+        .lines()
+        .map(|line| {
+            if line.contains("Synthetic first prompt.") {
+                format!("{padding}{line}\n{padding}")
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    let mut f = PiDriver::warm("transition-pi-content-fence", &initial);
+    let before = f.disk.record_bytes();
+    let rewritten = initial.replacen("Synthetic first prompt.", "Synthetic other prompt.", 1);
+    assert_ne!(initial, rewritten);
+    assert_eq!(initial.len(), rewritten.len());
+    std::fs::write(&f.path, rewritten).unwrap();
+    input_clock(&f.path);
+    f.grow(&[pi_turn(
+        "message",
+        Some("after-fence"),
+        20,
+        "2026-10-27T06:02:00Z",
+    )]);
+    let cold = f.emit_bodies(Mode::ColdFull);
+    let (edited, rows) =
+        crate::local_resource_diagnostics::capture(|| f.emit_bodies(Mode::Restart));
+    assert_eq!((edited.modes, edited.restored), ((1, 0, 0), 0));
+    assert_eq!(
+        rows.iter()
+            .filter_map(|r| r["counts"]["rederive_fence_mismatch"][0].as_u64())
+            .sum::<u64>(),
+        1
+    );
+    whole_body(&cold, &edited);
+    f.save_gc(Mode::Restart);
+    assert_ne!(
+        f.disk.record_bytes(),
+        before,
+        "denied predecessor is replaced by the Full receipt"
+    );
+    f.restart();
+    let quiet = f.emit_bodies(Mode::Restart);
+    assert_eq!((quiet.modes.0, quiet.modes.1), (0, 0));
+}

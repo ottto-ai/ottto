@@ -897,13 +897,9 @@ fn pi_decoded(path: &Path) -> (CachedJsonlReduction, Decoded) {
     (reduction, decoded)
 }
 
-/// The desired behaviour: restore admits a Pi body with a header `cwd` and a
-/// first user prompt, and gives both values back. `content_charge` and
-/// `rederive_content` are the production steps that refuse the prompt today, so
-/// this reaches the refusal on every platform; `durable_restore_record` itself
-/// is layout-gated.
+/// Bounded replay restores Pi workspace, first prompt and fallback title.
+/// These content steps are portable; durable bounded decode is layout-gated.
 #[test]
-#[ignore = "needs the Pi first_prompt head re-derive (option b)"]
 fn pi_cwd_and_first_prompt_body_is_admitted_for_restore() {
     let scratch = Scratch::new("pi-admitted");
     let path = scratch.write("pi.jsonl", &pi_lines(true));
@@ -920,17 +916,21 @@ fn pi_cwd_and_first_prompt_body_is_admitted_for_restore() {
     assert_eq!(restored.first_prompt_title, cold.first_prompt_title);
 }
 
-/// What still refuses. A first prompt refuses before input until its head
-/// re-derive lands, which flips the first assert; a workspace alone is funded
-/// and rederives from its header.
+/// Both first-prompt and workspace-only heads are funded within the bound.
 #[test]
-fn pi_first_prompt_refuses_restore_and_header_workspace_rederives() {
-    let scratch = Scratch::new("pi-refused");
+fn pi_first_prompt_and_header_workspace_rederive_within_bounds() {
+    let scratch = Scratch::new("pi-funded");
     let path = scratch.write("prompt.jsonl", &pi_lines(true));
     let (_, decoded) = pi_decoded(&path);
     assert!(decoded.rederive.first_prompt.is_some());
     assert!(decoded.rederive.workspace.is_some());
-    assert!(matches!(decoded.content_charge(), Err(RederiveUnfunded)));
+    assert!(decoded.content_charge().unwrap() > 0, "prompt head funded");
+    let (restored, receipt) = decoded
+        .rederive_content(&File::open(&path).unwrap())
+        .unwrap();
+    assert!(restored.accumulator.first_prompt_material.is_some());
+    assert!(restored.accumulator.first_prompt_title.is_some());
+    assert!(receipt.head_bytes <= HEAD_BOUND);
 
     let path = scratch.write("workspace.jsonl", &pi_lines(false));
     let (_, decoded) = pi_decoded(&path);
@@ -941,6 +941,26 @@ fn pi_first_prompt_refuses_restore_and_header_workspace_rederives() {
         .rederive_content(&File::open(&path).unwrap())
         .unwrap();
     assert!(restored.accumulator.workspace_path.is_some());
+}
+
+/// A physical first prompt after 1 MiB cannot obtain a bounded durable proof.
+#[test]
+fn pi_first_prompt_beyond_head_bound_refuses_persistence() {
+    let scratch = Scratch::new("pi-head-bound");
+    let mut lines = pi_lines(true);
+    lines.insert(
+        1,
+        json!({"type":"progress", "padding":"x".repeat(HEAD_BOUND as usize)}).to_string(),
+    );
+    let path = scratch.write("pi.jsonl", &lines);
+    let (native, _) = full_read(&path, SnapshotSource::Pi);
+    assert!(native.accumulator.durable_marks.first_prompt.unwrap() > HEAD_BOUND);
+    assert!(matches!(
+        encode(&native, crate::durable_tail_store::RECORD_BYTES, line_cap()),
+        Err(Refuse::NotRederivable(
+            "SnapshotAccumulator.first_prompt_material"
+        ))
+    ));
 }
 
 const PI_MARKER: &str = "ZZsyntheticcanaryQQ";
@@ -1093,14 +1113,12 @@ fn pi_restore_tail_case(cwd: bool) {
 }
 
 #[test]
-#[ignore = "needs the Pi first_prompt head re-derive (option b)"]
 fn pi_restored_tail_publishes_the_cold_first_prompt_and_title() {
     pi_restore_tail_case(false);
 }
 
 /// The same with a header `cwd`, rederived from its marked header row.
 #[test]
-#[ignore = "needs the Pi first_prompt head re-derive (option b)"]
 fn pi_restored_tail_with_header_cwd_publishes_the_cold_body() {
     pi_restore_tail_case(true);
 }
@@ -1108,7 +1126,6 @@ fn pi_restored_tail_with_header_cwd_publishes_the_cold_body() {
 /// The title stays last-wins across a restore: a later title replaces the
 /// first-prompt title, and the first-prompt grouping facts stay.
 #[test]
-#[ignore = "needs the Pi first_prompt head re-derive (option b)"]
 fn pi_tail_title_follows_its_update_and_the_first_prompt_fields_stay() {
     let scratch = Scratch::new("pi-marked-title");
     let path = scratch.write("t.jsonl", &pi_marked_lines(false));
@@ -2360,9 +2377,7 @@ fn m3_seam_never_runs_before_the_held_object_is_revalidated() {
     assert_eq!(calls, 0);
 }
 
-/// The Pi source/section is not admitted on this branch. Exercise the bounded
-/// content consumer directly against the native cfg(test) oracle, without
-/// manufacturing a Pi body or moving either existing source's allowlist pin.
+/// Compare Pi header precedence with the native replay oracle.
 #[test]
 fn bounded_pi_workspace_matches_native_header_only_precedence() {
     let scratch = Scratch::new("pi-workspace-content");
@@ -2436,6 +2451,11 @@ fn bounded_pi_workspace_matches_native_header_only_precedence() {
         assert!(
             prompt.content_charge().is_err(),
             "a fabricated prompt without a physical mark refuses"
+        );
+        prompt.reduction.accumulator.durable_marks.first_prompt = Some(1);
+        assert!(
+            prompt.content_charge().is_ok(),
+            "a marked Pi prompt is funded"
         );
         let mut wrong = make();
         wrong.rederive.workspace = Some([0; 32]);
@@ -2672,8 +2692,7 @@ fn pl_scope_is_closed_and_every_other_e_field_stays_refusing() {
     );
 }
 
-/// Pi is not registered by this slice. Exercise the same decoded production
-/// content interface without granting Pi store/write authority (E5 owns that).
+/// Exercise the registered Pi body through production decode and content replay.
 #[test]
 fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
     let root = Scratch::new("pi-bounded-head-tail");
@@ -2691,11 +2710,7 @@ fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
             assert!(digests.first_prompt.is_some());
             assert!(digests.session_start.is_none());
             assert!(digests.agent_label.is_none());
-            let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
-                native.put(e)?;
-                digests.put(e)
-            })
-            .unwrap();
+            let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
             let certificate = checkpoint
                 .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
                 .unwrap();
@@ -2980,12 +2995,7 @@ pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
         let path = root.join(format!("{}-private.jsonl", source.api_slug()));
         fs::write(&path, lines.join("\n") + "\n").unwrap();
         let (native, _) = full_read(&path, source);
-        let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
-        let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
-            native.put(e)?;
-            digests.put(e)
-        })
-        .unwrap();
+        let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
         for class in 0..5 {
             let bad = decode_body(&body, source).unwrap().test_fence_body(class);
             // A real caught panic is a failed test, with a content-free failure
@@ -3023,12 +3033,7 @@ pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
             + "\n";
         fs::write(&path, raw + &lines.join("\n") + "\n").unwrap();
         let (native, _) = full_read(&path, source);
-        let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
-        let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
-            native.put(e)?;
-            digests.put(e)
-        })
-        .unwrap();
+        let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
         let result = decode_body(&body, source)
             .unwrap()
             .rederive_content(&File::open(&path).unwrap());
@@ -3086,8 +3091,7 @@ fn bounded_replay_errors_logs_and_panics_are_content_free() {
     );
 }
 
-/// Pi remains unregistered here. This is the production codec/acquisition/
-/// native-finish/finalizer interface E5 will route after registration, with
+/// Exercise the production codec/acquisition/native-finish/finalizer interface with
 /// actual A < C < B extents and a real complete native body (no hand-built item).
 #[test]
 fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
@@ -3107,12 +3111,7 @@ fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
         let path = root.write("source.jsonl", &lines);
         let (native, checkpoint) = full_read(&path, source);
         let a = fs::metadata(&path).unwrap().len();
-        let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
-        let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
-            native.put(e)?;
-            digests.put(e)
-        })
-        .unwrap();
+        let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
         let certificate = checkpoint
             .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
             .unwrap();
