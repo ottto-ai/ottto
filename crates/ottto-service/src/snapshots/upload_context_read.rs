@@ -193,6 +193,20 @@ impl ScanIndex {
                 .candidate_decision_with_reason_at(candidate, terminal_off_decision_now(audit_now))
                 .1
                 == Some(CandidateParseReason::UploadContext)
+            // Under ON, Claude never adopts the source-wide context. A real
+            // sidecar/retry read must not become paced context catch-up just
+            // because UploadContext is the first selecting gate. OFF and
+            // Codex keep the original expression above.
+            && (!self.mixed_context_view.claude
+                || self
+                    .candidate_decision_with_reason_gated(
+                        candidate,
+                        terminal_off_decision_now(audit_now),
+                        true,
+                        false,
+                    )
+                    .0
+                    != CandidateDecision::Parse)
     }
 }
 #[cfg(test)]

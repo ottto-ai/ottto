@@ -50461,7 +50461,7 @@ impl ScanIndex {
         candidate: &CandidateFile,
         now: u64,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
-        self.candidate_decision_with_reason_gated(candidate, now, true)
+        self.candidate_decision_with_reason_gated(candidate, now, true, true)
     }
 
     /// True when the local list names this Claude file's family root or the
@@ -50484,7 +50484,7 @@ impl ScanIndex {
         self.effective_upload_body_witness_revision_requires_adoption(&local_index_key(
             &candidate.path,
         )) && self
-            .candidate_decision_with_reason_gated(candidate, now, false)
+            .candidate_decision_with_reason_gated(candidate, now, false, true)
             .0
             == CandidateDecision::Skip
     }
@@ -50532,6 +50532,7 @@ impl ScanIndex {
         candidate: &CandidateFile,
         now: u64,
         body_witness_adoption: bool,
+        upload_context: bool,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         let key = local_index_key(&candidate.path);
         if self.decode_holds_file(&key) {
@@ -50608,7 +50609,8 @@ impl ScanIndex {
                 Some(CandidateParseReason::BodyWitnessAdoption),
             );
         }
-        if self.file_upload_context_requires_adoption(&key)
+        if upload_context
+            && self.file_upload_context_requires_adoption(&key)
             && !self.file_upload_context_backoff_holds(candidate)
         {
             return (

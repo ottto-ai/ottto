@@ -249,3 +249,16 @@ first-duplicate behavior now matches main's original `.find()`.
 | 192 | [snapshots/upload_context_receipt.rs:299](../../crates/ottto-service/src/snapshots/upload_context_receipt.rs#L299)<br>`@@ -116,3 +299,5 @@` | gated / neutral | OFF adoption has a literal main fallback. Mixed context view is empty/false in OFF, including stale-view query protection; memo and retry-hold narrowing are ON-only. Main per-ACK receipt format/validation/context policies are untouched. |
 | 193 | [snapshots/upload_context_receipt.rs:311](../../crates/ottto-service/src/snapshots/upload_context_receipt.rs#L311)<br>`@@ -125,0 +311,6 @@` | gated / neutral | OFF adoption has a literal main fallback. Mixed context view is empty/false in OFF, including stale-view query protection; memo and retry-hold narrowing are ON-only. Main per-ACK receipt format/validation/context policies are untouched. |
 | 194 | [snapshots/upload_context_receipt.rs:329](../../crates/ottto-service/src/snapshots/upload_context_receipt.rs#L329)<br>`@@ -138,3 +329,10 @@` | gated / neutral | OFF adoption has a literal main fallback. Mixed context view is empty/false in OFF, including stale-view query protection; memo and retry-hold narrowing are ON-only. Main per-ACK receipt format/validation/context policies are untouched. |
+
+
+## L4 context-only scheduling delta (from `f7dd3fe6c`)
+
+This supplements the frozen inventory above; it changes no serialized state.
+
+| Hunk | Classification | OFF identity / ON behavior |
+| --- | --- | --- |
+| `snapshots.rs`: `candidate_decision_with_reason_at` | neutral | Passes both existing body-witness and new upload-context gates as enabled; identical decisions. |
+| `snapshots.rs`: `candidate_requires_only_body_witness_adoption` | neutral | Disables only body-witness adoption as before; upload context remains enabled. |
+| `snapshots.rs`: gated-decision signature | neutral | Private boolean argument only; no persisted field or public API. |
+| `snapshots.rs`: UploadContext branch | gated | Every existing caller enables this gate. Only the ON-Claude context-only check disables it for a second decision. |
+| `snapshots/upload_context_read.rs`: `context_only_read` | gated, ON-only, Claude-only | `mixed_context_view.claude` is set only by Claude context activation under ON. OFF and Codex short-circuit to the exact prior expression. ON counts a read as context-only only when the decision without UploadContext is not Parse; Migrate/ReconcileLegacy stay eligible. Real source changes and due retries use ordinary read budgets. |
