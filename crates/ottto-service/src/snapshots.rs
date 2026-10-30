@@ -49464,6 +49464,132 @@ impl ScanIndex {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn terminal_off_on_with_locally_held_keys_reverted(
+        &self,
+        previous: &ScanIndex,
+        held: &BTreeSet<String>,
+        reparse_held: &BTreeSet<String>,
+    ) -> ScanIndex {
+        let empty_advances = self.claude_empty_map_advances(previous);
+        let held_keys = self.locally_held_keys(held);
+        let placeholders =
+            self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
+        let mut result = self.clone();
+        result
+            .claude_money_birth_store
+            .preserve_missing_from(&previous.claude_money_birth_store);
+        self.note_claude_history_not_accepted(previous, &held_keys);
+        for key in &held_keys {
+            let reparse = self
+                .files
+                .get(key)
+                .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
+                || self
+                    .file_snapshot_fingerprints
+                    .get(key)
+                    .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held));
+            match previous.files.get(key) {
+                Some(committed) => {
+                    let mut committed = committed.clone();
+                    if reparse {
+                        committed.source_file_fingerprint.clear();
+                    }
+                    result.files.insert(key.clone(), committed);
+                }
+                None if placeholders.contains(key) => {
+                    if let Some(entry) = result.files.get_mut(key) {
+                        entry.last_snapshot_fingerprint = None;
+                        entry.last_upload_body_witness = None;
+                    }
+                    result.re_owe_effective_upload_body_witness_revision(key, 0);
+                }
+                None => {
+                    result.files.remove(key);
+                }
+            }
+            if let Some(carried) = previous.accepted_rebuild_incidence.get(key) {
+                result
+                    .accepted_rebuild_incidence
+                    .insert(key.clone(), carried.clone());
+                result.preserve_carried_ack_clock(previous);
+            }
+            match previous.file_snapshot_fingerprints.get(key) {
+                Some(fingerprints) => {
+                    result
+                        .file_snapshot_fingerprints
+                        .insert(key.clone(), fingerprints.clone());
+                }
+                None => {
+                    result.file_snapshot_fingerprints.remove(key);
+                }
+            }
+            if previous.confirmed_empty_files.contains(key) {
+                result.confirmed_empty_files.insert(key.clone());
+            } else {
+                result.confirmed_empty_files.remove(key);
+            }
+            result.revert_codex_blocked_attribution(previous, key);
+            match previous.terminal_jsonl_dispositions.get(key) {
+                Some(disposition) => {
+                    result
+                        .terminal_jsonl_dispositions
+                        .insert(key.clone(), disposition.clone());
+                }
+                None => {
+                    result.terminal_jsonl_dispositions.remove(key);
+                }
+            }
+            if let Some((_, member)) = claude_index_path_family_member(Path::new(key)) {
+                match previous.claude_owned_start_census.get(&member) {
+                    Some(witness) => {
+                        result
+                            .claude_owned_start_census
+                            .insert(member, witness.clone());
+                    }
+                    None => {
+                        result.claude_owned_start_census.remove(&member);
+                    }
+                }
+            }
+        }
+        result.retain_terminal_off_held_retries(&held_keys);
+        let mut restored = BTreeSet::new();
+        for key in &held_keys {
+            match result.file_snapshot_fingerprints.get(key) {
+                Some(fingerprints) => restored.extend(fingerprints.iter().cloned()),
+                None => restored.extend(
+                    result
+                        .files
+                        .get(key)
+                        .and_then(|entry| entry.last_snapshot_fingerprint.clone()),
+                ),
+            }
+        }
+        for fingerprint in &restored {
+            if let Some(activity_at) = previous.snapshot_activity_at.get(fingerprint) {
+                result
+                    .snapshot_activity_at
+                    .entry(fingerprint.clone())
+                    .or_insert_with(|| activity_at.clone());
+            }
+            if previous
+                .accepted_snapshot_fingerprints
+                .contains(fingerprint)
+            {
+                result
+                    .accepted_snapshot_fingerprints
+                    .insert(fingerprint.clone());
+            }
+        }
+        result.restore_claude_empty_map_advances(empty_advances);
+        let current = result.current_snapshot_fingerprints();
+        result
+            .snapshot_activity_at
+            .retain(|fingerprint, _| current.contains(fingerprint));
+        result
+    }
+
     /// The commit for a `Completed` upload whose only unsettled entities are
     /// locally held, non-progressing revisions. Every uploaded entity was
     /// accepted or unchanged, so each key without a held entity commits
@@ -49491,6 +49617,13 @@ impl ScanIndex {
         held: &BTreeSet<String>,
         reparse_held: &BTreeSet<String>,
     ) -> ScanIndex {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return self.terminal_off_on_with_locally_held_keys_reverted(
+                previous,
+                held,
+                reparse_held,
+            );
+        }
         let empty_advances = self.claude_empty_map_advances(previous);
         let held_keys = self.locally_held_keys(held);
         let placeholders =

@@ -82,6 +82,10 @@ Linux and the merge-queue Mac. Two ON blockers are fixed here, both gated on
   cleared member stays cleared until it is read; eviction or a restart costs
   at most one more re-read, never proof, ACK or settlement.
 
+OFF retains main's retry-admission completion veto: a retained, storage-deferred
+admission cannot grant a complete census. The unchanged oversized accepted
+singleton control guards that refusal; disabling containment does not bypass it.
+
 ## OFF proof and the separate ON gate
 
 OFF is proven by main's own tests: every original retains its exact text,

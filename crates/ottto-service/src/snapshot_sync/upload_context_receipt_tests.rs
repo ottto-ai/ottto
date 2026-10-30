@@ -336,7 +336,28 @@ pub(crate) struct Uploader {
     pub policy: SnapshotUploadPolicy,
 }
 impl Uploader {
+    pub(crate) fn terminal_off_on_new(source: SnapshotSource) -> Self {
+        Self {
+            progress: SnapshotUploadProgress::new(
+                "a".repeat(64),
+                snapshot_quarantine_witness(source),
+            ),
+            scratch: crate::test_scratch::ScratchDir::new("context-real-uploader"),
+            posts: Vec::new(),
+            received_item_bytes: 0,
+            received_catchup_bytes: 0,
+            received_resend_bytes: 0,
+            not_stored: false,
+            refuse: false,
+            fail_after: None,
+            policy: SnapshotUploadPolicy::default(),
+        }
+    }
+
     pub(crate) fn new(source: SnapshotSource) -> Self {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return Self::terminal_off_on_new(source);
+        }
         Self {
             progress: SnapshotUploadProgress::new(
                 "a".repeat(64),
@@ -361,7 +382,7 @@ impl Uploader {
     ) {
         activate_source_upload_context(source, context, index, &mut self.progress);
     }
-    pub(crate) fn prepare_for_scan(
+    pub(crate) fn terminal_off_on_prepare_for_scan(
         &mut self,
         source: SnapshotSource,
         context: String,
@@ -385,7 +406,189 @@ impl Uploader {
                     .saturating_sub(crate::snapshots::BACKFILL_WINDOW_DAYS * 86_400),
             }),
         );
+        // Match the service's post-prepare retry views before recording holds.
+        index.activate_terminal_contract_retries(
+            self.progress
+                .active_quarantine_retries
+                .iter()
+                .filter(|fp| {
+                    self.progress
+                        .quarantined_fingerprints
+                        .get(*fp)
+                        .is_some_and(|record| record.contract_retry_claims.is_some())
+                })
+                .cloned()
+                .collect(),
+        );
+        index.activate_reason_reoffer_retries(self.progress.active_reason_reoffers.clone());
+        index.activate_reason_reoffer_cooldowns(self.progress.reason_reoffer_cooldowns(now));
+        index.count_mixed_file_context_holds();
     }
+
+    pub(crate) fn prepare_for_scan(
+        &mut self,
+        source: SnapshotSource,
+        context: String,
+        index: &mut ScanIndex,
+    ) {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return self.terminal_off_on_prepare_for_scan(source, context, index);
+        }
+        self.activate(source, context, index);
+        let replay_generation =
+            cycle_replay_generation(source, true, index, "context-real-uploader");
+        let now = reason_reoffer::now_unix_seconds();
+        // Import durable refusals through the same prepare path as the service,
+        // before scanning: an empty disposable ledger must not erase a hold.
+        prepare_upload_progress_for_cycle_with_reoffer(
+            &mut self.progress,
+            index,
+            &replay_generation,
+            false,
+            Some(&reason_reoffer::Scope {
+                index,
+                now,
+                window_start_unix_seconds: now
+                    .saturating_sub(crate::snapshots::BACKFILL_WINDOW_DAYS * 86_400),
+            }),
+        );
+    }
+    pub(crate) fn terminal_off_on_send(
+        &mut self,
+        source: SnapshotSource,
+        index: &mut ScanIndex,
+        previous: &ScanIndex,
+        items: &[SnapshotItem],
+    ) -> Result<(u64, u64)> {
+        self.progress
+            .prepare_context_receipt_candidates(index, previous, items);
+        let path = self.scratch.join("progress.json");
+        let catchup = items
+            .iter()
+            .filter(|item| {
+                self.progress
+                    .context_resend
+                    .is_catchup(&item.snapshot_fingerprint)
+            })
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        let resends = items
+            .iter()
+            .filter(|item| {
+                self.progress
+                    .context_resend
+                    .is_resend(&item.snapshot_fingerprint)
+            })
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        let posts = &mut self.posts;
+        let received_item_bytes = &mut self.received_item_bytes;
+        let received_catchup_bytes = &mut self.received_catchup_bytes;
+        let received_resend_bytes = &mut self.received_resend_bytes;
+        let fail_after = self.fail_after;
+        let not_stored = self.not_stored;
+        let refuse = self.refuse;
+        let policy = self.policy;
+        upload_resumable_batches_with_body_witness(
+            items,
+            "context-real-uploader",
+            &mut self.progress,
+            &mut 0,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |batch| {
+                if fail_after == Some(posts.len()) {
+                    return Err(anyhow!("synthetic transport failure"));
+                }
+                for item in &batch {
+                    let bytes = serde_json::to_vec(item).unwrap().len() as u64;
+                    *received_item_bytes += bytes;
+                    if catchup.contains(&item.snapshot_fingerprint) {
+                        *received_catchup_bytes += bytes;
+                    }
+                    if resends.contains(&item.snapshot_fingerprint) {
+                        *received_resend_bytes += bytes;
+                    }
+                }
+                posts.push(
+                    batch
+                        .iter()
+                        .map(|item| serde_json::to_value(item).unwrap())
+                        .collect(),
+                );
+                let cas = batch.iter().any(|item| item.cache_observations.is_some());
+                let entities =
+                    batch
+                        .iter()
+                        .map(|item| crate::snapshot_client::SnapshotEntityRef {
+                            source_session_id: item.source_session_id.clone(),
+                            snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                            occurrence_count: 1,
+                            body_witness_version:
+                                crate::snapshot_client::snapshot_ack_body_witness_version(item)
+                                    .unwrap(),
+                            body_witness_digest:
+                                crate::snapshot_client::snapshot_ack_body_witness_version(item)
+                                    .unwrap()
+                                    .map(|_| snapshot_upload_body_witness(item)),
+                            head_etag: cas.then(|| "e".repeat(64)),
+                            head_challenge: None,
+                            unchanged_basis: not_stored.then(|| "usage_identical".into()),
+                        })
+                        .collect::<Vec<_>>();
+                let response = crate::snapshot_client::SnapshotBatchResponse {
+                    accepted: if refuse { 0 } else { batch.len() as u64 },
+                    sessions_reconciled: batch.len() as u64,
+                    session_ids: Vec::new(),
+                    disabled: false,
+                    disabled_reason: None,
+                    entity_ack_contract: Some(
+                        crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into(),
+                    ),
+                    accepted_entities: if not_stored || refuse {
+                        Vec::new()
+                    } else {
+                        entities.clone()
+                    },
+                    unchanged_entities: if not_stored { entities } else { Vec::new() },
+                    rejected_entities: if refuse {
+                        batch
+                            .iter()
+                            .map(|item| crate::snapshot_client::SnapshotEntityRejection {
+                                source_session_id: item.source_session_id.clone(),
+                                snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                                occurrence_count: 1,
+                                reason: "invalid".into(),
+                                detail: "synthetic refusal".into(),
+                                permanent: true,
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
+                    conflict_entities: Vec::new(),
+                };
+                response.validate_entity_ack(&SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: source.api_slug().into(),
+                    machine_id: "synthetic".into(),
+                    collector_version: None,
+                    snapshots: batch,
+                    upload_policy: policy,
+                    client_report: crate::client_report::ClientReport::empty(),
+                })?;
+                Ok(response)
+            },
+            |progress| progress.save(&path),
+        )?;
+        settle_index_after_upload(index, previous, &self.progress);
+        let counts = index.accept_file_upload_context_acks(
+            &self.progress.context_receipt_candidates,
+            &self.progress.fresh_context_body_acks,
+        );
+        Ok((counts.files, counts.bytes))
+    }
+
     pub(crate) fn send(
         &mut self,
         source: SnapshotSource,
@@ -393,6 +596,9 @@ impl Uploader {
         previous: &ScanIndex,
         items: &[SnapshotItem],
     ) -> Result<(u64, u64)> {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return self.terminal_off_on_send(source, index, previous, items);
+        }
         self.progress
             .prepare_context_receipt_candidates(index, previous, items);
         let path = self.scratch.join("progress.json");
