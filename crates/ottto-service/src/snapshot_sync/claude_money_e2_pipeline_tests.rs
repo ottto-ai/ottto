@@ -2900,6 +2900,11 @@ mod money_equivalence_tests {
     }
 }
 
+// V2-only fixtures must not enter the cross-build harness transplanted to v1.
+mod state_v2_money_tests {
+    include!("state_v2_money_tests.rs");
+}
+
 #[test]
 fn e2_page_never_creates_p1_ledger_or_diagnostics() {
     with_e2(|| {
