@@ -273,18 +273,32 @@ fn desktop_identity_complete_flaps_and_restarts_never_reoffer() {
 }
 
 #[test]
-fn desktop_identity_downgraded_emission_never_settles_complete_and_reoffers_at_most_once() {
-    // The creation-proof downgrade wins over the metadata census: the emitted
-    // body is missing, so nothing latches as settled-complete. The one
-    // recovery re-offer is refused (Lead B: settled, no retry), then quiet.
+fn desktop_identity_downgraded_emission_never_latches_pending_and_reoffers_at_most_once() {
+    // E1: the creation-proof downgrade wins over a complete own disposition.
+    // That missing body is not census-caused: it settles without a re-offer.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let f = IdentityFixture::new(CREATED_LATE);
     let (first, counts) = f.run(ScanIndex::default(), COLLECTED);
     assert_eq!(disposition(f.child(&first)), Some("missing"));
     assert_eq!(counts, Reoffers::default());
     let index = ack(first);
-    assert_eq!(f.latch(&index), Some(Pending), "a downgrade is not settled");
-    let (refused, counts) = f.run(index, "2026-08-02T07:12:00Z");
+    assert_eq!(
+        f.latch(&index),
+        Some(Settled),
+        "a downgrade is never pending"
+    );
+    f.quiet(
+        f.restart(index),
+        &["2026-08-02T07:12:00Z", "2026-08-02T07:13:00Z"],
+    );
+    // Census-caused missing that is also downgraded: the one recovery
+    // re-offer is refused (Lead B: settled, no retry), then quiet.
+    let f = IdentityFixture::new(CREATED_LATE);
+    let (first, _) = f.run(f.loaded_incomplete("2026-08-02T07:11:00Z"), COLLECTED);
+    assert_eq!(disposition(f.child(&first)), Some("missing"));
+    let index = ack(first);
+    assert_eq!(f.latch(&index), Some(Pending));
+    let (refused, counts) = f.run(f.restart(index), "2026-08-02T07:12:00Z");
     assert!(
         refused.result.snapshots.is_empty(),
         "the unchanged missing body is never posted again"
@@ -352,21 +366,26 @@ fn desktop_identity_adoption_sends_once_from_cache_with_the_childs_own_account()
     // incomplete census) and the old reader lost the latch.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let f = IdentityFixture::new(CREATED);
-    let cache = Arc::new(SharedCache::default());
-    let index = f.loaded_incomplete("2026-08-02T07:11:00Z");
-    let (first, _) = f.run_with(index, cache.clone(), COLLECTED);
-    assert_eq!(disposition(f.child(&first)), Some("missing"));
-    // A natural append while still incomplete admits this known file to the
-    // retained cache (a new cold file is never sampled under partial coverage).
-    f.native.append_transcript(1);
-    let (grown, _) = f.run_with(ack(first), cache.clone(), "2026-08-02T07:10:30Z");
-    let missing = f.child(&grown).clone();
+    let (stored, _) = f.run(f.loaded_incomplete("2026-08-02T07:11:00Z"), COLLECTED);
+    let missing = f.child(&stored).clone();
     assert_eq!(disposition(&missing), Some("missing"));
-    let mut index = ack(grown);
-    assert_eq!(f.latch(&index), Some(Pending));
+    let stored = ack(stored);
+    // The same unchanged extent, retained in RAM by a pass under complete
+    // coverage (a cold file is never sampled under partial coverage).
+    let cache = Arc::new(SharedCache::default());
+    let (retained, _) = f.run_with(ScanIndex::default(), cache.clone(), COLLECTED);
+    assert_eq!(disposition(f.child(&retained)), Some("complete"));
+    let mut index = ack(retained);
+    // Its stored and accepted body is the legacy missing one, with no latch.
+    let key = f.key();
+    let entry = index.files.get_mut(&key).unwrap();
+    entry.last_snapshot_fingerprint = stored.files[&key].last_snapshot_fingerprint.clone();
+    entry.last_upload_body_witness = stored.files[&key].last_upload_body_witness.clone();
+    index.file_snapshot_fingerprints = stored.file_snapshot_fingerprints.clone();
+    index.accepted_snapshot_fingerprints = stored.accepted_snapshot_fingerprints.clone();
     index.claude_desktop_identity_latches.clear();
-    // The census completes on an uncached pass: adoption waits, reads nothing.
-    let (cold, counts) = f.run(index, "2026-08-02T07:12:00Z");
+    // An uncached pass (as after a restart): adoption waits, reads nothing.
+    let (cold, counts) = f.run(f.restart(index), "2026-08-02T07:12:00Z");
     assert!(cold.result.snapshots.is_empty());
     assert_eq!((cold.native_bytes, counts), (0, Reoffers::default()));
     let supported = u64::from(crate::heap_layout_bound::layout_supported());

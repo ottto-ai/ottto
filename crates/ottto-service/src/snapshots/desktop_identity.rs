@@ -211,6 +211,11 @@ impl ScanIndex {
             match emitted {
                 // After the creation-proof, ownership and request downgrades.
                 Some("complete") => Some(IdentityLatch::Settled),
+                // E1: a downgrade of an already complete own disposition is
+                // not census-caused; a re-offer would emit the same body.
+                Some(_) if pair && pending.desktop_identity_resolved => {
+                    Some(IdentityLatch::Settled)
+                }
                 // Only a Desktop child carrying its own pair can later
                 // resolve complete from the same metadata; other Claude
                 // sessions never enter the map.
