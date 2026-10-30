@@ -35173,7 +35173,6 @@ impl OwnedSourceScan {
                         && restart_restore::enabled()
                         && !paced_full_granted
                         && !repin_ready
-                        && !capacity_growth
                         && !active_bound_degraded
                         && migration_floor.is_none()
                         && !cache.upgrade_full_allowed(
@@ -46499,7 +46498,6 @@ fn open_candidate_file_stat_retained(
     Ok((file, stat))
 }
 
-#[cfg(test)]
 fn open_and_identify_scan_candidate(
     source: SnapshotSource,
     candidate: CandidateFile,

@@ -5,7 +5,6 @@
 use super::*;
 use crate::transcript_acquisition::ReadPlan;
 use std::io::{Read, Write};
-use std::time::{Duration, Instant};
 
 const CLAUDE: SnapshotSource = SnapshotSource::ClaudeCode;
 
