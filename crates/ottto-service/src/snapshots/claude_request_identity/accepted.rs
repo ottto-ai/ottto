@@ -1,6 +1,7 @@
 //! Class L hints: bucket starts and non-reversible accepted share fingerprints.
 use super::*;
 use hmac::{Hmac, Mac};
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserializer, Serializer};
 use std::ops::Deref;
 use zeroize::Zeroizing;
@@ -32,9 +33,12 @@ impl Serialize for AcceptedBuckets {
 #[serde(deny_unknown_fields)]
 pub(crate) struct AcceptedSession {
     // Required: unkeyed v1 records have no epoch and decode as unknown.
+    #[serde(with = "digest_hex")]
     key_epoch: [u8; 32],
     #[serde(skip)]
     key: Option<FingerprintKey>,
+    #[serde(default)]
+    last_ack: u64,
     starts: Vec<i64>,
     shares: Vec<AcceptedShare>,
     #[serde(default)]
@@ -43,8 +47,53 @@ pub(crate) struct AcceptedSession {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) struct AcceptedShare {
     bucket: i64,
+    #[serde(with = "digest_hex")]
     row: [u8; 32],
+    #[serde(with = "optional_digest_hex")]
     authority: Option<[u8; 32]>,
+}
+mod digest_hex {
+    use super::*;
+    pub(super) fn encode(value: &[u8; 32]) -> String {
+        value.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+    pub(super) fn decode<E: serde::de::Error>(value: &str) -> Result<[u8; 32], E> {
+        if !hash_is_valid(value) {
+            return Err(E::custom("invalid fingerprint"));
+        }
+        let mut result = [0; 32];
+        for (byte, pair) in result.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+            let digit = |n: u8| if n <= b'9' { n - b'0' } else { n - b'a' + 10 };
+            *byte = (digit(pair[0]) << 4) | digit(pair[1]);
+        }
+        Ok(result)
+    }
+    pub(super) fn serialize<S: Serializer>(
+        value: &[u8; 32],
+        encoder: S,
+    ) -> Result<S::Ok, S::Error> {
+        encoder.serialize_str(&encode(value))
+    }
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(decoder: D) -> Result<[u8; 32], D::Error> {
+        decode(&String::deserialize(decoder)?)
+    }
+}
+mod optional_digest_hex {
+    use super::*;
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<[u8; 32]>,
+        encoder: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.as_ref().map(digest_hex::encode).serialize(encoder)
+    }
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        decoder: D,
+    ) -> Result<Option<[u8; 32]>, D::Error> {
+        Option::<String>::deserialize(decoder)?
+            .as_deref()
+            .map(digest_hex::decode)
+            .transpose()
+    }
 }
 impl Deref for AcceptedSession {
     type Target = [i64];
@@ -149,21 +198,27 @@ impl AcceptedSession {
 }
 impl<'de> Deserialize<'de> for AcceptedBuckets {
     fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
-        // Invalid, old timestamp-only, or oversized L hints become unknown;
-        // they must not invalidate neighbouring billing ACKs or invent proof.
-        let value = Value::deserialize(decoder)?;
-        let decoded = Self(
-            value
-                .as_object()
-                .into_iter()
-                .flat_map(|map| map.iter())
-                .filter_map(|(session, value)| {
-                    if !hash_is_valid(session) {
-                        return None;
+        struct Hints;
+        impl<'de> Visitor<'de> for Hints {
+            type Value = AcceptedBuckets;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("optional accepted identity hints")
+            }
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut states = BTreeMap::new();
+                while let Some(session) = map.next_key::<String>()? {
+                    if !hash_is_valid(&session) || states.len() == MAX_SESSIONS {
+                        map.next_value::<IgnoredAny>()?;
+                        continue;
                     }
-                    let mut state: AcceptedSession = serde_json::from_value(value.clone()).ok()?;
+                    // At most one session Value tree, consumed without cloning.
+                    // Malformed/old hints never invalidate neighbouring ordinary ACKs.
+                    let value = map.next_value::<Value>()?;
+                    let Ok(mut state) = serde_json::from_value::<AcceptedSession>(value) else {
+                        continue;
+                    };
                     if state.starts.len() > MAX_BUCKETS || state.shares.len() > MAX_SHARES {
-                        return None;
+                        continue;
                     }
                     state.starts.sort_unstable();
                     state.starts.dedup();
@@ -174,24 +229,80 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
                         .iter()
                         .any(|share| state.starts.binary_search(&share.bucket).is_err())
                     {
-                        return None;
+                        continue;
                     }
-                    // Bound retained capacities too, not only logical lengths.
                     state.starts = state.starts.into_boxed_slice().into_vec();
                     state.shares = state.shares.into_boxed_slice().into_vec();
-                    Some((session.clone(), state))
-                })
-                .take(MAX_SESSIONS)
-                .collect(),
-            None,
-        );
-        Ok(decoded)
+                    states.insert(session, state);
+                }
+                Ok(AcceptedBuckets(states, None))
+            }
+            fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(AcceptedBuckets::default())
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(AcceptedBuckets::default())
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+        }
+        decoder.deserialize_any(Hints)
     }
 }
 impl AcceptedBuckets {
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
         Self(BTreeMap::new(), Some(fixture_key()))
+    }
+    #[cfg(test)]
+    pub(crate) fn maximum_for_test() -> Self {
+        let key = fixture_key();
+        Self(
+            (0..MAX_SESSIONS)
+                .map(|session| {
+                    let starts = (0..MAX_BUCKETS)
+                        .map(|n| i64::MIN + n as i64)
+                        .collect::<Vec<_>>();
+                    let shares = (0..MAX_SHARES)
+                        .map(|n| {
+                            let mut row = [255; 32];
+                            row[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                            AcceptedShare {
+                                bucket: starts[n],
+                                row,
+                                authority: Some([255; 32]),
+                            }
+                        })
+                        .collect();
+                    (
+                        session_key(&key, &format!("max-{session}")),
+                        AcceptedSession {
+                            key_epoch: key_epoch(&key),
+                            key: Some(key.clone()),
+                            last_ack: u64::MAX,
+                            starts,
+                            shares,
+                            incomplete: true,
+                        },
+                    )
+                })
+                .collect(),
+            Some(key),
+        )
     }
     #[cfg(test)]
     pub(crate) fn restore_for_test(bytes: &[u8]) -> Self {
@@ -249,14 +360,32 @@ impl AcceptedBuckets {
             return;
         }
         let key = session_key(fingerprint_key, session);
+        let last_ack = self
+            .0
+            .values()
+            .map(|state| state.last_ack)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         if !self.0.contains_key(&key) && self.0.len() == MAX_SESSIONS {
-            self.0.pop_first();
+            let oldest = self
+                .0
+                .iter()
+                .min_by_key(|(key, state)| (state.last_ack, *key))
+                .map(|(key, _)| key.clone())
+                .expect("full ledger");
+            self.0.remove(&oldest);
+            super::budget::record(&super::budget::Counts {
+                accepted_state_evicted: 1,
+                ..Default::default()
+            });
         }
         let entry = self.0.entry(key).or_insert_with(|| AcceptedSession {
             key_epoch: key_epoch(fingerprint_key),
             key: Some(fingerprint_key.clone()),
             ..Default::default()
         });
+        entry.last_ack = last_ack;
         let mut shares = std::mem::take(&mut entry.shares)
             .into_iter()
             .collect::<BTreeSet<_>>();
@@ -397,7 +526,7 @@ mod tests {
             .map(|i| {
                 (
                     format!("{i:064x}"),
-                    json!({"key_epoch":key_epoch(&fixture_key()),"starts":[],"shares":[]}),
+                    json!({"key_epoch":digest_hex::encode(&key_epoch(&fixture_key())),"starts":[],"shares":[]}),
                 )
             })
             .collect::<serde_json::Map<_, _>>();
@@ -435,6 +564,7 @@ mod heap_tests {
                         AcceptedSession {
                             key_epoch: [0; 32],
                             key: None,
+                            last_ack: 0,
                             starts: (0..MAX_BUCKETS as i64).collect(),
                             shares: vec![
                                 AcceptedShare {
@@ -586,7 +716,7 @@ mod keyed_tests {
             .unwrap()
             .values_mut()
             .next()
-            .unwrap()["key_epoch"] = json!(vec![0; 32]);
+            .unwrap()["key_epoch"] = json!("0".repeat(64));
         let mut restored: AcceptedBuckets = serde_json::from_value(version_changed).unwrap();
         restored.bind_test_key(Some([0x42; 32]));
         assert!(restored.is_empty());
@@ -628,5 +758,34 @@ mod keyed_tests {
         }})).unwrap();
         assert!(restored.is_empty());
         assert!(restored.get("synthetic").is_none());
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::*;
+    #[test]
+    fn last_ack_lru_survives_restart_and_counts_eviction_separately() {
+        let mut state = AcceptedBuckets::for_test();
+        let body = |session: usize| {
+            let mut body = tests::body(true);
+            body["source_session_id"] = json!(format!("lru-{session}"));
+            body
+        };
+        super::super::take_identity_counts();
+        for session in 0..MAX_SESSIONS {
+            state.record(&body(session));
+        }
+        state.record(&body(0)); // refresh the oldest before restart
+        let mut restored = AcceptedBuckets::restore_for_test(&serde_json::to_vec(&state).unwrap());
+        restored.record(&body(MAX_SESSIONS));
+        assert!(restored.get("lru-0").is_some());
+        assert!(restored.get("lru-1").is_none());
+        assert!(restored.get(&format!("lru-{MAX_SESSIONS}")).is_some());
+        assert!(restored.get("brand-new").is_none());
+        let counts = serde_json::to_value(super::super::take_identity_counts()).unwrap();
+        assert_eq!(counts["identity_cap"]["accepted_state_evicted"], 1);
+        assert_eq!(counts["identity_cap"]["accepted_state_unknown"], 0);
+        assert_eq!(restored.0.len(), MAX_SESSIONS);
     }
 }

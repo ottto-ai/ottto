@@ -14,6 +14,7 @@ pub(crate) struct Counts {
     pub(crate) refused_new_buckets: u64,
     pub(crate) accepted_state_unknown: u64,
     pub(crate) accepted_share_changed: u64,
+    pub(crate) accepted_state_evicted: u64,
     pub(crate) accepted_overflow: OverflowCounts,
 }
 impl Counts {
@@ -22,10 +23,10 @@ impl Counts {
     }
 }
 #[cfg(not(test))]
-static COUNTERS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static COUNTERS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 #[cfg(test)]
-thread_local! { static COUNTERS: [AtomicU64; 6] = const { [const { AtomicU64::new(0) }; 6] }; }
-fn counters<T>(f: impl FnOnce(&[AtomicU64; 6]) -> T) -> T {
+thread_local! { static COUNTERS: [AtomicU64; 7] = const { [const { AtomicU64::new(0) }; 7] }; }
+fn counters<T>(f: impl FnOnce(&[AtomicU64; 7]) -> T) -> T {
     #[cfg(test)]
     {
         COUNTERS.with(f)
@@ -42,6 +43,7 @@ pub(super) fn record(counts: &Counts) {
             counts.refused_new_buckets,
             counts.accepted_state_unknown,
             counts.accepted_share_changed,
+            counts.accepted_state_evicted,
             counts.accepted_overflow.same_as_parent,
             counts.accepted_overflow.differs,
         ]) {
@@ -50,13 +52,14 @@ pub(super) fn record(counts: &Counts) {
     });
 }
 pub(super) fn take_counts() -> Counts {
-    let [retained_buckets, refused_new_buckets, accepted_state_unknown, accepted_share_changed, same_as_parent, differs] =
+    let [retained_buckets, refused_new_buckets, accepted_state_unknown, accepted_share_changed, accepted_state_evicted, same_as_parent, differs] =
         counters(|counters| counters.each_ref().map(|counter| counter.swap(0, Relaxed)));
     Counts {
         retained_buckets,
         refused_new_buckets,
         accepted_state_unknown,
         accepted_share_changed,
+        accepted_state_evicted,
         accepted_overflow: OverflowCounts {
             same_as_parent,
             differs,

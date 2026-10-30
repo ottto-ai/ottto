@@ -174,3 +174,41 @@ fn identity_budget_reserves_predecessor_retractions_without_mutating_local_patch
         crate::snapshots::claude_request_identity::item_bytes(&item) + reserved,
     );
 }
+
+#[test]
+fn maximum_accepted_ledger_progress_json_and_actual_load_peak_are_bounded() {
+    let mut progress = progress();
+    progress.accepted_identity_buckets =
+        crate::snapshots::claude_request_identity::AcceptedBuckets::maximum_for_test();
+    let bytes = serde_json::to_vec(&progress).unwrap();
+    // Worst accepted-ledger caps in the real progress envelope; other ACK owners empty.
+    let root = std::env::temp_dir().join(format!(
+        "ottto-identity-load-{}",
+        format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("progress.json");
+    std::fs::write(&path, &bytes).unwrap();
+    let (restored, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        SnapshotUploadProgress::load(
+            &path,
+            &"a".repeat(64),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap()
+    });
+    assert!(!restored.accepted_identity_buckets.is_empty());
+    let json_bytes = bytes.len();
+    let load_peak = allocation.requested_peak_with_overlap;
+    eprintln!("E2_ACCEPTED_PROGRESS_JSON_BYTES={json_bytes} E2_ACCEPTED_PROGRESS_LOAD_PEAK_BYTES={load_peak}");
+    assert!(json_bytes < 8 * 1024 * 1024, "json={json_bytes}");
+    assert!(load_peak < 32 * 1024 * 1024, "peak={load_peak}");
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -1108,13 +1108,16 @@ fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::
                 .filter(|(_, amount)| amount.counts != [0; 8])
                 .map(|(key, _)| key.as_ref().map(|key| accepted.authority_hash(key)))
                 .collect::<BTreeSet<_>>();
-            // An always-missing sibling remains untagged without a refusal.
-            // New tagged shares in an accepted bucket were never accepted;
-            // their absence from the fingerprint must not authorize a retag.
-            if prior.is_empty() && current.iter().all(Option::is_none) {
+            // Only a row frozen with tagged proof can constrain later proof.
+            // New rows and rows previously ACKed untagged remain admissible.
+            if prior.is_empty() {
                 continue;
             }
-            let changed = current != prior;
+            // Resolving an untagged share to the same surviving tagged set is
+            // new proof, not a retag. Missing prior tagged keys still count changed.
+            let resolved_missing = prior.contains(&None)
+                && current == prior.iter().filter(|key| key.is_some()).copied().collect();
+            let changed = current != prior && !resolved_missing;
             if !changed {
                 continue;
             }
@@ -1160,6 +1163,7 @@ fn cap_counts(
     budget::Counts {
         retained_buckets: measurement.map_or(retained, |m| m.accepted_retained),
         refused_new_buckets: measurement.map_or(0, |m| m.refused_recent_buckets),
+        accepted_state_evicted: 0,
         accepted_state_unknown: u64::from(accepted.map_or(true, |known| known.incomplete)),
         accepted_share_changed: grouping.accepted_share_changed.len() as u64,
         accepted_overflow: measurement

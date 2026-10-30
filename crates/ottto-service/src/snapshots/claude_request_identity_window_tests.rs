@@ -1690,9 +1690,37 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
     assert_eq!(original.request_identity_refusals, 0);
     sticky_assert_reconciled(&original);
     cases.insert("restore_from_held_proof", sticky_wire(original));
+    let (mut changed, mut proof) = sticky_session(4);
+    sticky_price_fixture(&mut changed, &mut proof);
+    let mut first = changed.clone();
+    let mut accepted = identity::AcceptedBuckets::for_test();
+    sticky_apply(&mut first, &proof, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(first).unwrap());
+    proof[1].identity = login_key(D64);
+    sticky_apply(&mut changed, &proof, &accepted).unwrap();
+    assert_eq!(changed.request_identity_refusals, 1);
+    assert!(changed.usage_buckets[0].model_usage[0]
+        .identity_parts
+        .as_ref()
+        .unwrap()
+        .iter()
+        .any(|part| part.evidence_ref.is_none()));
+    sticky_assert_reconciled(&changed);
+    cases.insert("accepted_share_changed", sticky_wire(changed));
     let actual = serde_json::to_value(cases).unwrap();
     let fixture = include_str!("fixtures/claude_identity_cap_emitted.json");
     let expected: Value = serde_json::from_str(fixture).unwrap();
+    for case in [
+        "mixed_presence",
+        "window",
+        "accepted_overflow",
+        "restore_from_held_proof",
+    ] {
+        assert_eq!(
+            actual[case], expected[case],
+            "existing golden changed: {case}; STOP and report"
+        );
+    }
     if actual != expected {
         // Bootstrap/update on Linux CI only. The compact compressed receipt
         // is lossless; committing it never requires running tests on the Mac.
@@ -1736,5 +1764,75 @@ fn sticky_rotated_or_unavailable_key_counts_unknown_without_share_changed_refusa
         assert_eq!(counts["identity_cap"]["accepted_share_changed"], 0);
         assert_eq!(next.request_identity_refusals, 0);
         sticky_assert_reconciled(&next);
+    }
+}
+
+#[test]
+fn sticky_new_model_and_previously_untagged_rows_gain_proof_without_retaging_refusals() {
+    for previously_present in [false, true] {
+        let (mut original, proof) = sticky_session(1);
+        let mut added_row = original.usage_buckets[0].model_usage[0].clone();
+        added_row.model = "claude-new-model".into();
+        let mut added_proof = proof.clone();
+        for c in &mut added_proof {
+            c.row_key.model = added_row.model.clone();
+        }
+        let mut first = original.clone();
+        let mut first_proof = proof.clone();
+        if previously_present {
+            first.model_usage.push(added_row.clone());
+            first.usage_buckets[0].model_usage.push(added_row.clone());
+            let mut missing = added_proof.clone();
+            for c in &mut missing {
+                c.identity = RequestIdentity::Missing;
+            }
+            first_proof.extend(missing);
+        }
+        let mut accepted = identity::AcceptedBuckets::for_test();
+        sticky_apply(&mut first, &first_proof, &accepted).unwrap();
+        accepted.record(&serde_json::to_value(first).unwrap());
+        original.model_usage.push(added_row.clone());
+        original.usage_buckets[0].model_usage.push(added_row);
+        let mut current_proof = proof.clone();
+        current_proof.extend(added_proof);
+        for _ in 0..2 {
+            let mut current = original.clone();
+            identity::take_identity_counts();
+            sticky_apply(&mut current, &current_proof, &accepted).unwrap();
+            assert_eq!(current.request_identity_refusals, 0);
+            assert!(current.usage_buckets[0]
+                .model_usage
+                .iter()
+                .all(sticky_tagged));
+            let counts = serde_json::to_value(identity::take_identity_counts()).unwrap();
+            assert_eq!(counts["identity_cap"]["accepted_share_changed"], 0);
+            sticky_assert_reconciled(&current);
+            accepted.record(&serde_json::to_value(current).unwrap());
+        }
+    }
+}
+#[test]
+fn sticky_missing_presence_resolves_to_the_same_accepted_tagged_set_without_repeated_refusals() {
+    let (original, mut proof) = sticky_session(1);
+    proof[2].identity = RequestIdentity::Missing;
+    let mut first = original.clone();
+    let mut accepted = identity::AcceptedBuckets::for_test();
+    sticky_apply(&mut first, &proof, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(first).unwrap());
+    proof[2].identity = proof[0].identity.clone();
+    for _ in 0..2 {
+        let mut current = original.clone();
+        identity::take_identity_counts();
+        sticky_apply(&mut current, &proof, &accepted).unwrap();
+        assert_eq!(current.request_identity_refusals, 0);
+        let parts = current.usage_buckets[0].model_usage[0]
+            .identity_parts
+            .as_ref()
+            .unwrap();
+        assert!(parts.iter().all(|part| part.evidence_ref.is_some()));
+        let counts = serde_json::to_value(identity::take_identity_counts()).unwrap();
+        assert_eq!(counts["identity_cap"]["accepted_share_changed"], 0);
+        sticky_assert_reconciled(&current);
+        accepted.record(&serde_json::to_value(current).unwrap());
     }
 }
