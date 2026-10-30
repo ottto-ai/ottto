@@ -296,7 +296,8 @@ impl ScanIndex {
                 && self.mixed_context_view.claude
                 && terminal_off_empty_context_seen(self, key));
         }
-        !self.mixed_terminal_context_settled(key)
+        !(self.mixed_context_view.claude && terminal_off_held_context_seen(self, key))
+            && !self.mixed_terminal_context_settled(key)
             && self
                 .files
                 .get(key)

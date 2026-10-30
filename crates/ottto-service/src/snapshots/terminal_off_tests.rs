@@ -2239,3 +2239,41 @@ fn terminal_off_stale_clear_memo_is_bounded_and_eviction_fails_toward_another_cl
     reloaded.traversal = None;
     assert!(terminal_off_stale_clear_served(&reloaded, "context", &roots).is_empty());
 }
+
+#[test]
+fn terminal_off_held_context_memo_forgets_changes_and_nonheld_parse_without_credit() {
+    let _on = ClaudeTerminalOffForTest::enabled();
+    assert!(claude_terminal_off());
+    clear_terminal_off_held_contexts_for_test();
+    let scratch = crate::test_scratch::ScratchDir::new("held-context-key");
+    let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
+    fs::write(&path, freshness_line(OFF_ROOT, "held-context-key")).unwrap();
+    let mut index = off_index();
+    off_scan(&mut index, &scratch, W1, 10);
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "memo-context".into());
+    let key = local_index_key(&path);
+    let fp = index.files[&key].source_file_fingerprint.clone();
+    let before = serde_json::to_value(&index).unwrap();
+    note_terminal_off_held_context(&index, &key, &fp);
+    assert!(terminal_off_held_context_seen(&index, &key));
+    assert_eq!(serde_json::to_value(&index).unwrap(), before, "no persisted proof, receipt or ACK");
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "other-context".into());
+    assert!(!terminal_off_held_context_seen(&index, &key));
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "memo-context".into());
+    assert!(!terminal_off_held_context_seen(&index, &key), "old context forgotten");
+    note_terminal_off_held_context(&index, &key, &fp);
+    index.files.get_mut(&key).unwrap().source_file_fingerprint.clear();
+    assert!(!terminal_off_held_context_seen(&index, &key));
+    index.files.get_mut(&key).unwrap().source_file_fingerprint = fp.clone();
+    assert!(!terminal_off_held_context_seen(&index, &key), "old fingerprint forgotten");
+    note_terminal_off_held_context(&index, &key, &fp);
+    forget_terminal_off_held_context(&key);
+    assert!(!terminal_off_held_context_seen(&index, &key), "non-held parse forgets");
+    {
+        let _off = ClaudeCompletionPathsForTest::enable();
+        assert!(!claude_terminal_off());
+        note_terminal_off_held_context(&index, &key, &fp);
+        assert!(!terminal_off_held_context_seen(&index, &key));
+    }
+    assert_eq!(with_terminal_off_held_contexts(|memo| memo.keys.len()), 0, "OFF writes no memo");
+}

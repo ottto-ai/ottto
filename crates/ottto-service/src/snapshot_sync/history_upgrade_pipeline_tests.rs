@@ -68,6 +68,9 @@ const HISTORY_BASELINE: HistoryCycle<'static> = HistoryCycle {
 };
 
 struct HistoryOutcome {
+    wire_bytes: u64,
+    upload_requests: usize,
+    uploaded_bodies: Vec<SnapshotItem>,
     scan: crate::snapshots::SourceScanResult,
     index: ScanIndex,
     /// Sessions whose bodies reached the in-process upload.
@@ -79,6 +82,7 @@ struct HistoryOutcome {
 }
 
 struct HistoryFixture {
+    terminal_off_progress: std::cell::RefCell<BTreeMap<String, Vec<u8>>>,
     pending_hints: std::cell::RefCell<Vec<PathBuf>>,
     base: PathBuf,
     root: PathBuf,
@@ -104,6 +108,7 @@ impl HistoryFixture {
             .expect("write synthetic Claude transcript");
         }
         Self {
+            terminal_off_progress: Default::default(),
             index_path: base.join("claude-scan-index.json"),
             base,
             root,
@@ -126,6 +131,7 @@ impl HistoryFixture {
             .expect("write synthetic Claude transcript");
         }
         Self {
+            terminal_off_progress: Default::default(),
             pending_hints: Default::default(),
             index_path: base.join("claude-scan-index.json"),
             base,
@@ -452,6 +458,7 @@ impl HistoryFixture {
         settle_index_after_upload(&mut index, &committed_index, &progress);
         index.save(&index_path).expect("save scan index");
         HistoryOutcome {
+            wire_bytes: 0, upload_requests: 0, uploaded_bodies: Vec::new(),
             scan,
             index: ScanIndex::load(&index_path).expect("reload scan index"),
             uploaded,
@@ -490,7 +497,11 @@ impl HistoryFixture {
             crate::backfill::save_backfill_state(&self.support, &backfill)
                 .expect("persist backfill state");
         }
-        let mut progress = test_upload_progress();
+        // Model the persisted production ledger across cycles and destinations;
+        // serde deliberately drops fresh ACK candidates and other RAM-only state.
+        let mut progress = self.terminal_off_progress.borrow().get(destination)
+            .map(|bytes| serde_json::from_slice::<SnapshotUploadProgress>(bytes).unwrap())
+            .unwrap_or_else(test_upload_progress);
         // Read before the replay claims a generation, as in production.
         let prior_history = claude_prior_history(
             &backfill,
@@ -534,7 +545,9 @@ impl HistoryFixture {
         );
         let committed_index = index.clone();
         let hints = self.pending_hints.take();
-        let mut scan = crate::snapshots::scan_source_roots_with_test_limit_and_hints(
+        let mut scan = crate::snapshots::with_terminal_off_audit_now_for_test(
+            OffsetDateTime::parse(collected_at, &Rfc3339).unwrap().unix_timestamp() as u64, || {
+            crate::snapshots::scan_source_roots_with_test_limit_and_hints(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&self.root),
             &mut index,
@@ -544,7 +557,8 @@ impl HistoryFixture {
             true,
             &hints,
         )
-        .expect("scan Claude page");
+        .expect("scan Claude page")
+        });
         before_evidence(&mut scan);
         let (mut disposition, _, _) =
             apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
@@ -622,6 +636,9 @@ impl HistoryFixture {
         let mut uploaded = BTreeSet::new();
         let mut uploaded_literal = BTreeSet::new();
         let mut accepted = 0;
+        let mut wire_bytes = 0;
+        let mut upload_requests = 0;
+        let mut uploaded_bodies = Vec::new();
         let result = upload_resumable_batches_with_body_witness(
             &scan.snapshots,
             &unique_poison_scope(),
@@ -637,6 +654,9 @@ impl HistoryFixture {
                         code: None,
                     }));
                 }
+                upload_requests += 1;
+                wire_bytes += items.iter().map(|item| serde_json::to_vec(item).unwrap().len() as u64).sum::<u64>();
+                uploaded_bodies.extend(items.iter().cloned());
                 uploaded.extend(items.iter().map(|item| item.source_session_id.clone()));
                 uploaded_literal.extend(
                     items
@@ -694,7 +714,9 @@ impl HistoryFixture {
             &progress.fresh_context_body_acks,
         );
         index.save(&index_path).expect("save scan index");
+        self.terminal_off_progress.borrow_mut().insert(destination.to_string(), serde_json::to_vec(&progress).unwrap());
         HistoryOutcome {
+            wire_bytes, upload_requests, uploaded_bodies,
             scan,
             index: ScanIndex::load(&index_path).expect("reload scan index"),
             uploaded,
@@ -1092,7 +1114,6 @@ fn upload_context_change_does_not_carry_history_past_the_gate() {
 /// list. Nothing is emitted, the old upload tuple stays, and the reason
 /// settles: the next cycle reads nothing.
 #[test]
-#[ignore = "terminal-off ON-readiness: R5"]
 fn terminal_off_on_upload_context_change_does_not_carry_history_past_the_gate() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -1755,7 +1776,6 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
 /// Retain it through complete census and files held without further parses;
 /// release must reconstruct those files with zero re-offer of accepted history.
 #[test]
-#[ignore = "terminal-off ON-readiness: R5"]
 fn terminal_off_on_user_repair_override_carries_accepted_history_through_census_and_release() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -6265,5 +6285,115 @@ fn terminal_off_on_e2_restamp_carries_the_retired_permit_bit() {
                 "and keeps the retired bit: {state}"
             );
         })
+    });
+}
+
+/// R5: actual hourly production walks, current context, list changes, restart
+/// and growth. A held parse cannot mint a current-context ACK receipt.
+#[test]
+fn terminal_off_held_history_context_change_reads_once_per_context() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    for listed in [false, true] {
+        let fixture = HistoryFixture::new("held-context-once");
+        let baseline = fixture.baseline();
+        if listed { fixture.install_list(&HISTORY_SESSIONS); }
+        else { fixture.corrupt_backfill_state(); }
+        crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+            let context = HistoryCycle { upload_context: "held-context-2", ..HISTORY_REVISION_2 };
+            for (at, reads) in [("09:00:00", 3), ("09:05:01", 0), ("10:00:00", 0)] {
+                let held = fixture.cycle(&format!("2026-08-02T{at}Z"), context);
+                assert_eq!(held.scan.scanned_file_count, reads, "listed={listed}/{at}");
+                assert_eq!(held.upload_requests, 0);
+                assert_eq!(held.wire_bytes, 0);
+                let state = serde_json::to_value(&held.index).unwrap();
+                let old = serde_json::to_value(&baseline).unwrap();
+                for (key, entry) in &held.index.files {
+                    assert_eq!(entry.last_upload_body_witness, baseline.files[key].last_upload_body_witness);
+                    assert_eq!(entry.effective_upload_body_witness_revision, 1);
+                    assert_eq!(state["files"][key]["upload_context_receipt"], old["files"][key]["upload_context_receipt"]);
+                }
+            }
+            let context = HistoryCycle { upload_context: "held-context-3", ..context };
+            let changed = fixture.cycle("2026-08-02T11:00:00Z", context);
+            assert_eq!(changed.scan.scanned_file_count, 3);
+            assert_eq!(changed.upload_requests, 0);
+            crate::snapshots::clear_terminal_off_held_contexts_for_test();
+            let restarted = fixture.cycle("2026-08-02T12:00:00Z", context);
+            assert_eq!(restarted.scan.scanned_file_count, 3, "one held reread after restart");
+            assert_eq!(restarted.upload_requests, 0);
+            assert_eq!(restarted.wire_bytes, 0);
+            let quiet = fixture.cycle("2026-08-02T13:00:00Z", context);
+            assert_eq!(quiet.scan.scanned_file_count, 0);
+            assert_eq!(crate::snapshots::fill_terminal_off_held_contexts_for_test(), 3);
+            let evicted = fixture.cycle("2026-08-02T13:05:01Z", context);
+            assert_eq!(evicted.scan.scanned_file_count, 3, "one held reread after eviction");
+            assert_eq!(evicted.upload_requests, 0);
+            assert_eq!(evicted.wire_bytes, 0);
+            let quiet = fixture.cycle("2026-08-02T13:10:02Z", context);
+            assert_eq!(quiet.scan.scanned_file_count, 0);
+            fixture.install_list(&[]);
+            let released = fixture.cycle("2026-08-02T14:00:00Z", context);
+            assert_eq!(released.scan.scanned_file_count, 3, "BodyWitnessAdoption still releases history");
+            assert_eq!(released.upload_requests, 1);
+            assert_eq!(released.uploaded_bodies.len(), 3);
+            for body in &released.uploaded_bodies {
+                let body = serde_json::to_value(body).unwrap();
+                assert_eq!(body["input_tokens"], 10);
+                assert_eq!(body["output_tokens"], 10);
+                assert_eq!(body["request_count"], 1);
+            }
+            let quiet = fixture.cycle("2026-08-02T15:00:00Z", context);
+            assert_eq!(quiet.scan.scanned_file_count, 0);
+            assert_eq!(quiet.upload_requests, 0);
+        });
+    }
+}
+
+#[test]
+fn terminal_off_held_history_growth_still_reads_with_memo_hit() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    let fixture = HistoryFixture::new("held-context-growth");
+    fixture.baseline();
+    fixture.corrupt_backfill_state();
+    crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+        let cycle = HistoryCycle { upload_context: "held-growth-context", ..HISTORY_REVISION_2 };
+        let held = fixture.cycle("2026-08-02T09:00:00Z", cycle);
+        assert_eq!(held.scan.scanned_file_count, 3);
+        assert_eq!(held.upload_requests, 0);
+        let quiet = fixture.cycle("2026-08-02T10:00:00Z", cycle);
+        assert_eq!(quiet.scan.scanned_file_count, 0);
+        fixture.append(HISTORY_SESSIONS[0], "grown-after-held-memo");
+        let grown = fixture.cycle("2026-08-02T11:00:00Z", cycle);
+        assert_eq!(grown.scan.scanned_file_count, 1, "TranscriptChanged ignores memo");
+    });
+}
+
+/// Durable ACK progress survives the index loss. Accepted history must either
+/// be filtered or settle UNCHANGED, never receive a second acceptance. This
+/// fixture's server accepts all POSTs, so zero resend bytes is the strict arm.
+#[test]
+fn terminal_off_held_index_rebuild_release_does_not_accept_history_twice() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    let fixture = HistoryFixture::new("held-rebuild-release");
+    fixture.baseline();
+    fixture.corrupt_backfill_state();
+    crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        assert_eq!(held.scan.scanned_file_count, 3);
+        assert_eq!(held.wire_bytes, 0);
+        fixture.corrupt_index();
+        let rebuilt = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+        assert_eq!(rebuilt.scan.scanned_file_count, 3);
+        assert_eq!(rebuilt.wire_bytes, 0);
+        fixture.install_list(&[]);
+        let released = fixture.cycle("2026-08-02T11:00:00Z", HISTORY_REVISION_2);
+        assert_eq!(released.scan.scanned_file_count, 3);
+        eprintln!("held_rebuild_release resent_bytes={} requests={}", released.wire_bytes, released.upload_requests);
+        assert_eq!(released.wire_bytes, 0, "no second acceptance of accepted history");
+        assert_eq!(released.upload_requests, 0);
+        assert!(released.uploaded.is_empty());
     });
 }

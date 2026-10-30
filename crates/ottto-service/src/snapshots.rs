@@ -8147,7 +8147,17 @@ pub fn finalize_scan_after_policy_with_body_witness(
         }
         if index.finalize_claude_held_history(&pending.index_key, &pending.source_file_fingerprint)
         {
+            if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+                note_terminal_off_held_context(
+                    index,
+                    &pending.index_key,
+                    &pending.source_file_fingerprint,
+                );
+            }
             continue;
+        }
+        if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+            forget_terminal_off_held_context(&pending.index_key);
         }
         let final_fingerprints = by_source_file
             .get(&pending.source_file_fingerprint)

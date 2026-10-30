@@ -56,8 +56,6 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_same_user_reclaim_keeps_the_cutoff_but_gates_the_new_destination", "prior-code-unclassified"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_seen_marker_rebuild_latch_and_cutoff_feed_one_decision", "prior-code-unclassified"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_session_created_after_a_pre_gate_index_last_receipt_is_uploaded", "r25-code-unclassified"),
-    ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_upload_context_change_does_not_carry_history_past_the_gate", "R5"),
-    ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_user_repair_override_carries_accepted_history_through_census_and_release", "R5"),
     ("snapshot_sync/oversized_discovery_pipeline_tests.rs", "terminal_off_on_oversized_blocking_hold_is_reoffered_once_per_six_hour_floor", "R12"),
     ("snapshot_sync/prior_index_lifetime_tests.rs", "terminal_off_on_prior_index_lifetime_real_finish_preserves_refusals_retry_and_failed_cas", "r25-code-unclassified"),
     ("snapshots.rs", "terminal_off_on_claude_context_backfill_resumes_after_restart_without_rereading_settled_files", "P1"),
