@@ -22,6 +22,8 @@ use crate::durable_tail_codec::{Corrupt, Dec, Durable, Enc, Refuse, Shape};
 /// Head re-parse bound for re-derived first-write-wins fields (Amendment 1,
 /// C-4).
 pub(crate) const HEAD_BOUND: u64 = 1024 * 1024;
+/// Runtime bound only: outside the persisted allowlist digest.
+pub(crate) const TITLE_LINE_BOUND: u64 = 1024 * 1024;
 
 /// At most this many named lines are pread per entry (Amendment 1). M1 uses
 /// one: the title.
@@ -389,6 +391,8 @@ impl SnapshotAccumulator {
         self.codex_counting.as_deref().map(|c| c.durable_contract())
     }
 }
+#[cfg(unix)]
+mod bounded_value;
 #[cfg(unix)]
 mod content;
 
