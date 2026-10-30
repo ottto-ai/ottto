@@ -8645,3 +8645,72 @@ fn terminal_off_on_stale_start_clear_cause_matches_the_actual_traversal_start_re
         rearm_cause::reproven(&key);
     }
 }
+
+const TERMINAL_OFF_DESTINATION: &str = "terminal-off-destination";
+
+/// Containment's red-retry fixture: the same failed window and families as
+/// `carry_index`, with an explicit upload context and contract latch.
+fn terminal_off_rearm_index(context: Option<&str>, latched: bool) -> ScanIndex {
+    let mut index = ScanIndex {
+        claude_request_identity_contract: Some(
+            crate::snapshots::claude_request_identity::COLLECTOR.to_string(),
+        ),
+        claude_request_identity_contract_changed: latched,
+        upload_context_fingerprint: context.map(str::to_string),
+        active_upload_context_fingerprint: Some(TERMINAL_OFF_DESTINATION.to_string()),
+        claude_duplicate_request_witness_overflowed: true,
+        ..ScanIndex::default()
+    };
+    carry_file(&mut index, CARRY_OTHER, None);
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[],
+        &mut index,
+        CARRY_FAILED,
+        BACKFILL_WINDOW_DAYS,
+    );
+    carry_family(&mut index, CARRY_ROOT, &[None, Some(CARRY_AGENT)], true);
+    carry_family(&mut index, CARRY_UNWITNESSED, &[None], false);
+    carry_red(&mut index, CARRY_FAILED, 1);
+    index
+}
+
+/// A real red-retry start: the red traversal's retry is due and the sweep
+/// left an unsettled upload.
+fn terminal_off_red_retry_start(index: &mut ScanIndex, at: &str) -> serde_json::Value {
+    index.bounded_sweep_had_unsettled_upload = true;
+    carry_start(index, at, BACKFILL_WINDOW_DAYS)
+}
+
+/// Lead B B-P2: with the redundant stale clear suppressed, a member whose head
+/// body the server never ACKed is still cleared (Parse); ACKed members keep
+/// their revision (Skip).
+#[test]
+fn terminal_off_suppressed_start_still_rearms_an_unacked_head() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    let mut index = terminal_off_rearm_index(Some(TERMINAL_OFF_DESTINATION), false);
+    let unacked = carry_key(CARRY_UNWITNESSED, None);
+    assert!(index
+        .accepted_snapshot_fingerprints
+        .remove(&format!("body-{}", carry_member(CARRY_UNWITNESSED, None))));
+    assert!(claude_redundant_stale_clear_suppressed(&index));
+    let row = terminal_off_red_retry_start(&mut index, CARRY_RETRY);
+    assert_eq!(row["stale_pending_families"], 2);
+    assert_eq!(row["rearmed_index_files"], 1, "only the unaccepted head");
+    assert!(
+        index.files[&unacked].source_file_fingerprint.is_empty(),
+        "unaccepted debt stays debt: Parse"
+    );
+    for key in carry_family_keys() {
+        assert!(
+            !index.files[&key].source_file_fingerprint.is_empty(),
+            "the ACKed control keeps its suppressed clear: Skip"
+        );
+    }
+    // The next start in the same generation still owes the unACKed head.
+    index.files.get_mut(&unacked).unwrap().source_file_fingerprint =
+        format!("rev-{}", carry_member(CARRY_UNWITNESSED, None));
+    carry_red(&mut index, CARRY_RETRY, 2);
+    let again = terminal_off_red_retry_start(&mut index, CARRY_SECOND_RETRY);
+    assert_eq!(again["rearmed_index_files"], 1);
+}

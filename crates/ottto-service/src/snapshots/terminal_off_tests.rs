@@ -2111,3 +2111,89 @@ fn terminal_off_to_default_off_discards_retained_checkpoint_before_reconciliatio
         "OFF cannot remove files from the retained ON traversal"
     );
 }
+
+/// Lead B B-P2 on real files at the production default (no completion
+/// override): a stale family whose unchanged head was never ACKed stays Parse
+/// and its head is offered again; the ACKed control keeps its suppressed
+/// stale clear.
+#[test]
+fn terminal_off_unacked_head_stays_parse_and_is_reoffered_beside_an_acked_control() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+    const UNACKED_ROOT: &str = "b2222222-2222-4222-8222-222222222222";
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-unacked-head");
+    let root = scratch.join("projects");
+    fs::create_dir_all(&root).unwrap();
+    let acked = root.join(format!("{OFF_ROOT}.jsonl"));
+    let unacked = root.join(format!("{UNACKED_ROOT}.jsonl"));
+    fs::write(&acked, off_line(OFF_ROOT, "X")).unwrap();
+    fs::write(&unacked, off_line(UNACKED_ROOT, "Y")).unwrap();
+    let mut index = off_index();
+    let first = off_scan(&mut index, &root, W1, 10);
+    for item in first
+        .snapshots
+        .iter()
+        .filter(|item| item.source_session_id == OFF_ROOT)
+    {
+        index
+            .accepted_snapshot_fingerprints
+            .insert(item.snapshot_fingerprint.clone());
+    }
+    let (acked_key, unacked_key) = (local_index_key(&acked), local_index_key(&unacked));
+    for (key, family) in [(&acked_key, OFF_ROOT), (&unacked_key, UNACKED_ROOT)] {
+        assert!(
+            index.claude_usage_family_pending.contains_key(family),
+            "{family} is pending custody"
+        );
+        assert!(index
+            .file_snapshot_fingerprints
+            .get(key)
+            .is_some_and(|head| !head.is_empty()));
+        assert!(!index.files[key].source_file_fingerprint.is_empty());
+    }
+    let unacked_head = index.file_snapshot_fingerprints[&unacked_key].clone();
+    assert!(unacked_head
+        .iter()
+        .all(|body| !index.accepted_snapshot_fingerprints.contains(body)));
+
+    // The next window starts a new traversal with the clear suppressed.
+    index.traversal = None;
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&root),
+        &mut index,
+        W2,
+        BACKFILL_WINDOW_DAYS,
+    );
+    off_suppression_preconditions(&index);
+    assert!(
+        !index.files[&acked_key].source_file_fingerprint.is_empty(),
+        "the ACKed control keeps its suppressed clear: Skip"
+    );
+    assert!(
+        index.files[&unacked_key].source_file_fingerprint.is_empty(),
+        "unaccepted debt stays debt: Parse"
+    );
+    index
+        .claude_full_rearm_progress
+        .terminal_off_rediscovery_after = 0;
+    let acked_revision = index.files[&acked_key].source_file_fingerprint.clone();
+    let page = off_scan(&mut index, &root, W2, 10);
+    assert!(
+        page.snapshots
+            .iter()
+            .any(|item| item.source_session_id == UNACKED_ROOT),
+        "the unaccepted head is offered again"
+    );
+    assert!(
+        page.snapshots
+            .iter()
+            .all(|item| item.source_session_id != OFF_ROOT),
+        "the ACKed control is not re-read"
+    );
+    assert_eq!(
+        index.files[&acked_key].source_file_fingerprint,
+        acked_revision
+    );
+    assert!(!index.files[&unacked_key].source_file_fingerprint.is_empty());
+}

@@ -6485,6 +6485,14 @@ fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
     if carry.roots.is_empty() && carry.capped_roots.is_empty() {
         return true;
     }
+    let unacked = if suppress {
+        claude_unacked_head_members(
+            index,
+            &carry.roots.union(&carry.capped_roots).cloned().collect(),
+        )
+    } else {
+        BTreeSet::new()
+    };
     let (mut requeues, mut path_bytes) = (0_usize, 0_usize);
     for index_key in index.files.keys() {
         if claude_index_path_member_ref(Path::new(index_key))
@@ -6526,7 +6534,7 @@ fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
             .is_some_and(|member| carry.contains(member.root))
             && !entry.source_file_fingerprint.is_empty()
         {
-            if suppress {
+            if suppress && !unacked.contains(index_key) {
                 continue;
             }
             rearm_cause::clear(index_key, entry, rearm_cause::Cause::CarryInvalidation);
@@ -6797,6 +6805,11 @@ fn replay_and_rearm_claude_family(
 ) -> (usize, usize) {
     rearm_cause::retain(index);
     let suppress = claude_redundant_stale_clear_suppressed(index);
+    let unacked = if suppress {
+        claude_unacked_head_members(index, &BTreeSet::from([root_session_id.to_string()]))
+    } else {
+        BTreeSet::new()
+    };
     let in_family = |index_key: &str| {
         claude_index_path_member_ref(Path::new(index_key))
             .is_some_and(|member| member.root == root_session_id)
@@ -6833,7 +6846,7 @@ fn replay_and_rearm_claude_family(
             && !entry.source_file_fingerprint.is_empty()
         {
             // Defensive reset of the parsed member remains explicit read debt.
-            if suppress && index_key.as_str() != parsed_key {
+            if suppress && index_key.as_str() != parsed_key && !unacked.contains(index_key) {
                 continue;
             }
             rearm_cause::clear(index_key, entry, rearm_cause::Cause::CarryInvalidation);
@@ -42190,17 +42203,24 @@ fn ensure_bounded_traversal(
             full_rearm_window: false,
             admission: (!stale.is_empty()).then_some(admission),
         });
-        if !claude_redundant_stale_clear_suppressed(index) {
+        let suppressed = claude_redundant_stale_clear_suppressed(index);
+        // B-P2: an unACKed head is never suppressed.
+        let unacked = claude_unacked_head_members(index, &stale);
+        if !suppressed || !unacked.is_empty() {
             // Actual destination/identity-contract invalidation remains owed.
             for (key, entry) in &mut index.files {
-                if claude_index_path_member_ref(Path::new(key))
-                    .is_some_and(|m| stale.contains(m.root))
+                if unacked.contains(key)
+                    || (!suppressed
+                        && claude_index_path_member_ref(Path::new(key))
+                            .is_some_and(|m| stale.contains(m.root)))
                 {
                     transition.rearmed_index_files +=
                         usize::from(!entry.source_file_fingerprint.is_empty());
                     rearm_cause::clear(key, entry, transition.rearm_cause());
                 }
             }
+        }
+        if !suppressed {
             eprintln!(
                 "claude_terminal_off semantic_context_reselection files={}",
                 index.files.len()

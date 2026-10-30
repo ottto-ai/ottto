@@ -191,6 +191,31 @@ fn claude_redundant_stale_clear_suppressed(index: &ScanIndex) -> bool {
         && index.upload_context_fingerprint == index.active_upload_context_fingerprint
 }
 
+/// B-P2: stale-family members whose committed head carries a body the server
+/// never accepted and no refusal quarantine owns. Unaccepted debt stays
+/// debt, so the redundant stale clear is never suppressed for them: they stay
+/// Parse and their head is offered again. Empty outside containment.
+fn claude_unacked_head_members(index: &ScanIndex, roots: &BTreeSet<String>) -> BTreeSet<String> {
+    if !claude_terminal_off() {
+        return BTreeSet::new();
+    }
+    index
+        .file_snapshot_fingerprints
+        .iter()
+        .filter(|(key, head)| {
+            claude_index_path_member_ref(Path::new(key.as_str()))
+                .is_some_and(|member| roots.contains(member.root))
+                && head.iter().any(|fingerprint| {
+                    !index.accepted_snapshot_fingerprints.contains(fingerprint)
+                        && !index
+                            .quarantined_snapshot_fingerprints
+                            .contains_key(fingerprint)
+                })
+        })
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
 fn claude_terminal_stale_roots(index: &ScanIndex, window: &str) -> BTreeSet<String> {
     index
         .claude_usage_family_pending
