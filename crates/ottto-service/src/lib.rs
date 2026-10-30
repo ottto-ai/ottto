@@ -3141,6 +3141,16 @@ fn local_health_blockers_for_status(
             ));
         }
     }
+    if otlp_relay::legacy::recent_request() {
+        blockers.push(blocker(
+            otlp_relay::legacy::STALE_EXPORTER_CODE,
+            LocalHealthSeverity::Warning,
+            "source",
+            LocalHealthAuthority::Runtime,
+            &status.generated_at,
+            "Some Claude Code sessions still send telemetry to an older Ottto port; restart those Claude Code sessions.",
+        ));
+    }
     blockers
 }
 
@@ -6182,6 +6192,58 @@ mod tests {
             health.overall.next_action.as_deref(),
             Some("finish_source_setup")
         );
+    }
+
+    #[test]
+    fn canonical_health_warns_for_recent_legacy_requests_without_port_text() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        for (now, recent) in [(1000, true), (4599, true), (4600, false)] {
+            otlp_relay::legacy::with_recent_request_for_test(1000, now, || {
+                let status = daemon.status(TOKEN).expect("status");
+                let health = status.canonical_health.expect("canonical health");
+                let finding = health
+                    .blockers
+                    .iter()
+                    .find(|blocker| blocker.code == otlp_relay::legacy::STALE_EXPORTER_CODE);
+                assert_eq!(finding.is_some(), recent);
+                if recent {
+                    let finding = finding.unwrap();
+                    assert_eq!(finding.severity, LocalHealthSeverity::Warning);
+                    assert_eq!(finding.owner, "source");
+                    assert_eq!(finding.source, LocalHealthAuthority::Runtime);
+                    assert_eq!(finding.clear_condition, "Some Claude Code sessions still send telemetry to an older Ottto port; restart those Claude Code sessions.");
+                    assert!(!finding.clear_condition.chars().any(|c| c.is_ascii_digit()));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn stale_exporter_warning_follows_disconnected_account_blocker() {
+        otlp_relay::legacy::with_recent_request_for_test(1000, 1000, || {
+            let status = daemon().status(TOKEN).expect("status");
+            let health = status.canonical_health.expect("health");
+            assert_eq!(health.account.state, LocalHealthAccountState::NotConnected);
+            let reconnect = health
+                .blockers
+                .iter()
+                .position(|finding| finding.code == "reconnect_required")
+                .unwrap();
+            let stale = health
+                .blockers
+                .iter()
+                .position(|finding| finding.code == otlp_relay::legacy::STALE_EXPORTER_CODE)
+                .unwrap();
+            assert!(reconnect < stale);
+            assert_ne!(
+                health.overall.primary_blocker.as_deref(),
+                Some(otlp_relay::legacy::STALE_EXPORTER_CODE)
+            );
+            assert_eq!(
+                health.blockers[reconnect].severity,
+                LocalHealthSeverity::Blocking
+            );
+        });
     }
 
     #[test]
