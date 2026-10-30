@@ -488,3 +488,28 @@ fn persisted_cursor_drains_next_unit_and_stale_schedule_cannot_override_it() {
     let foreign = Planner::new(foreign_id, 1, selection.prior_schedule.clone());
     assert!(db.begin_selected(foreign.select().unwrap()).is_err());
 }
+
+#[test]
+fn source_dependency_couples_every_fragment_including_unrelated_file_scopes() {
+    let mut p = plan();
+    add(&mut p, "global", vec![Scope::Source], HARD_BYTES);
+    add(&mut p, "file", vec![scope(1)], 0);
+    add(
+        &mut p,
+        "family",
+        vec![Scope::Family(b"independent".to_vec())],
+        0,
+    );
+    let selection = p.select().unwrap();
+    assert_eq!(selection.selected_units, 0);
+    assert_eq!(selection.held, 1);
+    assert_eq!(selection.keys().count(), 0);
+    assert_eq!(selection.next_schedule.deferred, 1);
+}
+
+#[test]
+fn journal_off_import_cannot_borrow_rollback_based_unit_admission() {
+    let scratch = Scratch::new();
+    let mut db = sqlite::Sqlite::create_import(&scratch.path()).unwrap();
+    assert!(db.begin_selected(plan().select().unwrap()).is_err());
+}

@@ -336,6 +336,11 @@ impl Planner {
                 }
             }
         }
+        // A source-wide dependency couples every fragment in this planning
+        // page, including fragments which name only a file or family scope.
+        if owners.contains_key(&Scope::Source.token()?) {
+            parents.fill(0);
+        }
         struct Unit {
             token: [u8; 32],
             changes: Vec<Change>,

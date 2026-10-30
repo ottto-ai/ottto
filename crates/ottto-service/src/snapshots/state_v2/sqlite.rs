@@ -1068,6 +1068,7 @@ impl Sqlite {
     /// Ordinary callers keep their existing conservative transaction limits.
     #[allow(dead_code)] // Complete mapper plans are required before enabling publication.
     pub(super) fn begin_selected(&mut self, selection: units::Selection) -> Result<Txn<'_>> {
+        ensure!(!self.import, "state_v2_unit_requires_live_store");
         let mut tx = self.begin(TxnMode::Write)?;
         ensure!(
             tx.store.read_control::<Identity>("identity")?.as_ref() == Some(&selection.identity)
