@@ -156,7 +156,14 @@ A fresh hold keeps its one immediate retry (the r26 held-retry contract);
 from its first held re-read on, an unchanged object in the same context is
 read at most once per six hours, and only an actual acquisition renews the
 timestamp. So a new non-blocking hold costs at most two reads in its first
-six hours, then one per six hours. The floor crosses traversal
+six hours (the first read plus one immediate retry or restart read; Lead B
+approved), then one per six hours. The extra early reads are counted as
+`nbf_initial_retry_reads` (process total, `terminal_off_nbf_initial_retry_read`
+diagnostic, no persisted field) so the M4 trial shows their rate. When a held
+key's floor expires it is re-offered once through the targeted queue
+(`held_retry_due`): a walk that suppresses unchanged stats and the
+deduplicated targeted token would otherwise leave it unread, which is a
+custody break. The floor crosses traversal
 starts without changing sweep-held family roots, proof state or disk formats.
 Object/context changes and observation eviction fail toward another read.
 
