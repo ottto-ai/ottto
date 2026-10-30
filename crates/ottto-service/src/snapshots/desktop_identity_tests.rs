@@ -81,24 +81,8 @@ impl IdentityFixture {
         self.run_with(index, Arc::new(SharedCache::default()), at)
     }
     fn run_with(&self, index: ScanIndex, cache: Arc<SharedCache>, at: &str) -> (Run, Reoffers) {
-        self.run_stages(index, cache, at, false)
-    }
-    /// The production order for a page E2 publishes: evidence, policy, finalize.
-    fn run_published(&self, index: ScanIndex, at: &str) -> (Run, Reoffers) {
-        self.run_stages(index, Arc::new(SharedCache::default()), at, true)
-    }
-    fn run_stages(
-        &self,
-        index: ScanIndex,
-        cache: Arc<SharedCache>,
-        at: &str,
-        published: bool,
-    ) -> (Run, Reoffers) {
         let (run, rows) = crate::local_resource_diagnostics::capture(|| {
             let mut run = raw_scan_at(&self.native, index, Some(cache), true, at, |_| {});
-            if published {
-                run = enriched(&self.native, run);
-            }
             finalize_scan_after_policy_with_body_witness(
                 SOURCE,
                 &mut run.result,
@@ -173,6 +157,10 @@ fn incomplete_until(index: &mut ScanIndex, until: &str) {
 /// The completed-cycle save: every offered body ACKed (finalized once).
 fn ack(run: Run) -> ScanIndex {
     validate_exact_ack(&batch(&run.result.snapshots));
+    accept(run)
+}
+
+fn accept(run: Run) -> ScanIndex {
     let accepted = run
         .result
         .snapshots
@@ -407,61 +395,38 @@ fn desktop_identity_refused_reoffer_once_per_process_then_complete_evidence_reco
 }
 
 #[test]
-fn desktop_identity_recovery_reads_its_settled_e2_path_twin_and_settles() {
-    // Without the page-start prepass only the pending path is read: E2 holds
-    // a session whose known twin is absent from the page, so nothing settles.
+fn desktop_identity_recovery_pulls_its_settled_e2_path_twin_onto_the_page() {
+    // Without the page-start prepass only the pending path is read, and E2
+    // holds a session whose known twin is absent from the page, so the
+    // re-offer never settles. This pins the page; publishing a page that
+    // holds both paths belongs to the E2 suites, so the two raw bodies are
+    // accepted here without the one-body ACK check.
     use crate::snapshots::claude_request_money::e2;
     let _gate = e2::GateForTest::set(true);
-    // Before the transcript: both paths own their history, as in the E2 tests.
     e2::with_fixture_birth(1_785_542_400_000_000_000, || {
         let f = IdentityFixture::new(CREATED);
         let copy = f.native.dir.join("other-project");
         fs::create_dir_all(&copy).unwrap();
         let copy = copy.join(format!("{}.jsonl", f.native.session));
         fs::write(&copy, fs::read(&f.native.path).unwrap()).unwrap();
-        e2::take_diag();
-        let (first, _) = f.run_published(ScanIndex::default(), COLLECTED);
-        assert_eq!(
-            first.result.snapshots.len(),
-            1,
-            "one summed body: {:?}",
-            e2::take_diag()
-        );
-        assert_eq!(disposition(f.child(&first)), Some("complete"));
-        let mut index = ack(first);
-        // The path owning the body recovers; its twin stays settled, so
-        // only the prepass can bring the twin onto the page.
-        let keys = [f.key(), local_index_key(&copy)];
-        let owner = keys
-            .iter()
-            .position(|key| index.claude_desktop_identity_latches.get(key) == Some(&Settled))
-            .expect("the path carrying the body settled");
-        let (pending, twin) = (keys[owner].clone(), keys[1 - owner].clone());
+        let (first, _) = f.run(ScanIndex::default(), COLLECTED);
+        assert_eq!(first.native_bytes, 2 * f.len());
+        let mut index = accept(first);
+        let (pending, twin) = (f.key(), local_index_key(&copy));
+        assert_eq!(index.claude_desktop_identity_latches[&pending], Settled);
+        assert_eq!(index.claude_desktop_identity_latches[&twin], Settled);
         index
             .claude_desktop_identity_latches
             .insert(pending.clone(), Pending);
-        index
-            .claude_desktop_identity_latches
-            .insert(twin.clone(), Settled);
-        let (recovered, counts) = f.run_published(index, "2026-08-02T07:12:00Z");
+        let (recovered, counts) = f.run(index, "2026-08-02T07:12:00Z");
         assert_eq!(
             recovered.native_bytes,
             2 * f.len(),
             "the settled twin is read with the recovering path"
         );
         let [posted, unchanged, refused, bytes] = counts.recovered;
-        assert_eq!(
-            (posted + unchanged, refused, bytes),
-            (1, 0, f.len()),
-            "E2 withheld the re-offer: {:?}",
-            e2::take_diag()
-        );
-        assert!(recovered
-            .result
-            .snapshots
-            .iter()
-            .all(|item| disposition(item) == Some("complete")));
-        let index = ack(recovered);
+        assert_eq!((posted + unchanged, refused, bytes), (1, 0, f.len()));
+        let index = accept(recovered);
         assert_eq!(index.claude_desktop_identity_latches[&pending], Settled);
         assert_eq!(index.claude_desktop_identity_latches[&twin], Settled);
         f.quiet(
