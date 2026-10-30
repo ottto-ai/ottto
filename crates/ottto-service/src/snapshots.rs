@@ -28805,13 +28805,8 @@ impl OwnedSourceScan {
                         for member in &group_members {
                             let mut due = None;
                             let key = local_index_key(&member.path);
-                            let held = cache.durable_member_hold_active(
-                                source,
-                                &key,
-                                !restart_restore::enabled(),
-                                index,
-                                &mut due,
-                            );
+                            let held = cache
+                                .durable_member_hold_active(source, &key, false, index, &mut due);
                             if let Some(at) =
                                 group.members.iter().position(|m| m.path == member.path)
                             {
@@ -28825,6 +28820,8 @@ impl OwnedSourceScan {
                                 }
                             }
                         }
+                        // OFF has no successor writer and therefore no T14
+                        // start to commit. Its one read-only pass is sufficient.
                         if restart_restore::enabled() && !refused {
                             for member in &group_members {
                                 let key = local_index_key(&member.path);

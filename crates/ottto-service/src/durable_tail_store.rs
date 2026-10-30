@@ -1108,7 +1108,11 @@ impl DurableTailStore {
         live_context: &Digest32,
     ) -> Result<Option<u64>, Refusal> {
         let held = self.guard_with_carrier(key, has_index, live_context);
+        // The OFF/M1 reader has no successor writer. Its optional corrupt
+        // cache may recover in RAM, but cannot consume an attempt whose only
+        // discharge would be a new durable record.
         if start
+            && !self.read_v1_only
             && held.is_ok()
             && self.disabled.is_none()
             && self.rebuilt.get(key) == Some(&Rebuild::Authorized)

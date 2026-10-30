@@ -4976,3 +4976,88 @@ fn m1_reader_ceiling_keeps_consent_erasure_for_known_v3_private_labels() {
     assert!(!record_path.exists());
     assert_eq!(reader.counters().records_written, 0);
 }
+
+#[test]
+fn m1_without_a_successor_writer_never_strands_corruption_recovery() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp-a", None));
+    let mut writer = scratch.store();
+    assert_eq!(
+        writer
+            .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+            .unwrap()
+            .written,
+        1
+    );
+    let record_path = writer.record_path(&b.key);
+    let mut bytes = fs::read(&record_path).unwrap();
+    let tail = bytes.len() - 1;
+    bytes[tail] ^= 1;
+    fs::write(&record_path, &bytes).unwrap();
+    let mut reader = scratch.store();
+    reader.restrict_reads_to_v1();
+    // Model a native Full, successful memory-only completion, then RAM loss
+    // and more growth across several passes. The record cannot be repaired
+    // while OFF; its corruption must never become a permanent acquisition hold.
+    for _ in 0..3 {
+        reader.begin_pass();
+        assert_eq!(reader.full_guard(&b.key, false, true, &[0; 32]), Ok(None));
+        assert_eq!(reader.full_guard(&b.key, true, true, &[0; 32]), Ok(None));
+        assert_eq!(reader.rebuilt[&b.key], Rebuild::Authorized);
+    }
+    assert_eq!(reader.counters().t14_rebuild_full_started, 0);
+    assert_eq!(reader.counters().records_written, 0);
+    assert_eq!(fs::read(&record_path).unwrap(), bytes);
+}
+
+#[test]
+fn m1_blocked_group_leaves_earlier_corrupt_member_recoverable() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let a = binding("account", "scope", ("fp-a", None));
+    let mut b = a.clone();
+    b.key = key_digest(DurableSource::ClaudeCode, "later-member");
+    let mut writer = scratch.store();
+    assert_eq!(
+        writer
+            .write_after_save(
+                &lock,
+                1,
+                0,
+                vec![
+                    pending(a.clone(), certificate(&path), 1),
+                    pending(b.clone(), certificate(&path), 1)
+                ]
+            )
+            .unwrap()
+            .written,
+        2
+    );
+    let corrupt = writer.record_path(&a.key);
+    let later = writer.record_path(&b.key);
+    let mut bytes = fs::read(&corrupt).unwrap();
+    let tail = bytes.len() - 1;
+    bytes[tail] ^= 1;
+    fs::write(&corrupt, &bytes).unwrap();
+    let mut unknown = fs::read(&later).unwrap();
+    unknown[8..10].copy_from_slice(&FORMAT_V3.to_le_bytes());
+    fs::write(&later, unknown).unwrap();
+    let mut reader = scratch.store();
+    reader.restrict_reads_to_v1();
+    // Admission checks every needed member before committing any start.
+    assert_eq!(reader.full_guard(&a.key, false, true, &[0; 32]), Ok(None));
+    assert_eq!(
+        reader.full_guard(&b.key, false, true, &[0; 32]),
+        Err(Refusal::NewerFormat)
+    );
+    assert_eq!(reader.rebuilt[&a.key], Rebuild::Authorized);
+    fs::remove_file(&later).unwrap();
+    reader.begin_pass();
+    assert_eq!(reader.full_guard(&a.key, false, true, &[0; 32]), Ok(None));
+    assert_eq!(reader.full_guard(&b.key, false, true, &[0; 32]), Ok(None));
+    assert_eq!(reader.full_guard(&a.key, true, true, &[0; 32]), Ok(None));
+    assert_eq!(reader.counters().t14_rebuild_full_started, 0);
+}
