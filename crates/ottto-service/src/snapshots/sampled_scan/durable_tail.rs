@@ -2191,6 +2191,9 @@ impl SharedCache {
             if !restart_restore::enabled() {
                 slot.store.restrict_reads_to_v1();
             }
+            if restart_restore::enabled() {
+                slot.store.enable_capacity_quota();
+            }
             slot.store.begin_pass();
             // At most one resource probe per pass; the store owns its back-off.
             // Held keys retry through their own next native write.
@@ -3246,6 +3249,13 @@ impl SharedCache {
         }
     }
 
+    /// Quota can first become known after a legitimate Full has completed.
+    /// Enrol that read in the same pace, so immediate growth cannot buy a
+    /// second Full. If its start already spent the pace, this spends nothing.
+    pub(in crate::snapshots) fn completed_capacity_full(&self, source: SnapshotSource, key: &str) {
+        let _ = self.paced_admission(source, key, SystemTime::now(), false, false, true);
+    }
+
     pub(in crate::snapshots) fn start_resource_full(
         &self,
         source: SnapshotSource,
@@ -3256,6 +3266,14 @@ impl SharedCache {
     ) -> bool {
         if !self.paced_growth_full(source, key, file, accepted_end, SystemTime::now(), phase) {
             return false;
+        }
+        if phase == "capacity" {
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                source.api_slug(),
+                &serde_json::json!({
+                    "capacity_full": {"files": 1, "source_bytes": file.metadata().map_or(0, |m| m.len())}
+                }),
+            );
         }
         if let Some(mut stores) = self.durable() {
             Counters::bump(&mut stores.counters.resource_full, phase);

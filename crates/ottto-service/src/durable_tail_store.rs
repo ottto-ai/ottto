@@ -47,6 +47,7 @@ use std::sync::{
 };
 
 pub(crate) mod active;
+mod capacity;
 mod stream;
 pub(crate) use active::{ActiveLease, ActiveOverBudget, LeaseWait, ACTIVE_BYTES};
 pub(crate) use stream::{
@@ -557,6 +558,12 @@ pub(crate) struct StoreCounters {
     /// verified predecessor stays until replacement; without one, the entry
     /// is Full after restart.
     pub(crate) budget_refused: u64,
+    /// Metadata-only encoded occupancy; quota refusal never selects a victim.
+    pub(crate) tail_checkpoint_files: u64,
+    pub(crate) tail_referenced_bytes: u64,
+    pub(crate) tail_staged_bytes: u64,
+    pub(crate) tail_quota_bytes: u64,
+    pub(crate) capacity_refused: u64,
     pub(crate) durable_floor_skipped: u64,
     pub(crate) receipt_reconciled: u64,
     pub(crate) receipt_pending_held: u64,
@@ -666,6 +673,7 @@ pub(crate) struct DurableTailStore {
     checked: bool,
     /// M1's reader ceiling, selected by the source owner before a pass.
     read_v1_only: bool,
+    capacity_quota: u64,
     pass: [u64; 2],
     /// Process-lifetime attempts, removed only after a successful replacement.
     rebuilt: BTreeMap<Digest32, Rebuild>,
@@ -722,6 +730,7 @@ impl DurableTailStore {
             disabled: None,
             checked: false,
             read_v1_only: false,
+            capacity_quota: 0,
             pass: [0; 2],
             rebuilt: BTreeMap::new(),
             startup_synced: false,
@@ -1770,6 +1779,10 @@ impl DurableTailStore {
                 continue;
             }
             let bytes = encode(&stored);
+            if !self.admit_capacity(&key, bytes.len() as u64, false)? {
+                receipt.budget_refused += 1;
+                continue;
+            }
             let ack_bytes = if self.source == DurableSource::ClaudeCode {
                 BATCH_ACK_BYTES
             } else {
@@ -2004,6 +2017,15 @@ impl DurableTailStore {
             let mut layout_retirement = None;
             let mut class_retirement = None;
             let verdict = match self.classify(&key, "delete", Some(writer)) {
+                // A class/scope/age decision is not irreversible finish proof.
+                // Keep active records, even outside this bounded inventory.
+                Ok(Some(header))
+                    if self.capacity_quota != 0
+                        && (header.record.binding.context == *live_context
+                            || *live_context == [0; 32]) =>
+                {
+                    Some(len)
+                }
                 Ok(Some(header))
                     if header.format == FORMAT_V3
                         && !crate::heap_layout_bound::layout_supported() =>

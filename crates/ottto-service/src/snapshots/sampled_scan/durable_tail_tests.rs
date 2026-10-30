@@ -15133,3 +15133,58 @@ fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write
         "a new cycle defaults fail-closed until its owner supplies policy"
     );
 }
+
+#[test]
+fn capacity_full_overflow_evicts_oldest_stamp_reads_and_then_paces() {
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    let root = crate::test_scratch::ScratchDir::new("capacity-pace-overflow");
+    let path = root.join("source.jsonl");
+    fs::write(&path, b"{}\n{}\n").unwrap();
+    let file = File::open(&path).unwrap();
+    let cache = SharedCache::default();
+    let source = SnapshotSource::Codex;
+    let now = SystemTime::now();
+    {
+        let mut stores = cache.durable().unwrap();
+        stores.retail_full_now = Some(now);
+        for n in 0..2 * store::MAX_RECORDS {
+            stores.retail_full_at.insert(
+                full_pace_key(source, &format!("old-{n}")),
+                FullPace {
+                    at: now - std::time::Duration::from_secs(1 + u64::from(n == 0)),
+                    structural: false,
+                },
+            );
+        }
+    }
+    let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+        assert!(cache.start_resource_full(source, "capacity", &file, 3, "capacity"));
+        assert!(!cache.start_resource_full(source, "capacity", &file, 3, "capacity"));
+    });
+    let stores = cache.durable().unwrap();
+    assert_eq!(stores.counters.pace_evicted[1], 1);
+    assert!(!stores
+        .retail_full_at
+        .contains_key(&full_pace_key(source, "old-0")));
+    assert_eq!(stores.counters.resource_full.get("capacity"), Some(&1));
+    assert_eq!(
+        alarms
+            .iter()
+            .filter(|a| !a["counts"]["capacity_full"].is_null())
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn first_capacity_refusal_enrols_completed_full_before_more_growth() {
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    let root = crate::test_scratch::ScratchDir::new("capacity-completed-full");
+    let path = root.join("source.jsonl");
+    fs::write(&path, b"{}\n{}\n").unwrap();
+    let file = File::open(path).unwrap();
+    let cache = SharedCache::default();
+    let source = SnapshotSource::Codex;
+    cache.completed_capacity_full(source, "key");
+    assert!(!cache.start_resource_full(source, "key", &file, 3, "capacity"));
+}

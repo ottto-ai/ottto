@@ -117,6 +117,7 @@ pub(crate) enum NotPersisted {
     Unsealed,
     ActiveBound,
     PassBudget,
+    Capacity,
     Layout,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +143,7 @@ pub(crate) enum HeldCause {
     Incompatible,
     /// D3 Claude: this key's stale predecessor survived; hold this key only.
     StaleSurvivor,
+    Capacity,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DegradedCause {
@@ -694,6 +696,9 @@ impl SharedCache {
             }
             match slot.store.prepare_stream(writer, header) {
                 Ok(preparation) => preparation,
+                Err(failure) if failure.stage() == "stream_capacity" => {
+                    return PrepareOutcome::NotPersisted(NotPersisted::Capacity);
+                }
                 Err(failure) if failure.stage() == "stream_budget" => {
                     return PrepareOutcome::NotPersisted(NotPersisted::PassBudget);
                 }
@@ -742,10 +747,14 @@ impl SharedCache {
             drop(guard);
             match registered {
                 Ok(pending) => pending,
+                Err(mut failure) if failure.stage() == "stream_capacity" => {
+                    let _ = failure.discard();
+                    return WriteOutcome::FailedHeld(HeldCause::Capacity);
+                }
                 Err(failure) => return self.resolve_failed_preparation(failure, fences),
             }
         };
-        // Outside Stores: conditional rename and survivor stamp, no fsync per record.
+        // Outside Stores: conditional rename of the already fsynced candidate.
         let committed = match pending.commit() {
             Ok(committed) => committed,
             Err(failure) => return self.resolve_failed_preparation(failure, fences),
@@ -1036,6 +1045,12 @@ impl SharedCache {
             // A store fault or resource pause never retires a valid
             // predecessor: hold only this Claude key; keys without a stale
             // survivor (and every Codex key, whose v1 entry refuses) publish.
+            PriorRecord::Retained { .. }
+                if matches!(reason, Unprepared::NotPersisted(NotPersisted::Capacity)) =>
+            {
+                // Capacity never authorizes publication over a resumable prior.
+                UnpreparedDisposition::Hold(HeldCause::Capacity)
+            }
             PriorRecord::Retained { .. } if fault && source == DurableSource::ClaudeCode => {
                 let held = stores.hold(&digest).is_some();
                 if stores.hold_content_changed(digest)
@@ -1201,6 +1216,7 @@ impl SharedCache {
                     NotPersisted::Unsealed => "wa.unsealed",
                     NotPersisted::ActiveBound => "wa.active_bound",
                     NotPersisted::PassBudget => "wa.pass_budget",
+                    NotPersisted::Capacity => "wa.capacity",
                     NotPersisted::Layout => "wa.layout",
                 },
             );

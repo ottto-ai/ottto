@@ -294,6 +294,7 @@ impl StreamPreparation {
             let (temp, _) = output.into_parts();
             self.attempt.temp = Some(temp);
             result?;
+            self.attempt.temp.as_ref().expect("owned stream").sync()?;
             self.attempt.content = content.finalize().into();
             self.attempt.identity = Some(RecordIdentity {
                 binding: self.header.binding.clone(),
@@ -556,6 +557,7 @@ impl DurableTailStore {
         };
         let mut protected = None;
         let mut budget_refused = false;
+        let mut capacity_refused = false;
         let result = (|| {
             self.check_writer(writer)?;
             if self.disabled.is_some() {
@@ -634,6 +636,17 @@ impl DurableTailStore {
                 }
             }
             attempt.prior_known = true;
+            if !self
+                .admit_capacity(&key, encoded_len as u64, false)
+                .unwrap_or_else(|_| {
+                    self.counters.store_write_failed[1] += 1;
+                    self.counters.capacity_refused += 1;
+                    false
+                })
+            {
+                capacity_refused = true;
+                return Err(io::Error::other("encoded source quota exhausted"));
+            }
             self.stream_records += 1;
             self.stream_bytes += encoded_len;
             Ok(())
@@ -642,7 +655,9 @@ impl DurableTailStore {
             Ok(()) => Ok(StreamPreparation { attempt, header }),
             Err(error) => {
                 let mut failure = attempt.failure(
-                    if budget_refused {
+                    if capacity_refused {
+                        "stream_capacity"
+                    } else if budget_refused {
                         "stream_budget"
                     } else {
                         "stream_prepare"
@@ -660,6 +675,7 @@ impl DurableTailStore {
         prepared: PreparedRecord,
     ) -> Result<PendingCommit, PrepareStoreFailure> {
         let attempt = *prepared.attempt;
+        let mut capacity_refused = false;
         let result = (|| {
             self.check_writer(writer)?;
             if self.disabled.is_some()
@@ -671,6 +687,17 @@ impl DurableTailStore {
             let identity = attempt.identity.as_ref().expect("prepared identity");
             if stamp_at(&attempt.path)? != attempt.prior {
                 return Err(io::Error::other("predecessor changed before registration"));
+            }
+            if !self
+                .admit_capacity(&attempt.key, identity.encoded_len, true)
+                .unwrap_or_else(|_| {
+                    self.counters.store_write_failed[1] += 1;
+                    self.counters.capacity_refused += 1;
+                    false
+                })
+            {
+                capacity_refused = true;
+                return Err(io::Error::from_raw_os_error(libc::ENOSPC));
             }
             self.pending.insert(
                 attempt.key,
@@ -687,8 +714,17 @@ impl DurableTailStore {
         match result {
             Ok(()) => Ok(PendingCommit { attempt }),
             Err(error) => {
-                let mut failure = attempt.failure("stream_register", error);
-                failure.protected = Some(Refusal::ReceiptPending);
+                let mut failure = attempt.failure(
+                    if capacity_refused {
+                        "stream_capacity"
+                    } else {
+                        "stream_register"
+                    },
+                    error,
+                );
+                if !capacity_refused {
+                    failure.protected = Some(Refusal::ReceiptPending);
+                }
                 Err(failure)
             }
         }
@@ -1060,6 +1096,131 @@ mod tests {
             .unwrap();
         store.finish_stream(committed).unwrap()
     }
+    #[test]
+    fn capacity_refuses_without_eviction_and_exact_replacement_fits_for_both_sources() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        for source in [DurableSource::ClaudeCode, DurableSource::Codex] {
+            let scratch = Scratch::new();
+            let writer = crate::locked_state_dir::test_locks::hold(&scratch.root);
+            let mut store = DurableTailStore::new(scratch.root.join("quota"), source);
+            let (first, body) = header(&scratch, source, 1);
+            let key = first.binding.key;
+            let receipt = commit(&mut store, writer, first, &body);
+            let original = fs::read(store.record_path(&key)).unwrap();
+            store.enable_capacity_quota();
+            store.capacity_quota = original.len() as u64;
+            store.begin_pass();
+            let (mut next, _) = header(&scratch, source, 1);
+            next.binding.key = key_digest(source, "other-active");
+            let failure = match store.prepare_stream(writer, next) {
+                Err(failure) => failure,
+                Ok(_) => panic!("quota admitted a second active file"),
+            };
+            assert_eq!(failure.stage(), "stream_capacity");
+            assert_eq!(fs::read(store.record_path(&key)).unwrap(), original);
+            assert!(store.receipt_current(&receipt));
+            assert_eq!(store.counters.capacity_refused, 1);
+            assert_eq!(store.counters.tail_checkpoint_files, 1);
+            // Even exclusion and an empty inventory are not finish proof.
+            store
+                .gc_classified(writer, &receipt.identity.binding.context, &BTreeMap::new())
+                .unwrap();
+            assert_eq!(fs::read(store.record_path(&key)).unwrap(), original);
+            store.begin_pass();
+            let (replacement, body) = header(&scratch, source, 1);
+            assert!(store.authorize_native(&replacement.binding, 17));
+            let replacement = commit(&mut store, writer, replacement, &body);
+            assert!(store.receipt_current(&replacement));
+            assert_eq!(store.counters.gc_records_deleted, 0);
+        }
+    }
+
+    #[test]
+    fn capacity_rechecks_before_rename_and_preserves_exact_predecessor() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let scratch = Scratch::new();
+        let writer = crate::locked_state_dir::test_locks::hold(&scratch.root);
+        let source = DurableSource::ClaudeCode;
+        let mut store = DurableTailStore::new(scratch.root.join("quota-recheck"), source);
+        let (first, body) = header(&scratch, source, 1);
+        let key = first.binding.key;
+        let receipt = commit(&mut store, writer, first, &body);
+        let original = fs::read(store.record_path(&key)).unwrap();
+        store.enable_capacity_quota();
+        store.capacity_quota = original.len() as u64;
+        store.begin_pass();
+        let (next, body) = header(&scratch, source, 1);
+        assert!(store.authorize_native(&next.binding, 17));
+        let prepared = store
+            .prepare_stream(writer, next)
+            .unwrap()
+            .write(|out| {
+                out.write_all(&body)
+                    .map_err(|_| codec::Refuse::WriteFailed)?;
+                Ok(body.len())
+            })
+            .unwrap();
+        // Unknown occupants count toward quota and are never victims.
+        let unknown = store.record_path(&key_digest(source, "unknown"));
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&unknown)
+            .unwrap()
+            .write_all(b"unknown")
+            .unwrap();
+        let mut failure = match store.commit_stream(writer, prepared) {
+            Err(failure) => failure,
+            Ok(_) => panic!("stale capacity inventory admitted a candidate"),
+        };
+        assert_eq!(failure.stage(), "stream_capacity");
+        failure.discard().unwrap();
+        assert_eq!(fs::read(store.record_path(&key)).unwrap(), original);
+        assert!(store.receipt_current(&receipt));
+        assert_eq!(fs::read(unknown).unwrap(), b"unknown");
+        assert!(!store.has_pending());
+    }
+
+    #[test]
+    fn capacity_off_ignores_disk_quota_and_on_caps_staging_without_payload_reads() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let scratch = Scratch::new();
+        let writer = crate::locked_state_dir::test_locks::hold(&scratch.root);
+        let source = DurableSource::ClaudeCode;
+        let mut store = DurableTailStore::new(scratch.root.join("staging"), source);
+        let (first, body) = header(&scratch, source, 1);
+        commit(&mut store, writer, first, &body);
+        let temp = store.dir.join(".unresolved.tmp");
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)
+            .unwrap()
+            .set_len(WRITE_PASS_BYTES as u64)
+            .unwrap();
+        let key = key_digest(source, "new");
+        assert!(store.admit_capacity(&key, 1, false).unwrap());
+        assert_eq!(store.counters.tail_quota_bytes, 0);
+        store.enable_capacity_quota();
+        assert!(!store.admit_capacity(&key, 1, false).unwrap());
+        assert_eq!(store.counters.tail_staged_bytes, WRITE_PASS_BYTES as u64);
+        assert!(temp.exists());
+        assert_eq!(store.counters.guard_verify_bytes, 0);
+        assert_eq!(
+            store.counters.tail_quota_bytes,
+            capacity::CLAUDE_QUOTA_BYTES
+        );
+        assert_eq!(capacity::PI_QUOTA_BYTES, 32 * 1024 * 1024);
+    }
+
     #[test]
     fn native_population_beyond_memo_bound_reverifies_and_updates_without_hold() {
         if !crate::test_isolation::run_here() {
