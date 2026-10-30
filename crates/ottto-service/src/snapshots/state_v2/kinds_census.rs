@@ -55,6 +55,35 @@ struct ShadowRow {
     #[serde(default, rename = "d")]
     drift: u64,
 }
+// A complete group's counts travel with its mandatory shadow singleton. Losing
+// an entire tombstone/duplicate/stub owner must refuse hydration, not look absent.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CensusManifest {
+    shadow: ShadowRow,
+    records: u64,
+    duplicate_sets: u64,
+    owned: u64,
+    tombstones: u64,
+}
+fn counts(index: &ScanIndex) -> [usize; 4] {
+    [
+        index.claude_request_census.record_count(),
+        index.claude_duplicate_request_owners.len(),
+        index.claude_owned_start_census.len(),
+        index.claude_retired_family_tombstones.len(),
+    ]
+}
+fn manifest(index: &ScanIndex) -> Result<CensusManifest> {
+    let [records, duplicate_sets, owned, tombstones] = counts(index);
+    Ok(CensusManifest {
+        shadow: serde_json::from_value(serde_json::to_value(&index.claude_request_census_shadow)?)?,
+        records: records.try_into()?,
+        duplicate_sets: duplicate_sets.try_into()?,
+        owned: owned.try_into()?,
+        tombstones: tombstones.try_into()?,
+    })
+}
 type Families = BTreeMap<String, (Option<u64>, BTreeMap<String, BTreeSet<String>>)>;
 type DuplicateOwners = BTreeMap<
     String,
@@ -484,12 +513,15 @@ fn delta_inner(
         &prev.claude_retired_family_tombstones.entries,
         &next.claude_retired_family_tombstones.entries,
     )?;
-    if full || prev.claude_request_census_shadow != next.claude_request_census_shadow {
+    if full
+        || prev.claude_request_census_shadow != next.claude_request_census_shadow
+        || counts(prev) != counts(next)
+    {
         put(
             tx,
             &key("v1_field.census_shadow", "")?,
             &Fixed::None,
-            &next.claude_request_census_shadow,
+            &manifest(next)?,
         )?;
     }
     for (kind, before, after) in [
@@ -623,8 +655,7 @@ pub(super) fn hydrate<S: Store>(
                     }
                     "v1_field.census_shadow" => {
                         ensure!(key_bytes.is_empty(), "state_v2_census_key");
-                        let row: ShadowRow = read(&mut tx, &h)?;
-                        shadow = Some(serde_json::from_value(serde_json::to_value(row)?)?);
+                        shadow = Some(read::<CensusManifest>(&mut tx, &h)?);
                     }
                     flag => {
                         ensure!(key_bytes.is_empty(), "state_v2_census_key");
@@ -634,7 +665,22 @@ pub(super) fn hydrate<S: Store>(
             }
         }
     }
-    let shadow = shadow.context("state_v2_census_partial")?;
+    let manifest = shadow.context("state_v2_census_partial")?;
+    ensure!(
+        [
+            manifest.records,
+            manifest.duplicate_sets,
+            manifest.owned,
+            manifest.tombstones
+        ] == [
+            census.record_count() as u64,
+            duplicates.len() as u64,
+            owned.len() as u64,
+            tombstones.len() as u64
+        ],
+        "state_v2_census_partial"
+    );
+    let shadow = serde_json::from_value(serde_json::to_value(manifest.shadow)?)?;
     let overflowed = *flags.get(KINDS[5]).context("state_v2_census_partial")?;
     let initialized = *flags.get(KINDS[7]).context("state_v2_census_partial")?;
     let uncertain = *flags.get(KINDS[8]).context("state_v2_census_partial")?;
@@ -1162,6 +1208,28 @@ mod tests {
         ] {
             assert!(paths.contains(text), "missing {text:?}");
         }
+    }
+
+    #[test]
+    fn missing_entire_tombstone_owner_refuses_instead_of_resurrecting() {
+        let tmp = Fixture::new();
+        let mut db = tmp.store();
+        let index = fixture();
+        populate_commit(&mut db, &index);
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        tx.delete(
+            &key(
+                "tombstone.claude_retired_family_tombstones",
+                &"b".repeat(64),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+        let mut out = skeleton(&index);
+        let before = subset(&out);
+        assert!(hydrate(&mut db, &mut out, &mut KindCxCensus).is_err());
+        assert_eq!(subset(&out), before);
     }
 
     #[test]
