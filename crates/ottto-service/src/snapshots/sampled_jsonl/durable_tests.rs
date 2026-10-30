@@ -893,7 +893,7 @@ fn pi_decoded(path: &Path) -> (CachedJsonlReduction, Decoded) {
 /// `rederive_content` are the production steps B1 refuses, so this reaches the
 /// refusal on every platform; `durable_restore_record` itself is layout-gated.
 #[test]
-#[ignore = "B1: Pi workspace/first-prompt restore refusal (lead-B/to-e5-pi-r2.md); un-ignore with the fix"]
+#[ignore = "B1: Pi workspace/first-prompt restore refusal; un-ignore with the fix"]
 fn pi_cwd_and_first_prompt_body_is_admitted_for_restore() {
     let scratch = Scratch::new("pi-admitted");
     let path = scratch.write("pi.jsonl", &pi_lines(true));
