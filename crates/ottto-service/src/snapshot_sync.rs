@@ -4960,9 +4960,11 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
                 self.daemon.codex_versions.clone(),
             ))
         });
-        let finished = crate::local_resource_diagnostics::source_finish(source.api_slug(), || {
-            self.finish_completed(completed)
-        });
+        let v2_active = crate::snapshots::state_v2_growth_retention_active(&completed.1);
+        let finished =
+            crate::local_resource_diagnostics::source_finish(source.api_slug(), v2_active, || {
+                self.finish_completed(completed)
+            });
         if let Some(ticket) = continuation_ticket {
             continuation::after_ordinary_codex_page(ticket, self.codex_started, finished.is_ok());
         }
@@ -6053,21 +6055,31 @@ fn prepare_sync_source(
     let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
         source == SnapshotSource::ClaudeCode,
     );
-    let result = crate::local_resource_diagnostics::source_prepare(source.api_slug(), || {
-        prepare_sync_source_inner(
-            client,
-            device,
-            device_secret,
-            source,
-            machine_id,
-            home,
-            support_dir,
-            daemon,
-            transport_cycle,
-            account_witness,
-            retry_enabled,
-        )
+    let v2_path = (source == SnapshotSource::ClaudeCode).then(|| {
+        snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+            &snapshot_index_path(support_dir, source),
+            &snapshot_upload_destination_namespace(device, device_secret),
+        ))
     });
+    let result = crate::local_resource_diagnostics::source_prepare(
+        source.api_slug(),
+        v2_path.as_deref(),
+        || {
+            prepare_sync_source_inner(
+                client,
+                device,
+                device_secret,
+                source,
+                machine_id,
+                home,
+                support_dir,
+                daemon,
+                transport_cycle,
+                account_witness,
+                retry_enabled,
+            )
+        },
+    );
     let counts = diagnostics.finish();
     if let Ok(Some(preparation)) = &result {
         if let Some(lease) = preparation.native_comparison_lease.as_ref() {

@@ -197,6 +197,23 @@ pub(in super::super) fn published(path: &Path) -> Result<bool> {
     }
     held(fence::evidence(path))
 }
+/// Only a verified runtime enables pass diagnostics; custody or the switch alone
+/// cannot start sampling. Reuse the existing route registry without admission.
+pub(in super::super) fn runtime_active(path: &Path) -> bool {
+    if binding(path).is_none() {
+        return false;
+    }
+    let state = states()
+        .lock()
+        .ok()
+        .and_then(|states| states.get(path).cloned());
+    state.is_some_and(|state| {
+        state
+            .lock()
+            .is_ok_and(|state| state.current.as_ref().is_some_and(|runtime| runtime.active))
+    })
+}
+
 #[cfg(test)]
 pub(in super::super) fn checkpoint_priority_fixture(path: &Path, active: bool) {
     with_state(path, |state| {
@@ -375,6 +392,9 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
     }));
     if result.is_err() {
         with_state(path, |state| {
+            if state.latched || state.current.as_ref().is_some_and(|runtime| runtime.active) {
+                telemetry::abort_pass();
+            }
             state.cached = None;
             if let Some(runtime) = state.current.take() {
                 runtime

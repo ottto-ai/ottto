@@ -688,14 +688,21 @@ impl Observation {
 
 /// Local prepare window, including index load/baseline work before page probes.
 /// Return values and errors pass through; unwinding closes sampling silently.
-pub(crate) fn source_prepare<T>(source: &str, inner: impl FnOnce() -> T) -> T {
-    if source == "claude_code" {
+pub(crate) fn source_prepare<T>(
+    source: &str,
+    v2_path: Option<&std::path::Path>,
+    inner: impl FnOnce() -> T,
+) -> T {
+    let active = || {
+        source == "claude_code" && v2_path.is_some_and(crate::snapshots::state_v2_runtime_active)
+    };
+    if active() {
         crate::snapshots::state_v2_pass_start();
     }
     let probe = Probe::start();
     let footprint = footprint::Stage::begin();
     let result = inner();
-    if source == "claude_code" {
+    if active() {
         crate::snapshots::state_v2_prepare_observed();
     }
     emit(&Record {
@@ -713,16 +720,18 @@ pub(crate) fn source_prepare<T>(source: &str, inner: impl FnOnce() -> T) -> T {
 /// A panic drops the probe silently. Outcome reporting remains with the caller.
 pub(crate) fn source_finish<T>(
     source: &str,
+    v2_active: bool,
     inner: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let probe = Probe::start();
     let footprint = footprint::Stage::begin();
-    let v2_window = (source == "claude_code")
+    let v2_active = source == "claude_code" && v2_active;
+    let v2_window = v2_active
         .then(crate::snapshots::state_v2_finish_window)
         .flatten();
     let result = inner();
     drop(v2_window);
-    if source == "claude_code" {
+    if v2_active {
         crate::snapshots::state_v2_post_pass_observed();
     }
     emit(&Record {
@@ -2118,8 +2127,8 @@ mod tests {
     fn footprint_fields_are_stage_only_for_all_native_sources() {
         for source in ["claude_code", "codex", "pi"] {
             let (result, records) = capture(|| {
-                source_prepare(source, || {
-                    source_finish(source, || Ok::<_, anyhow::Error>(17))
+                source_prepare(source, None, || {
+                    source_finish(source, false, || Ok::<_, anyhow::Error>(17))
                 })
             });
             assert_eq!(result.unwrap(), 17);
@@ -2163,7 +2172,7 @@ mod tests {
         let value = Box::new(17);
         let original = std::ptr::from_ref(value.as_ref());
         let (result, records) = capture(|| {
-            source_finish("claude_code", || {
+            source_finish("claude_code", false, || {
                 let mut upload = UploadCall::start("claude_code");
                 upload.serialized(20);
                 upload.attempt(20, false);
@@ -2202,7 +2211,7 @@ mod tests {
         let error =
             anyhow::Error::new(OriginalError(identity.clone())).context("synthetic context");
         let original_chain: Vec<_> = error.chain().map(ToString::to_string).collect();
-        let (result, records) = capture(|| source_finish::<()>("codex", || Err(error)));
+        let (result, records) = capture(|| source_finish::<()>("codex", false, || Err(error)));
         let returned = result.unwrap_err();
         assert_eq!(
             returned
@@ -2225,7 +2234,7 @@ mod tests {
         let original = payload.clone();
         let (result, records) = capture(|| {
             std::panic::catch_unwind(|| {
-                source_finish::<()>("pi", || std::panic::panic_any(payload))
+                source_finish::<()>("pi", false, || std::panic::panic_any(payload))
             })
         });
         let panic = result.unwrap_err();
@@ -2578,7 +2587,7 @@ mod tests {
             let (_, allocation) = crate::retry_allocation_probe::measure_process(|| {
                 for _ in 0..ITERATIONS {
                     if stage == "source_finish" {
-                        source_finish("claude_code", || Ok(())).unwrap();
+                        source_finish("claude_code", false, || Ok(())).unwrap();
                     } else {
                         Probe::start().collection(
                             "claude_code",
@@ -2671,7 +2680,7 @@ mod tests {
                     full_causes: Default::default(),
                 },
             );
-            source_finish("secret/path/provider", || Ok(())).unwrap();
+            source_finish("secret/path/provider", false, || Ok(())).unwrap();
             let mut upload = UploadCall::start("secret/path/provider");
             upload.serialized(1000);
             upload.attempt(100, true);

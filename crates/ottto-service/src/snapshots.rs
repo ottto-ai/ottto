@@ -93359,6 +93359,10 @@ fn candidate_from_traversal_path_at(
 // Opaque v2-only companion for the unchanged upload-progress store.
 pub(crate) use state_v2::ack::ProgressRecovery;
 // OPS diagnostics bridges; the private storage module stays private.
+pub(crate) fn state_v2_runtime_active(path: &Path) -> bool {
+    state_v2::runtime_active(path)
+}
+pub(crate) use state_v2::state_v2_growth_retention_active;
 pub(crate) fn state_v2_pass_start() {
     state_v2::telemetry::pass_start();
 }

@@ -88,6 +88,11 @@ pub(in super::super) struct Stage {
 impl Stage {
     pub(super) fn new(kind: Kind) -> Self {
         if matches!(kind, Kind::Hydrate) {
+            // The first adopted load has no active runtime at prepare entry.
+            // Start its v2 window here, after publication has been verified.
+            if !PASS.with(|pass| pass.borrow().started) {
+                pass_start();
+            }
             PASS.with(|pass| pass.borrow_mut().active = true);
             initialize_pass();
         }
@@ -210,14 +215,17 @@ pub(super) fn process_written_bytes() -> Option<u64> {
 }
 
 #[derive(Clone, Copy, Default, Serialize)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct Decoded {
     rows: u64,
     headers: u64,
     chunks: u64,
 }
 #[derive(Default)]
+#[cfg_attr(test, derive(Clone, Debug, PartialEq))]
 struct Pass {
     active: bool,
+    started: bool,
     cpu_start: Option<u64>,
     written_start: Option<u64>,
     decoded: Decoded,
@@ -231,11 +239,16 @@ thread_local! {
 pub(in super::super) fn pass_start() {
     PASS.with(|pass| {
         *pass.borrow_mut() = Pass {
+            started: true,
             cpu_start: crate::local_resource_diagnostics::state_v2_cpu_us(),
             written_start: process_written_bytes(),
             ..Default::default()
         }
     });
+}
+/// Failed v2 hydration cannot carry a baseline into a later preparation.
+pub(super) fn abort_pass() {
+    PASS.with(|pass| *pass.borrow_mut() = Pass::default());
 }
 pub(super) fn sample_cached_graph() -> bool {
     PASS.with(|pass| !std::mem::replace(&mut pass.borrow_mut().cached_sampled, true))
@@ -303,6 +316,7 @@ pub(in super::super) fn plateau() {
             crate::local_resource_diagnostics::claude_state_v2(&*stats);
         }
         pass.active = false;
+        pass.started = false;
     });
 }
 /// Successful physical decodes, including repeated reads for checks/encoding.
@@ -548,6 +562,45 @@ pub(super) fn save_work(rows: u64, bytes: u64) {
 #[cfg(test)]
 mod ops_tests {
     use super::*;
+
+    /// [off=main] OFF Claude passes preserve even stale active v2 telemetry state.
+    #[test]
+    fn off_claude_passes_do_not_touch_v2_telemetry() {
+        let root = crate::test_scratch::private_dir("off-v2-pass");
+        let path = root
+            .join("b".repeat(64))
+            .join("claude_code-test-scan-index.json");
+        // Stale state from a different source must not authorize these bridges.
+        let previous = PASS.with(|pass| {
+            std::mem::replace(
+                &mut *pass.borrow_mut(),
+                Pass {
+                    active: true,
+                    cpu_start: Some(7),
+                    written_start: Some(13),
+                    initialized: true,
+                    ..Default::default()
+                },
+            )
+        });
+        let before = PASS.with(|pass| pass.borrow().clone());
+        let (result, records) = crate::local_resource_diagnostics::capture(|| {
+            crate::local_resource_diagnostics::source_prepare("claude_code", Some(&path), || {
+                crate::local_resource_diagnostics::source_finish("claude_code", false, || Ok(17))
+            })
+        });
+        let after = PASS.with(|pass| std::mem::replace(&mut *pass.borrow_mut(), previous));
+        assert_eq!(result.unwrap(), 17);
+        assert_eq!(after, before);
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r["stage"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["source_finish", "source_prepare"]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// [behaviour] family requests heap is separate and diagnostics never contain its text.
     #[test]
