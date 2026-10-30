@@ -1050,6 +1050,9 @@ fn codex_admission_branches_preserve_emitted_totals() {
     fallback["payload"]["info"].as_object_mut().unwrap().remove("model");
     let mut dropped = ui(1, Some(1), 1);
     dropped["timestamp"] = json!("invalid");
+    let mut explicit = ui(1, Some(1), 1);
+    explicit["payload"]["info"]["last_token_usage"]["request_count"] = json!(3);
+    explicit["payload"]["info"]["total_token_usage"]["request_count"] = json!(3);
     let mut overflow = vec![start()];
     overflow.extend((1..=66).map(|i| {
         let mut row = ui(i, Some(1), i);
@@ -1069,6 +1072,10 @@ fn codex_admission_branches_preserve_emitted_totals() {
         ("dropped-staging", false, vec![start(),dropped,ui(2,Some(1),2),close()],1),
         ("pending-overflow", false, overflow,66),
         ("model-fallback", true, vec![fallback,ui(2,Some(1),2)],2),
+        ("explicit-request-count", false, vec![start(),explicit,close()],1),
+        ("invalid-closure", false, vec![close(),event("task_complete",""),
+            event("task_complete", &"x".repeat(129)), start(),ui(1,Some(1),1),
+            event("task_complete", ""),close()],1),
     ] {
         let c = corpus(&format!("codex-admission-{name}"));
         let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z",
@@ -1080,6 +1087,9 @@ fn codex_admission_branches_preserve_emitted_totals() {
         let _cutover = crate::snapshots::TestCutover::set(if legacy { i64::MAX } else { 0 });
         let (_, scan, _) = other_page(&c, &E2ScanFixture::default(), SnapshotSource::Codex, ScanIndex::default());
         assert_eq!(scan.snapshots.iter().map(|s| s.input_tokens).sum::<u64>(), expected, "{name}");
+        if name == "explicit-request-count" {
+            assert_eq!(scan.snapshots.iter().map(|s| s.request_count).sum::<u64>(), 3);
+        }
         let wire = other_wire(SnapshotSource::Codex, &scan);
         assert!(!wire.is_empty(), "{name}: emitted body must validate");
     }
