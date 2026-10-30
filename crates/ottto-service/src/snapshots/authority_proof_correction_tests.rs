@@ -867,7 +867,7 @@ fn apc_pending(
         },
         parsed_snapshot_count,
         effective_upload_body_witness_revision: 0,
-        pi_restored_behind_accepted: false,
+        pi_restored_behind_accepted: None,
     }
 }
 

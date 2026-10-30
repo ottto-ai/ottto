@@ -839,7 +839,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
         diagnostic_reason: FileReason::Complete,
         parsed_snapshot_count: 1,
         effective_upload_body_witness_revision: 0,
-        pi_restored_behind_accepted: false,
+        pi_restored_behind_accepted: None,
     });
     finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut loaded);
     assert!(scan.snapshots.is_empty());
@@ -4874,17 +4874,17 @@ fn o3_ambiguous_negative_evidence_refuses_through_every_reader() {
 }
 
 /// Pi's restored-behind-accepted count settles at finalization: it follows the
-/// flag and needs a body that survived holds and semantic no-op removal. These
-/// are finalization facts, independent of the native layout a restore needs.
+/// flag and needs either an offer or a smaller committed index selection.
+/// These facts are independent of the native layout a restore needs.
 #[test]
-fn pi_restored_behind_accepted_counts_only_a_surviving_offer() {
+fn pi_restored_behind_accepted_counts_an_offer_or_an_index_regression() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
     let scratch = crate::test_scratch::ScratchDir::new("lenient-pi-behind-accepted");
     let key = "/synthetic/0.jsonl".to_string();
     let mut body = tests::sample_session_artifact_item();
     body.source_file_fingerprint = Some("source".into());
     let mut index = fixture();
-    let mut finalize = |flagged: bool, body: Option<&SnapshotItem>, previous: (_, _)| {
+    let mut finalize = |extent: Option<u64>, body: Option<&SnapshotItem>, previous: (_, _)| {
         let mut empty_index = ScanIndex::default();
         let mut scan = scan_source_roots_with_test_limit(
             SnapshotSource::Pi,
@@ -4908,7 +4908,7 @@ fn pi_restored_behind_accepted_counts_only_a_surviving_offer() {
             diagnostic_reason: FileReason::Complete,
             parsed_snapshot_count: 1,
             effective_upload_body_witness_revision: 0,
-            pi_restored_behind_accepted: flagged,
+            pi_restored_behind_accepted: extent,
         });
         let (_, counts) =
             observe(|| finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut index));
@@ -4921,10 +4921,19 @@ fn pi_restored_behind_accepted_counts_only_a_surviving_offer() {
         )
     };
     let none = || (None, None);
-    assert_eq!(finalize(false, Some(&body), none()).0, 0, "not flagged");
-    let (count, offered, group, witness) = finalize(true, Some(&body), none());
+    assert_eq!(finalize(None, Some(&body), none()).0, 0, "not flagged");
+    let (count, offered, group, witness) = finalize(Some(0), Some(&body), none());
     assert_eq!((count, offered), (1, 1), "the offered body");
-    let (count, offered, ..) = finalize(true, Some(&body), (group, witness));
+    let (count, offered, ..) = finalize(Some(0), Some(&body), (group, witness));
     assert_eq!((count, offered), (0, 0), "semantic no-op, nothing offered");
-    assert_eq!(finalize(true, None, none()).0, 0, "no body for this file");
+    assert_eq!(
+        finalize(Some(0), None, none()).0,
+        0,
+        "no body for this file"
+    );
+    assert_eq!(
+        finalize(Some(u64::MAX), None, none()).0,
+        1,
+        "a smaller committed index selection counts even without an offer"
+    );
 }

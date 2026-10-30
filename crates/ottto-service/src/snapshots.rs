@@ -7866,7 +7866,7 @@ struct PendingIndexFinalization {
     parsed_snapshot_count: usize,
     effective_upload_body_witness_revision: u64,
     /// `Active::pi_restored_behind_accepted`, settled at finalization.
-    pi_restored_behind_accepted: bool,
+    pi_restored_behind_accepted: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -8358,16 +8358,21 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .map(|source_file| !noop_source_files.contains(source_file))
                 .unwrap_or(true)
     });
-    // Only an offer that survived policy, holds and semantic no-op removal.
-    for pending in result
-        .pending_finalization
-        .iter()
-        .filter(|pending| pending.pi_restored_behind_accepted)
-    {
+    // Count a surviving offer or a committed extent regression. Semantic
+    // no-op suppression alone does not make a smaller index selection safe.
+    for (pending, accepted_extent) in result.pending_finalization.iter().filter_map(|pending| {
+        pending
+            .pi_restored_behind_accepted
+            .map(|extent| (pending, extent))
+    }) {
         if result.snapshots.iter().any(|snapshot| {
             snapshot.source_file_fingerprint.as_deref()
                 == Some(pending.source_file_fingerprint.as_str())
-        }) {
+        }) || index
+            .files
+            .get(&pending.index_key)
+            .is_some_and(|entry| entry.size_bytes < accepted_extent)
+        {
             crate::local_resource_diagnostics::cache_lifecycle::record(
                 crate::local_resource_diagnostics::cache_lifecycle::Event::PiRestoredBehindAccepted,
             );
@@ -31175,7 +31180,7 @@ impl OwnedSourceScan {
                             parsed_snapshot_count: parsed.len(),
                             effective_upload_body_witness_revision: index
                                 .active_effective_upload_body_witness_revision,
-                            pi_restored_behind_accepted: false,
+                            pi_restored_behind_accepted: None,
                         });
                         let alias_items = parsed
                             .iter()
@@ -31245,7 +31250,7 @@ impl OwnedSourceScan {
                         .active_effective_upload_body_witness_revision,
                     pi_restored_behind_accepted: file_sampling
                         .as_ref()
-                        .is_some_and(|active| active.pi_restored_behind_accepted),
+                        .and_then(|active| active.pi_restored_behind_accepted),
                 });
                 if source == SnapshotSource::Codex
                     && parse_complete
@@ -33515,7 +33520,7 @@ impl OwnedSourceScan {
                             retained_hint: None,
                             retained_finalization_charge: 0,
                             retained_usage: None,
-                            pi_restored_behind_accepted: false,
+                            pi_restored_behind_accepted: None,
                             reinsertion: Default::default(),
                         });
                     }
@@ -33875,13 +33880,16 @@ impl OwnedSourceScan {
                                 // reuse. A stale cache record cannot hold it idle.
                                 && !debt.is_some_and(|owed| sampled_scan::now_seconds() >= owed.due_unix_seconds) =>
                             {
+                                let pi_namespace = (source == SnapshotSource::Pi)
+                                    .then(|| context.cache.durable_pi_namespace())
+                                    .flatten();
                                 let mut interpretation =
                                     sampled_scan::durable_tail::Interpretation::of(
                                         source,
                                         &key,
                                         index,
                                         claude_request_identity_capture,
-                                        &context.namespace,
+                                        pi_namespace.as_ref().unwrap_or(&context.namespace),
                                     );
                                 interpretation.accepted = restore_floor;
                                 let restore = context.cache.durable_restore(
@@ -34290,7 +34298,7 @@ impl OwnedSourceScan {
                         // Pi has no accepted floor (`Interpretation::of`): this
                         // read publishes below the extent the entry still holds.
                         #[cfg(unix)]
-                        let pi_restored_behind_accepted = restored_pi
+                        let pi_restored_behind_accepted = (restored_pi
                             && sampled_scan::tail_behind_accepted(
                                 mode,
                                 parser
@@ -34299,9 +34307,11 @@ impl OwnedSourceScan {
                                     .as_ref()
                                     .map(|plan| plan.frozen_length()),
                                 index.files.get(&key).map(|entry| entry.size_bytes),
-                            );
+                            ))
+                        .then(|| index.files.get(&key).map(|entry| entry.size_bytes))
+                        .flatten();
                         #[cfg(not(unix))]
-                        let pi_restored_behind_accepted = false;
+                        let pi_restored_behind_accepted = None;
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
                             key,
@@ -34384,7 +34394,7 @@ impl OwnedSourceScan {
                             retained_hint: None,
                             retained_finalization_charge: 0,
                             retained_usage: None,
-                            pi_restored_behind_accepted: false,
+                            pi_restored_behind_accepted: None,
                             reinsertion: Default::default(),
                         });
                     }

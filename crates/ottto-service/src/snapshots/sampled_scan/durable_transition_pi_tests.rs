@@ -635,6 +635,59 @@ fn pi_restored_tail_behind_accepted_extent_publishes_the_cold_body() {
     whole_body(&cold, &restored);
 }
 
+/// An unchanged survivor below the accepted extent still finalizes its older
+/// body. Count the offer and the downward accepted/index transition explicitly.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "Pi restore requires qualified native heap layout"
+)]
+fn pi_restored_unchanged_below_accepted_counts_its_smaller_offer() {
+    if !supported("pi_transition_unchanged_smaller") {
+        return;
+    }
+    let mut f = PiDriver::warm("transition-pi-unchanged-smaller", &pi_seed());
+    let older = f.disk.record_bytes();
+    let sealed = std::fs::read(&f.path).unwrap();
+    f.grow(&[pi_turn(
+        "message",
+        Some("accepted-growth"),
+        20,
+        "2026-10-27T06:02:00Z",
+    )]);
+    f.emit_bodies(Mode::Restart);
+    f.save_gc(Mode::Restart);
+    let accepted = f.accepted.clone();
+    let key = fixture::local_key(&f.path);
+    let accepted_size = f.prior.files[&key].size_bytes;
+    for (path, bytes) in older {
+        std::fs::write(path, bytes).unwrap();
+    }
+    std::fs::write(&f.path, &sealed).unwrap();
+    f.restart();
+    let extent = sealed.len() as u64;
+    assert!(extent < accepted_size);
+    let cold = f.emit_bodies(Mode::ColdFull);
+    let unchanged = f.emit_bodies(Mode::Restart);
+    assert_eq!((unchanged.modes, unchanged.restored), ((0, 0, 1), 1));
+    assert_eq!(
+        unchanged.batches.len(),
+        1,
+        "the Unchanged read makes an upload offer"
+    );
+    whole_body(&cold, &unchanged);
+    assert_eq!(f.restored_behind(Mode::Restart), 1);
+    let emitted = f.pages[&Mode::Restart].emitted[&f.entity].clone();
+    f.save_gc(Mode::Restart);
+    assert_ne!(
+        f.accepted, accepted,
+        "accepted changed to the smaller offer"
+    );
+    assert_eq!(f.accepted[&f.entity], emitted);
+    assert_eq!(f.prior.files[&key].size_bytes, extent);
+    assert!(f.prior.files[&key].size_bytes < accepted_size);
+}
+
 // P-S in-process control (RAM resident): the same object cut below the
 // accepted extent with the same head, its entry still in RAM, is classified
 // Shrunk by the certificate/ReadPlan and takes one A2 Full

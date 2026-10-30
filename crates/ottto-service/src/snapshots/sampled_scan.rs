@@ -588,23 +588,23 @@ pub(super) struct Active {
     /// (`SnapshotAccumulator::usage_witness`); `None` without one. Q-PR15's
     /// guard compares it at completion.
     pub(super) retained_usage: Option<u64>,
-    /// A durable-restored Pi copy whose Tail ends below the accepted extent
-    /// (`tail_behind_accepted`), frozen with the plan.
-    pub(super) pi_restored_behind_accepted: bool,
+    /// The previous accepted extent when a restored Pi Tail or Unchanged
+    /// read ends below it, frozen with the plan.
+    pub(super) pi_restored_behind_accepted: Option<u64>,
     pub(super) reinsertion: crate::local_resource_diagnostics::claude_reread::Reinsertion,
 }
 crate::heap_layout_bound::fields!(Active; no_record, key, scope, mode, audit_due, retained_hint,
     retained_finalization_charge, retained_usage, pi_restored_behind_accepted, reinsertion);
 
-/// A Tail whose frozen extent ends below the committed entry's extent. Any
-/// other mode, or a missing plan or entry, is not behind.
+/// A continued read whose frozen extent ends below the committed entry.
+/// A Full, or a missing plan or entry, is not behind.
 #[cfg(unix)]
 pub(super) fn tail_behind_accepted(
     mode: ReadMode,
     extent: Option<u64>,
     accepted: Option<u64>,
 ) -> bool {
-    mode == ReadMode::Tail
+    matches!(mode, ReadMode::Tail | ReadMode::Unchanged)
         && extent
             .zip(accepted)
             .is_some_and(|(extent, accepted)| extent < accepted)

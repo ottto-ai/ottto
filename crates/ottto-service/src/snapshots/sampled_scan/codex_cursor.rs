@@ -6944,7 +6944,7 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
         diagnostic_reason: disclosure.diagnostic_reason,
         parsed_snapshot_count: disclosure.parsed_snapshot_count,
         effective_upload_body_witness_revision: index.active_effective_upload_body_witness_revision,
-        pi_restored_behind_accepted: false,
+        pi_restored_behind_accepted: None,
     });
     if settleable {
         targets.census.ownership_incomplete_file_count +=
