@@ -9350,15 +9350,23 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     stats.paired_sidecar_root_count = usage_roots.len();
     // Account the actual all-pending strict cohort before its first I/O.
     // Page-local roots have priority; off-page roots rotate across passes.
-    let page_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let strict_plan = strict_cohort::plan(
-        support_dir,
-        usage_roots,
-        &page_roots,
-        &index.claude_strict_service_scope(),
-    );
+    let strict_plan = if crate::snapshots::claude_terminal_off() {
+        let page_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        strict_cohort::plan(
+            support_dir,
+            usage_roots,
+            &page_roots,
+            &index.claude_strict_service_scope(),
+        )
+    } else {
+        strict_cohort::Plan {
+            roots: usage_roots,
+            deferred: BTreeSet::new(),
+            deferred_bytes: 0,
+        }
+    };
     let mut deferred_roots = strict_plan.deferred.len();
     let mut deferred_bytes = strict_plan.deferred_bytes;
     if deferred_roots > 0 {
@@ -9416,10 +9424,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_incomplete_root_count += 1;
         }
         if !api.health.is_complete() || !trace.is_complete() {
-            deferred_roots += 1;
-            deferred_bytes = deferred_bytes.saturating_add(
-                crate::claude_local_otel::strict_cohort_bytes(support_dir, &root_session_id),
-            );
+            if crate::snapshots::claude_terminal_off() {
+                deferred_roots += 1;
+                deferred_bytes = deferred_bytes.saturating_add(
+                    crate::claude_local_otel::strict_cohort_bytes(support_dir, &root_session_id),
+                );
+            }
             full_rearm_evidence_complete = false;
             if let Some(rows) = api.evidence.remove(&root_session_id) {
                 veto_api_rows.insert(root_session_id.clone(), rows);
@@ -9471,7 +9481,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     }
     // Keep global negative-dependency debt separate from per-root health:
     // page-local healthy accounting must not become an unrelated read error.
-    scan_result.strict_cohort_deferred_root_count = deferred_roots;
+    scan_result.strict_cohort_deferred_root_count = if crate::snapshots::claude_terminal_off() {
+        deferred_roots
+    } else {
+        0
+    };
     if stats.request_set_mismatch_root_count > 0 {
         index.note_claude_ignored_rearm_veto(
             &scan_result.census_window_end,

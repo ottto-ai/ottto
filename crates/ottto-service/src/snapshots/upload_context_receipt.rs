@@ -277,6 +277,17 @@ impl ScanIndex {
         if self.upload_context_fingerprint == self.active_upload_context_fingerprint {
             return false;
         }
+        if !claude_terminal_off() {
+            // Literal main fallback; stale same-process test views cannot grant
+            // context credit when containment is disabled.
+            if !self.file_upload_context_enabled || self.confirmed_empty_files.contains(key) {
+                return self.upload_context_fingerprint != self.active_upload_context_fingerprint;
+            }
+            return self
+                .files
+                .get(key)
+                .map_or(true, |entry| !self.receipt_matches(entry));
+        }
         if !self.file_upload_context_enabled || self.confirmed_empty_files.contains(key) {
             // Only a complete empty projection in THIS Claude context may
             // suppress its redundant read. Other sources and unknown debt keep
@@ -297,7 +308,10 @@ impl ScanIndex {
             return false;
         }
         let key = local_index_key(&candidate.path);
-        if self.mixed_context_view.claude && !self.mixed_context_current(&key) {
+        if claude_terminal_off()
+            && self.mixed_context_view.claude
+            && !self.mixed_context_current(&key)
+        {
             return false; // Unknown or old-context ACKs cannot hold D's projection.
         }
         self.files.get(&key).is_some_and(|entry| {
@@ -316,7 +330,8 @@ impl ScanIndex {
                         self.quarantined_snapshot_fingerprints
                             .get(entity)
                             .is_some_and(|record| {
-                                !self.mixed_context_view.claude
+                                !claude_terminal_off()
+                                    || !self.mixed_context_view.claude
                                     || record.disposition
                                         == SnapshotQuarantineDisposition::RetryPending
                             })
