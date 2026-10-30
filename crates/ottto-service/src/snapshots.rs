@@ -3221,20 +3221,6 @@ pub(crate) fn begin_durable_pass(
     }
 }
 
-#[cfg(all(test, unix))]
-pub(crate) fn set_pi_test_write_bytes(bytes: Option<usize>) {
-    sampled_scan::durable_tail::set_test_write_bytes(bytes);
-}
-
-/// Persist the content-free consent transition before a scan can be deferred.
-#[cfg(unix)]
-pub(crate) fn observe_pi_upload_consent(
-    support_dir: &Path,
-    policy: SnapshotUploadPolicy,
-) -> std::io::Result<()> {
-    sampled_jsonl::durable::pi::consent::observe(support_dir, policy.into()).map(|_| ())
-}
-
 /// The pass's upload settings and key epoch for Pi's carried first-prompt
 /// values, then the purge of stored copies they no longer permit. Runs before
 /// the pass can replace a record, so each purge is counted once. Removal needs
@@ -3249,12 +3235,7 @@ pub(crate) fn begin_pi_upload_gates(
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) {
     let current = sampled_jsonl::durable::pi::current_hmac_key_epoch(attribution_context);
-    if cache
-        .durable_note_pi_upload(policy.into(), current, support_dir)
-        .is_err()
-    {
-        return;
-    }
+    cache.durable_note_pi_upload(policy.into(), current);
     if let Some(writer) = crate::locked_state_dir::held_for(support_dir) {
         let _ = cache.durable_purge_pi_literals(writer, index);
     }
@@ -29813,11 +29794,6 @@ impl OwnedSourceScan {
                         sampling
                             .as_ref()
                             .and_then(|context| context.cache.durable_pi_upload_gates()),
-                    );
-                    parser.accumulator.bind_pi_capture(
-                        sampling
-                            .as_ref()
-                            .and_then(|context| context.cache.durable_pi_context(index)),
                     );
                 }
                 let mut completed_acquisition = if let Some(certificate) = cursor_certificate {

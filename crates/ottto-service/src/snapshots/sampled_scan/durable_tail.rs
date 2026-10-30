@@ -416,8 +416,6 @@ struct Slot {
     decided: BTreeMap<String, ScopeDecision>,
     /// The pass's sampled scope and identity-capture mode.
     namespace: Scope,
-    pi_base_namespace: Scope,
-    pi_consent: Option<(PathBuf, codec::pi::consent::State)>,
     identity_capture: bool,
     /// Keys held (U) by this source, and the totals the last alarm reported:
     /// [held, t14_rebuild, mode_repaired, disabled, rebuild_full,
@@ -2105,7 +2103,7 @@ impl SharedCache {
         let dir = store::store_dir_for_index(index_path);
         let changed = stores.slot(source).as_ref().map_or(true, |slot| {
             slot.dir != dir
-                || slot.pi_base_namespace != *namespace
+                || slot.namespace != *namespace
                 || slot.identity_capture != identity_capture
         });
         if changed {
@@ -2128,7 +2126,6 @@ impl SharedCache {
             current.decided.clear();
             current.index_path = index_path.to_owned();
             current.namespace = namespace.clone();
-            current.pi_base_namespace = namespace.clone();
             current.identity_capture = identity_capture;
         } else {
             if let Some(old) = slot.as_mut().filter(|s| s.store.has_pending()) {
@@ -2141,8 +2138,6 @@ impl SharedCache {
                 dir,
                 decided: BTreeMap::new(),
                 namespace: namespace.clone(),
-                pi_base_namespace: namespace.clone(),
-                pi_consent: None,
                 identity_capture,
                 held: 0,
                 old_binding_no_match: 0,
@@ -3932,12 +3927,6 @@ impl SharedCache {
             refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)
                 .map_err(|_| Failure::NotRederived(Refuse::NotRederivable("compressed")))?;
         }
-        let _consent = if source == SnapshotSource::Pi {
-            self.durable_pi_consent_guard()
-                .map_err(|_| Failure::Ineligible(store::Ineligible::Context))?
-        } else {
-            None
-        };
         record.eligible(expected).map_err(Failure::Ineligible)?;
         record
             .record
@@ -4396,12 +4385,6 @@ impl SharedCache {
             return None;
         };
         let service = std::time::Instant::now();
-        if snapshot_source == SnapshotSource::Pi
-            && self.durable_purge_pi_literals(writer, index).is_err()
-        {
-            lease.release();
-            return None;
-        }
         let result = self.write_after_save_active(writer, snapshot_source, index);
         let micros = service.elapsed().as_micros().min(u64::MAX as u128) as u64;
         crate::local_resource_diagnostics::durable_tail_alarm(
@@ -4421,11 +4404,6 @@ impl SharedCache {
         index: &ScanIndex,
     ) -> Option<store::BatchReceipt> {
         let source = durable_source(snapshot_source)?;
-        let _consent = if snapshot_source == SnapshotSource::Pi {
-            self.durable_pi_consent_guard().ok()?
-        } else {
-            None
-        };
         let allowlist = source.properties().allowlist();
         let (touched, mut selected, namespace, identity_capture, retiring) = {
             let mut stores = self.durable()?;
@@ -4447,15 +4425,6 @@ impl SharedCache {
             )
         };
         let namespace = &namespace;
-        let pi_policy = (snapshot_source == SnapshotSource::Pi)
-            .then(|| {
-                Some((
-                    self.durable_pi_context(index)?,
-                    self.durable_pi_upload_gates()?,
-                    self.durable_pi_key_epoch(),
-                ))
-            })
-            .flatten();
         let mut pending = Vec::new();
         let mut offered = BTreeMap::new();
         let mut retirement_offers = BTreeSet::new();
@@ -4480,14 +4449,6 @@ impl SharedCache {
                 };
                 if retained.state.source() != snapshot_source {
                     later.insert(key);
-                    continue;
-                }
-                if snapshot_source == SnapshotSource::Pi
-                    && !pi_policy.is_some_and(|(context, gates, epoch)| {
-                        retained.state.pi_capture_matches(context, gates, epoch)
-                    })
-                {
-                    not_persisted.push("pi_upload_policy");
                     continue;
                 }
                 // Selection provenance: only a reduction acquired for the
@@ -4863,80 +4824,17 @@ impl SharedCache {
         slot.store.gc_classified(writer, &context, &keep)
     }
 
-    /// Binds both the policy and the irreversible consent generation. The
-    /// journal has its own lock, so observing an off policy needs no writer.
+    /// Binds the Pi store to this pass's upload settings and key epoch.
     pub(crate) fn durable_note_pi_upload(
         &self,
         gates: codec::pi::UploadGates,
         key_epoch: Option<codec::pi::HmacKeyEpoch>,
-        support_dir: &Path,
-    ) -> std::io::Result<()> {
-        let state = match codec::pi::consent::observe(support_dir, gates) {
-            Ok(state) => state,
-            Err(error) => {
-                if let Some(mut stores) = self.durable() {
-                    if let Some(slot) = stores.slot(DurableSource::Pi).as_mut() {
-                        slot.pi_upload = None;
-                        slot.store.disable("pi_consent");
-                    }
-                }
-                return Err(error);
-            }
-        };
-        let changed = if let Some(mut stores) = self.durable() {
+    ) {
+        if let Some(mut stores) = self.durable() {
             if let Some(slot) = stores.slot(DurableSource::Pi).as_mut() {
-                let changed = slot
-                    .pi_upload
-                    .is_some_and(|prior| prior != (gates, key_epoch))
-                    || slot
-                        .pi_consent
-                        .as_ref()
-                        .is_some_and(|(_, prior)| *prior != state);
                 slot.pi_upload = Some((gates, key_epoch));
-                slot.namespace = state.namespace(&slot.pi_base_namespace);
-                slot.pi_consent = Some((support_dir.to_owned(), state));
-                changed
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if changed {
-            // A re-enabled field needs a fresh native capture. Evict only Pi.
-            if let Ok(mut retained) = self.retained() {
-                retained.remove_where(|state| state.source() == SnapshotSource::Pi);
             }
         }
-        Ok(())
-    }
-
-    /// Keep the journal lock through the physical write. A concurrent hint
-    /// cannot turn consent off between the current-policy check and mutation.
-    fn durable_pi_consent_guard(&self) -> std::io::Result<Option<codec::pi::consent::Guard>> {
-        let binding = self
-            .durable()
-            .and_then(|mut stores| stores.slot(DurableSource::Pi).as_ref()?.pi_consent.clone());
-        let Some((dir, expected)) = binding else {
-            return Ok(None);
-        };
-        let guard = codec::pi::consent::current(&dir)?;
-        if guard.state != expected {
-            return Err(std::io::Error::other("Pi consent changed"));
-        }
-        Ok(Some(guard))
-    }
-
-    pub(in crate::snapshots) fn durable_pi_context(
-        &self,
-        index: &ScanIndex,
-    ) -> Option<store::Digest32> {
-        let mut stores = self.durable()?;
-        let slot = stores.slot(DurableSource::Pi).as_ref()?;
-        Some(store::context_digest(
-            &slot.namespace.0,
-            index.active_upload_context_fingerprint.as_deref(),
-        ))
     }
 
     /// `None` until a pass notes them: capture then stores nothing.
@@ -4962,28 +4860,12 @@ impl SharedCache {
         index: &ScanIndex,
     ) -> std::io::Result<()> {
         use crate::local_resource_diagnostics::cache_lifecycle;
-        let binding = self
-            .durable()
-            .and_then(|mut stores| stores.slot(DurableSource::Pi).as_ref()?.pi_consent.clone());
-        let consent = binding
-            .as_ref()
-            .map(|(dir, _)| codec::pi::consent::current(dir))
-            .transpose()?;
         let Some(mut stores) = self.durable() else {
             return Ok(());
         };
         let Some(slot) = stores.slot(DurableSource::Pi).as_mut() else {
             return Ok(());
         };
-        if let Some(consent) = consent.as_ref() {
-            slot.namespace = consent.state.namespace(&slot.pi_base_namespace);
-            if let Some((_, state)) = slot.pi_consent.as_mut() {
-                *state = consent.state;
-            }
-            if let Some((gates, _)) = slot.pi_upload.as_mut() {
-                *gates = consent.state.gates;
-            }
-        }
         let Some((gates, key_epoch)) = slot.pi_upload else {
             return Ok(());
         };
@@ -5004,17 +4886,7 @@ impl SharedCache {
                     cache_lifecycle::record(cache_lifecycle::Event::PiUploadedLiteralKeyChanged);
                     true
                 }
-                // A stale-context literal set is retired even if all gates
-                // are on again: its generation may precede a revoked policy.
-                Ok(codec::pi::LiteralVerdict::Keep) => {
-                    if codec::pi::stored_has_literals(body).unwrap_or(false) {
-                        cache_lifecycle::record(cache_lifecycle::Event::PiUploadedLiteralPurged);
-                        true
-                    } else {
-                        false
-                    }
-                }
-                Err(_) => false,
+                Ok(codec::pi::LiteralVerdict::Keep) | Err(_) => false,
             }
         })?;
         slot.pi_literals_purged = Some(context);

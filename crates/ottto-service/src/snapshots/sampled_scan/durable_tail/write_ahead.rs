@@ -601,24 +601,6 @@ impl SharedCache {
         view: &LiveFinishView<'_>,
     ) -> PrepareOutcome {
         let chain = view.chain;
-        let _consent = if chain.source() == SnapshotSource::Pi {
-            let Ok(guard) = self.durable_pi_consent_guard() else {
-                return PrepareOutcome::NotPersisted(NotPersisted::Codec);
-            };
-            let Some(gates) = self.durable_pi_upload_gates() else {
-                return PrepareOutcome::NotPersisted(NotPersisted::Codec);
-            };
-            if !view.accumulator.pi_capture_matches(
-                chain.binding().context,
-                gates,
-                self.durable_pi_key_epoch(),
-            ) {
-                return PrepareOutcome::NotPersisted(NotPersisted::Codec);
-            }
-            guard
-        } else {
-            None
-        };
         if !crate::heap_layout_bound::layout_supported() {
             self.durable_note_native_layout_skipped(chain.source());
             return PrepareOutcome::NotPersisted(NotPersisted::Layout);
@@ -733,19 +715,6 @@ impl SharedCache {
         let Some(source) = fences.source() else {
             self.discard_prepared(prepared);
             return WriteOutcome::FailedHeld(HeldCause::Incompatible);
-        };
-        let _consent = if source == DurableSource::Pi {
-            let guard = self.durable_pi_consent_guard();
-            if guard.is_err()
-                || self.durable_pi_context(fences.committed_index)
-                    != Some(prepared.identity().binding().context)
-            {
-                self.discard_prepared(prepared);
-                return WriteOutcome::FailedHeld(HeldCause::Fence);
-            }
-            guard.ok().flatten()
-        } else {
-            None
         };
         // Predecessor authorization happened at chain capture/rebind, before
         // prepare_stream checked it; registration rechecks the prior stamp.

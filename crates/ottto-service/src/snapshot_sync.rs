@@ -5957,20 +5957,6 @@ fn prepare_sync_source_inner(
     let scan_started_at = current_rfc3339();
     let relay_token = client.issue_status_relay_token(device, device_secret, source)?;
     let mut activity_hint = client.get_activity_hint(&relay_token)?;
-    #[cfg(unix)]
-    if source == SnapshotSource::Pi {
-        // Observe revocation even when cadence or policy skips the scan and
-        // no state-directory writer is held. No user content enters metadata.
-        let policy = SnapshotUploadPolicy {
-            session_titles_enabled: activity_hint.session_titles_enabled,
-            session_attribution_enabled: activity_hint.session_attribution_enabled,
-            session_attribution_labels_enabled: activity_hint.session_attribution_enabled
-                && activity_hint.session_titles_enabled
-                && activity_hint.session_attribution_labels_enabled,
-            ..SnapshotUploadPolicy::default()
-        };
-        crate::snapshots::observe_pi_upload_consent(support_dir, policy)?;
-    }
     // Treat the activity hint as the only authority for the semantic evidence
     // window. Missing/malformed hints already fail JSON decoding; future
     // out-of-contract widths fail here before any scan or receipt can

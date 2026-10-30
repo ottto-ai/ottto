@@ -22,9 +22,6 @@ pub(crate) const PI_LEDGER_MAX_KEYS: usize = 65_536;
 /// The codec refusal class of a ledger over `PI_LEDGER_MAX_KEYS`.
 pub(crate) const PI_LEDGER_CAP: &str = "pi_ledger_cap";
 
-#[path = "durable/pi/consent.rs"]
-pub(crate) mod consent;
-
 const SECTION_TAG: u64 = 1;
 
 /// Cold titles keep at most 255 chars of at most 4 bytes each.
@@ -67,11 +64,8 @@ pub(in crate::snapshots) struct PiPromptCarry {
     prompt_seen: bool,
     key_epoch: Option<HmacKeyEpoch>,
     not_uploaded: bool,
-    // RAM-only provenance. The envelope binds restored copies separately.
-    capture_context: Option<[u8; 32]>,
-    capture_gates: Option<UploadGates>,
 }
-crate::heap_layout_bound::fields!(PiPromptCarry; wire, prompt_seen, key_epoch, not_uploaded, capture_context, capture_gates);
+crate::heap_layout_bound::fields!(PiPromptCarry; wire, prompt_seen, key_epoch, not_uploaded);
 
 struct PiSection {
     usage_keys: BTreeMap<String, PiUsageDedupState>,
@@ -172,8 +166,6 @@ pub(crate) fn take_body(d: &mut Dec<'_>) -> Result<Decoded, Corrupt> {
                 prompt_seen: section.prompt_seen,
                 key_epoch: section.hmac_key_epoch,
                 not_uploaded: section.not_uploaded,
-                capture_context: None,
-                capture_gates: None,
             })
         });
     d.refilled_section();
@@ -205,26 +197,12 @@ pub(crate) struct UploadGates {
     attribution: bool,
     labels: bool,
 }
-crate::heap_layout_bound::fields!(UploadGates; titles, attribution, labels);
 impl From<SnapshotUploadPolicy> for UploadGates {
     fn from(policy: SnapshotUploadPolicy) -> Self {
         Self {
             titles: policy.session_titles_enabled,
             attribution: policy.session_attribution_enabled,
             labels: policy.session_attribution_labels_enabled,
-        }
-    }
-}
-
-impl UploadGates {
-    pub(crate) fn bits(self) -> u8 {
-        u8::from(self.titles) | (u8::from(self.attribution) << 1) | (u8::from(self.labels) << 2)
-    }
-    pub(crate) fn from_bits(bits: u8) -> Self {
-        Self {
-            titles: bits & 1 != 0,
-            attribution: bits & 2 != 0,
-            labels: bits & 4 != 0,
         }
     }
 }
@@ -281,37 +259,7 @@ impl PiWirePrompt {
     }
 }
 
-impl CachedJsonlReduction {
-    pub(in crate::snapshots) fn pi_capture_matches(
-        &self,
-        context: [u8; 32],
-        gates: UploadGates,
-        epoch: Option<HmacKeyEpoch>,
-    ) -> bool {
-        self.accumulator.pi_capture_matches(context, gates, epoch)
-    }
-}
-
 impl SnapshotAccumulator {
-    pub(in crate::snapshots) fn bind_pi_capture(&mut self, context: Option<[u8; 32]>) {
-        if let Some(carry) = self.pi_prompt.as_deref_mut() {
-            carry.capture_context = context;
-        }
-    }
-
-    pub(in crate::snapshots) fn pi_capture_matches(
-        &self,
-        context: [u8; 32],
-        gates: UploadGates,
-        epoch: Option<HmacKeyEpoch>,
-    ) -> bool {
-        self.pi_prompt.as_ref().is_none_or(|carry| {
-            carry.capture_context == Some(context)
-                && carry.capture_gates == Some(gates)
-                && (carry.wire.is_none() || !key_epoch_changed(carry.key_epoch, epoch))
-        })
-    }
-
     /// No first-prompt or title value was uploaded under the known policy.
     pub(in crate::snapshots) fn pi_not_uploaded(&self) -> bool {
         self.pi_prompt
@@ -377,8 +325,6 @@ impl SnapshotAccumulator {
                 prompt_seen: seen,
                 key_epoch,
                 not_uploaded,
-                capture_context: None,
-                capture_gates: gates,
             })
         });
     }
@@ -504,7 +450,21 @@ pub(crate) fn stored_literal_verdict(
     gates: UploadGates,
     current: Option<HmacKeyEpoch>,
 ) -> Result<LiteralVerdict, Corrupt> {
-    let (wire, key_epoch) = stored_prompt(body)?;
+    let mut d = Dec::new(body);
+    d.require_section();
+    CachedJsonlReduction::verify(&mut d)?;
+    Rederive::verify(&mut d)?;
+    let (wire, key_epoch) = d.section(SECTION_TAG, |d| {
+        ledger_bound(d)?;
+        <BTreeMap<String, PiUsageDedupState> as crate::durable_tail_codec::HDigest>::verify_h(d)?;
+        let wire = <Option<PiWirePrompt> as Durable>::take(d)?;
+        bool::verify(d)?;
+        let key_epoch = <Option<HmacKeyEpoch> as crate::durable_tail_codec::HDigest>::take_h(d)?;
+        bool::verify(d)?;
+        Ok((wire, key_epoch))
+    })?;
+    d.refilled_section();
+    d.ended()?;
     let Some(wire) = wire else {
         return Ok(LiteralVerdict::Keep);
     };
@@ -522,36 +482,6 @@ pub(crate) fn stored_literal_verdict(
             LiteralVerdict::Keep
         },
     )
-}
-
-fn stored_prompt(body: &[u8]) -> Result<(Option<PiWirePrompt>, Option<HmacKeyEpoch>), Corrupt> {
-    let mut d = Dec::new(body);
-    d.require_section();
-    CachedJsonlReduction::verify(&mut d)?;
-    Rederive::verify(&mut d)?;
-    let values = d.section(SECTION_TAG, |d| {
-        ledger_bound(d)?;
-        <BTreeMap<String, PiUsageDedupState> as crate::durable_tail_codec::HDigest>::verify_h(d)?;
-        let wire = <Option<PiWirePrompt> as Durable>::take(d)?;
-        bool::verify(d)?;
-        let key_epoch = <Option<HmacKeyEpoch> as crate::durable_tail_codec::HDigest>::take_h(d)?;
-        bool::verify(d)?;
-        Ok((wire, key_epoch))
-    })?;
-    d.refilled_section();
-    d.ended()?;
-    Ok(values)
-}
-
-pub(crate) fn stored_has_literals(body: &[u8]) -> Result<bool, Corrupt> {
-    let (wire, _) = stored_prompt(body)?;
-    Ok(wire.is_some_and(|wire| {
-        wire.prefix_label.is_some()
-            || wire.template_id.is_some()
-            || wire.skill_id.is_some()
-            || wire.skill_label.is_some()
-            || wire.title.is_some()
-    }))
 }
 
 #[cfg(test)]

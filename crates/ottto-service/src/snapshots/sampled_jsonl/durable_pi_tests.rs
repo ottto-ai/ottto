@@ -506,8 +506,6 @@ fn prompt_fields_round_trip_and_verify_without_allocation() {
         prompt_seen: true,
         key_epoch: Some([9; 32]),
         not_uploaded: false,
-        capture_context: None,
-        capture_gates: None,
     }));
     let bytes = body(&reduction).unwrap();
     assert_eq!(verify_without_allocation(&bytes), Ok(()));
