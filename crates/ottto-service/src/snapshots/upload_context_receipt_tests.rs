@@ -2406,7 +2406,7 @@ fn terminal_off_empty_and_three_normal_files_stay_quiet_then_context_rereads_emp
     assert_eq!(
         reads
             .iter()
-            .filter(|(path, _)| path == &empty)
+            .filter(|(path, _)| *path == &empty)
             .map(|(_, count)| count)
             .sum::<usize>(),
         1,
