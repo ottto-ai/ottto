@@ -3983,6 +3983,17 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
             let row = &copy.usage_buckets[0].model_usage[0];
             assert!(!row.identity_retained && row.identity_parts.is_some(), "fresh own tags");
             assert_eq!(org_shares(&copy).get(&x), None);
+            // A copied marker never lent B's row: its own later change is #909's.
+            text += &switched("33333333-3333-4333-8333-333333333333");
+            text += &line_by(COPY, "own-late", "2026-08-02T08:20:00Z", 10, RESUME_WRITER);
+            c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
+            let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
+            take_identity_counts();
+            page.enrich_with(&c, Some(&mut ledger));
+            let counts = serde_json::to_value(take_identity_counts()).unwrap();
+            assert_eq!(counts["identity_cap"]["accepted_share_changed"], json!(1));
+            assert!(counts["identity_cap"]["copy_derived_proof_invalidated"].is_null());
+            assert_eq!(body(&page, COPY).unwrap().request_identity_refusals, u64::from(!retained));
         });
     }
 }

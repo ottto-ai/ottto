@@ -687,9 +687,10 @@ impl AcceptedBuckets {
             ..Default::default()
         });
     }
-    /// Durably tombstone the copy-derived rows an identity pass treated as
-    /// never accepted (`AcceptedSession::invalidate`), counted once per row.
-    pub(crate) fn invalidate_copy_derived(&mut self, rows: &[super::CopyInvalidation]) {
+    /// Tombstone the copy-derived rows an identity pass treated as never
+    /// accepted (`AcceptedSession::invalidate`), counted once per row.
+    /// Returns whether the ledger changed; the caller persists before upload.
+    pub(crate) fn invalidate_copy_derived(&mut self, rows: &[super::CopyInvalidation]) -> bool {
         let mut invalidated = 0;
         for row in rows {
             if let Some(state) = self.session_mut(&row.session) {
@@ -702,6 +703,7 @@ impl AcceptedBuckets {
                 ..Default::default()
             });
         }
+        invalidated > 0
     }
     fn session_mut(&mut self, session: &str) -> Option<&mut AcceptedSession> {
         let key = self.1.as_ref()?;

@@ -7383,10 +7383,14 @@ fn finish_sync_source(
             }
         };
         // SOURCE 2026-10-31 (#944 xPR F5): the bodies just built treat these
-        // rows as never accepted; the ledger records that before any upload.
-        upload_progress
+        // rows as never accepted; the ledger records that durably before any
+        // upload, so a lost reply or restart cannot restore their proof.
+        if upload_progress
             .accepted_identity_buckets
-            .invalidate_copy_derived(&std::mem::take(&mut stats.copy_invalidated));
+            .invalidate_copy_derived(&std::mem::take(&mut stats.copy_invalidated))
+        {
+            upload_progress.save(&upload_progress_path)?;
+        }
         #[cfg(test)]
         tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::record_evidence_stats(&stats);
         if let Ok(counts) = serde_json::to_string(&stats) {

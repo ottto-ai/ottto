@@ -2309,12 +2309,20 @@ fn finish_holder_identity(item: &mut SnapshotItem) {
         accounts.after_copy_decision(claude_org_markers.as_deref(), &fold.skipped, first_retained);
     // SOURCE 2026-10-31 (#944 xPR F5): identity a copied marker lent to a
     // counted request is invalidated where a stored body froze it, so the
-    // identity pass learns which sessions this re-derivation changed.
+    // identity pass learns which (bucket, account) this re-derivation moved.
     if let Some(own) = rebuilt.as_mut() {
-        own.copied_marker_authority = claude_usage_occurrences
+        let lent = claude_usage_occurrences
             .values()
             .filter(|o| !fold.is_skipped(o.sequence) && !o.usage.is_zero())
-            .any(|o| accounts.account(o.sequence) != own.account(o.sequence));
+            .filter_map(|o| {
+                let lent = accounts.account(o.sequence)?;
+                if own.account(o.sequence).as_ref() == Some(&lent) {
+                    return None;
+                }
+                Some((fold.occurrence_key(o)?.0, lent))
+            })
+            .collect();
+        own.copied_marker_lent = lent;
     }
     if let Some(own) = rebuilt.as_ref() {
         // Restored identified prefix grains were placed with the original

@@ -1442,34 +1442,50 @@ pub(crate) struct CopyInvalidation {
 }
 
 /// SOURCE 2026-10-31 (#944 xPR F5): proof a copied marker lent must not keep
-/// placing. In a session whose accounts the copy-prefix switch re-derived
-/// without a copied marker, a frozen row whose shares now change is
-/// copy-derived: it is treated as never accepted (fresh own tags or untagged,
-/// never a refusal or marker). A row its own evidence still proves matches
-/// its frozen shares and keeps #909/option (ii) protection.
+/// placing. A frozen row whose shares change and include an account a copied
+/// marker lent in that bucket (one the copy-prefix switch re-derived without
+/// it) is copy-derived: it is treated as never accepted (fresh own tags or
+/// untagged, never a refusal or marker). Other changed rows keep #909's
+/// refusal, and rows their own evidence still proves are unchanged.
 fn copy_derived_rows(
     item: &SnapshotItem,
     grouping: &Grouping,
     accepted: Option<&accepted::AcceptedSession>,
 ) -> Vec<(i64, RowKey)> {
-    let copied = item
-        .claude_money
-        .as_deref()
-        .and_then(|fold| fold.accounts.as_deref())
-        .is_some_and(|accounts| accounts.copied_marker_authority);
-    let Some(accepted) = accepted.filter(|_| copied) else {
+    let Some((accepted, accounts)) = accepted.zip(
+        item.claude_money
+            .as_deref()
+            .and_then(|fold| fold.accounts.as_deref()),
+    ) else {
         return Vec::new();
     };
-    grouping
-        .groups
+    let lent = accounts
+        .copied_marker_lent
         .iter()
-        .filter_map(|(bucket, rows)| Some((accepted::bucket_key(bucket)?, rows)))
-        .flat_map(|(start, rows)| {
-            rows.iter()
-                .filter(move |(row, group)| changed_shares(accepted, start, row, group).is_some())
-                .map(move |(row, _)| (start, row.clone()))
+        .filter_map(|(bucket, key)| {
+            Some((
+                accepted::bucket_key(bucket)?,
+                Some(accepted.authority_hash(key)),
+            ))
         })
-        .collect()
+        .collect::<BTreeSet<_>>();
+    if lent.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = Vec::new();
+    for (bucket, groups) in &grouping.groups {
+        let Some(start) = accepted::bucket_key(bucket) else {
+            continue;
+        };
+        for (row, group) in groups {
+            if changed_shares(accepted, start, row, group)
+                .is_some_and(|prior| prior.iter().any(|share| lent.contains(&(start, *share))))
+            {
+                rows.push((start, row.clone()));
+            }
+        }
+    }
+    rows
 }
 
 fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::AcceptedSession>) {
@@ -2615,12 +2631,13 @@ pub(crate) struct RequestAccounts {
     reconciled: bool,
     /// Root start known, but the native Unknown grains are not filled yet.
     root_fallback_pending: bool,
-    /// Copy-prefix switch on: the copy decision removed a copied marker that
-    /// had lent an account to a counted request (see `copy_derived_rows`).
-    pub(crate) copied_marker_authority: bool,
+    /// Copy-prefix switch on: (bucket start, account) a copied marker had
+    /// lent to a counted request the copy decision re-derived without it
+    /// (see `copy_derived_rows`).
+    pub(crate) copied_marker_lent: BTreeSet<(String, Arc<AuthorityKey>)>,
 }
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
-crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, copied_marker_authority);
+crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, copied_marker_lent);
 
 /// One account policy for E2. Never use a later marker for an earlier request.
 /// A conflict fills missing shares; trusted own/earlier org runs stay intact.
