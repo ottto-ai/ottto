@@ -408,7 +408,7 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
     index.upload_context_fingerprint = Some("synthetic-policy".into());
     index.active_upload_context_fingerprint = Some("active-synthetic-policy".into());
     index.file_upload_context_enabled = true;
-    assert!(save_locked(&f.path, &mut index, false).unwrap());
+    assert!(save_locked(&f.path, &mut index, false, None).unwrap());
     assert_eq!(index.generation, 2);
     assert_eq!(
         index.active_upload_context_fingerprint.as_deref(),

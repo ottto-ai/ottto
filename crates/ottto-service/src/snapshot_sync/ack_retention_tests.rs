@@ -2634,6 +2634,21 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_commit_and_back
             let mut scanned = ScanIndex::default();
             let scan = AckFixture::scan(&f.sources, &mut scanned);
             assert_eq!(scan.snapshots.len(), 3);
+            for item in &scan.snapshots {
+                let key = scanned
+                    .file_snapshot_fingerprints
+                    .iter()
+                    .find(|(_, members)| members.contains(&item.snapshot_fingerprint))
+                    .unwrap()
+                    .0
+                    .clone();
+                scanned
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .last_upload_body_witness =
+                    Some(one_body_set_witness(&snapshot_upload_body_witness(item)));
+            }
             let parent = f.scratch.join("snapshots/destinations").join(&f.namespace);
             std::fs::create_dir_all(&parent).unwrap();
             let index_path = parent.join("claude_code-partial-scan-index.json");
@@ -2730,9 +2745,13 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_commit_and_back
             }
             assert!(!restored
                 .accepted_snapshot_fingerprint_recorded(&scan.snapshots[2].snapshot_fingerprint));
-            let handoff = restored.upload_ack_retirement_handoff.as_ref().unwrap();
+            assert!(
+                restored.upload_ack_retirement_handoff.is_none(),
+                "live bodies use exact adoption"
+            );
             assert_eq!(
-                handoff.bodies, accepted,
+                restored.adopted_upload_progress_acks(&accepted),
+                accepted.keys().cloned().collect(),
                 "only saved exact bodies may retire"
             );
             assert_eq!(

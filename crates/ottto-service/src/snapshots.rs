@@ -48305,6 +48305,12 @@ impl ScanIndex {
         read_limit: Option<usize>,
         owner: &crate::snapshot_sync::SnapshotProgressLock,
     ) -> Result<()> {
+        if !state_v2::state_v2_growth_retention_active(self) {
+            return match read_limit {
+                Some(cap) => self.save_with_read_limit(path, cap),
+                None => self.save(path),
+            };
+        }
         self.save_internal(path, read_limit, false, Some(owner))
     }
     fn save_growth_claim(&mut self, path: &Path) -> Result<()> {
