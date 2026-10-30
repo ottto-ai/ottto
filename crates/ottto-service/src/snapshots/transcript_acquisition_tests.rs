@@ -5690,6 +5690,32 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
         actual.scan_root, admitted.scan_root,
         "same-path UPSERT follows actual read"
     );
+    // R25 targeted scheduling must preserve this REAL selected owner too;
+    // the deepest-root inference would invent ScopeChanged on the same key.
+    let mut targeted = scan.index.clone();
+    targeted
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_candidates
+        .clear();
+    targeted
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    terminal_off_discovery::targeted(&mut targeted, 184, 1);
+    let targeted_path = targeted
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .front()
+        .unwrap();
+    assert_eq!(targeted_path.path, admitted.path);
+    assert_eq!(targeted_path.scan_root, admitted.scan_root);
+    assert!(!targeted_path.census_member);
     for failed in [false, true] {
         let mut index = scan.index.clone();
         index.traversal.as_mut().unwrap().pending_candidates.clear();

@@ -1024,9 +1024,12 @@ fn terminal_off_rediscovery_deadline_survives_two_save_load_cycles() {
     );
     assert_eq!(
         index.traversal.as_ref().unwrap().pending_directories.len(),
-        1,
-        "destination scopes cannot share scheduling suppression"
+        0,
+        "R25 G3: destination work never force-wakes the whole walk"
     );
+    assert_eq!(index.traversal.as_ref().unwrap().pending_candidates.len(), 1,
+        "R25 G1/G2: the current-context mismatch queues its key");
+    assert!(index.traversal.as_ref().unwrap().pending_candidates.iter().all(|p| !p.census_member));
     assert!(!first.census_complete);
 }
 
@@ -1148,9 +1151,8 @@ fn terminal_off_idle_cadence_never_parks_already_owed_read_work() {
                 .unwrap()
                 .set_unverified_deadline(1),
             "contract" => {
-                index
-                    .terminal_contract_retries
-                    .insert("exact-entity".into(), "body".into());
+                index.activate_terminal_contract_retries(
+                    index.file_snapshot_fingerprints[&key].clone());
             }
             "cleared" => index
                 .files
@@ -1173,9 +1175,12 @@ fn terminal_off_idle_cadence_never_parks_already_owed_read_work() {
         refresh_terminal_off_discovery_at_test(&mut index, &[scratch.to_path_buf()], at, false);
         assert_eq!(
             index.traversal.as_ref().unwrap().pending_directories.len(),
-            1,
-            "{cause}: only bounded metadata scheduling wakes"
+            0,
+            "R25 G3: {cause} must not force-wake the root walk"
         );
+        assert_eq!(index.traversal.as_ref().unwrap().pending_candidates.len(), 1,
+            "R25 G1/G2: {cause} queues the actual owning key");
+        assert!(!index.traversal.as_ref().unwrap().pending_candidates[0].census_member);
         assert_eq!(
             START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get),
             before,
@@ -1576,6 +1581,18 @@ fn terminal_off_targeted_adoption_is_page_bounded_deduplicated_and_never_census(
         6
     );
     assert!(index.accepted_snapshot_fingerprints.is_empty());
+    // All nine have been admitted after one more turn. Even a fully queued
+    // cohort gets at most the per-page inspection allowance on later turns.
+    terminal_off_discovery::targeted(&mut index, now, 3);
+    for _ in 0..4 {
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            terminal_off_discovery::targeted(&mut index, now, 2)
+        });
+        let count = rows.iter().find(|r| r["stage"] == "terminal_off_target_inspections").unwrap();
+        assert_eq!(count["counts"]["keys"], 2);
+        assert_eq!(count["counts"]["stat_operations"], 0, "queued paths are not re-statted");
+        assert_eq!(index.traversal.as_ref().unwrap().pending_candidates.len(), 9);
+    }
 }
 
 #[test]

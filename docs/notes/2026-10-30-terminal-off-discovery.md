@@ -4,7 +4,9 @@ Claude terminal authority remains off. Ordinary page upload, exact ACK and
 selected-save rules are unchanged. Scheduling state below exists only in RAM.
 
 Owed work enqueues individual keys, bounded by the page allowance and deduplicated
-against the retained candidate queue. New targeted entries are non-census; an
+against the retained candidate queue. A RAM cursor also bounds inspected keys
+and stat operations per page, including turns that admit no work. Actual selected
+scan-root custody survives targeted requeues. New targeted entries are non-census; an
 existing entry keeps its census role. Targeted service never marks observed
 census keys. Existing selector, privacy/history, byte budget, numeric audit debt
 and failed-open throttle remain authoritative. Diagnostics count existing causes:
