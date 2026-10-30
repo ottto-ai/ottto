@@ -160,6 +160,15 @@ fn raw_string_prefix(rest: &[u8]) -> Option<usize> {
     (rest.get(prefix + hashes) == Some(&b'"')).then_some(prefix)
 }
 
+/// Bytes before the opening quote of `"…"`, `b"…"` or `c"…"`.
+fn string_prefix(rest: &[u8]) -> Option<usize> {
+    match rest {
+        [b'"', ..] => Some(1),
+        [b'b' | b'c', b'"', ..] => Some(2),
+        _ => None,
+    }
+}
+
 /// Rust tokens with comments dropped. Enough of the lexical grammar to keep
 /// strings, raw strings, chars and lifetimes apart from code.
 fn tokenize(text: &str) -> Vec<Token<'_>> {
@@ -197,11 +206,7 @@ fn tokenize(text: &str) -> Vec<Token<'_>> {
             let end = start + text[start..].find(&close).expect("closed raw string");
             tokens.push(Token::Str(&text[start..end]));
             at = end + close.len();
-        } else if let Some(prefix) = match rest {
-            [b'"', ..] => Some(1),
-            [b'b' | b'c', b'"', ..] => Some(2),
-            _ => None,
-        } {
+        } else if let Some(prefix) = string_prefix(rest) {
             let start = at + prefix;
             let mut end = start;
             while bytes[end] != b'"' {
@@ -295,11 +300,23 @@ struct SourceFn {
     test: bool,
     ignores: Vec<Ignore>,
     on_guard: bool,
+    /// Identifiers the body uses as values or calls (not fields, methods or
+    /// bindings); collected only in files that hold ON tests.
+    references: std::collections::BTreeSet<String>,
 }
 
 impl SourceFn {
     fn on(&self) -> bool {
         self.test && (self.name.starts_with("terminal_off_on_") || self.on_guard)
+    }
+
+    fn readiness_clusters(&self) -> Vec<String> {
+        self.ignores
+            .iter()
+            .filter_map(|ignore| ignore.reason.as_deref()?.strip_prefix(READINESS))
+            .flat_map(|cluster| cluster.split('/'))
+            .map(str::to_string)
+            .collect()
     }
 }
 
@@ -435,6 +452,25 @@ fn items(tokens: &[Token<'_>], module: &str, base: usize, out: &mut Vec<Item>) {
     }
 }
 
+fn references(body: &[Token<'_>]) -> std::collections::BTreeSet<String> {
+    let mut found = std::collections::BTreeSet::new();
+    for (at, token) in body.iter().enumerate() {
+        let Token::Ident(ident) = token else {
+            continue;
+        };
+        let previous = at.checked_sub(1).map(|at| body[at]);
+        let field_or_binding = matches!(
+            previous,
+            Some(Token::Punct(b'.') | Token::Ident("let" | "fn" | "mut"))
+        ) || (body.get(at + 1) == Some(&Token::Punct(b':'))
+            && body.get(at + 2) != Some(&Token::Punct(b':')));
+        if !field_or_binding {
+            found.insert((*ident).to_string());
+        }
+    }
+    found
+}
+
 /// Every module-level fn under `src/`, parsed once per test binary.
 fn source() -> &'static [SourceFn] {
     static SOURCE: std::sync::OnceLock<Vec<SourceFn>> = std::sync::OnceLock::new();
@@ -458,6 +494,8 @@ fn source() -> &'static [SourceFn] {
                     .expect("under src")
                     .to_string_lossy()
                     .replace('\\', "/");
+                let holds_on_tests =
+                    text.contains("terminal_off_on_") || text.contains("ClaudeTerminalOffForTest");
                 let tokens = tokenize(&text);
                 let mut parsed = Vec::new();
                 items(&tokens, "", 0, &mut parsed);
@@ -486,6 +524,11 @@ fn source() -> &'static [SourceFn] {
                         test,
                         ignores,
                         on_guard,
+                        references: if holds_on_tests {
+                            references(body)
+                        } else {
+                            Default::default()
+                        },
                     });
                 }
             }
@@ -593,81 +636,133 @@ fn every_ignored_terminal_off_on_twin_names_its_readiness_cluster() {
     assert_eq!(macos_gates, pinned(INHERITED_MACOS_GATES));
 }
 
-/// Lead B Q5: an ON wrapper that calls an ignored twin body (the p12 base-exit
-/// wrappers) carries that ignore too, so un-ignoring needs the body's cluster
-/// fix. A wrapper may name a more specific cluster beside the body's.
-#[test]
-fn every_wrapper_of_an_ignored_twin_carries_its_readiness_cluster() {
-    let ignored = ignored_for_readiness();
-    let clusters = |cluster: &str| cluster.split('/').map(str::to_string).collect::<Vec<_>>();
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut pending = vec![src];
-    let mut wrappers = 0;
-    while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(&dir).expect("read source directory") {
-            let path = entry.expect("source entry").path();
-            if path.is_dir() {
-                pending.push(path);
-                continue;
-            }
-            if path.extension().is_none_or(|ext| ext != "rs") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("read source file");
-            let lines: Vec<_> = text.lines().collect();
-            for (index, line) in lines.iter().enumerate() {
-                let indent = &line[..line.len() - line.trim_start().len()];
-                let Some(name) = line.trim_start().strip_prefix("fn terminal_off_on_") else {
+/// F3 / Lead B Q5: every ON test that runs another test's body, as
+/// (wrapper file, wrapper, body file, body), sorted. The body is a twin, or
+/// an original run under the ON guard (original-name dispatch: the four
+/// C1-X p12 base-exit wrappers), reached directly, through an alias, or
+/// through a same-file helper. Its ON obligation is the body itself when it
+/// is a twin, else its `terminal_off_on_` twin.
+const WRAPPED_BODIES: &[(&str, &str, &str, &str)] = &[
+    ("snapshot_sync/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_account_deferred_hold_lets_a_bounded_claude_traversal_converge", "snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_account_deferred_hold_lets_a_bounded_claude_traversal_converge"),
+    ("snapshot_sync/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_terminal_family_member_controls_keep_blocking_pruning_and_rebinding", "snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_terminal_family_member_controls_keep_blocking_pruning_and_rebinding"),
+    ("snapshot_sync/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_terminal_family_never_committed_members_let_the_claude_census_complete", "snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_terminal_family_never_committed_members_let_the_claude_census_complete"),
+    ("snapshot_sync/p12_pipeline_original_tests.rs", "terminal_off_on_native_comparison_original_novel_import_oracle", "snapshot_sync/p12_pipeline_original_tests.rs", "terminal_off_on_novel_import_recovers_after_owner_coverage_then_stops_reading"),
+    ("snapshots/census_convergence_tests.rs", "terminal_off_on_p12_experimental_base_exit_duplicate_fence_full_coverage_oracle", "snapshots/census_convergence_tests.rs", "terminal_off_on_claude_duplicate_fence_reopens_only_after_full_coverage"),
+    ("snapshots/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_claude_duplicate_across_pages_stays_refused_without_reparse_loop", "snapshots.rs", "claude_duplicate_across_pages_stays_refused_without_reparse_loop"),
+    ("snapshots/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_claude_explicit_fork_duplicate_owned_request_fails_posture_closed", "snapshots.rs", "terminal_off_on_claude_explicit_fork_duplicate_owned_request_fails_posture_closed"),
+    ("snapshots/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_claude_future_quarantine_preserves_cross_page_duplicate_refusal", "snapshots.rs", "claude_future_quarantine_preserves_cross_page_duplicate_refusal"),
+    ("snapshots/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_claude_pending_census_recovers_without_releasing_future_quarantine", "snapshots.rs", "claude_pending_census_recovers_without_releasing_future_quarantine"),
+    ("snapshots/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_claude_stable_owned_start_recovers_after_partial_conflict", "snapshots.rs", "claude_stable_owned_start_recovers_after_partial_conflict"),
+    ("snapshots/p12_usage_original_tests.rs", "terminal_off_on_native_comparison_original_member_change_unit_oracle", "snapshots/p12_usage_original_tests.rs", "terminal_off_on_member_change_after_unchanged_proof_fails_closed_until_family_reparse"),
+];
+
+/// (ON wrapper, body) pairs found in the source, by reference, not by name.
+fn wrapped_bodies() -> Vec<(&'static SourceFn, &'static SourceFn)> {
+    let source = source();
+    let mut tests = std::collections::BTreeMap::<&str, Vec<&SourceFn>>::new();
+    let mut helpers = std::collections::BTreeMap::<(&str, &str), Vec<&SourceFn>>::new();
+    for item in source {
+        if item.test {
+            tests.entry(&item.name).or_default().push(item);
+        } else {
+            helpers
+                .entry((&item.file, &item.name))
+                .or_default()
+                .push(item);
+        }
+    }
+    let mut found = Vec::new();
+    for wrapper in source.iter().filter(|item| item.on()) {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pending = vec![wrapper];
+        while let Some(caller) = pending.pop() {
+            for name in &caller.references {
+                if *name == wrapper.name {
                     continue;
-                };
-                let name = format!("terminal_off_on_{}", name.split('(').next().unwrap_or(name));
-                let end = lines[index + 1..]
-                    .iter()
-                    .position(|line| *line == format!("{indent}}}"))
-                    .map_or(lines.len(), |at| index + 1 + at);
-                let body = lines[index + 1..end].join("\n");
-                let own = lines[..index]
-                    .iter()
-                    .rev()
-                    .take_while(|line| {
-                        let line = line.trim_start();
-                        line.starts_with("#[") || line.starts_with("//")
-                    })
-                    .find_map(|line| {
-                        let reason = line.trim().strip_prefix(concat!(
-                            "#[ignore = \"terminal-off ",
-                            "ON-readiness: "
-                        ))?;
-                        Some(clusters(reason.strip_suffix("\"]")?))
-                    });
-                for (_, callee, cluster) in &ignored {
-                    let called = *callee != name
-                        && body.match_indices(&format!("{callee}(")).any(|(at, _)| {
-                            !body[..at]
-                                .chars()
-                                .next_back()
-                                .is_some_and(|c| c.is_alphanumeric() || c == '_')
-                        });
-                    if !called {
-                        continue;
-                    }
-                    wrappers += 1;
-                    let own = own.as_ref().unwrap_or_else(|| {
-                        panic!(
-                            "{}: {name} calls ignored {callee} without its readiness ignore",
-                            path.display()
-                        )
-                    });
-                    for needed in clusters(cluster) {
-                        assert!(
-                            own.contains(&needed),
-                            "{}: {name} calls {callee} ({cluster}) but names only {own:?}",
-                            path.display()
-                        );
+                }
+                if let Some(candidates) = tests.get(name.as_str()) {
+                    let local = candidates
+                        .iter()
+                        .filter(|body| body.file == wrapper.file)
+                        .collect::<Vec<_>>();
+                    let body = match (local.as_slice(), candidates.as_slice()) {
+                        ([body], _) => **body,
+                        ([], [body]) => *body,
+                        _ => panic!("{}: {} runs ambiguous {name}", wrapper.file, wrapper.name),
+                    };
+                    found.push((wrapper, body));
+                } else if let Some(helpers) = helpers.get(&(wrapper.file.as_str(), name.as_str())) {
+                    if seen.insert(name.as_str()) {
+                        pending.extend(helpers.iter().copied());
                     }
                 }
             }
         }
     }
-    assert!(wrappers > 0, "the p12 base-exit wrappers are checked");
+    let key = |(wrapper, body): &(&SourceFn, &SourceFn)| {
+        (
+            wrapper.file.clone(),
+            wrapper.name.clone(),
+            body.file.clone(),
+            body.name.clone(),
+        )
+    };
+    found.sort_by_key(key);
+    found.dedup_by_key(|pair| key(pair));
+    found
+}
+
+/// An ON wrapper of a parked body carries that ignore too, so un-ignoring it
+/// needs the body's cluster fix. A wrapper may name a more specific cluster
+/// beside the body's (`NBF/C6`).
+#[test]
+fn every_wrapper_of_an_ignored_twin_carries_its_readiness_cluster() {
+    let wrapped = wrapped_bodies();
+    let actual = wrapped
+        .iter()
+        .map(|(wrapper, body)| {
+            (
+                wrapper.file.as_str(),
+                wrapper.name.as_str(),
+                body.file.as_str(),
+                body.name.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        WRAPPED_BODIES.to_vec(),
+        "the ON wrapper -> body set is explicit"
+    );
+    for (wrapper, body) in wrapped {
+        let obligation = if body.name.starts_with("terminal_off_on_") {
+            body
+        } else {
+            let twin = format!("terminal_off_on_{}", body.name);
+            source()
+                .iter()
+                .find(|item| {
+                    item.test
+                        && item.file == body.file
+                        && item.module == body.module
+                        && item.name == twin
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: {} runs {} under ON, which has no ON twin",
+                        wrapper.file, wrapper.name, body.name
+                    )
+                })
+        };
+        let own = wrapper.readiness_clusters();
+        for needed in obligation.readiness_clusters() {
+            assert!(
+                own.contains(&needed),
+                "{}: {} runs {} ({needed}) but names only {own:?}",
+                wrapper.file,
+                wrapper.name,
+                obligation.name
+            );
+        }
+    }
 }
