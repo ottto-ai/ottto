@@ -1396,23 +1396,32 @@ retains per-row proof, so the accepted priority is not used: fresh tags take
 the plain newest-first order within the unchanged caps.
 
 A bucket row enters the local proved-row ledger only when a stored-body entity
-ACK (no `unchanged_basis`) with a body witness covers a body where that row
-carried a positive tag, and only while the capability is on. The ledger keeps
-truncated keyed digests of the row key and of that proof (authorities plus the
-eight counts and five costs); later positive proof replaces it. Per revision,
-a proved row whose current proof equals the ACKed proof in a closed hour, or
-whose transcript no longer proves it, is sent untagged with full amounts and
-`identity_retained: true`; it is not a refusal. Different proof, the open
-hour and never-proved rows get fresh tags. A row is never both tagged and
-marked; top-level rows are never marked.
+ACK (no `unchanged_basis`) covers a body where that row carried a positive tag,
+only while the capability is on, and only when that ACK declares a body witness
+version and its digest equals the local body witness of a body that has a
+public witness version (context curve, session account evidence or cache
+observations), so the ACK validator also checked the exact version. The
+ledger keeps truncated keyed digests of the row key and of that proof
+(authorities plus the eight counts and five costs); later positive proof
+replaces it. Per revision, a proved row whose current proof equals the ACKed
+proof in a closed hour, or whose transcript no longer proves it, is sent
+untagged with full amounts and `identity_retained: true`; it is not a refusal.
+Different proof, the open hour and never-proved rows get fresh tags. A row is
+never both tagged and marked; top-level rows are never marked. If the
+untagged fallback cannot fit every marker beside the stripped body, it keeps
+the newest that fit and counts each dropped proved row as a refusal.
 
+Before any upload, a proved row that the outgoing body freshly tags with a
+different proof leaves the ledger, and progress is saved before the request,
+so a lost reply cannot leave a stale proof that a later marker would honour.
 A stored-body ACK's optional `retained_proof_missing` bucket starts remove that
 body's marked rows, so a later revision re-tags them through the same
 allocator. A destination namespace or historical replay generation change
-clears all proved rows, as do key rotation and session eviction. Limits:
-1,536 proved rows and 1,536 pending missing buckets per session, 40 inline
-bytes per proved row; with the class L hints above the requested-layout
-maximum stays below 4 MiB.
+clears all proved rows, as do key rotation and session eviction (the class L
+last-ACK LRU above). Limits: 1,536 proved rows per session, persisted as one
+hex string of 40-byte records, and 64 pending missing buckets (diagnostic
+only). At every cap the progress JSON stays below 8 MiB and the
+requested-layout maximum below 4 MiB.
 
 Sparse `identity_cap` counters, omitted while zero: `retained_marker_rows`,
 `retained_proof_missing_received`, `retained_set_cleared` and
