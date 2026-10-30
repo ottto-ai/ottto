@@ -74,7 +74,7 @@ pub(super) fn compressed_input_credit() -> io::Result<usize> {
         .ok_or_else(|| invalid("compressed rollout credit overflow"))
 }
 
-fn thread_cpu_micros() -> u64 {
+pub(super) fn thread_cpu_micros() -> u64 {
     let mut spec: libc::timespec = unsafe { std::mem::zeroed() };
     // SAFETY: valid writable timespec, querying only the current thread.
     if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spec) } != 0 {
@@ -610,7 +610,10 @@ pub(in crate::snapshots) mod tests {
         assert!(format!("{error:#}").contains("decoded-byte limit"));
     }
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux")),
+        ignore = "needs validated heap layout"
+    )]
     fn paid_decoder_closes_after_real_eof_early_read_error_and_caught_unwind() {
         let _lock = DECODER_TEST_LOCK.lock().unwrap();
         let encoded = zstd::stream::encode_all(&b"synthetic decoded content"[..], 1).unwrap();
@@ -662,7 +665,10 @@ pub(in crate::snapshots) mod tests {
         }
     }
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux")),
+        ignore = "needs validated heap layout"
+    )]
     fn paid_decoder_yields_to_singleton_and_drop_safety_net_is_observable() {
         let _lock = DECODER_TEST_LOCK.lock().unwrap();
         let f = fixture(

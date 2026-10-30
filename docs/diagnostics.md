@@ -76,6 +76,10 @@ the `sampled acquisition` text line: full-read reasons now come from
 Version 1 readers that need reasons must retain their text fallback while
 accepting version 1 binaries; there is no version negotiation.
 
+| Stage | Local fields | Meaning |
+| --- | --- | --- |
+| `claude_request_identity_over_cap` | `counts.claude_request_identity_over_cap`: `evidence_entries`, `authority_keys`, `parts_per_row`, `parts_per_item`, `rows`, `bytes`; `counts.claude_request_identity_last_over_cap_item_bytes` | Cumulative, saturating process counters per cap reason, plus the attempted tagged item's last budgeted compact wire byte size, including semantic framing. One attempt can increment several reasons; retries count separately. Recorded before budget recovery or full-strip fallback. Labels are append-only. No row content or identity is logged or uploaded. |
+
 Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
 full/tail/unchanged selection counts describe acquisition decisions, including
@@ -1152,6 +1156,86 @@ Capacity/availability retain their existing degraded behavior. Full-cause
 admission and its other counter projections arrive in subsequent slices.
 
 
+## Claude Family Census Shadow (schema 2 additive)
+
+Each Claude Code scan page emits one `local_resources` record with stage
+`claude_family_census_shadow`, under `counts`. It estimates, per session family
+(a root transcript and its subagents), whether the family would be complete in
+the current census window. It is shadow-only: the record changes no read,
+census bit, manifest, upload, retirement or other decision. Other sources emit
+no such record. The row holds counts, ages, fixed reason names and one order-free
+digest; no paths, ids, account hashes or request hashes.
+
+**Units.** A page evaluates the families its selection touched
+(`touched_families`, with `touched_families_over_cap` beyond the bound of 1,024),
+the families its previous page parsed (`followup_families`), and up to 64 others
+from a rotating cursor (`rotation_families`). Family counts are evaluations on
+this page: a family can repeat across pages, so they are neither distinct
+families nor a stock, and rows must not be summed into one.
+
+**Strict partition.** Every evaluated family (`families_evaluated`) is exactly
+one of `family_census_complete`, `family_complete_deferred.quantum` (complete past
+the limit of 64 per page), or one first-match reason in
+`family_census_incomplete`, tried in this order: `membership_unknown`, `queued`,
+`refused_read`, `refused_read_unattributed`, `held`, `quarantine`, `residue`,
+`evidence`, `evidence/presence_only`, `not_current_window`, `path_not_unique`.
+`singleton_families_evaluated` is included in `families_evaluated`.
+`families_unevaluated_member_budget` counts families left for a later page, which
+are not in `families_evaluated`.
+
+**Child finalization partition.** `family_child_finalize_eligible` and
+`family_child_finalize_blocked` are a separate partition of a separate
+population, and a family in it also keeps its strict reason. A candidate has a
+valid account proof that names no outside member, a live root bound at its
+current tuple, no stale bound child, at least one unfinalized child, and every
+member's current revision attested; a family with no live root is blocked
+`root_absent`. Candidates can include `held`, `membership_unknown` and
+`refused_read_unattributed` families, so the total can exceed the `evidence`
+count. Blocked causes are first-match, in this order: `root_absent`,
+`witness_missing`, `witness_conflict`, `witness_held`, `shared_parent`,
+`native_ownership_conflict`, `cross_family_unknown`,
+`identity_contract_changed`, `twin_set`, `sticky_veto`, `enumeration_open`,
+`uniqueness_unknown`, `window_moved`, `policy_changed`.
+
+`family_child_finalize_eligible` is an UPPER BOUND, not a finalization
+certificate. The per-session owner binding cannot be read at the scan step, and
+cross-family dependencies only a terminal census derives are not visible: a
+member's parent reference, a request shared with a family not yet censused, and
+request overlap with another family's pending proof. No code consumes this count.
+
+**Freshness.** `pending_census_members` describes the skipped set: `count`
+(queue plus replay entries), `replay`, `replay_repeat`, `oldest_age_s`,
+`over_24h`, `tracked`, `unqueued_unresolved`, `pace_evicted` and `stamped_for_s`.
+`skipped_set` holds `digest` and `retained`, the entries the previous page also
+skipped. `sticky_vetoes` holds `namespace_loss_age_s` and `unattributed_age_s`,
+null when the veto is not latched. These are process-local, and restart, a scope
+change or an eviction (`pace_evicted`) resets them, so every age is a LOWER BOUND
+across a restart and `stamped_for_s` caps it. Attestations reset the same way, so
+after a restart members count `evidence/presence_only` until ordinary work attests
+them again. Attestations and vetoes also reset with each new traversal generation.
+
+**Work counters.** These are approximate units, not exact operations.
+`member_keys_visited` is range advances of the member lookups, at most 16,384.
+Under `cost`: `root_index_keys_processed` is keys the uniqueness pass consumed,
+at most 8,192, plus one check per parse; the merged loop may also peek up to 2
+keys it does not count. `cross_family_entries_visited` is outer-map entries of the
+cross-family records, not the owner references flattened from them, and is zero
+on a page with no candidate. `rotation_keys_visited`, `queue_entries_visited` (two
+passes over the queue, not bounded by a constant) and `history_gates_visited`
+count entries. `predicate_cpu_us` is thread CPU, and excludes mutex wait.
+`families_evaluated`, `attested_keys`, `attestations_evicted` and
+`runtime_heap_bytes` (retained shadow state after the page, excluding page
+transients) are gauges. `root_index_restarted`, `root_index_complete`,
+`root_index_overflowed`, `queued_roots_overflowed`, `history_gates_overflowed`
+and `cross_family_overflowed` are flags. At the top level, `shadow_decision_calls`
+and `shadow_attest_micros` measure this page's equality attestation, and
+`attest_capped` counts Skips past the limit of 4,096 per page, not attested.
+
+**Zero and unavailable.** A zero count is a real zero for that page. An absent
+record means the page had no traversal state or was not Claude. Uniqueness is
+unavailable while `cost.root_index_complete` is false, and families then count
+`path_not_unique`, or `uniqueness_unknown` among child candidates.
+
 ## Pi reported-cost parsing
 
 Pi cost fields use checked decimal arithmetic and an inclusive $100,000 ceiling
@@ -1348,3 +1432,98 @@ values.
 A later complete native parse still emits its exclusive body for a session with
 an earlier state-only row. An emitted total alone does not prove a server-side
 overwrite; backend authority rules independently govern successor acceptance.
+
+## Claude request-identity cap priority
+
+`native_collection_page.counts.identity_cap` contains sparse page observations
+for `retained_buckets`, `refused_new_buckets`, `accepted_state_unknown`, and
+`accepted_overflow.{same_as_parent,differs}`, `accepted_share_changed`,
+`unpriced_part_untagged`, `accepted_row_vanished` and
+`accepted_state_unknown_cause.{no_key,epoch_changed,untracked_session,incomplete}`.
+Labels are append-only.
+`accepted_share_changed` counts bucket observations where a previously accepted
+row gains a different authority or loses a tagged share/presence. Unchanged
+shares stay tagged; changed/missing shares become untagged with one refusal
+per affected row. Such a bucket is not counted as retained.
+`accepted_state_unknown_cause` splits each `accepted_state_unknown` attempt
+into exactly one cause: `no_key` (no usable attribution key, so share
+protection is off while shares are still tagged), `epoch_changed` (this pass
+discarded hints of a different key epoch), `untracked_session` (no hints for
+the session: never stored-body ACKed, evicted or invalid) or `incomplete`
+(whole buckets evicted at the share limit). `accepted_row_vanished` counts
+frozen tagged rows absent from their still-present accepted bucket, such as
+usage moved to a new row key by late effort or billing resolution; it is
+counts-only and changes no tag or money.
+
+The final derived rows mirror the receiver's identity-part money presence
+rule: a row carrying a cost field needs it on every part. A share whose
+contributing buckets all lack a cost its priced row carries has no exact
+value, and no zero or guessed identity stands in. That whole model row (top
+row and every bucket row) goes out untagged with unchanged money and one
+refusal per newly untagged bucket row; orphaned evidence is pruned and the
+wire is reconciled again. `unpriced_part_untagged` counts such model rows; a
+stripped row with frozen accepted shares also counts in
+`accepted_overflow.differs`.
+
+The default classifier always uses `differs`: a local starting login, creator
+hint or display cannot prove the backend's parent binding. Zero
+`same_as_parent` is explicit when this object is present. Counts describe tagging
+attempts, including retries, rather than distinct sessions.
+
+Within the existing item caps, acknowledged tagged buckets have priority over
+never-acknowledged buckets. If those accepted buckets overflow, a fitting open
+current-hour accepted bucket has priority; settled buckets are considered newest first, preferring to drop the oldest
+within the classifier's priority. One unencodable bucket does not erase
+independent accepted proof; the complete accepted set is checked first. Dropped usage goes out untagged with a
+row refusal; there is no upload hold. Top-level shares are refolded from exactly
+the kept bucket shares and the untagged remainder, as required by receiver
+reconciliation. Evidence is pruned and references remapped. Display names only
+accounts still proved by emitted bucket rows.
+
+Accepted overflow removes buckets from the collective set in that drop order,
+using reversible per-share sums and money-presence counts. A bucket need not
+fit alone: multiple buckets can collapse a temporary top-level parts row. Only an unavoidable representation
+lower bound can exclude an impossible bucket before the collective check.
+Row byte deltas and reference widths are updated incrementally; allocation
+does not serialize the growing item for each candidate or removal.
+
+Money follows the receiver's presence arithmetic independently for all five
+cost fields: add present values, ignore absent contributions, and leave the
+sum absent only if none was present. All eight counters sum exactly. There
+is no unpriced-witness rule: an absent contribution cannot erase known money.
+Re-admission can complete a shared top row when this collapses Parts to Single;
+failed row completions are cached until selection changes. The byte budget
+includes the existing semantic envelope, the largest policy flag encoding and
+a possible cache predecessor. The upload owner reserves any cache reconciliation
+growth once before selection, without changing the local cache patch. Full
+wire size is checked again after allocation; 640 KiB is unchanged.
+Individual shared-row completions are tried before their union, so unrelated
+new buckets sharing another row cannot prevent a fitting accepted completion.
+
+The destination-scoped upload progress stores class L hints: hashed session
+keys, sorted bucket starts, and SHA-256 row/authority fingerprints of each
+row's first accepted share set, including whether an untagged share was present.
+It never stores or reconstructs identities. Only stored-body ACKs update it;
+a later stripped/refused ACK cannot bless a new authority or missing presence.
+Restoration still requires current held proof. An always-missing sibling row
+has no accepted tagged fingerprint and is not spuriously refused.
+
+Limits are 16 sessions, 5,000 starts and 1,536 share-presence records per session.
+Each share record occupies 80 inline bytes on the requested 64-bit layout;
+the maximum requested-layout fixture is 2,628,072 bytes (below 3 MiB). Whole buckets are
+evicted from the hint ledger at the share limit, never partial share sets;
+`accepted_state_unknown` counts attempts using incomplete or missing state.
+Eviction, timestamp-only migration and older-decoder loss degrade to currently
+proved buckets that fit. The append-only progress field still defaults empty;
+invalid L hints do not invalidate neighbouring billing ACKs. No wire cap or
+backend rule changes.
+
+The pure `measure_identity_cap(item, accepted_state)` hook returns
+`tagged_recent_buckets`, `refused_recent_buckets`, `accepted_retained`,
+`accepted_overflow` and `item_bytes` without reading evidence, logging or
+uploading. Here recent means the currently proved, never-accepted candidate
+buckets; already stripped proof cannot be recovered from the hint ledger.
+
+Upstream authority-key allocation loss remains fail-closed: inherited partitions
+are not reclassified as request proof by budget recovery or a uniform starting-account
+retry. Only an intact current grouping can enter the cap allocator.

@@ -351,10 +351,15 @@ fn integrated_capture(
     selected: &[usize],
     trace: &mut IntegratedTrace,
 ) -> IntegratedSlot {
-    let entry = crate::retry_allocation_probe::stats().requested_live;
+    let entry = crate::retry_allocation_probe::caller_thread_stats()
+        .unwrap_or_else(crate::retry_allocation_probe::stats)
+        .requested_live;
     crate::retry_allocation_probe::phase_begin();
     let slot = IntegratedSlot::capture(f, selected).unwrap();
-    let retained = (crate::retry_allocation_probe::stats().requested_live - entry) as usize;
+    let retained = (crate::retry_allocation_probe::caller_thread_stats()
+        .unwrap_or_else(crate::retry_allocation_probe::stats)
+        .requested_live
+        - entry) as usize;
     let peak = crate::retry_allocation_probe::phase_peak();
     assert!(retained <= slot.bound);
     trace.captures.push((slot.bound, retained, peak));
