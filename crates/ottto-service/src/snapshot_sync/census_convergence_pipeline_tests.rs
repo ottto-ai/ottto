@@ -6057,7 +6057,10 @@ fn returning_member_after_a_lost_tombstone_set_is_held_not_new() {
 /// witness: nothing is uploaded or accepted and a bounded record re-forms.
 #[test]
 #[serial(source_manifests)]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn terminal_off_on_returning_member_after_a_lost_tombstone_set_is_held_not_new() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -6323,7 +6326,10 @@ fn restored_stale_member_after_a_lost_tombstone_set_is_held_not_new() {
 /// the returning member is held, never new.
 #[test]
 #[serial(source_manifests)]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn terminal_off_on_restored_stale_member_after_a_lost_tombstone_set_is_held_not_new() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

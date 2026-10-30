@@ -328,6 +328,7 @@ fn oversized_metadata_only_touches_give_zero_wakes() {
 
 #[test]
 #[serial(source_manifests)]
+#[cfg_attr(not(target_os = "macos"), ignore = "runs macOS /usr/bin/xattr")]
 fn terminal_off_on_oversized_metadata_only_touches_give_zero_wakes() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

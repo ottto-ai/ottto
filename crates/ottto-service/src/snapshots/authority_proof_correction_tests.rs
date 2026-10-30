@@ -4477,7 +4477,10 @@ fn load_drops_unbound_authority_record_and_keeps_index() {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn terminal_off_on_load_drops_unbound_authority_record_and_keeps_index() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -4537,7 +4540,10 @@ fn contained_unbound_authority_record_does_not_latch_claude_reemission_stop() {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn terminal_off_on_contained_unbound_authority_record_does_not_latch_claude_reemission_stop() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

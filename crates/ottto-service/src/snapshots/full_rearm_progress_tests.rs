@@ -1277,7 +1277,10 @@ fn full_rearm_window_keeps_the_origin_after_scanner_checkpoint_retirement() {
 /// The production scanner retires a clean traversal before the fold. Its
 /// origin must survive so the re-arm can bind the next window, even then.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn terminal_off_on_full_rearm_window_keeps_the_origin_after_scanner_checkpoint_retirement() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

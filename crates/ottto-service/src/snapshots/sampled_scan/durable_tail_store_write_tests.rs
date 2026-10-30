@@ -276,7 +276,10 @@ fn failed_write_after_save_costs_one_counted_full_after_restart() {
 /// Full, counted with the bytes that Full read. The fault-free control
 /// restores and Tails with both counters at 0.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS retained layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS retained layout"
+)]
 fn terminal_off_on_failed_write_after_save_costs_one_counted_full_after_restart() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

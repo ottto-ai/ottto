@@ -116,11 +116,13 @@ const INHERITED_MAIN_IGNORES: &[(&str, &str, &str, &str)] = &[
     ("snapshots/transcript_acquisition_tests.rs", "", "terminal_off_on_sampled_production_performance_32mib", "run explicitly for native synthetic throughput measurements"),
 ];
 
-/// Main's macOS-only layout probes, `cfg_attr(not(target_os = "macos"),
-/// ignore = reason)`, identical to the original on main c440307e6. They run on
-/// the macOS `Rust contracts` job, so they are not readiness debt.
+/// Main's platform gates, identical to the original on main: the layout gate
+/// `cfg_attr(not(any(target_os = "macos", target_os = "linux")), ignore = reason)`
+/// (#937) or the macOS-only `cfg_attr(not(target_os = "macos"), ignore = reason)`.
+/// They run wherever main's original runs, so they are not readiness debt.
 const INHERITED_MACOS_GATES: &[(&str, &str, &str, &str)] = &[
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "", "terminal_off_on_restored_stale_member_after_a_lost_tombstone_set_is_held_not_new", "needs macOS heap layout"),
+    ("snapshot_sync/oversized_discovery_pipeline_tests.rs", "", "terminal_off_on_oversized_metadata_only_touches_give_zero_wakes", "runs macOS /usr/bin/xattr"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "", "terminal_off_on_returning_member_after_a_lost_tombstone_set_is_held_not_new", "needs macOS heap layout"),
     ("snapshots/authority_proof_correction_tests.rs", "", "terminal_off_on_contained_unbound_authority_record_does_not_latch_claude_reemission_stop", "needs macOS heap layout"),
     ("snapshots/authority_proof_correction_tests.rs", "", "terminal_off_on_load_drops_unbound_authority_record_and_keeps_index", "needs macOS heap layout"),
@@ -142,6 +144,7 @@ const INHERITED_MACOS_GATES: &[(&str, &str, &str, &str)] = &[
 
 const READINESS: &str = concat!("terminal-off ", "ON-readiness: ");
 const MACOS_ONLY: &str = "not(target_os=\"macos\")";
+const LAYOUT_GATE: &str = "not(any(target_os=\"macos\",target_os=\"linux\"))";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Token<'a> {
@@ -596,7 +599,7 @@ fn every_ignored_terminal_off_on_twin_names_its_readiness_cluster() {
             match (ignore.condition.as_deref(), ignore.reason.as_deref()) {
                 (None, Some(reason)) if reason.starts_with(READINESS) => {}
                 (None, Some(reason)) => main_ignores.push((identity, reason)),
-                (Some(MACOS_ONLY), Some(reason)) => macos_gates.push((identity, reason)),
+                (Some(MACOS_ONLY | LAYOUT_GATE), Some(reason)) => macos_gates.push((identity, reason)),
                 _ => panic!(
                     "{}: {} carries {ignore:?}; inventory it as readiness debt",
                     item.file, item.name

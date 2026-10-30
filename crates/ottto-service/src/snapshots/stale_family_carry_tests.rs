@@ -2630,7 +2630,10 @@ fn fix2_restart_before_the_first_window_start_is_base() {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn terminal_off_on_fix2_restart_before_the_first_window_start_is_base() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -3444,7 +3447,10 @@ fn new_carry_writer_exposes_only_c1b_roots_to_old_shape_reader() {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn terminal_off_on_new_carry_writer_exposes_only_c1b_roots_to_old_shape_reader() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

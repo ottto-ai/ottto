@@ -3466,7 +3466,10 @@ fn source_aware_loads_share_history_freshness_and_repair_tombstones() {
 // #705/#712 composition: both daemon and general loads share freshness,
 // retain guard (b) after the index fills, and repair a lost tombstone set.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn terminal_off_on_source_aware_loads_share_history_freshness_and_repair_tombstones() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -3661,7 +3664,10 @@ fn malformed_tombstones_never_fail_the_index_decode() {
 // wrong container type decodes as empty, each counted; the index and all its
 // other state still load, never quarantined.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn terminal_off_on_malformed_tombstones_never_fail_the_index_decode() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -4175,7 +4181,10 @@ fn a_lost_tombstone_set_never_restores_new_file_eligibility() {
 // member is still read through the authority path, never as a new file, and
 // that survives a save and reload. An unwitnessed new root stays new.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn terminal_off_on_a_lost_tombstone_set_never_restores_new_file_eligibility() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -4438,7 +4447,10 @@ fn an_unplaceable_tombstone_loss_keeps_a_durable_fence() {
 // settled proof frees enough slots, the next complete terminal (Round 15)
 // tombstones the absent witnessed roots and lowers it.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn terminal_off_on_an_unplaceable_tombstone_loss_keeps_a_durable_fence() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -4623,7 +4635,10 @@ fn an_indexed_member_never_waives_a_lost_tombstone() {
 // the member is gone again its return is still read through the authority
 // path.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn terminal_off_on_an_indexed_member_never_waives_a_lost_tombstone() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -5361,7 +5376,10 @@ fn a_downgrade_that_drops_the_marker_and_set_fails_closed() {
 // marker (and could evict at its cap) is caught the same way. A healthy
 // unmarked index (the witnessed root is indexed) still starts empty.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn terminal_off_on_a_downgrade_that_drops_the_marker_and_set_fails_closed() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
