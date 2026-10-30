@@ -371,7 +371,7 @@ pub(super) fn select(
 /// A scoped unchanged revision re-read also owes its qualified context. That
 /// second debt must not turn a history-budget hold into an ordinary read.
 /// Real changes and independent audit/authority reasons keep their rules.
-pub(super) fn unchanged_requested(index: &ScanIndex, candidate: &CandidateFile) -> bool {
+pub(super) fn unchanged_requested(index: &ScanIndex, candidate: &CandidateFile, now: u64) -> bool {
     let key = local_index_key(&candidate.path);
     claude_request_money::e2::resumed_prefix_enabled()
         && index
@@ -379,11 +379,16 @@ pub(super) fn unchanged_requested(index: &ScanIndex, candidate: &CandidateFile) 
             .money_marks(claude_money_birth_store::location_key(&key))
             & REOWED
             != 0
+        && index.copy_prefix_base_context_proven(&key)
         && index.files.get(&key).is_some_and(|entry| {
             entry.size_bytes == candidate.size_bytes
                 && entry.modified_unix_seconds == candidate.modified_unix_seconds
                 && entry.modified_unix_nanos == Some(candidate.modified_unix_nanos)
         })
+        // Re-evaluate every independent reason without revision or mode
+        // debt. Sidecar changes, retries and source changes must still parse
+        // locally under history holds, as before this scoped mechanism.
+        && index.candidate_decision_with_reason_gated(candidate, now, false, false).0 == CandidateDecision::Skip
 }
 
 #[cfg(test)]

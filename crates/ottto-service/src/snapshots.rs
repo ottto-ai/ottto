@@ -32542,7 +32542,9 @@ impl OwnedSourceScan {
                 let adoption_only = parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
                     && (index.candidate_requires_only_body_witness_adoption(&candidate, audit_now)
                         || (source == SnapshotSource::ClaudeCode
-                            && claude_copy_prefix_reread::unchanged_requested(index, &candidate)));
+                            && claude_copy_prefix_reread::unchanged_requested(
+                                index, &candidate, audit_now,
+                            )));
                 let history = if source == SnapshotSource::ClaudeCode {
                     index.claude_history_upgrade_decision(
                         &candidate,
@@ -50326,7 +50328,7 @@ impl ScanIndex {
         candidate: &CandidateFile,
         now: u64,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
-        self.candidate_decision_with_reason_gated(candidate, now, true)
+        self.candidate_decision_with_reason_gated(candidate, now, true, true)
     }
 
     /// True when the local list names this Claude file's family root or the
@@ -50349,7 +50351,7 @@ impl ScanIndex {
         self.effective_upload_body_witness_revision_requires_adoption(&local_index_key(
             &candidate.path,
         )) && self
-            .candidate_decision_with_reason_gated(candidate, now, false)
+            .candidate_decision_with_reason_gated(candidate, now, false, true)
             .0
             == CandidateDecision::Skip
     }
@@ -50392,11 +50394,14 @@ impl ScanIndex {
         )
     }
 
+    /// Scoped history admission can ignore revision and proven mode-context
+    /// debt while checking every independent local refresh reason.
     fn candidate_decision_with_reason_gated(
         &self,
         candidate: &CandidateFile,
         now: u64,
         body_witness_adoption: bool,
+        upload_context_adoption: bool,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         let key = local_index_key(&candidate.path);
         if self.decode_holds_file(&key) {
@@ -50480,7 +50485,8 @@ impl ScanIndex {
                 Some(CandidateParseReason::BodyWitnessAdoption),
             );
         }
-        if self.file_upload_context_requires_adoption(&key)
+        if upload_context_adoption
+            && self.file_upload_context_requires_adoption(&key)
             && !self.file_upload_context_backoff_holds(candidate)
         {
             return (

@@ -253,6 +253,38 @@ fn scoped_recovery_consumes_existing_replay_without_duplicate_native_reads() {
 }
 
 #[test]
+fn scoped_mode_budget_preserves_independent_source_refresh() {
+    let (home, root, mut index, _) = setup("copy-prefix-independent-source");
+    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
+    let support = home.join("support");
+    run(&home.join("scope.json"), &support, true).unwrap();
+    activate_mode(&mut index, "ctx-1", true, false);
+    let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
+    let key = local_index_key(&pending[0]);
+    // A different source witness models changed account/telemetry sidecars;
+    // transcript size and mtime remain exact. Both revision and context are owed.
+    let stale = "f".repeat(64);
+    index.files.get_mut(&key).unwrap().source_file_fingerprint = stale.clone();
+    assert!(index.copy_prefix_base_context_proven(&key));
+    let (after, scan, opened) =
+        with_body_witness_adoption_byte_budget(1, || walk(&root, index, &pending));
+    assert_eq!(
+        opened,
+        vec![pending[0].clone()],
+        "independent refresh still reads locally under the hold"
+    );
+    assert_eq!(scan.scanned_file_count, 1);
+    assert_ne!(after.files[&key].source_file_fingerprint, stale);
+    let mut changed_policy = after;
+    activate_mode(&mut changed_policy, "new-policy", true, false);
+    assert!(
+        !changed_policy.copy_prefix_base_context_proven(&key),
+        "real base changes are not mode-only debt"
+    );
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn estimate_reports_out_of_window_members_and_apply_refuses_without_state() {
     let (home, _, index, paths) = setup("copy-prefix-window-estimate");
     fs::File::open(&paths[0])

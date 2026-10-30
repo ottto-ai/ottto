@@ -118,6 +118,29 @@ impl ScanIndex {
         context == base || context == local_on || context == wire_on
     }
 
+    /// Only mode debt can share the scoped history-read admission. A genuine
+    /// base policy change keeps ordinary local evidence refresh semantics.
+    pub(super) fn copy_prefix_base_context_proven(&self, key: &str) -> bool {
+        if self
+            .upload_context_fingerprint
+            .as_deref()
+            .is_some_and(|context| self.same_copy_prefix_base(context))
+        {
+            return true;
+        }
+        self.files.get(key).is_some_and(|entry| {
+            entry
+                .upload_context_receipt
+                .as_ref()
+                .is_some_and(|receipt| {
+                    self.same_copy_prefix_base(&receipt.context_fingerprint)
+                        && receipt.replay_generation == self.context_curve_replay_epoch
+                        && receipt.source_witness == entry.source_file_fingerprint
+                        && entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
+                })
+        })
+    }
+
     fn unaffected_file(&self, key: &str) -> bool {
         self.copy_prefix_base_upload_context.is_some()
             && self
