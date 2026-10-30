@@ -284,8 +284,6 @@ const LIFECYCLE_COUNTERS: &[(&str, CounterClass)] = &[
     // snapshots.rs::finalize_scan_after_policy_with_body_witness: a surviving
     // offer of a restored Pi Tail below the accepted extent; not a refusal.
     ("pi_restored_behind_accepted", CounterClass::Observation),
-    ("pi_uploaded_literal_purged", CounterClass::Observation),
-    ("pi_uploaded_literal_key_changed", CounterClass::Observation),
     // transcript_cache.rs::evict_until: cursor reservation victim action.
     (
         "cursor_reservation_entries_evicted",

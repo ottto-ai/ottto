@@ -2216,8 +2216,6 @@ mod tests {
             "retention_bound_refused_pi_bytes",
             "pi",
             "pi_restored_behind_accepted",
-            "pi_uploaded_literal_purged",
-            "pi_uploaded_literal_key_changed",
         ] {
             assert_eq!(record["counts"][key], u64::MAX);
         }
