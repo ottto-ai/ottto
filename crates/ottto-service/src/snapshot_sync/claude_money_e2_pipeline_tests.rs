@@ -5653,3 +5653,89 @@ fn terminal_off_two_member_new_copy_cohort_emits_shared_request_once() {
         );
     });
 }
+
+
+// R10: the warm page deliberately has neither an upload nor an ACK/receipt.
+// Before fix P the late sidecar is misclassified as context-only: only one
+// file fits this page (also observable on Linux without native retained layout).
+#[test]
+fn terminal_off_on_r10_sidecar_change_reads_both_unacked_members() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    with_e2(|| {
+        let mut c = Corpus::new("r10-late-side-owner");
+        let root = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+        let agent = c.agent(0, &line(ROOT, "agent", AT, 20));
+        let scanner = E2ScanFixture::default();
+        let mut warm = c.raw(&scanner, ScanIndex::default(), 100, true, &[]);
+        assert_mode(warm.modes, (2, 0, 0));
+        warm.enrich(&c);
+        warm.finish();
+        let prior = c.reload(&mut warm.index);
+        c.evidence(
+            &[api("r1", 10, 100), api("agent", 20, 200), api("side", 5, 50)],
+            &[trace("side", "000")],
+        );
+        let mut after = c.raw(&scanner, prior.clone(), 100, true, &[]);
+        assert_eq!(
+            scanner.paths().into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([root, agent]),
+            "real sidecar work must not be paced as context-only catch-up"
+        );
+        assert_mode(after.modes, (0, 0, 2));
+        assert_eq!(after.index.context_read_counts.files, 0);
+        after.enrich(&c);
+        after.finish();
+        literal(&after);
+        assert_eq!(after.scan.snapshots.len(), 2);
+        let root_body = body(&after, ROOT).unwrap();
+        let agent_body = body(&after, &format!("{ROOT}_agent-000")).unwrap();
+        assert_eq!((root_body.request_count, root_body.input_tokens), (1, 10));
+        assert_eq!((agent_body.request_count, agent_body.input_tokens), (2, 25));
+        assert_eq!(root_body.cost.as_ref().unwrap().total_cost_usd.as_deref(), Some("0.0001"));
+        assert_eq!(agent_body.cost.as_ref().unwrap().total_cost_usd.as_deref(), Some("0.00025"));
+        assert_eq!(total(&after), 3, "the side call is published exactly once");
+        let mut full = c.raw(&E2ScanFixture::default(), prior, 100, true, &[]);
+        assert_mode(full.modes, (2, 0, 0));
+        full.enrich(&c);
+        full.finish();
+        let full_root = body(&full, ROOT).unwrap();
+        assert_eq!(
+            (root_body.request_count, root_body.input_tokens, root_body.output_tokens),
+            (full_root.request_count, full_root.input_tokens, full_root.output_tokens)
+        );
+        assert_eq!(canonical(&after.scan.snapshots), canonical(&full.scan.snapshots));
+    });
+}
+
+#[test]
+fn terminal_off_on_r10_pure_context_debt_keeps_one_file_per_page() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    with_e2(|| {
+        let mut c = Corpus::new("r10-context-pacing");
+        let root = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+        let other = c.root(COPY, &line(COPY, "r2", AT, 20));
+        let scanner = E2ScanFixture::default();
+        let mut warm = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
+        warm.enrich(&c);
+        warm.finish();
+        let prior = c.reload(&mut warm.index);
+        let mut first = c.raw(&scanner, prior, 100, false, &[]);
+        assert_eq!(first.index.context_read_counts.files, 1);
+        let first_paths = scanner.paths();
+        assert_eq!(first_paths.len(), 1);
+        first.enrich(&c);
+        first.finish();
+        let next = c.reload(&mut first.index);
+        // No ACK or receipt shortcut: retained traversal drains the deferred
+        // member on the following page, even though both still owe context.
+        let second = c.raw(&scanner, next, 100, false, &[]);
+        assert_eq!(second.index.context_read_counts.files, 1);
+        let second_paths = scanner.paths();
+        assert_eq!(second_paths.len(), 1);
+        assert_ne!(first_paths, second_paths);
+        assert_eq!(
+            first_paths.into_iter().chain(second_paths).collect::<BTreeSet<_>>(),
+            BTreeSet::from([root, other])
+        );
+    });
+}

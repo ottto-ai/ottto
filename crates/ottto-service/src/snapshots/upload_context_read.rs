@@ -268,3 +268,57 @@ mod tests {
         budget.charge_cursor_ordinary(&mut page); // charged only once
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn r10_off_and_codex_keep_main_context_classification() {
+        for on in [false, true] {
+            let _on = on.then(ClaudeTerminalOffForTest::enabled);
+            for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+                let mut entry = crate::snapshots::tests::manifest_index_entry(Some("body"));
+                entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+                let mut candidate = CandidateFile {
+                    physical_identity: None,
+                    scan_root: PathBuf::from("/synthetic/r10"),
+                    path: PathBuf::from("/synthetic/r10/session.jsonl"),
+                    size_bytes: entry.size_bytes,
+                    modified_unix_seconds: entry.modified_unix_seconds,
+                    modified_unix_nanos: entry.modified_unix_nanos.unwrap(),
+                    source_file_fingerprint: "late-sidecar".into(),
+                    legacy_source_file_fingerprint: String::new(),
+                    legacy_config_reconciliation_required: false,
+                    opened_object_identity: String::new(),
+                    fingerprint_changed_nanos: 0,
+                    fingerprint_birth_nanos: 0,
+                };
+                let key = local_index_key(&candidate.path);
+                let mut index = ScanIndex::default();
+                index.activate_file_upload_context(source, "new-context".into());
+                index.files.insert(key.clone(), entry.clone());
+                index
+                    .file_snapshot_fingerprints
+                    .insert(key.clone(), BTreeSet::from(["body".into()]));
+                index
+                    .snapshot_activity_at
+                    .insert("body".into(), Some("2026-08-02T07:00:10Z".into()));
+                assert_eq!(
+                    index.context_only_read(&candidate, 0),
+                    !(on && source == SnapshotSource::ClaudeCode)
+                );
+                candidate.source_file_fingerprint = entry.source_file_fingerprint.clone();
+                assert!(index.context_only_read(&candidate, 0));
+                // Legacy metadata adoption is not another Parse cause.
+                entry.scan_identity_version = None;
+                candidate.legacy_source_file_fingerprint = entry.source_file_fingerprint.clone();
+                index.files.insert(key, entry);
+                for reconcile in [false, true] {
+                    candidate.legacy_config_reconciliation_required = reconcile;
+                    assert!(index.context_only_read(&candidate, 0));
+                }
+            }
+        }
+    }
+}
