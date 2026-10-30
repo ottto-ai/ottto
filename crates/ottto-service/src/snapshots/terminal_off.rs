@@ -1,20 +1,18 @@
 #[path = "terminal_off/discovery.rs"]
 mod terminal_off_discovery;
 
-// Temporary containment. No admitted read path or new persisted shape.
-// A future paged fold must replace the reconstruction guard, not just flip a
-// switch: a changed member may have replaced the old window's negative proof.
-// This literal and static assertion belong to every non-test build. There is
-// no feature, environment variable, serialized setting or release override.
-const CLAUDE_RELEASE_TERMINAL_OFF: bool = true;
-const _: () = assert!(CLAUDE_RELEASE_TERMINAL_OFF);
+#[path = "terminal_off/policy.rs"]
+mod terminal_off_policy;
+#[cfg(test)]
+pub(crate) use terminal_off_policy::ClaudeTerminalOffForTest;
 
+/// The machine owner alone opts in. Absent marker/default means main policy.
 pub(crate) fn claude_terminal_off() -> bool {
     #[cfg(test)]
     if claude_completion_paths_for_test() {
         return false;
     }
-    CLAUDE_RELEASE_TERMINAL_OFF
+    terminal_off_policy::enabled()
 }
 
 // Future-paging coverage only. A fixture must opt in explicitly, on its own
@@ -95,18 +93,20 @@ mod completion_policy_tests {
                 "{suite} must exercise production containment"
             );
         }
-        assert!(claude_terminal_off());
+        assert!(!claude_terminal_off(), "release default is main");
     }
 
     #[test]
-    fn release_terminal_policy_is_constant_and_fixture_override_is_thread_scoped() {
+    fn release_terminal_policy_defaults_off_and_fixture_override_is_thread_scoped() {
+        assert!(!claude_terminal_off());
+        let _containment = ClaudeTerminalOffForTest::enabled();
         assert!(claude_terminal_off());
         let enabled = ClaudeCompletionPathsForTest::enable();
         assert!(!claude_terminal_off());
-        // The non-test branch is this constant, even while this fixture opts in.
-        let release_policy = std::hint::black_box(CLAUDE_RELEASE_TERMINAL_OFF);
-        assert!(release_policy);
-        assert!(std::thread::spawn(claude_terminal_off).join().unwrap());
+        assert!(
+            !std::thread::spawn(claude_terminal_off).join().unwrap(),
+            "new test threads default OFF"
+        );
         {
             let _nested = ClaudeCompletionPathsForTest::enable();
             assert!(!claude_terminal_off());
@@ -128,6 +128,7 @@ fn claude_effective_duplicate_fence_closed(index: &ScanIndex) -> bool {
     claude_terminal_off() || index.claude_duplicate_request_witness_overflowed
 }
 
+#[cfg(test)]
 fn claude_terminal_reconstructed(index: &ScanIndex, window: &str) -> bool {
     index
         .claude_full_rearm_progress
@@ -173,14 +174,10 @@ fn claude_terminal_reconstructed(index: &ScanIndex, window: &str) -> bool {
             })
 }
 
-pub(crate) fn claude_terminal_authority(index: &ScanIndex, offered: bool, window: &str) -> bool {
-    // Only the cfg(test) fixture guard exercises the historical completion
-    // algorithms. A release caller must earn reconstruction before authority.
-    #[cfg(test)]
-    if claude_completion_paths_for_test() {
-        return offered;
-    }
-    offered && !claude_terminal_off() && claude_terminal_reconstructed(index, window)
+pub(crate) fn claude_terminal_authority(_index: &ScanIndex, offered: bool, _window: &str) -> bool {
+    // OFF restores the main completion path. ON cannot acquire authority by
+    // changing a latch or restoring persisted scheduling/reconstruction data.
+    offered && !claude_terminal_off()
 }
 
 fn claude_redundant_stale_clear_suppressed(index: &ScanIndex) -> bool {
