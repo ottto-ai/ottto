@@ -1920,7 +1920,6 @@ fn census_derivation_drift_tripwire_counts_changed_ids_at_one_revision() {
 /// S3(d) tripwire: a verified complete re-parse at an unchanged fingerprint
 /// and derivation that yields different ids is counted; the same ids are not.
 #[test]
-#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 fn terminal_off_on_census_derivation_drift_tripwire_counts_changed_ids_at_one_revision() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

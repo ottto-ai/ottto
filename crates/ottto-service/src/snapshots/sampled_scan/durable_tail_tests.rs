@@ -2464,7 +2464,6 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
 
 /// F1 needs the real acquisition/publication seam, beyond store-only outcomes.
 #[test]
-#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 fn terminal_off_on_store_io_failures_emit_cold_production_body_without_holds() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

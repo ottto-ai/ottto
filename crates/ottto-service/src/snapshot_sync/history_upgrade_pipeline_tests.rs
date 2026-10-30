@@ -971,7 +971,6 @@ fn historical_replay_after_bootstrap_paces_history_without_a_list() {
 /// records) and paced through the budget, one file per page here, never
 /// re-sent at once (StateMissing N1).
 #[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
 fn terminal_off_on_historical_replay_after_bootstrap_paces_history_without_a_list() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -1040,7 +1039,6 @@ fn quarantined_index_without_an_intended_list_paces_history() {
 /// intended (durable intent Absent, no list, no seen-marker; this destination's own bootstrap): the
 /// rebuilt history is paced through the budget, not held for good.
 #[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
 fn terminal_off_on_quarantined_index_without_an_intended_list_paces_history() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -1248,7 +1246,6 @@ fn installed_list_paces_rebuilt_history_and_denies_listed_families() {
 /// Addendum 2 item 13: with the list installed and budget available, history
 /// after a quarantine is paced and a listed family is never emitted.
 #[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
 fn terminal_off_on_installed_list_paces_rebuilt_history_and_denies_listed_families() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -2367,7 +2364,6 @@ fn a_re_owed_file_goes_back_through_the_gate() {
 /// (as #699's selection-loss path will); the file is owed again, a listed
 /// one is held and keeps 2, an unlisted one upgrades back to 3.
 #[test]
-#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 fn terminal_off_on_a_re_owed_file_goes_back_through_the_gate() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -2486,7 +2482,6 @@ fn seen_marker_rebuild_latch_and_cutoff_feed_one_decision() {
 /// latches; held history stays held even with an installed list, while a
 /// file born after the cutoff still ingests.
 #[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
 fn terminal_off_on_seen_marker_rebuild_latch_and_cutoff_feed_one_decision() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -2992,7 +2987,6 @@ fn explicit_full_move_paces_history_born_before_the_claim() {
 /// other destination's history is paced through the budget, counted, only
 /// because the last claim was an explicit `full`.
 #[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
 fn terminal_off_on_explicit_full_move_paces_history_born_before_the_claim() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -3141,7 +3135,6 @@ fn same_user_reclaim_keeps_the_cutoff_but_gates_the_new_destination() {
 /// that destination is prior history: gated and paced, never re-sent
 /// ungated.
 #[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
 fn terminal_off_on_same_user_reclaim_keeps_the_cutoff_but_gates_the_new_destination() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -3154,7 +3147,6 @@ fn same_user_reclaim_before_bootstrap_is_still_gated() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
 fn terminal_off_on_same_user_reclaim_before_bootstrap_is_still_gated() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -3573,7 +3565,6 @@ fn resumed_pre_gate_index_on_a_new_destination_records_the_cutoff() {
 /// created after it is new and is uploaded, even with no history budget;
 /// the indexed history stays held (a move without a `full` claim).
 #[test]
-#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 fn terminal_off_on_resumed_pre_gate_index_on_a_new_destination_records_the_cutoff() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -3811,7 +3802,6 @@ fn session_created_after_a_pre_gate_index_last_receipt_is_uploaded() {
 /// after its last receipt, no list. The new session is uploaded at once,
 /// even with no history budget; the indexed history is paced, not held.
 #[test]
-#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 fn terminal_off_on_session_created_after_a_pre_gate_index_last_receipt_is_uploaded() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -3893,7 +3883,6 @@ fn intended_list_holds_listed_families_and_paces_the_rest_after_a_quarantine() {
 /// is emitted. After a restart, the listed family is never emitted and the
 /// rest is paced through the budget.
 #[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
 fn terminal_off_on_intended_list_holds_listed_families_and_paces_the_rest_after_a_quarantine() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -4075,7 +4064,6 @@ fn over_budget_rebuild_preserves_history_holds_list_latch_and_pacing() {
 /// prior-history gate. NewFile-shaped history is never emitted on the held
 /// paths; the allowed unlisted history is still paced at revision <= 2.
 #[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
 fn terminal_off_on_over_budget_rebuild_preserves_history_holds_list_latch_and_pacing() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -4488,7 +4476,6 @@ fn e2_refused_twins_keep_prior_tuple_and_stay_owed_while_siblings_settle() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: unclassified"]
 fn terminal_off_on_e2_refused_twins_keep_prior_tuple_and_stay_owed_while_siblings_settle() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -4638,7 +4625,6 @@ fn e2_ok_unhealthy_root_holds_history_then_healthy_read_settles_reported_once() 
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: history-adoption"]
 fn terminal_off_on_e2_ok_unhealthy_root_holds_history_then_healthy_read_settles_reported_once() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -4888,7 +4874,6 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
 /// marks; a later money rule re-owes only the files whose marks it names,
 /// once, under the same budget.
 #[test]
-#[ignore = "terminal-off ON-readiness: history-adoption"]
 fn terminal_off_on_e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_files() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -5322,7 +5307,6 @@ fn e2_unhealthy_root_holds_owed_agent_history_too() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 fn terminal_off_on_e2_unhealthy_root_holds_owed_agent_history_too() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -5446,7 +5430,6 @@ fn e2_repaired_between_attachment_and_strict_read_stays_owed_until_next_page() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 fn terminal_off_on_e2_repaired_between_attachment_and_strict_read_stays_owed_until_next_page() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -5564,7 +5547,6 @@ fn e2_side_call_census_deadline_holds_root_history_then_counts_side_call_once() 
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 fn terminal_off_on_e2_side_call_census_deadline_holds_root_history_then_counts_side_call_once() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -5799,7 +5781,6 @@ fn e2_unlisting_replays_the_legacy_money_mark_once() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: completion-fold"]
 fn terminal_off_on_e2_unlisting_replays_the_legacy_money_mark_once() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -6077,7 +6058,6 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
 /// as stored, never cleared or replayed. Was
 /// `e2_late_identity_permit_reowes_nothing_and_discloses_unpermitted_stamps`.
 #[test]
-#[ignore = "terminal-off ON-readiness: P5"]
 fn terminal_off_on_e2_always_on_contract_reowes_no_uncaptured_history() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

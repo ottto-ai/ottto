@@ -808,7 +808,6 @@ fn registration_changes_no_selection_result_or_step_boundary() {
 /// E3 condition 2: registering an observer changes neither which files a
 /// pass selects, its results, nor its step (page) boundaries.
 #[test]
-#[ignore = "terminal-off ON-readiness: unclassified"]
 fn terminal_off_on_registration_changes_no_selection_result_or_step_boundary() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

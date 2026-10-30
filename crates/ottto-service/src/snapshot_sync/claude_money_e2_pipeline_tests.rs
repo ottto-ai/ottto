@@ -634,7 +634,6 @@ fn e2_pipeline_dark_matches_fold_absent_publication_and_selection() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 fn terminal_off_on_e2_pipeline_dark_matches_fold_absent_publication_and_selection() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -1321,7 +1320,6 @@ fn e2_pipeline_twins_original_discovered_first() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
 fn terminal_off_on_e2_pipeline_twins_original_discovered_first() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -1333,7 +1331,6 @@ fn e2_pipeline_twins_copy_discovered_first() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
 fn terminal_off_on_e2_pipeline_twins_copy_discovered_first() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -3675,7 +3672,6 @@ fn e2_pipeline_overlapping_restored_histories_count_their_union_once() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
 fn terminal_off_on_e2_pipeline_overlapping_restored_histories_count_their_union_once() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -3687,7 +3683,6 @@ fn e2_pipeline_overlapping_restored_histories_count_their_union_once_reverse() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
 fn terminal_off_on_e2_pipeline_overlapping_restored_histories_count_their_union_once_reverse() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -5619,7 +5614,6 @@ fn e2_pipeline_withheld_new_file_retries_external_evidence_unchanged() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: unclassified"]
 fn terminal_off_on_e2_pipeline_withheld_new_file_retries_external_evidence_unchanged() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -5632,7 +5626,6 @@ fn e2_pipeline_withheld_new_file_retries_external_evidence_after_growth() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: unclassified"]
 fn terminal_off_on_e2_pipeline_withheld_new_file_retries_external_evidence_after_growth() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -5693,7 +5686,6 @@ fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: unclassified"]
 fn terminal_off_on_e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

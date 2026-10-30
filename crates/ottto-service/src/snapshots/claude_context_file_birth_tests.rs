@@ -2823,7 +2823,6 @@ fn api_sidecar_without_trace_sidecar_still_vetoes() {
 /// the veto only: a copied request that this root's own API sidecar reports
 /// still withholds, through the real scan and local evidence pipeline.
 #[test]
-#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 fn terminal_off_on_api_sidecar_without_trace_sidecar_still_vetoes() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -3431,7 +3430,6 @@ fn capture_on_bodies_match_the_clear_outside_context_scalars() {
 /// only. Money, usage, identity,
 /// contract 5 rows and account tags are byte-identical to the clear.
 #[test]
-#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 fn terminal_off_on_capture_on_bodies_match_the_clear_outside_context_scalars() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

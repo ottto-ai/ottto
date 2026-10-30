@@ -1198,7 +1198,7 @@ fn account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
 /// ordinary traversal reparses only the held file instead of every unchanged
 /// file.
 #[test]
-#[ignore = "terminal-off ON-readiness: C6"]
+#[ignore = "terminal-off ON-readiness: NBF"]
 #[serial(source_manifests)]
 fn terminal_off_on_account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2328,7 +2328,7 @@ fn terminal_family_never_committed_members_let_the_claude_census_complete() {
 /// are never uploaded, accepted, or in the manifest, healthy siblings keep
 /// their accepted bodies, and the next unchanged traversal parses nothing.
 #[test]
-#[ignore = "terminal-off ON-readiness: C6"]
+#[ignore = "terminal-off ON-readiness: NBF"]
 #[serial(source_manifests)]
 fn terminal_off_on_terminal_family_never_committed_members_let_the_claude_census_complete() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2632,7 +2632,7 @@ fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
 /// missing member is pruned only by the complete census; a replaced member is
 /// reparsed once, held, and rebound.
 #[test]
-#[ignore = "terminal-off ON-readiness: C6"]
+#[ignore = "terminal-off ON-readiness: NBF"]
 #[serial(source_manifests)]
 fn terminal_off_on_terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -5889,7 +5889,6 @@ fn returning_member_that_never_reproves_is_held_until_its_bounded_terminal() {
 /// cap. The tombstone, the witness and the terminal record stay; every
 /// sighting counts as a tombstone hit.
 #[test]
-#[ignore = "terminal-off ON-readiness: completion-fold"]
 #[serial(source_manifests)]
 fn terminal_off_on_returning_member_that_never_reproves_is_held_until_its_bounded_terminal() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -6630,7 +6629,6 @@ fn full_tombstone_set_keeps_the_excess_family_and_holds_both_returns() {
 /// and re-forms its record against its witness, and the kept family's record
 /// still holds its member.
 #[test]
-#[ignore = "terminal-off ON-readiness: completion-fold"]
 #[serial(source_manifests)]
 fn terminal_off_on_full_tombstone_set_keeps_the_excess_family_and_holds_both_returns() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -7271,7 +7269,7 @@ fn terminal_off_new_unindexed_session_is_held_and_counted_behind_closed_fence() 
     std::fs::write(&path, pipeline_transcript_line(session, "req_new_fence", 0)).unwrap();
     let pages = fixture.walk(9, &ABSENCE_CYCLE);
     assert!(pages.iter().any(|page| page.parsed.contains(session)));
-    assert!(pages.iter().map(|page| page.scan.held_body_count).sum::<usize>() > 0);
+    assert!(pages.iter().map(|page| page.scan.ownership_incomplete_file_count).sum::<usize>() > 0);
     assert!(pages.iter().any(|page| !page.held.is_empty()));
     assert!(pages.iter().all(|page| page.uploaded.is_empty()));
     assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());

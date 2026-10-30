@@ -623,7 +623,6 @@ fn prior_index_lifetime_real_finish_preserves_refusals_retry_and_failed_cas() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]

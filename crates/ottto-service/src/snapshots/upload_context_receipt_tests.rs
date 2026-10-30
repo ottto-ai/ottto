@@ -1668,7 +1668,6 @@ fn real_uploader_not_stored_backs_off_but_growth_earns_receipt() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: C5"]
 fn terminal_off_on_real_uploader_not_stored_backs_off_but_growth_earns_receipt() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

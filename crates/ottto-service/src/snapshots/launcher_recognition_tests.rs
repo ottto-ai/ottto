@@ -199,7 +199,6 @@ fn native_batches_cross_512_workers_without_a_store_sweep_per_file() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 fn terminal_off_on_native_batches_cross_512_workers_without_a_store_sweep_per_file() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -241,13 +240,13 @@ fn terminal_off_on_native_batches_cross_512_workers_without_a_store_sweep_per_fi
         let (_, control, control_steps) = {
             let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
             run_with_limit(
-            &empty_home,
-            source,
-            &root,
-            ScanIndex::default(),
-            &cache,
-            count,
-        )
+                &empty_home,
+                source,
+                &root,
+                ScanIndex::default(),
+                &cache,
+                count,
+            )
         };
         let (index, launched, launched_steps) = {
             let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();

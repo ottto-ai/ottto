@@ -1855,7 +1855,7 @@ fn novel_import_recovers_after_owner_coverage_then_stops_reading() {
 }
 
 #[test]
-#[ignore = "P12: needs full qualified two-phase driver; original expectations preserved"]
+#[ignore = "terminal-off ON-readiness: P12-driver"]
 #[serial(source_manifests)]
 fn terminal_off_on_novel_import_recovers_after_owner_coverage_then_stops_reading() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -1980,7 +1980,7 @@ fn native_comparison_original_novel_import_oracle() {
 }
 
 #[test]
-#[ignore = "UNMET historical strict-fence aspiration; superseded by explicit native_comparison_novel_import_base_parity"]
+#[ignore = "terminal-off ON-readiness: historical-strict-fence"]
 fn terminal_off_on_native_comparison_original_novel_import_oracle() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

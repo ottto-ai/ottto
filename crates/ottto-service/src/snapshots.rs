@@ -57278,35 +57278,35 @@ mod tests {
         // even a conflict-free cohort must now withhold terminal recovery.
         let mut control = ScanIndex::default();
         {
-        let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
-        for tick in 0..2 {
-            let mut page = scan_source_roots_with_limit(
-                SnapshotSource::ClaudeCode,
-                std::slice::from_ref(&root),
-                &mut control,
-                &format!("2026-08-20T10:0{}:00Z", 2 + tick),
-                BACKFILL_WINDOW_DAYS,
-                3,
-                true,
-            )
-            .expect("control page");
-            let held = apply_claude_reported_usage_with_index(
-                &mut page.snapshots,
-                &api,
-                &trace,
-                &mut control,
-                page.census_complete,
-                &page.census_window_end,
-            );
-            assert_eq!(
-                held.quarantined_entity_count(),
-                0,
-                "fixture must not manufacture local authority withholding"
-            );
-            assert!(!control.account_claude_usage_authority_census_health(&mut page));
-            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut page, &mut control);
-            assert!(!page.census_complete);
-        }
+            let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
+            for tick in 0..2 {
+                let mut page = scan_source_roots_with_limit(
+                    SnapshotSource::ClaudeCode,
+                    std::slice::from_ref(&root),
+                    &mut control,
+                    &format!("2026-08-20T10:0{}:00Z", 2 + tick),
+                    BACKFILL_WINDOW_DAYS,
+                    3,
+                    true,
+                )
+                .expect("control page");
+                let held = apply_claude_reported_usage_with_index(
+                    &mut page.snapshots,
+                    &api,
+                    &trace,
+                    &mut control,
+                    page.census_complete,
+                    &page.census_window_end,
+                );
+                assert_eq!(
+                    held.quarantined_entity_count(),
+                    0,
+                    "fixture must not manufacture local authority withholding"
+                );
+                assert!(!control.account_claude_usage_authority_census_health(&mut page));
+                finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut page, &mut control);
+                assert!(!page.census_complete);
+            }
         }
         assert!(
             control.claude_owned_start_census["a-stable"]
@@ -81575,7 +81575,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "terminal-off ON-readiness: P1"]
     fn terminal_off_on_claude_context_backfill_resumes_after_restart_without_rereading_settled_files(
     ) {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -81588,9 +81587,16 @@ mod tests {
             let mut scan = claude_context_backfill_scan(&root, &mut index, 2);
             assert_eq!(scan.scanned_file_count, 2);
             assert!(!scan.census_complete);
-        assert_eq!(index.claude_usage_authority_pending_count(), 0);
-        assert_eq!((scan.unreadable_path_count, scan.disappeared_file_count,
-            scan.malformed_json_line_count, scan.invalid_utf8_line_count), (0, 0, 0, 0));
+            assert_eq!(index.claude_usage_authority_pending_count(), 0);
+            assert_eq!(
+                (
+                    scan.unreadable_path_count,
+                    scan.disappeared_file_count,
+                    scan.malformed_json_line_count,
+                    scan.invalid_utf8_line_count
+                ),
+                (0, 0, 0, 0)
+            );
             assert_eq!(index.scan_traversal_exhausted_for_test(), page == 2);
             parsed += scan.scanned_file_count;
             // Restart between pages: only the settled index survives.
@@ -82328,8 +82334,15 @@ mod tests {
         );
         assert!(!deferred.census_complete);
         assert_eq!(refused.claude_usage_authority_pending_count(), 0);
-        assert_eq!((deferred.unreadable_path_count, deferred.disappeared_file_count,
-            deferred.malformed_json_line_count, deferred.invalid_utf8_line_count), (0, 0, 0, 0));
+        assert_eq!(
+            (
+                deferred.unreadable_path_count,
+                deferred.disappeared_file_count,
+                deferred.malformed_json_line_count,
+                deferred.invalid_utf8_line_count
+            ),
+            (0, 0, 0, 0)
+        );
         let changed = index
             .files
             .keys()
@@ -82366,8 +82379,15 @@ mod tests {
         );
         assert!(!scan.census_complete);
         assert_eq!(index.claude_usage_authority_pending_count(), 0);
-        assert_eq!((scan.unreadable_path_count, scan.disappeared_file_count,
-            scan.malformed_json_line_count, scan.invalid_utf8_line_count), (0, 0, 0, 0));
+        assert_eq!(
+            (
+                scan.unreadable_path_count,
+                scan.disappeared_file_count,
+                scan.malformed_json_line_count,
+                scan.invalid_utf8_line_count
+            ),
+            (0, 0, 0, 0)
+        );
         let mut index = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
         let mut settled = revisions(&index);
         settled.sort();
@@ -82705,8 +82725,15 @@ mod tests {
         assert_eq!(paused.scanned_file_count, 0);
         assert!(!paused.census_complete);
         assert_eq!(index.claude_usage_authority_pending_count(), 0);
-        assert_eq!((paused.unreadable_path_count, paused.disappeared_file_count,
-            paused.malformed_json_line_count, paused.invalid_utf8_line_count), (0, 0, 0, 0));
+        assert_eq!(
+            (
+                paused.unreadable_path_count,
+                paused.disappeared_file_count,
+                paused.malformed_json_line_count,
+                paused.invalid_utf8_line_count
+            ),
+            (0, 0, 0, 0)
+        );
         assert!(index
             .files
             .values()

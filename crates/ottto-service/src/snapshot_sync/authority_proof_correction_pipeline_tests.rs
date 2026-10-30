@@ -2271,7 +2271,6 @@ fn changed_proof_after_terminal_authority_owes_one_exact_correction() {
 /// no-op, and the record clears with the last one. An unchanged later
 /// generation grants nothing again.
 #[test]
-#[ignore = "terminal-off ON-readiness: proof-grant"]
 #[serial(source_manifests)]
 fn terminal_off_on_changed_proof_after_terminal_authority_owes_one_exact_correction() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2371,7 +2370,6 @@ fn account_held_member_stays_owed_while_owed_siblings_drain_across_passes() {
 /// siblings drain on their own exact settlement; the record is kept until
 /// that member's own ACK or no-op, then clears.
 #[test]
-#[ignore = "terminal-off ON-readiness: proof-grant"]
 #[serial(source_manifests)]
 fn terminal_off_on_account_held_member_stays_owed_while_owed_siblings_drain_across_passes() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2946,7 +2944,6 @@ fn unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant() {
 /// and the deadline unchanged; held bodies are never ACKed; and an unhealthy
 /// census never grants again.
 #[test]
-#[ignore = "terminal-off ON-readiness: proof-grant"]
 #[serial(source_manifests)]
 fn terminal_off_on_unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -3093,7 +3090,6 @@ fn new_request_after_the_grant_fails_then_one_new_proof_regrants_all_members() {
 /// member; the receipt also records whether an unchanged-transcript member's
 /// corrected body differed between the proofs.
 #[test]
-#[ignore = "terminal-off ON-readiness: proof-grant"]
 #[serial(source_manifests)]
 fn terminal_off_on_new_request_after_the_grant_fails_then_one_new_proof_regrants_all_members() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -3311,7 +3307,6 @@ fn natural_owed_members_drain_on_separate_bounded_pages() {
 /// with the last one; every save reloads intact; at least one corrected body
 /// is actually uploaded and acknowledged.
 #[test]
-#[ignore = "terminal-off ON-readiness: proof-grant"]
 #[serial(source_manifests)]
 fn terminal_off_on_natural_owed_members_drain_on_separate_bounded_pages() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -4160,7 +4155,6 @@ fn retryable_refusal_keeps_its_member_owed_across_restart() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: proof-grant"]
 #[serial(source_manifests)]
 fn terminal_off_on_retryable_refusal_keeps_its_member_owed_across_restart() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -4207,7 +4201,6 @@ fn complete_cutoff_drains_without_upload_or_repeated_grant_parse() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: C6"]
 #[serial(source_manifests)]
 fn terminal_off_on_complete_cutoff_drains_without_upload_or_repeated_grant_parse() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -4689,7 +4682,6 @@ fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
 /// re-forms bound to the current witness, or with no witness left the family
 /// stays unproven residue with no record. Nothing is stranded.
 #[test]
-#[ignore = "terminal-off ON-readiness: proof-grant"]
 #[serial(source_manifests)]
 fn terminal_off_on_controlled_unbound_record_rearms_its_family_and_reforms_bound() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -4965,7 +4957,6 @@ fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() 
 /// the record resolves, the reported bodies are offered and accepted, and the
 /// tombstone clears with that settled proof.
 #[test]
-#[ignore = "terminal-off ON-readiness: proof-grant"]
 #[serial(source_manifests)]
 fn terminal_off_on_returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -5191,7 +5182,6 @@ fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
 /// owed members' first request-owned bodies, through the same exact-ACK
 /// settlement, with one read each; once clear nothing is re-offered.
 #[test]
-#[ignore = "terminal-off ON-readiness: C6"]
 #[serial(source_manifests)]
 fn terminal_off_on_e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -5376,7 +5366,6 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
 /// the tombstone clears with that publication and no authority record is
 /// left; a quiet generation offers nothing again.
 #[test]
-#[ignore = "terminal-off ON-readiness: proof-grant"]
 #[serial(source_manifests)]
 fn terminal_off_on_e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
