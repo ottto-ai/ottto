@@ -70,7 +70,7 @@ impl KeyDebt {
 }
 /// Funded nodes per map: owed/hold keys need no more than the RAM cache's
 /// key count. Native writes reserve a node before any fault can create a
-/// D3 hold. A full map defers an unstarted write as counted NotPersisted;
+/// D3 hold. A map full of live custody defers an unstarted write as NotPersisted;
 /// existing receipt/debt overflow retains the conservative discovery bit.
 const KEY_DEBT_KEYS: usize = store::MAX_RECORDS;
 pub(super) fn key_debt_node_bytes() -> Option<usize> {

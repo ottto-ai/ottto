@@ -96,7 +96,8 @@ pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 256
 /// M3 per-key maps outside the A0-h custody node, each with its own prepaid
 /// capacity of `MAX_RECORDS` nodes (plus the retained root) of <=1024 bytes:
 /// the receipt-debt/D3-hold map (`owed::KeyDebt`) and the P1-1 restore-pending
-/// map. Neither evicts; each overflow fails toward its existing safe path.
+/// map. Neither evicts live custody; debt pressure can reclaim idle diagnostics
+/// and expired pacing. Live-capacity overflow keeps the existing safe path.
 pub(crate) const KEY_RESERVE_BYTES: usize = 2 * (store::MAX_RECORDS + 1) * 1024;
 const _: () = assert!(KEY_RESERVE_BYTES == 526_336);
 
