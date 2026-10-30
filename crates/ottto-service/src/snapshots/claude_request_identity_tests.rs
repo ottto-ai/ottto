@@ -108,6 +108,7 @@ fn typed_row(row: &Value) -> SnapshotModelUsage {
         identity_parts: row
             .get("identity_parts")
             .map(|parts| parts.as_array().unwrap().iter().map(typed_part).collect()),
+        identity_retained: row.get("identity_retained").is_some_and(|v| v == true),
         cost_usd: opt_string(row, "cost_usd"),
         input_cost_usd: opt_string(row, "input_cost_usd"),
         output_cost_usd: opt_string(row, "output_cost_usd"),
@@ -607,6 +608,17 @@ fn w0_r5_cap_fallbacks_match_bodies() {
         grow(target);
         grow(&mut built.model_usage[0]);
         let result = identity::apply(&mut built, &contributions).unwrap();
+        if tagged == "new-cap-evidence-16" {
+            // Revised cap policy: this two-hour body can retain the newest
+            // eight keys; W0's old whole-item fallback is no longer required.
+            assert!(matches!(result, Tagged::Sent { refusals: 1 }), "{result:?}");
+            assert!(built.usage_buckets[0].model_usage[0].identity_parts.is_none());
+            assert!(built.usage_buckets[1].model_usage[0].identity_parts.is_some());
+            assert_eq!(built.request_evidence.len(), 8);
+            assert_eq!(identity::semantic_leaf(&built)["refused"], true);
+            sticky_assert_reconciled(&built);
+            continue;
+        }
         let Tagged::Fallback { refusals, .. } = result else {
             panic!("{tagged}: {result:?}")
         };
@@ -867,7 +879,11 @@ fn builder_enforces_the_declared_parts_per_item_cap() {
                     bucket_start: bucket_start.clone(),
                     row_key: row_key_from_model_usage(&row),
                     usage: holder_usage(&one, None),
-                    identity: telemetry(char::from(b'a' + login), 'd'),
+                    // All eleven keys must be valid lowercase hex. The old
+                    // a..k spelling made g..k refusal shares instead of keys.
+                    identity: RequestIdentity::Tagged(AuthorityKey {
+                        login: Some(format!("{login:064x}")), org: Some("d".repeat(64)), basis: identity::TELEMETRY,
+                    }),
                 });
             }
             rows.push(row);
@@ -896,6 +912,78 @@ fn builder_enforces_the_declared_parts_per_item_cap() {
     );
     assert_eq!(refusals, 200);
     assert!(identity::item_bytes(&item) <= identity::MAX_ITEM_BYTES);
+}
+
+#[test]
+fn over_cap_diagnostics_increment_each_reason_and_record_last_size() {
+    use identity::OverCap;
+    let reasons = BTreeSet::from([
+        OverCap::EvidenceEntries,
+        OverCap::AuthorityKeys,
+        OverCap::PartsPerRow,
+        OverCap::PartsPerItem,
+        OverCap::Rows,
+        OverCap::Bytes,
+    ]);
+    let (_, records) = crate::local_resource_diagnostics::capture(|| {
+        crate::local_resource_diagnostics::claude_identity_over_cap(&reasons, 700_000);
+        crate::local_resource_diagnostics::claude_identity_over_cap(&reasons, 800_000);
+    });
+    assert_eq!(records.len(), 2);
+    let before = &records[0]["counts"]["claude_request_identity_over_cap"];
+    let after = &records[1]["counts"]["claude_request_identity_over_cap"];
+    for label in [
+        "evidence_entries",
+        "authority_keys",
+        "parts_per_row",
+        "parts_per_item",
+        "rows",
+        "bytes",
+    ] {
+        assert_eq!(
+            after[label].as_u64().unwrap(),
+            before[label].as_u64().unwrap() + 1
+        );
+    }
+    assert_eq!(
+        records[1]["counts"]["claude_request_identity_last_over_cap_item_bytes"],
+        800_000
+    );
+    assert!(serde_json::to_vec(&records[1]).unwrap().len() < 2048);
+}
+
+#[test]
+fn byte_cap_diagnostic_measures_tagged_attempt_and_preserves_full_strip() {
+    let mut item = one_row_item(&[(10, None)]);
+    let request = contribution(&item, 10, None, login_key(OWNER_A));
+    identity::apply(&mut item, std::slice::from_ref(&request)).unwrap();
+    // Unrelated body bytes can leave no room even for a single tagged bucket.
+    item.session_display_name = Some("x".repeat(identity::MAX_ITEM_BYTES));
+    let attempted_bytes = identity::item_bytes(&item);
+    let mut expected = stripped(&item);
+    expected.provenance.collector = identity::COLLECTOR.to_owned();
+    expected.request_identity_refusals = 1;
+    expected.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &expected);
+    let (result, records) = crate::local_resource_diagnostics::capture(|| {
+        identity::apply(&mut item, &[request]).unwrap()
+    });
+    let Tagged::Fallback { over_cap, refusals } = result else {
+        panic!("{result:?}");
+    };
+    assert!(over_cap.contains(&identity::OverCap::Bytes));
+    assert_eq!(refusals, 1);
+    assert_eq!(
+        serde_json::to_vec(&item).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0]["counts"]["claude_request_identity_last_over_cap_item_bytes"],
+        attempted_bytes
+    );
+    assert!(records[0]["counts"]["claude_request_identity_over_cap"]["bytes"]
+        .as_u64()
+        .unwrap() > 0);
 }
 
 // --- Classification ---------------------------------------------------------
@@ -5133,3 +5221,6 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
     }
     let _ = fs::remove_dir_all(dir);
 }
+
+include!("claude_request_identity_window_tests.rs");
+include!("claude_request_identity_retained_tests.rs");

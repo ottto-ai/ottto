@@ -201,6 +201,8 @@ impl Page {
                     None,
                     None,
                     Some((&self.cache, &self.committed)),
+                    None,
+                    None,
                 )
                 .unwrap()
             });

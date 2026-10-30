@@ -76,6 +76,10 @@ the `sampled acquisition` text line: full-read reasons now come from
 Version 1 readers that need reasons must retain their text fallback while
 accepting version 1 binaries; there is no version negotiation.
 
+| Stage | Local fields | Meaning |
+| --- | --- | --- |
+| `claude_request_identity_over_cap` | `counts.claude_request_identity_over_cap`: `evidence_entries`, `authority_keys`, `parts_per_row`, `parts_per_item`, `rows`, `bytes`; `counts.claude_request_identity_last_over_cap_item_bytes` | Cumulative, saturating process counters per cap reason, plus the attempted tagged item's last budgeted compact wire byte size, including semantic framing. One attempt can increment several reasons; retries count separately. Recorded before budget recovery or full-strip fallback. Labels are append-only. No row content or identity is logged or uploaded. |
+
 Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
 full/tail/unchanged selection counts describe acquisition decisions, including
@@ -1348,3 +1352,148 @@ values.
 A later complete native parse still emits its exclusive body for a session with
 an earlier state-only row. An emitted total alone does not prove a server-side
 overwrite; backend authority rules independently govern successor acceptance.
+
+## Claude request-identity cap priority
+
+`native_collection_page.counts.identity_cap` contains sparse page observations
+for `retained_buckets`, `refused_new_buckets`, `accepted_state_unknown`, and
+`accepted_overflow.{same_as_parent,differs}`, `accepted_share_changed`,
+`unpriced_part_untagged`, `accepted_row_vanished` and
+`accepted_state_unknown_cause.{no_key,epoch_changed,untracked_session,incomplete}`.
+Labels are append-only.
+`accepted_share_changed` counts bucket observations where a previously accepted
+row gains a different authority or loses a tagged share/presence. Unchanged
+shares stay tagged; changed/missing shares become untagged with one refusal
+per affected row. Such a bucket is not counted as retained.
+`accepted_state_unknown_cause` splits each `accepted_state_unknown` attempt
+into exactly one cause: `no_key` (no usable attribution key, so share
+protection is off while shares are still tagged), `epoch_changed` (this pass
+discarded hints of a different key epoch), `untracked_session` (no hints for
+the session: never stored-body ACKed, evicted or invalid) or `incomplete`
+(whole buckets evicted at the share limit). `accepted_row_vanished` counts
+frozen tagged rows absent from their still-present accepted bucket, such as
+usage moved to a new row key by late effort or billing resolution; it is
+counts-only and changes no tag or money.
+
+The final derived rows mirror the receiver's identity-part money presence
+rule: a row carrying a cost field needs it on every part. A share whose
+contributing buckets all lack a cost its priced row carries has no exact
+value, and no zero or guessed identity stands in. That whole model row (top
+row and every bucket row) goes out untagged with unchanged money and one
+refusal per newly untagged bucket row; orphaned evidence is pruned and the
+wire is reconciled again. `unpriced_part_untagged` counts such model rows; a
+stripped row with frozen accepted shares also counts in
+`accepted_overflow.differs`.
+
+The default classifier always uses `differs`: a local starting login, creator
+hint or display cannot prove the backend's parent binding. Zero
+`same_as_parent` is explicit when this object is present. Counts describe tagging
+attempts, including retries, rather than distinct sessions.
+
+Within the existing item caps, acknowledged tagged buckets have priority over
+never-acknowledged buckets. If those accepted buckets overflow, a fitting open
+current-hour accepted bucket has priority; settled buckets are considered newest first, preferring to drop the oldest
+within the classifier's priority. One unencodable bucket does not erase
+independent accepted proof; the complete accepted set is checked first. Dropped usage goes out untagged with a
+row refusal; there is no upload hold. Top-level shares are refolded from exactly
+the kept bucket shares and the untagged remainder, as required by receiver
+reconciliation. Evidence is pruned and references remapped. Display names only
+accounts still proved by emitted bucket rows.
+
+Accepted overflow removes buckets from the collective set in that drop order,
+using reversible per-share sums and money-presence counts. A bucket need not
+fit alone: multiple buckets can collapse a temporary top-level parts row. Only an unavoidable representation
+lower bound can exclude an impossible bucket before the collective check.
+Row byte deltas and reference widths are updated incrementally; allocation
+does not serialize the growing item for each candidate or removal.
+
+Money follows the receiver's presence arithmetic independently for all five
+cost fields: add present values, ignore absent contributions, and leave the
+sum absent only if none was present. All eight counters sum exactly. There
+is no unpriced-witness rule: an absent contribution cannot erase known money.
+Re-admission can complete a shared top row when this collapses Parts to Single;
+failed row completions are cached until selection changes. The byte budget
+includes the existing semantic envelope, the largest policy flag encoding and
+a possible cache predecessor. The upload owner reserves any cache reconciliation
+growth once before selection, without changing the local cache patch. Full
+wire size is checked again after allocation; 640 KiB is unchanged.
+Individual shared-row completions are tried before their union, so unrelated
+new buckets sharing another row cannot prevent a fitting accepted completion.
+
+The destination-scoped upload progress stores class L hints: hashed session
+keys, sorted bucket starts, and SHA-256 row/authority fingerprints of each
+row's first accepted share set, including whether an untagged share was present.
+It never stores or reconstructs identities. Only stored-body ACKs update it;
+a later stripped/refused ACK cannot bless a new authority or missing presence.
+Restoration still requires current held proof. An always-missing sibling row
+has no accepted tagged fingerprint and is not spuriously refused.
+
+Limits are 16 sessions, 5,000 starts and 1,536 share-presence records per session.
+Each share record occupies 80 inline bytes on the requested 64-bit layout;
+the maximum requested-layout fixture is 2,628,072 bytes (below 3 MiB). Whole buckets are
+evicted from the hint ledger at the share limit, never partial share sets;
+`accepted_state_unknown` counts attempts using incomplete or missing state.
+Eviction, timestamp-only migration and older-decoder loss degrade to currently
+proved buckets that fit. The append-only progress field still defaults empty;
+invalid L hints do not invalidate neighbouring billing ACKs. No wire cap or
+backend rule changes.
+
+The pure `measure_identity_cap(item, accepted_state)` hook returns
+`tagged_recent_buckets`, `refused_recent_buckets`, `accepted_retained`,
+`accepted_overflow` and `item_bytes` without reading evidence, logging or
+uploading. Here recent means the currently proved, never-accepted candidate
+buckets; already stripped proof cannot be recovered from the hint ledger.
+
+Upstream authority-key allocation loss remains fail-closed: inherited partitions
+are not reclassified as request proof by budget recovery or a uniform starting-account
+retry. Only an intact current grouping can enter the cap allocator.
+
+### Option (ii): `identity_retained` bucket rows
+
+Off unless the activity hint carries exactly
+`session_request_identity_retained_contract: "session_request_identity_retained:v1"`;
+any other value keeps the bodies above byte-identical. When on, the backend
+retains per-row proof, so the accepted priority is not used: fresh tags take
+the plain newest-first order within the unchanged caps.
+
+A bucket row enters the local proved-row ledger only when a stored-body entity
+ACK (no `unchanged_basis`) covers a body where that row carried a positive tag,
+only while the capability is on, and only when that ACK declares a body witness
+version and its digest equals the local body witness of a body that has a
+public witness version (context curve, session account evidence or cache
+observations), so the ACK validator also checked the exact version. The
+ledger keeps truncated keyed digests of the row key and of that proof
+(authorities plus the eight counts and five costs); later positive proof
+replaces it. Per revision, a proved row whose current proof equals the ACKed
+proof in a closed hour, or whose transcript no longer proves it, is sent
+untagged with full amounts and `identity_retained: true`; it is not a refusal.
+Different proof, the open hour and never-proved rows get fresh tags. A row is
+never both tagged and marked; top-level rows are never marked. If the
+untagged fallback cannot fit every marker beside the stripped body, it keeps
+the newest that fit and counts each dropped proved row as a refusal.
+
+Before any upload, a proved row that the outgoing body freshly tags with a
+different proof becomes a proof-free tombstone, and progress is saved before
+the request, so a lost reply cannot leave a stale proof that a later marker
+would honour. While that tombstone stands, a row the transcript no longer
+proves is a counted refusal; the replacement's ACK replaces it.
+A stored-body ACK's optional `retained_proof_missing` bucket starts remove that
+body's marked rows, so a later revision re-tags them through the same
+allocator. A destination namespace or historical replay generation change
+clears all proved rows, as do key rotation and session eviction (the class L
+last-ACK LRU above). Limits: 1,024 proved rows per session, persisted as
+versioned base64 of 73-byte records, and 64 pending missing buckets (diagnostic
+only). Each proved record also stores the proving revision's optional row-level
+account hash (class H, bounded and erased with the session). Login markers resend
+that ACK-bound hash for grain only; parts markers have no hash. Old records without
+hash provenance fail closed to fresh tags. Markers require contract 6
+(`claude_request_owned_usage:v1`); contract-5-only bodies send fresh tags.
+Rows evicted at the proof cap also send fresh tags through the usual caps. At every cap the progress JSON stays below 8 MiB and the
+requested-layout maximum below 4 MiB.
+
+Sparse `identity_cap` counters, omitted while zero: `retained_marker_rows`,
+`retained_proof_missing_received`, `retained_set_cleared`, `proved_rows_capped`
+(rows not retained at the proof cap), and
+`retained_missing_unfit` (a missing-proof bucket whose fresh proof did not fit
+and kept today's untagged/refused rule). `accepted_share_changed` also counts
+proved rows sent with different proof.

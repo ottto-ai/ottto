@@ -152,6 +152,7 @@ fn exact_ack(items: Vec<SnapshotItem>) -> Result<crate::snapshot_client::Snapsho
                 head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
                 head_challenge: None,
                 unchanged_basis: None,
+                retained_proof_missing: Vec::new(),
             });
     }
     response.validate_entity_ack_with_head_cas(&request, false)?;
@@ -790,6 +791,77 @@ fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
         main_posts,
         all.len(),
         "all admitted bodies converge without losing remaining work"
+    );
+}
+
+/// Every source binds the ledger each cycle. The reread copy has no key, and a
+/// rebind that discarded hints is unsaved until the next ACK page.
+#[test]
+fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
+    let hint = serde_json::json!({
+        "source_session_id": "synthetic",
+        "provenance": {"collector": crate::snapshots::claude_request_identity::COLLECTOR},
+        "request_evidence": [{"identity_basis": "telemetry_login"}],
+        "usage_buckets": [{"bucket_start": "2026-09-01T10:00:00Z", "model_usage": [
+            {"model": "claude-synthetic", "evidence_ref": 0, "account_identifier_hash": "a".repeat(64)}
+        ]}],
+    });
+    let cases = [
+        ("bound with a saved hint", Some([0x42; 32]), true, None),
+        ("bound with no hints", Some([0x42; 32]), false, None),
+        (
+            "rotated key, unsaved",
+            Some([0x41; 32]),
+            true,
+            Some(Some([0x42; 32])),
+        ),
+        (
+            "no key this cycle, unsaved",
+            Some([0x41; 32]),
+            true,
+            Some(None),
+        ),
+    ];
+    let mut refused = Vec::new();
+    for cause in [
+        UnsettledUploadCause::Shed,
+        UnsettledUploadCause::UploadError,
+    ] {
+        for (case, saved_key, record, rebind) in cases {
+            let f = AckFixture::new(true);
+            let (index, mut progress) = f.load();
+            progress.accepted_identity_buckets.bind_test_key(saved_key);
+            progress.accepted_identity_buckets.set_retained_enabled(true);
+            if record {
+                progress.accepted_identity_buckets.record(&hint);
+                assert!(!progress.accepted_identity_buckets.is_empty(), "{case}");
+            }
+            progress.save(&f.progress_path).unwrap();
+            if let Some(key) = rebind {
+                progress.accepted_identity_buckets.bind_test_key(key);
+                assert!(progress.accepted_identity_buckets.is_empty(), "{case}");
+            }
+            if let Err(error) = checkpoint_partial_snapshot_index_with_comparison(
+                &index,
+                &index,
+                &progress,
+                std::slice::from_ref(&f.item),
+                None,
+                &BTreeSet::new(),
+                &f.index_path,
+                &f.progress_path,
+                || Ok(()),
+                None,
+                None,
+                Some(cause),
+            ) {
+                refused.push(format!("{cause:?}, {case}: {error:#}"));
+            }
+        }
+    }
+    assert!(
+        refused.is_empty(),
+        "partial checkpoints refused: {refused:#?}"
     );
 }
 
