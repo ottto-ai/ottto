@@ -183,6 +183,19 @@ pub(crate) fn claude_terminal_authority(_index: &ScanIndex, offered: bool, _wind
     offered && !claude_terminal_off()
 }
 
+// Main's independent acceptance and a current per-file ACK are both required.
+// This grants no source/census authority and cannot protect held or listed debt.
+fn terminal_off_stale_member_can_skip_clear(index: &ScanIndex, key: &str, entry: &ScanIndexEntry) -> bool {
+    if !claude_terminal_off() {
+        return false;
+    }
+    #[cfg(test)]
+    if KEEP_STALE_CLAUDE_FAMILY_REARM_FOR_TEST.with(std::cell::Cell::get) {
+        return false;
+    }
+    claude_stale_member_independently_accepted(index, key, entry) && index.receipt_matches(entry)
+}
+
 fn claude_redundant_stale_clear_suppressed(index: &ScanIndex) -> bool {
     // Only redundant stale-window debt; independent semantic/context clears
     // and every already-empty fingerprint remain owned by their usual gates.

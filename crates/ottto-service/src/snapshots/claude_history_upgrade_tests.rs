@@ -3998,3 +3998,84 @@ fn terminal_off_on_copies_read_under_a_closed_duplicate_fence_settle_after_one_w
     assert_eq!(accepted_total() / APPENDED_INPUT, 1);
     let _ = fs::remove_dir_all(root);
 }
+
+// R11: each refusal to skip has its own control. All receipts below come
+// through the real validated uploader, never a synthetic persisted receipt.
+#[test]
+fn terminal_off_r11_current_exact_ack_skips_semantic_clear_and_base_keeps_it() {
+    let _on = ClaudeTerminalOffForTest::enabled();
+    assert!(claude_terminal_off());
+    let (home, _, index) = families("r11-accepted", 1);
+    for (key, entry) in &index.files {
+        assert!(terminal_off_stale_member_can_skip_clear(&index, key, entry));
+        let _base = KeepStaleClaudeFamilyRearmForTest::new();
+        assert!(!terminal_off_stale_member_can_skip_clear(
+            &index, key, entry
+        ));
+    }
+    let mut changed = index.clone();
+    changed.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-2".into());
+    for (key, entry) in &changed.files {
+        assert!(!terminal_off_stale_member_can_skip_clear(
+            &changed, key, entry
+        ));
+    }
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn terminal_off_r11_ackless_member_keeps_semantic_clear() {
+    let _on = ClaudeTerminalOffForTest::enabled();
+    assert!(claude_terminal_off());
+    let (home, _, mut index) = families("r11-ackless", 1);
+    index.accepted_snapshot_fingerprints.clear();
+    for (key, entry) in &index.files {
+        assert!(!terminal_off_stale_member_can_skip_clear(
+            &index, key, entry
+        ));
+    }
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn terminal_off_r11_held_member_keeps_semantic_clear() {
+    let _on = ClaudeTerminalOffForTest::enabled();
+    assert!(claude_terminal_off());
+    let (home, _, mut index) = families("r11-held", 1);
+    index.claude_reemission_exclusions = ReemissionExclusions::with_state(ListState::Unreadable);
+    for (key, entry) in &index.files {
+        assert!(!terminal_off_stale_member_can_skip_clear(
+            &index, key, entry
+        ));
+    }
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn terminal_off_r11_listed_member_keeps_semantic_clear() {
+    let _on = ClaudeTerminalOffForTest::enabled();
+    assert!(claude_terminal_off());
+    let (home, _, mut index) = families("r11-listed", 1);
+    index.claude_reemission_exclusions =
+        ReemissionExclusions::parse(format!("{}\n", digest(&session(0))).as_bytes());
+    for (key, entry) in &index.files {
+        assert!(!terminal_off_stale_member_can_skip_clear(
+            &index, key, entry
+        ));
+    }
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn terminal_off_r11_no_list_held_member_keeps_semantic_clear() {
+    let _on = ClaudeTerminalOffForTest::enabled();
+    assert!(claude_terminal_off());
+    let (home, _, mut index) = families("r11-no-list-held", 1);
+    index.claude_reemission_exclusions = ReemissionExclusions::with_state(ListState::NotInstalled);
+    for (key, entry) in &index.files {
+        assert!(!terminal_off_stale_member_can_skip_clear(
+            &index, key, entry
+        ));
+    }
+    let _ = fs::remove_dir_all(home);
+}

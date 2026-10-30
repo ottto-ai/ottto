@@ -258,7 +258,7 @@ impl ScanIndex {
         self.activate_quarantine_witness(source);
     }
 
-    fn receipt_matches(&self, entry: &ScanIndexEntry) -> bool {
+    pub(super) fn receipt_matches(&self, entry: &ScanIndexEntry) -> bool {
         entry
             .upload_context_receipt
             .as_ref()
