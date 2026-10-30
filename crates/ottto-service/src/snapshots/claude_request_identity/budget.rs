@@ -328,7 +328,12 @@ struct MoneyPlan {
     suppliers: Vec<Vec<usize>>,
 }
 impl MoneyPlan {
-    fn closure(&self, seeds: impl IntoIterator<Item = usize>, kept: &[bool]) -> Option<Vec<usize>> {
+    fn closure(
+        &self,
+        seeds: impl IntoIterator<Item = usize>,
+        kept: &[bool],
+        preferred: Option<usize>,
+    ) -> Option<Vec<usize>> {
         let mut pending = seeds.into_iter().collect::<Vec<_>>();
         let mut included = BTreeSet::new();
         let mut supplied = BTreeSet::new();
@@ -345,7 +350,11 @@ impl MoneyPlan {
                 {
                     continue;
                 }
-                pending.push(*self.suppliers[node].first()?);
+                pending.push(
+                    preferred
+                        .filter(|candidate| self.suppliers[node].contains(candidate))
+                        .or_else(|| self.suppliers[node].first().copied())?,
+                );
             }
         }
         Some(included.into_iter().collect())
@@ -676,7 +685,7 @@ pub(super) fn select(
     {
         item.provenance.collector = cycle_contract(true).to_owned();
     }
-    let base_bytes = item_bytes(item);
+    let base_bytes = grouping.item_bytes(item);
     if item.model_usage.len() > MAX_ROWS
         || item
             .usage_buckets
@@ -760,6 +769,9 @@ pub(super) fn select(
     // also collapse Parts to Single; cache failed completions until selection
     // changes, so one shared long row is not retried for every bucket.
     let mut failed_completions = BTreeSet::new();
+    // Bound alternative closures over the whole item, not once per bucket.
+    // Trials use row deltas, never whole-item serialization.
+    let mut witness_trials_left = super::accepted::MAX_BUCKETS;
     for &index in &order {
         if kept[index] || !plan.possible[index] {
             continue;
@@ -772,23 +784,37 @@ pub(super) fn select(
         own_rows.sort_unstable();
         own_rows.dedup();
         let mut choices = vec![vec![index]];
-        if let Some(companions) = plan.closure([index], &kept) {
+        if let Some(companions) = plan.closure([index], &kept, None) {
             if companions.len() > 1 {
                 choices.push(companions);
             }
         }
+        let mut completion = None;
         if !failed_completions.contains(&own_rows) {
             let seeds = own_rows
                 .iter()
                 .flat_map(|&row| row_buckets[row].iter().copied());
-            if let Some(completion) = plan.closure(seeds, &kept) {
-                if completion.len() > 1 {
-                    choices.push(completion);
-                }
-            }
+            completion = plan
+                .closure(seeds, &kept, None)
+                .filter(|members| members.len() > 1);
         }
-        let mut admitted = false;
-        for mut members in choices {
+        let mut alternatives = plan.required[index]
+            .iter()
+            .flat_map(|&node| plan.suppliers[node].iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|&supplier| !kept[supplier])
+            .collect::<Vec<_>>();
+        alternatives.sort_by_key(|&supplier| rank[supplier]);
+        let alternatives = alternatives
+            .into_iter()
+            .take(witness_trials_left)
+            .filter_map(|supplier| {
+                witness_trials_left -= 1;
+                plan.closure([index], &kept, Some(supplier))
+            });
+        let mut admitted = None;
+        for mut members in choices.into_iter().chain(alternatives).chain(completion) {
             members.sort_by_key(|&member| rank[member]);
             let mut trial = selection.clone();
             let mut added = Vec::new();
@@ -806,16 +832,17 @@ pub(super) fn select(
             if !valid || fits(item, &trial, base_bytes, prior_refusals).is_none() {
                 continue;
             }
+            admitted = Some((trial, added));
+            break;
+        }
+        if let Some((trial, added)) = admitted {
             selection = trial;
             for (member, identities) in added {
                 kept[member] = true;
                 bucket_identities[member] = identities;
             }
-            admitted = true;
             failed_completions.clear();
-            break;
-        }
-        if !admitted {
+        } else {
             failed_completions.insert(own_rows);
         }
     }
@@ -849,7 +876,7 @@ pub(super) fn select(
         prior_refusals.saturating_add(selection.refused_rows),
     );
     let mut measurement = Measurement {
-        item_bytes: item_bytes(item),
+        item_bytes: grouping.item_bytes(item),
         ..Default::default()
     };
     if measurement.item_bytes > MAX_ITEM_BYTES {

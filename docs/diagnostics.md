@@ -1178,6 +1178,12 @@ wire size is checked again after allocation; the 640 KiB wire cap is unchanged.
 Sizing uses fixed-width hash placeholders with the existing envelope serializer,
 avoiding a second semantic-hash computation solely to count bytes. Fixtures
 compare its size with real upload envelopes, including optional components.
+The upload owner projects cache reconciliation against its accepted predecessor
+once per item and reserves any growth before identity selection; the local
+cache patch is left intact. Required money companions try deterministic
+alternative witnesses before refusing the preferred bucket, with at most
+5,000 alternative trials shared by the item and no full-item serialization
+per trial.
 
 The destination-scoped upload progress stores class L priority hints only:
 hashed session keys and sorted bucket-start timestamps, with no identities.

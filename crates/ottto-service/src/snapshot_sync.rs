@@ -1062,6 +1062,26 @@ fn prepare_snapshot_cache_for_upload(
     );
 }
 
+/// Reserve growth from the ACKed cache predecessor without changing the local
+/// patch. Missing-head/legacy fencing can only remove this projected material.
+fn identity_cache_wire_reserve(
+    snapshot: &SnapshotItem,
+    progress: &SnapshotUploadProgress,
+) -> usize {
+    if snapshot.cache_observations.is_none()
+        && !progress
+            .accepted_cache_heads
+            .contains_key(&cache_session_key(&snapshot.source_session_id))
+    {
+        return 0;
+    }
+    let mut projected = snapshot.clone();
+    prepare_snapshot_cache_for_upload(&mut projected, progress, true, false, &BTreeSet::new());
+    crate::snapshots::claude_request_identity::item_bytes(&projected).saturating_sub(
+        crate::snapshots::claude_request_identity::item_bytes(snapshot),
+    )
+}
+
 fn effective_snapshot_upload_body_witness(
     snapshot: &SnapshotItem,
     progress: &SnapshotUploadProgress,
@@ -6945,6 +6965,13 @@ fn finish_sync_source(
             &index,
             machine_id,
         );
+        let reserve_cache_bytes = |item: &SnapshotItem| {
+            if cache_observations_enabled {
+                identity_cache_wire_reserve(item, &upload_progress)
+            } else {
+                0
+            }
+        };
         let applied = try_apply_claude_local_evidence_to_scan_with_comparison(
             support_dir,
             &mut scan_result,
@@ -6954,6 +6981,7 @@ fn finish_sync_source(
             native_comparison_lease.as_ref(),
             Some((&daemon.transcript_cache, &committed_index)),
             Some(&upload_progress.accepted_identity_buckets),
+            Some(&reserve_cache_bytes),
         );
         let (disposition, census_withheld, stats) = match applied {
             Ok(applied) => applied,
@@ -8836,6 +8864,7 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
         lease,
         None,
         None,
+        None,
     )
     .expect("ordinary or logical comparison evidence fixture has no resource refusal")
 }
@@ -8858,6 +8887,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
     retained: Option<(&crate::snapshots::sampled_scan::SharedCache, &ScanIndex)>,
     accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
+    wire_size_reservation: Option<&dyn Fn(&SnapshotItem) -> usize>,
 ) -> std::result::Result<
     (
         crate::snapshots::ClaudeUsageAuthorityDisposition,
@@ -9116,6 +9146,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .with_status_coverage(crate::claude_status_coverage::snapshot())
         .with_native_originals(&originals)
         .with_accepted_buckets(accepted_identity_buckets)
+        .with_wire_size_reservation(wire_size_reservation)
     });
     if !full_rearm_evidence_complete {
         index.note_claude_full_rearm_evidence_gap(&scan_result.census_window_end);
@@ -11665,6 +11696,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let owner = std::sync::Arc::new(lifecycle::Lifecycle::default());
@@ -11681,6 +11713,7 @@ mod tests {
                 None,
                 completion.as_mut(),
                 Some(&lease),
+                None,
                 None,
                 None,
             )

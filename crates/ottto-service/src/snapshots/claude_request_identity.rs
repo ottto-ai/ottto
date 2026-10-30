@@ -406,6 +406,8 @@ pub(crate) struct Grouping {
     keys: BTreeSet<AuthorityKey>,
     keys_over_cap: bool,
     upstream_proof_lost: bool,
+    /// Additional cache-reconciliation wire bytes, projected once before tags.
+    extra_wire_bytes: usize,
     failed: Option<Ineligible>,
     /// Requests a `RequestSink` admitted: those the item's transcript holds,
     /// and telemetry-only (auxiliary) ones the reported rebuild added.
@@ -530,6 +532,7 @@ impl Grouping {
             keys: BTreeSet::new(),
             keys_over_cap: false,
             upstream_proof_lost: false,
+            extra_wire_bytes: 0,
             failed: None,
             transcript_requests: 0,
             telemetry_only_requests: 0,
@@ -538,6 +541,10 @@ impl Grouping {
             desktop_recent: crate::desktop_recent::RecentActivity::default(),
             latest: LatestRequests::default(),
         }
+    }
+
+    fn item_bytes(&self, item: &SnapshotItem) -> usize {
+        item_bytes(item).saturating_add(self.extra_wire_bytes)
     }
 
     #[cfg(test)]
@@ -750,7 +757,18 @@ pub(crate) fn apply_with_accepted_for_test(
     contributions: &[Contribution],
     accepted: &AcceptedBuckets,
 ) -> Result<Tagged, Ineligible> {
+    apply_with_reserved_bytes_for_test(item, contributions, accepted, 0)
+}
+
+#[cfg(test)]
+pub(crate) fn apply_with_reserved_bytes_for_test(
+    item: &mut SnapshotItem,
+    contributions: &[Contribution],
+    accepted: &AcceptedBuckets,
+    extra_wire_bytes: usize,
+) -> Result<Tagged, Ineligible> {
     let mut grouping = Grouping::new(bucket_row_count(item));
+    grouping.extra_wire_bytes = extra_wire_bytes;
     for c in contributions {
         grouping.add_at(
             &c.bucket_start,
@@ -962,7 +980,7 @@ fn apply_grouped_with_accepted(
     // byte counts and closed reason labels enter local diagnostics. Recovery
     // below must satisfy the same wire bounds and reconciliation rules.
     install(item, &evidence, top_identities, bucket_identities, refusals);
-    let attempted_bytes = item_bytes(item);
+    let attempted_bytes = grouping.item_bytes(item);
     if attempted_bytes > MAX_ITEM_BYTES {
         over_cap.insert(OverCap::Bytes);
     }
@@ -2881,6 +2899,7 @@ pub(crate) struct ScanEvidence<'a> {
     /// unambiguous native account used by local Desktop activity.
     native_originals: Option<&'a BTreeMap<String, super::SessionAccountEvidence>>,
     accepted_buckets: Option<&'a AcceptedBuckets>,
+    wire_size_reservation: Option<&'a dyn Fn(&SnapshotItem) -> usize>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2946,6 +2965,14 @@ impl<'a> ScanEvidence<'a> {
 
     pub(crate) fn with_accepted_buckets(mut self, accepted: Option<&'a AcceptedBuckets>) -> Self {
         self.accepted_buckets = accepted;
+        self
+    }
+
+    pub(crate) fn with_wire_size_reservation(
+        mut self,
+        reservation: Option<&'a dyn Fn(&SnapshotItem) -> usize>,
+    ) -> Self {
+        self.wire_size_reservation = reservation;
         self
     }
 
@@ -4180,13 +4207,16 @@ fn tag_item(
         if keeps_markerless_account(item) {
             return None;
         }
-        let grouping = request_owned_grouping(item)?;
+        let mut grouping = request_owned_grouping(item)?;
         let lifecycle = (
             item.source_started_at.clone(),
             item.source_ended_at.clone(),
             item.source_last_activity_at.clone(),
         );
         normalize_activity(item);
+        grouping.extra_wire_bytes = evidence
+            .wire_size_reservation
+            .map_or(0, |reserve| reserve(item));
         let tagged = apply_grouped_with_accepted(item, grouping, accepted);
         if tagged.is_err() {
             (
@@ -4247,6 +4277,9 @@ fn tag_item(
         item.source_last_activity_at.clone(),
     );
     normalize_activity(item);
+    grouping.extra_wire_bytes = evidence
+        .wire_size_reservation
+        .map_or(0, |reserve| reserve(item));
     let desktop_recent = std::mem::take(&mut grouping.desktop_recent);
     let owned = !grouping.unowned_request;
     let tagged = apply_grouped_with_accepted(item, grouping, accepted);

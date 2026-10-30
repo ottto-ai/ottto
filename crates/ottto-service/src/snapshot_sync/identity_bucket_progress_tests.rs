@@ -107,3 +107,55 @@ fn only_a_stored_body_ack_records_bucket_keys() {
         );
     }
 }
+
+#[test]
+fn identity_budget_reserves_predecessor_retractions_without_mutating_local_patch() {
+    use crate::snapshots::cache_observations::CacheObservations;
+    let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    item.cache_observations = Some(CacheObservations {
+        schema_version: 1,
+        operations: vec![],
+        coverage: "complete".into(),
+        omitted_observation_count: Some(0),
+    });
+    let before = item.cache_observations.clone();
+    let mut progress = progress();
+    progress.accepted_cache_states.insert(
+        cache_session_key(&item.source_session_id),
+        json!({"observations":(0..32).map(|n| json!({"event_id":format!("cache:{n:064x}")})).collect::<Vec<_>>()}),
+    );
+    let reserved = identity_cache_wire_reserve(&item, &progress);
+    assert!(reserved > 2_000);
+    assert_eq!(item.cache_observations, before);
+    let mut projected = item.clone();
+    prepare_snapshot_cache_for_upload(&mut projected, &progress, true, false, &BTreeSet::new());
+    assert_eq!(
+        projected
+            .cache_observations
+            .as_ref()
+            .unwrap()
+            .operations
+            .len(),
+        32
+    );
+    assert_eq!(
+        crate::snapshots::claude_request_identity::item_bytes(&projected),
+        crate::snapshots::claude_request_identity::item_bytes(&item) + reserved,
+    );
+    // The upload owner attaches a known predecessor even with no cache patch.
+    item.cache_observations = None;
+    item.cache_observations_state = None;
+    item.cache_requests.clear();
+    item.cache_base_head_etag = None;
+    progress
+        .accepted_cache_heads
+        .insert(cache_session_key(&item.source_session_id), "a".repeat(64));
+    let reserved = identity_cache_wire_reserve(&item, &progress);
+    assert!(reserved > 64);
+    let mut projected = item.clone();
+    prepare_snapshot_cache_for_upload(&mut projected, &progress, true, false, &BTreeSet::new());
+    assert_eq!(
+        crate::snapshots::claude_request_identity::item_bytes(&projected),
+        crate::snapshots::claude_request_identity::item_bytes(&item) + reserved,
+    );
+}

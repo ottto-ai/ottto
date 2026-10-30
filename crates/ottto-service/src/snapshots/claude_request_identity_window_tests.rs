@@ -1176,3 +1176,142 @@ fn sticky_protected_current_money_keeps_its_old_unpriced_companion_over_a_middle
 fn sticky_re_admission_completes_top_rows_atomically_when_single_buckets_cannot_fit() {
     sticky_assert_money_companions_survive_eviction(false);
 }
+
+#[test]
+fn sticky_cache_retractions_are_budgeted_before_retaining_identity_parts() {
+    let (mut item, mut proof) = sticky_session(24);
+    item.session_display_name = Some("x".into());
+    item.workspace_display_label = Some("x".into());
+    item.repository_label = Some("x".into());
+    item.cache_observations = Some(cache_observations::CacheObservations {
+        schema_version: 1,
+        operations: vec![],
+        coverage: "complete".into(),
+        omitted_observation_count: Some(0),
+    });
+    let prior = json!({"observations":(0..32)
+        .map(|n| json!({"event_id":format!("cache:{n:064x}")})).collect::<Vec<_>>()});
+    let accepted = identity::AcceptedBuckets::default();
+    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    let clean = stripped(&item);
+    let overhead = identity::item_bytes(&item) - identity::item_bytes(&clean);
+    let (mut padded, filler) = sticky_pad_to_bytes(&clean, identity::MAX_ITEM_BYTES - overhead);
+    proof.extend(filler);
+    let mut unreserved = padded.clone();
+    identity::apply_with_accepted_for_test(&mut unreserved, &proof, &accepted).unwrap();
+    assert_eq!(identity::item_bytes(&unreserved), identity::MAX_ITEM_BYTES);
+    prepare_cache_observations(&mut unreserved, Some(&prior));
+    assert!(identity::item_bytes(&unreserved) > identity::MAX_ITEM_BYTES);
+
+    let mut projected = padded.clone();
+    prepare_cache_observations(&mut projected, Some(&prior));
+    let reserved = identity::item_bytes(&projected) - identity::item_bytes(&padded);
+    identity::apply_with_reserved_bytes_for_test(&mut padded, &proof, &accepted, reserved).unwrap();
+    assert!(sticky_tagged(&padded.usage_buckets[23].model_usage[0]));
+    let refused = padded.usage_buckets[..24]
+        .iter()
+        .filter(|bucket| !sticky_tagged(&bucket.model_usage[0]))
+        .count();
+    assert!(refused > 0);
+    assert_eq!(padded.request_identity_refusals, refused as u64);
+    prepare_cache_observations(&mut padded, Some(&prior));
+    assert_eq!(
+        padded.cache_observations.as_ref().unwrap().operations.len(),
+        32
+    );
+    sticky_assert_reconciled(&padded);
+}
+
+#[test]
+fn sticky_current_bucket_tries_a_smaller_alternative_money_witness() {
+    let mut requests = vec![
+        display_request(Some("max"), HOUR_10, 1, login_key(OWNER_A), Some(HOUR_10)),
+        display_request(Some("max"), HOUR_11, 1, login_key(OWNER_A), Some(HOUR_11)),
+        display_request(
+            Some("max"),
+            "2026-09-01T12:00:00Z",
+            1,
+            login_key(OWNER_A),
+            Some("2026-09-01T12:00:00Z"),
+        ),
+        display_request(
+            Some("max"),
+            "2026-09-01T09:00:00Z",
+            1,
+            RequestIdentity::Missing,
+            None,
+        ),
+    ];
+    for plan in ["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7"] {
+        requests.push(display_request(
+            Some(plan),
+            HOUR_11,
+            1,
+            login_key(D64),
+            Some(HOUR_11),
+        ));
+    }
+    let (mut item, timed) = display_item(&requests);
+    item.collected_at = "2026-09-01T12:05:00Z".into();
+    item.session_display_name = Some("x".into());
+    item.workspace_display_label = Some("x".into());
+    item.repository_label = Some("x".into());
+    let mut proof = timed.into_iter().map(|(c, _)| c).collect::<Vec<_>>();
+    for share in &mut proof {
+        share.usage.costs = UsageCosts {
+            observed: true,
+            reported: false,
+            ..Default::default()
+        };
+    }
+    item.usage_buckets[3].model_usage[0].cost_usd = Some("0.000001".into());
+    proof[2].usage.costs = UsageCosts {
+        observed: true,
+        reported: true,
+        total: Some(1_000_000),
+        ..Default::default()
+    };
+    let mut accepted = identity::AcceptedBuckets::default();
+    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(&item).unwrap());
+    let clean = stripped(&item);
+    let extra = |small_witness: bool| {
+        let mut candidate = clean.clone();
+        let mut shares = proof.clone();
+        for share in &mut shares {
+            if (share.bucket_start == HOUR_11 && small_witness)
+                || (share.bucket_start == HOUR_10 && !small_witness)
+            {
+                share.identity = RequestIdentity::Missing;
+            }
+        }
+        identity::apply_with_accepted_for_test(
+            &mut candidate,
+            &shares,
+            &identity::AcceptedBuckets::default(),
+        )
+        .unwrap();
+        candidate.request_identity_refusals = if small_witness { 9 } else { 1 };
+        sticky_assert_reconciled(&candidate);
+        identity::item_bytes(&candidate) - identity::item_bytes(&clean)
+    };
+    let headroom = extra(true);
+    assert!(extra(false) > headroom);
+    let (mut padded, filler) = sticky_pad_to_bytes(&clean, identity::MAX_ITEM_BYTES - headroom);
+    proof.extend(filler);
+    identity::apply_with_accepted_for_test(&mut padded, &proof, &accepted).unwrap();
+    assert!(
+        sticky_tagged(&padded.usage_buckets[1].model_usage[0]),
+        "small old witness"
+    );
+    assert!(padded.usage_buckets[2]
+        .model_usage
+        .iter()
+        .all(|row| !sticky_tagged(row)));
+    assert!(
+        sticky_tagged(&padded.usage_buckets[3].model_usage[0]),
+        "protected current hour"
+    );
+    assert_eq!(padded.request_identity_refusals, 9);
+    sticky_assert_reconciled(&padded);
+}
