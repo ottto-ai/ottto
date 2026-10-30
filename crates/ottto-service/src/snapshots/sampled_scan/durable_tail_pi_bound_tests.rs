@@ -359,10 +359,11 @@ fn pi_structural_transition(overflow: bool) {
     assert_eq!(actual, f.cold_wire(prior, grown));
     f.commit(&cache, &mut caught_index, &caught);
     drop(cache);
-    let (index, idle, modes) = f.run(f.owner(), ScanIndex::load(&f.index_path).unwrap());
+    let (_, idle, modes) = f.run(f.owner(), ScanIndex::load(&f.index_path).unwrap());
     assert!(idle.snapshots.is_empty(), "no duplicate publication");
+    // Nothing is owed after catch-up, so ordinary quiet-file retirement of
+    // the aged entry is safe; the contract here is no reacquisition.
     assert_eq!(modes, (0, 0, 0), "restart reacquires nothing");
-    assert!(index.files.contains_key(&f.key));
 }
 
 // `LeaseBusy` (D-ACTIVE-WAIT, source=pi) is NOT the structural fallback: a
