@@ -1,6 +1,10 @@
 // Lead B condition b: synthetic v1 custody -> composed rows -> mapper hydrate
 // -> real scan, identity qualification, finalization and upload encoding.
+use super::money_equivalence_tests::{
+    compare_claude_uploads, corpus, finish_claude_pages, grow, input_clock, receipt_with_output,
+};
 use super::*;
+use serde_json::Value;
 
 fn tagged_api(
     request: &str,
@@ -275,7 +279,12 @@ fn condition_b(class: &str) {
             }
         } else {
             let body = compare_claude_uploads(&pages);
-            receipt(&format!("v2-{class}"), &[body]);
+            receipt_with_output(
+                &format!("v2-{class}"),
+                &[body],
+                "OTTTO_STATE_V2_MONEY_EQUIVALENCE_OUTPUT",
+                "STATE_V2_MONEY_EQUIVALENCE",
+            );
             // Receiver UNCHANGED is a distinct settlement: compare the real
             // POST and retained progress without pretending it was a stored ACK.
             let unchanged = pages.each_ref().map(|page| {
