@@ -4137,25 +4137,28 @@ pub(crate) fn finish_page(
         }
         true
     });
-    // Literal guards inspect the final request-owned bodies, after apply.
-    // A locally rebuilt body vetoed by history is not a corrected family.
-    let guard = index.claude_literal_guard(items);
-    let corrected_families = items
-        .iter()
-        .filter(|item| {
-            telemetry == TelemetryRead::Loaded
-                && !super::super::claude_reemission_stop_latched()
-                && !withheld.contains(&item.source_session_id)
-                && corrected_sessions.contains(&item.source_session_id)
-                && index.claude_history_emission.permits(item, &guard)
-        })
-        .map(|item| claude_snapshot_family_root_ref(item).to_owned())
-        .collect::<BTreeSet<_>>();
-    if !corrected_families.is_empty() {
-        let mut counts = Counts::default();
-        counts.0[23] = corrected_families.len() as u64;
-        diag("copy_prefix_families_corrected", counts.0[23]);
-        record_counts(counts);
+    // The guard walks every indexed file; build it only for a corrected session.
+    if !corrected_sessions.is_empty() {
+        // Literal guards inspect the final request-owned bodies, after apply.
+        // A locally rebuilt body vetoed by history is not a corrected family.
+        let guard = index.claude_literal_guard(items);
+        let corrected_families = items
+            .iter()
+            .filter(|item| {
+                telemetry == TelemetryRead::Loaded
+                    && !super::super::claude_reemission_stop_latched()
+                    && !withheld.contains(&item.source_session_id)
+                    && corrected_sessions.contains(&item.source_session_id)
+                    && index.claude_history_emission.permits(item, &guard)
+            })
+            .map(|item| claude_snapshot_family_root_ref(item).to_owned())
+            .collect::<BTreeSet<_>>();
+        if !corrected_families.is_empty() {
+            let mut counts = Counts::default();
+            counts.0[23] = corrected_families.len() as u64;
+            diag("copy_prefix_families_corrected", counts.0[23]);
+            record_counts(counts);
+        }
     }
     diag("withheld_sessions", withheld.len() as u64);
     // A withheld session is read again: its decisions count on that page.

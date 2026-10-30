@@ -45,7 +45,7 @@ fn activate_mode(index: &mut ScanIndex, base: &str, enabled: bool, wire: bool) {
     let mode = crate::snapshot_sync::resumed_prefix_upload_context(base.into(), enabled);
     let mode = crate::snapshot_sync::copy_unproven_upload_context(mode, wire);
     index.activate_file_upload_context(SnapshotSource::ClaudeCode, mode);
-    index.copy_prefix_base_upload_context = Some(base.into());
+    index.set_copy_prefix_base_upload_context(Some(base.into()), enabled);
 }
 
 /// Drive ordinary selection and its real reader, observing body opens rather
@@ -121,6 +121,81 @@ fn mode_changes_read_and_upload_zero_unaffected_files() {
         .files
         .keys()
         .all(|key| index.file_upload_context_requires_adoption(key)));
+    fs::remove_dir_all(home).unwrap();
+}
+
+/// After an ON launch adopted its mode context, OFF launches over unchanged
+/// files read and upload nothing; once the base is re-adopted, main's
+/// receipt path (no base) takes over.
+#[test]
+fn off_launch_after_on_reads_and_uploads_nothing() {
+    let (home, root, mut index, _) = setup("copy-prefix-on-then-off");
+    let on = claude_request_money::e2::ResumedPrefixForTest::set(true);
+    activate_mode(&mut index, "ctx-1", true, false);
+    let on_context = index.active_upload_context_fingerprint.clone().unwrap();
+    let (next, _, opened) = walk(&root, index, &[]);
+    index = next;
+    assert!(opened.is_empty());
+    drop(on);
+    let _off = claude_request_money::e2::ResumedPrefixForTest::set(false);
+    for (adopted, base_kept) in [(on_context.as_str(), true), ("ctx-1", false)] {
+        super::super::e2_pipeline_scan_fixture::adopt_acked_census_for_test(&mut index, adopted);
+        activate_mode(&mut index, "ctx-1", false, false);
+        assert_eq!(index.copy_prefix_base_upload_context.is_some(), base_kept);
+        let (next, scan, opened) = walk(&root, index, &[]);
+        index = next;
+        assert!(opened.is_empty(), "OFF after ON opened unchanged bodies");
+        assert_eq!(scan.scanned_file_count, 0);
+        assert!(scan.snapshots.is_empty(), "nothing can reach the uploader");
+        assert!(index
+            .files
+            .keys()
+            .all(|key| !index.file_upload_context_requires_adoption(key)));
+    }
+    fs::remove_dir_all(home).unwrap();
+}
+
+/// An apply intent persisted under ON is neither dropped nor re-armed by an
+/// OFF launch's preparation, and the next ON launch reads it exactly once.
+#[test]
+fn apply_intent_survives_an_off_launch_and_runs_once_on_the_next_on() {
+    let (home, root, mut index, _) = setup("copy-prefix-intent-off");
+    let support = home.join("support");
+    let on = claude_request_money::e2::ResumedPrefixForTest::set(true);
+    run(&home.join("scope.json"), &support, true).unwrap();
+    activate_mode(&mut index, "ctx-1", true, false);
+    let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
+    assert_eq!(pending.len(), 3);
+    let intent = |index: &ScanIndex| {
+        pending
+            .iter()
+            .map(|path| {
+                let key = local_index_key(path);
+                (
+                    index
+                        .claude_money_birth_store
+                        .money_marks(claude_money_birth_store::location_key(&key))
+                        & REOWED,
+                    index.files[&key].effective_upload_body_witness_revision,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(intent(&index), vec![(REOWED, 2); 3]);
+    drop(on);
+    let off = claude_request_money::e2::ResumedPrefixForTest::set(false);
+    activate_mode(&mut index, "ctx-1", false, false);
+    assert!(prepare(&mut index, &support, std::slice::from_ref(&root))
+        .unwrap()
+        .is_empty());
+    assert_eq!(intent(&index), vec![(REOWED, 2); 3], "OFF keeps the intent");
+    drop(off);
+    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
+    activate_mode(&mut index, "ctx-1", true, false);
+    let again = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
+    assert_eq!(again, pending);
+    let (_, _, opened) = walk(&root, index, &again);
+    assert_eq!(opened, pending, "the next ON reads each member once");
     fs::remove_dir_all(home).unwrap();
 }
 

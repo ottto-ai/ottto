@@ -6427,8 +6427,10 @@ fn prepare_sync_source_inner(
     continuation::observe(source, &upload_context, upload_policy);
     activate_source_upload_context(source, upload_context, &mut index, &mut upload_progress);
     index.copy_unproven_enabled = copy_unproven_enabled;
-    index.copy_prefix_base_upload_context =
-        (source == SnapshotSource::ClaudeCode).then_some(base_upload_context);
+    index.set_copy_prefix_base_upload_context(
+        (source == SnapshotSource::ClaudeCode).then_some(base_upload_context),
+        resumed_prefix_enabled,
+    );
     if !context_curve_enabled {
         // Stamp the off transition before taking the partial-commit baseline.
         // If an ordinary no-curve upload is partially accepted and then shed,
