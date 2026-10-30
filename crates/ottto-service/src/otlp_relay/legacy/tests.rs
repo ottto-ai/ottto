@@ -271,7 +271,7 @@ fn restricted_handler_rejects_control_health_and_non_otlp_and_shares_export_resp
             TcpStream::connect(open.listener.as_ref().unwrap().local_addr().unwrap()).unwrap();
         apply_relay_io_timeouts(&client);
         write!(client, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nX-Ottto-Local-Relay: codex\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}").unwrap();
-        let stream = open.accept().unwrap();
+        let stream = retry_would_block(|| open.accept()).unwrap();
         apply_relay_io_timeouts(&stream);
         with_request_approval(Some(APPROVED), || {
             handle_client(
@@ -690,7 +690,7 @@ fn revoked_approval_refuses_preaccepted_request_before_tick_without_capture_or_a
         let mut client =
             TcpStream::connect(open.listener.as_ref().unwrap().local_addr().unwrap()).unwrap();
         apply_relay_io_timeouts(&client);
-        let stream = open.accept().unwrap();
+        let stream = retry_would_block(|| open.accept()).unwrap();
         apply_relay_io_timeouts(&stream);
         let activity = open.activity.clone();
         let capture_dir = ScratchDir::new("legacy-revoked-capture");
@@ -882,9 +882,14 @@ fn unknown_ticks_preserve_state_and_revocation_requires_two_consecutive_ticks() 
 /// A nonblocking owner may see WouldBlock while the loopback handshake that
 /// `connect` started is still completing; allow it a bounded moment.
 fn accept_within(owner: &TcpListener) -> io::Result<(TcpStream, SocketAddr)> {
+    retry_would_block(|| owner.accept())
+}
+
+/// Retry a nonblocking accept for up to 2 s while the handshake completes.
+fn retry_would_block<T>(mut accept: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
-        match owner.accept() {
+        match accept() {
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
                     && std::time::Instant::now() < deadline =>
@@ -1248,7 +1253,7 @@ fn legacy_listener_rebinds_immediately_after_a_server_first_close() {
     let port = listener.local_addr().unwrap().port();
     let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
     apply_relay_io_timeouts(&client);
-    let (mut server, _) = listener.accept().unwrap();
+    let (mut server, _) = retry_would_block(|| listener.accept()).unwrap();
     server.set_nonblocking(false).unwrap();
     apply_relay_io_timeouts(&server);
     let request = b"POST /v1/metrics HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
