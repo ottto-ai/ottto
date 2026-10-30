@@ -1050,3 +1050,174 @@ fn pi_mixed_with_claude_keeps_each_source_cold_equivalent() {
         }
     });
 }
+
+const CANARY_RESPONSE: &str = "CANARY_RESPONSE_pi_private";
+const CANARY_PROMPT: &str = "CANARY_PROMPT_pi_private";
+const CANARY_SYSTEM: &str = "CANARY_SYSTEM_pi_private";
+const CANARY_SUMMARY: &str = "CANARY_SUMMARY_pi_private";
+const CANARY_CHECKPOINT: &str = "CANARY_CHECKPOINT_pi_private";
+const CANARY_PARENT: &str = "/tmp/CANARY_PARENT_pi_private/session.jsonl";
+const CANARY_SELECTOR_KEY: &str = "canary_selector_key_pi_private";
+const CANARY_SELECTOR_VALUE: &str = "CANARY_SELECTOR_VALUE_pi_private";
+
+/// No canary in raw, lower/upper hex or any standard/URL base64 form.
+fn assert_private(what: &str, bytes: &[u8]) {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    use base64::Engine as _;
+    for canary in [
+        CANARY_RESPONSE,
+        CANARY_PROMPT,
+        CANARY_SYSTEM,
+        CANARY_SUMMARY,
+        CANARY_CHECKPOINT,
+        CANARY_PARENT,
+        CANARY_SELECTOR_KEY,
+        CANARY_SELECTOR_VALUE,
+    ] {
+        let hex = canary
+            .bytes()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        for form in [
+            canary.to_string(),
+            hex.to_uppercase(),
+            hex,
+            STANDARD.encode(canary),
+            STANDARD_NO_PAD.encode(canary),
+            URL_SAFE.encode(canary),
+            URL_SAFE_NO_PAD.encode(canary),
+        ] {
+            assert!(
+                !bytes
+                    .windows(form.len())
+                    .any(|window| window == form.as_bytes()),
+                "{what}: private Pi canary {canary} persisted"
+            );
+        }
+    }
+}
+
+/// A Pi 1.4.0 session carrying every SOURCE condition 6 canary: the raw
+/// response id, the prompt, a ~7 KB system message, a compaction checkpoint
+/// and a path-like `parentSession`.
+fn canary_session() -> String {
+    pi_header("synthetic-pi-canary", 3, Some(CANARY_PARENT))
+        + &pi_json(
+            json!({"type":"model_change","id":"a0000000","parentId":null,
+            "timestamp":"2026-10-27T06:00:00Z","provider":"openai","modelId":"gpt-5.4"}),
+        )
+        + &pi_json(
+            json!({"type":"message","id":"a0000003","parentId":"a0000000",
+            "message":{"role":"system",
+                "content":format!("{CANARY_SYSTEM}{}", "s".repeat(7_168)),
+                "timestamp":1793080800000u64}}),
+        )
+        + &pi_json(
+            json!({"type":"message","id":"a0000004","parentId":"a0000003",
+            "message":{"role":"user","content":[{"type":"text","text":CANARY_PROMPT}],
+                "timestamp":1793080800000u64}}),
+        )
+        + &pi_json(pi_turn(
+            "message",
+            Some(CANARY_RESPONSE),
+            10,
+            "2026-10-27T06:00:01Z",
+        ))
+        + &pi_json(
+            json!({"type":"compaction","id":"b0000001","parentId":"a0000004",
+            "timestamp":"2026-10-27T06:00:02Z","summary":CANARY_SUMMARY,
+            "firstKeptEntryId":"a0000004","tokensBefore":8000,
+            "usage":{"input":20,"output":5,"cost":{"total":0.002}},
+            "details":{"systemPrompt":format!("{CANARY_CHECKPOINT}{}", "c".repeat(7_168))}}),
+        )
+}
+
+/// Every record file, plus this route's store counters and summary line.
+fn assert_store_private(f: &PiDriver, mode: Mode) {
+    let records = f.disk.record_bytes();
+    assert!(!records.is_empty(), "{mode:?}: a native Pi record exists");
+    for bytes in records.values() {
+        assert_private(&format!("{mode:?} record"), bytes);
+    }
+    let (counts, store) = f.pages[&mode].cache.durable_counters(SOURCE).unwrap();
+    assert_private(
+        &format!("{mode:?} summary"),
+        counts.summary(SOURCE, &store).as_bytes(),
+    );
+    assert_private(
+        &format!("{mode:?} counters"),
+        format!("{counts:?} {store:?}").as_bytes(),
+    );
+}
+
+// Canaries (SOURCE condition 6, Addenda 2/5): no raw response id, prompt, ~7 KB
+// system message, compaction checkpoint, `parentSession` or rejected selector
+// text reaches a persisted Pi record, the store's counters/summary or the
+// durable diagnostics, through the native receipt, a restore + Tail and the
+// re-receipted record. The selector is validated at capture by the known-key
+// table: an unknown key is dropped identically in cold Full and restore + Tail
+// while a known key publishes. (#852's value-format rejection and its
+// `selector_key_rejected` gauge are not on this base.)
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "Pi restore requires qualified native heap layout"
+)]
+fn pi_canaries_never_reach_persisted_records_and_the_selector_is_validated() {
+    if !supported("pi_transition_canaries") {
+        return;
+    }
+    let mut f = PiDriver::warm("transition-pi-canaries", &canary_session());
+    assert_eq!(
+        f.accepted[&f.entity].body["request_count"],
+        json!(2),
+        "the canary turn and the compaction usage both count"
+    );
+    for bytes in f.disk.record_bytes().values() {
+        assert_private("warm record", bytes);
+    }
+    f.restart();
+    let tail = f.grow(&[
+        json!({"type":"custom", "id":"c0000001", "parentId":"b0000001",
+            "customType":"ottto-selector",
+            "data":{"selector_context":{"service_tier":"flex",
+                (CANARY_SELECTOR_KEY):CANARY_SELECTOR_VALUE}},
+            "timestamp":"2026-10-27T06:00:30Z"}),
+        pi_turn(
+            "message",
+            Some(&format!("{CANARY_RESPONSE}-2")),
+            20,
+            "2026-10-27T06:01:00Z",
+        ),
+    ]);
+    let cold = f.emit_bodies(Mode::ColdFull);
+    let (restored, events) =
+        crate::local_resource_diagnostics::capture(|| f.emit_bodies(Mode::Restart));
+    assert_eq!((restored.modes, restored.restored), ((0, 1, 0), 1));
+    assert_eq!(restored.io.consumed, tail + restored.io.rederive_head);
+    money_oracle::assert_equivalent(&cold, &restored);
+    whole_body(&cold, &restored);
+    assert_private("diagnostics", &serde_json::to_vec(&events).unwrap());
+    assert_store_private(&f, Mode::Restart);
+    let body = restored.snapshots[&f.entity].to_string();
+    assert!(
+        body.contains("\"flex\""),
+        "the known selector key publishes"
+    );
+    for text in [CANARY_SELECTOR_KEY, CANARY_SELECTOR_VALUE] {
+        assert!(
+            !body.contains(text),
+            "unknown selector key dropped from body"
+        );
+        for batch in &restored.batches {
+            assert!(
+                !batch.windows(text.len()).any(|w| w == text.as_bytes()),
+                "unknown selector key not POSTed"
+            );
+        }
+    }
+    f.save_gc(Mode::Restart);
+    for bytes in f.disk.record_bytes().values() {
+        assert_private("re-receipted record", bytes);
+    }
+}
