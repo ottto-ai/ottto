@@ -618,6 +618,7 @@ fn unchanged_member() -> (ScanIndex, CandidateFile) {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     (index, candidate)
 }

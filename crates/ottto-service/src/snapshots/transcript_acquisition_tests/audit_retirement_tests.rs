@@ -876,18 +876,28 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
         "held-quiet",
     );
     fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-    let (mut index, _, modes) =
+    let (mut index, held_scan, modes) =
         production_scan(&fixture, source, index, Some(cache.clone()), "held-quiet");
     assert_eq!(modes, (0, 1, 0));
     let key = local_index_key(&fixture.file.0);
     let checkpoint = cache.retained_checkpoint(&key).unwrap();
     let due = checkpoint.audit_debt().unwrap().due_unix_seconds;
+    let mut disposition = ClaudeUsageAuthorityDisposition::default();
+    disposition.defer_sessions(
+        held_scan
+            .snapshots
+            .iter()
+            .map(|item| item.source_session_id.clone())
+            .collect(),
+    );
+    let deferred_tokens = disposition.account_deferred_tokens(&held_scan.snapshots);
     let held = index.file_snapshot_fingerprints[&key].clone();
     assert!(!held.is_empty());
     let fingerprint = index.files[&key].source_file_fingerprint.clone();
-    assert!(
-        index.record_claude_account_deferred_holds([(key.as_str(), fingerprint.as_str())], &held,)
-    );
+    assert!(index.record_claude_account_deferred_holds(
+        [(key.as_str(), fingerprint.as_str())],
+        &deferred_tokens,
+    ));
     assert!(index.claude_account_deferred_holds.contains_key(&key));
     fill_unavailable_audits(
         &mut index,
@@ -933,7 +943,7 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
     // now, but the scan's original slot reservation must remain intact.
     assert!(index.record_claude_account_deferred_holds(
         [(key.as_str(), fingerprint.as_str())],
-        &BTreeSet::new(),
+        &BTreeMap::new(),
     ));
     assert!(!index.claude_account_deferred_holds.contains_key(&key));
     let ((mut retired, _, modes, _), diagnostics) =
@@ -978,7 +988,7 @@ fn held_fresh_debt_at_cap_is_not_cap_full_or_a_new_marker() {
     let fixture = ScanFixture::new(source);
     fixture.file.append(&usage(source, 100, 0, "fixture-model"));
     let cache = Arc::new(sampled_scan::SharedCache::default());
-    let (mut index, _, _) = production_scan(
+    let (mut index, held_scan, _) = production_scan(
         &fixture,
         source,
         ScanIndex::default(),
@@ -987,12 +997,22 @@ fn held_fresh_debt_at_cap_is_not_cap_full_or_a_new_marker() {
     );
     let key = local_index_key(&fixture.file.0);
     assert!(!index.files[&key].has_unverified_source());
+    let mut disposition = ClaudeUsageAuthorityDisposition::default();
+    disposition.defer_sessions(
+        held_scan
+            .snapshots
+            .iter()
+            .map(|item| item.source_session_id.clone())
+            .collect(),
+    );
+    let deferred_tokens = disposition.account_deferred_tokens(&held_scan.snapshots);
     let held = index.file_snapshot_fingerprints[&key].clone();
     assert!(!held.is_empty());
     let fingerprint = index.files[&key].source_file_fingerprint.clone();
-    assert!(
-        index.record_claude_account_deferred_holds([(key.as_str(), fingerprint.as_str())], &held,)
-    );
+    assert!(index.record_claude_account_deferred_holds(
+        [(key.as_str(), fingerprint.as_str())],
+        &deferred_tokens,
+    ));
     fill_unavailable_audits(
         &mut index,
         &key,
@@ -1067,7 +1087,7 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
         row
     };
     fixture.file.append(&held_row(100, 0));
-    let (next, _, modes) = production_scan(
+    let (next, held_scan, modes) = production_scan(
         &fixture,
         source,
         index,
@@ -1092,11 +1112,22 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
     fixture.file.0 = held_path;
     let held_key = local_index_key(&fixture.file.0);
     assert!(!index.files[&held_key].has_unverified_source());
+    let mut disposition = ClaudeUsageAuthorityDisposition::default();
+    disposition.defer_sessions(
+        held_scan
+            .snapshots
+            .iter()
+            .map(|item| item.source_session_id.clone())
+            .collect(),
+    );
+    let deferred_tokens = disposition.account_deferred_tokens(&held_scan.snapshots);
     let held = index.file_snapshot_fingerprints[&held_key].clone();
     assert!(!held.is_empty());
     let fingerprint = index.files[&held_key].source_file_fingerprint.clone();
-    assert!(index
-        .record_claude_account_deferred_holds([(held_key.as_str(), fingerprint.as_str())], &held,));
+    assert!(index.record_claude_account_deferred_holds(
+        [(held_key.as_str(), fingerprint.as_str())],
+        &deferred_tokens,
+    ));
     fill_unavailable_audits(
         &mut index,
         &quiet_key,
@@ -1215,7 +1246,7 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let namespace = "post-scan-release";
-        let (mut index, _, modes) = production_scan(
+        let (mut index, held_scan, modes) = production_scan(
             &fixture,
             source,
             ScanIndex::default(),
@@ -1225,10 +1256,21 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
         assert_eq!(modes, (1, 0, 0));
         let key = local_index_key(&fixture.file.0);
         let fingerprint = index.files[&key].source_file_fingerprint.clone();
+        let mut disposition = ClaudeUsageAuthorityDisposition::default();
+        disposition.defer_sessions(
+            held_scan
+                .snapshots
+                .iter()
+                .map(|item| item.source_session_id.clone())
+                .collect(),
+        );
+        let deferred_tokens = disposition.account_deferred_tokens(&held_scan.snapshots);
         let held = index.file_snapshot_fingerprints[&key].clone();
         assert!(!held.is_empty());
-        assert!(index
-            .record_claude_account_deferred_holds([(key.as_str(), fingerprint.as_str())], &held));
+        assert!(index.record_claude_account_deferred_holds(
+            [(key.as_str(), fingerprint.as_str())],
+            &deferred_tokens
+        ));
         let due = START + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
         fill_unavailable_audits(&mut index, &key, marked, due);
         let committed = index.clone();
