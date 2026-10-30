@@ -12837,6 +12837,7 @@ fn retired_missing_uses_shared_history_page_and_growth_pace() {
                 })
             });
         assert!(!allowed);
+        assert!(!cache.missing_reduction_growth(source, &key, &index.files, 3));
         assert_eq!(input, 0);
         assert!(samples.is_empty());
         fs::OpenOptions::new()
@@ -12865,6 +12866,56 @@ fn retired_missing_uses_shared_history_page_and_growth_pace() {
             &mut HistoryPage::default()
         ));
         writable.set_len(6).unwrap();
+        {
+            let _off = RestartRestoreForTest::disabled();
+            assert!(cache.missing_reduction_growth(source, &key, &index.files, 6));
+            assert!(DiscoveryRecovery {
+                files: &index.files,
+                cache: Some(&cache)
+            }
+            .requires(source, &path, 6));
+        }
+        // A group denied on its second member must not spend the first
+        // member's pace. Its next ordinary admission can still read it.
+        let sibling = root.join("sibling.jsonl");
+        fs::write(&sibling, b"{}\n{}\n").unwrap();
+        let sibling_key = local_index_key(&sibling);
+        record.binding.key = store::key_digest(ds, &sibling_key);
+        record.certificate = certificate(&sibling, &namespace);
+        let sibling_record = dir.join(format!(
+            "{}.rec",
+            record
+                .binding
+                .key
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        fs::write(&sibling_record, store::tests::pinned_v1_bytes(&record, 1)).unwrap();
+        fs::set_permissions(&sibling_record, fs::Permissions::from_mode(0o600)).unwrap();
+        index.files.insert(sibling_key, index.files[&key].clone());
+        let members: Vec<_> = [&path, &sibling]
+            .into_iter()
+            .map(|path| {
+                candidate_from_traversal_path(
+                    source,
+                    ScanTraversalPath {
+                        scan_root: root.to_path_buf(),
+                        path: path.clone(),
+                        census_member: true,
+                        watcher_hint: false,
+                    },
+                    &mut ScanCensus::default(),
+                    None,
+                    365,
+                    &BTreeMap::new(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut group_page = HistoryPage::default();
+        assert!(group_page.reserve("ordinary-history", 1024 * 1024 * 1024 - 6));
+        assert!(!cache.upgrade_group_full_allowed(source, &members, &index, &mut group_page));
         let mut page = HistoryPage::default();
         assert!(cache.upgrade_full_allowed(source, &key, &file, &index, &mut page));
         assert!(!cache.upgrade_full_allowed(

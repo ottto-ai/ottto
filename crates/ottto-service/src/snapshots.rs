@@ -28520,27 +28520,12 @@ impl OwnedSourceScan {
                 #[cfg(unix)]
                 if boot.awaits_read() {
                     if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                        let allowed = boot
-                            .group
-                            .members
-                            .iter()
-                            .filter(|member| {
-                                index
-                                    .files
-                                    .get(&local_index_key(&member.path))
-                                    .is_some_and(|entry| member.size_bytes > entry.size_bytes)
-                            })
-                            .all(|member| {
-                                File::open(&member.path).is_ok_and(|file| {
-                                    cache.upgrade_full_allowed(
-                                        source,
-                                        &local_index_key(&member.path),
-                                        &file,
-                                        index,
-                                        &mut history_upgrade,
-                                    )
-                                })
-                            });
+                        let allowed = cache.upgrade_group_full_allowed(
+                            source,
+                            &boot.group.members,
+                            index,
+                            &mut history_upgrade,
+                        );
                         if !allowed {
                             sampled_scan::codex_cursor::requeue_members(
                                 index,
@@ -33026,8 +33011,16 @@ impl OwnedSourceScan {
                 claude_effort_support_dir_ref,
             );
             let rescue_key = local_index_key(&candidate.path);
-            let verification_rescue =
-                sampled_audit::progress_debt(index, &rescue_key, audit_now).is_some();
+            let verification_rescue = sampled_audit::progress_debt(index, &rescue_key, audit_now)
+                .is_some()
+                || sampling.as_ref().is_some_and(|context| {
+                    context.cache.missing_reduction_growth(
+                        source,
+                        &rescue_key,
+                        &index.files,
+                        candidate.size_bytes,
+                    )
+                });
             let Some((mut candidate, opened_file)) = open_and_identify_scan_candidate_with_rescue(
                 source,
                 candidate,
@@ -45526,10 +45519,15 @@ impl<'a> From<&'a BTreeMap<String, ScanIndexEntry>> for DiscoveryRecovery<'a> {
 impl DiscoveryRecovery<'_> {
     fn requires(&self, source: SnapshotSource, path: &Path, length: u64) -> bool {
         #[cfg(unix)]
-        if self
-            .cache
-            .is_some_and(|cache| cache.owes_discovery(source, &local_index_key(path)))
-        {
+        if self.cache.is_some_and(|cache| {
+            cache.owes_discovery(source, &local_index_key(path))
+                || cache.missing_reduction_growth(
+                    source,
+                    &local_index_key(path),
+                    self.files,
+                    length,
+                )
+        }) {
             return true;
         }
         sampled_audit::path_requires_recovery(source, self.files, path, length)

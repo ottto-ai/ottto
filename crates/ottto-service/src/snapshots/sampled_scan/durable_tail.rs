@@ -2645,8 +2645,42 @@ impl SharedCache {
             .full_hold(&store::key_digest(source, key), start)
     }
 
-    /// Missing reductions share one per-key pace. Retired-pin rebuilds also
-    /// reserve the existing history page before the first native input.
+    fn missing_reduction_cause(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+    ) -> Result<Option<&'static str>, store::ActiveOverBudget> {
+        let Some(ds) = durable_source(source) else {
+            return Ok(None);
+        };
+        self.durable_funded_probe(source, |cache| {
+            cache.durable().and_then(|mut stores| {
+                stores
+                    .slot(ds)
+                    .as_mut()?
+                    .store
+                    .missing_cause(&store::key_digest(ds, key))
+            })
+        })
+    }
+
+    /// Preserve discovery of unread retired growth even outside the activity
+    /// window. Reuse the missing classifier; quiet files do not probe the store.
+    pub(in crate::snapshots) fn missing_reduction_growth(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        files: &BTreeMap<String, ScanIndexEntry>,
+        length: u64,
+    ) -> bool {
+        files
+            .get(key)
+            .is_some_and(|entry| length > entry.size_bytes)
+            && self
+                .missing_reduction_cause(source, key)
+                .is_ok_and(|cause| cause == Some("repin"))
+    }
+
     pub(in crate::snapshots) fn upgrade_full_allowed(
         &self,
         source: SnapshotSource,
@@ -2655,12 +2689,68 @@ impl SharedCache {
         index: &ScanIndex,
         page: &mut HistoryPage,
     ) -> bool {
+        self.upgrade_full_admission(source, key, file, index, page, true)
+    }
+
+    /// A group reads as one unit. Reserve its existing history page and probe
+    /// every member's existing pace before spending any member's allowance.
+    pub(in crate::snapshots) fn upgrade_group_full_allowed(
+        &self,
+        source: SnapshotSource,
+        members: &[CandidateFile],
+        index: &ScanIndex,
+        page: &mut HistoryPage,
+    ) -> bool {
+        let files: Option<Vec<_>> = members
+            .iter()
+            .filter(|member| {
+                index
+                    .files
+                    .get(&local_index_key(&member.path))
+                    .is_some_and(|entry| member.size_bytes > entry.size_bytes)
+            })
+            .map(|member| {
+                Some((
+                    local_index_key(&member.path),
+                    File::open(&member.path).ok()?,
+                ))
+            })
+            .collect();
+        let Some(files) = files else {
+            return false;
+        };
+        let mut reserved = page.clone();
+        if !files.iter().all(|(key, file)| {
+            self.upgrade_full_admission(source, key, file, index, &mut reserved, false)
+        }) {
+            return false;
+        }
+        if !files.iter().all(|(key, file)| {
+            self.upgrade_full_admission(source, key, file, index, &mut reserved, true)
+        }) {
+            return false;
+        }
+        *page = reserved;
+        true
+    }
+
+    /// Missing reductions share one per-key pace. Retired-pin rebuilds also
+    /// reserve the existing history page before the first native input.
+    fn upgrade_full_admission(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        file: &File,
+        index: &ScanIndex,
+        page: &mut HistoryPage,
+        start: bool,
+    ) -> bool {
         let Some(entry) = index.files.get(key).filter(|e| {
             !e.source_file_fingerprint.is_empty() || e.last_upload_body_witness.is_some()
         }) else {
             return true;
         };
-        let Some(ds) = durable_source(source) else {
+        let Some(_) = durable_source(source) else {
             return true;
         };
         match self.durable_classifier_enabled(source) {
@@ -2668,15 +2758,7 @@ impl SharedCache {
             Err(_) => return false,
             Ok(true) => {}
         }
-        let cause = match self.durable_funded_probe(source, |cache| {
-            cache.durable().and_then(|mut stores| {
-                stores
-                    .slot(ds)
-                    .as_mut()?
-                    .store
-                    .missing_cause(&store::key_digest(ds, key))
-            })
-        }) {
+        let cause = match self.missing_reduction_cause(source, key) {
             Ok(cause) => cause,
             Err(_) => return false,
         };
@@ -2709,16 +2791,28 @@ impl SharedCache {
                 source,
                 key,
                 SystemTime::now(),
-                (false, false, true),
+                (false, false, start),
                 Some(4),
             ) {
                 return false;
+            }
+            if !start {
+                return true;
             }
             if let Some(mut stores) = self.durable() {
                 stores.counters.upgrade_missing_full += 1;
                 Counters::bump(&mut stores.counters.resource_full, "repin");
             }
             return true;
+        }
+        if !start {
+            return self.paced_with_cause(
+                source,
+                key,
+                SystemTime::now(),
+                (false, near_source_cap(source, metadata.len()), false),
+                Some(4),
+            );
         }
         self.paced_cause_full(key, file, entry.size_bytes, SystemTime::now(), Some(4))
     }

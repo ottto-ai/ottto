@@ -1046,7 +1046,7 @@ pending!(
     "E1 design D1: Pi explicitly remains Full-on-change; no retained Pi reduction on main"
 );
 
-/// Admission branches omitted by the native-authority sticky fixture. Check
+/// [money] Admission branches omitted by the native-authority sticky fixture. Check
 /// real scanner output against explicit additive totals, without a frozen parser.
 #[test]
 fn codex_admission_branches_preserve_emitted_totals() {

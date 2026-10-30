@@ -223,8 +223,3 @@ impl crate::heap_layout_bound::HeapLayoutBound for AcquiredChain {
         c.add(file_scope.0.capacity())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-}
