@@ -518,6 +518,30 @@ impl Uploader {
         );
         Ok((counts.files, counts.bytes))
     }
+    pub(crate) fn finish_adopted_index(
+        &mut self,
+        index: &mut ScanIndex,
+        locally_held: &BTreeSet<String>,
+    ) -> Result<usize> {
+        // Match the successful service finish: durable index first, then only
+        // adopted/non-held ACK retirement, then the atomic progress finish.
+        index.save(&self.scratch.join("index.json"))?;
+        assert!(index.generation > 0, "the real save advances generation");
+        let before = self.progress.accepted_body_witnesses.len();
+        self.progress
+            .retire_acks_after_index_save(index, &BTreeSet::new(), locally_held);
+        let retired = before - self.progress.accepted_body_witnesses.len();
+        let path = self.scratch.join("progress.json");
+        self.progress.finish_cycle(&path)?;
+        // finish_cycle may remove a fully adopted ledger. A new service cycle
+        // loads it again rather than retaining the deleted file's CAS generation.
+        self.progress = SnapshotUploadProgress::load(
+            &path,
+            &"a".repeat(64),
+            self.progress.active_quarantine_witness.clone().unwrap(),
+        )?;
+        Ok(retired)
+    }
     pub(crate) fn restart(&mut self, source: SnapshotSource, context: &str) {
         self.progress = SnapshotUploadProgress::load(
             &self.scratch.join("progress.json"),

@@ -231,7 +231,8 @@ impl Fixture {
             // Per-census unchanged-group identity walks pre-exist on main; no body read.
             assert!(
                 parses.is_empty(),
-                "no body parser is stepped on a quiet or held page"
+                "no body parser is stepped on a quiet or held page; quiet_call={} parses={parses:?} sampled_bytes={bytes} group_body_bytes={group_bytes}",
+                quiet_call + 1
             );
             assert_eq!(bytes, 0);
             assert_eq!(
@@ -1722,6 +1723,13 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
             .0,
         4
     );
+    assert!(
+        f.uploader
+            .finish_adopted_index(&mut f.index, &BTreeSet::new())
+            .unwrap()
+            > 0,
+        "setup transfers adopted ACKs through the real saved-index finish"
+    );
     // A remains receipt-settled. B has ordinary physical work; z is new.
     fs::write(&singleton, body).unwrap();
     let d = f.root.join("d.jsonl");
@@ -1784,7 +1792,7 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
     let mut total_group_bytes = 0;
     // Ordinary B and z may share a page or run on separate pages. Observe the
     // bounded service window, not a filename/hash-dependent ordinary schedule.
-    for _ in 0..3 {
+    for page in 0..3 {
         f.cache = Arc::default();
         let previous = f.index.clone();
         let (((scan, native), reads), physical_group_bytes) =
@@ -1884,7 +1892,17 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
         let group_posted = posted
             .iter()
             .any(|item| item["source_session_id"] == "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+        eprintln!(
+            "settled-alias page={} reads={reads:?} B_admitted={group_admitted} B_posted={group_posted} sampled_bytes={native} group_body_bytes={physical_group_bytes} POSTs={} B_owed={:?}",
+            page + 1,
+            f.uploader.posts.len() - first,
+            ordinary_group.iter().map(|path| f.index.file_upload_context_requires_adoption(&local_index_key(path))).collect::<Vec<_>>()
+        );
         assert!(!group_posted || group_admitted, "unadmitted B cannot POST");
+        assert!(
+            !group_admitted || group_posted,
+            "B admission must POST and receive a fresh ACK after setup ACK retirement"
+        );
         if group_posted {
             for path in &ordinary_group {
                 let entry = &f.index.files[&local_index_key(path)];
@@ -1913,5 +1931,26 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
         total_group_bytes, group_bytes,
         "physical group body bytes are exactly one c/d replay, with no a/b read"
     );
+    for path in ordinary_group.iter().chain(std::iter::once(&singleton)) {
+        let key = local_index_key(path);
+        let entry = &f.index.files[&key];
+        let receipt = entry
+            .upload_context_receipt
+            .as_ref()
+            .expect("ordinary work is settled before entering quiet checks");
+        assert_eq!(
+            Some(&receipt.context_fingerprint),
+            f.index.active_upload_context_fingerprint.as_ref()
+        );
+        assert_eq!(receipt.source_witness, entry.source_file_fingerprint);
+        assert_eq!(
+            Some(&receipt.body_witness),
+            entry.last_upload_body_witness.as_ref()
+        );
+        assert!(
+            !f.index.file_upload_context_requires_adoption(&key),
+            "ordinary work owes no adoption before quiet checks"
+        );
+    }
     f.assert_quiet();
 }
