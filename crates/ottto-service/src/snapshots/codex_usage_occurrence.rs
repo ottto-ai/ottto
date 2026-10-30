@@ -1351,3 +1351,8 @@ mod content_decision_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod equivalence_tests;
+#[cfg(test)]
+mod pre_refactor;

@@ -1396,6 +1396,28 @@ binding authority is counted as `rederive_retire_unproven` or
 `rederive_retire_unfunded` and never grants deletion. Unlink's directory-sync
 obligation survives an absent path and is retried at saves. Pending receipts
 and unknown survivors remain protected. Retirement never creates an ACK.
+Missing retirement authority also emits `retire_exact_held{edge}`, where `edge`
+is `metadata`, `accepted_object`, `independent_edit` or `scoped_certificate`.
+The predecessor and discovery hold remain. `retire_exact_held_exit` names an
+existing exit: `revalidated_retire_exact` means a later eligible verified read
+can reacquire the witness for the post-save writer; `native_replacement_receipt`
+means a later native acquisition must commit its exact replacement receipt
+(`receipt_acquisition`/`discharge_owed`, which release restore-pending discovery).
+Conflicting retained predecessors also require their existing writer/receipt
+settlement before another witness can be installed. A failed stat/read is never
+proven absence; unlink's pending directory sync stays in key custody.
+
+`retire_exact_held_first_attempt{source}` is a **process proxy**, emitted with
+`process_id` on the same per-source pass carrier. It counts keys whose first
+retirement attempt in this process lacked authority; a first success followed
+by a later hold does not count. It resets on restart and stores no restart
+streak. Alarm on the server/log side when this proxy is non-zero across more
+than three consecutive starts. It cannot identify a repeated key. If a first
+observation cannot be funded or is reclaimed, the process latches
+`retire_exact_first_attempt_tracking_closed` and stops enrolling first attempts;
+the cumulative total is then a lower bound and a returning key cannot count
+twice. These observations use the existing bounded key custody and do not
+change any persisted format.
 Claude's accepted-floor hold reports `restored_behind_accepted.held` at its
 actual decision edges. The discovery dependency continues to hard-gate the
 production switch; RAM pacing does not establish restart-persistent bounds.

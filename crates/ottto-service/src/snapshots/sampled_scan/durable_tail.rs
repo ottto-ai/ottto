@@ -224,7 +224,7 @@ pub(in crate::snapshots) fn record_rederive_read_call() {
     });
 }
 #[cfg(test)]
-fn capture_rederive_reads<T>(run: impl FnOnce() -> T) -> (T, u64) {
+pub(in crate::snapshots) fn capture_rederive_reads<T>(run: impl FnOnce() -> T) -> (T, u64) {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -265,6 +265,24 @@ pub(in crate::snapshots) fn record_rederive_fence(source: SnapshotSource, classe
         &serde_json::json!({"rederive_fence_mismatch":classes.map(u64::from)}),
     );
 }
+#[derive(Clone, Copy)]
+enum RetirementEdge {
+    Metadata,
+    AcceptedObject,
+    IndependentEdit,
+    ScopedCertificate,
+}
+impl RetirementEdge {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::AcceptedObject => "accepted_object",
+            Self::IndependentEdit => "independent_edit",
+            Self::ScopedCertificate => "scoped_certificate",
+        }
+    }
+}
+
 const PACE_SECS: u64 = 6 * 3600;
 // Sleep and implausible clock changes must fail toward reading.
 const PACE_SANITY_SECS: u64 = 7 * 86_400;
@@ -284,6 +302,11 @@ pub(crate) struct Counters {
     pub(crate) restore_attempts: u64,
     /// Per-process totals, emitted together once at the source pass boundary.
     rederive_failed_first_attempt: [u64; 3],
+    /// Missing authority at the closed set of retirement decision edges.
+    pub(crate) retire_exact_held: BTreeMap<&'static str, u64>,
+    /// Process proxy only: no persisted key identity or restart streak.
+    retire_exact_held_first_attempt: [u64; 3],
+    retire_exact_first_attempt_tracking_closed: bool,
     rederive_first_attempt_tracking_closed: bool,
     restore_pending_quiet: [u64; 3],
     pub(crate) restored: u64,
@@ -3460,6 +3483,53 @@ impl SharedCache {
         granted
     }
 
+    /// Missing authority preserves the predecessor and discoverability. The
+    /// named existing exits are revalidation followed by writer retire_exact,
+    /// or a later native replacement's exact receipt; no absence is inferred.
+    fn hold_rederive_retirement(
+        &self,
+        source: DurableSource,
+        key: store::Digest32,
+        edge: RetirementEdge,
+        exit: &'static str,
+    ) {
+        if let Some(mut stores) = self.durable() {
+            Counters::bump(&mut stores.counters.retire_exact_held, edge.label());
+            if let Some(debt) = stores.fund_debt(key) {
+                debt.rederive_hold = Some(source);
+            } else {
+                stores.owed_overflow[source.slot()] = true;
+            }
+        }
+        self.record_first_retire_result(source, key, true);
+        crate::local_resource_diagnostics::durable_tail_alarm(
+            source.properties().snapshot.api_slug(),
+            &serde_json::json!({"retire_exact_held":{(edge.label()):1}, "retire_exact_held_exit":exit}),
+        );
+    }
+
+    fn record_first_retire_result(&self, source: DurableSource, key: store::Digest32, held: bool) {
+        let Some(mut stores) = self.durable() else {
+            return;
+        };
+        if stores.counters.retire_exact_first_attempt_tracking_closed {
+            return;
+        }
+        if stores.fund_debt(key).is_none() {
+            stores.counters.retire_exact_first_attempt_tracking_closed = true;
+            return;
+        }
+        if stores.counters.retire_exact_first_attempt_tracking_closed {
+            return;
+        }
+        let debt = stores.key_debt.get_mut(&key).expect("funded");
+        if debt.first_retire_held.is_none() {
+            debt.first_retire_held = Some(held);
+            stores.counters.retire_exact_held_first_attempt
+                [diagnostic_source_slot(source.properties().snapshot)] += u64::from(held);
+        }
+    }
+
     /// Per-edge original binding must already be eligible. Failure to retain
     /// authority holds safely; it never manufactures a deletion witness.
     fn queue_rederive_retirement(
@@ -3467,7 +3537,10 @@ impl SharedCache {
         source: DurableSource,
         record: &store::DurableRecord,
         expected: &Expected,
+        edge: RetirementEdge,
     ) {
+        #[cfg(test)]
+        super::test_hooks::fire(super::test_hooks::Point::BeforeRetireWitness);
         // Early metadata/object edit edges can fence-drop before scoped
         // content replay. They share the same first-attempt observation.
         self.record_first_rederive_result(
@@ -3485,10 +3558,14 @@ impl SharedCache {
         });
         let Some(proof) = proof else {
             Counters::bump(&mut stores.counters.ineligible, "rederive_retire_unproven");
+            drop(stores);
+            self.hold_rederive_retirement(source, key, edge, "revalidated_retire_exact");
             return;
         };
         if !stores.fund_key(key) || stores.fund_debt(key).is_none() {
             Counters::bump(&mut stores.counters.ineligible, "rederive_retire_unfunded");
+            drop(stores);
+            self.hold_rederive_retirement(source, key, edge, "native_replacement_receipt");
             return;
         }
         let custody = stores.retail_spent.get_mut(&key).expect("funded");
@@ -3501,11 +3578,15 @@ impl SharedCache {
             .is_some_and(|p| p.same_predecessor(&proof))
         {
             Counters::bump(&mut stores.counters.ineligible, "rederive_retire_unproven");
+            drop(stores);
+            self.hold_rederive_retirement(source, key, edge, "native_replacement_receipt");
             return;
         }
         let debt = stores.fund_debt(key).expect("funded");
         debt.retire_source = Some(source);
         debt.rederive_hold = Some(source);
+        drop(stores);
+        self.record_first_retire_result(source, key, false);
     }
 
     /// Head-once is an extent discriminator, never predecessor authority.
@@ -3882,7 +3963,12 @@ impl SharedCache {
                         full_reason_class(reason),
                     );
                 }
-                self.queue_rederive_retirement(source, &record, &original_expected);
+                self.queue_rederive_retirement(
+                    source,
+                    &record,
+                    &original_expected,
+                    RetirementEdge::Metadata,
+                );
                 return Err(MissClass::RealEdit(reason).into());
             }
         }
@@ -3911,9 +3997,21 @@ impl SharedCache {
                     );
                 }
                 if original_matches {
-                    self.queue_rederive_retirement(source, &record, &original_expected);
+                    self.queue_rederive_retirement(
+                        source,
+                        &record,
+                        &original_expected,
+                        RetirementEdge::AcceptedObject,
+                    );
                 } else if let Some(mut stores) = self.durable() {
                     Counters::bump(&mut stores.counters.ineligible, "rederive_retire_unproven");
+                    drop(stores);
+                    self.hold_rederive_retirement(
+                        source,
+                        store_key,
+                        RetirementEdge::AcceptedObject,
+                        "native_replacement_receipt",
+                    );
                 }
                 return Err(MissClass::RealEdit(FullReason::Replaced).into());
             }
@@ -4018,11 +4116,19 @@ impl SharedCache {
                                                     source,
                                                     &record,
                                                     &original_expected,
+                                                    RetirementEdge::IndependentEdit,
                                                 );
                                             } else if let Some(mut stores) = self.durable() {
                                                 Counters::bump(
                                                     &mut stores.counters.ineligible,
                                                     "rederive_retire_unproven",
+                                                );
+                                                drop(stores);
+                                                self.hold_rederive_retirement(
+                                                    source,
+                                                    store_key,
+                                                    RetirementEdge::IndependentEdit,
+                                                    "native_replacement_receipt",
                                                 );
                                             }
                                             return Err(MissClass::Failure(Failure::Certificate(
@@ -4103,7 +4209,12 @@ impl SharedCache {
                     | FullReason::Replaced
             )))
         ) {
-            self.queue_rederive_retirement(source, &record, &expected);
+            self.queue_rederive_retirement(
+                source,
+                &record,
+                &expected,
+                RetirementEdge::ScopedCertificate,
+            );
         }
         // Registry probes include allowlist hashing; keep them outside Stores.
         let owed = if matches!(restored, Err(Failure::Ineligible(store::Ineligible::Scope))) {
@@ -4593,6 +4704,8 @@ impl SharedCache {
         let slot = diagnostic_source_slot(source);
         let failed = stores.counters.rederive_failed_first_attempt[slot];
         let quiet = stores.counters.restore_pending_quiet[slot];
+        let retire_held = stores.counters.retire_exact_held_first_attempt[slot];
+        let retire_tracking_closed = stores.counters.retire_exact_first_attempt_tracking_closed;
         let stores_tracking_closed = stores.counters.rederive_first_attempt_tracking_closed;
         drop(stores);
         crate::local_resource_diagnostics::durable_tail_alarm(
@@ -4601,6 +4714,8 @@ impl SharedCache {
                 "rederive_failed_first_attempt": failed,
                 "restore_pending_quiet": quiet,
                 "rederive_first_attempt_tracking_closed": stores_tracking_closed,
+                "retire_exact_held_first_attempt": retire_held,
+                "retire_exact_first_attempt_tracking_closed": retire_tracking_closed,
             }),
         );
     }

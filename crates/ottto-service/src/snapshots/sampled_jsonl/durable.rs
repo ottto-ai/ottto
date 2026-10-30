@@ -679,3 +679,31 @@ pub(crate) fn store_skill_fixture_body() -> Vec<u8> {
     )
     .unwrap()
 }
+
+/// Exercise the real encoding, scratch replay, hash fence and content adoption
+/// with an independently owned accumulator from the frozen admission oracle.
+#[cfg(test)]
+pub(in crate::snapshots) fn test_rederive_codex_accumulator(
+    accumulator: &SnapshotAccumulator,
+    file: &File,
+    corrupt_prompt_fence: bool,
+) -> Result<SnapshotAccumulator, Refuse> {
+    let reduction = CachedJsonlReduction {
+        accumulator: accumulator.clone(),
+        report: JsonlReadReport::default(),
+        recognized_usage_drop_count: 0,
+        positive_recognized_usage_count: 0,
+        positive_usage_evidence: false,
+    };
+    let body = encode(&reduction, 16 * 1024 * 1024, 1024 * 1024)?;
+    let decoded = decode(&body, SnapshotSource::Codex).expect("fixture decode");
+    let decoded = if corrupt_prompt_fence {
+        decode(&decoded.test_fence_body(0), SnapshotSource::Codex).expect("fence fixture")
+    } else {
+        decoded
+    };
+    decoded.rederive_content(file).map(|(r, _)| r.accumulator)
+}
+
+#[cfg(test)]
+pub(in crate::snapshots) use content::test_codex_content_scratch;

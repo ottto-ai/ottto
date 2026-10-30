@@ -5241,3 +5241,55 @@ fn exact_retirement_preserves_pending_and_retained_receipt_successors() {
         assert_eq!(fs::read(record_file(&cold, &b.key)).unwrap(), before);
     }
 }
+
+#[test]
+fn exact_retirement_stat_io_error_is_retry_and_never_proven_absence() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let transcript = scratch.transcript("retire-stat.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp", None));
+    let mut store = scratch.store();
+    assert_eq!(
+        store
+            .write_after_save(
+                &lock,
+                1,
+                0,
+                vec![pending(b.clone(), certificate(&transcript), 1)]
+            )
+            .unwrap()
+            .written,
+        1
+    );
+    let record = found(store.read(&b.key));
+    let expected = Expected {
+        binding: b.clone(),
+        committed_generation: 1,
+    };
+    let proof = store.mutation_witness(&record, &expected).unwrap();
+    let path = record_file(&store, &b.key);
+    let saved_dir = scratch.root.join("saved-record-dir");
+    fs::rename(store.dir(), &saved_dir).unwrap();
+    // A regular file as the parent returns ENOTDIR at stamp_at, not ENOENT.
+    fs::write(store.dir(), b"blocked parent").unwrap();
+    assert!(stamp_at(&path).is_err());
+    let mut sync_due = true;
+    assert!(matches!(
+        store.retire_exact(&lock, &proof, &mut sync_due),
+        RetireOutcome::Retry
+    ));
+    assert!(
+        sync_due,
+        "a stat error cannot discharge directory-sync custody"
+    );
+    assert_eq!(store.counters.records_invalidated, 0);
+    fs::remove_file(store.dir()).unwrap();
+    fs::rename(&saved_dir, store.dir()).unwrap();
+    assert!(path.exists());
+    assert!(matches!(
+        store.retire_exact(&lock, &proof, &mut sync_due),
+        RetireOutcome::Retired
+    ));
+    assert!(!sync_due);
+    assert_eq!(store.counters.records_invalidated, 1);
+}

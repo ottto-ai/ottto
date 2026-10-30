@@ -474,3 +474,16 @@ fn replay_line(
     }
     Ok(())
 }
+
+#[cfg(test)]
+pub(in crate::snapshots) fn test_codex_content_scratch(
+    stored: &SnapshotAccumulator,
+) -> Box<SnapshotAccumulator> {
+    let mut fresh = scratch(SnapshotSource::Codex);
+    fresh.source_session_id = stored.source_session_id.clone();
+    fresh.codex_counting = stored
+        .codex_counting
+        .as_ref()
+        .map(|c| Box::new(c.content_scratch()));
+    fresh
+}

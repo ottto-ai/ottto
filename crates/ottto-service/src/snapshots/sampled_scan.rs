@@ -1945,6 +1945,7 @@ pub(super) mod test_hooks {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(in crate::snapshots) enum Point {
+        BeforeRetireWitness,
         /// A bounded restore is decoded, immediately before identity sampling.
         BeforeRestoredIdentity,
         /// The first opened-object identity sample has actually been read.

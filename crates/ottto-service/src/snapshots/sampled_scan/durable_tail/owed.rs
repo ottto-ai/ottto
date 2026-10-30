@@ -36,6 +36,7 @@ pub(super) struct KeyDebt {
     pub(super) full_spend: Option<FullSpend>,
     /// Diagnostic only: the first non-quiet scoped replay result this process.
     pub(super) first_rederive_failed: Option<bool>,
+    pub(super) first_retire_held: Option<bool>,
     pub(super) retire_source: Option<DurableSource>,
     pub(super) retire_sync: bool,
     /// D3: this Claude key's stale predecessor survived a failed write.
@@ -66,6 +67,7 @@ impl KeyDebt {
             && self.retire_source.is_none()
             && self.full_spend.is_none()
             && self.first_rederive_failed.is_none()
+            && self.first_retire_held.is_none()
     }
 }
 /// Funded nodes per map: owed/hold keys need no more than the RAM cache's
@@ -169,6 +171,9 @@ impl Stores {
                 .find_map(|(key, debt)| debt.reclaimable(now).then_some(*key))
             {
                 let forgotten = self.key_debt.remove(&idle).expect("idle observation");
+                if forgotten.first_retire_held.is_some() {
+                    self.counters.retire_exact_first_attempt_tracking_closed = true;
+                }
                 if forgotten.first_rederive_failed.is_some() {
                     self.close_first_rederive_tracking();
                 }

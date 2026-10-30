@@ -2722,10 +2722,15 @@ pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
         // Native raw-value handling accepts/reparses this physical input;
         // bounded replay must explicitly refuse the special key, without
         // reflecting either the input or serde's error payload.
-        let raw = format!(
-            "{{\"$serde_json::private::RawValue\":\"{{}}\",\"ignored\":\"{}\"}}\n",
-            PRIVACY_CANARIES[0]
-        );
+        // Value's raw-value map consumes exactly one field. A second outer
+        // field makes the native JSONL read lossy, so the certified full_read
+        // premise would fail before bounded replay. Keep the canary inside the
+        // raw JSON string; native parses it and bounded replay refuses the key.
+        let raw = json!({
+            "$serde_json::private::RawValue": json!({"ignored":PRIVACY_CANARIES[0]}).to_string()
+        })
+        .to_string()
+            + "\n";
         fs::write(&path, raw + &lines.join("\n") + "\n").unwrap();
         let (native, _) = full_read(&path, source);
         let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();

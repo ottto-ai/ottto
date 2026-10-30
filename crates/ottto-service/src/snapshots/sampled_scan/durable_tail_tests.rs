@@ -15323,7 +15323,11 @@ fn quiet_restore_has_no_sample_or_content_input_before_decode_on_all_sources() {
 }
 
 // F5/F7: turn over the actual paid map, rather than merely clearing a flag.
-fn evict_failed_replay_pace(cache: &SharedCache, source: SnapshotSource, key: &str) {
+pub(in crate::snapshots) fn evict_failed_replay_pace(
+    cache: &SharedCache,
+    source: SnapshotSource,
+    key: &str,
+) {
     let digest = full_pace_key(source, key);
     let now = SystemTime::now();
     {
@@ -15752,4 +15756,210 @@ fn key_debt_pressure_preserves_live_custody_and_only_reclaims_expired_full_spend
     stores.retail_full_now = Some(now + std::time::Duration::from_secs(PACE_SECS));
     assert!(stores.fund_debt(extra).is_some());
     assert!(stores.key_debt.contains_key(&retained));
+}
+
+#[test]
+fn retirement_each_edge_holds_without_witness_then_exits_by_revalidated_exact_retirement() {
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    for edge in [
+        RetirementEdge::Metadata,
+        RetirementEdge::AcceptedObject,
+        RetirementEdge::IndependentEdit,
+        RetirementEdge::ScopedCertificate,
+    ] {
+        let root = crate::test_scratch::ScratchDir::new("retire-held-edge");
+        let index_path = root.join("index.json");
+        let transcript = root.join("source.jsonl");
+        std::fs::write(&transcript, b"{}\n").unwrap();
+        let source = SnapshotSource::Codex;
+        let ds = DurableSource::Codex;
+        let scope = Scope("retire-held".into());
+        let key = local_index_key(&transcript);
+        let mut index = ScanIndex::default();
+        index.files.insert(key.clone(),serde_json::from_value(serde_json::json!({"size_bytes":3,"modified_unix_seconds":1,"source_file_fingerprint":"retire-held"})).unwrap());
+        index.save(&index_path).unwrap();
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &scope, false);
+        let mut binding = store::tests::binding("account", "scope", ("retire-held", None));
+        binding.source = ds;
+        binding.key = store::key_digest(ds, &key);
+        let expected = Expected {
+            binding: binding.clone(),
+            committed_generation: index.generation,
+        };
+        let lock = test_locks::hold(&root);
+        let (record, record_path) = {
+            let mut stores = cache.durable().unwrap();
+            let slot = stores.slot(ds).as_mut().unwrap();
+            assert_eq!(
+                slot.store
+                    .write_after_save(
+                        lock,
+                        index.generation,
+                        0,
+                        vec![PendingRecord {
+                            acquisition: None,
+                            binding: binding.clone(),
+                            certificate: certificate(&transcript, &scope),
+                            body: codec::store_fixture_body(source, 0, 0),
+                            allowlist: codec::allowlist_digest(source),
+                        }]
+                    )
+                    .unwrap()
+                    .written,
+                1
+            );
+            let ReadOutcome::Found(record) = slot.store.read(&binding.key) else {
+                panic!("verified record");
+            };
+            let path = std::fs::read_dir(slot.store.dir())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| p.extension().is_some_and(|e| e == "rec"))
+                .unwrap();
+            (record, path)
+        };
+        let original = std::fs::read(&record_path).unwrap();
+        // Real canonical-object stamp change invalidates the verified witness;
+        // neither the record bytes nor a fake deletion permission is substituted.
+        File::open(&record_path)
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(2))
+            .unwrap();
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            cache.queue_rederive_retirement(ds, &record, &expected, edge);
+            cache.queue_rederive_retirement(ds, &record, &expected, edge);
+            cache.durable_rederive_proxies(source);
+        });
+        assert_eq!(std::fs::read(&record_path).unwrap(), original);
+        assert!(cache.owes_discovery(source, &key));
+        {
+            let stores = cache.durable().unwrap();
+            let debt = &stores.key_debt[&binding.key];
+            assert_eq!(debt.retire_source, None);
+            assert!(!debt.retire_sync);
+            assert_eq!(
+                stores.counters.retire_exact_held.get(edge.label()),
+                Some(&2)
+            );
+            assert_eq!(stores.counters.retire_exact_held_first_attempt, [0, 1, 0]);
+        }
+        assert!(rows
+            .iter()
+            .any(|r| r["counts"]["retire_exact_held"][edge.label()] == 1
+                && r["counts"]["retire_exact_held_exit"] == "revalidated_retire_exact"));
+        assert!(rows
+            .iter()
+            .any(|r| r["counts"]["retire_exact_held_first_attempt"] == 1
+                && r["process_id"] == std::process::id()));
+        // Named exit: the next verified read re-establishes the same eligible
+        // predecessor, then the existing post-save writer runs retire_exact.
+        let current = {
+            let mut stores = cache.durable().unwrap();
+            let ReadOutcome::Found(record) =
+                stores.slot(ds).as_mut().unwrap().store.read(&binding.key)
+            else {
+                panic!("revalidation");
+            };
+            record
+        };
+        cache.queue_rederive_retirement(ds, &current, &expected, edge);
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap();
+        assert!(!record_path.exists());
+        let stores = cache.durable().unwrap();
+        assert_eq!(
+            stores.counters.ineligible.get("rederive_retire.retired"),
+            Some(&1)
+        );
+        assert_eq!(stores.counters.retire_exact_held_first_attempt, [0, 1, 0]);
+        assert_eq!(stores.key_debt[&binding.key].retire_source, None);
+        assert!(!stores.key_debt[&binding.key].retire_sync);
+    }
+}
+
+#[test]
+fn retirement_first_attempt_proxy_is_process_local_and_closes_before_marker_reuse() {
+    let cache = SharedCache::default();
+    let ds = DurableSource::Codex;
+    let key = full_pace_key(SnapshotSource::Codex, "first-success");
+    cache.record_first_retire_result(ds, key, false);
+    cache.record_first_retire_result(ds, key, true);
+    assert_eq!(
+        cache
+            .durable()
+            .unwrap()
+            .counters
+            .retire_exact_held_first_attempt,
+        [0; 3]
+    );
+    let restarted = SharedCache::default();
+    restarted.record_first_retire_result(ds, key, true);
+    restarted.record_first_retire_result(ds, key, true);
+    assert_eq!(
+        restarted
+            .durable()
+            .unwrap()
+            .counters
+            .retire_exact_held_first_attempt,
+        [0, 1, 0]
+    );
+    for n in 0..store::MAX_RECORDS {
+        cache.record_first_retire_result(
+            ds,
+            full_pace_key(SnapshotSource::Codex, &format!("observed-retire-{n}")),
+            true,
+        );
+    }
+    let count = cache
+        .durable()
+        .unwrap()
+        .counters
+        .retire_exact_held_first_attempt;
+    assert!(
+        cache
+            .durable()
+            .unwrap()
+            .counters
+            .retire_exact_first_attempt_tracking_closed
+    );
+    cache.record_first_retire_result(ds, key, true);
+    assert_eq!(
+        cache
+            .durable()
+            .unwrap()
+            .counters
+            .retire_exact_held_first_attempt,
+        count
+    );
+    assert!(owed::key_debt_node_bytes().unwrap() <= 1024);
+}
+
+/// Start with a consumed ordinary Full allowance, through the production
+/// gate. The full-scanner fixture then measures only subsequent passes.
+#[cfg(target_os = "macos")]
+pub(in crate::snapshots) fn spend_rederive_full_for_scanner_fixture(
+    cache: &SharedCache,
+    source: SnapshotSource,
+    key: &str,
+    file: &File,
+    accepted_end: u64,
+) {
+    assert!(cache.rederive_full(source, key, file, accepted_end, true));
+}
+
+#[cfg(target_os = "macos")]
+pub(in crate::snapshots) fn advance_scanner_clock_past_eviction_fillers(cache: &SharedCache) {
+    let mut stores = cache.durable().unwrap();
+    // The eviction helper creates future-dated dummy nodes to select an exact
+    // victim. Subsequent real attempts must be newer than those dummy nodes;
+    // otherwise the fixture would accidentally evict the attempts it just made.
+    let latest = stores
+        .retail_full_at
+        .values()
+        .map(|pace| pace.at)
+        .max()
+        .unwrap();
+    stores.retail_full_now = Some(latest + std::time::Duration::from_secs(1));
 }

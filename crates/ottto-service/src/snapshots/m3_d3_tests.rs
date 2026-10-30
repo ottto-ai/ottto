@@ -1786,3 +1786,211 @@ fn codex_real_restore_then_shrink_preserves_the_native_identity_guard() {
         "the rejected read actually froze below the accepted floor"
     );
 }
+
+/// F7's source scheduler row. Twenty first heads and twenty permitted
+/// post-eviction heads precede a maximal waiter; all measured scan passes
+/// select zero Fulls. The initial state has already spent each failed key's
+/// ordinary growth-Full allowance, as a preceding recovery would.
+#[test]
+fn full_source_scan_failed_heads_and_evictions_release_maximal_waiter_without_fulls() {
+    use super::sampled_jsonl::durable as codec;
+    use super::sampled_scan::durable_tail::{capture_rederive_reads, tests as fixtures};
+    let _on = RestartRestoreForTest::enabled();
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let mut rig = Rig::new(SnapshotSource::Codex, "rederive-full-scanner-fairness");
+    let failing: Vec<_> = (0..20)
+        .map(|i| format!("11111111-1111-4111-8111-{i:012}"))
+        .collect();
+    let waiter = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    for session in failing
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(waiter))
+    {
+        let mut text = codex_head(session);
+        for i in 1..=3 {
+            text.push_str(&codex_line(i));
+        }
+        if session != waiter {
+            text.push_str("{\"$serde_json::private::RawValue\":\"{}\"}\n");
+        }
+        let prompt=json!({"type":"event_msg","payload":{"type":"user_message","message":"Synthetic fairness prompt"}}).to_string()+"\n";
+        let end = if session == waiter {
+            codec::HEAD_BOUND as usize
+        } else {
+            90_000
+        };
+        assert!(text.len() + prompt.len() + 3 < end);
+        text.push_str(&" ".repeat(end - text.len() - prompt.len() - 3));
+        text.push_str("{}\n");
+        text.push_str(&prompt);
+        if session == waiter {
+            text.push_str("{}\n");
+            let mut title = json!({"type":"event_msg","payload":{"type":"thread_name_updated","thread_name":"Synthetic fairness title"},"padding":""});
+            title["padding"] =
+                json!("x".repeat(codec::TITLE_LINE_BOUND as usize - title.to_string().len() - 1));
+            assert_eq!(
+                title.to_string().len() + 1,
+                codec::TITLE_LINE_BOUND as usize
+            );
+            text.push_str(&(title.to_string() + "\n"));
+        }
+        fs::write(rig.path(session), text).unwrap();
+    }
+    let seed = rig.pass();
+    assert_eq!(seed.full(), 21);
+    for session in failing
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(waiter))
+    {
+        rig.assert_native_record(session);
+    }
+    // Prove the maximum replay plan from the actual native record, not a
+    // hand-built job size or a synthetic accumulator.
+    let mut disk = store::DurableTailStore::new(rig.store_dir(), store::DurableSource::Codex);
+    let store::ReadOutcome::Found(record) = disk.read(&rig.digest(waiter)) else {
+        panic!("waiter record");
+    };
+    let plan = codec::decode(&record.record.body, rig.source)
+        .unwrap()
+        .rederive_plan()
+        .unwrap();
+    assert_eq!(plan.end, codec::HEAD_BOUND);
+    assert_eq!(plan.title.unwrap().1, codec::TITLE_LINE_BOUND);
+    assert_eq!(plan.input_bytes(), 2 * 1024 * 1024);
+    let predecessor = fs::read(rig.record(waiter)).unwrap();
+    rig.restart();
+    rig.cache
+        .durable_begin_pass(rig.source, &rig.index_path, &rig.namespace, true);
+    for session in failing
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(waiter))
+    {
+        use std::io::Write;
+        let append = if session == waiter {
+            // A real usage delta makes publication observable; an ignored
+            // progress row could correctly be suppressed as an equal body.
+            codex_line(4)
+        } else {
+            "{\"type\":\"progress\"}\n".into()
+        };
+        File::options()
+            .append(true)
+            .open(rig.path(session))
+            .unwrap()
+            .write_all(append.as_bytes())
+            .unwrap();
+        if session != waiter {
+            fixtures::spend_rederive_full_for_scanner_fixture(
+                &rig.cache,
+                rig.source,
+                &rig.key(session),
+                &File::open(rig.path(session)).unwrap(),
+                rig.index.files[&rig.key(session)].size_bytes,
+            );
+        }
+    }
+    let accepted = rig.accepted(waiter);
+    for pass in 0..3 {
+        if pass == 1 {
+            for session in &failing {
+                fixtures::evict_failed_replay_pace(&rig.cache, rig.source, &rig.key(session));
+            }
+            fixtures::advance_scanner_clock_past_eviction_fillers(&rig.cache);
+        }
+        let (result, reads) = capture_rederive_reads(|| rig.pass());
+        assert_eq!(result.full(), 0, "source pass {pass}: no Full selection");
+        let input: u64 = result
+            .events
+            .iter()
+            .filter_map(|r| r["counts"]["rederive_input_bytes"].as_u64())
+            .sum();
+        assert!(
+            input <= 2 * 1024 * 1024,
+            "source pass respects aggregate input budget"
+        );
+        if pass < 2 {
+            assert_eq!(reads, 20, "twenty actual failed heads, source pass {pass}");
+            assert_eq!(result.published(waiter), 0);
+            assert_eq!(rig.accepted(waiter), accepted);
+            assert_eq!(fs::read(rig.record(waiter)).unwrap(), predecessor);
+            assert!(rig.cache.owes_discovery(rig.source, &rig.key(waiter)));
+        } else {
+            assert_eq!(
+                reads, 2,
+                "maximal head plus independent title admitted after head-once bounds churn"
+            );
+            assert_eq!(result.tail(), 1);
+            assert_eq!(result.witness(waiter), Some(rig.cold(waiter)));
+            assert_eq!(rig.counters().0.restored, 1);
+        }
+    }
+    let idle = rig.pass();
+    assert_eq!(idle.full(), 0);
+    assert_eq!(idle.published(waiter), 0);
+}
+
+/// F10 positive: C is stable before discovery freezes its identity. Codex's
+/// floor policy permits this complete native body below B; a shrink AFTER
+/// discovery is separately refused by the adjacent native identity fixture.
+#[test]
+fn codex_stable_below_accepted_restore_publishes_full_scanner_native_tail() {
+    let _on = RestartRestoreForTest::enabled();
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let mut rig = Rig::new(SnapshotSource::Codex, "stable-restored-below-accepted");
+    let session = CODEX_SESSION;
+    fs::write(rig.path(session), codex_head(session) + &json!({"type":"event_msg","payload":{"type":"user_message","message":"Synthetic stable restored prompt"}}).to_string() + "\n").unwrap();
+    rig.append(session, 3);
+    assert_eq!(rig.pass().published(session), 1);
+    rig.assert_native_record(session);
+    let a = fs::metadata(rig.path(session)).unwrap().len();
+    let predecessor = fs::read(rig.record(session)).unwrap();
+    rig.append(session, 1);
+    let c = fs::metadata(rig.path(session)).unwrap().len();
+    rig.append(session, 1);
+    // B is a real accepted cold Full; no post-save writer replaces A.
+    let (index, items) = scan(
+        rig.source,
+        &rig.sessions,
+        rig.index.clone(),
+        Arc::new(SharedCache::default()),
+        &rig.namespace,
+    );
+    assert_eq!(items.len(), 1);
+    rig.index = index;
+    rig.index.save(&rig.index_path).unwrap();
+    let b = rig.index.files[&rig.key(session)].size_bytes;
+    assert!(a < c && c < b);
+    assert_eq!(fs::read(rig.record(session)).unwrap(), predecessor);
+    // The selected identity and native preparation both see the SAME C.
+    File::options()
+        .write(true)
+        .open(rig.path(session))
+        .unwrap()
+        .set_len(c)
+        .unwrap();
+    rig.restart();
+    let result = rig.pass();
+    assert_eq!(rig.counters().0.restored, 1, "real durable restore");
+    assert!(rig.counters().0.rederive_head_bytes > 0);
+    assert_eq!((result.full(), result.tail()), (0, 1));
+    assert_eq!(result.published(session), 1);
+    assert_eq!(result.witness(session), Some(rig.cold(session)));
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .filter_map(|r| r["counts"]["restored_behind_accepted"]["published"].as_u64())
+            .sum::<u64>(),
+        1
+    );
+    let idle = rig.pass();
+    assert_eq!(idle.full(), 0);
+    assert_eq!(idle.published(session), 0, "no repeat publication");
+}
