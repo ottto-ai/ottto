@@ -535,10 +535,21 @@ pub(in super::super) fn acquire_window(index: &ScanIndex) -> Option<Window> {
     Window::begin("acquire")
 }
 
+/// One bounded sample per save attempt; rejected work is visible too. Gauges
+/// share the claude_state_v2 diagnostic row and contain counts/bytes only.
+pub(super) fn save_work(rows: u64, bytes: u64) {
+    if let Ok(mut stats) = stats().lock() {
+        stats.save_dirty_rows.observe(rows);
+        stats.save_dirty_bytes.observe(bytes);
+        crate::local_resource_diagnostics::claude_state_v2(&*stats);
+    }
+}
+
 #[cfg(test)]
 mod ops_tests {
     use super::*;
 
+    /// [behaviour] family requests heap is separate and diagnostics never contain its text.
     #[test]
     fn family_requests_heap_is_separate_and_diagnostics_never_contain_its_text() {
         let mut index = ScanIndex::default();
@@ -570,15 +581,5 @@ mod ops_tests {
         let json = serde_json::to_string(&observation).unwrap();
         assert!(!json.contains("synthetic-private"));
         assert!(json.contains("family.requests"));
-    }
-}
-
-/// One bounded sample per save attempt; rejected work is visible too. Gauges
-/// share the claude_state_v2 diagnostic row and contain counts/bytes only.
-pub(super) fn save_work(rows: u64, bytes: u64) {
-    if let Ok(mut stats) = stats().lock() {
-        stats.save_dirty_rows.observe(rows);
-        stats.save_dirty_bytes.observe(bytes);
-        crate::local_resource_diagnostics::claude_state_v2(&*stats);
     }
 }

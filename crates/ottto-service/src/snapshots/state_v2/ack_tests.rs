@@ -6,6 +6,7 @@ fn progress(generation: u64, body: &str) -> Vec<u8> {
 fn write(path: &Path, bytes: &[u8]) {
     ottto_core::write_owner_only_file_atomic(path, bytes).unwrap();
 }
+/// [money] receipt first replaces only exact predecessor and replays idempotently.
 #[test]
 fn receipt_first_replaces_only_exact_predecessor_and_replays_idempotently() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-receipt-first");
@@ -23,6 +24,7 @@ fn receipt_first_replaces_only_exact_predecessor_and_replays_idempotently() {
     binding.recover(&path).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), new);
 }
+/// [money] mismatched identity generation and same generation forks hold without changes.
 #[test]
 fn mismatched_identity_generation_and_same_generation_forks_hold_without_changes() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-refuse");
@@ -56,6 +58,7 @@ fn mismatched_identity_generation_and_same_generation_forks_hold_without_changes
         "missing historical progress is not empty"
     );
 }
+/// [money] absent initial progress is only a binding marker and next receipt can recover it.
 #[test]
 fn absent_initial_progress_is_only_a_binding_marker_and_next_receipt_can_recover_it() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-missing");
@@ -69,6 +72,7 @@ fn absent_initial_progress_is_only_a_binding_marker_and_next_receipt_can_recover
     binding.recover(&path).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), next);
 }
+/// [money] missing or damaged receipt never falls back to unbound progress.
 #[test]
 fn missing_or_damaged_receipt_never_falls_back_to_unbound_progress() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-corrupt");
@@ -85,6 +89,7 @@ fn missing_or_damaged_receipt_never_falls_back_to_unbound_progress() {
     assert_eq!(std::fs::read(&path).unwrap(), old);
 }
 
+/// [money] import sealing is idempotent but never rebinds a different db or progress.
 #[test]
 fn import_sealing_is_idempotent_but_never_rebinds_a_different_db_or_progress() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-import-seal");
@@ -106,6 +111,7 @@ fn import_sealing_is_idempotent_but_never_rebinds_a_different_db_or_progress() {
     assert!(ProgressRecovery::seal_import(foreign, 10, &index, Some(&old)).is_err());
 }
 
+/// [money] post commit cleanup receipt binds latest db generation and refuses rollback.
 #[test]
 fn post_commit_cleanup_receipt_binds_latest_db_generation_and_refuses_rollback() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-postcommit-generation");
@@ -136,6 +142,7 @@ fn post_commit_cleanup_receipt_binds_latest_db_generation_and_refuses_rollback()
     assert_eq!(std::fs::read(&path).unwrap(), cleaned);
 }
 
+/// [money] obsolete unpublished seal preserves custody then retries after v1 advances.
 #[test]
 fn obsolete_unpublished_seal_preserves_custody_then_retries_after_v1_advances() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-obsolete-import");
@@ -184,6 +191,7 @@ fn obsolete_unpublished_seal_preserves_custody_then_retries_after_v1_advances() 
     assert!(newest.retry_identity(identity).is_err());
     assert_eq!(std::fs::read(&companion).unwrap(), sealed);
 }
+/// [money] interrupted predecessor copy retries without losing exact companion.
 #[test]
 fn interrupted_predecessor_copy_retries_without_losing_exact_companion() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-import-copy-retry");

@@ -173,6 +173,7 @@ fn admitted(
     sampled_audit::growth_read_admitted_at(index, candidate, ReadMode::Full(reason), now)
 }
 
+/// [money] confirmed claim survives native reopen and clock rollback.
 #[test]
 fn confirmed_claim_survives_native_reopen_and_clock_rollback() {
     let f = Fixture::new();
@@ -212,6 +213,7 @@ fn confirmed_claim_survives_native_reopen_and_clock_rollback() {
     ));
 }
 
+/// [money] independent load cannot borrow claim generation even without working debt.
 #[test]
 fn independent_load_cannot_borrow_claim_generation_even_without_working_debt() {
     let f = Fixture::new();
@@ -234,6 +236,7 @@ fn independent_load_cannot_borrow_claim_generation_even_without_working_debt() {
         .any(|row| row["counts"]["latest"]["growth_claim_refused"] == "lineage"));
 }
 
+/// [money] reopened owner and other path cannot reuse foreign claim context.
 #[test]
 fn reopened_owner_and_other_path_cannot_reuse_foreign_claim_context() {
     let f = Fixture::new();
@@ -262,6 +265,7 @@ fn reopened_owner_and_other_path_cannot_reuse_foreign_claim_context() {
     ));
 }
 
+/// [money] unconfirmed commit cannot publish receipt or admit full.
 #[test]
 fn unconfirmed_commit_cannot_publish_receipt_or_admit_full() {
     let f = Fixture::new();
@@ -281,6 +285,7 @@ fn unconfirmed_commit_cannot_publish_receipt_or_admit_full() {
     ));
 }
 
+/// [money] same generation db replacement cannot borrow constant fence.
 #[test]
 fn same_generation_db_replacement_cannot_borrow_constant_fence() {
     let f = Fixture::new();
@@ -304,6 +309,7 @@ fn same_generation_db_replacement_cannot_borrow_constant_fence() {
     ));
 }
 
+/// [money] real claim save authenticates old clone and ordinary save ends its authority.
 #[test]
 fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority() {
     let f = Fixture::new();

@@ -15996,6 +15996,7 @@ mod tests {
         assert!(progress.accepted_fingerprints.is_empty());
     }
 
+    /// [regress] off busy progress preserves damaged v1 before containment.
     #[test]
     fn off_busy_progress_preserves_damaged_v1_before_containment() {
         let root = crate::test_scratch::private_dir("off-progress-before-v1");
@@ -16039,6 +16040,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// [regress] published custody authenticates before damaged progress containment.
     #[test]
     fn published_custody_authenticates_before_damaged_progress_containment() {
         let root = crate::test_scratch::private_dir("v2-route-before-progress");

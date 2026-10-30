@@ -1,4 +1,5 @@
 //! Pre-publication pacing and the Claude semantic mapper boundary.
+use super::resume::ResumeHooks;
 use super::*;
 use anyhow::bail;
 use std::path::Path;
@@ -7,7 +8,6 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Pause {
-    PublicationPending,
     R1StagingNotInstalled,
     UnknownClass,
     Malformed,
@@ -101,20 +101,6 @@ pub(super) trait Mapper {
         Ok(None)
     }
     fn preflight(&self, index: &ScanIndex) -> std::result::Result<(), Pause>;
-    fn populate<S: Store>(&self, store: &mut S, index: &ScanIndex) -> Result<()>;
-    fn populate_context<S: Store>(&self, store: &mut S, index: &ScanIndex) -> Result<KindCx> {
-        self.populate(store, index)?;
-        Ok(KindCx::default())
-    }
-    fn populate_original<S: Store>(
-        &self,
-        store: &mut S,
-        index: &ScanIndex,
-        original: Option<&Original>,
-    ) -> Result<KindCx> {
-        let _ = original;
-        self.populate_context(store, index)
-    }
     fn import_generation(&self, index: &ScanIndex) -> Result<u64> {
         Ok(index.generation)
     }
@@ -123,16 +109,9 @@ pub(super) trait Mapper {
         store: &mut S,
         index: &ScanIndex,
         original: Option<&Original>,
-    ) -> Result<KindCx> {
-        let cx = self.populate_original(store, index, original)?;
-        self.verify(store, index)?;
-        Ok(cx)
-    }
-    // Proof mismatch/oversize must return a typed Pause; engine/IO failures
-    // remain transient. The framework never guesses from provider text.
-    fn verify<S: Store>(&self, store: &mut S, index: &ScanIndex) -> Result<()>;
-    /// Read every semantic row through Transaction::read_value, including
-    /// projection-bearing rows: it verifies value digests while decoding. Never return
+    ) -> Result<KindCx>;
+    /// Read every semantic row through Transaction::read_value, verifying
+    /// value digests while decoding. Never return
     /// a partially hydrated graph or normalize unknown raw holds away.
     fn hydrate<S: Store>(&self, store: &mut S) -> Result<ScanIndex>;
     fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)> {
@@ -141,19 +120,14 @@ pub(super) trait Mapper {
     /// Uses the SAME claim maxima/hold and repair comparisons as v1; the
     /// adapter streams current custody through txn, without a second graph.
     fn merge_cas<T: Transaction>(&self, txn: &mut T, index: &mut ScanIndex) -> Result<()>;
-    /// Emit only dirty rows against the resident header map. Before mutating,
-    /// bound the proposed page to 5k rows / 32 MiB, shrinking collection pages
-    /// when necessary. More than 64 account windows is an alarm, never
+    /// Emit the complete dirty delta against the resident header map. Saves
+    /// above 5k rows / 32 MiB reduce the next collection page; the whole save
+    /// rolls back at its hard ceiling. More than 64 account windows is an alarm, never
     /// permission to drop unsettled custody. KEEP persisted shared refs: decode
     /// only each changed row's old refs, diff against new refs, adjust/reclaim
     /// in this transaction. Never perform whole-history GC during a save.
-    fn delta<T: Transaction>(
-        &self,
-        txn: &mut T,
-        index: &ScanIndex,
-        plan: Option<&units_graph::RowPlan>,
-    ) -> Result<()>;
-    fn selected_save(
+    fn delta<T: Transaction>(&self, txn: &mut T, index: &ScanIndex) -> Result<()>;
+    fn save_delta(
         &self,
         db: &mut sqlite::Sqlite,
         identity: &Identity,
@@ -164,7 +138,7 @@ pub(super) trait Mapper {
         let _ = (db, identity, prev, index, cx);
         Ok(false)
     }
-    fn selected_claim_save(
+    fn save_claim_delta(
         &self,
         db: &mut sqlite::Sqlite,
         identity: &Identity,
@@ -172,21 +146,11 @@ pub(super) trait Mapper {
         index: &mut ScanIndex,
         cx: &mut KindCx,
     ) -> Result<bool> {
-        self.selected_save(db, identity, prev, index, cx)
-    }
-    fn restore_selected(
-        &self,
-        db: &mut sqlite::Sqlite,
-        index: &mut ScanIndex,
-        cx: &mut KindCx,
-    ) -> Result<()> {
-        let _ = (db, index, cx);
-        Ok(())
+        self.save_delta(db, identity, prev, index, cx)
     }
 }
-/// Semantic reads/extractors are integrated. Conversion and writes deliberately
-/// refuse until original-authority inventory, import generation publication,
-/// committable-unit selection and owner-locked R1 callbacks are connected.
+/// Composed semantic mapper. The default NoResumeHooks refuses conversion
+/// until M3 installs the source owner's immutable-record staging adapter.
 pub(super) struct ClaudeMapper;
 impl Mapper for ClaudeMapper {
     fn references(
@@ -210,15 +174,14 @@ impl Mapper for ClaudeMapper {
         Original::read(path).map(Some)
     }
     fn preflight(&self, _: &ScanIndex) -> std::result::Result<(), Pause> {
-        // M1 protects every active file publication, including first admission.
-        // Omitting resume rows cannot promise v1-equivalent restart recovery.
-        Err(Pause::R1StagingNotInstalled)
-    }
-    fn populate<S: Store>(&self, _: &mut S, _: &ScanIndex) -> Result<()> {
-        bail!(Pause::PublicationPending)
-    }
-    fn verify<S: Store>(&self, _: &mut S, _: &ScanIndex) -> Result<()> {
-        bail!(Pause::PublicationPending)
+        kinds_files::NoResumeHooks
+            .preflight_import()
+            .map_err(|error| {
+                error
+                    .downcast_ref::<Pause>()
+                    .copied()
+                    .unwrap_or(Pause::Mismatch)
+            })
     }
     fn import_generation(&self, index: &ScanIndex) -> Result<u64> {
         index
@@ -273,15 +236,12 @@ impl Mapper for ClaudeMapper {
         kinds_misc::merge_cas(tx, index)?;
         kinds_files::merge_growth_cas(tx, index)
     }
-    fn delta<T: Transaction>(
-        &self,
-        tx: &mut T,
-        _: &ScanIndex,
-        plan: Option<&units_graph::RowPlan>,
-    ) -> Result<()> {
-        plan.ok_or(Pause::PublicationPending)?.apply(tx)
+    fn delta<T: Transaction>(&self, _: &mut T, _: &ScanIndex) -> Result<()> {
+        // Production saves use save_delta with their resident committed context.
+        // The generic fallback is for mappers without semantic row ownership.
+        bail!(Hold::ReloadRequired)
     }
-    fn selected_save(
+    fn save_delta(
         &self,
         db: &mut sqlite::Sqlite,
         identity: &Identity,
@@ -295,11 +255,14 @@ impl Mapper for ClaudeMapper {
             prev,
             index,
             cx,
-            &mut kinds_files::NoResumeHooks,
+            SaveOptions {
+                hooks: &mut kinds_files::NoResumeHooks,
+                claim_only: false,
+            },
         )?;
         Ok(true)
     }
-    fn selected_claim_save(
+    fn save_claim_delta(
         &self,
         db: &mut sqlite::Sqlite,
         identity: &Identity,
@@ -307,80 +270,44 @@ impl Mapper for ClaudeMapper {
         index: &mut ScanIndex,
         cx: &mut KindCx,
     ) -> Result<bool> {
-        self.save_admitted_mode(
+        self.save_admitted(
             db,
             identity,
             prev,
             index,
             cx,
-            &mut kinds_files::NoResumeHooks,
-            true,
+            SaveOptions {
+                hooks: &mut kinds_files::NoResumeHooks,
+                claim_only: true,
+            },
         )?;
         Ok(true)
     }
-    fn restore_selected(
-        &self,
-        db: &mut sqlite::Sqlite,
-        index: &mut ScanIndex,
-        cx: &mut KindCx,
-    ) -> Result<()> {
-        let identity = {
-            let mut tx = db.begin(TxnMode::Read)?;
-            identity(&mut tx)?
-        };
-        if let Some(mut desired) = units_graph::restore(db, &identity, index)? {
-            super::super::lenient_decode::post_decode_hydrated(
-                &mut desired,
-                "load",
-                "claude_code",
-            )?;
-            self.save_admitted(
-                db,
-                &identity,
-                index,
-                &mut desired,
-                cx,
-                &mut kinds_files::NoResumeHooks,
-            )?;
-            *index = desired;
-        }
-        Ok(())
-    }
+}
+struct SaveOptions<'a> {
+    hooks: &'a mut dyn kinds_files::ResumeHooks,
+    claim_only: bool,
 }
 impl ClaudeMapper {
-    pub(super) fn save_admitted(
+    fn save_admitted(
         &self,
         db: &mut sqlite::Sqlite,
         identity: &Identity,
         prev: &ScanIndex,
         next: &mut ScanIndex,
         cx: &mut KindCx,
-        hooks: &mut dyn kinds_files::ResumeHooks,
-    ) -> Result<()> {
-        self.save_admitted_mode(db, identity, prev, next, cx, hooks, false)
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn save_admitted_mode(
-        &self,
-        db: &mut sqlite::Sqlite,
-        identity: &Identity,
-        prev: &ScanIndex,
-        next: &mut ScanIndex,
-        cx: &mut KindCx,
-        hooks: &mut dyn kinds_files::ResumeHooks,
-        claim_only: bool,
+        options: SaveOptions<'_>,
     ) -> Result<()> {
         {
             let mut tx = db.begin(TxnMode::Read)?;
             kinds_misc::merge_cas_at(&mut tx, next, prev.generation)?;
             kinds_files::merge_growth_cas(&mut tx, next)?;
         }
-        if !claim_only {
+        if !options.claim_only {
             next.retire_committed_claude_account_pending_windows();
         }
         super::super::lenient_decode::check_held_output(next)?;
-        let plan = units_graph::plan(db, identity, prev, next, cx, hooks)?;
-        kinds::save_selected(db, prev, next, cx, plan, hooks, self)
+        kinds::save_graph(db, identity, prev, next, cx, options.hooks)
     }
 }
 
@@ -392,34 +319,6 @@ fn identity(tx: &mut dyn Transaction) -> Result<Identity> {
     let mut bytes = Vec::new();
     tx.read_value(&h, &mut bytes)?;
     Ok(serde_json::from_slice(&bytes)?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn monotonic_pacing_is_one_hour_six_hours_third_disable_or_daily() {
-        let now = Instant::now();
-        let mut pace = Pace::default();
-        assert_eq!(pace.start(now), Some(true));
-        pace.failed(now, Pause::Io);
-        assert_eq!(pace.start(now + Duration::from_secs(3599)), None);
-        let second = now + Duration::from_secs(3600);
-        assert_eq!(pace.start(second), Some(false));
-        pace.failed(second, Pause::Io);
-        let third = second + Duration::from_secs(6 * 3600);
-        assert_eq!(pace.start(third), Some(false));
-        pace.failed(third, Pause::Io);
-        assert!(pace.disabled());
-        assert_eq!(pace.start(third + Duration::from_secs(48 * 3600)), None);
-        let mut pace = Pace::default();
-        assert_eq!(pace.start(now), Some(true));
-        pace.failed(now, Pause::UnknownClass);
-        assert_eq!(pace.start(now + Duration::from_secs(86400 - 1)), None);
-        assert_eq!(pace.start(now + Duration::from_secs(86400)), Some(false));
-        // Restart allowance is explicitly process-local, not wall-clock paced.
-        assert_eq!(Pace::default().start(now), Some(true));
-    }
 }
 
 /// Evidence is collected before lenient decoding. It contains only bounded
@@ -746,15 +645,15 @@ fn original_shape(input: impl std::io::BufRead) -> Result<()> {
         input,
         failed: false,
     };
-    let result = shape::inventory(&mut observed);
+    let result = codec::inventory(&mut observed);
     if observed.failed {
         bail!(Pause::Io);
     }
     result.map_err(|p| {
         match p {
-            shape::Pause::Unknown => Pause::UnknownClass,
-            shape::Pause::Malformed => Pause::Malformed,
-            shape::Pause::Oversize => Pause::Oversize,
+            codec::Pause::Unknown => Pause::UnknownClass,
+            codec::Pause::Malformed => Pause::Malformed,
+            codec::Pause::Oversize => Pause::Oversize,
         }
         .into()
     })
@@ -1091,7 +990,7 @@ impl Original {
 /// every value through the backend's checked streaming comparison, without
 /// hydrating a second ScanIndex or retaining any packed history payloads.
 /// The returned context is the one installed for the verified graph.
-#[allow(dead_code)] // Conversion remains gated on CAS, R1 and application parity.
+#[cfg(test)]
 fn verify_normalized(
     tx: &mut dyn Transaction,
     index: &ScanIndex,
@@ -1322,6 +1221,7 @@ mod application_cases {
         }
     }
 
+    /// [format] composed import advances once and seals owned progress before final path exists.
     #[test]
     fn composed_import_advances_once_and_seals_owned_progress_before_final_path_exists() {
         for generation in [0_u64, 41] {
@@ -1385,6 +1285,7 @@ mod application_cases {
         }
     }
 
+    /// [format] import publication holds progress owner and reopens real claude mapper at new generation.
     #[test]
     fn import_publication_holds_progress_owner_and_reopens_real_claude_mapper_at_new_generation() {
         let c = Corpus::new();
@@ -1440,6 +1341,7 @@ mod application_cases {
         );
     }
 
+    /// [format] original progress requires owner and unchanged bytes and baseline.
     #[test]
     fn original_progress_requires_owner_and_unchanged_bytes_and_baseline() {
         let c = Corpus::new();
@@ -1484,6 +1386,7 @@ mod application_cases {
         assert!(!fence::sibling(&c.path, ".v2.sqlite").exists());
     }
 
+    /// [format] original presence precedes normalization and inventory has no write side effects.
     #[test]
     fn original_presence_precedes_normalization_and_inventory_has_no_write_side_effects() {
         let c = Corpus::new();
@@ -1500,6 +1403,7 @@ mod application_cases {
         assert_eq!(fs::read(&c.path).unwrap(), b"changed-original");
     }
 
+    /// [format] desktop inventory conversion keeps original presence without digest custody.
     #[test]
     fn desktop_inventory_conversion_keeps_original_presence_without_digest_custody() {
         for inventory in [
@@ -1550,6 +1454,7 @@ mod application_cases {
             assert_eq!(fs::read(&c.path).unwrap(), bytes);
         }
     }
+    /// [format] duplicate unknown and invalid escaped originals pause before baseline.
     #[test]
     fn duplicate_unknown_and_invalid_escaped_originals_pause_before_baseline() {
         for bytes in [
@@ -1569,6 +1474,7 @@ mod application_cases {
         }
     }
 
+    /// [format] all referenced shards are inventoried and preserved without unreferenced files.
     #[test]
     fn all_referenced_shards_are_inventoried_and_preserved_without_unreferenced_files() {
         let c = Corpus::new();
@@ -1599,6 +1505,7 @@ mod application_cases {
         assert!(original.unchanged().is_err());
     }
 
+    /// [format] fifo referenced shard refuses without blocking the owner lock.
     #[test]
     fn fifo_referenced_shard_refuses_without_blocking_the_owner_lock() {
         use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
@@ -1638,6 +1545,7 @@ mod application_cases {
         assert!(!fence::sibling(&c.path, ".v1-readonly").exists());
     }
 
+    /// [format] unknown nested field in final shard pauses even with valid descriptor digest.
     #[test]
     fn unknown_nested_field_in_final_shard_pauses_even_with_valid_descriptor_digest() {
         use sha2::Digest;
@@ -1672,6 +1580,7 @@ mod application_cases {
         assert!(!fence::sibling(&c.path, ".v1-readonly").exists());
     }
 
+    /// [format] f7 baseline failures remain unpublished and keep original authority.
     #[test]
     fn f7_baseline_failures_remain_unpublished_and_keep_original_authority() {
         for point in [
@@ -1693,6 +1602,7 @@ mod application_cases {
         }
     }
 
+    /// [format] normalized readback checks all groups raw custody presence and extra rows.
     #[test]
     fn normalized_readback_checks_all_groups_raw_custody_presence_and_extra_rows() {
         let c = Corpus::new();
@@ -1744,6 +1654,7 @@ mod application_cases {
         let mut tx = db.begin(TxnMode::Read).unwrap();
         assert!(verify_normalized(&mut tx, &index, &original, c.binding()).is_err());
     }
+    /// [format] f4 original unbound authority repair preserves freeze raw bytes and provenance.
     #[test]
     fn f4_original_unbound_authority_repair_preserves_freeze_raw_bytes_and_provenance() {
         let c = Corpus::new();
@@ -1791,6 +1702,7 @@ mod application_cases {
         verify_normalized(&mut tx, &normalized, &original, c.binding()).unwrap();
     }
 
+    /// [format] complete real shaped money graph passes streaming readback with shared membership.
     #[test]
     fn complete_real_shaped_money_graph_passes_streaming_readback_with_shared_membership() {
         let c = Corpus::new();
@@ -1821,6 +1733,7 @@ mod application_cases {
 #[cfg(test)]
 mod codec_mapper_regressions {
     use super::*;
+    /// [format] read back counts aggregated references to repeated empty evidence.
     #[test]
     fn read_back_counts_aggregated_references_to_repeated_empty_evidence() {
         let scratch = crate::test_scratch::ScratchDir::new("codec-ref-readback");

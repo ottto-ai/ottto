@@ -78,6 +78,7 @@ fn commit_populate(db: &mut sqlite::Sqlite, index: &ScanIndex) {
     populate(index, &mut tx, &mut cx).unwrap();
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
 }
+/// [format] all groups share one snapshot and roundtrip real v1 without losing context or membership.
 #[test]
 fn all_groups_share_one_snapshot_and_roundtrip_real_v1_without_losing_context_or_membership() {
     let (_scratch, mut db) = Scratch::store();
@@ -117,6 +118,7 @@ fn all_groups_share_one_snapshot_and_roundtrip_real_v1_without_losing_context_or
     let expected = 1 + index.claude_usage_family_pending.len();
     assert_eq!(owners, expected);
 }
+/// [format] incomplete census group cannot escape as a partially hydrated graph.
 #[test]
 fn incomplete_census_group_cannot_escape_as_a_partially_hydrated_graph() {
     let (_scratch, mut db) = Scratch::store();
@@ -127,6 +129,7 @@ fn incomplete_census_group_cannot_escape_as_a_partially_hydrated_graph() {
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
     assert!(hydrate(&mut db, Scratch::binding()).is_err());
 }
+/// [format] noop resume adapter cannot publish new file progress.
 #[test]
 fn noop_resume_adapter_cannot_publish_new_file_progress() {
     let prev = ScanIndex::default();
@@ -148,6 +151,7 @@ impl Value for Stored {
         Ok(())
     }
 }
+/// [format] last shared literal release marks erasure in the deleting transaction and rollback keeps it.
 #[test]
 fn last_shared_literal_release_marks_erasure_in_the_deleting_transaction_and_rollback_keeps_it() {
     let (_scratch, mut db) = Scratch::live_store();
@@ -189,6 +193,7 @@ fn last_shared_literal_release_marks_erasure_in_the_deleting_transaction_and_rol
     assert_eq!(serde_json::from_slice::<u64>(&bytes).unwrap(), 2);
 }
 
+/// [format] foreign source and registered but unmapped money kinds refuse hydration.
 #[test]
 fn foreign_source_and_registered_but_unmapped_money_kinds_refuse_hydration() {
     let (_scratch, mut db) = Scratch::store();
@@ -211,6 +216,7 @@ fn foreign_source_and_registered_but_unmapped_money_kinds_refuse_hydration() {
         .to_string()
         .contains("state_v2_unmapped_kind"));
 }
+/// [format] generic erasure extraction visits nested text keys and shared evidence.
 #[test]
 fn generic_erasure_extraction_visits_nested_text_keys_and_shared_evidence() {
     let (_scratch, mut db) = Scratch::store();
@@ -274,6 +280,7 @@ impl kinds_files::ResumeHooks for SaveHooks {
         Ok(())
     }
 }
+/// [format] complete misc dirty plan covers scalar map ack and raw hold changes.
 #[test]
 fn complete_misc_dirty_plan_covers_scalar_map_ack_and_raw_hold_changes() {
     let prev = fixture();
@@ -301,6 +308,7 @@ fn complete_misc_dirty_plan_covers_scalar_map_ack_and_raw_hold_changes() {
     );
 }
 
+/// [money] streamed cas merges retry and growth maxima without resurrecting removed quarantine.
 #[test]
 fn streamed_cas_merges_retry_and_growth_maxima_without_resurrecting_removed_quarantine() {
     let (_scratch, mut db) = Scratch::store();
@@ -349,6 +357,7 @@ fn streamed_cas_merges_retry_and_growth_maxima_without_resurrecting_removed_quar
     working.generation += 1;
     assert!(kinds_misc::merge_cas(&mut tx, &mut working).is_err());
 }
+/// [money] growth raw hold survives composed hydration and cas cannot release it.
 #[test]
 fn growth_raw_hold_survives_composed_hydration_and_cas_cannot_release_it() {
     let (_scratch, mut db) = Scratch::store();
@@ -374,6 +383,7 @@ fn growth_raw_hold_survives_composed_hydration_and_cas_cannot_release_it() {
     assert!(kinds_misc::merge_cas(&mut tx, &mut working).is_err());
 }
 
+/// [format] whole delta stages before begin and calls gc only after commit.
 #[test]
 fn whole_delta_stages_before_begin_and_calls_gc_only_after_commit() {
     let (_scratch, mut db) = Scratch::live_store();
@@ -406,6 +416,7 @@ fn whole_delta_stages_before_begin_and_calls_gc_only_after_commit() {
     );
 }
 
+/// [format] stale generation or future writer refuses before restart side effects.
 #[test]
 fn stale_generation_or_future_writer_refuses_before_restart_side_effects() {
     for future_writer in [false, true] {
@@ -426,6 +437,7 @@ fn stale_generation_or_future_writer_refuses_before_restart_side_effects() {
     }
 }
 
+/// [money] window ids are monotonic across a b a and complete family removal.
 #[test]
 fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
     let (_scratch, mut db) = Scratch::store();
@@ -478,6 +490,7 @@ fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
     }
 }
 
+/// [format] on open runs after complete hydration and per file stage exclusion retains progress.
 #[test]
 fn on_open_runs_after_complete_hydration_and_per_file_stage_exclusion_retains_progress() {
     #[derive(Default)]
@@ -494,6 +507,14 @@ fn on_open_runs_after_complete_hydration_and_per_file_stage_exclusion_retains_pr
             self.opened = true;
             Ok(())
         }
+        fn plan(
+            &mut self,
+            prev: &ScanIndex,
+            next: &ScanIndex,
+            current: &BTreeMap<String, resume::ResumeCheckpoint>,
+        ) -> Result<resume::StagedCheckpoints> {
+            self.stage(prev, next, current)
+        }
         fn stage(
             &mut self,
             _: &ScanIndex,
@@ -506,7 +527,7 @@ fn on_open_runs_after_complete_hydration_and_per_file_stage_exclusion_retains_pr
             })
         }
     }
-    let (_scratch, mut db) = Scratch::store();
+    let (_scratch, mut db) = Scratch::live_store();
     let prev = fixture();
     commit_populate(&mut db, &prev);
     let mut tx = db.begin(TxnMode::Read).unwrap();
@@ -518,18 +539,21 @@ fn on_open_runs_after_complete_hydration_and_per_file_stage_exclusion_retains_pr
     next.generation += 1;
     next.files.get_mut("synthetic-file").unwrap().size_bytes += 1;
     next.upload_context_fingerprint = Some("independent-change".into());
-    cx.preflight(&prev, &next, &mut hooks).unwrap();
-    cx.retain_excluded(&prev, &mut next).unwrap();
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    save_graph(&mut db, &identity, &prev, &mut next, &mut cx, &mut hooks).unwrap();
     assert_eq!(
-        next.files["synthetic-file"].size_bytes,
-        prev.files["synthetic-file"].size_bytes
+        serde_json::to_vec(&next.files["synthetic-file"]).unwrap(),
+        serde_json::to_vec(&prev.files["synthetic-file"]).unwrap()
     );
-    let dirty = kinds_misc::dirty_fields(&prev, &next).unwrap();
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    delta(&prev, &next, &mut tx, &mut cx, dirty).unwrap();
-    let result = tx.commit(prev.generation, next.generation);
-    assert_eq!(result, DurableCommitOutcome::Committed(next.generation));
-    cx.post_commit(&result, &mut hooks).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&next.claude_request_census).unwrap(),
+        serde_json::to_vec(&prev.claude_request_census).unwrap()
+    );
+    assert_eq!(next.growth_retention, prev.growth_retention);
+    assert_eq!(
+        next.upload_context_fingerprint.as_deref(),
+        Some("independent-change")
+    );
     let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
     assert_eq!(
         serde_json::to_vec(&restored).unwrap(),
@@ -537,6 +561,7 @@ fn on_open_runs_after_complete_hydration_and_per_file_stage_exclusion_retains_pr
     );
 }
 
+/// [format] census evidence larger than the projected row cap roundtrips.
 #[test]
 fn census_evidence_larger_than_the_projected_row_cap_roundtrips() {
     use base64::Engine as _;

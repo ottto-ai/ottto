@@ -2339,6 +2339,7 @@ fn desktop_inventory_keeps_existing_positional_index_slots() {
     }
 }
 
+/// [format] growth retention keeps existing positional index slots.
 #[test]
 fn growth_retention_keeps_existing_positional_index_slots() {
     let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();

@@ -18,8 +18,9 @@ pub(super) use runtime::checkpoint_priority_fixture;
 pub(super) use runtime::invalidate_tree;
 pub(super) use runtime::Hold;
 pub(super) use runtime::{
-    after_v1_locked, checkpoint_priority_active, published, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
-    idle, load_locked, recovery_save_guard, save_locked,
+    after_v1_locked, checkpoint_priority_active, collection_page_limit, erase_tree,
+    guard_containment_locked, guard_external, idle, load_locked, published, recovery_save_guard,
+    save_locked,
 };
 mod codec;
 #[cfg(test)]
@@ -33,7 +34,6 @@ mod kinds_files;
 mod kinds_misc;
 mod mapper;
 pub(crate) mod resume;
-use codec as shape;
 mod sqlite;
 use kinds::KindCx;
 
@@ -327,11 +327,7 @@ fn integrity(hash: sha2::Sha256) -> [u8; 16] {
 fn value_cap(key: &RowKey) -> u64 {
     match key {
         RowKey::Meta(_) => CONTROL_BYTES,
-        RowKey::Record { kind, .. }
-            if kind.name().starts_with("raw_hold.") =>
-        {
-            VALUE_BYTES
-        }
+        RowKey::Record { kind, .. } if kind.name().starts_with("raw_hold.") => VALUE_BYTES,
         RowKey::Record { kind, .. }
             if matches!(
                 kind.name(),

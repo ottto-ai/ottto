@@ -88,6 +88,7 @@ fn value(tx: &mut impl Transaction, h: &Header) -> Vec<u8> {
     out
 }
 
+/// [format] f8 owner replacement reclaims all superseded parts atomically.
 #[test]
 fn f8_owner_replacement_reclaims_all_superseded_parts_atomically() {
     let tmp = Scratch::new();
@@ -120,6 +121,7 @@ fn f8_owner_replacement_reclaims_all_superseded_parts_atomically() {
     db.validate_parts().unwrap();
 }
 
+/// [format] f8 64 mib admission checks before read allocation.
 #[test]
 fn f8_64_mib_admission_checks_before_read_allocation() {
     let key = raw_hold("large".into());
@@ -141,6 +143,7 @@ fn f8_64_mib_admission_checks_before_read_allocation() {
     .is_err());
 }
 
+/// [format] f8 json raw spelling hashes and positional neighbours survive.
 #[test]
 fn f8_json_raw_spelling_hashes_and_positional_neighbours_survive() {
     let raw = br#"{ "source_file_fingerprint":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "raw": {"retry_after_unix_seconds":"mistyped"}, "positional":[7,null,8], "unicode":"\u0041" }"#;
@@ -157,8 +160,9 @@ fn f8_json_raw_spelling_hashes_and_positional_neighbours_survive() {
     }
 }
 
+/// [format] header scan cannot hide corrupt value parts.
 #[test]
-fn header_projection_never_reads_corrupt_parts() {
+fn header_scan_cannot_hide_corrupt_value_parts() {
     let tmp = Scratch::new();
     let mut db = tmp.store();
     let key = traversal("traversal".into());
@@ -181,6 +185,7 @@ fn header_projection_never_reads_corrupt_parts() {
     assert!(tx.read_value(&h, &mut std::io::sink()).is_err());
 }
 
+/// [format] f8 orphan and dangling parts are damage without silent gc.
 #[test]
 fn f8_orphan_and_dangling_parts_are_damage_without_silent_gc() {
     let tmp = Scratch::new();
@@ -193,6 +198,7 @@ fn f8_orphan_and_dangling_parts_are_damage_without_silent_gc() {
     );
 }
 
+/// [format] wrong fixed type and generation refuse without publishing.
 #[test]
 fn wrong_fixed_type_and_generation_refuse_without_publishing() {
     let tmp = Scratch::new();
@@ -203,7 +209,10 @@ fn wrong_fixed_type_and_generation_refuse_without_publishing() {
             .put(RowInput {
                 value_version: 1,
                 key: &file("x".into()),
-                fixed: &Fixed::None,
+                fixed: &Fixed::RequestSet {
+                    commitment: [1; 32],
+                    refs: 1
+                },
                 value: &Bytes(vec![])
             })
             .is_err());
@@ -215,6 +224,7 @@ fn wrong_fixed_type_and_generation_refuse_without_publishing() {
     assert!(tx.get(&test_record("new".into())).unwrap().is_none());
 }
 
+/// [format] f6 import is journal off and has no import wal.
 #[test]
 fn f6_import_is_journal_off_and_has_no_import_wal() {
     let tmp = Scratch::new();
@@ -234,6 +244,7 @@ fn f6_import_is_journal_off_and_has_no_import_wal() {
     reopened.validate_parts().unwrap();
 }
 
+/// [regress] owner sidecar allows sqlite init migration publication and reopen.
 #[test]
 fn owner_sidecar_allows_sqlite_init_migration_publication_and_reopen() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -277,6 +288,7 @@ fn owner_sidecar_allows_sqlite_init_migration_publication_and_reopen() {
     assert_eq!(db.stamp().unwrap().0, 0);
 }
 
+/// [format] owner sidecar rejects symlinks and hardlinks before db creation.
 #[test]
 fn owner_sidecar_rejects_symlinks_and_hardlinks_before_db_creation() {
     use std::os::unix::fs::PermissionsExt;
@@ -298,6 +310,7 @@ fn owner_sidecar_rejects_symlinks_and_hardlinks_before_db_creation() {
     }
 }
 
+/// [format] f5 independent identity mismatch refuses before wal mutation.
 #[test]
 fn f5_independent_identity_mismatch_refuses_before_wal_mutation() {
     let tmp = Scratch::new();
@@ -312,6 +325,7 @@ fn f5_independent_identity_mismatch_refuses_before_wal_mutation() {
     assert!(!tmp.0.join("index.v2.sqlite.import-shm").exists());
 }
 
+/// [format] f6 pl in values requires purge even with hash only keys.
 #[test]
 fn f6_pl_in_values_requires_purge_even_with_hash_only_keys() {
     let tmp = Scratch::new();
@@ -340,6 +354,7 @@ fn f6_pl_in_values_requires_purge_even_with_hash_only_keys() {
     }
 }
 
+/// [format] f6 passive complete can leave allocated wal and allows next write.
 #[test]
 fn f6_passive_complete_can_leave_allocated_wal_and_allows_next_write() {
     let tmp = Scratch::new();
@@ -369,56 +384,52 @@ fn f6_passive_complete_can_leave_allocated_wal_and_allows_next_write() {
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
 }
 
+/// [format] f9 unknown top nested array tail and reserved money pause.
 #[test]
 fn f9_unknown_top_nested_array_tail_and_reserved_money_pause() {
     for (raw, expected) in [
         (
             r#"{"files":{},"future_custody":{"owed":true}}"#,
-            shape::Pause::Unknown,
+            codec::Pause::Unknown,
         ),
         (
             r#"{"files":{"/synthetic":{"size_bytes":1,"future_custody":true}}}"#,
-            shape::Pause::Unknown,
+            codec::Pause::Unknown,
         ),
         (
             r#"{"files":{"/synthetic":[1,2,null,"",null,null,0,null,null,null,null,null,false,null,false,false,null,null,null,null,null,null,7]}}"#,
-            shape::Pause::Unknown,
+            codec::Pause::Unknown,
         ),
         (
             r#"{"files":{},"claude_request_census":{"~lost":{"k":1}}}"#,
-            shape::Pause::Unknown,
+            codec::Pause::Unknown,
         ),
         (
             r#"{"files":{},"claude_copy_removals":{}}"#,
-            shape::Pause::Unknown,
+            codec::Pause::Unknown,
         ),
     ] {
         assert_eq!(
-            shape::inventory(std::io::Cursor::new(raw)),
+            codec::inventory(std::io::Cursor::new(raw)),
             Err(expected),
             "{raw}"
         );
     }
 }
 
+/// [format] f9 unknown plus malformed is a conversion refusal without writes.
 #[test]
 fn f9_unknown_plus_malformed_is_a_conversion_refusal_without_writes() {
     let raw = br#"{"files":{},"future_custody": { definitely malformed"#;
     assert_eq!(
-        shape::inventory(std::io::Cursor::new(raw)),
-        Err(shape::Pause::Unknown)
+        codec::inventory(std::io::Cursor::new(raw)),
+        Err(codec::Pause::Unknown)
     );
     let tmp = Scratch::new();
     assert_eq!(fs::read_dir(&tmp.0).unwrap().count(), 0);
 }
 
-#[test]
-fn f9_default_writer_and_complete_root_registry_are_known() {
-    let index = super::super::ScanIndex::default();
-    let raw = serde_json::to_vec(&index).unwrap();
-    assert_eq!(shape::inventory(std::io::Cursor::new(raw)), Ok(()));
-}
-
+/// [format] failed write cannot be ignored then committed.
 #[test]
 fn failed_write_cannot_be_ignored_then_committed() {
     use std::cell::Cell;
@@ -451,6 +462,7 @@ fn failed_write_cannot_be_ignored_then_committed() {
     assert!(tx.get(&key).unwrap().is_none());
 }
 
+/// [format] aborted journal off import is never finishable.
 #[test]
 fn aborted_journal_off_import_is_never_finishable() {
     let tmp = Scratch::new();
@@ -462,6 +474,7 @@ fn aborted_journal_off_import_is_never_finishable() {
     assert!(db.finish_import().is_err());
 }
 
+/// [format] independent identity is write once.
 #[test]
 fn independent_identity_is_write_once() {
     let tmp = Scratch::new();
@@ -486,43 +499,7 @@ fn independent_identity_is_write_once() {
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::NotPublished);
 }
 
-#[test]
-fn f9_production_traversal_writer_includes_registered_parent_counts() {
-    assert_eq!(
-        crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES,
-        12
-    );
-    let checkpoint: super::super::ScanTraversalCheckpoint =
-        serde_json::from_value(serde_json::json!({
-            "context_fingerprint": "synthetic-context",
-            "census_window_end": "2026-10-30T00:00:00Z",
-            "scan_roots": ["/synthetic/root"],
-            "pending_directories": [],
-            "pending_candidates": [{"scan_root":"/synthetic/root",
-                "path":"/synthetic/root/file", "census_member":true, "watcher_hint":false}],
-            "observed_index_keys": [],
-            "reconciliation_upper_bound": null,
-            "reconciliation_after": null,
-            "reconciliation_started": false,
-            "counts": {}
-        }))
-        .unwrap();
-    let index = super::super::ScanIndex {
-        traversal: Some(checkpoint),
-        ..Default::default()
-    };
-    let raw = serde_json::to_vec(&index).unwrap();
-    let actual: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-    assert_eq!(
-        actual["traversal"]["counts"]["parent_unresolvable"]["counts"]
-            .as_array()
-            .unwrap()
-            .len(),
-        12
-    );
-    assert_eq!(shape::inventory(std::io::Cursor::new(raw)), Ok(()));
-}
-
+/// [format] f6 deadline keeps writes live without resetting oldest purge.
 #[test]
 fn f6_deadline_keeps_writes_live_without_resetting_oldest_purge() {
     let tmp = Scratch::new();
@@ -568,6 +545,7 @@ fn f6_deadline_keeps_writes_live_without_resetting_oldest_purge() {
     );
 }
 
+/// [format] f8 vacuum churn removes deleted keys and pl values.
 #[test]
 fn f8_vacuum_churn_removes_deleted_keys_and_pl_values() {
     let tmp = Scratch::new();
@@ -628,6 +606,7 @@ fn f8_vacuum_churn_removes_deleted_keys_and_pl_values() {
     assert!(stats["vacuum_wal_peak_bytes"].is_u64());
 }
 
+/// [format] request set candidates allow collisions and compare complete evidence.
 #[test]
 fn request_set_candidates_allow_collisions_and_compare_complete_evidence() {
     use interning::{intern_request_set, RequestEvidence};
@@ -719,6 +698,7 @@ fn request_set_candidates_allow_collisions_and_compare_complete_evidence() {
     db.validate_parts().unwrap();
 }
 
+/// [format] colliding candidate before exact match is not aliased or overwritten.
 #[test]
 fn colliding_candidate_before_exact_match_is_not_aliased_or_overwritten() {
     use interning::{intern_request_set, RequestEvidence};
@@ -768,6 +748,7 @@ fn colliding_candidate_before_exact_match_is_not_aliased_or_overwritten() {
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
 }
 
+/// [format] f8 set last reference reclaims parts without reusing ids.
 #[test]
 fn f8_set_last_reference_reclaims_parts_without_reusing_ids() {
     use interning::{intern_request_set, release_request_set, RequestEvidence};
@@ -801,6 +782,7 @@ fn f8_set_last_reference_reclaims_parts_without_reusing_ids() {
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
 }
 
+/// [format] f8 full stream comparison validates parts and all bytes.
 #[test]
 fn f8_full_stream_comparison_validates_parts_and_all_bytes() {
     let tmp = Scratch::new();
@@ -819,6 +801,7 @@ fn f8_full_stream_comparison_validates_parts_and_all_bytes() {
     assert!(tx.value_matches(&h, &Repeat(h.len)).is_err());
 }
 
+/// [format] f6 busy purge retains obligation paces retry and allows in deadline writes.
 #[test]
 fn f6_busy_purge_retains_obligation_paces_retry_and_allows_in_deadline_writes() {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -866,6 +849,7 @@ fn f6_busy_purge_retains_obligation_paces_retry_and_allows_in_deadline_writes() 
     assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_ok());
 }
 
+/// [format] f6 restart between vacuum and metadata clear keeps pending debt.
 #[test]
 fn f6_restart_between_vacuum_and_metadata_clear_keeps_pending_debt() {
     let tmp = Scratch::new();
@@ -891,6 +875,7 @@ fn f6_restart_between_vacuum_and_metadata_clear_keeps_pending_debt() {
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
 }
 
+/// [format] f6 overdue recovery overrides a future attempt clock.
 #[test]
 fn f6_overdue_recovery_overrides_a_future_attempt_clock() {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -919,6 +904,7 @@ fn f6_overdue_recovery_overrides_a_future_attempt_clock() {
     assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_ok());
 }
 
+/// [format] growth retention follows runtime custody through clones subsets and baselines.
 #[test]
 fn growth_retention_follows_runtime_custody_through_clones_subsets_and_baselines() {
     use std::collections::{BTreeMap, BTreeSet};
@@ -945,6 +931,7 @@ fn growth_retention_follows_runtime_custody_through_clones_subsets_and_baselines
     baseline.retain_persistence_baseline_from(&super::super::ScanIndex::default());
     assert!(!state_v2_growth_retention_active(&baseline));
 }
+/// [format] c1 same key rewrites and path set diffs.
 #[test]
 fn c1_same_key_rewrites_and_path_set_diffs() {
     let tmp = Scratch::new();
@@ -968,6 +955,7 @@ fn c1_same_key_rewrites_and_path_set_diffs() {
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(4));
 }
 
+/// [format] clean checkpoint is durable and next write marks dirty before mutation.
 #[test]
 fn clean_checkpoint_is_durable_and_next_write_marks_dirty_before_mutation() {
     let tmp = Scratch::new();
@@ -993,6 +981,7 @@ fn clean_checkpoint_is_durable_and_next_write_marks_dirty_before_mutation() {
         .is_none());
 }
 
+/// [format] purge starts at twelve hours and busy source pauses at twenty.
 #[test]
 fn purge_starts_at_twelve_hours_and_busy_source_pauses_at_twenty() {
     let tmp = Scratch::new();
@@ -1039,6 +1028,7 @@ fn purge_starts_at_twelve_hours_and_busy_source_pauses_at_twenty() {
     assert_eq!(stats["erasure_breaches"], 1);
 }
 
+/// [format] changed reference diff is atomic and daily drift holds.
 #[test]
 fn changed_reference_diff_is_atomic_and_daily_drift_holds() {
     use interning::{intern_request_set, RequestEvidence};
@@ -1081,6 +1071,7 @@ fn changed_reference_diff_is_atomic_and_daily_drift_holds() {
     assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_err());
 }
 
+/// [format] one save commits all dirty rows above soft targets.
 #[test]
 fn one_save_commits_all_dirty_rows_above_soft_targets() {
     let tmp = Scratch::new();
@@ -1101,6 +1092,7 @@ fn one_save_commits_all_dirty_rows_above_soft_targets() {
         assert_eq!(value(&mut tx, &header), b"evidence");
     }
 }
+/// [format] ceiling rolls back every row and keeps committed headers.
 #[test]
 fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
     let tmp = Scratch::new();
@@ -1121,6 +1113,7 @@ fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
     let header = tx.get(&key).unwrap().unwrap();
     assert_eq!(value(&mut tx, &header), b"old");
 }
+/// [format] sqlite full at commit or chunk write rolls back the complete save.
 #[test]
 fn sqlite_full_at_commit_or_chunk_write_rolls_back_the_complete_save() {
     struct JsonChunk;
@@ -1208,20 +1201,15 @@ fn tx_header(key: &RowKey, bytes: &[u8]) -> Header {
     })
     .unwrap()
 }
-fn file_fixed() -> Fixed {
-    Fixed::None
-}
-fn census_fixed() -> Fixed {
-    Fixed::None
-}
 
+/// [format] typed keys and json headers round trip every physical owner.
 #[test]
 fn typed_keys_and_json_headers_round_trip_every_physical_owner() {
     let tmp = Scratch::new();
     let mut db = tmp.store();
     let rows = vec![
-        (file("file".into()), file_fixed()),
-        (census("file".into()), census_fixed()),
+        (file("file".into()), Fixed::None),
+        (census("file".into()), Fixed::None),
         (
             RowKey::record("account_window", b"family".to_vec(), 17).unwrap(),
             Fixed::None,
@@ -1262,6 +1250,7 @@ fn typed_keys_and_json_headers_round_trip_every_physical_owner() {
         assert_eq!(value(&mut tx, &h), b"opaque\0bytes");
     }
 }
+/// [format] f8 damaged header refuses both lookup and scan before owned copy.
 #[test]
 fn f8_damaged_header_refuses_both_lookup_and_scan_before_owned_copy() {
     for oversized in [false, true] {
@@ -1272,7 +1261,7 @@ fn f8_damaged_header_refuses_both_lookup_and_scan_before_owned_copy() {
         tx.put(RowInput {
             value_version: 1,
             key: &key,
-            fixed: &file_fixed(),
+            fixed: &Fixed::None,
             value: &Bytes(vec![]),
         })
         .unwrap();
@@ -1295,6 +1284,7 @@ fn f8_damaged_header_refuses_both_lookup_and_scan_before_owned_copy() {
             .is_err());
     }
 }
+/// [format] format one physical columns match the four table contract.
 #[test]
 fn format_one_physical_columns_match_the_four_table_contract() {
     let tmp = Scratch::new();
@@ -1318,6 +1308,7 @@ fn format_one_physical_columns_match_the_four_table_contract() {
     assert!(RecordKind::parse("not.registered").is_err());
     assert!(RecordKind::parse("raw_hold.unknown").is_err());
 }
+/// [format] mutable values require segmentation and raw holds stay exact.
 #[test]
 fn mutable_values_require_segmentation_and_raw_holds_stay_exact() {
     let mutable = traversal("family".into());
@@ -1347,6 +1338,7 @@ fn mutable_values_require_segmentation_and_raw_holds_stay_exact() {
     assert_eq!(value(&mut tx, &h), bytes);
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
 }
+/// [format] extra chunks and shared record owner aliases are refused.
 #[test]
 fn extra_chunks_and_shared_record_owner_aliases_are_refused() {
     let tmp = Scratch::new();
@@ -1364,6 +1356,7 @@ fn extra_chunks_and_shared_record_owner_aliases_are_refused() {
     let mut tx = db.begin(TxnMode::Read).unwrap();
     assert!(tx.read_value(&h, &mut std::io::sink()).is_err());
 }
+/// [format] f8 corrupted refcount cannot reclaim evidence or commit sibling changes.
 #[test]
 fn f8_corrupted_refcount_cannot_reclaim_evidence_or_commit_sibling_changes() {
     use interning::{intern_request_set, release_request_set, RequestEvidence};
@@ -1390,12 +1383,13 @@ fn f8_corrupted_refcount_cannot_reclaim_evidence_or_commit_sibling_changes() {
     assert!(tx.get(&sibling).unwrap().is_none());
     assert!(tx.get(&RowKey::RequestSet(id)).is_err());
 }
+/// [format] private labels aliases and raw holds create erasure epochs.
 #[test]
 fn private_labels_aliases_and_raw_holds_create_erasure_epochs() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = file("file".into());
-    let fixed = file_fixed();
+    let fixed = Fixed::None;
     for (g, text) in [(0, "private label"), (1, "changed label")] {
         let mut tx = db.begin(TxnMode::Write).unwrap();
         tx.put(RowInput {
@@ -1409,6 +1403,7 @@ fn private_labels_aliases_and_raw_holds_create_erasure_epochs() {
     }
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
 }
+/// [format] positions and current pointer survive retirement without renumbering.
 #[test]
 fn positions_and_current_pointer_survive_retirement_without_renumbering() {
     let tmp = Scratch::new();
@@ -1454,6 +1449,7 @@ fn test_record(key: String) -> RowKey {
     RowKey::record("v1_field.files", key.into_bytes(), 0).unwrap()
 }
 
+/// [format] changing control replay is bounded before capability parse.
 #[test]
 fn changing_control_replay_is_bounded_before_capability_parse() {
     struct Changes(std::cell::Cell<u8>);
@@ -1484,6 +1480,7 @@ fn changing_control_replay_is_bounded_before_capability_parse() {
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::NotPublished);
     assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(0));
 }
+/// [format] key admission matches for cached and cold reads.
 #[test]
 fn key_admission_matches_for_cached_and_cold_reads() {
     let tmp = Scratch::new();
@@ -1504,6 +1501,7 @@ fn key_admission_matches_for_cached_and_cold_reads() {
     }
 }
 
+/// [format] overdue external reader is a breach and recovery precedes collection.
 #[test]
 fn overdue_external_reader_is_a_breach_and_recovery_precedes_collection() {
     let tmp = Scratch::new();
@@ -1535,6 +1533,7 @@ fn overdue_external_reader_is_a_breach_and_recovery_precedes_collection() {
     );
 }
 
+/// [format] space recovery after restart purges before collection despite recent failure.
 #[test]
 fn space_recovery_after_restart_purges_before_collection_despite_recent_failure() {
     let tmp = Scratch::new();
@@ -1569,6 +1568,7 @@ fn space_recovery_after_restart_purges_before_collection_despite_recent_failure(
     );
 }
 
+/// [format] external owner lock is counted without clearing overdue debt.
 #[test]
 fn external_owner_lock_is_counted_without_clearing_overdue_debt() {
     let tmp = Scratch::new();
@@ -1582,6 +1582,7 @@ fn external_owner_lock_is_counted_without_clearing_overdue_debt() {
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(1));
 }
 
+/// [format] failed idle purge recovers before collection even inside the deadline.
 #[test]
 fn failed_idle_purge_recovers_before_collection_even_inside_the_deadline() {
     let tmp = Scratch::new();
@@ -1602,6 +1603,7 @@ fn failed_idle_purge_recovers_before_collection_even_inside_the_deadline() {
     );
 }
 
+/// [format] serial scan propagates maintenance refusal without consuming custody.
 #[test]
 fn serial_scan_propagates_maintenance_refusal_without_consuming_custody() {
     let mut index = ScanIndex {

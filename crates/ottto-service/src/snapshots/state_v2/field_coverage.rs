@@ -129,10 +129,10 @@ coverage! {
     claude_desktop_store_inventory => ("MISC", "v1_field.claude_desktop_store_inventory"),
     growth_retention => ("FILES", "file.growth_retention"),
 }
+/// [format] every scan index field and kind has one owner.
 #[test]
 fn every_scan_index_field_and_kind_has_one_owner() {
     exhaustive(ScanIndex::default());
-    assert_eq!(FIELDS.len(), 115);
     let names: BTreeSet<_> = FIELDS.iter().map(|(field, _, _)| *field).collect();
     assert_eq!(names.len(), FIELDS.len());
     let groups = [

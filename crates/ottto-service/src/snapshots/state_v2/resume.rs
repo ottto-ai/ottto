@@ -177,6 +177,9 @@ pub(crate) struct StagedCheckpoints {
 /// immutable file and its directory before returning staging proof. The mapper
 /// owns no filesystem handles and never implements a promote step.
 pub(crate) trait ResumeHooks {
+    fn preflight_import(&self) -> Result<()> {
+        Ok(())
+    }
     fn on_open(
         &mut self,
         generation: u64,
@@ -230,7 +233,11 @@ pub(crate) trait ResumeHooks {
 /// A buildable seam before R1 installs its adapter. Preflight still refuses
 /// advancing an active file without a freshly staged reference.
 pub(super) struct NoResumeHooks;
-impl ResumeHooks for NoResumeHooks {}
+impl ResumeHooks for NoResumeHooks {
+    fn preflight_import(&self) -> Result<()> {
+        anyhow::bail!(import::Pause::R1StagingNotInstalled)
+    }
+}
 pub(super) struct Prepared {
     pub(super) generation: u64,
     pub(super) signature: [u8; 32],
@@ -309,40 +316,7 @@ impl KindCx {
     pub(super) fn prepared_checkpoints(&self) -> Option<&BTreeMap<String, ResumeCheckpoint>> {
         self.prepared.as_ref().map(|p| &p.checkpoints)
     }
-    pub(super) fn checkpoints(&self) -> &BTreeMap<String, ResumeCheckpoint> {
-        &self.committed
-    }
-    pub(super) fn preflight_selected(
-        &mut self,
-        prev: &ScanIndex,
-        next: &ScanIndex,
-        selection: &units::Selection,
-        hooks: &mut dyn ResumeHooks,
-    ) -> Result<()> {
-        ensure!(
-            self.binding.as_ref() == Some(&selection.identity.binding)
-                && prev.generation == selection.generation
-                && prev.generation.checked_add(1) == Some(next.generation),
-            "state_v2_resume_selected_generation"
-        );
-        let selected: BTreeSet<_> = selection.keys().collect();
-        for path in prev.files.keys().chain(next.files.keys()) {
-            if prev.files.get(path).map(publication).transpose()?
-                != next.files.get(path).map(publication).transpose()?
-            {
-                ensure!(
-                    selected.contains(&mapper::key("file.progress", path, 1)?),
-                    "state_v2_resume_unselected_file"
-                );
-            }
-        }
-        let bytes = hooks.preflight_selected(prev, next, &self.committed)?;
-        ensure!(
-            bytes <= selection.staging_bytes(),
-            "state_v2_resume_staging_admission"
-        );
-        self.preflight_reserved(prev, next, hooks, bytes)
-    }
+    #[cfg(test)]
     pub(super) fn preflight(
         &mut self,
         prev: &ScanIndex,

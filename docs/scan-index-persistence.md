@@ -524,3 +524,17 @@ transaction caps. WAL/FULL, fullfsync, the 16 MiB journal size limit, PASSIVE at
 8 MiB and idle TRUNCATE remain in effect. Conversion remains paused with reason
 **R1 staging not installed** until restart custody is available; omitting restart
 rows cannot enable publication or fallback to v1.
+
+For an unknown field or other state-v2 load failure, an unpublished source keeps
+collecting through v1 and reports `import_paused` / `import_paused_alarm`.
+After the durable fence, collection holds with a named state-v2 error and the
+existing local-data repair status and alarm. Keep the database, fence, baseline
+and upload-progress bytes as found. Do not reset, rewrite or delete them to clear
+the hold. Growth-retained files remain discoverable so a compatible build can
+catch up by Tail after the hold clears.
+
+If this hold lasts **24 hours**, escalate to **Ottto state recovery support**
+with the counts-only diagnostics and named hold reason. Source applications can
+age out their original transcript files while collection is held; an extended
+hold can therefore lose usage. Prioritize a compatible build and preservation
+of source files. A counter alone is not a recovery action.

@@ -850,6 +850,7 @@ fn integrated_no_store_true_first_install_still_initializes_without_transcript_r
     assert_eq!(observations.iter().map(|(_, _, n)| n).sum::<u64>(), 0);
 }
 
+/// [off=main] off large v1 manifest load cas and containment match compact v1.
 #[test]
 fn off_large_v1_manifest_load_cas_and_containment_match_compact_v1() {
     let compact = Fixture::new();

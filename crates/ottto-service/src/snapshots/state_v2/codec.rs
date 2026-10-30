@@ -204,8 +204,10 @@ fn key_coverage(
     Ok(())
 }
 
-// Callers that produce a streaming Value still use this one JSON codec.
+// Fixture Values use the same production JSON codec.
+#[cfg(test)]
 pub(super) struct Json<'a, T: ?Sized>(pub &'a T);
+#[cfg(test)]
 impl<T: Serialize + ?Sized> Value for Json<'_, T> {
     fn write(&self, out: &mut dyn Write) -> Result<()> {
         out.write_all(&encode(&json(self.0, VALUE_BYTES)?)?)?;
@@ -243,6 +245,7 @@ impl<W: Write> Write for Encoder<W> {
         Ok(())
     }
 }
+#[cfg(test)]
 pub(super) fn unpack(mut input: impl Read, out: &mut dyn Write) -> Result<()> {
     let mut raw = Vec::new();
     input.by_ref().take(VALUE_BYTES + 1).read_to_end(&mut raw)?;
@@ -300,6 +303,7 @@ pub(super) fn inventory(input: impl Read) -> std::result::Result<(), Pause> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// [format] threshold magic logical digest and bounded decode.
     #[test]
     fn threshold_magic_logical_digest_and_bounded_decode() {
         for len in [0, 509, 510, 511, 512, 4096] {
@@ -315,6 +319,7 @@ mod tests {
             assert!(decode::<serde_json::Value>(raw, 1024).is_err());
         }
     }
+    /// [format] generic guard rejects nested ignored fields and opaque census keys.
     #[test]
     fn generic_guard_rejects_nested_ignored_fields_and_opaque_census_keys() {
         #[derive(Serialize, Deserialize)]
@@ -336,6 +341,7 @@ mod tests {
         )
         .is_err());
     }
+    /// [format] guard keeps u128 and intentional zero presence.
     #[test]
     fn guard_keeps_u128_and_intentional_zero_presence() {
         #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -413,6 +419,7 @@ pub(super) fn check_map<'de, A: serde::de::MapAccess<'de>, T: DeserializeOwned +
 #[cfg(test)]
 mod alias_tests {
     use super::*;
+    /// [format] inventory accepts consumed account container aliases but refuses hidden keys.
     #[test]
     fn inventory_accepts_consumed_account_container_aliases_but_refuses_hidden_keys() {
         for (version, field, value) in [

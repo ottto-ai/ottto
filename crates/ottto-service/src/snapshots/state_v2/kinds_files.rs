@@ -1,6 +1,6 @@
 //! File-owned records use their original v1 serde types.
 #[cfg(test)]
-pub(super) use super::resume::{Certificate, StagedCheckpoints};
+pub(super) use super::resume::StagedCheckpoints;
 pub(super) use super::resume::{NoResumeHooks, ResumeCheckpoint, ResumeHooks};
 use super::*;
 use anyhow::{ensure, Context};

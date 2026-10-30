@@ -396,7 +396,6 @@ impl ProgressRecovery {
     /// Import must call this under the existing owner/checkpoint locks after
     /// proving the original progress belongs to the source, before publication.
     /// It seals existing bytes without changing the upload-progress store.
-    #[allow(dead_code)] // The importer seals custody before publishing its fence.
     pub(super) fn adopt(&self, progress: Option<&[u8]>) -> Result<()> {
         let bytes = progress.unwrap_or(b"{\"generation\":0}");
         require(
@@ -583,7 +582,6 @@ impl ProgressRecovery {
 #[path = "ack_tests.rs"]
 mod tests;
 
-#[allow(dead_code)] // Called by the import owner after proving original custody.
 impl ProgressRecovery {
     pub(super) fn seal_import(
         identity: Identity,
@@ -609,20 +607,5 @@ impl ProgressRecovery {
         };
         recovery.adopt(progress)?;
         Ok(recovery)
-    }
-}
-
-/// Decoded checkpoints are mutable values, capped before extending the buffer.
-struct CheckpointBytes(Vec<u8>);
-impl std::io::Write for CheckpointBytes {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.0.len().saturating_add(bytes.len()) > MUTABLE_VALUE_BYTES as usize {
-            return Err(std::io::Error::other("state_v2_backup_resume_admission"));
-        }
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
     }
 }

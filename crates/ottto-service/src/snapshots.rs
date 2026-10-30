@@ -74,7 +74,7 @@ mod scan_index_integration;
 pub(crate) mod scan_index_persistence;
 // The engine is not routed until importer/fence/hydrate integration is complete.
 #[allow(dead_code)]
-mod state_v2;
+pub(crate) mod state_v2;
 use scan_index_integration::read_scan_index_representation;
 mod idless_retry_marker;
 mod oversized_discovery;
@@ -93461,6 +93461,7 @@ impl CheckpointLock {
 mod state_v2_maintenance_lock_tests {
     use super::*;
 
+    /// [off=main] off sources never consult checkpoint owners even when poisoned.
     #[test]
     fn off_sources_never_consult_checkpoint_owners_even_when_poisoned() {
         let root = std::env::temp_dir().join(format!(
@@ -93522,6 +93523,7 @@ mod state_v2_maintenance_lock_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// [behaviour] maintenance reserves the next turn ahead of our normal work.
     #[test]
     fn maintenance_reserves_the_next_turn_ahead_of_our_normal_work() {
         let root = std::env::temp_dir().join(format!(

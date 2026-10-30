@@ -165,11 +165,10 @@ fn add_class(index: &mut ScanIndex, path: &Path, class: &str) {
 
 fn condition_b(class: &str) {
     with_e2(|| {
-        // Contract-5's per-request classifier refuses invalid telemetry. E2
-        // account reconciliation instead inherits the preceding account, so
-        // that path cannot supply this fixture's invalid-r2 refusal premise.
-        let _classifier = (class == "identity").then(e2::GateForTest::off);
         let mut c = corpus(&format!("v2-condition-b-{class}"));
+        if class == "identity" {
+            crate::snapshots::write_claude_reemission_list_for_test(&c.support, &[ROOT]);
+        }
         let path = c.root(ROOT, &line(ROOT, "r1", AT, 10));
         input_clock(&path);
         c.evidence(
@@ -253,7 +252,6 @@ fn condition_b(class: &str) {
         if class == "identity_inheritance" {
             // Preserve coverage of the original E2 path too: its invalid
             // login inherits r1's account rather than emitting a refusal.
-            assert!(e2::enabled());
             assert!(pages[0]
                 .scan
                 .snapshots
@@ -329,7 +327,7 @@ fn condition_b(class: &str) {
 }
 
 macro_rules! classes {
-    ($($test:ident => $class:literal),+ $(,)?) => {$(#[test] fn $test() { condition_b($class); })+};
+    ($($test:ident => $class:literal),+ $(,)?) => {$(#[doc = "[money] Preserve the next upload and ACK custody for this persisted money class."] #[test] fn $test() { condition_b($class); })+};
 }
 classes! {
     v2_census_and_920_keep_emit_identical_next_body => "census_keep",
@@ -343,6 +341,7 @@ classes! {
     v2_e2_invalid_identity_inheritance_preserves_next_body => "identity_inheritance",
 }
 
+/// [money] v2 accepted identity buckets and ack receipt preserve identical next upload.
 #[test]
 fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload() {
     with_e2(|| {

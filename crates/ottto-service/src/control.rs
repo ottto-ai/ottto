@@ -25492,6 +25492,7 @@ for line in sys.stdin:
         );
     }
 
+    /// [regress] forget removes more than 64 legacy claude namespaces and progress files.
     #[test]
     #[serial]
     fn forget_removes_more_than_64_legacy_claude_namespaces_and_progress_files() {

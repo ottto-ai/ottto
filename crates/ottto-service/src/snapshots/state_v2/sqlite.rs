@@ -1438,12 +1438,7 @@ impl Transaction for Txn<'_> {
                 read_value(self.store.conn()?, old, &mut io::sink())?;
                 self.remember_paths(old)?;
             }
-            self.admit_change(
-                row.key,
-                h.len,
-                h.parts,
-                false,
-            )?;
+            self.admit_change(row.key, h.len, h.parts, false)?;
             delete_chunks(self.store.conn()?, row.key)?;
             self.removed_keys.remove(row.key);
             let conn = self.store.conn()?;

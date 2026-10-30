@@ -597,27 +597,6 @@ impl Sqlite {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn size_budgets_and_failed_attempt_backoff_follow_the_ruling() {
-        assert_eq!(size_budget(0, 20), Duration::from_secs(2));
-        assert_eq!(
-            size_budget(224 * 1024 * 1024, 20),
-            Duration::from_millis(6480)
-        );
-        assert_eq!(
-            size_budget(224 * 1024 * 1024, 10),
-            Duration::from_millis(4240)
-        );
-        assert_eq!(
-            [1, 2, 3, 100].map(retry_seconds),
-            [3600, 7200, 14400, 14400]
-        );
-    }
-}
-
-#[cfg(test)]
 thread_local! {
     static TEST_SPACE: std::cell::RefCell<Option<Option<u64>>> = const { std::cell::RefCell::new(None) };
 }

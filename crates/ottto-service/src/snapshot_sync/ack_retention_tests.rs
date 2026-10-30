@@ -2425,6 +2425,7 @@ fn load_bound_progress(
     loaded.ack_recovery = progress.ack_recovery.clone();
     loaded
 }
+/// [money] v2 receipt first crash restores exact ack without duplicate accepted upload.
 #[test]
 fn v2_receipt_first_crash_restores_exact_ack_without_duplicate_accepted_upload() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-upload-crash");
@@ -2467,6 +2468,7 @@ fn v2_receipt_first_crash_restores_exact_ack_without_duplicate_accepted_upload()
     .unwrap();
     assert_eq!((posts, accepted), (0, 0));
 }
+/// [money] v2 db first crash retires only the committed exact handoff.
 #[test]
 fn v2_db_first_crash_retires_only_the_committed_exact_handoff() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-db-first");
@@ -2496,6 +2498,7 @@ fn v2_db_first_crash_retires_only_the_committed_exact_handoff() {
     let reloaded = load_bound_progress(&loaded, &path, &namespace);
     assert!(reloaded.accepted_fingerprints.is_empty());
 }
+/// [money] v2 newer receipt precedes older db retirement and cannot be retired by it.
 #[test]
 fn v2_newer_receipt_precedes_older_db_retirement_and_cannot_be_retired_by_it() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-newer-first");
@@ -2530,6 +2533,7 @@ fn v2_newer_receipt_precedes_older_db_retirement_and_cannot_be_retired_by_it() {
     assert_eq!(loaded.accepted_body_witnesses[&fp], "d".repeat(64));
     assert!(saved.upload_ack_retirement_handoff.is_none());
 }
+/// [money] v2 transport error and failed index commit never authorize an ack.
 #[test]
 fn v2_transport_error_and_failed_index_commit_never_authorize_an_ack() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-err");
@@ -2574,6 +2578,7 @@ fn v2_transport_error_and_failed_index_commit_never_authorize_an_ack() {
     assert!(progress.accepted_fingerprints.contains(&"b".repeat(64)));
 }
 
+/// [off=main] v2 runtime binding preserves existing progress bytes and off performs no receipt io.
 #[test]
 fn v2_runtime_binding_preserves_existing_progress_bytes_and_off_performs_no_receipt_io() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-off-bytes");
@@ -2601,6 +2606,7 @@ fn v2_runtime_binding_preserves_existing_progress_bytes_and_off_performs_no_rece
     assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
 }
 
+/// [money] v2 bound invalid progress holds without legacy quarantine or reset.
 #[test]
 fn v2_bound_invalid_progress_holds_without_legacy_quarantine_or_reset() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-no-quarantine");
@@ -2624,8 +2630,9 @@ fn v2_bound_invalid_progress_holds_without_legacy_quarantine_or_reset() {
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
 }
 
+/// [regress] published v2 partial checkpoint reuses progress owner through atomic save.
 #[test]
-fn published_v2_partial_checkpoint_reuses_progress_owner_through_commit_and_backups() {
+fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
     for stop in ["transport", "shed", "capacity"] {
         for read_limit in [None, Some(crate::snapshot_retry::RESPONSE_BYTES)] {
             let f = AckFixture::new(false);

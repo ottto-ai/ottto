@@ -4428,6 +4428,7 @@ fn e2_identity_incomplete_clock_survives_discarded_twin_in_both_orders() {
     });
 }
 
+/// [regress] retained growth identity failure cannot suppress another sessions request.
 #[test]
 fn retained_growth_identity_failure_cannot_suppress_another_sessions_request() {
     use crate::snapshots::claude_request_census::{
@@ -4435,7 +4436,7 @@ fn retained_growth_identity_failure_cannot_suppress_another_sessions_request() {
         ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
     };
     use std::os::unix::fs::MetadataExt;
-    with_enabled(|| {
+    {
         for held in [false, true] {
             let scratch = crate::test_scratch::ScratchDir::new("growth-identity-copy");
             let root = scratch.join("sources");
@@ -4578,5 +4579,5 @@ fn retained_growth_identity_failure_cannot_suppress_another_sessions_request() {
             );
             assert_eq!(fold(&copy).entity.totals().1, 1);
         }
-    });
+    }
 }

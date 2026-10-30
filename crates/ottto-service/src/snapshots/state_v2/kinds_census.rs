@@ -13,7 +13,6 @@ pub(super) const KINDS: &[&str] = &[
     "setting.claude_retired_family_tombstones_initialized",
     "setting.claude_retired_family_tombstones_uncertain",
 ];
-pub(super) use mapper::family as dependency_family;
 macro_rules! maps {
     ($m:ident) => {
         $m!(claude_duplicate_request_owners, "v1_field.duplicate_owners");

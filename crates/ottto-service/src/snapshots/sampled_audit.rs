@@ -2371,6 +2371,7 @@ mod growth_tests {
         streamed
     }
 
+    /// [money] f1 resumed reconciliation keeps growth after hold and restart.
     #[test]
     fn f1_resumed_reconciliation_keeps_growth_after_hold_and_restart() {
         let _active = Active::on();
@@ -2440,6 +2441,7 @@ mod growth_tests {
         }
     }
 
+    /// [money] f2 progress restart terminal excludes debt until native settlement.
     #[test]
     fn f2_progress_restart_terminal_excludes_debt_until_native_settlement() {
         let _active = Active::on();
@@ -2483,6 +2485,7 @@ mod growth_tests {
         assert_eq!(index.claude_request_census.hash_total_for_test(), 0);
     }
 
+    /// [money] f2 admission pressure keeps retained hashes and defers new record.
     #[test]
     fn f2_admission_pressure_keeps_retained_hashes_and_defers_new_record() {
         let _active = Active::on();
@@ -2539,6 +2542,7 @@ mod growth_tests {
         );
     }
 
+    /// [regress] retained same key rollback restores exact custody inside tombstone reserve.
     #[test]
     fn retained_same_key_rollback_restores_exact_custody_inside_tombstone_reserve() {
         let _active = Active::on();
@@ -2607,6 +2611,7 @@ mod growth_tests {
         assert_eq!(index.claude_request_census.recounted_for_test(), totals);
     }
 
+    /// [off=main] f3 off preserves v1 age and bytes.
     #[test]
     fn f3_off_preserves_v1_age_and_bytes() {
         let fixture = Fixture::new();
@@ -2651,6 +2656,7 @@ mod growth_tests {
         assert!(!index.files.contains_key(&fixture.key));
     }
 
+    /// [money] f9 uncertainty alarms on fourth consecutive saved pass without dropping.
     #[test]
     fn f9_uncertainty_alarms_on_fourth_consecutive_saved_pass_without_dropping() {
         let _active = Active::on();
@@ -2688,6 +2694,7 @@ mod growth_tests {
         );
         assert_eq!(index.growth_retention[&fixture.key].uncertain_passes, 0);
     }
+    /// [money] f3 identity causes are not reclassified as retained growth.
     #[test]
     fn f3_identity_causes_are_not_reclassified_as_retained_growth() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
@@ -2745,6 +2752,7 @@ mod growth_tests {
         );
     }
 
+    /// [money] f2 growth subset restores debt for unsettled file only.
     #[test]
     fn f2_growth_subset_restores_debt_for_unsettled_file_only() {
         let _active = Active::on();
@@ -2794,6 +2802,7 @@ mod growth_tests {
         .0
     }
 
+    /// [money] f3 growth full claim survives restart failure and subset save.
     #[test]
     fn f3_growth_full_claim_survives_restart_failure_and_subset_save() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
@@ -2898,6 +2907,7 @@ mod growth_tests {
         }
     }
 
+    /// [money] f3 growth full without durable index never reads.
     #[test]
     fn f3_growth_full_without_durable_index_never_reads() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
@@ -2923,6 +2933,7 @@ mod growth_tests {
         );
     }
 
+    /// [money] f3 recent claim outlives removal until interval expires.
     #[test]
     fn f3_recent_claim_outlives_removal_until_interval_expires() {
         let fixture = Fixture::new();
@@ -2943,6 +2954,7 @@ mod growth_tests {
         prune_growth_retention(&mut index, 100 + GROWTH_FULL_INTERVAL);
         assert!(index.growth_retention.is_empty());
     }
+    /// [money] f3 malformed growth claim stays held across codec round trips.
     #[test]
     fn f3_malformed_growth_claim_stays_held_across_codec_round_trips() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
@@ -2976,6 +2988,7 @@ mod growth_tests {
         }
     }
 
+    /// [money] f3 failed claim save never authorizes full or spends memory only.
     #[test]
     fn f3_failed_claim_save_never_authorizes_full_or_spends_memory_only() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
@@ -3009,6 +3022,7 @@ mod growth_tests {
             None
         );
     }
+    /// [money] f3 claim receipt rejects same generation checkpoint replacement.
     #[test]
     fn f3_claim_receipt_rejects_same_generation_checkpoint_replacement() {
         use crate::transcript_acquisition::{FullReason, ReadMode};

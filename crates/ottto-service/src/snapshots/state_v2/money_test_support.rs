@@ -1,6 +1,6 @@
 //! Test-only bridge from emitted-body fixtures to the composed semantic mapper.
 //! Publication is deliberately not simulated: this proves row custody, while
-//! the import-peak fixture separately requires the real production route.
+//! the import fixtures separately exercise the production publication route.
 use super::*;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -69,7 +69,7 @@ pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> ScanIndex {
 use import::Mapper;
 
 /// Install synthetic custody without lifting the production conversion/R1 gate.
-/// All subsequent loads, saves, receipt replay and backups use the real route.
+/// All subsequent loads, saves and receipt replay use the real route.
 pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIndex {
     let binding = super::super::scan_index_integration::scan_index_storage_binding(path).unwrap();
     let identity = Identity {

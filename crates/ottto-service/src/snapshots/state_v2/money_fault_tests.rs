@@ -78,6 +78,7 @@ fn assert_refs(db: &mut sqlite::Sqlite) -> BTreeMap<RowKey, u64> {
     actual
 }
 
+/// [money] money presence empty null zero and tombstones survive all kind hydration.
 #[test]
 fn money_presence_empty_null_zero_and_tombstones_survive_all_kind_hydration() {
     let scratch = crate::test_scratch::ScratchDir::new("money-presence");
@@ -122,6 +123,7 @@ fn money_presence_empty_null_zero_and_tombstones_survive_all_kind_hydration() {
     }
 }
 
+/// [money] money missing owner tombstone or segment refuses complete hydration.
 #[test]
 fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
     for kind in [
@@ -158,6 +160,7 @@ fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
     }
 }
 
+/// [money] money ref diffs rollback and commit across accounts census and family membership.
 #[test]
 fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_family_membership() {
     let scratch = crate::test_scratch::ScratchDir::new("money-ref-diff");
@@ -212,6 +215,7 @@ fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_family_members
     }
 }
 
+/// [money] money missing shared value refuses instead of losing request membership.
 #[test]
 fn money_missing_shared_value_refuses_instead_of_losing_request_membership() {
     let scratch = crate::test_scratch::ScratchDir::new("money-missing-ref");
@@ -237,6 +241,7 @@ fn money_missing_shared_value_refuses_instead_of_losing_request_membership() {
     assert_eq!(assert_refs(&mut db), all);
 }
 
+/// [money] money 915 lost saturated and unknown copy classes pause before any baseline.
 #[test]
 fn money_915_lost_saturated_and_unknown_copy_classes_pause_before_any_baseline() {
     let scratch = crate::test_scratch::ScratchDir::new("money-unmapped");
@@ -273,6 +278,7 @@ fn money_915_lost_saturated_and_unknown_copy_classes_pause_before_any_baseline()
     }
 }
 
+/// [money] money unknown registered marks refuse even with zero length payload.
 #[test]
 fn money_unknown_registered_marks_refuse_even_with_zero_length_payload() {
     let scratch = crate::test_scratch::ScratchDir::new("money-unknown-kind");
@@ -293,6 +299,7 @@ fn money_unknown_registered_marks_refuse_even_with_zero_length_payload() {
     assert!(import::ClaudeMapper.hydrate(&mut db).is_err());
 }
 
+/// [money] money large memberships segment and preserve exact shared domains.
 #[test]
 fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
     use sha2::Digest;

@@ -1,7 +1,6 @@
 //! The complete semantic adapter has one context and one transaction boundary.
 //! A context belongs to the committed graph; discard it after any failed write.
-//! Runtime publication stays gated until raw inventory, CAS and R1 are composed.
-#![allow(dead_code)] // Publication integration is a separate, fail-closed step.
+//! NoResumeHooks keeps conversion paused until the R1 owner adapter is installed.
 use super::*;
 use anyhow::{bail, ensure};
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,6 +39,7 @@ pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut Kin
 
 /// Decode all four groups from one snapshot into an unpublished graph. Account
 /// skeletons precede census-owned request membership; no partial graph escapes.
+#[cfg(test)]
 pub(super) fn hydrate<S: Store>(
     store: &mut S,
     binding: super::super::scan_index_persistence::Binding,

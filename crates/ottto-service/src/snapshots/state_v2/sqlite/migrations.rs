@@ -132,6 +132,7 @@ pub(super) fn run(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// [format] shipped revision fixtures match fresh and refuse old writers.
     #[test]
     fn shipped_revision_fixtures_match_fresh_and_refuse_old_writers() {
         let fresh = Connection::open_in_memory().unwrap();
@@ -169,6 +170,7 @@ mod tests {
 }
 
 #[cfg(test)]
+/// [format] migration crash child.
 #[test]
 fn migration_crash_child() {
     if let Some(path) = std::env::var_os("OTTTO_STATE_V2_MIGRATION_CRASH_FIXTURE") {
@@ -178,6 +180,7 @@ fn migration_crash_child() {
     }
 }
 #[cfg(test)]
+/// [format] crash between ddl and revision bump rolls back on restart.
 #[test]
 fn crash_between_ddl_and_revision_bump_rolls_back_on_restart() {
     let dir = std::env::temp_dir().join(format!("v2-migration-crash-{}", std::process::id()));
@@ -203,6 +206,7 @@ fn crash_between_ddl_and_revision_bump_rolls_back_on_restart() {
 }
 
 #[cfg(test)]
+/// [format] revision one four table ddl golden.
 #[test]
 fn revision_one_four_table_ddl_golden() {
     assert_eq!(
