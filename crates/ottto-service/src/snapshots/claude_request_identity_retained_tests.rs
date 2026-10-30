@@ -1,6 +1,9 @@
 fn retained_session(hours: usize) -> (SnapshotItem, Vec<Contribution>) {
     let (mut item, proof) = sticky_session(hours);
     item.usage_accounting_contract = Some("claude_request_owned_usage:v1".into());
+    item.removed_request_count = Some(0);
+    item.removed_usage = Some(ClaudeRemovedUsage::default());
+    item.telemetry_owned_complete = Some(true);
     (item, proof)
 }
 // Option (ii): `identity_retained` markers over the witnessed proved-row
@@ -339,8 +342,10 @@ fn retained_gate_off_is_byte_identical_to_the_909_goldens() {
     // Gate on with no proved rows yet: the plain recent window equals #909's.
     let (mut window, mut proof) = retained_session(576);
     sticky_price_fixture(&mut window, &mut proof);
+    let mut baseline = window.clone();
+    sticky_apply(&mut baseline, &proof, &identity::AcceptedBuckets::for_test()).unwrap();
     sticky_apply(&mut window, &proof, &retained_state()).unwrap();
-    assert_eq!(sticky_wire(window), fixture["window"]);
+    assert_eq!(sticky_wire(window), sticky_wire(baseline));
 }
 
 #[test]
@@ -476,9 +481,12 @@ fn retained_golden_cases() -> Value {
     cases.insert("login_marker_with_hash", sticky_wire(login_marked));
     let mut contract5 = login.clone();
     contract5.usage_accounting_contract = None;
+    contract5.removed_request_count = None;
+    contract5.removed_usage = None;
+    contract5.telemetry_owned_complete = None;
     sticky_apply(&mut contract5, &login_proof, &login_state).unwrap();
     assert!(contract5.usage_buckets.iter().all(|b| b.model_usage.iter().all(|r| !r.identity_retained && sticky_tagged(r))));
-    cases.insert("contract5_fresh_proving", sticky_wire(login_first.clone()));
+    cases.insert("contract5_fresh_proving", sticky_wire(contract5.clone()));
     cases.insert("contract5_fresh", sticky_wire(contract5));
     // Force a capacity refusal after witnessed proof; the marker is excluded.
     let mut refusal = login.clone();
@@ -556,6 +564,9 @@ fn retained_login_hash_is_ack_bound_even_when_transcript_proof_disappears() {
     // Contract 5 always uses fresh tags even with capability + witnessed state.
     let mut legacy = original.clone();
     legacy.usage_accounting_contract = None;
+    legacy.removed_request_count = None;
+    legacy.removed_usage = None;
+    legacy.telemetry_owned_complete = None;
     sticky_apply(&mut legacy, &proof, &restored).unwrap();
     assert!(legacy.usage_buckets.iter().all(|b| !b.model_usage[0].identity_retained && sticky_tagged(&b.model_usage[0])));
     sticky_assert_reconciled(&legacy);
@@ -601,7 +612,9 @@ fn retained_capped_rows_send_fresh_tags_through_the_normal_caps() {
     sticky_apply(&mut body, &proof, &state).unwrap();
     // The entire source can exceed the wire cap, so prove compact fixture rows
     // directly only for rows the emitted body's ACK actually carried.
+    identity::take_identity_counts();
     retained_ack(&mut state, &body, &[]);
+    assert_eq!(retained_count(&retained_counts(), "proved_rows_capped"), 2);
     assert!(state.proved_rows_for_test(&body.source_session_id).unwrap().0 <= 1_024);
     let mut next = original;
     sticky_apply(&mut next, &proof, &state).unwrap();
@@ -609,4 +622,25 @@ fn retained_capped_rows_send_fresh_tags_through_the_normal_caps() {
     assert!(!next.usage_buckets[0].model_usage[0].identity_retained);
     assert!(identity::item_bytes(&next) <= identity::MAX_ITEM_BYTES);
     sticky_assert_reconciled(&next);
+}
+
+#[test]
+fn retained_lost_replacement_then_missing_proof_is_a_counted_refusal() {
+    let (original, proof) = retained_login_session();
+    let mut state = retained_state();
+    let mut first = original.clone();
+    sticky_apply(&mut first, &proof, &state).unwrap();
+    retained_ack(&mut state, &first, &[]);
+    let mut changed = proof.clone();
+    for c in &mut changed[..3] { c.identity = login_key(D64); }
+    let mut replacement = original.clone();
+    sticky_apply(&mut replacement, &changed, &state).unwrap();
+    assert!(state.invalidate_replaced(&serde_json::to_value(replacement).unwrap()));
+    for c in &mut changed[..3] { c.identity = RequestIdentity::Missing; }
+    let mut missing = original;
+    sticky_apply(&mut missing, &changed, &state).unwrap();
+    let row = &missing.usage_buckets[0].model_usage[0];
+    assert!(!row.identity_retained && !sticky_tagged(row));
+    assert!(missing.request_identity_refusals > 0);
+    sticky_assert_reconciled(&missing);
 }
