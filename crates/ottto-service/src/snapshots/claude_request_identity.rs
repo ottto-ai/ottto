@@ -2635,6 +2635,11 @@ pub(crate) fn reconcile_request_accounts(
             }
             fold.accounts = Some(accounts);
             item.claude_money = Some(fold);
+            // Emission preserves a uniform wire account even for billing rows
+            // that bypass final identity grouping. Discard suppresses it too.
+            if super::set_claude_account_hash(item, None) {
+                item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+            }
             continue;
         }
         let native = accounts.clone();

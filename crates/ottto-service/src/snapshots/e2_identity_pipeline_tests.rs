@@ -733,7 +733,24 @@ fn e2_bound_trace_totals(items: &[SnapshotItem]) -> BTreeMap<String, serde_json:
 }
 
 fn e2_bound_trace_regression(mode: &str, split_logins: bool) {
+    e2_bound_trace_billing_regression(mode, split_logins, false);
+}
+
+fn e2_bound_trace_billing_regression(mode: &str, split_logins: bool, external: bool) {
     let (dir, root, _) = claude_account_family_fixture();
+    if external {
+        for path in [
+            dir.join(format!("{root}.jsonl")),
+            dir.join(&root).join("subagents").join(format!("agent-{E2_CHILD}.jsonl")),
+        ] {
+            let lines = fs::read_to_string(&path).unwrap().lines().map(|line| {
+                let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+                row["auth_mode"] = json!("api_key");
+                format!("{row}\n")
+            }).collect::<String>();
+            fs::write(path, lines).unwrap();
+        }
+    }
     let support = dir.join("support");
     let (mut api, trace) = e2_family_evidence(&root);
     for row in &mut api {
@@ -760,6 +777,15 @@ fn e2_bound_trace_regression(mode: &str, split_logins: bool) {
     let (clean, stats) = e2_bound_trace_page(&dir, &support, &root, &mut index, false);
     let child_login = if split_logins { "c" } else { "b" }.repeat(64);
     e2_bound_trace_assert_logins(&clean, &root, Some("b".repeat(64)), Some(child_login.clone()));
+    if external {
+        for item in &clean {
+            for row in e2_rows(item) {
+                assert_eq!(row.auth_mode.as_deref(), Some("api_key"));
+                assert!(!claude_request_accounts::local_subscription(row),
+                    "this fixture bypasses contract-5 identity grouping");
+            }
+        }
+    }
     assert_eq!(stats.trace_discard_no_fallback_requests, 0);
     assert!(serde_json::to_value(&stats).unwrap().get("trace_discard_no_fallback_requests").is_none());
     let totals = e2_bound_trace_totals(&clean);
@@ -864,4 +890,20 @@ fn e2_pipeline_bound_a_split_logins_cap_discard_blocks_retained_a() {
 #[test]
 fn e2_pipeline_bound_a_split_logins_generation_discard_blocks_retained_a() {
     e2_bound_trace_regression("generation", true);
+}
+
+#[test]
+fn e2_pipeline_external_billing_cap_discard_clears_wire_account_then_recovers() {
+    e2_bound_trace_billing_regression("cap", false, true);
+}
+
+#[cfg(unix)]
+#[test]
+fn e2_pipeline_external_billing_generation_discard_clears_wire_account_then_recovers() {
+    e2_bound_trace_billing_regression("generation", false, true);
+}
+
+#[test]
+fn e2_pipeline_external_billing_malformed_trace_keeps_main_account() {
+    e2_bound_trace_billing_regression("malformed", false, true);
 }
