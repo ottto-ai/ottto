@@ -2892,6 +2892,9 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
 #[cfg(unix)]
 #[test]
 fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store::{self as store, SingleWriter};
     use std::io::Read;
@@ -2998,7 +3001,8 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
     let (index, result) = next_generation(&root, index, &cache, 1);
     assert!(
         result.census_complete,
-        "a known_corrupt group must not make source census red"
+        "a known_corrupt group must not make source census red: {result:?}; {:?}",
+        cache.durable_counters(source)
     );
     assert_eq!(result.unreadable_path_count, 0);
     assert_eq!(index.files[&key].last_snapshot_fingerprint, accepted);

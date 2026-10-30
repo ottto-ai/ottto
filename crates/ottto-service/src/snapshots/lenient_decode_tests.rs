@@ -2155,7 +2155,7 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
             // The main positional schema ends at audit progress; appending E2
             // must leave every already-shipped position intact.
             forms.push(Value::Array(
-                fields[..fields.len() - 3]
+                fields[..fields.len() - 2]
                     .iter()
                     .map(|name| legacy[*name].clone())
                     .collect(),

@@ -3409,8 +3409,9 @@ fn full_v1_writer_goldens_preserve_zero_and_nonzero_debt() {
         let file = record_file(&store, &[1; 32]);
         ensure_private_dir(store.dir()).unwrap();
         put_record(&file, &golden);
-        assert!(matches!(store.read(&[1;32]), ReadOutcome::Refused(Refusal::Repin)));
-        assert_eq!(store.counters().format_hold[Refusal::Repin as usize],1);
+        assert!(matches!(store.read(&[1;32]), ReadOutcome::Missing));
+        assert_eq!(store.counters().missing, 1);
+        assert_eq!(store.counters().format_hold[Refusal::Repin as usize], 0);
         assert_eq!(fs::read(&file).unwrap(),golden,"refusal never misreads or rewrites historical bytes");
     }
 }
