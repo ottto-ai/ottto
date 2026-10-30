@@ -71,31 +71,6 @@ wire field:
   parent transcript to resolve an ambiguous Desktop id. Existing head/tail caps
   apply (256 KiB at each end); cached windows and metadata census work count zero.
 
-Root discovery also reports sparse `desktop_discovery_incomplete{capped,error}`
-counts on that page line, once per census discovery across its configured homes.
-The limits remain 64 roots (default plus 63 configured siblings) and 4,096
-inspected directory entries. Exactly 4,096 entries is incomplete because proving
-exhaustion would exceed the read budget. Enumeration and matching-profile stat
-errors also revoke completeness; a nonexistent support directory is known absence.
-A clean sweep of a returned subset cannot restore census proof or establish a
-new legacy owner. Recovery requires complete discovery and a clean store sweep
-when the existing retry deadline allows it. Accepted owners remain unchanged.
-The first incomplete discovery per process emits a `desktop_discovery_incomplete`
-alarm on the existing local diagnostic carrier. The third consecutive capped
-census discovery emits `desktop_discovery_capped_persistent`; a noncapped
-discovery resets the streak. This diagnostic state is process-local, carries no
-paths or identifiers, and never increases a cap or changes retry timing.
-
-`lineage_parentless_while_incomplete{files}` counts distinct source files in
-finalized offers whose cached Desktop metadata identifies a child, whose lineage
-census is incomplete, and whose emitted facts/origin have no parent reference.
-It runs after held-body and semantic no-op removal, using resident metadata only;
-no read, persisted field, selector or attribution decision is added. Scratch is
-bounded by emitted page items. Unobserved children cannot be counted before their
-metadata is discovered. Retries can count the same file again; this is offered
-work, not distinct lifetime sessions or stored-body ACKs. Complete lineage
-censuses count zero. The counter uses the existing finish diagnostics scope.
-
 Inventory changes cool down even a successful small metadata sweep using the
 existing 60-second initial retry and one-hour ceiling. A changed inventory during
 backoff revokes the census witness immediately, retains the deadline, and does
@@ -108,10 +83,9 @@ independently selected native read; census discovery never opens transcripts.
 A healthy spawned session adopts this metadata dependency revision once; unrelated
 profiles and later coverage loss/recovery do not select unchanged transcripts.
 
-An incomplete Desktop census prevents a new legacy owner binding when only a
-cached account hash is available. That body still uploads its full usage and cost,
-with account tags cleared to Unknown; a cached unique hash cannot win before an
-unseen sibling is read. Conflicting evidence, existing owners and independently
+A new legacy binding also defers when a Desktop account hash is present but its
+original proof is missing while the Desktop census is incomplete. A cached unique
+hash cannot win before an unseen sibling is read. Existing owners and independently
 qualified contract-5 requests keep their admission rules. Complete census recovery
 marks existing account-held retries with a now-complete Desktop proof for read
 accounting. Their existing retry/retention path remains authoritative. Recovery

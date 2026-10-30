@@ -8298,56 +8298,6 @@ pub fn finalize_scan_after_policy_with_body_witness(
         .retain(|fingerprint, _| current_fingerprints.contains(fingerprint));
 }
 
-/// Observe only offers that survived policy, holds and semantic no-op removal.
-/// Cached Desktop child metadata is already resident; no source reads or durable
-/// state are needed. Scratch is bounded by this page's emitted items.
-pub(crate) fn record_lineage_parentless_while_incomplete(
-    source: SnapshotSource,
-    snapshots: &[SnapshotItem],
-    index: &ScanIndex,
-) {
-    if source != SnapshotSource::ClaudeCode
-        || index.claude_desktop_lineage_census_complete
-        || snapshots.is_empty()
-    {
-        return;
-    }
-    let mut parentless: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for snapshot in snapshots {
-        if snapshot
-            .origin
-            .as_ref()
-            .and_then(|origin| origin.parent_session_ref.as_deref())
-            .is_none()
-            && !snapshot
-                .attribution_facts
-                .iter()
-                .any(|fact| fact.field == "parent_session_ref")
-        {
-            if let Some(file) = snapshot.source_file_fingerprint.as_deref() {
-                parentless
-                    .entry(&snapshot.source_session_id)
-                    .or_default()
-                    .insert(file);
-            }
-        }
-    }
-    if parentless.is_empty() {
-        return;
-    }
-    let mut files = BTreeSet::new();
-    for entry in index.claude_desktop_title_files.values() {
-        if entry.spawned_from_desktop_session_id.is_some() || entry.spawned_from_unresolved {
-            if let Some(emitted) = parentless.remove(entry.cli_session_id.as_str()) {
-                files.extend(emitted);
-            }
-        }
-    }
-    crate::local_resource_diagnostics::claude_reread::lineage_parentless_while_incomplete(
-        files.len() as u64,
-    );
-}
-
 /// The producer-side event clock mirrored by the accepted-log append path.
 /// The maximum activity clock is stable across retries and reconstructible on
 /// both sides. `collected_at` is deliberately excluded because it is an
@@ -16476,56 +16426,26 @@ impl ClaudeTitleMetadata {
         identity_capture: bool,
     ) -> Self {
         let mut store_dirs = BTreeSet::new();
-        let mut capped = false;
-        let mut error = false;
         for root in roots {
             // root is `<home>/.claude/projects`; discover each configured app's
             // existing session metadata store without adding transcript roots.
             let Some(home) = root.parent().and_then(Path::parent) else {
                 continue;
             };
-            let discovery = crate::claude_desktop::discover_support_roots(home);
-            capped |= discovery.capped;
-            error |= discovery.error;
             store_dirs.extend(
-                discovery
-                    .roots
+                crate::claude_desktop::support_roots(home)
                     .into_iter()
                     .map(|root| root.join("claude-code-sessions")),
             );
         }
-        crate::local_resource_diagnostics::claude_reread::desktop_discovery(capped, error);
-        Self::load_from_discovered_store_dirs_with_index(
-            &store_dirs,
-            index,
-            collected_at,
-            identity_capture,
-            !capped && !error,
-        )
+        Self::load_from_store_dirs_with_index(&store_dirs, index, collected_at, identity_capture)
     }
 
-    #[cfg(test)]
     fn load_from_store_dirs_with_index(
         store_dirs: &BTreeSet<PathBuf>,
         index: &mut ScanIndex,
         collected_at: &str,
         identity_capture: bool,
-    ) -> Self {
-        Self::load_from_discovered_store_dirs_with_index(
-            store_dirs,
-            index,
-            collected_at,
-            identity_capture,
-            true,
-        )
-    }
-
-    fn load_from_discovered_store_dirs_with_index(
-        store_dirs: &BTreeSet<PathBuf>,
-        index: &mut ScanIndex,
-        collected_at: &str,
-        identity_capture: bool,
-        discovery_complete: bool,
     ) -> Self {
         let now = rfc3339_unix_seconds(collected_at);
         let inventory = claude_request_identity::inventory_digest(store_dirs);
@@ -16542,13 +16462,6 @@ impl ClaudeTitleMetadata {
             index.claude_desktop_lineage_census_complete = false;
             index.claude_desktop_census_witness = None;
             crate::local_resource_diagnostics::claude_reread::desktop_inventory_restart();
-        }
-        if !discovery_complete {
-            // A clean scan of the returned subset cannot certify unseen roots.
-            // Revoke before backoff as well, retaining the existing deadline.
-            index.claude_desktop_identity_census_complete = false;
-            index.claude_desktop_lineage_census_complete = false;
-            index.claude_desktop_census_witness = None;
         }
         let retry_due = match (
             now,
@@ -16671,9 +16584,7 @@ impl ClaudeTitleMetadata {
                 Err(_) => census.invalid_file_count += 1,
             }
         }
-        let sweep_had_errors = index.claude_desktop_store_sweep_had_errors
-            || census.has_errors()
-            || !discovery_complete;
+        let sweep_had_errors = index.claude_desktop_store_sweep_had_errors || census.has_errors();
         if sweep_complete && !sweep_had_errors {
             index
                 .claude_desktop_title_files
@@ -44839,9 +44750,9 @@ impl ScanIndex {
         result
     }
 
-    /// Attach only the owner proved for this session. An incomplete Desktop
-    /// census leaves new legacy sessions uploadable without an account tag.
-    /// Conflicting or owner-contradicting revisions keep their existing hold.
+    /// Attach only the owner proved for this session. A missing or conflicting
+    /// Claude revision is held for a later complete scan; the durable proof
+    /// remains intact.
     pub(crate) fn bind_session_accounts(
         &mut self,
         source: SnapshotSource,
@@ -44943,25 +44854,13 @@ impl ScanIndex {
                                 evidence.identity_disposition == Some("conflict")
                                     || (!self.claude_desktop_identity_census_complete
                                         && evidence.identity_disposition == Some("missing")
-                                        && !mixed.permits_single_account(item))
+                                        && evidence.account_identifier_hash.is_some())
                             })
                     {
-                        if item
-                            .session_account_evidence
-                            .as_ref()
-                            .is_some_and(|evidence| {
-                                evidence.identity_disposition == Some("conflict")
-                            })
-                        {
-                            deferred.insert(session_id.clone());
-                        } else {
-                            // An incomplete census vetoes only a new owner: keep
-                            // the usage/cost body uploadable, with no account tag
-                            // borrowed from the partial native-profile cache,
-                            // including released scalar-only cache entries.
-                            // Fresh independent request proof remains eligible.
-                            set_session_account_hash(item, None);
-                        }
+                        // Partial native profiles cannot establish a new owner
+                        // either: an unseen sibling may contradict the cache.
+                        // Use the existing counted account-deferral/retention path.
+                        deferred.insert(session_id.clone());
                         continue;
                     }
                     let observed = exact_session_account_hash(item);
@@ -67582,104 +67481,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn desktop_incomplete_census_preserves_fresh_request_account_proof() {
-        let _gate = claude_request_money::e2::GateForTest::off();
-        let (dir, root, items) = claude_account_family_fixture();
-        let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-            evidence: BTreeMap::from([(
-                root.clone(),
-                (1..=4)
-                    .map(|n| complete_api_row(&root, &format!("req_{n}"), n, 10, 10, 0))
-                    .collect(),
-            )]),
-            ..Default::default()
-        };
-        let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
-            evidence: BTreeMap::from([(
-                root,
-                (1..=4)
-                    .map(|n| {
-                        complete_trace_row(&items[0].source_session_id, &format!("req_{n}"), "")
-                    })
-                    .collect(),
-            )]),
-            ..Default::default()
-        };
-        for missing_carrier in [false, true] {
-            for complete_clocks in [false, true] {
-                let mut item = items[0].clone();
-                item.session_account_evidence = missing_carrier.then(|| {
-                    ClaudeTitleMetadata::default().session_account_evidence(&item.source_session_id)
-                });
-                if !complete_clocks {
-                    for occurrence in item.claude_usage_occurrences.values_mut() {
-                        occurrence.event_clock_complete = false;
-                    }
-                }
-                let qualification =
-                    claude_request_accounts::apply(std::slice::from_mut(&mut item), &api, &trace);
-                assert_eq!(
-                    qualification.coverage,
-                    [if complete_clocks {
-                        claude_request_accounts::Coverage::Complete
-                    } else {
-                        claude_request_accounts::Coverage::UnprovedEventClock
-                    }]
-                );
-                let original = item.clone();
-                let mut index = ScanIndex::default();
-                assert!(!index.claude_desktop_identity_census_complete);
-                assert!(index
-                    .bind_session_accounts_with_mixed(
-                        SnapshotSource::ClaudeCode,
-                        "machine",
-                        std::slice::from_mut(&mut item),
-                        &[],
-                        &qualification.mixed,
-                    )
-                    .is_empty());
-                assert_eq!(index.session_account_bindings.len(), 1);
-                assert_eq!(exact_session_account_hash(&item), Some("a".repeat(64)));
-                assert_eq!(
-                    serde_json::to_value(&item).unwrap(),
-                    serde_json::to_value(&original).unwrap()
-                );
-                if missing_carrier {
-                    // A collector marker copied without this scan's capability
-                    // cannot upgrade cached tags into independent request proof.
-                    let mut marker_only = original;
-                    let mut index = ScanIndex::default();
-                    assert!(index
-                        .bind_session_accounts(
-                            SnapshotSource::ClaudeCode,
-                            "machine",
-                            std::slice::from_mut(&mut marker_only),
-                            &[],
-                        )
-                        .is_empty());
-                    assert!(exact_session_account_hash(&marker_only).is_none());
-                    assert!(index.session_account_bindings.is_empty());
-                }
-            }
-        }
-        fs::remove_dir_all(dir).unwrap();
-    }
-
     fn d1_subagent_account_specimen(
         item: &mut SnapshotItem,
         api: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
         trace: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
     ) -> bool {
-        d1_subagent_account_qualification(item, api, trace).coverage
-            == [claude_request_accounts::Coverage::Complete]
-    }
-
-    fn d1_subagent_account_qualification(
-        item: &mut SnapshotItem,
-        api: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
-        trace: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
-    ) -> claude_request_accounts::Qualification {
         let root = claude_snapshot_family_root(item);
         let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
             evidence: BTreeMap::from([(root.clone(), api.to_vec())]),
@@ -67690,6 +67496,8 @@ mod tests {
             ..Default::default()
         };
         claude_request_accounts::apply(std::slice::from_mut(item), &api_report, &trace_report)
+            .coverage
+            == [claude_request_accounts::Coverage::Complete]
     }
 
     #[test]
@@ -68112,22 +67920,16 @@ mod tests {
         let api = vec![complete_api_row(&root, "req_5", 5, 10, 1, 0)];
         let trace = vec![complete_trace_row(&root, "req_5", "a4d1585d310070d0f")];
         let mut proved = items[1].clone();
-        let qualification = d1_subagent_account_qualification(&mut proved, &api, &trace);
-        assert_eq!(
-            qualification.coverage,
-            [claude_request_accounts::Coverage::Complete]
-        );
+        assert!(d1_subagent_account_specimen(&mut proved, &api, &trace));
         let mut index = ScanIndex::default();
         assert!(index
-            .bind_session_accounts_with_mixed(
+            .bind_session_accounts(
                 SnapshotSource::ClaudeCode,
                 "machine-a",
                 std::slice::from_mut(&mut proved),
-                &[],
-                &qualification.mixed,
+                &[]
             )
             .is_empty());
-        assert_eq!(index.session_account_bindings.len(), 1);
         let index_path = dir.join("account-index.json");
         index.save(&index_path).unwrap();
         let mut restarted = ScanIndex::load(&index_path).unwrap();
@@ -78526,349 +78328,6 @@ mod tests {
     }
 
     #[test]
-    fn finalized_parentless_desktop_child_counts_only_incomplete_emission() {
-        let _gate = claude_request_money::e2::GateForTest::off();
-        for complete in [false, true] {
-            let child = spawn_cli("parentless-count-child");
-            let parent = spawn_cli("parentless-count-parent");
-            let mut index = ScanIndex {
-                claude_desktop_lineage_census_complete: complete,
-                ..ScanIndex::default()
-            };
-            index.claude_desktop_title_files.insert(
-                "child".into(),
-                desktop_spawn_entry_raw(&child, "local_child", Some("local_parent")),
-            );
-            index.claude_desktop_title_files.insert(
-                "parent".into(),
-                desktop_spawn_entry_raw(&parent, "local_parent", None),
-            );
-            let metadata = ClaudeTitleMetadata::from_durable_index(&index, !complete);
-            let home = crate::test_scratch::ScratchDir::new("parentless-offer-count");
-            let path = home.join(format!("{child}.jsonl"));
-            fs::write(
-                &path,
-                json!({"timestamp":"2026-09-30T10:00:00Z",
-                "type":"assistant", "sessionId":child, "requestId":"child-request",
-                "message":{"id":"child-message", "model":"claude-opus-4-8",
-                    "usage":{"input_tokens":10,"output_tokens":2}}})
-                .to_string(),
-            )
-            .unwrap();
-            let item = parse_claude_code_jsonl_file_with_title_metadata(
-                &path,
-                "2026-09-30T10:05:00Z",
-                "f".repeat(64),
-                &metadata,
-                false,
-            )
-            .unwrap()
-            .remove(0);
-            assert_eq!(
-                item.attribution_facts
-                    .iter()
-                    .any(|fact| fact.field == "parent_session_ref"),
-                complete
-            );
-            let mut result = SourceScanResult::empty(SnapshotSource::ClaudeCode);
-            result.snapshots.push(item);
-            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
-            record_lineage_parentless_while_incomplete(
-                SnapshotSource::ClaudeCode,
-                &result.snapshots,
-                &index,
-            );
-            assert_eq!(result.snapshots.len(), 1, "the child is actually offered");
-            let counts = serde_json::to_value(scope.finish()).unwrap();
-            assert_eq!(
-                counts["lineage_parentless_while_incomplete"]["files"]
-                    .as_u64()
-                    .unwrap_or(0),
-                u64::from(!complete)
-            );
-            if !complete {
-                // Repeated entities for one physical file count once; ordinary
-                // sessions and files already carrying a parent count zero.
-                result.snapshots.push(result.snapshots[0].clone());
-                let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-                finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
-                record_lineage_parentless_while_incomplete(
-                    SnapshotSource::ClaudeCode,
-                    &result.snapshots,
-                    &index,
-                );
-                assert_eq!(
-                    serde_json::to_value(scope.finish()).unwrap()
-                        ["lineage_parentless_while_incomplete"]["files"],
-                    1
-                );
-                result.snapshots.truncate(1);
-                result.snapshots[0]
-                    .origin
-                    .get_or_insert_with(SnapshotOrigin::default)
-                    .parent_session_ref = Some(parent.clone());
-                let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-                finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
-                record_lineage_parentless_while_incomplete(
-                    SnapshotSource::ClaudeCode,
-                    &result.snapshots,
-                    &index,
-                );
-                assert!(serde_json::to_value(scope.finish())
-                    .unwrap()
-                    .get("lineage_parentless_while_incomplete")
-                    .is_none());
-                result.snapshots[0].origin = None;
-                result.snapshots[0].source_session_id = "ordinary".into();
-                result.snapshots.truncate(1);
-                let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-                finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
-                record_lineage_parentless_while_incomplete(
-                    SnapshotSource::ClaudeCode,
-                    &result.snapshots,
-                    &index,
-                );
-                assert!(serde_json::to_value(scope.finish())
-                    .unwrap()
-                    .get("lineage_parentless_while_incomplete")
-                    .is_none());
-            }
-        }
-    }
-
-    #[test]
-    fn desktop_root_overflow_holds_new_owner_until_complete_discovery() {
-        let _gate = claude_request_money::e2::GateForTest::off();
-        let home = crate::test_scratch::ScratchDir::new("desktop-discovery-owner");
-        let mut index = ScanIndex::default();
-        let a = "123e4567-e89b-12d3-a456-426614174000";
-        let b = "223e4567-e89b-12d3-a456-426614174000";
-        let mut accepted =
-            desktop_profile_account_fixture(&home, &mut index, "Claude", a, "native-session");
-        let mut retained = index.clone();
-        assert!(retained
-            .bind_session_accounts(
-                SnapshotSource::ClaudeCode,
-                "machine",
-                std::slice::from_mut(&mut accepted),
-                &[]
-            )
-            .is_empty());
-        let owners = retained.session_account_bindings.clone();
-        let support = home.join("Library/Application Support");
-        for i in 0..crate::claude_desktop::MAX_ROOTS - 1 {
-            let profile = support.join(format!("Claude-{i:03}"));
-            fs::create_dir_all(&profile).unwrap();
-            fs::write(profile.join("config.json"), "{}").unwrap();
-        }
-        let omitted = support.join("Claude-ZZZ");
-        let bucket = omitted
-            .join("claude-code-sessions")
-            .join(b)
-            .join("123e4567-e89b-12d3-a456-426614174001");
-        fs::create_dir_all(&bucket).unwrap();
-        fs::write(omitted.join("config.json"), "{}").unwrap();
-        fs::write(
-            bucket.join("conflict.json"),
-            json!({"cliSessionId":"native-session",
-            "createdAt":"2026-09-30T10:00:00Z"})
-            .to_string(),
-        )
-        .unwrap();
-        let discovery = crate::claude_desktop::discover_support_roots(&home);
-        assert!(discovery.capped && !discovery.roots.contains(&omitted));
-        let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-        let partial = ClaudeTitleMetadata::load_from_roots_with_index(
-            &[home.join(".claude/projects")],
-            &mut index,
-            "2026-09-30T10:10:00Z",
-            true,
-        );
-        let counts = serde_json::to_value(scope.finish()).unwrap();
-        assert_eq!(counts["desktop_discovery_incomplete"]["capped"], 1);
-        assert!(!index.claude_desktop_identity_census_complete);
-        assert!(!index.claude_desktop_lineage_census_complete);
-        assert!(index.claude_desktop_census_witness.is_none());
-        let mut item = claude_original_carrier_fixture(&partial, "");
-        assert_eq!(
-            exact_session_account_hash(&item),
-            exact_session_account_hash(&accepted)
-        );
-        assert_eq!(
-            item.session_account_evidence
-                .as_ref()
-                .unwrap()
-                .identity_disposition,
-            Some("missing")
-        );
-        let mut retained_item = item.clone();
-        assert!(index
-            .bind_session_accounts(
-                SnapshotSource::ClaudeCode,
-                "machine",
-                std::slice::from_mut(&mut item),
-                &[]
-            )
-            .is_empty());
-        assert!(exact_session_account_hash(&item).is_none());
-        assert!(index.session_account_bindings.is_empty());
-        assert!(retained
-            .bind_session_accounts(
-                SnapshotSource::ClaudeCode,
-                "machine",
-                std::slice::from_mut(&mut retained_item),
-                &[]
-            )
-            .is_empty());
-        assert_eq!(retained.session_account_bindings, owners);
-        assert_eq!(retained_item.model_usage, accepted.model_usage);
-        assert_eq!(retained_item.cost, accepted.cost);
-        // Removing the conflicting profile from configuration makes the next
-        // clean discovery genuinely cover every configured root.
-        fs::remove_file(omitted.join("config.json")).unwrap();
-        let complete = ClaudeTitleMetadata::load_from_roots_with_index(
-            &[home.join(".claude/projects")],
-            &mut index,
-            "2026-09-30T10:20:00Z",
-            true,
-        );
-        assert!(index.claude_desktop_identity_census_complete);
-        assert!(index.claude_desktop_lineage_census_complete);
-        assert!(index.claude_desktop_census_witness.is_some());
-        let mut item = claude_original_carrier_fixture(&complete, "");
-        assert!(index
-            .bind_session_accounts(
-                SnapshotSource::ClaudeCode,
-                "machine",
-                std::slice::from_mut(&mut item),
-                &[]
-            )
-            .is_empty());
-        assert_eq!(index.session_account_bindings.len(), 1);
-    }
-
-    #[test]
-    fn desktop_entry_cap_and_discovery_error_revoke_proof_during_backoff() {
-        let _gate = claude_request_money::e2::GateForTest::off();
-        let home = crate::test_scratch::ScratchDir::new("desktop-discovery-backoff");
-        let mut index = ScanIndex::default();
-        desktop_profile_account_fixture(
-            &home,
-            &mut index,
-            "Claude",
-            "123e4567-e89b-12d3-a456-426614174000",
-            "native-session",
-        );
-        let support = home.join("Library/Application Support");
-        // The default profile is one entry; fill to cap - 1.
-        for i in 0..crate::claude_desktop::MAX_DISCOVERY_ENTRIES - 2 {
-            fs::write(support.join(format!("other-{i:04}")), "").unwrap();
-        }
-        let complete = ClaudeTitleMetadata::load_from_roots_with_index(
-            &[home.join(".claude/projects")],
-            &mut index,
-            "2026-09-30T10:10:00Z",
-            true,
-        );
-        assert!(!complete.original_identity_census_incomplete);
-        let deadline = rfc3339_unix_seconds("2026-09-30T10:20:00Z").unwrap();
-        index.claude_desktop_store_retry_not_before_unix_seconds = Some(deadline);
-        let inventory = index.claude_desktop_store_inventory.clone();
-        for extra in ["at-cap", "over-cap"] {
-            fs::write(support.join(extra), "").unwrap();
-            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-            let partial = ClaudeTitleMetadata::load_from_roots_with_index(
-                &[home.join(".claude/projects")],
-                &mut index,
-                "2026-09-30T10:12:00Z",
-                true,
-            );
-            assert_eq!(
-                serde_json::to_value(scope.finish()).unwrap()["desktop_discovery_incomplete"]
-                    ["capped"],
-                1
-            );
-            assert!(partial.original_identity_census_incomplete);
-            assert!(!index.claude_desktop_identity_census_complete);
-            assert!(index.claude_desktop_census_witness.is_none());
-            assert_eq!(index.claude_desktop_store_inventory, inventory);
-            assert_eq!(
-                index.claude_desktop_store_retry_not_before_unix_seconds,
-                Some(deadline)
-            );
-            let mut item = claude_original_carrier_fixture(&partial, "");
-            assert!(index
-                .bind_session_accounts(
-                    SnapshotSource::ClaudeCode,
-                    "machine",
-                    std::slice::from_mut(&mut item),
-                    &[]
-                )
-                .is_empty());
-            assert!(exact_session_account_hash(&item).is_none());
-            assert!(index.session_account_bindings.is_empty());
-        }
-        fs::remove_file(support.join("at-cap")).unwrap();
-        fs::remove_file(support.join("over-cap")).unwrap();
-        let hidden = home.join("saved-support");
-        fs::rename(&support, &hidden).unwrap();
-        fs::write(&support, "synthetic directory-open failure").unwrap();
-        let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-        let failed = ClaudeTitleMetadata::load_from_roots_with_index(
-            &[home.join(".claude/projects")],
-            &mut index,
-            "2026-09-30T10:13:00Z",
-            true,
-        );
-        assert_eq!(
-            serde_json::to_value(scope.finish()).unwrap()["desktop_discovery_incomplete"]["error"],
-            1
-        );
-        assert!(failed.original_identity_census_incomplete);
-        let mut item = claude_original_carrier_fixture(&failed, "");
-        assert!(index
-            .bind_session_accounts(
-                SnapshotSource::ClaudeCode,
-                "machine",
-                std::slice::from_mut(&mut item),
-                &[]
-            )
-            .is_empty());
-        assert!(exact_session_account_hash(&item).is_none());
-        fs::remove_file(&support).unwrap();
-        fs::rename(hidden, &support).unwrap();
-        let early = ClaudeTitleMetadata::load_from_roots_with_index(
-            &[home.join(".claude/projects")],
-            &mut index,
-            "2026-09-30T10:14:00Z",
-            true,
-        );
-        assert!(
-            early.original_identity_census_incomplete,
-            "clean discovery alone cannot finish the held sweep"
-        );
-        let recovered = ClaudeTitleMetadata::load_from_roots_with_index(
-            &[home.join(".claude/projects")],
-            &mut index,
-            "2026-09-30T10:20:00Z",
-            true,
-        );
-        assert!(!recovered.original_identity_census_incomplete);
-        assert!(index.claude_desktop_census_witness.is_some());
-        let mut item = claude_original_carrier_fixture(&recovered, "");
-        assert!(index
-            .bind_session_accounts(
-                SnapshotSource::ClaudeCode,
-                "machine",
-                std::slice::from_mut(&mut item),
-                &[]
-            )
-            .is_empty());
-        assert_eq!(index.session_account_bindings.len(), 1);
-    }
-
-    #[test]
     fn desktop_partial_native_proof_holds_new_binding_but_keeps_retained_owner() {
         let _gate = claude_request_money::e2::GateForTest::off();
         let complete = claude_original_carrier_metadata();
@@ -78902,16 +78361,15 @@ mod tests {
             Some("missing")
         );
         let mut unbound = ScanIndex::default();
-        let mut unbound_item = item.clone();
-        assert!(unbound
-            .bind_session_accounts(
+        assert_eq!(
+            unbound.bind_session_accounts(
                 SnapshotSource::ClaudeCode,
                 "machine",
-                std::slice::from_mut(&mut unbound_item),
+                std::slice::from_mut(&mut item),
                 &[]
-            )
-            .is_empty());
-        assert!(exact_session_account_hash(&unbound_item).is_none());
+            ),
+            BTreeSet::from([item.source_session_id.clone()])
+        );
         assert!(unbound.session_account_bindings.is_empty());
         let mut completed_index = ScanIndex {
             claude_desktop_identity_census_complete: true,
