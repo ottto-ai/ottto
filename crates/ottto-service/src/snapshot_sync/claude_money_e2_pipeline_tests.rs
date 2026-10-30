@@ -3361,3 +3361,39 @@ fn e2_pipeline_recorded_removals_survive_repeated_walk_deadlines_with_live_proof
         }
     });
 }
+
+#[test]
+fn e2_pipeline_zero_usage_prefix_responses_neither_lend_markers_nor_hold_own_turns() {
+    for zero_before_proven in [false, true] {
+        with_e2(|| {
+            let mut c = Corpus::new("e2-pipeline-copy-marker-zero-usage");
+            let scanner = E2ScanFixture::default();
+            c.root(ROOT, &resumed(ROOT, &[A]));
+            let old = ScanIndex::default();
+            let page = ready(&c, &scanner, old.clone(), 100, false);
+            let prior = settle(&c, &old, page, &mut e2_progress());
+            let org = "11111111-1111-4111-8111-111111111111";
+            let marker = json!({"type":"attachment", "sessionId":COPY,
+                "attachment":{"type":"credential_org","organizationUuid":org}}).to_string() + "\n";
+            let mut zero: serde_json::Value = serde_json::from_str(
+                &line_by(COPY, "zero", B.1, 0, RESUME_WRITER)).unwrap();
+            if zero_before_proven { zero["timestamp"] = json!("2026-08-02T07:00:05Z"); }
+            zero["message"]["usage"] = json!({"input_tokens":0,"output_tokens":0});
+            let zero = zero.to_string() + "\n";
+            let text = marker + &if zero_before_proven {
+                zero + &resumed(COPY, &[A, C])
+            } else {
+                resumed(COPY, &[A]) + &zero + &resumed(COPY, &[C])
+            };
+            c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
+            e2::take_diag();
+            let page = ready(&c, &scanner, prior, 100, false);
+            let copy = body(&page, COPY).expect("zero-usage prefix never withholds own turns");
+            assert_eq!((copy.request_count, copy.removed_request_count), (1, Some(1)));
+            let org = ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap();
+            assert!(copy.request_evidence.iter().all(|e| e.provider_workspace_hash.as_ref() != Some(&org)),
+                "the removed marker cannot lend identity across a zero-usage response");
+            assert_eq!(copy_diag(&["copy_prefix_unproven"]), [0]);
+        });
+    }
+}

@@ -16,6 +16,9 @@ Account-marker decisions follow the exact removed or held requests. Such
 markers cannot lend identity to retained usage. Emitted prefix markers and
 later own markers keep their scope; both identified and id-less inherited
 grains wait for this decision before account reconciliation.
+Marker adjudication follows the first nonzero response that established copy
+status, even across intervening zero-usage records. Zero-usage responses have
+no counted prefix grain and never enter identity repartition.
 
 Storage shares a global 4 MiB charged bound: 40 bytes per file, 32 per holder
 group, and 8 per request hash. A file with prefix retry debt and no removals

@@ -1508,8 +1508,9 @@ pub(crate) type AccountPartition = Option<Arc<AuthorityKey>>;
 struct AccountRun {
     position: u64,
     account: AccountPartition,
-    /// E2's decision for the first resolved usage following this marker.
-    copied: Option<bool>,
+    /// First nonzero usage following this marker: its response position and
+    /// E2 copy status. Zero-usage responses may separate it from the marker.
+    copied: Option<(u64, bool)>,
 }
 crate::heap_layout_bound::fields!(AccountRun; position, account, copied);
 
@@ -1726,7 +1727,7 @@ impl RequestAccounts {
             .iter_mut()
             .take_while(|run| run.position <= sequence)
         {
-            run.copied = Some(copied);
+            run.copied = Some((sequence, copied));
         }
         if !copied {
             self.first_retained.get_or_insert(sequence);
@@ -1750,7 +1751,7 @@ impl RequestAccounts {
         runs.iter()
             .rev()
             .find(|run| run.account.is_some())
-            .filter(|run| run.copied == Some(true))?;
+            .filter(|run| matches!(run.copied, Some((_, true))))?;
         runs.last().map(|run| run.position)
     }
 
@@ -1814,7 +1815,7 @@ impl RequestAccounts {
             let excluded = self
                 .runs
                 .iter()
-                .filter(|run| run.copied == Some(true))
+                .filter(|run| matches!(run.copied, Some((_, true))))
                 .map(|run| run.position)
                 .collect::<Vec<_>>();
             let mut own = request_accounts(
@@ -1852,11 +1853,11 @@ impl RequestAccounts {
             .runs
             .iter()
             .filter(|run| {
-                let at = skipped.partition_point(|(_, end)| *end <= run.position);
-                run.copied == Some(true)
-                    && skipped
-                        .get(at)
-                        .is_some_and(|(start, _)| *start <= run.position)
+                let Some((response, true)) = run.copied else {
+                    return false;
+                };
+                let at = skipped.partition_point(|(_, end)| *end <= response);
+                skipped.get(at).is_some_and(|(start, _)| *start <= response)
             })
             .map(|run| run.position)
             .collect::<Vec<_>>();

@@ -1415,7 +1415,8 @@ impl FileFold {
     /// its copy proof failed. Exactly the flagged range; own turns never.
     fn unproven_copy(&self, occurrence: &ClaudeTranscriptUsageOccurrence) -> bool {
         let at = occurrence.timestamp.as_deref().and_then(rfc3339_unix_nanos);
-        self.money_birth.copied_with_slack(at, SLACK) == Some(true)
+        !occurrence.usage.is_zero()
+            && self.money_birth.copied_with_slack(at, SLACK) == Some(true)
             && !self.is_skipped(occurrence.sequence)
     }
 
