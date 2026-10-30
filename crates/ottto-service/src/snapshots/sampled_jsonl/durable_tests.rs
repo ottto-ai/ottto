@@ -890,10 +890,17 @@ fn restore_then_tail_matches_cold_full() {
         let mut held = File::open(&path).unwrap();
         let (checkpoint, _) = certificate.restore(&mut held, scope()).unwrap();
         let (oracle, _) = restore(&path, &body, case.source).unwrap();
-        let (restored, _) = decode(&body, case.source)
-            .unwrap()
-            .rederive_content(&File::open(&path).unwrap())
-            .unwrap();
+        let (restored, _) = {
+            let decoded = decode(&body, case.source).unwrap();
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| {
+                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                })
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        }
+        .unwrap();
         assert_eq!(full_digest(&restored), full_digest(&oracle));
         let mut continued = parser(&path, case.source);
         let mode = continued
@@ -1819,10 +1826,18 @@ fn bounded_content_matches_native_corpus_and_fences_every_class() {
         let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
         let decoded = decode(&body, source).unwrap();
         assert!(decoded.rederive.workspace.is_some());
-        assert!(decoded.content_charge().is_ok());
-        let (bounded, _) = decoded
-            .rederive_content(&File::open(&path).unwrap())
-            .unwrap();
+        assert!(decoded.rederive_plan().map(|plan| plan.charge).is_ok());
+        let (bounded, _) = {
+            let decoded = decoded;
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| {
+                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                })
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        }
+        .unwrap();
         let oracle = restore(&path, &body, source).unwrap().0;
         assert_eq!(full_digest(&bounded), full_digest(&oracle));
         let mut workspace = decode(&body, source).unwrap();
@@ -1830,21 +1845,38 @@ fn bounded_content_matches_native_corpus_and_fences_every_class() {
             workspace: workspace.rederive.workspace,
             ..Default::default()
         };
-        let charge = workspace.content_charge().unwrap();
+        let charge = workspace.rederive_plan().map(|plan| plan.charge).unwrap();
         assert!(charge >= workspace.head_end().unwrap());
         let mut wrong = decode(&body, source).unwrap();
         wrong.rederive = Rederive {
             workspace: Some([0; 32]),
             ..Default::default()
         };
-        wrong.content_charge().unwrap();
+        wrong.rederive_plan().map(|plan| plan.charge).unwrap();
         assert!(matches!(
-            wrong.rederive_content(&File::open(&path).unwrap()),
+            {
+                let decoded = wrong;
+                decoded
+                    .rederive_plan()
+                    .map_err(Refuse::NotRederivable)
+                    .and_then(|plan| {
+                        decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                    })
+                    .map(|(reduction, receipt, _)| (reduction, receipt))
+            },
             Err(Refuse::NotRederivable("content_fence"))
         ));
-        let (bounded, receipt) = workspace
-            .rederive_content(&File::open(&path).unwrap())
-            .unwrap();
+        let (bounded, receipt) = {
+            let decoded = workspace;
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| {
+                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                })
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        }
+        .unwrap();
         assert_eq!(
             bounded.accumulator.workspace_path,
             oracle.accumulator.workspace_path
@@ -1869,9 +1901,17 @@ fn bounded_content_matches_native_corpus_and_fences_every_class() {
                 2 => excluded.rederive.agent_label = Some([1; 32]),
                 _ => excluded.rederive.session_start = Some([1; 32]),
             }
-            assert!(excluded
-                .rederive_content(&File::open(&path).unwrap())
-                .is_err());
+            assert!({
+                let decoded = excluded;
+                decoded
+                    .rederive_plan()
+                    .map_err(Refuse::NotRederivable)
+                    .and_then(|plan| {
+                        decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                    })
+                    .map(|(reduction, receipt, _)| (reduction, receipt))
+            }
+            .is_err());
         }
     }
 }
@@ -1899,8 +1939,17 @@ fn bounded_workspace_cap_and_escaped_text_keep_native_values_or_refuse() {
                 workspace: decoded.rederive.workspace,
                 ..Default::default()
             };
-            decoded.content_charge().unwrap();
-            let actual = decoded.rederive_content(&File::open(&path).unwrap());
+            decoded.rederive_plan().map(|plan| plan.charge).unwrap();
+            let actual = {
+                let decoded = decoded;
+                decoded
+                    .rederive_plan()
+                    .map_err(Refuse::NotRederivable)
+                    .and_then(|plan| {
+                        decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                    })
+                    .map(|(reduction, receipt, _)| (reduction, receipt))
+            };
             assert_eq!(
                 actual.unwrap().0.accumulator.workspace_path,
                 native.accumulator.workspace_path
@@ -1915,14 +1964,22 @@ fn bounded_workspace_cap_and_escaped_text_keep_native_values_or_refuse() {
         workspace: decoded.rederive.workspace,
         ..Default::default()
     };
-    decoded.content_charge().unwrap();
+    decoded.rederive_plan().map(|plan| plan.charge).unwrap();
     assert_eq!(
-        decoded
-            .rederive_content(&File::open(&path).unwrap())
-            .unwrap()
-            .0
-            .accumulator
-            .workspace_path,
+        {
+            let decoded = decoded;
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| {
+                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                })
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        }
+        .unwrap()
+        .0
+        .accumulator
+        .workspace_path,
         Some(PathBuf::from("/tmp/abc"))
     );
 }
@@ -1945,14 +2002,22 @@ fn workspace_unknown_object_shapes_match_native_without_formatting_the_input() {
             ..Default::default()
         };
         assert!(decoded.rederive.workspace.is_some());
-        decoded.content_charge().unwrap();
+        decoded.rederive_plan().map(|plan| plan.charge).unwrap();
         assert_eq!(
-            decoded
-                .rederive_content(&File::open(&path).unwrap())
-                .unwrap()
-                .0
-                .accumulator
-                .workspace_path,
+            {
+                let decoded = decoded;
+                decoded
+                    .rederive_plan()
+                    .map_err(Refuse::NotRederivable)
+                    .and_then(|plan| {
+                        decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                    })
+                    .map(|(reduction, receipt, _)| (reduction, receipt))
+            }
+            .unwrap()
+            .0
+            .accumulator
+            .workspace_path,
             native.accumulator.workspace_path
         );
     }
@@ -2125,10 +2190,13 @@ fn bounded_pi_workspace_matches_native_header_only_precedence() {
             )
             .unwrap();
         assert!(
-            make().content_charge().unwrap() >= native.accumulator.durable_marks.workspace.unwrap()
+            make().rederive_plan().map(|plan| plan.charge).unwrap()
+                >= native.accumulator.durable_marks.workspace.unwrap()
         );
-        let (actual, receipt) = make()
-            .rederive_content(&File::open(&path).unwrap())
+        let decoded = make();
+        let plan = decoded.rederive_plan().unwrap();
+        let (actual, receipt, _) = decoded
+            .rederive_content_planned(&File::open(&path).unwrap(), &plan)
             .unwrap();
         assert_eq!(
             actual.accumulator.workspace_path,
@@ -2144,13 +2212,22 @@ fn bounded_pi_workspace_matches_native_header_only_precedence() {
         let mut prompt = make();
         prompt.rederive.first_prompt = Some([1; 32]);
         assert!(
-            prompt.content_charge().is_err(),
+            prompt.rederive_plan().map(|plan| plan.charge).is_err(),
             "a fabricated prompt without a physical mark refuses"
         );
         let mut wrong = make();
         wrong.rederive.workspace = Some([0; 32]);
         assert!(matches!(
-            wrong.rederive_content(&File::open(&path).unwrap()),
+            {
+                let decoded = wrong;
+                decoded
+                    .rederive_plan()
+                    .map_err(Refuse::NotRederivable)
+                    .and_then(|plan| {
+                        decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                    })
+                    .map(|(reduction, receipt, _)| (reduction, receipt))
+            },
             Err(Refuse::NotRederivable("content_fence"))
         ));
     }
@@ -2182,8 +2259,17 @@ fn bounded_pi_workspace_enforces_cap_and_refuses_nonheader_cwd() {
                 ..Default::default()
             },
         };
-        decoded.content_charge().unwrap();
-        let result = decoded.rederive_content(&File::open(&path).unwrap());
+        decoded.rederive_plan().map(|plan| plan.charge).unwrap();
+        let result = {
+            let decoded = decoded;
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| {
+                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                })
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        };
         assert_eq!(
             result.unwrap().0.accumulator.workspace_path,
             Some(PathBuf::from("x".repeat(size)))
@@ -2210,7 +2296,16 @@ fn bounded_pi_workspace_enforces_cap_and_refuses_nonheader_cwd() {
         },
     };
     assert!(matches!(
-        decoded.rederive_content(&File::open(&path).unwrap()),
+        {
+            let decoded = decoded;
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| {
+                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                })
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        },
         Err(Refuse::NotRederivable("content_fence"))
     ));
 }
@@ -2416,9 +2511,17 @@ fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
                 .restore(&mut File::open(&path).unwrap(), scope())
                 .unwrap();
             let decoded = decode_body(&body, source).unwrap();
-            let (restored, receipt) = decoded
-                .rederive_content(&File::open(&path).unwrap())
-                .unwrap();
+            let (restored, receipt) = {
+                let decoded = decoded;
+                decoded
+                    .rederive_plan()
+                    .map_err(Refuse::NotRederivable)
+                    .and_then(|plan| {
+                        decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                    })
+                    .map(|(reduction, receipt, _)| (reduction, receipt))
+            }
+            .unwrap();
             assert!(receipt.head_bytes <= HEAD_BOUND);
             assert_eq!(
                 restored.accumulator.first_prompt_material,
@@ -2505,7 +2608,14 @@ fn bounded_fence_refuses_each_content_class_before_adoption() {
         };
         *digest = Some([0; 32]);
         let (result, rows) = crate::local_resource_diagnostics::capture(|| {
-            decoded.rederive_content(&File::open(&path).unwrap())
+            let decoded = decoded;
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| {
+                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                })
+                .map(|(reduction, receipt, _)| (reduction, receipt))
         });
         assert!(matches!(
             result,
@@ -2702,9 +2812,14 @@ pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
             // assertion. The subprocess test also inspects the panic hook sink.
             let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::local_resource_diagnostics::capture(|| {
-                    decode_body(&bad, source)
-                        .unwrap()
-                        .rederive_content(&File::open(&path).unwrap())
+                    let decoded = decode_body(&bad, source).unwrap();
+                    decoded
+                        .rederive_plan()
+                        .map_err(Refuse::NotRederivable)
+                        .and_then(|plan| {
+                            decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                        })
+                        .map(|(reduction, receipt, _)| (reduction, receipt))
                 })
             }));
             assert!(
@@ -2739,9 +2854,16 @@ pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
             digests.put(e)
         })
         .unwrap();
-        let result = decode_body(&body, source)
-            .unwrap()
-            .rederive_content(&File::open(&path).unwrap());
+        let result = {
+            let decoded = decode_body(&body, source).unwrap();
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| {
+                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                })
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        };
         assert!(matches!(
             result,
             Err(Refuse::NotRederivable("raw_value_key"))
@@ -2751,11 +2873,16 @@ pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
         // carriers without formatting a Value, prompt, title or label.
         assert!(decode_body(&body[..body.len() - 1], source).is_err());
         let fd = File::options().write(true).open(&path).unwrap();
-        let err = decode_body(&body, source)
-            .unwrap()
-            .rederive_content(&fd)
-            .err()
-            .unwrap();
+        let err = {
+            let decoded = decode_body(&body, source).unwrap();
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| decoded.rederive_content_planned(&fd, &plan))
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        }
+        .err()
+        .unwrap();
         safe_log.push_str(&format!("{err:?}\n"));
     }
     for canary in PRIVACY_CANARIES {
@@ -2889,10 +3016,17 @@ fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
         let (checkpoint, _) = certificate
             .restore_grown(&mut File::open(&path).unwrap(), scope())
             .unwrap();
-        let (restored, _) = decode_body(&body, source)
-            .unwrap()
-            .rederive_content(&File::open(&path).unwrap())
-            .unwrap();
+        let (restored, _) = {
+            let decoded = decode_body(&body, source).unwrap();
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| {
+                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                })
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        }
+        .unwrap();
         // The accepted extent remains B while the actual plan freezes C.
         File::options()
             .write(true)

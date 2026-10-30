@@ -14062,7 +14062,7 @@ fn b4_workspace_positive_restore_and_funding_before_read() {
     let before = lease.charged_for_test();
     let decoded = codec::decode_bounded(&record.record.body, source, &mut lease).unwrap();
     let decode_bytes = lease.charged_for_test() - before;
-    let content_bytes = decoded.content_charge().unwrap();
+    let content_bytes = decoded.rederive_plan().map(|plan| plan.charge).unwrap();
     assert!(content_bytes > 0);
     drop(decoded);
     lease

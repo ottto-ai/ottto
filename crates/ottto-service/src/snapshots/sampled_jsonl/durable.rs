@@ -702,7 +702,15 @@ pub(in crate::snapshots) fn test_rederive_codex_accumulator(
     } else {
         decoded
     };
-    decoded.rederive_content(file).map(|(r, _)| r.accumulator)
+    {
+        let decoded = decoded;
+        decoded
+            .rederive_plan()
+            .map_err(Refuse::NotRederivable)
+            .and_then(|plan| decoded.rederive_content_planned(file, &plan))
+            .map(|(reduction, receipt, _)| (reduction, receipt))
+    }
+    .map(|(r, _)| r.accumulator)
 }
 
 #[cfg(test)]
