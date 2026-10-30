@@ -3416,6 +3416,8 @@ pub(crate) struct UploadAckRetirementHandoff {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScanIndex {
     #[serde(skip)]
+    growth_claim_context: Option<Arc<sampled_audit::GrowthClaimContext>>,
+    #[serde(skip)]
     persistence_root: Option<(
         scan_index_persistence::Binding,
         scan_index_persistence::LoadedRoot,
@@ -3998,7 +4000,7 @@ pub struct ScanIndex {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_desktop_store_inventory: Option<String>,
     /// V2 selection debt only. Never authorizes acquisition or census proof.
-    /// Integration TODO: register in the store-owned bounded persistence codec.
+    /// Pacing claims are committed before acquisition; keys PL, values N.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     growth_retention: BTreeMap<String, sampled_audit::GrowthRetention>,
 }
@@ -4150,6 +4152,7 @@ fn deserialize_unsettled_causes<'de, D: serde::Deserializer<'de>>(
 impl Default for ScanIndex {
     fn default() -> Self {
         Self {
+            growth_claim_context: None,
             growth_retention: Default::default(),
             claude_money_birth_store: Default::default(),
             persistence_root: None,
@@ -26900,9 +26903,7 @@ impl OwnedSourceScan {
         let growth_active =
             source == SnapshotSource::ClaudeCode && sampled_audit::growth_active(index);
         if growth_active {
-            index
-                .growth_retention
-                .retain(|key, _| index.files.contains_key(key));
+            sampled_audit::prune_growth_retention(index, sampled_scan::now_seconds());
         }
         let next_generation_hints;
         {
@@ -48045,6 +48046,9 @@ impl ScanIndex {
         };
         let load_origin = ScanIndexLoadOrigin::from(&origin);
         index.settle_claude_index_load(path, load_origin);
+        if source == SnapshotSource::ClaudeCode && sampled_audit::growth_active(&index) {
+            sampled_audit::bind_growth_claims(&mut index, path);
+        }
         index.mint_or_reuse_codex_proof_incarnation(path, origin);
         if source == SnapshotSource::ClaudeCode
             && load_origin.is_fresh(&index)
@@ -48074,6 +48078,9 @@ impl ScanIndex {
     fn load_attributed(path: &Path, source: Option<SnapshotSource>) -> Result<Self> {
         let (mut index, origin) = Self::load_inner(path, source)?;
         index.settle_claude_index_load(path, ScanIndexLoadOrigin::from(&origin));
+        if sampled_audit::growth_active(&index) {
+            sampled_audit::bind_growth_claims(&mut index, path);
+        }
         index.mint_or_reuse_codex_proof_incarnation(path, origin);
         Ok(index)
     }
@@ -48461,22 +48468,33 @@ impl ScanIndex {
     }
 
     pub fn save(&mut self, path: &Path) -> Result<()> {
-        self.save_internal(path, None)
+        self.save_internal(path, None, false)
     }
     pub(crate) fn save_with_read_limit(&mut self, path: &Path, cap: usize) -> Result<()> {
-        self.save_internal(path, Some(cap))
+        self.save_internal(path, Some(cap), false)
     }
-    fn save_internal(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
+    fn save_growth_claim(&mut self, path: &Path) -> Result<()> {
+        self.save_internal(path, None, true)
+    }
+    fn save_internal(
+        &mut self,
+        path: &Path,
+        read_limit: Option<usize>,
+        claim_only: bool,
+    ) -> Result<()> {
         self.require_persistence_available()?;
         lenient_decode::retain_persistence_claims(self);
-        self.prune_claude_money_births(sampled_scan::now_seconds());
+        if !claim_only {
+            self.prune_claude_money_births(sampled_scan::now_seconds());
+        }
         lenient_decode::controls(self, scan_index_source_label(None))?;
-        // Every save writes the tombstone map under its marker (Round 13).
-        self.claude_retired_family_tombstones_initialized = true;
-        // Fails closed for the one record, in debug and release; never the save.
-        self.drop_unbound_claude_authority_records("save");
-        let drops = self.drop_invalid_index_records();
-        note_scan_index_record_drops("save", scan_index_source_label(None), drops);
+        if !claim_only {
+            // Every ordinary save writes tombstones under their marker.
+            self.claude_retired_family_tombstones_initialized = true;
+            self.drop_unbound_claude_authority_records("save");
+            let drops = self.drop_invalid_index_records();
+            note_scan_index_record_drops("save", scan_index_source_label(None), drops);
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create scan index directory {}", parent.display()))?;
@@ -48485,7 +48503,12 @@ impl ScanIndex {
         #[cfg(test)]
         pause_scan_index_cas_if_requested_for_test();
         if path.exists() {
-            if let Some((binding, root)) = &self.persistence_root {
+            let claim_generation = sampled_audit::own_growth_claim_generation(self, path);
+            if let Some((binding, root)) = &self
+                .persistence_root
+                .as_ref()
+                .filter(|_| claim_generation.is_none())
+            {
                 scan_index_persistence::LockedStore::new(
                     path,
                     binding.clone(),
@@ -48500,7 +48523,8 @@ impl ScanIndex {
                 read_limit,
             )
             .context("parse current local snapshot scan index for compare-and-swap")?;
-            if self.persistence_root.is_none()
+            if claim_generation.is_none()
+                && self.persistence_root.is_none()
                 && current
                     .persistence_root
                     .as_ref()
@@ -48510,11 +48534,20 @@ impl ScanIndex {
             }
             current.require_persistence_available()?;
             if current.schema_version != SCAN_INDEX_SCHEMA_VERSION
-                || current.generation != self.generation
+                || current.generation != claim_generation.unwrap_or(self.generation)
             {
                 return Err(anyhow::anyhow!(
                     "local snapshot scan index changed concurrently"
                 ));
+            }
+            sampled_audit::merge_growth_claims(
+                &mut self.growth_retention,
+                &current.growth_retention,
+            );
+            if claim_generation.is_some() {
+                // Only this load lineage's claim-only commits may advance CAS.
+                self.generation = current.generation;
+                self.persistence_root = current.persistence_root.clone();
             }
             terminal_contract_retry::merge_maps(
                 &mut self.quarantined_snapshot_fingerprints,
@@ -48530,7 +48563,12 @@ impl ScanIndex {
                 "local snapshot scan index disappeared concurrently"
             ));
         }
-        self.retire_committed_claude_account_pending_windows();
+        if !claim_only {
+            self.retire_committed_claude_account_pending_windows();
+            if sampled_audit::growth_active(self) {
+                sampled_audit::prune_growth_retention(self, sampled_scan::now_seconds());
+            }
+        }
         let previous_generation = self.generation;
         self.schema_version = SCAN_INDEX_SCHEMA_VERSION;
         self.generation = self
@@ -48545,6 +48583,11 @@ impl ScanIndex {
             Ok(Some(state)) => {
                 self.persistence_root = Some(state);
                 self.persistence_legacy_recovery = None;
+                if claim_only {
+                    sampled_audit::publish_growth_claim_receipt(self, path)?;
+                } else {
+                    sampled_audit::renew_growth_claims(self, path);
+                }
                 return Ok(());
             }
             Ok(None) => {} // Standalone legacy files retain their existing path.
@@ -48584,6 +48627,13 @@ impl ScanIndex {
         if result.is_err() {
             self.generation = previous_generation;
             let _ = fs::remove_file(&temp_path);
+        }
+        if result.is_ok() {
+            if claim_only {
+                sampled_audit::publish_growth_claim_receipt(self, path)?;
+            } else {
+                sampled_audit::renew_growth_claims(self, path);
+            }
         }
         result
     }
@@ -49747,6 +49797,7 @@ impl ScanIndex {
             codex_counting_tombstones: self.codex_counting_tombstones.clone(),
             codex_counting_evicted_legacy: self.codex_counting_evicted_legacy.clone(),
             codex_counting_evictions: self.codex_counting_evictions,
+            growth_claim_context: previous.growth_claim_context.clone(),
             persistence_root: previous.persistence_root.clone(),
             persistence_controls: previous.persistence_controls.clone(),
             persistence_legacy_recovery: self
@@ -93473,7 +93524,7 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U subscription_product: Option<String>,
 });
 crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; growth_retention, persistence_legacy_recovery, persistence_root, persistence_unavailable, persistence_controls, decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, file_upload_context_enabled, context_read_counts, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store, claude_desktop_store_inventory);
+crate::heap_layout_bound::fields!(ScanIndex; growth_claim_context, growth_retention, persistence_legacy_recovery, persistence_root, persistence_unavailable, persistence_controls, decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, file_upload_context_enabled, context_read_counts, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store, claude_desktop_store_inventory);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
@@ -94146,6 +94197,7 @@ crate::heap_layout_bound::fields!(UploadAckRetirementHandoff; destination_namesp
 
 impl ScanIndex {
     pub(crate) fn retain_persistence_baseline_from(&mut self, committed: &Self) {
+        self.growth_claim_context = committed.growth_claim_context.clone();
         self.persistence_root = committed.persistence_root.clone();
         self.persistence_controls = committed.persistence_controls.clone();
         // A published baseline has consumed its shared recovery grant. Adopt
