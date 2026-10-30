@@ -28784,6 +28784,7 @@ impl OwnedSourceScan {
                     #[cfg(unix)]
                     if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
                         let mut refused = false;
+                        let mut retry_members = false;
                         // C9: inspect and account for EVERY member before holding
                         // the group; short-circuiting loses refused-member evidence.
                         for member in &group.members {
@@ -28794,6 +28795,8 @@ impl OwnedSourceScan {
                                 Ok(None) => {}
                                 Ok(Some(reason)) => {
                                     refused = true;
+                                    retry_members |= !restart_restore::enabled()
+                                        || reason != crate::durable_tail_store::Refusal::Corrupt;
                                     cache.durable_hold_exit(
                                         source,
                                         reason,
@@ -28807,6 +28810,7 @@ impl OwnedSourceScan {
                                 }
                                 Err(_) => {
                                     refused = true;
+                                    retry_members = true;
                                     cache.durable_custody_hold(
                                         source,
                                         "active_input_pending",
@@ -28817,11 +28821,19 @@ impl OwnedSourceScan {
                             }
                         }
                         if refused {
-                            sampled_scan::codex_cursor::requeue_members(
-                                index,
-                                &codex_selected_flags,
-                                &group.members,
-                            );
+                            if retry_members {
+                                sampled_scan::codex_cursor::requeue_members(
+                                    index,
+                                    &codex_selected_flags,
+                                    &group.members,
+                                );
+                            } else {
+                                // A spent corrupt rebuild is terminal for this
+                                // pass, just like the singleton hold exit. Keep
+                                // its accepted state while allowing the census
+                                // and unrelated groups to finish.
+                                sampled_scan::codex_cursor::dequeue_members(index, &group.members);
+                            }
                             pending!();
                         }
                     }

@@ -575,9 +575,15 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             return refuse(Event::InsertFrozenChargeRefused, incoming);
         }
         let mut custody = Counter::new(self.entry_limit);
-        let state_bytes = taken
-            .durable
-            .heap_bound(&mut custody)
+        let custody_box = if taken.durable.is_empty() {
+            Some(0)
+        } else {
+            std::mem::size_of::<crate::snapshots::DurableCustody>()
+                .checked_add(std::mem::align_of::<crate::snapshots::DurableCustody>())
+        };
+        let state_bytes = custody_box
+            .and_then(|bytes| custody.add(bytes))
+            .and_then(|_| taken.durable.heap_bound(&mut custody))
             .and_then(|_| std::mem::size_of::<Entry<S>>().checked_add(heap_bytes))
             .and_then(|n| n.checked_add(custody.bytes));
         let Some(state_bytes) = state_bytes.filter(|n| *n <= self.entry_limit) else {
