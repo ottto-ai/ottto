@@ -4,21 +4,27 @@ use crate::transcript_acquisition::Scope;
 
 /// The sampled scope and identity-capture mode this fixture's scans bind; a
 /// durable record (#806) restores only under the same pair.
-fn durable_binding(source: SnapshotSource) -> (Scope, bool) {
+fn durable_binding(source: SnapshotSource, claude_identity_capture: bool) -> (Scope, bool) {
     match source {
-        SnapshotSource::ClaudeCode => (Scope("e2-pipeline".into()), CLAUDE_IDENTITY_CAPTURE),
+        SnapshotSource::ClaudeCode => (Scope("e2-pipeline".into()), claude_identity_capture),
         // Outside a sync cycle every scan captures (also in tests).
         _ => (Scope("money-equivalence".into()), true),
     }
 }
-const CLAUDE_IDENTITY_CAPTURE: bool = false;
-
 #[derive(Default)]
 pub(crate) struct E2ScanFixture {
     pub(crate) cache: Arc<sampled_scan::SharedCache>,
     observed: Mutex<Vec<PathBuf>>,
+    identity_capture: bool,
 }
 impl E2ScanFixture {
+    pub(crate) fn with_identity_capture(identity_capture: bool) -> Self {
+        Self {
+            identity_capture,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
         self.observed.lock().unwrap().clone()
     }
@@ -32,7 +38,7 @@ impl E2ScanFixture {
         state_dir: &Path,
         index_path: &Path,
     ) {
-        let (scope, capture) = durable_binding(source);
+        let (scope, capture) = durable_binding(source, self.identity_capture);
         begin_durable_pass(
             &self.cache,
             state_dir,
@@ -79,10 +85,10 @@ impl E2ScanFixture {
             hints,
             false,
             true,
-            CLAUDE_IDENTITY_CAPTURE,
+            self.identity_capture,
         );
         if sampled {
-            let (scope, _) = durable_binding(SnapshotSource::ClaudeCode);
+            let (scope, _) = durable_binding(SnapshotSource::ClaudeCode, self.identity_capture);
             scan = scan.with_sampled_acquisition(self.cache.clone(), scope);
         }
         // The same synthetic root births reach the page's staged twin probes,
@@ -121,7 +127,7 @@ impl E2ScanFixture {
             true,
         );
         if sampled {
-            let (scope, _) = durable_binding(source);
+            let (scope, _) = durable_binding(source, self.identity_capture);
             scan = scan.with_sampled_acquisition(self.cache.clone(), scope);
         }
         self.drive(scan, &BTreeMap::new())

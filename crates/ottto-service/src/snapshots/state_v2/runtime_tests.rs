@@ -426,13 +426,40 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
 #[test]
 fn newly_adopted_import_can_save_without_an_intervening_load() {
     let f = Fixture::new();
-    fs::write(&f.path, b"synthetic-v1-authority").unwrap();
-    assert!(load_with(&f.path, true, &EmptyMapper).unwrap().is_none());
+    fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
+    // Use the real inventory/publication path so import seals the external
+    // progress receipt. EmptyMapper only stands in for semantic row mapping.
+    assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
     let mut index = ScanIndex::default();
     import_with(&f.path, &mut index, &EmptyMapper).unwrap();
     assert!(index.persistence_v2.is_some());
+    assert!(fence::sibling(&f.path, ".v2-ack-receipt").is_file());
+    let runtime = index.persistence_v2.clone().unwrap();
     assert!(save_with(&f.path, &mut index, &EmptyMapper).unwrap());
     assert_eq!(index.generation, 1);
+    assert!(Arc::ptr_eq(
+        &runtime,
+        index.persistence_v2.as_ref().unwrap()
+    ));
+}
+
+#[test]
+fn newly_adopted_import_without_a_sealed_receipt_refuses_save() {
+    let f = Fixture::new();
+    fs::write(&f.path, b"synthetic-v1-authority").unwrap();
+    assert!(load_with(&f.path, true, &EmptyMapper).unwrap().is_none());
+    let mut index = ScanIndex::default();
+    // The table-agnostic fake publishes without Original's progress custody.
+    import_with(&f.path, &mut index, &EmptyMapper).unwrap();
+    assert!(index.persistence_v2.is_some());
+    assert!(!fence::sibling(&f.path, ".v2-ack-receipt").exists());
+    assert_eq!(
+        save_with(&f.path, &mut index, &EmptyMapper)
+            .unwrap_err()
+            .downcast_ref::<Hold>(),
+        Some(&Hold::DbUnavailable)
+    );
+    assert_eq!(index.generation, 0);
 }
 
 // Real mapper coverage for the raw decoder/load route (the fixtures above use
