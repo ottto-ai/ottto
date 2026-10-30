@@ -188,6 +188,8 @@ mod line_delivery_tests;
 mod pi_retry_inputs;
 mod sampled_audit;
 mod sampled_jsonl;
+#[cfg(unix)]
+pub(crate) use sampled_jsonl::durable::pl_text::PlText;
 mod upgrade_replay;
 /// Structural verification plus the nested source binding `decode` enforces.
 #[cfg(unix)]

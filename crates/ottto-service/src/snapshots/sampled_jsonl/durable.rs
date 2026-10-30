@@ -16,6 +16,8 @@ use std::fs::File;
 #[cfg(test)]
 use std::io::{Read, Seek, SeekFrom};
 
+pub(crate) mod pl_text;
+
 use super::*;
 use crate::durable_tail_codec::{Corrupt, Dec, Durable, Enc, Refuse, Shape};
 

@@ -27423,8 +27423,44 @@ for line in sys.stdin:
         );
     }
 
+    /// Seed the private record directory with codec bytes, so both diagnostic
+    /// paths must exclude stored literals rather than merely redact a Debug.
+    fn seed_private_literal_canary(support: &Path) -> &'static str {
+        use crate::durable_tail_codec::{Durable, Enc, PlText};
+        const CANARY: &str = "PRIVATE_LITERAL_DIAGNOSTICS_CANARY_20261030";
+        let literal = PlText::<96>::new(CANARY.into()).unwrap();
+        let body = Enc::count_write(1024, |e| literal.put(e)).unwrap();
+        assert!(body
+            .windows(CANARY.len())
+            .any(|bytes| bytes == CANARY.as_bytes()));
+        let dir =
+            crate::durable_tail_store::store_dir_for_index(&support.join("claude-scan-index.json"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let record = dir.join(format!("{}.rec", "0".repeat(64)));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(record)
+            .unwrap();
+        file.write_all(&body).unwrap();
+        CANARY
+    }
+
     #[test]
+    #[serial]
     fn diagnostics_collect_is_local_only_without_upload() {
+        let _env_lock = lock_backend_test_env();
+        let support = crate::test_scratch::ScratchDir::new("pl-diagnostics-export");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let _secrets =
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &support.join("secrets"));
+        let _keys = EnvVarGuard::set_path(
+            TELEMETRY_KEY_FILE_STORE_ENV,
+            &support.join("telemetry-keys"),
+        );
+        let canary = seed_private_literal_canary(&support);
         let response = handle_request(
             &daemon(),
             LocalControlRequest {
@@ -27443,6 +27479,7 @@ for line in sys.stdin:
 
         assert!(response.ok, "{response:?}");
         let payload = response.payload.expect("payload");
+        assert!(!serde_json::to_string(&payload).unwrap().contains(canary));
         assert!(payload
             .get("bundle_id")
             .and_then(|value| value.as_str())
@@ -27539,7 +27576,18 @@ for line in sys.stdin:
     }
 
     #[test]
+    #[serial]
     fn diagnostics_upload_with_support_claim_posts_redacted_bundle() {
+        let _env_lock = lock_backend_test_env();
+        let support = crate::test_scratch::ScratchDir::new("pl-support-bundle");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let _secrets =
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &support.join("secrets"));
+        let _keys = EnvVarGuard::set_path(
+            TELEMETRY_KEY_FILE_STORE_ENV,
+            &support.join("telemetry-keys"),
+        );
+        let canary = seed_private_literal_canary(&support);
         let captured = Arc::new(Mutex::new(None));
         let api_base_url = diagnostics_upload_server(captured.clone());
         let response = handle_request(
@@ -27602,6 +27650,8 @@ for line in sys.stdin:
         assert!(body.contains("\"retention_disclosure_accepted\":true"));
         assert!(body.contains("\"support_claim_provided\":true"));
         assert!(!body.contains("support_123"));
+        assert!(!body.contains(canary));
+        assert!(!payload_json.contains(canary));
     }
 
     #[test]

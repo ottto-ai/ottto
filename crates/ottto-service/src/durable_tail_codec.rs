@@ -11,6 +11,12 @@
 //! - `L` a provider-minted opaque id (request, response, message, tool-use,
 //!   call or MCP call id). Persisted only in the local 0600 durable-tail store;
 //!   never logged, never in diagnostics or counters, never uploaded from it;
+//! - `PL` private local literal: exactly the uploaded wire value, or the
+//!   explicitly approved bounded native state from which that upload is derived
+//!   (PL-retained). Consent-gated; never stored while consent is off and purged
+//!   at the next save on revocation. Dropped on identity failure and erased with
+//!   its record. Never exposed in logs, diagnostics, status, support bundles or
+//!   error text; single use, restoring only the same approved upload/state.
 //! - `X` content (text, paths). Never encoded. Restored by re-derivation from
 //!   the file itself and verified by hash, else the entry reads in Full;
 //! - `E` must be empty in the retained copy. A non-empty value refuses the
@@ -33,6 +39,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write;
 
 use sha2::{Digest, Sha256};
+
+#[cfg(unix)]
+#[allow(unused_imports)] // Shared API; field activation follows separately.
+pub(crate) use crate::snapshots::PlText;
 
 /// Why a value was not encoded. Carries field paths only, never values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,6 +320,19 @@ impl<'a> Dec<'a> {
         let len = self.take_len()?;
         self.raw(len)
     }
+    /// Check the field bound and UTF-8 before requesting allocation credit.
+    pub(crate) fn bounded_text(&mut self, cap: usize) -> Result<String, Corrupt> {
+        let bytes = self.bounded_text_bytes(cap)?;
+        self.slots::<u8>(bytes.len())?;
+        Ok(bytes.to_owned())
+    }
+    pub(crate) fn bounded_text_bytes(&mut self, cap: usize) -> Result<&'a str, Corrupt> {
+        let len = self.take_len()?;
+        if len > cap {
+            return Err(Corrupt);
+        }
+        std::str::from_utf8(self.raw(len)?).map_err(|_| Corrupt)
+    }
     pub(crate) fn remaining(&self) -> usize {
         self.bytes.len() - self.at
     }
@@ -361,6 +384,24 @@ pub(crate) trait Durable: Sized {
     /// Walk the stored fields without constructing the value or allocating.
     fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt>;
     fn shape(s: &mut Shape);
+}
+
+/// Only private literal wrappers implement this class. In particular, ordinary
+/// String and arbitrary Durable values cannot be labelled PL by the macro.
+/// Each use still needs its field-specific consent, lifetime and single-use rule.
+pub(crate) trait PlLiteral: Durable {
+    fn put_pl(&self, e: &mut Enc) -> Result<(), Refuse> {
+        self.put(e)
+    }
+    fn take_pl(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        Self::take(d)
+    }
+    fn verify_pl(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        Self::verify(d)
+    }
+    fn shape_pl(s: &mut Shape) {
+        Self::shape(s);
+    }
 }
 
 /// `H` is a type, not a label: only fixed 32-byte values (a raw
@@ -1250,6 +1291,10 @@ macro_rules! durable_field {
     (put U, $e:ident, $f:ident, $ty:ty, $path:expr) => {
         $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
     };
+    (put PL, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
+        let value: &$ty = $f;
+        $crate::durable_tail_codec::PlLiteral::put_pl(value, $e)?;
+    }};
     (put L, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
         let value: &$ty = $f;
         #[cfg(test)]
@@ -1288,6 +1333,9 @@ macro_rules! durable_field {
     (take U, $d:ident, $ty:ty) => {
         <$ty as $crate::durable_tail_codec::Durable>::take($d)?
     };
+    (take PL, $d:ident, $ty:ty) => {
+        <$ty as $crate::durable_tail_codec::PlLiteral>::take_pl($d)?
+    };
     (take L, $d:ident, $ty:ty) => {
         <$ty as $crate::durable_tail_codec::Durable>::take($d)?
     };
@@ -1300,6 +1348,7 @@ macro_rules! durable_field {
     (take $other:ident, $d:ident, $ty:ty) => {
         <$ty as ::std::default::Default>::default()
     };
+    (verify PL, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::PlLiteral>::verify_pl($d)? };
     (verify H, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::HDigest>::verify_h($d)? };
     (verify X, $d:ident, $ty:ty) => {};
     (verify E, $d:ident, $ty:ty) => {};
@@ -1310,6 +1359,8 @@ macro_rules! durable_field {
     (verify D, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
     (verify P, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
     (verify $other:ident, $d:ident, $ty:ty) => { compile_error!("unknown durable field class in verify") };
+    (key_type PL, $ty:ty, $lt:lifetime) => { compile_error!("PL fields cannot appear in durable keys") };
+    (key PL, $d:ident, $ty:ty) => { compile_error!("PL fields cannot appear in durable keys") };
     (key_type X, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
     (key_type E, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
     (key_type I, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
@@ -1320,6 +1371,10 @@ macro_rules! durable_field {
     (key_type $c:ident, $ty:ty, $lt:lifetime) => { <$ty as $crate::durable_tail_codec::DurableKey>::View<$lt> };
     (key H, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::HDigestKey>::key_h($d)? };
     (key $c:ident, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::DurableKey>::key($d)? };
+    (shape PL, $s:ident, $f:ident, $ty:ty) => {{
+        $s.push(concat!("PL ", stringify!($f)));
+        <$ty as $crate::durable_tail_codec::PlLiteral>::shape_pl($s);
+    }};
     (shape X, $s:ident, $f:ident, $ty:ty) => {{
         $s.push(concat!("X ", stringify!($f)));
         <$ty as $crate::durable_tail_codec::Durable>::shape($s);
