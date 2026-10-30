@@ -151,11 +151,33 @@ fn over_cap_tail_uploads_match_one_full_upload_without_retractions() {
     let empty = json!({"schema_version":1,"observations":[],"coverage":"partial","omitted_observation_count":131});
     for start in [None, Some(empty)] {
         let mut prior = start;
-        // Each length is one tail pass; 130 ends on a break still awaiting its next request.
-        for length in [21, 129, 130, 131, 141, full.len()] {
+        // 128 ends at selected row 64 awaiting its next request; 129 completes it.
+        // 130 ends on the first omitted break awaiting its next request.
+        for length in [21, 127, 128, 129, 130, 131, 141, full.len()] {
             let (wire, state) = upload(&full[..length], prior.as_ref());
             assert_eq!(retracted(&wire), 0, "length {length}");
             assert!(wire.operations.len() <= MAX_OPERATIONS);
+            let last_selected = state["observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["affected_request_ref"] == "cold_63");
+            if length == 127 {
+                assert!(last_selected.is_none());
+            } else if length >= 128 {
+                let last_selected = last_selected.unwrap();
+                assert_eq!(
+                    last_selected["event_id"],
+                    cache_observations::event_id("s", "cold_63")
+                );
+                if length == 128 {
+                    assert_eq!(last_selected["status"], "awaiting_next");
+                    assert!(last_selected["immediate_next"].is_null());
+                } else {
+                    assert_eq!(last_selected["status"], "complete");
+                    assert_eq!(last_selected["immediate_next"]["request_ref"], "warm_64");
+                }
+            }
             prior = Some(state);
         }
         let (wire, fresh) = upload(&full, None);
@@ -259,8 +281,8 @@ pub(crate) fn large_prior_and_replacement_fixture() -> (CacheObservations, Value
             .cloned()
             .map(|row| large_row(row, conditions))
             .collect();
-        let prior = cache_state_from_patch(None, &partial(old));
-        let merged = cache_state_from_patch(Some(&prior), &candidate);
+        let prior = cache_state_from_patch(None, &partial(old)).unwrap();
+        let merged = cache_state_from_patch(Some(&prior), &candidate).unwrap();
         if encoded(&prior) <= cache_observations::MAX_WIRE_BYTES
             && encoded(&merged) > cache_observations::MAX_WIRE_BYTES
         {
@@ -274,7 +296,7 @@ pub(crate) fn large_prior_and_replacement_fixture() -> (CacheObservations, Value
 fn large_accepted_prior_small_replacements_validate_actual_merge_after_every_trim() {
     let (candidate, prior) = large_prior_and_replacement_fixture();
     assert!(candidate.validate(), "small replacement patch itself fits");
-    let merged = cache_state_from_patch(Some(&prior), &candidate);
+    let merged = cache_state_from_patch(Some(&prior), &candidate).unwrap();
     assert!(
         !cache_state_within_limits(&merged),
         "but actual cumulative state does not"
@@ -282,7 +304,7 @@ fn large_accepted_prior_small_replacements_validate_actual_merge_after_every_tri
     let mut trimmed = candidate.clone();
     trimmed.operations.pop();
     assert!(
-        encoded(&cache_state_from_patch(Some(&prior), &trimmed)) > encoded(&merged),
+        encoded(&cache_state_from_patch(Some(&prior), &trimmed).unwrap()) > encoded(&merged),
         "discarding a shrinking replacement increases cumulative bytes"
     );
     let mut item = super::tests::sample_session_artifact_item();
@@ -294,7 +316,7 @@ fn large_accepted_prior_small_replacements_validate_actual_merge_after_every_tri
     assert_eq!(wire.omitted_observation_count, None);
     let state = item.cache_observations_state.unwrap();
     assert!(cache_state_within_limits(&state));
-    assert_eq!(state, cache_state_from_patch(Some(&prior), &wire));
+    assert_eq!(state, cache_state_from_patch(Some(&prior), &wire).unwrap());
     for row in prior["observations"].as_array().unwrap() {
         assert!(state["observations"].as_array().unwrap().contains(row));
     }
@@ -303,7 +325,7 @@ fn large_accepted_prior_small_replacements_validate_actual_merge_after_every_tri
 #[test]
 fn dropped_replacement_is_present_and_not_counted_as_omitted() {
     let desired = rows(&codex_cache_wire_for_requests("s", &session("", 65)).unwrap());
-    let prior = cache_state_from_patch(None, &partial(desired[..10].to_vec()));
+    let prior = cache_state_from_patch(None, &partial(desired[..10].to_vec())).unwrap();
     let mut selected = desired[10..].to_vec();
     selected.extend_from_slice(&desired[..10]);
     let mut candidate = partial(selected);
@@ -335,7 +357,7 @@ fn cumulative_row_cap_and_metadata_only_refusal_preserve_accepted_evidence() {
         row.immediate_next = None;
         row.status = "next_unavailable".into();
     }
-    let prior = cache_state_from_patch(None, &partial(accepted));
+    let prior = cache_state_from_patch(None, &partial(accepted)).unwrap();
     assert!(cache_state_within_limits(&prior));
     let (wire, state) = upload(&session("", 65), Some(&prior));
     assert!(wire.operations.is_empty());
@@ -350,7 +372,8 @@ fn cumulative_row_cap_and_metadata_only_refusal_preserve_accepted_evidence() {
         &partial(rows(
             &codex_cache_wire_for_requests("s", &session("old_", 10)).unwrap(),
         )),
-    );
+    )
+    .unwrap();
     exact["omitted_observation_count"] = json!(0);
     // Fill using schema-valid condition strings within per-field limits.
     let budget = cache_observations::MAX_WIRE_BYTES;
@@ -421,4 +444,87 @@ fn partial_retracted_status_is_not_a_deletion_backdoor() {
         item.cache_observations_state.unwrap()["observations"],
         prior["observations"]
     );
+}
+
+#[test]
+fn malformed_accepted_rows_refuse_complete_and_partial_cache_updates() {
+    let candidate = codex_cache_wire_for_requests("s", &session("", 2)).unwrap();
+    let valid = cache_state_from_patch(None, &candidate).unwrap();
+    let mut malformed = valid.clone();
+    // Keep the accepted ID but break a required field. Previously this row was
+    // silently dropped, even when its raw size exceeded the cumulative budget.
+    malformed["observations"][0]["affected"] = Value::Null;
+    let mut oversized = malformed.clone();
+    oversized["observations"][0]["supporting_conditions"] =
+        json!(["x".repeat(cache_observations::MAX_WIRE_BYTES)]);
+    assert!(encoded(&oversized) > cache_observations::MAX_WIRE_BYTES);
+    let mut wrong_shape = valid.clone();
+    wrong_shape["observations"] = Value::Null;
+    for prior in [malformed, oversized, wrong_shape] {
+        for coverage in ["complete", "partial"] {
+            let mut patch = candidate.clone();
+            patch.coverage = coverage.into();
+            assert!(cache_state_from_patch(Some(&prior), &patch).is_none());
+            let before = prior.clone();
+            let mut item = super::tests::sample_session_artifact_item();
+            item.cache_observations = Some(patch);
+            // A previously projected state must be cleared on refusal too.
+            item.cache_observations_state = Some(valid.clone());
+            prepare_cache_observations(&mut item, Some(&prior));
+            assert!(item.cache_observations.is_none());
+            assert!(item.cache_observations_state.is_none());
+            assert_eq!(prior, before);
+        }
+    }
+}
+
+#[test]
+fn under_cap_byte_trim_keeps_the_session_prefix_even_with_backwards_clocks() {
+    let mut requests = session("", 64);
+    let count = requests.len() as i64;
+    for (index, request) in requests.iter_mut().enumerate() {
+        request.slot.occurred_at = request_time(count - index as i64);
+    }
+    let candidate = codex_cache_wire_for_requests("s", &requests).unwrap();
+    assert_eq!(candidate.coverage, "complete");
+    // Fitting complete patches retain the preexisting event-ID wire order.
+    let mut item = super::tests::sample_session_artifact_item();
+    item.cache_observations = Some(candidate.clone());
+    prepare_cache_observations(&mut item, None);
+    let complete = item.cache_observations.unwrap();
+    assert_eq!(complete.coverage, "complete");
+    let ids = rows(&complete)
+        .into_iter()
+        .map(|row| row.event_id)
+        .collect::<Vec<_>>();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids, sorted);
+
+    let mut padded = candidate;
+    for op in &mut padded.operations {
+        if let Operation::Upsert { observation } = op {
+            **observation = large_row(observation.as_ref().clone(), 32);
+        }
+    }
+    assert!(
+        !padded.validate(),
+        "force a byte-budget fallback below 64 rows"
+    );
+    item.cache_observations = Some(padded);
+    prepare_cache_observations(&mut item, None);
+    let wire = item.cache_observations.unwrap();
+    assert_eq!(wire.coverage, "partial");
+    assert!(wire.validate());
+    assert!(!wire.operations.is_empty());
+    assert!(wire.operations.len() < MAX_OPERATIONS);
+    assert_eq!(upserted(&wire), colds(0..wire.operations.len()));
+    assert_eq!(
+        wire.omitted_observation_count,
+        Some((64 - wire.operations.len()) as u64)
+    );
+    assert_eq!(retracted(&wire), 0);
+    let state = item.cache_observations_state.unwrap();
+    assert!(cache_state_within_limits(&state));
+    assert_eq!(state, cache_state_from_patch(None, &wire).unwrap());
 }

@@ -250,6 +250,16 @@ pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
     line_unselected(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
 }
 
+// Same public seam as E3/#876. Its merged withheld carrier can keep this
+// signature; this branch emits the count on the existing diagnostics carrier.
+pub(crate) fn audit_retired_absent(source: &str) {
+    traversal_point(
+        "audit_retired_absent",
+        source,
+        &serde_json::json!({"audit_retired_absent": {"events": 1}}),
+    );
+}
+
 const SCHEMA_VERSION: u8 = 2;
 
 pub(crate) fn connection_binding_read<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
@@ -767,6 +777,12 @@ pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) 
         counts,
     );
 }
+/// Local alarm, once per park: a held Claude key's progress audit failed its
+/// secure open 8 times in a row and is parked, its audit debt still owed.
+/// Counts only; no path, id or wire event.
+pub(crate) fn claude_held_audit_open_parked(counts: &impl Serialize) {
+    traversal_point("claude_held_audit_open_parked", "claude_code", counts);
+}
 /// Local alarm, at most hourly: a complete Claude terminal kept the retired
 /// family tombstone uncertainty fence up, because more absent witnessed roots
 /// need a tombstone than fit under the cap. Counts only; no path, id or wire
@@ -872,6 +888,10 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
 /// disabled store, as [since last, total] counts. No path, id or wire event.
 pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {
     traversal_point("durable_tail_alarm", source, counts);
+}
+/// At most once per 24 h while restart Fulls caused by a failed store write persist.
+pub(crate) fn durable_tail_restart_full_alarm(source: &str, counts: &impl Serialize) {
+    traversal_point("durable_tail_restart_full_alarm", source, counts);
 }
 pub(crate) fn codex_continuation(held: Option<&'static str>) {
     let counts = serde_json::json!({
@@ -1301,6 +1321,8 @@ pub(crate) struct PageEvents {
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct IndexState {
+    pub(crate) audit_quiet_retired: usize,
+    pub(crate) audit_cap_full: usize,
     pub(crate) pending_audits: usize,
     pub(crate) overdue_audits: usize,
     pub(crate) oldest_due_age_seconds: u64,
@@ -1722,6 +1744,8 @@ mod tests {
                 max_completion_overdue_seconds: u64::MAX,
             },
             index_state_at_page_end: IndexState {
+                audit_quiet_retired: usize::MAX,
+                audit_cap_full: usize::MAX,
                 pending_audits: usize::MAX,
                 overdue_audits: usize::MAX,
                 oldest_due_age_seconds: u64::MAX,

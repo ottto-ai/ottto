@@ -125,14 +125,39 @@ pub fn ensure_launch_agent_write_allowed(
         return Ok(state);
     }
 
-    let current_owner = conflicting_owner(&state);
-    anyhow::bail!(
-        "refusing to replace {LAUNCH_AGENT_LABEL}: existing owner is {}, requested owner is {}. {}",
-        install_owner_label(current_owner),
-        install_owner_label(state.expected_owner),
-        install_owner_repair_hint(current_owner)
-    )
+    Err(owner_conflict_error(&state))
 }
+
+/// A refusal to replace another installation, independent of probe failures.
+#[derive(Debug)]
+pub struct LaunchAgentOwnerConflict {
+    current_owner: InstallOwner,
+    expected_owner: InstallOwner,
+}
+
+impl std::fmt::Display for LaunchAgentOwnerConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f,
+            "refusing to replace {LAUNCH_AGENT_LABEL}: existing owner is {}, requested owner is {}. {}",
+            install_owner_label(self.current_owner),
+            install_owner_label(self.expected_owner),
+            install_owner_repair_hint(self.current_owner))
+    }
+}
+impl std::error::Error for LaunchAgentOwnerConflict {}
+
+pub fn owner_conflict_error(state: &LaunchAgentOwnerState) -> anyhow::Error {
+    LaunchAgentOwnerConflict {
+        current_owner: conflicting_owner(state),
+        expected_owner: state.expected_owner,
+    }
+    .into()
+}
+
+/// A failed/indeterminate lifecycle operation must never invite blind retry.
+#[derive(Debug, thiserror::Error)]
+#[error("{0:#}")]
+pub struct LaunchAgentLifecycleFailure(#[source] pub anyhow::Error);
 
 pub fn inspect_launch_agent_owner(
     plist_path: &Path,
