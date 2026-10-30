@@ -1670,7 +1670,7 @@ pub(crate) fn trace_verify(f: impl FnOnce()) -> (Vec<(usize, bool)>, usize) {
 #[cfg(test)]
 mod tests {
 
-    /// [behaviour] count write matches bytes and refuses before output.
+    /// [format] count write matches bytes and refuses before output.
     #[test]
     fn count_write_matches_bytes_and_refuses_before_output() {
         let put = |e: &mut Enc<'_>| {
@@ -1694,7 +1694,7 @@ mod tests {
         assert_eq!(calls.get(), 1, "count refusal never starts the output pass");
     }
 
-    /// [behaviour] write sink handles short writes limits and io errors.
+    /// [format] write sink handles short writes limits and io errors.
     #[test]
     fn write_sink_handles_short_writes_limits_and_io_errors() {
         struct Short(Vec<u8>);

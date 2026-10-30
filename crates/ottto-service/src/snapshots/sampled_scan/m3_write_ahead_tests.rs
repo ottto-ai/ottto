@@ -39,7 +39,7 @@ impl Drop for Case {
     }
 }
 
-/// [behaviour] writer sink refuses underflow overflow and propagates io failure.
+/// [money] writer sink refuses underflow overflow and propagates io failure.
 #[test]
 fn writer_sink_refuses_underflow_overflow_and_propagates_io_failure() {
     let mut out = Vec::new();
@@ -65,7 +65,7 @@ fn writer_sink_refuses_underflow_overflow_and_propagates_io_failure() {
     );
 }
 
-/// [behaviour] fresh duplicate dirty offers produce one exact completion.
+/// [money] fresh duplicate dirty offers produce one exact completion.
 #[test]
 fn fresh_duplicate_dirty_offers_produce_one_exact_completion() {
     let case = Case::new();

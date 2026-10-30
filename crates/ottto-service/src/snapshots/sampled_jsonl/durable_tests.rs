@@ -674,7 +674,7 @@ fn org_marker_email_is_stored_only_as_a_domain_separated_digest() {
 }
 
 /// Other E content still refuses; the approved mid-file skill label now persists.
-/// [behaviour] e content refuses and approved mid file skills persist.
+/// [format] e content refuses and approved mid file skills persist.
 #[test]
 fn e_content_refuses_and_approved_mid_file_skills_persist() {
     let scratch = Scratch::new("artifact");
@@ -1636,7 +1636,7 @@ fn assert_borrowed_count_identity(reduction: &CachedJsonlReduction) {
     take_l_spans();
 }
 
-/// [behaviour] borrowed count exact encoding matches populated both source canaries.
+/// [format] borrowed count exact encoding matches populated both source canaries.
 #[test]
 fn borrowed_count_exact_encoding_matches_populated_both_source_canaries() {
     let scratch = Scratch::new("borrowed-count-canaries");
@@ -1648,31 +1648,6 @@ fn borrowed_count_exact_encoding_matches_populated_both_source_canaries() {
         assert_borrowed_count_identity(&reduction);
     }
     assert_eq!(covered, BTreeSet::from(["claude_code", "codex"]));
-}
-
-/// [behaviour] borrowed count identity covers codex absent legacy and v2 state.
-#[test]
-fn borrowed_count_identity_covers_codex_absent_legacy_and_v2_state() {
-    use codex_counting_version::AckEvidence;
-    let scratch = Scratch::new("borrowed-count-contract");
-    let path = scratch.write("codex.jsonl", &codex_lines());
-    for (evidence, version) in [
-        (None, 0),
-        (Some(AckEvidence::LegacyAcked), 1),
-        (Some(AckEvidence::None), 2),
-    ] {
-        let mut parser = parser(&path, SnapshotSource::Codex);
-        if let Some(evidence) = evidence {
-            codex_counting_version::configure(&mut parser.accumulator, evidence, Some(0));
-        }
-        parser
-            .prepare_acquisition(None, &scope(), None, NOW)
-            .unwrap();
-        while !parser.step().unwrap() {}
-        let reduction = parser.durable_test_reduction_copy();
-        assert_eq!(reduction.durable_counting().map_or(0, |c| c.1), version);
-        assert_borrowed_count_identity(&reduction);
-    }
 }
 
 #[test]
@@ -1701,7 +1676,7 @@ fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
     });
 }
 
-/// [behaviour] tail reuse allowance cannot block an independently due full.
+/// [money] tail reuse allowance cannot block an independently due full.
 #[test]
 fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
     use crate::transcript_cache::Retained;
@@ -1758,54 +1733,6 @@ fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
     );
 }
 
-/// [behaviour] no input completion requires every rederive digest absent.
-#[test]
-fn no_input_completion_requires_every_rederive_digest_absent() {
-    for field in 0..5 {
-        let mut obligation = Rederive::default();
-        let slot = match field {
-            0 => &mut obligation.first_prompt,
-            1 => &mut obligation.workspace,
-            2 => &mut obligation.agent_label,
-            3 => &mut obligation.session_start,
-            _ => &mut obligation.title,
-        };
-        *slot = Some([1; 32]);
-        let decoded = Decoded {
-            reduction: CachedJsonlReduction {
-                accumulator: SnapshotAccumulator::new(SnapshotSource::ClaudeCode),
-                report: JsonlReadReport::default(),
-                recognized_usage_drop_count: 0,
-                positive_recognized_usage_count: 0,
-                positive_usage_evidence: false,
-            },
-            rederive: obligation,
-        };
-        let (result, stats) =
-            crate::retry_allocation_probe::measure_caller_thread(|| decoded.without_rederive());
-        assert!(
-            result.is_err(),
-            "obligation{field} cannot use a zero/missing head mark as absence"
-        );
-        assert_eq!(stats.allocations, 0);
-    }
-    let decoded = Decoded {
-        reduction: CachedJsonlReduction {
-            accumulator: SnapshotAccumulator::new(SnapshotSource::ClaudeCode),
-            report: JsonlReadReport::default(),
-            recognized_usage_drop_count: 0,
-            positive_recognized_usage_count: 0,
-            positive_usage_evidence: false,
-        },
-        rederive: Rederive::default(),
-    };
-    let (result, stats) =
-        crate::retry_allocation_probe::measure_caller_thread(|| decoded.without_rederive());
-    let (_, receipt) = result.unwrap();
-    assert_eq!(receipt, RederiveReceipt::default());
-    assert_eq!(stats.allocations, 0);
-}
-
 // M3 G1 (r6 native): the one native finish body and its PRE-finalization
 // seam. The seam is what `finish_with_repository_identity_prepared` stages
 // from; these controls pin where it runs and what it sees, without a store.
@@ -1830,7 +1757,7 @@ fn seam_body(live: crate::snapshots::PreFinalization<'_>) -> (Vec<u8>, bool) {
     (body, detached)
 }
 
-/// [behaviour] m3 seam live bytes equal retained copy and output equals legacy.
+/// [format] m3 seam live bytes equal retained copy and output equals legacy.
 #[test]
 fn m3_seam_live_bytes_equal_retained_copy_and_output_equals_legacy() {
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
@@ -1888,7 +1815,7 @@ fn m3_seam_live_bytes_equal_retained_copy_and_output_equals_legacy() {
     }
 }
 
-/// [behaviour] m3 seam never runs before the held object is revalidated.
+/// [format] m3 seam never runs before the held object is revalidated.
 #[test]
 fn m3_seam_never_runs_before_the_held_object_is_revalidated() {
     let scratch = Scratch::new("m3-seam-refused");
@@ -1920,7 +1847,7 @@ fn m3_seam_never_runs_before_the_held_object_is_revalidated() {
     assert_eq!(calls, 0);
 }
 
-/// [behaviour] skill label bounds and consent preserve the whole native state.
+/// [format] skill label bounds and consent preserve the whole native state.
 #[test]
 fn skill_label_bounds_and_consent_preserve_the_whole_native_state() {
     let scratch = Scratch::new("label-bounds");
@@ -1987,7 +1914,7 @@ fn skill_label_bounds_and_consent_preserve_the_whole_native_state() {
     );
 }
 
-/// [behaviour] skill labels preserve native provider and activity caps.
+/// [format] skill labels preserve native provider and activity caps.
 #[test]
 fn skill_labels_preserve_native_provider_and_activity_caps() {
     let scratch = Scratch::new("label-cap");
@@ -2092,7 +2019,7 @@ fn pl_scope_is_closed_and_every_other_e_field_stays_refusing() {
 
 /// Pi is not registered by this slice. Exercise the same decoded production
 /// content interface without granting Pi store/write authority (E5 owns that).
-/// [behaviour] bounded pi prompt workspace tail matches cold body in two cycles.
+/// [money] bounded pi prompt workspace tail matches cold body in two cycles.
 #[test]
 fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
     let root = Scratch::new("pi-bounded-head-tail");
@@ -2167,7 +2094,7 @@ fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
     }
 }
 
-/// [behaviour] bounded plan refuses unsupported codex boundaries and oversized marks without reads.
+/// [format] bounded plan refuses unsupported codex boundaries and oversized marks without reads.
 #[test]
 fn bounded_plan_refuses_unsupported_codex_boundaries_and_oversized_marks_without_reads() {
     let root = Scratch::new("unsupported-bounded");

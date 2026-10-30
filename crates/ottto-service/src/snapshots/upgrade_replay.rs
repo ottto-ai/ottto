@@ -223,7 +223,7 @@ impl OwnedSourceScan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// [behaviour] saved upgrade spend survives restart and index copy without grant.
+    /// [format] saved upgrade spend survives restart and index copy without grant.
     #[test]
     fn saved_upgrade_spend_survives_restart_and_index_copy_without_grant() {
         let _restart_restore = super::super::restart_restore::RestartRestoreForTest::enabled();
@@ -254,7 +254,7 @@ mod tests {
     /// reservation saved on the committed copy moves it, and the same cycle's
     /// working save must still commit.
     #[cfg(unix)]
-    /// [behaviour] reservation save moves the working baseline on a bound path.
+    /// [format] reservation save moves the working baseline on a bound path.
     #[test]
     fn reservation_save_moves_the_working_baseline_on_a_bound_path() {
         use std::os::unix::fs::PermissionsExt;
@@ -295,7 +295,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// [behaviour] partial checkpoint unions negative spends without live permissions.
+    /// [format] partial checkpoint unions negative spends without live permissions.
     #[test]
     fn partial_checkpoint_unions_negative_spends_without_live_permissions() {
         let mut committed = ScanIndex::default();

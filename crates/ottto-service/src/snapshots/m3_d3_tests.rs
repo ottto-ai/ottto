@@ -644,7 +644,7 @@ fn count_unlinks(record: PathBuf) -> Rc<Cell<u64>> {
 /// (no body, accepted facts and the stale A untouched) while another Claude
 /// key publishes; growth stays held and is counted; the key's next
 /// successful write releases it with a Tail catch-up equal to a cold Full.
-/// [behaviour] m3 d3 claude double fault holds only that key until its next write.
+/// [money] m3 d3 claude double fault holds only that key until its next write.
 #[test]
 fn m3_d3_claude_double_fault_holds_only_that_key_until_its_next_write() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -802,7 +802,7 @@ fn m3_d3_claude_cleanup_proving_a_absent_publishes_degraded() {
 /// holds the key with no write attempt per pass, key or record; a key with
 /// no record still publishes. The store's own recovery probe ends the pause
 /// and the key's next write releases it with a Tail equal to a cold Full.
-/// [behaviour] m3 d3 enospc pauses the store preserves a and resumes when space frees.
+/// [money] m3 d3 enospc pauses the store preserves a and resumes when space frees.
 #[test]
 fn m3_d3_enospc_pauses_the_store_preserves_a_and_resumes_when_space_frees() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -887,7 +887,7 @@ fn m3_d3_enospc_pauses_the_store_preserves_a_and_resumes_when_space_frees() {
 /// only be re-armed earlier, never postponed or cleared), the entry, upload
 /// membership and record stay, the key stays discoverable, and no $0 body
 /// is ever emitted for it.
-/// [behaviour] m3 d3 held key keeps 865 debt membership and record never absent.
+/// [money] m3 d3 held key keeps 865 debt membership and record never absent.
 #[test]
 fn m3_d3_held_key_keeps_865_debt_membership_and_record_never_absent() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -969,7 +969,7 @@ impl Change {
 /// Addendum: a genuine content change of a held key releases it even while
 /// its writes keep failing; the surviving stale A can never bind the changed
 /// file afterwards, including after a restart.
-/// [behaviour] m3 d3 content change releases a held key while writes still fail.
+/// [money] m3 d3 content change releases a held key while writes still fail.
 #[test]
 fn m3_d3_content_change_releases_a_held_key_while_writes_still_fail() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1270,7 +1270,7 @@ fn m3_d3_sigkill_at_native_order_points_recovers_exactly_once() {
 
 /// The real Codex native fault reaches the PRE barrier before any upload is
 /// authorized. The barrier saves retained facts, never the newly parsed end.
-/// [behaviour] m3 codex native double fault bound barrier then working save preserves both publications.
+/// [money] m3 codex native double fault bound barrier then working save preserves both publications.
 #[test]
 fn m3_codex_native_double_fault_bound_barrier_then_working_save_preserves_both_publications() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1501,7 +1501,7 @@ fn m3_d3_sigkill_at_pre_ack_fault_barrier_preserves_pre_facts() {
     }
 }
 
-/// [behaviour] m3 codex native pass budget is counted not persisted without hold or debt.
+/// [money] m3 codex native pass budget is counted not persisted without hold or debt.
 #[test]
 fn m3_codex_native_pass_budget_is_counted_not_persisted_without_hold_or_debt() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1538,7 +1538,7 @@ fn m3_codex_native_pass_budget_is_counted_not_persisted_without_hold_or_debt() {
 
 /// SOURCE singleton condition 2: the production owner changes from one plain
 /// file to a grouped pair; old native bytes cannot enter the joined reduction.
-/// [behaviour] m3 codex singleton to group refuses native restore and retires record.
+/// [money] m3 codex singleton to group refuses native restore and retires record.
 #[test]
 fn m3_codex_singleton_to_group_refuses_native_restore_and_retires_record() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1598,7 +1598,7 @@ fn m3_codex_singleton_to_group_refuses_native_restore_and_retires_record() {
 /// A priority contribution is discovered only after reading the appended
 /// suffix. Its existing Full replay must match cold money, and the committed
 /// receipt must refuse A across restart even when the first GC unlink fails.
-/// [behaviour] m3 codex post read tier transition refuses a across failed gc and restart.
+/// [money] m3 codex post read tier transition refuses a across failed gc and restart.
 #[test]
 fn m3_codex_post_read_tier_transition_refuses_a_across_failed_gc_and_restart() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1742,7 +1742,7 @@ pub(super) fn bounded_restore_tail_items(source: SnapshotSource) -> Vec<Snapshot
 /// F10: A is a real native v3 checkpoint; B is a later complete accepted
 /// extent while A's replacement is deferred. Truncate only after A has been
 /// restored, before native preparation freezes C with A < C < B.
-/// [behaviour] codex real restore then shrink preserves the native identity guard.
+/// [money] codex real restore then shrink preserves the native identity guard.
 #[test]
 fn codex_real_restore_then_shrink_preserves_the_native_identity_guard() {
     let _on = RestartRestoreForTest::enabled();

@@ -301,7 +301,7 @@ fn shared_old_writer_tail_receipt_gc_and_two_restarts() {
     });
 }
 
-/// [behaviour] shared quiet restart discloses m1 io gap instead of claiming zero.
+/// [format] shared quiet restart discloses m1 io gap instead of claiming zero.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -333,7 +333,7 @@ fn shared_quiet_restart_discloses_m1_io_gap_instead_of_claiming_zero() {
     });
 }
 
-/// [behaviour] shared selection cleared is an explicit m1 gap for 859.
+/// [format] shared selection cleared is an explicit m1 gap for 859.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -933,7 +933,7 @@ fn shared_transition_crash_edges_reach_sigkill_and_keep_a_valid_survivor() {
     }
 }
 
-/// [behaviour] shared codex dated legacy and v2 receipts survive two restarts.
+/// [format] shared codex dated legacy and v2 receipts survive two restarts.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1369,7 +1369,7 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
     }
 }
 
-/// [behaviour] shared 24b old writer restored version tail and unchanged restart twice.
+/// [format] shared 24b old writer restored version tail and unchanged restart twice.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1381,7 +1381,7 @@ fn shared_24b_old_writer_restored_version_tail_and_unchanged_restart_twice() {
     codex_24b_old_writer_row(false);
 }
 
-/// [behaviour] shared 24b old writer zero old bytes target.
+/// [format] shared 24b old writer zero old bytes target.
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "needs card-F retirement: main v1 restore re-derives SessionStartState prelude (DoD 6)"]

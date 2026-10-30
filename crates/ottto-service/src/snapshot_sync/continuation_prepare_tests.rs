@@ -1008,7 +1008,7 @@ fn ordinary_durable_continuation_to_eof(
 }
 
 #[cfg(unix)]
-/// [behaviour] continuation keeps ordinary gc decisions through native eof.
+/// [money] continuation keeps ordinary gc decisions through native eof.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn continuation_keeps_ordinary_gc_decisions_through_native_eof() {
@@ -1018,7 +1018,7 @@ fn continuation_keeps_ordinary_gc_decisions_through_native_eof() {
 }
 
 #[cfg(unix)]
-/// [behaviour] continuation keeps ordinary breaker and rebuilt keys through native eof.
+/// [money] continuation keeps ordinary breaker and rebuilt keys through native eof.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn continuation_keeps_ordinary_breaker_and_rebuilt_keys_through_native_eof() {

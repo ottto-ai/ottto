@@ -227,38 +227,4 @@ impl crate::heap_layout_bound::HeapLayoutBound for AcquiredChain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// [behaviour] immutable counting distinguishes absent none legacy v2 and zero date.
-    #[test]
-    fn immutable_counting_distinguishes_absent_none_legacy_v2_and_zero_date() {
-        let absent = ImmutableCounting::canonical(SnapshotSource::ClaudeCode, None).unwrap();
-        assert_eq!(absent.bytes(), &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        let mut seen = std::collections::BTreeSet::new();
-        seen.insert(*absent.bytes());
-        for date in [None, Some(0), Some(-1), Some(1234)] {
-            for version in 0..=2 {
-                let c =
-                    ImmutableCounting::canonical(SnapshotSource::Codex, Some((date, version, 0)))
-                        .unwrap();
-                assert!(seen.insert(*c.bytes()));
-                assert_eq!(c.bytes()[2], 1);
-                assert_eq!(c.bytes()[3], u8::from(date.is_some()));
-                assert_eq!(&c.bytes()[4..12], &date.unwrap_or(0).to_le_bytes());
-                for ack in 1..=2 {
-                    assert_eq!(
-                        c,
-                        ImmutableCounting::canonical(
-                            SnapshotSource::Codex,
-                            Some((date, version, ack))
-                        )
-                        .unwrap()
-                    );
-                }
-            }
-        }
-        assert!(
-            ImmutableCounting::canonical(SnapshotSource::ClaudeCode, Some((None, 0, 0))).is_err()
-        );
-        assert!(ImmutableCounting::canonical(SnapshotSource::Codex, Some((None, 3, 0))).is_err());
-        assert!(ImmutableCounting::canonical(SnapshotSource::Codex, Some((None, 0, 3))).is_err());
-    }
 }

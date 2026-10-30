@@ -118,7 +118,7 @@ fn native_publication_has_exactly_five_publishing_and_three_held_classes() {
     assert!(seen.into_iter().all(|class| class));
 }
 
-/// [behaviour] held decision survives later publishing siblings and empty page transport.
+/// [money] held decision survives later publishing siblings and empty page transport.
 #[test]
 fn held_decision_survives_later_publishing_siblings_and_empty_page_transport() {
     for held in [

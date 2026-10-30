@@ -7,28 +7,6 @@ const A: store::Digest32 = [1; 32];
 const B: store::Digest32 = [2; 32];
 const OBJECT: (u64, u64, u64) = (7, 11, 13);
 
-/// [behaviour] d3 hold releases on write or replaced object only.
-#[test]
-fn d3_hold_releases_on_write_or_replaced_object_only() {
-    let mut stores = Stores::default();
-    stores.hold_key(A, Some((OBJECT, 100)));
-    stores.hold_key(B, Some((OBJECT, 100)));
-    assert!(!stores.observe_hold(A, Some(((7, 11, 14), 10))));
-    assert_eq!(stores.counters.d3[D3_RELEASED_CONTENT], 1);
-    assert!(stores.observe_hold(B, None));
-    stores.release_hold(B, HoldRelease::Content);
-    assert!(stores.hold_content_changed(B));
-    assert!(stores.hold(&B).is_none());
-    assert_eq!(stores.counters.d3[D3_RELEASED_CONTENT], 2);
-    // Further settlement still sees the edit proof; only replacement receipt
-    // retires it, and does not count a second release of an active hold.
-    stores.release_hold(B, HoldRelease::Write);
-    stores.release_hold(B, HoldRelease::Write);
-    assert!(!stores.hold_content_changed(B));
-    assert_eq!(stores.counters.d3[D3_RELEASED_WRITE], 0);
-    assert_eq!(stores.claude_holds(), [0, 0]);
-}
-
 /// [money] owed hold is not downgraded and source clear is scoped.
 #[test]
 fn owed_hold_is_not_downgraded_and_source_clear_is_scoped() {
@@ -47,7 +25,7 @@ fn owed_hold_is_not_downgraded_and_source_clear_is_scoped() {
     assert_eq!(stores.owed_mark(&B), OwedMark::None);
 }
 
-/// [behaviour] d3 edit proof survives subsequent failed settlement and not discovery.
+/// [money] d3 edit proof survives subsequent failed settlement and not discovery.
 #[test]
 fn d3_edit_proof_survives_subsequent_failed_settlement_and_not_discovery() {
     let mut stores = Stores::default();

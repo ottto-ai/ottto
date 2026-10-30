@@ -68,7 +68,7 @@ fn resign(bytes: &mut [u8]) {
     bytes[end..].copy_from_slice(&trailer);
 }
 
-/// [behaviour] m3 p4a source table admits exact triples without repinning body.
+/// [format] m3 p4a source table admits exact triples without repinning body.
 #[test]
 fn m3_p4a_source_table_admits_exact_triples_without_repinning_body() {
     let rows = crate::snapshots::durable_sources::SOURCES;

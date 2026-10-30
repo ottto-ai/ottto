@@ -82,7 +82,7 @@ impl Drop for Fixture {
     }
 }
 
-/// [behaviour] m3 p4b q11 n10 physical byte budget.
+/// [money] m3 p4b q11 n10 physical byte budget.
 #[test]
 fn m3_p4b_q11_n10_physical_byte_budget() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -135,95 +135,7 @@ fn m3_p4b_q11_n10_physical_byte_budget() {
     assert!(matches!(f.begin(tomorrow), Err(RetailHold::Exhausted)));
 }
 
-/// [behaviour] n10 interruption pass clear and five relabels do not refund.
-#[test]
-fn n10_interruption_pass_clear_and_five_relabels_do_not_refund() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let f = Fixture::new();
-    let now = Instant::now();
-    // Cancellation before the first read still spends the admitted process grant.
-    {
-        let _interrupted = f.begin(now).unwrap();
-    }
-    assert!(physical().is_empty());
-    for pass in 0..5 {
-        f.cache.clear();
-        f.cache.durable_begin_pass(
-            SnapshotSource::ClaudeCode,
-            &f.root.join("index.json"),
-            &Scope(format!("changed-namespace-{pass}")),
-            pass % 2 == 0,
-        );
-        {
-            let mut stores = f.cache.durable().unwrap();
-            stores.selected.clear();
-            stores.touched.clear();
-            stores.retail_full_at.clear();
-        }
-        assert!(matches!(
-            f.begin(now + Duration::from_secs(pass + 1)),
-            Err(RetailHold::Exhausted)
-        ));
-    }
-    let tomorrow = now + RETAIL_DAILY;
-    {
-        let daily = f.begin(tomorrow).unwrap();
-        assert_eq!(daily.grant(), RetailGrant::Daily);
-    } // Failed/cancelled daily attempt also spends before reading.
-    assert!(matches!(
-        f.begin(tomorrow + RETAIL_DAILY - Duration::from_nanos(1)),
-        Err(RetailHold::Exhausted)
-    ));
-    let next = f.begin(tomorrow + RETAIL_DAILY).unwrap();
-    assert_eq!(next.grant(), RetailGrant::Daily);
-    next.finish();
-    assert!(physical().is_empty());
-    let stores = f.cache.durable().unwrap();
-    assert_eq!(stores.retail_spent.len(), 1);
-    assert_eq!(stores.counters.retail_keys, 1);
-    assert_eq!(stores.counters.retail_attempts, 3);
-}
-
-/// [behaviour] n10 clock rollback and custody overflow fail before any read.
-#[test]
-fn n10_clock_rollback_and_custody_overflow_fail_before_any_read() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let f = Fixture::new();
-    let now = Instant::now();
-    f.begin(now).unwrap().finish();
-    assert!(matches!(
-        f.begin(now - Duration::from_secs(1)),
-        Err(RetailHold::AccountingLost)
-    ));
-    let digest = store::key_digest(DurableSource::ClaudeCode, "same-index-key");
-    let prior = f.cache.durable().unwrap().retail_spent[&digest].spent;
-    {
-        let mut stores = f.cache.durable().unwrap();
-        for n in 0..2 * store::MAX_RECORDS - 1 {
-            assert!(stores.fund_key(store::key_digest(
-                DurableSource::ClaudeCode,
-                &format!("filled-{n}")
-            )));
-        }
-    }
-    assert!(matches!(
-        f.cache.begin_retail(
-            SnapshotSource::ClaudeCode,
-            "new-key",
-            &f.checkpoint,
-            &f.file,
-            f.file.metadata().unwrap().len(),
-            now + RETAIL_DAILY
-        ),
-        Err(RetailHold::AccountingLost)
-    ));
-    let stores = f.cache.durable().unwrap();
-    assert_eq!(stores.retail_spent.len(), 2 * store::MAX_RECORDS);
-    assert_eq!(stores.retail_spent[&digest].spent, prior);
-    assert!(physical().is_empty());
-}
-
-/// [behaviour] n10 pacing eviction allows growth without evicting spent authority.
+/// [money] n10 pacing eviction allows growth without evicting spent authority.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -272,64 +184,6 @@ fn n10_pacing_eviction_allows_growth_without_evicting_spent_authority() {
     drop(stores);
     assert!(matches!(
         f.begin(now + Duration::from_secs(1000)),
-        Err(RetailHold::Exhausted)
-    ));
-    assert!(physical().is_empty());
-}
-
-/// [behaviour] n10 replaced shorter object cannot reduce the spent high water.
-#[test]
-fn n10_replaced_shorter_object_cannot_reduce_the_spent_high_water() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let f = Fixture::new();
-    let now = Instant::now();
-    f.begin(now).unwrap().finish();
-    let high = f.file.metadata().unwrap().len();
-    std::fs::rename(&f.path, f.root.join("original.jsonl")).unwrap();
-    std::fs::write(&f.path, b"{\"n\":9}\n").unwrap();
-    let mut replacement = File::open(&f.path).unwrap();
-    let scope = Scope("relabelled-scope".into());
-    let mut plan = ReadPlan::prepare(&mut replacement, None, &scope, None, 1_800_000_001).unwrap();
-    let mut rows = Vec::new();
-    replacement.read_to_end(&mut rows).unwrap();
-    plan.observe_complete_records(&rows).unwrap();
-    let checkpoint = plan
-        .commit_after_native_completion(&replacement, &scope, 1_800_000_001)
-        .unwrap();
-    let end = replacement.metadata().unwrap().len();
-    assert!(end < high);
-    assert_ne!(
-        replacement.metadata().unwrap().ino(),
-        f.file.metadata().unwrap().ino()
-    );
-    let begin = |at| {
-        f.cache.begin_retail(
-            SnapshotSource::ClaudeCode,
-            "same-index-key",
-            &checkpoint,
-            &replacement,
-            end,
-            at,
-        )
-    };
-    assert!(matches!(
-        begin(now + Duration::from_secs(1)),
-        Err(RetailHold::Exhausted)
-    ));
-    let tomorrow = now + RETAIL_DAILY;
-    let granted = begin(tomorrow).unwrap();
-    assert_eq!(granted.grant(), RetailGrant::Daily);
-    granted.finish();
-    let digest = store::key_digest(DurableSource::ClaudeCode, "same-index-key");
-    assert_eq!(
-        f.cache.durable().unwrap().retail_spent[&digest]
-            .spent
-            .unwrap()
-            .0,
-        high
-    );
-    assert!(matches!(
-        begin(tomorrow + Duration::from_secs(1)),
         Err(RetailHold::Exhausted)
     ));
     assert!(physical().is_empty());

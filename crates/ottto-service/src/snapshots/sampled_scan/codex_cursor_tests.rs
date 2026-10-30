@@ -14654,7 +14654,7 @@ fn active_bound_no_record_cursor_preserves_scope_resumes_and_publishes() {
     });
 }
 
-/// [behaviour] structural restore page defer does not spend full pace.
+/// [money] structural restore page defer does not spend full pace.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native durable layout")]
 fn structural_restore_page_defer_does_not_spend_full_pace() {

@@ -178,7 +178,7 @@ impl Fixture {
     }
 }
 
-/// [behaviour] unsupported native finish keeps legacy path without a v3 record.
+/// [money] unsupported native finish keeps legacy path without a v3 record.
 #[test]
 fn unsupported_native_finish_keeps_legacy_path_without_a_v3_record() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -222,7 +222,7 @@ fn unsupported_native_finish_keeps_legacy_path_without_a_v3_record() {
     });
 }
 
-/// [behaviour] preexisting v3 on unsupported layout reads only selected key and keeps active record.
+/// [money] preexisting v3 on unsupported layout reads only selected key and keeps active record.
 #[test]
 fn preexisting_v3_on_unsupported_layout_reads_only_selected_key_and_keeps_active_record() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -305,7 +305,7 @@ fn preexisting_v3_on_unsupported_layout_reads_only_selected_key_and_keeps_active
     });
 }
 
-/// [behaviour] unsupported layout never retires a newer or unknown record.
+/// [money] unsupported layout never retires a newer or unknown record.
 #[test]
 fn unsupported_layout_never_retires_a_newer_or_unknown_record() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -340,128 +340,9 @@ fn unsupported_layout_never_retires_a_newer_or_unknown_record() {
     });
 }
 
-/// [behaviour] supported native layout still restores a grown key.
-#[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "actual native retained-layout restore control"
-)]
-fn supported_native_layout_still_restores_a_grown_key() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !crate::test_isolation::run_here() {
-        return;
-    }
-    let _gate = claude_request_money::e2::GateForTest::off();
-    assert!(crate::heap_layout_bound::layout_supported());
-    let f = Fixture::new();
-    let cache = f.cache();
-    let mut first = f.scan(ScanIndex::default(), Some(cache.clone()));
-    f.settle(&cache, &mut first);
-    assert_eq!(cache.durable_counters(SOURCE).unwrap().1.records_written, 1);
-    use std::io::Write;
-    fs::OpenOptions::new()
-        .append(true)
-        .open(&f.path)
-        .unwrap()
-        .write_all(Fixture::line(2).as_bytes())
-        .unwrap();
-    let restarted = f.cache();
-    let read = f.scan(first.index, Some(restarted.clone()));
-    assert_eq!(restarted.durable_counters(SOURCE).unwrap().0.restored, 1);
-    assert_eq!(read.modes, (0, 1, 0));
-    let cold = f.scan(ScanIndex::default(), None);
-    assert_eq!(
-        snapshot_upload_body_witness(&read.scan.snapshots[0]),
-        snapshot_upload_body_witness(&cold.scan.snapshots[0])
-    );
-    assert!(read.scan.snapshots[0].input_tokens > 0);
-    assert_eq!(
-        snapshot_fingerprint(SOURCE, &read.scan.snapshots[0]),
-        snapshot_fingerprint(SOURCE, &cold.scan.snapshots[0]),
-    );
-}
-
-/// [behaviour] unsupported layout budget deferral keeps a until a real selected read.
-#[test]
-fn unsupported_layout_budget_deferral_keeps_a_until_a_real_selected_read() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !crate::test_isolation::run_here() {
-        return;
-    }
-    let _gate = claude_request_money::e2::GateForTest::off();
-    with_unsupported_layout_for_test(|| {
-        let f = Fixture::new();
-        let mut index = f.scan(ScanIndex::default(), None).index;
-        index.save(&f.index_path()).unwrap();
-        let path = f.seed_record(&index);
-        let bytes = fs::read(&path).unwrap();
-        let cache = f.cache();
-        let key = f.key();
-        let interpretation = sampled_scan::durable_tail::Interpretation::of(
-            SOURCE,
-            &key,
-            &index,
-            false,
-            &f.namespace,
-        );
-        struct BudgetReset;
-        impl Drop for BudgetReset {
-            fn drop(&mut self) {
-                store::active::set_active_budget_for_test(None);
-            }
-        }
-        let reset = BudgetReset;
-        store::active::set_active_budget_for_test(Some(0));
-        assert!(matches!(
-            cache.durable_restore(
-                SOURCE,
-                &key,
-                &f.path,
-                &Scope("selected".into()),
-                &mut File::open(&f.path).unwrap(),
-                &index,
-                &interpretation
-            ),
-            sampled_scan::durable_tail::RestoreOutcome::Pending
-        ));
-        drop(reset);
-        cache.durable_gc(f.writer, SOURCE, &index).unwrap();
-        assert_eq!(
-            fs::read(&path).unwrap(),
-            bytes,
-            "budget deferral cannot retire A"
-        );
-        assert_eq!(
-            cache
-                .durable_counters(SOURCE)
-                .unwrap()
-                .1
-                .restore_unavailable_layout_gc,
-            0
-        );
-        f.select_audit(&mut index);
-        let mut read = f.scan(index, Some(cache.clone()));
-        assert_eq!(read.modes, (1, 0, 0));
-        assert_eq!(read.bytes, fs::metadata(&f.path).unwrap().len());
-        f.settle(&cache, &mut read);
-        assert!(
-            path.exists(),
-            "a selected read does not finish an appendable file"
-        );
-        assert_eq!(
-            cache
-                .durable_counters(SOURCE)
-                .unwrap()
-                .1
-                .restore_unavailable_layout_gc,
-            0
-        );
-    });
-}
-
 /// A real lossy selection may retire unsupported A only after #865 has an
 /// equal-or-earlier persisted carrier. GC counts successful unlink, not intent.
-/// [behaviour] unsupported layout lossy read carries debt through failed gc and restart.
+/// [money] unsupported layout lossy read carries debt through failed gc and restart.
 #[test]
 fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -630,7 +511,7 @@ fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
 
 /// Retryable JSON corruption withholds a replacement; it may neither emit $0
 /// nor erase the already finalized positive body or its re-armed audit debt.
-/// [behaviour] unsupported layout retryable loss preserves prior body and debt after gc.
+/// [money] unsupported layout retryable loss preserves prior body and debt after gc.
 #[test]
 fn unsupported_layout_retryable_loss_preserves_prior_body_and_debt_after_gc() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();

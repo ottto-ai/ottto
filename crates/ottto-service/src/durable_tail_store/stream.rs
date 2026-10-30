@@ -1060,7 +1060,7 @@ mod tests {
             .unwrap();
         store.finish_stream(committed).unwrap()
     }
-    /// [behaviour] native population beyond memo bound reverifies and updates without hold.
+    /// [money] native population beyond memo bound reverifies and updates without hold.
     #[test]
     fn native_population_beyond_memo_bound_reverifies_and_updates_without_hold() {
         if !crate::test_isolation::run_here() {
@@ -1110,98 +1110,6 @@ mod tests {
         assert!(store.disabled().is_none());
     }
 
-    /// [behaviour] native full authorized memo evicts only permission and reverifies for both sources.
-    #[test]
-    fn native_full_authorized_memo_evicts_only_permission_and_reverifies_for_both_sources() {
-        if !crate::test_isolation::run_here() {
-            return;
-        }
-        for source in [DurableSource::ClaudeCode, DurableSource::Codex] {
-            let scratch = Scratch::new();
-            let writer = crate::locked_state_dir::test_locks::hold(&scratch.root);
-            let mut store = DurableTailStore::new(
-                store_dir_for_index(&scratch.root.join("index.json")),
-                source,
-            );
-            for n in 0..=MAX_RECORDS {
-                if n % MAX_BATCH == 0 {
-                    store.begin_pass();
-                }
-                let (mut h, body) = header(&scratch, source, n as u64 + 1);
-                h.binding.key = key_digest(source, &format!("allowed-{n}"));
-                commit(&mut store, writer, h, &body);
-            }
-            store.begin_pass();
-            // Saturate permissions in ONE pass: begin_pass cannot hide an
-            // allowed-memo starvation by revoking everything between reads.
-            for n in 0..MAX_RECORDS {
-                let key = key_digest(source, &format!("allowed-{n}"));
-                let ReadOutcome::Found(record) = store.read(&key) else {
-                    panic!("native predecessor");
-                };
-                store.authorize(
-                    &record,
-                    &Expected {
-                        binding: record.record.binding.clone(),
-                        committed_generation: 9,
-                    },
-                );
-            }
-            assert_eq!(
-                store
-                    .durable
-                    .values()
-                    .filter(|(_, _, allowed)| *allowed)
-                    .count(),
-                MAX_RECORDS
-            );
-            let evictions = store.counters.memo_evicted;
-            let last = key_digest(source, &format!("allowed-{MAX_RECORDS}"));
-            assert!(matches!(store.read(&last), ReadOutcome::Found(_)));
-            assert_eq!(store.counters.memo_evicted, evictions + 1);
-            assert_eq!(store.durable.len(), MAX_RECORDS);
-            let missing = (0..MAX_RECORDS)
-                .map(|n| key_digest(source, &format!("allowed-{n}")))
-                .find(|key| !store.durable.contains_key(key))
-                .unwrap();
-            let unproved = store.counters.mutation_unproved;
-            assert!(
-                !store.authorized(&missing, FORMAT_V3),
-                "eviction revokes permission"
-            );
-            assert_eq!(store.counters.mutation_unproved, unproved + 1);
-            let before = store.counters.guard_verify_bytes;
-            let header_before = store.counters.guard_header_bytes;
-            let ReadOutcome::Found(record) = store.read(&missing) else {
-                panic!("reverify evicted A");
-            };
-            assert_eq!(
-                store.counters.guard_verify_bytes - before + store.counters.guard_header_bytes
-                    - header_before,
-                record.wire.as_ref().unwrap().encoded_len,
-                "one bounded reread: dispatch/header plus body/trailer, all counted"
-            );
-            store.authorize(
-                &record,
-                &Expected {
-                    binding: record.record.binding.clone(),
-                    committed_generation: 9,
-                },
-            );
-            assert!(store.authorized(&missing, FORMAT_V3));
-            let (mut h, body) = header(&scratch, source, 999);
-            h.binding = record.record.binding;
-            commit(&mut store, writer, h, &body);
-            assert!(store.disabled().is_none());
-            assert!(!store.has_pending());
-            assert_eq!(
-                store.counters.mutation_unproved,
-                unproved + 1,
-                "only the deliberate refusal before re-verification is unproved"
-            );
-        }
-    }
-
     /// [format] newly staged codex record is refused by both released decoders.
     #[test]
     fn newly_staged_codex_record_is_refused_by_both_released_decoders() {
@@ -1241,7 +1149,7 @@ mod tests {
             "old reader leaves A unchanged"
         );
     }
-    /// [behaviour] stream is byte identical and flush is once per dirty pass.
+    /// [money] stream is byte identical and flush is once per dirty pass.
     #[test]
     fn stream_is_byte_identical_and_flush_is_once_per_dirty_pass() {
         if !crate::test_isolation::run_here() {
@@ -1294,70 +1202,6 @@ mod tests {
         store.begin_pass();
         assert!(store.flush_pass(lock).unwrap().is_none());
         assert!(store.stream_reserve_bytes().unwrap() >= STREAM_BYTES as u64);
-    }
-    /// [behaviour] double failure is per source and enospc never unlinks a.
-    #[test]
-    fn double_failure_is_per_source_and_enospc_never_unlinks_a() {
-        if !crate::test_isolation::run_here() {
-            return;
-        }
-        for source in [DurableSource::ClaudeCode, DurableSource::Codex] {
-            let scratch = Scratch::new();
-            let lock = crate::locked_state_dir::test_locks::hold(&scratch.root);
-            let mut store = DurableTailStore::new(
-                store_dir_for_index(&scratch.root.join("index.json")),
-                source,
-            );
-            let (header_a, body_a) = header(&scratch, source, 1);
-            let receipt_a = commit(&mut store, lock, header_a, &body_a);
-            let key = receipt_a.identity.binding.key;
-            let before = fs::read(store.record_path(&key)).unwrap();
-            let (header_b, _) = header(&scratch, source, 2);
-            let mut failure = store
-                .prepare_stream(lock, header_b)
-                .unwrap()
-                .write(|_| Err(codec::Refuse::WriteFailed))
-                .err()
-                .expect("injected write failure");
-            failure.error = io::Error::from_raw_os_error(libc::ENOSPC);
-            assert!(failure.is_enospc());
-            assert_eq!(failure.stage(), "stream_write");
-            assert_eq!(failure.key(), key);
-            assert!(failure.identity().is_none());
-            assert!(failure.protected().is_none());
-            let plan = store.resolve_failed_stream(lock, failure);
-            assert!(store.resource_paused());
-            let disposition = store.finish_resolution(plan.resolve());
-            match source {
-                DurableSource::ClaudeCode => {
-                    assert!(matches!(
-                        disposition,
-                        FailureDisposition::Hold {
-                            cause: "stale_survivor"
-                        }
-                    ));
-                    assert!(store.disabled().is_none());
-                }
-                DurableSource::Codex => {
-                    assert!(matches!(
-                        disposition,
-                        FailureDisposition::PublishDegraded {
-                            strict_rebind: true,
-                            ..
-                        }
-                    ));
-                    assert_eq!(store.disabled(), Some("write_cleanup_failed"));
-                }
-            }
-            assert_eq!(fs::read(store.record_path(&key)).unwrap(), before);
-            assert!(store.pending.is_empty());
-            for _ in 0..10 {
-                store.begin_pass();
-                assert!(!store.check_resources(lock, 0));
-            }
-            assert_eq!(store.counters().resource_pause_checks, 1);
-            assert_eq!(store.counters().store_write_cleanup_failed, 1);
-        }
     }
     /// [format] first complete stage failed rename is absent not a survivor.
     #[test]

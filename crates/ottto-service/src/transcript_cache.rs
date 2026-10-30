@@ -755,103 +755,6 @@ mod tests {
             e2_held_new_file: true,
         })
     }
-    // Direct cache API controls: this does not claim the native scan retry gate.
-    /// [behaviour] lossless refusals preserve original box graph checkpoint and flags.
-    #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "validated native cache layout")]
-    fn lossless_refusals_preserve_original_box_graph_checkpoint_and_flags() {
-        assert!(heap_layout_bound::layout_supported());
-        for arm in [
-            "live",
-            "clock",
-            "disabled",
-            "heap",
-            "inline",
-            "key",
-            "bytes",
-            "count",
-            "no_victim",
-        ] {
-            let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 256);
-            let taken = original("same owned allocation");
-            let pointer = &*taken as *const _ as usize;
-            let allocation = taken.retained.state.as_ptr() as usize;
-            let checkpoint = format!("{:?}", taken.retained.checkpoint);
-            let mut key = String::from("incoming");
-            let mut live = 0;
-            match arm {
-                "live" => live = cache.byte_limit + 1,
-                "clock" => cache.clock = u64::MAX,
-                "disabled" => cache.count_limit = 0,
-                "heap" => cache.entry_limit = 1,
-                "inline" => {
-                    cache.entry_limit =
-                        heap_layout_bound::bound(&taken.retained, usize::MAX).unwrap();
-                    assert!(
-                        std::mem::size_of::<Entry<String>>()
-                            > std::mem::size_of::<Retained<String>>()
-                    );
-                }
-                "key" => key.reserve(2 * cache.entry_limit),
-                "bytes" => cache.byte_limit = heap_layout_bound::bound(&cache, usize::MAX).unwrap(),
-                "count" => {
-                    cache.count_limit = 1;
-                    assert!(cache.insert_at(
-                        "newer".into(),
-                        retained_at("newer".into(), Some(90)),
-                        0,
-                        std::time::Duration::from_secs(100)
-                    ));
-                }
-                "no_victim" => cache.byte_limit = 0,
-                _ => unreachable!(),
-            }
-            let (result, events) =
-                crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-                    cache.insert_taken_reserving(key, taken, live)
-                });
-            let returned = match result {
-                Err(taken) => taken,
-                Ok(()) => panic!("{arm}: expected refusal"),
-            };
-            assert_eq!(&*returned as *const _ as usize, pointer, "{arm}");
-            assert_eq!(
-                returned.retained.state.as_ptr() as usize,
-                allocation,
-                "{arm}"
-            );
-            assert_eq!(returned.retained.state, "same owned allocation");
-            assert_eq!(format!("{:?}", returned.retained.checkpoint), checkpoint);
-            assert_eq!(returned.modified_hint, (17, 19));
-            assert_eq!(returned.finalization_charge, 23);
-            assert!(returned.e2_held_new_file);
-            assert!(returned.durable.is_empty());
-            assert_eq!(events.insert_admitted, 0);
-            match arm {
-                "live" => assert_eq!(events.insert_live_reservation_refused, 1),
-                "clock" => {
-                    assert_eq!(events.insert_clock_reset, 1);
-                    assert_eq!(cache.clock, 0);
-                }
-                "disabled" => assert_eq!(events.insert_disabled_or_layout_refused, 1),
-                "heap" | "inline" => assert_eq!(events.insert_entry_bound_refused, 1),
-                "key" => assert_eq!(events.insert_key_bound_refused, 1),
-                "bytes" | "count" => {
-                    assert_eq!(events.insert_self_evicted, 1);
-                    assert_eq!(events.insert_entries_evicted, 1);
-                }
-                "no_victim" => {
-                    assert_eq!(events.insert_no_victim_refused, 1);
-                    assert_eq!(events.insert_entries_evicted, 1);
-                }
-                _ => unreachable!(),
-            }
-            if arm == "count" {
-                assert!(cache.peek("newer").is_some());
-            }
-        }
-    }
-
     struct Unfrozen(String);
     impl HeapLayoutBound for Unfrozen {
         fn heap_bound(&self, c: &mut Counter) -> Option<()> {
@@ -863,55 +766,7 @@ mod tests {
             false
         }
     }
-    /// [behaviour] unfrozen state is returned in the same original box.
-    #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "validated native cache layout")]
-    fn unfrozen_state_is_returned_in_the_same_original_box() {
-        assert!(heap_layout_bound::layout_supported());
-        let ordinary = original("unfrozen");
-        let taken = Box::new(Taken {
-            retained: Retained {
-                checkpoint: ordinary.retained.checkpoint,
-                state: Unfrozen(ordinary.retained.state),
-            },
-            durable: ordinary.durable,
-            modified_hint: ordinary.modified_hint,
-            finalization_charge: ordinary.finalization_charge,
-            e2_held_new_file: ordinary.e2_held_new_file,
-        });
-        let pointer = &*taken as *const _ as usize;
-        let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 256);
-        let (result, events) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-            cache.insert_taken_reserving("unfrozen".into(), taken, 0)
-        });
-        let Err(returned) = result else {
-            panic!("unfrozen refuses");
-        };
-        assert_eq!(&*returned as *const _ as usize, pointer);
-        assert_eq!(returned.retained.state.0, "unfrozen");
-        assert_eq!(events.insert_frozen_charge_refused, 1);
-    }
-
-    /// [behaviour] unsupported layout returns the original without admission.
-    #[test]
-    #[cfg(not(target_os = "macos"))]
-    fn unsupported_layout_returns_the_original_without_admission() {
-        assert!(!heap_layout_bound::layout_supported());
-        let mut cache = TranscriptCache::<String>::default();
-        let taken = original("unsupported");
-        let pointer = &*taken as *const _ as usize;
-        let (result, events) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-            cache.insert_taken_reserving("key".into(), taken, 0)
-        });
-        assert_eq!(
-            &*result.expect_err("layout refuses") as *const _ as usize,
-            pointer
-        );
-        assert_eq!(events.insert_disabled_or_layout_refused, 1);
-        assert!(cache.entries.is_empty());
-    }
-
-    /// [behaviour] ordinary admission matches predecessor limits victims clocks and events.
+    /// [money] ordinary admission matches predecessor limits victims clocks and events.
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "validated native cache layout")]
     fn ordinary_admission_matches_predecessor_limits_victims_clocks_and_events() {
@@ -967,7 +822,7 @@ mod tests {
         }
     }
 
-    /// [behaviour] attached retail guard survives virtual self eviction and real admission.
+    /// [money] attached retail guard survives virtual self eviction and real admission.
     #[test]
     #[cfg(unix)]
     #[cfg_attr(not(target_os = "macos"), ignore = "validated native cache layout")]

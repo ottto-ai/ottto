@@ -92,7 +92,7 @@ fn m3_d3_codex_strict_rebind_keeps_entry_debt_and_membership() {
     }
 }
 
-/// [behaviour] m3 d3 claude is never strictly rebound.
+/// [money] m3 d3 claude is never strictly rebound.
 #[test]
 fn m3_d3_claude_is_never_strictly_rebound() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -118,7 +118,7 @@ fn m3_d3_claude_is_never_strictly_rebound() {
     assert!(!index.files.contains_key(CODEX_KEY));
 }
 
-/// [behaviour] m3 d3 held claude key stays discoverable past the window.
+/// [money] m3 d3 held claude key stays discoverable past the window.
 #[test]
 fn m3_d3_held_claude_key_stays_discoverable_past_the_window() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();

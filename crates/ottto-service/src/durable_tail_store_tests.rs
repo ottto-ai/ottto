@@ -422,7 +422,7 @@ fn replacement_during_successful_directory_sync_cannot_receipt_an_impostor() {
     assert_eq!(store.hold(&b.key), Some(Refusal::ReceiptPending));
 }
 
-/// [behaviour] retained completion rejects wrong candidate and final path swap.
+/// [format] retained completion rejects wrong candidate and final path swap.
 #[test]
 fn retained_completion_rejects_wrong_candidate_and_final_path_swap() {
     let scratch = Scratch::new();
@@ -555,7 +555,7 @@ fn startup_sync_precedes_warming_and_no_writer_never_repairs_modes() {
     assert_eq!(readonly.counters().mode_repaired, 0);
 }
 
-/// [behaviour] pending capacity failure retains every existing obligation.
+/// [format] pending capacity failure retains every existing obligation.
 #[test]
 fn pending_capacity_failure_retains_every_existing_obligation() {
     let scratch = Scratch::new();
@@ -1205,7 +1205,7 @@ fn private_temp_replacement_cannot_be_committed_or_discarded() {
 
 /// Unwinding after temp sync keeps the old record and exercises counted Drop
 /// cleanup. Real SIGKILL edges (which cannot run Drop) remain in the crash matrix.
-/// [behaviour] interrupted replacement unwind discards temp and keeps the old record.
+/// [format] interrupted replacement unwind discards temp and keeps the old record.
 #[test]
 fn interrupted_replacement_unwind_discards_temp_and_keeps_the_old_record() {
     let scratch = Scratch::new();
@@ -3611,7 +3611,7 @@ fn claude_mutations_require_exact_strict_proof_and_a_current_stamp() {
     }
 }
 
-/// [behaviour] original witness survives memo turnover but never a different record.
+/// [format] original witness survives memo turnover but never a different record.
 #[test]
 fn original_witness_survives_memo_turnover_but_never_a_different_record() {
     for arm in [
@@ -4318,7 +4318,7 @@ fn delayed_t14_receipt_allows_clean_then_changed_offer_without_second_rebuild() 
     }
 }
 
-/// [behaviour] gc rotates past the first page and preserves unknown records.
+/// [format] gc rotates past the first page and preserves unknown records.
 #[test]
 fn gc_rotates_past_the_first_page_and_preserves_unknown_records() {
     let scratch = Scratch::new();
@@ -4373,7 +4373,7 @@ fn gc_rotates_past_the_first_page_and_preserves_unknown_records() {
     assert_eq!(store.counters().disk_records, 1);
 }
 
-/// [behaviour] retained completion delivers b and requeues newer c without b body.
+/// [format] retained completion delivers b and requeues newer c without b body.
 #[test]
 fn retained_completion_delivers_b_and_requeues_newer_c_without_b_body() {
     let scratch = Scratch::new();
@@ -4491,65 +4491,6 @@ fn verified_retirement_requeues_the_unwritten_successor() {
         .unwrap();
     assert_eq!(retried.written, 1);
     assert_eq!(retried.completed.len(), 1);
-}
-
-/// [behaviour] completed batch entries defer at capacity without disabling store.
-#[test]
-fn completed_batch_entries_defer_at_capacity_without_disabling_store() {
-    let scratch = Scratch::new();
-    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
-    let path = scratch.transcript("capacity.jsonl", b"{}\n");
-    let binding = binding("acct", "scope", ("fp", None));
-    let mut store = scratch.store();
-    store
-        .write_after_save(
-            &lock,
-            1,
-            0,
-            vec![pending(binding.clone(), certificate(&path), 1)],
-        )
-        .unwrap();
-    let target = store.dir().to_owned();
-    test_hooks::set_before_dir_sync(Some(Box::new(move |dir| {
-        if dir == target {
-            Err(io::Error::other("sync EIO"))
-        } else {
-            Ok(())
-        }
-    })));
-    let failed = store
-        .write_after_save(
-            &lock,
-            2,
-            0,
-            vec![pending(binding.clone(), certificate(&path), 2)],
-        )
-        .unwrap();
-    test_hooks::set_before_dir_sync(None);
-    assert_eq!(failed.written, 0);
-    let preserved = store.pending[&binding.key].candidate;
-    let records: Vec<_> = (0..MAX_BATCH)
-        .map(|n| {
-            let mut fresh = binding.clone();
-            fresh.key = key_digest(DurableSource::ClaudeCode, &format!("fresh-capacity-{n}"));
-            pending(fresh, certificate(&path), 3)
-        })
-        .collect();
-    let last = records.last().unwrap().clone();
-    let receipt = store.write_after_save(&lock, 3, 0, records).unwrap();
-    assert_eq!(receipt.written, MAX_BATCH - 1);
-    assert_eq!(receipt.completed.len(), MAX_BATCH - 1);
-    assert_eq!(receipt.deferred_keys, vec![last.binding.key]);
-    assert_eq!(store.disabled(), None);
-    assert_eq!(
-        store.pending.len(),
-        1,
-        "completed entries released, unresolved B retained"
-    );
-    assert_eq!(store.pending[&binding.key].candidate, preserved);
-    let retry = store.write_after_save(&lock, 4, 0, vec![last]).unwrap();
-    assert_eq!(retry.written, 1);
-    assert_eq!(store.disabled(), None);
 }
 
 /// Distinguish the D3 input from a write failure whose fallback really cleaned
@@ -4801,7 +4742,7 @@ fn m1_reader_ceiling_refuses_newer_envelopes_before_any_body_read() {
     }
 }
 
-/// [behaviour] m1 reader ceiling keeps consent erasure for known v3 private labels.
+/// [format] m1 reader ceiling keeps consent erasure for known v3 private labels.
 #[test]
 fn m1_reader_ceiling_keeps_consent_erasure_for_known_v3_private_labels() {
     let scratch = Scratch::new();

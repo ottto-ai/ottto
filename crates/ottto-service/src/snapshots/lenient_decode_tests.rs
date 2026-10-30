@@ -4841,7 +4841,7 @@ fn o3_negative_spend_crosses_full_positional_and_named_readers() {
     }
 }
 
-/// [behaviour] o3 ambiguous negative evidence refuses through every reader.
+/// [format] o3 ambiguous negative evidence refuses through every reader.
 #[test]
 fn o3_ambiguous_negative_evidence_refuses_through_every_reader() {
     let release = format!(
