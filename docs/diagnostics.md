@@ -1169,8 +1169,8 @@ lexical source precision, not an anomaly: Pi computes costs with floating point,
 so their decimal representations often carry more than twelve fractional digits.
 `pi_cost_refused_overflow` counts each field refused for arithmetic overflow or
 the ceiling, including a sub-pico excess above it. A string lexeme whose digits
-overflow checked arithmetic also counts, even when its mathematical value is in
-range; that field safely remains Unknown. Other invalid fields do not increment
+overflow checked `u128` arithmetic also counts, even when its mathematical value
+is in range; that field safely remains Unknown. Other invalid fields do not increment
 these counters.
 
 Both counters are cumulative saturating process totals in the lifecycle registry,
