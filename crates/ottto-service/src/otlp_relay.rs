@@ -80,6 +80,8 @@ macro_rules! relay_log {
     };
 }
 
+pub(crate) mod legacy;
+
 fn relay_log_timestamp() -> String {
     let now = OffsetDateTime::now_utc();
     now.replace_nanosecond(u32::from(now.millisecond()) * 1_000_000)
@@ -156,6 +158,9 @@ fn spawn_source_relay(daemon: LocalDaemon, source: SnapshotSource) -> Result<Soc
     let local_addr = listener.local_addr()?;
     let _ = daemon.set_relay_state_for_trusted_client(relay_connected_state(local_addr));
 
+    let primary_port = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(local_addr.port()));
+    let recovery_port = primary_port.clone();
+    let legacy_daemon = daemon.clone();
     let state_daemon = daemon.clone();
     thread::Builder::new()
         .name("ottto-otlp-relay".to_string())
@@ -164,6 +169,14 @@ fn spawn_source_relay(daemon: LocalDaemon, source: SnapshotSource) -> Result<Soc
                 listener,
                 bind_replacement_local_relay_listener,
                 |state| {
+                    recovery_port.store(
+                        state
+                            .endpoint
+                            .as_deref()
+                            .and_then(local_relay_port_from_endpoint)
+                            .unwrap_or(0),
+                        Ordering::Relaxed,
+                    );
                     let _ = state_daemon.set_relay_state_for_trusted_client(state);
                 },
                 |stream| dispatch_relay_connection(stream, source, &daemon),
@@ -171,11 +184,21 @@ fn spawn_source_relay(daemon: LocalDaemon, source: SnapshotSource) -> Result<Soc
         })
         .context("spawn local OTLP relay accept thread")?;
 
+    legacy::spawn(legacy_daemon, source, primary_port);
     Ok(local_addr)
 }
 
 /// Hands one accepted relay connection to a worker thread.
-fn dispatch_relay_connection(mut stream: TcpStream, source: SnapshotSource, daemon: &LocalDaemon) {
+fn dispatch_relay_connection(stream: TcpStream, source: SnapshotSource, daemon: &LocalDaemon) {
+    dispatch_relay_connection_with_activity(stream, source, daemon, None);
+}
+
+fn dispatch_relay_connection_with_activity(
+    mut stream: TcpStream,
+    source: SnapshotSource,
+    daemon: &LocalDaemon,
+    legacy_activity: Option<legacy::Activity>,
+) {
     // Bound per-connection I/O time before doing anything else so a slow or
     // stalled client trips the timeout instead of blocking a worker thread
     // forever.
@@ -200,7 +223,7 @@ fn dispatch_relay_connection(mut stream: TcpStream, source: SnapshotSource, daem
     // own connection (and its guard, releasing the slot).
     let spawned = thread::Builder::new().spawn(move || {
         let _guard = guard;
-        if let Err(error) = handle_client(stream, source, client_daemon) {
+        if let Err(error) = handle_client(stream, source, client_daemon, legacy_activity) {
             // BrokenPipe / ConnectionReset are routine when the exporting agent
             // (Codex / Claude Code) times out before we finish writing the
             // response — drop those silently so we don't fill the daemon log
@@ -545,6 +568,7 @@ pub(crate) fn bind_replacement_local_relay_listener(
     // Re-read consent/settings every attempt. The attempt budget belongs to one
     // listener failure, so settings changes cannot restart it indefinitely.
     if let Some(port) = approved_candidate_relay_port() {
+        legacy::release_for_primary(port);
         if attempt <= APPROVED_RELAY_REBIND_ATTEMPTS {
             match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
                 Ok(listener) => return Ok(listener),
@@ -726,10 +750,32 @@ fn current_uid() -> u32 {
 #[cfg(test)]
 pub(crate) fn serve_test_connection(stream: TcpStream, daemon: LocalDaemon) {
     apply_relay_io_timeouts(&stream);
-    handle_client(stream, SnapshotSource::ClaudeCode, daemon).expect("serve test relay connection");
+    handle_client(stream, SnapshotSource::ClaudeCode, daemon, None)
+        .expect("serve test relay connection");
 }
 
-fn handle_client(mut stream: TcpStream, source: SnapshotSource, daemon: LocalDaemon) -> Result<()> {
+fn handle_client(
+    stream: TcpStream,
+    source: SnapshotSource,
+    daemon: LocalDaemon,
+    legacy_activity: Option<legacy::Activity>,
+) -> Result<()> {
+    handle_client_at(
+        stream,
+        source,
+        daemon,
+        legacy_activity,
+        &ottto_core::default_support_dir(),
+    )
+}
+
+fn handle_client_at(
+    mut stream: TcpStream,
+    source: SnapshotSource,
+    daemon: LocalDaemon,
+    legacy_activity: Option<legacy::Activity>,
+    support_dir: &Path,
+) -> Result<()> {
     let request = match read_http_request(&mut stream) {
         Ok(request) => request,
         Err(error) => {
@@ -742,19 +788,19 @@ fn handle_client(mut stream: TcpStream, source: SnapshotSource, daemon: LocalDae
         }
     };
 
-    if request.path == "/control" {
+    if legacy_activity.is_none() && request.path == "/control" {
         return handle_control_request(&mut stream, &daemon, request);
     }
 
-    if request.path == "/whoami" {
+    if legacy_activity.is_none() && request.path == "/whoami" {
         return handle_whoami_request(&mut stream, &daemon, request);
     }
 
-    if request.path == "/local-health" {
+    if legacy_activity.is_none() && request.path == "/local-health" {
         return handle_local_health_request(&mut stream, &daemon, request);
     }
 
-    if request.method == "GET" && request.path == "/healthz" {
+    if legacy_activity.is_none() && request.method == "GET" && request.path == "/healthz" {
         return write_json_response(&mut stream, 200, relay_health_payload(source));
     }
 
@@ -772,8 +818,27 @@ fn handle_client(mut stream: TcpStream, source: SnapshotSource, daemon: LocalDae
     }
 
     let request_source = source_from_request(&request).unwrap_or(source);
-    let response =
-        local_otlp_export_response(request_source, &request, &ottto_core::default_support_dir());
+    let export = || local_otlp_export_response(request_source, &request, support_dir);
+    let response = if let Some(activity) = legacy_activity.as_ref() {
+        let Some(response) = activity.export_if_approved(|| {
+            let response = export();
+            // Keep success bookkeeping inside admission so retirement/rebind
+            // drains the complete export before taking its final idle clock.
+            if (200..300).contains(&response.status) {
+                activity.accepted();
+            }
+            response
+        }) else {
+            return write_json_response(
+                &mut stream,
+                403,
+                json!({"error":"legacy_relay_approval_revoked"}),
+            );
+        };
+        response
+    } else {
+        export()
+    };
     write_raw_response(
         &mut stream,
         response.status,
@@ -1220,6 +1285,7 @@ fn relay_health_payload(source: SnapshotSource) -> serde_json::Value {
         "ok": device_id != "missing",
         "source": source.api_slug(),
         "state_fingerprint": state_fingerprint(source, &api_base_url, &device_id),
+        "legacy_relay": legacy::counts(),
     })
 }
 
@@ -1577,7 +1643,7 @@ mod tests {
 
     const TOKEN: &str = "test-control-token";
 
-    fn test_daemon() -> LocalDaemon {
+    pub(super) fn test_daemon() -> LocalDaemon {
         LocalDaemon::new(
             MachineIdentity {
                 machine_id: "machine_test".to_string(),
@@ -2454,7 +2520,7 @@ mod tests {
         );
     }
 
-    const CLAUDE_API_REQUEST_LOG: &[u8] = br#"{"resourceLogs":[{"resource":{"attributes":[{"key":"session.id","value":{"stringValue":"retired-forward-session"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1783728000000000000","body":{"stringValue":"claude_code.api_request"},"attributes":[{"key":"request_id","value":{"stringValue":"req-retired-forward"}},{"key":"model","value":{"stringValue":"claude-opus-4-7"}},{"key":"effort","value":{"stringValue":"high"}},{"key":"input_tokens","value":{"intValue":"12"}},{"key":"output_tokens","value":{"intValue":"3"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;
+    pub(super) const CLAUDE_API_REQUEST_LOG: &[u8] = br#"{"resourceLogs":[{"resource":{"attributes":[{"key":"session.id","value":{"stringValue":"retired-forward-session"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1783728000000000000","body":{"stringValue":"claude_code.api_request"},"attributes":[{"key":"request_id","value":{"stringValue":"req-retired-forward"}},{"key":"model","value":{"stringValue":"claude-opus-4-7"}},{"key":"effort","value":{"stringValue":"high"}},{"key":"input_tokens","value":{"intValue":"12"}},{"key":"output_tokens","value":{"intValue":"3"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;
     const CLAUDE_LLM_REQUEST_TRACE: &[u8] = br#"{"resourceSpans":[{"resource":{"attributes":[{"key":"session.id","value":{"stringValue":"retired-forward-session"}}]},"scopeSpans":[{"spans":[{"name":"claude_code.llm_request","startTimeUnixNano":"1783728000000000000","attributes":[{"key":"request_id","value":{"stringValue":"req-retired-forward"}},{"key":"client_request_id","value":{"stringValue":"client-req-retired-forward"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;
 
     fn otlp_post(path: &str, content_type: &str, body: &[u8]) -> HttpRequest {
