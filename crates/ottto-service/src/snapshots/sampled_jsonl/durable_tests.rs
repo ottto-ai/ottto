@@ -4,6 +4,9 @@
 //! every platform.
 use super::*;
 use crate::durable_tail_codec::take_l_spans;
+use crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::{
+    ArchivedContent, ArchivedWriter, StateNode, W_53d05a43,
+};
 use crate::transcript_acquisition::{birth_unix_nanos, FullReason, ReadMode, Scope};
 use serde_json::json;
 use std::io::Write;
@@ -1516,4 +1519,184 @@ fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
             "refused before offset use"
         );
     });
+}
+
+fn archived_tag(source: SnapshotSource) -> u8 {
+    match source {
+        SnapshotSource::ClaudeCode => 1,
+        _ => 2,
+    }
+}
+
+/// A spawned Codex session: the only transcript shape with an agent label.
+fn codex_subagent_lines() -> Vec<String> {
+    let mut lines = codex_lines();
+    let meta = lines[0].replacen(
+        "\"source\":\"cli\"",
+        "\"source\":{\"subagent\":{\"thread_spawn\":{\"agent_path\":\"/root/explorer\"}}}",
+        1,
+    );
+    assert_ne!(meta, lines[0], "subagent premise");
+    lines[0] = meta;
+    lines
+}
+
+/// The seed's archive comparison runs only in the native rows. This covers the
+/// archived writer's encoding of live state for populated bodies on every
+/// platform and refuses digest drift through the archived functions themselves.
+#[test]
+fn populated_bodies_match_the_archived_v1_writer() {
+    let mut covered = [false; 4];
+    let inputs = cases()
+        .into_iter()
+        .map(|case| (case.source, case.lines))
+        .chain([(SnapshotSource::Codex, codex_subagent_lines())]);
+    for (source, lines) in inputs {
+        let scratch = Scratch::new("archived-writer");
+        let path = scratch.write("t.jsonl", &lines);
+        let (reduction, _) = full_read(&path, source);
+        let body = encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        )
+        .unwrap();
+        let tag = archived_tag(source);
+        let rendered = format!("{reduction:?}");
+        eprintln!(
+            "{source:?}: live state renders an OccurrenceReducer: {}",
+            rendered.contains("OccurrenceReducer")
+        );
+        let state = StateNode::parse(&rendered).unwrap();
+        assert_eq!(
+            W_53d05a43::encode_state(tag, &state, line_cap()).as_ref(),
+            Ok(&body)
+        );
+        assert_eq!(W_53d05a43::encode_body(tag, &body).as_ref(), Ok(&body));
+        let stored = decode(&body, source).unwrap().rederive;
+        let acc = &reduction.accumulator;
+        let content = ArchivedContent {
+            title: acc.title.clone(),
+            first_prompt_title: acc.first_prompt_title.clone(),
+            first_prompt_material: acc.first_prompt_material.clone(),
+            workspace_path: acc.workspace_path.clone(),
+            agent_label: acc.codex_agent_label.clone(),
+        };
+        let archived = W_53d05a43::content_digests(tag, &content).unwrap();
+        assert_eq!(archived.first_prompt, stored.first_prompt);
+        assert_eq!(archived.workspace, stored.workspace);
+        assert_eq!(archived.agent_label, stored.agent_label);
+        assert_eq!(archived.title, stored.title);
+        for (seen, digest) in covered.iter_mut().zip([
+            archived.first_prompt,
+            archived.workspace,
+            archived.agent_label,
+            archived.title,
+        ]) {
+            *seen |= digest.is_some();
+        }
+        let renamed = ArchivedContent {
+            title: Some("other title".to_string()),
+            first_prompt_material: Some("other prompt".to_string()),
+            workspace_path: Some(PathBuf::from("/fixture/other-workspace")),
+            agent_label: Some("other-agent".to_string()),
+            ..content
+        };
+        let moved = W_53d05a43::content_digests(tag, &renamed).unwrap();
+        assert_ne!(moved.first_prompt, stored.first_prompt);
+        assert_ne!(moved.workspace, stored.workspace);
+        assert_ne!(moved.agent_label, stored.agent_label);
+        assert_ne!(moved.title, stored.title);
+    }
+    assert_eq!(covered, [true; 4], "every content digest must be exercised");
+}
+
+/// A writer that reverses `SelectorCapture`'s two same-type `put` calls emits
+/// bytes the v1 layout still parses, so a round trip of its body cannot see the
+/// swap. Exchanging the two unequal values in the live state yields exactly that
+/// writer's bytes; the archived writer, fed the true state, refuses them.
+#[test]
+fn archived_writer_refuses_selector_capture_field_order_swap() {
+    let scratch = Scratch::new("archived-swap");
+    let path = scratch.write("t.jsonl", &claude_lines(1, 1));
+    let (mut reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
+    reduction.accumulator.current_selector.insert(
+        "service_tier",
+        "priority".into(),
+        "derived_from_logs_2",
+    );
+    let body = encode(
+        &reduction,
+        crate::durable_tail_store::RECORD_BYTES,
+        line_cap(),
+    )
+    .unwrap();
+    let tag = archived_tag(SnapshotSource::ClaudeCode);
+    let state = StateNode::parse(&format!("{reduction:?}")).unwrap();
+    assert_eq!(
+        W_53d05a43::encode_state(tag, &state, line_cap()).as_ref(),
+        Ok(&body)
+    );
+    let mut swapped = state.clone();
+    assert!(swapped.swap_fields("SelectorCapture", "context", "sources") >= 1);
+    let swapped_body = W_53d05a43::encode_state(tag, &swapped, line_cap()).unwrap();
+    assert_ne!(swapped_body, body, "unequal values premise");
+    assert_eq!(
+        W_53d05a43::encode_body(tag, &swapped_body).as_ref(),
+        Ok(&swapped_body),
+        "the old round trip accepts the swapped writer"
+    );
+    assert_ne!(
+        W_53d05a43::encode_state(tag, &state, line_cap()).unwrap(),
+        swapped_body
+    );
+}
+
+#[test]
+fn session_start_digest_matches_the_archived_v1_writer() {
+    for (source, lines) in [
+        (
+            SnapshotSource::ClaudeCode,
+            claude_instruction_lines("archived-writer"),
+        ),
+        (
+            SnapshotSource::Codex,
+            codex_instruction_lines("archived-writer"),
+        ),
+    ] {
+        let scratch = Scratch::new("archived-session-start");
+        let path = scratch.write("t.jsonl", &lines);
+        let (reduction, _) = full_read(&path, source);
+        let body = encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        )
+        .unwrap();
+        let stored = decode(&body, source).unwrap().rederive.session_start;
+        let digest = hex(stored.expect("instruction lines set a session start digest"));
+        assert_eq!(
+            Some(digest.as_str()),
+            W_53d05a43::session_start_golden(archived_tag(source))
+        );
+    }
+}
+
+/// Test-only: the archived-writer seed renders live reductions with `{:?}`.
+impl std::fmt::Debug for CachedJsonlReduction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedJsonlReduction")
+            .field("accumulator", &self.accumulator)
+            .field("report", &self.report)
+            .field(
+                "recognized_usage_drop_count",
+                &self.recognized_usage_drop_count,
+            )
+            .field(
+                "positive_recognized_usage_count",
+                &self.positive_recognized_usage_count,
+            )
+            .field("positive_usage_evidence", &self.positive_usage_evidence)
+            .finish()
+    }
 }

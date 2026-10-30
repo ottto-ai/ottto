@@ -1,8 +1,13 @@
 //! Genuine v1 records from main's pinned 53d05a43 writer, before R2 (#865).
 //! Read the production post-save artifact unchanged: never rewrite its version,
-//! binding, allowlist, body or trailer. Source pins below fail on codec drift;
-//! a future writer must supply archived bytes rather than relabel its output.
+//! binding, allowlist, body or trailer. The seed compares it byte for byte with
+//! what a hash-pinned `archived_writers` copy of that writer emits for the
+//! retained live reduction (never for the stored body), so current source can
+//! move on while a future writer that drifts, even by reordering two same-type
+//! fields, refuses instead of being relabeled. Header fields other than the
+//! body come from the stored record after the binding checks below.
 //!
+//! The `PINNED_SOURCES` tests below stay as the separate check on CURRENT code.
 //! Serializer regions are extracted by the single companion Python standard-
 //! library tool used for both baseline generation and candidate verification.
 //! Only tests launch it; production has no subprocess or dependency change.
@@ -24,8 +29,13 @@
 //! There is no environment opt-out. Tests inject an interpreter/root per call;
 //! they never change PATH or other process-global environment variables.
 use super::*;
+use archived_writers::{ArchivedRecord, ArchivedWriter, StateNode, W_53d05a43};
 use sha2::{Digest, Sha256};
 
+#[path = "archived_writers/mod.rs"]
+pub(crate) mod archived_writers;
+
+/// The fixture rows name writers by pin; `W_53d05a43` is the default row.
 pub(crate) fn seed_pinned_v1(
     cache: &SharedCache,
     source: SnapshotSource,
@@ -33,11 +43,27 @@ pub(crate) fn seed_pinned_v1(
     index: &ScanIndex,
     pin: &str,
 ) -> Vec<u8> {
-    assert_eq!(pin, "53d05a43");
-    assert_pinned_body_writer();
-    let checkpoint = cache
-        .retained_checkpoint(key)
-        .expect("populated native reduction");
+    archived_writers::require_known(pin);
+    match pin {
+        W_53d05a43::PIN => seed_archived::<W_53d05a43>(cache, source, key, index),
+        other => panic!("archived writer {other} has no seed arm"),
+    }
+}
+
+pub(crate) fn seed_archived<W: ArchivedWriter>(
+    cache: &SharedCache,
+    source: SnapshotSource,
+    key: &str,
+    index: &ScanIndex,
+) -> Vec<u8> {
+    archived_writers::assert_provenance::<W>();
+    let (checkpoint, state) = {
+        let retained = cache.retained().unwrap();
+        let retained = retained.peek(key).expect("populated native reduction");
+        (retained.checkpoint.clone(), format!("{:?}", retained.state))
+    };
+    let state = StateNode::parse(&state)
+        .unwrap_or_else(|error| panic!("live reduction rendering did not parse: {error}"));
     let ds = durable_source(source).unwrap();
     let mut stores = cache.durable().unwrap();
     let slot = stores.slot(ds).as_mut().unwrap();
@@ -57,8 +83,12 @@ pub(crate) fn seed_pinned_v1(
         ReadOutcome::Found(record) => record,
         other => panic!("pinned writer did not produce a readable record: {other:?}"),
     };
-    assert_eq!(record.format, 1);
-    assert_eq!(record.record.allowlist, codec::allowlist_digest(source));
+    let source_tag = match record.record.binding.source {
+        DurableSource::ClaudeCode => 1,
+        DurableSource::Codex => 2,
+    };
+    assert_eq!(record.format, W::FORMAT);
+    assert_eq!(Ok(record.record.allowlist), W::allowlist(source_tag));
     assert_eq!(record.record.binding, expected.binding);
     assert_eq!(record.index_generation, index.generation);
     let name = expected
@@ -68,14 +98,52 @@ pub(crate) fn seed_pinned_v1(
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
     let bytes = std::fs::read(slot.store.dir().join(format!("{name}.rec"))).unwrap();
-    assert_eq!(u16::from_le_bytes(bytes[8..10].try_into().unwrap()), 1);
-    assert_eq!(bytes, pinned_bytes(&record.record, record.index_generation));
+    assert_eq!(
+        u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+        W::FORMAT
+    );
+    let binding = &record.record.binding;
+    let certificate = &record.record.certificate;
+    let archived = W::encode_live(
+        &ArchivedRecord {
+            source_tag,
+            key: binding.key,
+            context: binding.context,
+            scope: binding.scope,
+            entry: binding.entry,
+            allowlist: record.record.allowlist,
+            generation: record.index_generation,
+            device: certificate.device,
+            inode: certificate.inode,
+            length: certificate.length,
+            modified: certificate.modified,
+            birth_nanos: certificate.birth_nanos,
+            sealed_offset: certificate.sealed_offset,
+            sample_len: certificate.sample_len,
+            head_sha256: certificate.head_sha256,
+            boundary_sha256: certificate.boundary_sha256,
+            verified_unix_seconds: certificate.verified_unix_seconds,
+            audit_debt: record
+                .envelope_audit_debt
+                .or(certificate.audit_debt_unix_seconds),
+            body: Vec::new(),
+        },
+        &state,
+        crate::snapshots::jsonl_line_cap() as u64,
+    )
+    .unwrap_or_else(|error| panic!("writer {} refused this live state: {error}", W::PIN));
+    assert_eq!(
+        bytes,
+        archived,
+        "production no longer emits writer {}; seed its bytes instead of relabeling",
+        W::PIN
+    );
     bytes
 }
 
 // Pin serializer, body-publication/store-framing regions and qualified helpers.
 // Discovery walks EVERY src/**/*.rs; non-catalog serializer regions must be empty.
-// Hashes are generated with the SAME extractor using --baseline 53d05a43;
+// Hashes are generated with the SAME extractor using --baseline <reviewed-ref>;
 // unrelated source edits are ignored, and new serializer definitions refuse.
 struct SourcePin {
     path: &'static str,
@@ -203,16 +271,39 @@ fn extract_overrides(
     interpreter: &std::ffi::OsStr,
     source_root: &std::path::Path,
 ) -> Extraction {
+    let output = run_extractor(&[], replacements, interpreter, source_root, None);
+    assert!(
+        output.status.success(),
+        "python3 serializer extraction failed (walk/parse): {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout)
+        .expect("python3 serializer extractor returned invalid JSON")
+}
+
+fn run_extractor(
+    arguments: &[&std::ffi::OsStr],
+    replacements: &[(&str, &str)],
+    interpreter: &std::ffi::OsStr,
+    source_root: &std::path::Path,
+    directory: Option<&std::path::Path>,
+) -> std::process::Output {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let sources = replacements.iter().copied().collect::<BTreeMap<_, _>>();
-    let mut child = Command::new(interpreter)
+    let mut command = Command::new(interpreter);
+    command
         .args([
             "-c",
             include_str!("transition_serializer_regions.py"),
             "--source-root",
         ])
         .arg(source_root)
+        .args(arguments);
+    if let Some(directory) = directory {
+        command.current_dir(directory);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -229,16 +320,9 @@ fn extract_overrides(
         .write_all(&serde_json::to_vec(&sources).unwrap())
         .expect("python3 serializer extractor request could not be written");
     drop(input);
-    let output = child
+    child
         .wait_with_output()
-        .expect("python3 serializer extractor process must complete");
-    assert!(
-        output.status.success(),
-        "python3 serializer extraction failed (walk/parse): {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout)
-        .expect("python3 serializer extractor returned invalid JSON")
+        .expect("python3 serializer extractor process must complete")
 }
 
 fn extract_with_python(replacement: Option<(&str, &str)>) -> Extraction {
@@ -421,9 +505,14 @@ fn pinned_v1_accepts_test_only_serializers_outside_catalog() {
         verify_pinned_sources(Some(("fixture_added_source.rs", changed))),
         Ok(())
     );
-    let changed = "crate::durable_tail_codec::durable_struct!(Added { N n: u64 });";
+    // This file owns the archive modules, so a stand-in must still declare them.
+    let changed =
+        format!("#[path = \"archived_writers/mod.rs\"] mod archived_writers;\n{ADDED_SERIALIZER}");
     assert_eq!(
-        verify_pinned_sources(Some(("snapshots/sampled_scan/transition_seed.rs", changed))),
+        verify_pinned_sources(Some((
+            "snapshots/sampled_scan/transition_seed.rs",
+            &changed
+        ))),
         Ok(())
     );
 }
@@ -691,53 +780,4 @@ fn pinned_v1_production_module_membership_overrides_test_paths() {
         verify_source_tree(&[("lib.rs", &lib), ("fixture_shared.rs", ADDED_SERIALIZER),]),
         Err("serializer regions outside baseline catalog")
     );
-}
-
-fn pinned_header(out: &mut Vec<u8>, record: &PendingRecord, generation: u64) {
-    let binding = &record.binding;
-    let certificate = &record.certificate;
-    out.extend_from_slice(b"ottto-dt");
-    out.extend_from_slice(&1_u16.to_le_bytes());
-    out.extend_from_slice(&record.allowlist);
-    out.push(match binding.source {
-        DurableSource::ClaudeCode => 1,
-        DurableSource::Codex => 2,
-    });
-    for part in [
-        &binding.key,
-        &binding.context,
-        &binding.scope,
-        &binding.entry,
-    ] {
-        out.extend_from_slice(part);
-    }
-    out.extend_from_slice(&generation.to_le_bytes());
-    for value in [certificate.device, certificate.inode, certificate.length] {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
-    out.extend_from_slice(&certificate.modified.0.to_le_bytes());
-    out.extend_from_slice(&certificate.modified.1.to_le_bytes());
-    out.extend_from_slice(&certificate.birth_nanos.to_le_bytes());
-    out.extend_from_slice(&certificate.sealed_offset.to_le_bytes());
-    out.extend_from_slice(&certificate.sample_len.to_le_bytes());
-    out.extend_from_slice(&certificate.head_sha256);
-    out.extend_from_slice(&certificate.boundary_sha256);
-    out.extend_from_slice(&certificate.verified_unix_seconds.to_le_bytes());
-    out.push(u8::from(certificate.audit_debt_unix_seconds.is_some()));
-    out.extend_from_slice(
-        &certificate
-            .audit_debt_unix_seconds
-            .unwrap_or(0)
-            .to_le_bytes(),
-    );
-    out.extend_from_slice(&(record.body.len() as u32).to_le_bytes());
-}
-
-fn pinned_bytes(record: &PendingRecord, generation: u64) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    pinned_header(&mut bytes, record, generation);
-    bytes.extend_from_slice(&record.body);
-    let trailer = Sha256::digest(&bytes);
-    bytes.extend_from_slice(&trailer);
-    bytes
 }
