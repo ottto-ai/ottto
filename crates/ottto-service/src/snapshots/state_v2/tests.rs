@@ -1312,7 +1312,10 @@ fn growth_retention_follows_runtime_custody_through_clones_subsets_and_baselines
     let mut committed = super::super::ScanIndex::default();
     assert!(!state_v2_growth_retention_active(&committed));
     let v1_bytes = serde_json::to_vec(&committed).unwrap();
-    committed.persistence_v2 = Some(Arc::new(Runtime { active: true }));
+    committed.persistence_v2 = Some(Arc::new(Runtime {
+        active: true,
+        session: std::sync::Mutex::new(None),
+    }));
     assert!(state_v2_growth_retention_active(&committed));
     assert_eq!(v1_bytes, serde_json::to_vec(&committed).unwrap());
     let working = committed.clone();
@@ -1329,19 +1332,24 @@ fn growth_retention_follows_runtime_custody_through_clones_subsets_and_baselines
     assert!(!state_v2_growth_retention_active(&baseline));
 }
 
-fn test_paths(_: &RowKey, value: &dyn Value) -> Result<std::collections::BTreeSet<String>> {
+fn test_paths(
+    key: &RowKey,
+    value: &dyn Value,
+    paths: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    if let RowKey::File(path) | RowKey::Census(path) = key {
+        paths(path)?;
+    }
     let mut bytes = Vec::new();
     value.write(&mut bytes)?;
-    // This fixture encoder labels a JSON string array as paths. Opaque fixture
-    // bytes are one PL string; real encoders must extract their exact paths.
-    if let Ok(paths) = serde_json::from_slice::<Vec<String>>(&bytes) {
-        return Ok(paths.into_iter().collect());
+    if let Ok(strings) = serde_json::from_slice::<Vec<String>>(&bytes) {
+        for path in strings {
+            paths(&path)?;
+        }
+    } else if !bytes.is_empty() {
+        paths(&String::from_utf8(bytes)?)?;
     }
-    Ok(if bytes.is_empty() {
-        Default::default()
-    } else {
-        [String::from_utf8(bytes)?].into_iter().collect()
-    })
+    Ok(())
 }
 
 #[test]

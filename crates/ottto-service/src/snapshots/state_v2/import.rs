@@ -1,0 +1,154 @@
+//! Pre-publication pacing and the single seam for the future semantic mapper.
+use super::*;
+use anyhow::bail;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Pause {
+    TableReview,
+    UnknownClass,
+    Malformed,
+    Partial,
+    Oversize,
+    Mismatch,
+    Io,
+    UnsafeParent,
+}
+impl std::fmt::Display for Pause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("state_v2_import_paused")
+    }
+}
+impl std::error::Error for Pause {}
+impl Pause {
+    fn deterministic(self) -> bool {
+        !matches!(self, Self::Io | Self::UnsafeParent)
+    }
+}
+#[derive(Default)]
+pub(super) struct Pace {
+    attempts: u64,
+    transient_failures: u8,
+    next: Option<Instant>,
+    disabled: bool,
+}
+impl Pace {
+    pub(super) fn start(&mut self, now: Instant) -> Option<bool> {
+        if self.disabled || self.next.is_some_and(|next| now < next) {
+            return None;
+        }
+        let first = self.attempts == 0;
+        self.attempts = self.attempts.saturating_add(1);
+        self.next = now.checked_add(Duration::from_secs(24 * 3600));
+        if self.next.is_none() {
+            self.disabled = true;
+        }
+        Some(first)
+    }
+    pub(super) fn failed(&mut self, now: Instant, class: Pause) {
+        let hours = if class.deterministic() {
+            24
+        } else {
+            self.transient_failures = self.transient_failures.saturating_add(1);
+            match self.transient_failures {
+                1 => 1,
+                2 => 6,
+                _ => {
+                    self.disabled = true;
+                    return;
+                }
+            }
+        };
+        self.next = now.checked_add(Duration::from_secs(hours * 3600));
+        // Overflow cannot grant a fresh attempt.
+        if self.next.is_none() {
+            self.disabled = true;
+        }
+    }
+    pub(super) fn disabled(&self) -> bool {
+        self.disabled
+    }
+}
+
+/// No semantic field/table mapping lives in this framework. The eventual
+/// adapter must preflight original raw shapes before v1 normalization, import
+/// the normalized graph, and prove read-back parity before publication.
+pub(super) trait Mapper {
+    fn private_paths(
+        key: &RowKey,
+        value: &dyn Value,
+        paths: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<()>;
+    fn inventory(&self, path: &Path) -> std::result::Result<(), Pause>;
+    fn preflight(&self, index: &ScanIndex) -> std::result::Result<(), Pause>;
+    fn populate<S: Store>(&self, store: &mut S, index: &ScanIndex) -> Result<()>;
+    // Proof mismatch/oversize must return a typed Pause; engine/IO failures
+    // remain transient. The framework never guesses from provider text.
+    fn verify<S: Store>(&self, store: &mut S, index: &ScanIndex) -> Result<()>;
+    fn hydrate<S: Store>(&self, store: &mut S) -> Result<ScanIndex>;
+    /// Uses the SAME claim maxima/hold and repair comparisons as v1; the
+    /// adapter streams current custody through txn, without a second graph.
+    fn merge_cas<T: Transaction>(&self, txn: &mut T, index: &mut ScanIndex) -> Result<()>;
+    fn delta<T: Transaction>(&self, txn: &mut T, index: &ScanIndex) -> Result<()>;
+}
+pub(super) struct PendingMapper;
+impl Mapper for PendingMapper {
+    fn private_paths(
+        _: &RowKey,
+        _: &dyn Value,
+        _: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
+        bail!(Hold::DbUnavailable)
+    }
+    fn inventory(&self, _: &Path) -> std::result::Result<(), Pause> {
+        Err(Pause::TableReview)
+    }
+    fn preflight(&self, _: &ScanIndex) -> std::result::Result<(), Pause> {
+        Err(Pause::TableReview)
+    }
+    fn populate<S: Store>(&self, _: &mut S, _: &ScanIndex) -> Result<()> {
+        bail!(Hold::DbUnavailable)
+    }
+    fn verify<S: Store>(&self, _: &mut S, _: &ScanIndex) -> Result<()> {
+        bail!(Hold::DbUnavailable)
+    }
+    fn hydrate<S: Store>(&self, _: &mut S) -> Result<ScanIndex> {
+        bail!(Hold::DbUnavailable)
+    }
+    fn merge_cas<T: Transaction>(&self, _: &mut T, _: &mut ScanIndex) -> Result<()> {
+        bail!(Hold::DbUnavailable)
+    }
+    fn delta<T: Transaction>(&self, _: &mut T, _: &ScanIndex) -> Result<()> {
+        bail!(Hold::DbUnavailable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn monotonic_pacing_is_one_hour_six_hours_third_disable_or_daily() {
+        let now = Instant::now();
+        let mut pace = Pace::default();
+        assert_eq!(pace.start(now), Some(true));
+        pace.failed(now, Pause::Io);
+        assert_eq!(pace.start(now + Duration::from_secs(3599)), None);
+        let second = now + Duration::from_secs(3600);
+        assert_eq!(pace.start(second), Some(false));
+        pace.failed(second, Pause::Io);
+        let third = second + Duration::from_secs(6 * 3600);
+        assert_eq!(pace.start(third), Some(false));
+        pace.failed(third, Pause::Io);
+        assert!(pace.disabled());
+        assert_eq!(pace.start(third + Duration::from_secs(48 * 3600)), None);
+        let mut pace = Pace::default();
+        assert_eq!(pace.start(now), Some(true));
+        pace.failed(now, Pause::UnknownClass);
+        assert_eq!(pace.start(now + Duration::from_secs(86400 - 1)), None);
+        assert_eq!(pace.start(now + Duration::from_secs(86400)), Some(false));
+        // Restart allowance is explicitly process-local, not wall-clock paced.
+        assert_eq!(Pace::default().start(now), Some(true));
+    }
+}

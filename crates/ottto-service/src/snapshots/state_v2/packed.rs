@@ -215,3 +215,20 @@ pub(super) fn read_hash_string(bytes: &[u8]) -> Result<String> {
         _ => anyhow::bail!("state_v2_hstr_tag"),
     }
 }
+
+#[cfg(test)]
+#[test]
+fn shipped_dictionary_is_append_only() {
+    use sha2::Digest;
+    const SHIPPED: usize = 29;
+    assert!(WORDS.len() >= SHIPPED);
+    let mut hash = sha2::Sha256::new();
+    for word in &WORDS[..SHIPPED] {
+        hash.update((word.len() as u32).to_be_bytes());
+        hash.update(word);
+    }
+    assert_eq!(
+        format!("{:x}", hash.finalize()),
+        "40daaa9d58099bd5ef7d559be10370000c2d44892f2903610b99636360fead2d"
+    );
+}

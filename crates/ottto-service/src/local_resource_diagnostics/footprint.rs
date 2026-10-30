@@ -268,6 +268,45 @@ fn current() -> Option<u64> {
     None
 }
 
+impl Stage {
+    pub(super) fn begin_rss() -> Option<Self> {
+        static SAMPLER: OnceLock<Option<Arc<Sampler>>> = OnceLock::new();
+        SAMPLER
+            .get_or_init(|| Sampler::spawn(resident))
+            .as_ref()?
+            .begin()
+    }
+}
+impl Observation {
+    pub(super) fn resident_bytes(&self) -> (Option<u64>, Option<u64>) {
+        (
+            self.stage_end_footprint_bytes,
+            self.stage_peak_footprint_bytes,
+        )
+    }
+}
+#[cfg(target_os = "macos")]
+fn resident() -> Option<u64> {
+    extern "C" {
+        static mach_task_self_: libc::mach_port_t;
+    }
+    let mut info = unsafe { std::mem::zeroed::<libc::mach_task_basic_info>() };
+    let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+    let result = unsafe {
+        libc::task_info(
+            mach_task_self_,
+            libc::MACH_TASK_BASIC_INFO,
+            (&mut info as *mut libc::mach_task_basic_info).cast(),
+            &mut count,
+        )
+    };
+    (result == 0 && count >= libc::MACH_TASK_BASIC_INFO_COUNT).then_some(info.resident_size)
+}
+#[cfg(not(target_os = "macos"))]
+fn resident() -> Option<u64> {
+    current()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

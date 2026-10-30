@@ -8368,6 +8368,7 @@ fn finish_sync_source(
             actual_native_conjunction && scan_result.census_complete && upload_fully_settled,
         );
     }
+    crate::snapshots::maintain_state_v2_idle(&index_path, &index)?;
     // A completed cycle is what moves the tier: uploads keep a source warm, a
     // quiet cycle lets it fall to idle and then cold. A conflict pass has still
     // durably committed its accepted siblings, but remains a source failure so

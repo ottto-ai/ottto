@@ -48008,8 +48008,11 @@ impl ScanIndex {
         now: SystemTime,
     ) -> Result<(Self, LoadOrigin)> {
         if !path.exists() {
-            let persistence_root =
-                scan_index_integration::check_missing(path, scan_index_source_label(source))?;
+            let persistence_root = scan_index_integration::check_missing(
+                path,
+                scan_index_source_label(source),
+                support_dir,
+            )?;
             return Ok((
                 Self {
                     persistence_root,
@@ -48019,6 +48022,12 @@ impl ScanIndex {
             ));
         }
         let _lock = CheckpointLock::acquire(path)?;
+        if let Some(index) = state_v2::load_locked(path, support_dir)? {
+            let file = File::open(path)?;
+            let opened = sampled_scan::codex_cursor::OpenStamp::capture(&file)?;
+            return Ok((index, LoadOrigin::Loaded(opened)));
+        }
+        let v1_gauge = state_v2::telemetry::Stage::v1(path);
         let file =
             File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
         let opened = sampled_scan::codex_cursor::OpenStamp::capture(&file)
@@ -48089,6 +48098,10 @@ impl ScanIndex {
                 if index.persistence_available() {
                     index.collapse_account_pending_windows();
                 }
+                if let Some(gauge) = v1_gauge {
+                    gauge.finish();
+                }
+                state_v2::after_v1_locked(path, &mut index)?;
                 Ok((index, LoadOrigin::Loaded(opened)))
             }
             Err(error) if error.quarantines() => {
@@ -48374,6 +48387,9 @@ impl ScanIndex {
         let _lock = CheckpointLock::acquire(path)?;
         #[cfg(test)]
         pause_scan_index_cas_if_requested_for_test();
+        if state_v2::save_locked(path, self)? {
+            return Ok(());
+        }
         if path.exists() {
             if let Some((binding, root)) = &self.persistence_root {
                 scan_index_persistence::LockedStore::new(
@@ -94045,4 +94061,12 @@ impl ScanIndex {
             }
         }
     }
+}
+
+/// Explicit privacy erasure hooks. Source-disable and Repair must not call this.
+pub(crate) fn erase_claude_state_v2_artifacts(support: &Path) -> Result<()> {
+    state_v2::erase_tree(support)
+}
+pub(crate) fn maintain_state_v2_idle(path: &Path, index: &ScanIndex) -> Result<()> {
+    state_v2::idle(path, index)
 }

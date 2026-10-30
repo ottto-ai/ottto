@@ -31,6 +31,11 @@ pub(in super::super) struct MaintenanceStats {
     erasure_pending_age_s: Option<u64>,
     erasure_overdue: bool,
     pub(super) erasure_pending_marks: u64,
+    pub(super) row_write_attempts: u64,
+    pub(super) row_delete_attempts: u64,
+    erasure_vacuum: ErasureVacuum,
+    erasure_vacuum_failed: std::collections::BTreeMap<&'static str, u64>,
+    oldest_pending_age_s: Option<u64>,
     vacuum_attempts: u64,
     vacuum_failures: u64,
     vacuum_deferred: u64,
@@ -40,6 +45,12 @@ pub(in super::super) struct MaintenanceStats {
     commit_latency_us: CommitLatency,
     cache_used_bytes: Option<u64>,
     db_bytes: Option<u64>,
+}
+#[derive(Clone, Default, Debug, Serialize)]
+struct ErasureVacuum {
+    runs: u64,
+    bytes: u64,
+    seconds: f64,
 }
 #[derive(Clone, Default, Debug, Serialize)]
 struct CommitLatency {
@@ -147,7 +158,7 @@ impl Sqlite {
         work: Duration,
     ) -> Result<()> {
         ensure!(
-            !deadline.is_zero() && !work.is_zero(),
+            !deadline.is_zero() && deadline <= Duration::from_secs(72 * 3600) && !work.is_zero(),
             "state_v2_purge_policy"
         );
         self.purge_policy = PurgePolicy { deadline, work };
@@ -159,6 +170,38 @@ impl Sqlite {
     }
 
     pub(super) fn vacuum(&mut self) -> Result<()> {
+        migrations::check_current(self.conn()?)?;
+        let started = Instant::now();
+        self.stats.erasure_vacuum.runs = self.stats.erasure_vacuum.runs.saturating_add(1);
+        let bytes = fs::metadata(&self.path).ok().map(|m| m.len()).unwrap_or(0);
+        let result = self.vacuum_inner();
+        self.stats.erasure_vacuum.seconds += started.elapsed().as_secs_f64();
+        self.stats.vacuum_latency_ms = u64::try_from(started.elapsed().as_millis()).ok();
+        if result.is_ok() {
+            self.stats.erasure_vacuum.bytes = self.stats.erasure_vacuum.bytes.saturating_add(bytes);
+        }
+        if let Err(error) = &result {
+            let reason = error
+                .downcast_ref::<rusqlite::Error>()
+                .and_then(|e| e.sqlite_error_code())
+                .map(|code| match code {
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
+                        "busy"
+                    }
+                    rusqlite::ErrorCode::OperationInterrupted => "timeout",
+                    rusqlite::ErrorCode::DiskFull => "disk_full",
+                    _ => "engine",
+                })
+                .unwrap_or("space_or_io");
+            self.erasure_failed(reason);
+        }
+        result
+    }
+    fn erasure_failed(&mut self, reason: &'static str) {
+        let count = self.stats.erasure_vacuum_failed.entry(reason).or_default();
+        *count = count.saturating_add(1);
+    }
+    fn vacuum_inner(&mut self) -> Result<()> {
         ensure!(!self.import, "state_v2_import_purge_refused");
         // Main-file length alone undercounts live pages still in the WAL.
         let logical = (|| -> Result<u64> {
@@ -221,6 +264,7 @@ impl Sqlite {
         result
     }
     fn maintenance_inner(&mut self, idle: bool) -> Result<()> {
+        migrations::check_current(self.conn()?)?;
         if self.import {
             return Ok(());
         }
@@ -233,6 +277,7 @@ impl Sqlite {
             None
         };
         self.stats.erasure_pending_age_s = age;
+        self.stats.oldest_pending_age_s = age;
         // A missing/future clock cannot establish that the privacy deadline is
         // still open. Keep custody and use the conservative overdue posture.
         let overdue = pending
@@ -270,6 +315,8 @@ impl Sqlite {
                 erased = true;
                 self.stats.erasure_overdue = false;
                 self.stats.erasure_pending_age_s = None;
+            } else {
+                self.erasure_failed("vacuum_or_truncate");
             }
         } else if pending && (idle || overdue) {
             self.stats.vacuum_deferred = self.stats.vacuum_deferred.saturating_add(1);
@@ -286,6 +333,12 @@ impl Sqlite {
             };
             let result = self.checkpoint(mode);
             self.debt = required && result.state != CheckpointState::Complete;
+        }
+        if idle {
+            let result = self.checkpoint(CheckpointMode::IdleReclaim);
+            if result.state == CheckpointState::Complete {
+                self.debt = false;
+            }
         }
         ensure!(!self.debt, "state_v2_wal_debt");
         ensure!(!overdue || erased, "state_v2_erasure_overdue");

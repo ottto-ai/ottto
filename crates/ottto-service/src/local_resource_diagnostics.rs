@@ -2824,3 +2824,32 @@ pub(crate) fn scan_index_repair_required(
         }),
     );
 }
+
+/// Reuses the bounded stage sampler. CPU is process-attributed; concurrent work
+/// can contribute. Peaks are 50-ms observations, not hard memory bounds.
+pub(crate) struct StateV2Probe {
+    footprint: Option<footprint::Stage>,
+    cpu: Option<ProcessSample>,
+}
+impl StateV2Probe {
+    pub(crate) fn begin() -> Self {
+        Self {
+            footprint: footprint::Stage::begin_rss(),
+            cpu: process_sample(),
+        }
+    }
+    pub(crate) fn finish(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        let (steady, peak) = self
+            .footprint
+            .as_ref()
+            .map(|s| s.finish().resident_bytes())
+            .unwrap_or_default();
+        (
+            self.cpu
+                .zip(process_sample())
+                .and_then(|(a, b)| b.cpu_us.checked_sub(a.cpu_us)),
+            steady,
+            peak,
+        )
+    }
+}

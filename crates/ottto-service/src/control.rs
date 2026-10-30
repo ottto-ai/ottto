@@ -1650,6 +1650,10 @@ fn handle_command(
                 ));
             }
             let home = local_lifecycle_home()?;
+            crate::snapshots::erase_claude_state_v2_artifacts(
+                &home.join("Library/Application Support/Ottto"),
+            )
+            .map_err(|_| LocalApiError::StatePoisoned)?;
             let mut result = execute_local_uninstall(&home, UninstallExecutionOptions::DAEMON);
             sweep_telemetry_keys_for_uninstall(&mut result);
             match &authorization {
@@ -7470,6 +7474,8 @@ fn forget_installation_state_locked() -> Result<(), LocalApiError> {
         .map_err(|_| LocalApiError::StatePoisoned)?;
     let support_dir = default_support_dir();
     crate::upload_receipts::clear(&support_dir).map_err(|_| LocalApiError::StatePoisoned)?;
+    crate::snapshots::erase_claude_state_v2_artifacts(&support_dir)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
     let path = support_dir.join("snapshots");
     if path.is_dir() {
         fs::remove_dir_all(&path).map_err(|_| LocalApiError::StatePoisoned)?;

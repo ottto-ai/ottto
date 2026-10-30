@@ -8,6 +8,14 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
+mod fence;
+mod import;
+mod runtime;
+pub(super) mod telemetry;
+pub(super) use runtime::Hold;
+pub(super) use runtime::{
+    after_v1_locked, erase_tree, guard_containment_locked, idle, load_locked, save_locked,
+};
 mod interning;
 mod packed;
 mod shape;
@@ -18,13 +26,26 @@ mod sqlite;
 #[derive(Debug)]
 pub(super) struct Runtime {
     active: bool,
+    session: std::sync::Mutex<Option<runtime::Session>>,
 }
-crate::heap_layout_bound::fields!(Runtime; active);
+impl crate::heap_layout_bound::HeapLayoutBound for Runtime {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        // A live native connection is opaque to the Rust graph estimator.
+        // Refuse overlap admission rather than claim an invented heap bound.
+        if self.session.lock().ok()?.is_some() {
+            return None;
+        }
+        c.add(0)
+    }
+}
 
 /// Stable seam shared with selection and census retention. Derived/subset
 /// indices carry the committed route; switch changes do not erase custody.
 pub(crate) fn state_v2_growth_retention_active(index: &ScanIndex) -> bool {
-    index.persistence_v2.as_ref().is_some_and(|runtime| runtime.active)
+    index
+        .persistence_v2
+        .as_ref()
+        .is_some_and(|runtime| runtime.active)
 }
 
 const FORMAT: u32 = 1;

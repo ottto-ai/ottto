@@ -14,15 +14,28 @@ pub(crate) const SHARD_DETAIL: &str = "Ottto paused collection for this app beca
 pub(crate) enum RepairCause {
     PriorState,
     StorageGeneration,
+    StateV2,
 }
 impl RepairCause {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::PriorState => "prior_state",
             Self::StorageGeneration => "storage_generation",
+            Self::StateV2 => "state_v2",
         }
     }
     fn from_error(error: &anyhow::Error) -> Option<Self> {
+        if error
+            .downcast_ref::<super::state_v2::Hold>()
+            .is_some_and(|cause| {
+                !matches!(
+                    cause,
+                    super::state_v2::Hold::Future | super::state_v2::Hold::NewerSchema
+                )
+            })
+        {
+            return Some(Self::StateV2);
+        }
         for cause in error.chain() {
             // The loader preserves this typed refusal after the representation
             // adapter fails closed. Do not classify arbitrary IO/shape errors.
@@ -139,7 +152,7 @@ pub(crate) fn is_version_refusal(error: &anyhow::Error) -> bool {
         Some(lenient_decode::Error::Refused("schema_version" | "accepted-ledger version")))
         // The representation adapter is a separate private component. Its
         // fixed version refusal must survive context wrapping in integration.
-        || error.chain().any(|cause| cause.to_string() == "scan_index_representation_refused")
+        || error.chain().any(|cause| matches!(cause.to_string().as_str(), "scan_index_representation_refused" | "state_v2_newer_schema_refused"))
 }
 
 pub(super) fn observe(source: SnapshotSource, loaded: &anyhow::Result<(ScanIndex, LoadOrigin)>) {

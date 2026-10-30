@@ -12,12 +12,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod maintenance;
+mod migrations;
 mod references;
 use maintenance::{MaintenanceStats, PurgePolicy};
 
 const BUSY: Duration = Duration::from_millis(100);
 const PAGE_HEADERS: usize = 128;
-const VAL: &str = "digest BLOB NOT NULL CHECK(length(digest)=16),len INTEGER NOT NULL CHECK(len BETWEEN 0 AND 67108864),parts INTEGER NOT NULL CHECK(parts BETWEEN 0 AND 256),inline BLOB,CHECK((parts=0 AND len<=512 AND inline IS NOT NULL AND length(inline)=len) OR (parts>0 AND len>512 AND inline IS NULL AND parts=(len+262143)/262144))";
 
 impl Table {
     fn name(self) -> &'static str {
@@ -111,27 +111,7 @@ impl Table {
 }
 
 fn schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(&format!(
-        "CREATE TABLE meta(name TEXT NOT NULL,{VAL},PRIMARY KEY(name)) WITHOUT ROWID;"
-    ))?;
-    conn.execute_batch(&format!("CREATE TABLE files(key TEXT NOT NULL,size BLOB NOT NULL CHECK(length(size)=8),mtime_s BLOB NOT NULL CHECK(length(mtime_s)=8),mtime_ns BLOB CHECK(mtime_ns IS NULL OR length(mtime_ns)=8),ctime_ns BLOB NOT NULL CHECK(length(ctime_ns)=8),birth_ns BLOB NOT NULL CHECK(length(birth_ns)=8),witness_rev BLOB NOT NULL CHECK(length(witness_rev)=8),flags INTEGER NOT NULL,source_fp BLOB NOT NULL,last_snapshot_fp BLOB,body_witness BLOB,scan_identity TEXT,{VAL},PRIMARY KEY(key)) WITHOUT ROWID;"))?;
-    conn.execute_batch(&format!(
-        "CREATE TABLE family_requests(root TEXT NOT NULL,{VAL},PRIMARY KEY(root)) WITHOUT ROWID;"
-    ))?;
-    conn.execute_batch(&format!("CREATE TABLE request_sets(set_id INTEGER NOT NULL,commitment BLOB NOT NULL,hash_count INTEGER,refs INTEGER NOT NULL,{VAL},PRIMARY KEY(set_id)) WITHOUT ROWID;"))?;
-    conn.execute_batch("CREATE TABLE census(key TEXT NOT NULL,fp BLOB NOT NULL,derivation INTEGER NOT NULL,window BLOB NOT NULL CHECK(length(window)=8),shape INTEGER NOT NULL CHECK(shape BETWEEN 0 AND 4),flags INTEGER NOT NULL,set_id INTEGER,retired BLOB CHECK(retired IS NULL OR length(retired)=8),old_path_requests BLOB CHECK(old_path_requests IS NULL OR length(old_path_requests)=8),old_path_tokens BLOB CHECK(old_path_tokens IS NULL OR length(old_path_tokens)=8),modified BLOB CHECK(modified IS NULL OR length(modified)=8),birth BLOB CHECK(birth IS NULL OR length(birth)=24),digest BLOB NOT NULL CHECK(length(digest)=16),PRIMARY KEY(key)) WITHOUT ROWID;")?;
-    conn.execute_batch(&format!("CREATE TABLE account_pending(root TEXT NOT NULL,window_no INTEGER NOT NULL,version_ord INTEGER NOT NULL,window_end TEXT NOT NULL,account_hash BLOB NOT NULL,evidence_count BLOB NOT NULL CHECK(length(evidence_count)=16),flags INTEGER NOT NULL,{VAL},PRIMARY KEY(root,window_no)) WITHOUT ROWID;"))?;
-    conn.execute_batch(&format!("CREATE TABLE usage_pending(root TEXT NOT NULL,window_end TEXT NOT NULL,flags INTEGER NOT NULL,idless_revision BLOB,{VAL},PRIMARY KEY(root)) WITHOUT ROWID;"))?;
-    conn.execute_batch(&format!("CREATE TABLE witnesses(kind INTEGER NOT NULL,key TEXT NOT NULL,{VAL},PRIMARY KEY(kind,key)) WITHOUT ROWID;"))?;
-    conn.execute_batch(&format!("CREATE TABLE accepted(kind INTEGER NOT NULL,key BLOB NOT NULL,{VAL},PRIMARY KEY(kind,key)) WITHOUT ROWID;"))?;
-    conn.execute_batch(&format!("CREATE TABLE quarantine(kind INTEGER NOT NULL,key TEXT NOT NULL,claims INTEGER,{VAL},PRIMARY KEY(kind,key)) WITHOUT ROWID;"))?;
-    conn.execute_batch(&format!("CREATE TABLE holds(kind INTEGER NOT NULL,field TEXT NOT NULL,key TEXT NOT NULL,{VAL},PRIMARY KEY(kind,field,key)) WITHOUT ROWID;"))?;
-    conn.execute_batch(&format!(
-        "CREATE TABLE traversal(name TEXT NOT NULL,{VAL},PRIMARY KEY(name)) WITHOUT ROWID;"
-    ))?;
-    conn.execute_batch(&format!("CREATE TABLE interned(kind INTEGER NOT NULL,ordinal INTEGER NOT NULL,refs INTEGER NOT NULL,{VAL},PRIMARY KEY(kind,ordinal)) WITHOUT ROWID;"))?;
-    // Named queries: full-evidence set candidates and bounded ordered part reads.
-    conn.execute_batch("CREATE INDEX request_sets_commitment ON request_sets(commitment); CREATE TABLE blob_parts(owner INTEGER NOT NULL CHECK(owner BETWEEN 0 AND 12),key BLOB NOT NULL,part INTEGER NOT NULL CHECK(part BETWEEN 0 AND 255),bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 262144),UNIQUE(owner,key,part));")?;
+    conn.execute_batch(include_str!("sqlite/migrations/revision_1.sql"))?;
     Ok(())
 }
 
@@ -650,7 +630,7 @@ impl Sqlite {
         )?;
         conn.execute_batch("PRAGMA page_size=4096; PRAGMA journal_mode=OFF;")?;
         settings(&conn, true)?;
-        schema(&conn)?;
+        migrations::run(&conn)?;
         private_file(path)?;
         Ok(Self {
             conn: Some(conn),
@@ -690,6 +670,10 @@ impl Sqlite {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         probe.busy_timeout(BUSY)?;
+        if migrations::revision(&probe)? > migrations::REVISION {
+            super::telemetry::event("newer_schema_refused", &1);
+            bail!(super::Hold::NewerSchema);
+        }
         let actual: super::Identity = read_json(&probe, &RowKey::Meta("identity".into()))?
             .ok_or_else(|| anyhow::anyhow!("state_v2_identity_missing"))?;
         ensure!(actual == *identity, "state_v2_foreign_binding");
@@ -732,6 +716,7 @@ impl Sqlite {
             before.dev() == after.dev() && before.ino() == after.ino(),
             "state_v2_object_changed"
         );
+        migrations::run(&conn)?;
         settings(&conn, false)?;
         validate_schema(&conn)?;
         let generation: u64 = read_json(&conn, &RowKey::Meta("generation".into()))?
@@ -779,7 +764,7 @@ impl Sqlite {
     pub(super) fn control<T: Serialize>(&mut self, name: &str, value: &T) -> Result<()> {
         ensure!(!pl(&RowKey::Meta(name.into())), "state_v2_control_class");
         let conn = self.conn()?;
-        conn.execute_batch("BEGIN IMMEDIATE")?;
+        migrations::begin_write(conn)?;
         let result = (|| {
             let mut tx = Txn {
                 store: self,
@@ -852,11 +837,11 @@ impl Store for Sqlite {
         if mode == TxnMode::Write {
             self.maintenance(false)?;
         }
-        self.conn()?.execute_batch(if mode == TxnMode::Write {
-            "BEGIN IMMEDIATE"
+        if mode == TxnMode::Write {
+            migrations::begin_write(self.conn()?)?;
         } else {
-            "BEGIN"
-        })?;
+            self.conn()?.execute_batch("BEGIN")?;
+        }
         Ok(Txn {
             store: self,
             write: mode == TxnMode::Write,
@@ -1070,9 +1055,16 @@ fn owner_key(key: &RowKey) -> Result<Vec<u8>> {
 }
 
 /// The semantic encoder owns path classification, including paths inside raw
-/// holds and packed maps. No table-specific field knowledge belongs here.
-pub(super) type PathExtractor = fn(&RowKey, &dyn Value) -> Result<BTreeSet<String>>;
-fn missing_path_extractor(_: &RowKey, _: &dyn Value) -> Result<BTreeSet<String>> {
+/// holds and packed maps AND the primary key. Only actual PL strings are
+/// emitted, through a bounded sink before allocation. No table field knowledge
+/// belongs here. Missing extractors refuse mutations, never infer privacy.
+pub(super) type PathExtractor =
+    fn(&RowKey, &dyn Value, &mut dyn FnMut(&str) -> Result<()>) -> Result<()>;
+fn missing_path_extractor(
+    _: &RowKey,
+    _: &dyn Value,
+    _: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
     bail!("state_v2_private_path_extractor_required")
 }
 struct StoredValue<'a> {
@@ -1094,40 +1086,65 @@ impl Txn<'_> {
         if !pl(&old.key) || self.original_paths.contains_key(&old.key) {
             return Ok(());
         }
-        let paths = (self.store.paths)(
+        let mut bytes: usize = self
+            .original_paths
+            .iter()
+            .map(|(key, paths)| {
+                owner_key(key).map(|key| {
+                    key.len() * 2 + 512 + paths.iter().map(|p| p.len() + 64).sum::<usize>()
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .sum();
+        bytes = bytes
+            .checked_add(owner_key(&old.key)?.len() * 2 + 512)
+            .context("state_v2_path_diff_admission")?;
+        let mut paths = BTreeSet::new();
+        (self.store.paths)(
             &old.key,
             &StoredValue {
                 conn: self.store.conn()?,
                 header: old,
             },
+            &mut |path| {
+                if !paths.contains(path) {
+                    bytes = bytes
+                        .checked_add(path.len() + 64)
+                        .context("state_v2_path_diff_admission")?;
+                    ensure!(bytes <= 8 * 1024 * 1024, "state_v2_path_diff_admission");
+                    paths.insert(path.to_owned());
+                }
+                Ok(())
+            },
         )?;
-        let bytes: usize = self
-            .original_paths
-            .values()
-            .flat_map(|p| p.iter())
-            .chain(paths.iter())
-            .map(|p| p.len())
-            .sum();
-        ensure!(bytes <= 8 * 1024 * 1024, "state_v2_path_diff_admission");
-        self.original_paths.insert(old.key.clone(), paths);
+        if !paths.is_empty() {
+            self.original_paths.insert(old.key.clone(), paths);
+        }
         Ok(())
     }
-    fn paths_removed(&self) -> Result<bool> {
-        for (key, old) in &self.original_paths {
-            if old.is_empty() {
-                continue;
+    fn paths_removed(&mut self) -> Result<bool> {
+        // Consume the admitted original set. New paths only remove candidates:
+        // no second encoded graph/set is allocated during the final diff.
+        for (key, mut old) in std::mem::take(&mut self.original_paths) {
+            if self.removed_keys.contains(&key) {
+                return Ok(true);
             }
-            let Some(header) = get(self.store.conn()?, key)? else {
+            let Some(header) = get(self.store.conn()?, &key)? else {
                 return Ok(true);
             };
-            let new = (self.store.paths)(
-                key,
+            (self.store.paths)(
+                &key,
                 &StoredValue {
                     conn: self.store.conn()?,
                     header: &header,
                 },
+                &mut |path| {
+                    old.remove(path);
+                    Ok(())
+                },
             )?;
-            if !old.is_subset(&new) {
+            if !old.is_empty() {
                 return Ok(true);
             }
         }
@@ -1237,12 +1254,6 @@ fn pl(key: &RowKey) -> bool {
         _ => true, // Values may contain PL even when the primary key is H/N.
     }
 }
-fn pl_key(key: &RowKey) -> bool {
-    !matches!(
-        key,
-        RowKey::Meta(_) | RowKey::Traversal(_) | RowKey::Interned { .. } | RowKey::RequestSet(_)
-    )
-}
 impl Transaction for Txn<'_> {
     fn get(&mut self, key: &RowKey) -> Result<Option<Header>> {
         get(self.store.conn()?, key)
@@ -1252,6 +1263,7 @@ impl Transaction for Txn<'_> {
     }
     fn put(&mut self, row: RowInput<'_>) -> Result<Header> {
         ensure!(self.write && !self.failed, "state_v2_transaction_refused");
+        self.store.stats.row_write_attempts = self.store.stats.row_write_attempts.saturating_add(1);
         let result = (|| {
             let h = preflight(&row)?;
             let table = row.key.table();
@@ -1353,6 +1365,8 @@ impl Transaction for Txn<'_> {
     }
     fn delete(&mut self, key: &RowKey) -> Result<bool> {
         ensure!(self.write && !self.failed, "state_v2_transaction_refused");
+        self.store.stats.row_delete_attempts =
+            self.store.stats.row_delete_attempts.saturating_add(1);
         let result = (|| {
             ensure!(
                 *key != RowKey::Meta("identity".into()),
@@ -1371,7 +1385,7 @@ impl Transaction for Txn<'_> {
                 &format!("DELETE FROM {} WHERE {}", table.name(), predicate(table)),
                 params_from_iter(key.values()?),
             )?;
-            if count != 0 && pl_key(key) {
+            if count != 0 && self.original_paths.contains_key(key) {
                 self.removed_keys.insert(key.clone());
             }
             Ok(count != 0)
@@ -1417,7 +1431,7 @@ impl Transaction for Txn<'_> {
             );
             let actual = self.store.read_control::<u64>("generation")?.unwrap_or(0);
             ensure!(actual == expected, "state_v2_concurrent_change");
-            let purge = !self.removed_keys.is_empty() || self.paths_removed()?;
+            let purge = self.paths_removed()?;
             if purge {
                 self.store.stats.erasure_pending_marks =
                     self.store.stats.erasure_pending_marks.saturating_add(1);
@@ -1504,38 +1518,25 @@ impl Transaction for Txn<'_> {
 }
 
 fn validate_schema(conn: &Connection) -> Result<()> {
-    let unique: i64 = conn.query_row("SELECT \"unique\" FROM pragma_index_list('request_sets') WHERE name='request_sets_commitment'", [], |r| r.get(0))?;
-    ensure!(unique == 0, "scan_index_representation_refused");
-    for table in Table::ALL {
-        let expected = table
-            .keys()
-            .iter()
-            .chain(table.fixed_columns())
-            .copied()
-            .chain(table.value_columns().iter().copied())
-            .collect::<Vec<_>>();
-        let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table.name()))?;
-        let actual = stmt
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        ensure!(actual == expected, "scan_index_representation_refused");
+    validate_schema_revision(conn, migrations::revision(conn)?)
+}
+fn validate_schema_revision(conn: &Connection, revision: u32) -> Result<()> {
+    ensure!(revision == 1, "scan_index_representation_refused");
+    // The expected object set comes from the immutable revision fixture, never
+    // the current table count/enum ordering. New revisions add their own image.
+    fn objects(conn: &Connection) -> Result<BTreeSet<(String, String, String)>> {
+        let mut stmt = conn.prepare(
+            "SELECT name,type,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
-    let mut stmt = conn.prepare(
-        "SELECT name,type FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
-    )?;
-    let names = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-    let mut count = 0;
-    for name in names {
-        let (name, kind) = name?;
-        ensure!(
-            (kind == "table"
-                && (name == "blob_parts" || Table::ALL.iter().any(|t| t.name() == name)))
-                || kind == "index" && name == "request_sets_commitment",
-            "scan_index_representation_refused"
-        );
-        count += 1;
-    }
-    ensure!(count == 15, "state_v2_schema_missing");
+    let expected = Connection::open_in_memory()?;
+    schema(&expected)?;
+    ensure!(
+        objects(conn)? == objects(&expected)?,
+        "scan_index_representation_refused"
+    );
     Ok(())
 }
 unsafe extern "C" fn progress(raw: *mut std::ffi::c_void) -> std::ffi::c_int {
