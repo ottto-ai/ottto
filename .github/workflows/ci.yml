@@ -150,7 +150,10 @@ jobs:
         # Print a failing assertion when it happens, not only after the suite.
         # Four threads on the 3-core runner: many tests wait on I/O or #[serial].
         # Six exposed shared-state races (control.rs notes some fail above 4).
-        run: cargo test --workspace --locked -- --nocapture --test-threads=4
+        # Branch Mac runs (dispatch) keep going past a failing test binary so
+        # scripts/mac_batch.py can map every failure to a PR; merge_group and
+        # schedule runs still stop at the first failing binary.
+        run: cargo test --workspace --locked ${{ github.event_name == 'workflow_dispatch' && '--no-fail-fast' || '' }} -- --nocapture --test-threads=4
 
       - name: Filtered Rust tests (partial pre-check)
         if: env.OTTTO_CI_TEST_FILTER != ''
@@ -158,8 +161,10 @@ jobs:
           set -euo pipefail
           # A name filter saves execution time, not compilation: both workspaces
           # still build their test binaries. Pass one quoted positional argument.
-          cargo test --workspace --locked "$OTTTO_CI_TEST_FILTER" -- --nocapture --test-threads=4 2>&1 | tee "$RUNNER_TEMP/filtered-rust-tests.log"
-          cargo test --manifest-path crates/Cargo.toml --workspace --locked "$OTTTO_CI_TEST_FILTER" -- --nocapture --test-threads=4 2>&1 | tee -a "$RUNNER_TEMP/filtered-rust-tests.log"
+          # Dispatch-only job: keep going past a failing test binary, as in
+          # "Runtime tests", so every failure is listed.
+          cargo test --workspace --locked ${{ github.event_name == 'workflow_dispatch' && '--no-fail-fast' || '' }} "$OTTTO_CI_TEST_FILTER" -- --nocapture --test-threads=4 2>&1 | tee "$RUNNER_TEMP/filtered-rust-tests.log"
+          cargo test --manifest-path crates/Cargo.toml --workspace --locked ${{ github.event_name == 'workflow_dispatch' && '--no-fail-fast' || '' }} "$OTTTO_CI_TEST_FILTER" -- --nocapture --test-threads=4 2>&1 | tee -a "$RUNNER_TEMP/filtered-rust-tests.log"
           # Cargo succeeds when nothing matches. A typo or ignored-only filter
           # must fail this pre-check, including when the other workspace is empty.
           grep -E '^test result: ok\. [1-9][0-9]* passed;' "$RUNNER_TEMP/filtered-rust-tests.log"
