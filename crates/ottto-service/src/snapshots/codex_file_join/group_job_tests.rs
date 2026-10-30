@@ -505,7 +505,10 @@ fn selection_skips_job_owned_entries() {
 }
 
 #[test]
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn blocked_owner_released_when_all_members_vanish_on_clean_walk() {
     let root = refused_fixture();
     write_rows(
@@ -1061,7 +1064,10 @@ fn line_loss_before_refusal_is_strict_and_not_memoized() {
 }
 
 #[test]
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn refused_group_memo_hit_on_live_growth_rereads_nothing() {
     let root = refused_fixture();
     let cache = Arc::new(SharedCache::default());
@@ -1089,7 +1095,10 @@ fn refused_group_memo_hit_on_live_growth_rereads_nothing() {
 }
 
 #[test]
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn append_curable_live_refusal_memo_matches_only_the_exact_stamp() {
     let root = temp_root("curable");
     let first = "11111111-aaaa-4aaa-8aaa-111111111111";
@@ -1141,7 +1150,10 @@ fn append_curable_live_refusal_memo_matches_only_the_exact_stamp() {
 /// before the file's end; bytes after it cannot cure it, so the exact-stamp
 /// entry is recorded and an unchanged group is not re-read.
 #[test]
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn mid_stream_live_gap_is_memoized_and_skipped_while_unchanged() {
     let root = temp_root("midgap");
     write_rows(
@@ -2436,7 +2448,10 @@ fn refused_first_page(cache: &Arc<SharedCache>) -> (PathBuf, ScanIndex) {
 /// owner. A departed non-member key (never on disk, so never in the census)
 /// keeps its claim, and with it the owner's block.
 #[test]
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn join_release_keeps_a_non_member_claim_on_the_same_owner() {
     let cache = Arc::new(SharedCache::default());
     let (root, mut index) = refused_first_page(&cache);
@@ -2608,7 +2623,10 @@ fn join_release_keeps_an_owner_a_header_still_names() {
 /// J-T5: releasing `OWNER` removes only its claims: `OTHER`'s claim on the
 /// same member key and its block survive; an emptied key is removed.
 #[test]
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn join_release_of_one_owner_never_deletes_another() {
     let cache = Arc::new(SharedCache::default());
     let (root, mut index) = refused_first_page(&cache);
@@ -2808,7 +2826,10 @@ fn join_release_skips_a_missing_traversal() {
 }
 
 #[test]
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
     use std::os::unix::fs::PermissionsExt;
     for change in [
