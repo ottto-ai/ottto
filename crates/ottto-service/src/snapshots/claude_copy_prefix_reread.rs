@@ -199,7 +199,7 @@ pub(crate) fn prepare(
         let entry = index
             .files
             .get(&key)
-            .ok_or_else(|| anyhow!("scope is not indexed"))?;
+            .ok_or_else(|| anyhow::anyhow!("scope is not indexed"))?;
         ensure!(
             entry.size_bytes == m.bytes
                 && entry
