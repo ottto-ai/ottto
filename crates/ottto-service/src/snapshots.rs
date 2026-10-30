@@ -72,6 +72,9 @@ pub(crate) mod claude_request_identity;
 pub(crate) mod claude_request_money;
 mod scan_index_integration;
 pub(crate) mod scan_index_persistence;
+// The engine is not routed until importer/fence/hydrate integration is complete.
+#[allow(dead_code)]
+mod state_v2;
 use scan_index_integration::read_scan_index_representation;
 mod idless_retry_marker;
 mod oversized_discovery;
