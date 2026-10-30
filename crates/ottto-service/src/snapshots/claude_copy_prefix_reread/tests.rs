@@ -6,10 +6,7 @@ fn setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, Vec<PathBuf>) {
     // preserves the previous (None) source census context even after ACKs.
     // This fixture models already delivered, fully adopted legacy history;
     // otherwise unrelated context debt exists BEFORE the switch changes.
-    let delivered = index.current_snapshot_fingerprints();
-    assert!(!delivered.is_empty());
-    assert!(delivered.is_subset(&index.accepted_snapshot_fingerprints));
-    index.upload_context_fingerprint = Some("ctx-1".into());
+    super::super::e2_pipeline_scan_fixture::adopt_acked_census_for_test(&mut index, "ctx-1");
     let mut paths = index
         .files
         .keys()

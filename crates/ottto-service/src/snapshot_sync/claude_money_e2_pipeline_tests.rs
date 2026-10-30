@@ -3276,10 +3276,8 @@ fn corrected_family_counter_excludes_history_vetoed_literals() {
         // demo_family uses partial commits, retaining an unadopted source
         // context. Model the fully adopted ACKed baseline so only THIRD's
         // genuine change is selected, without unrelated corrected families.
-        let delivered = prior.current_snapshot_fingerprints();
-        assert!(!delivered.is_empty());
-        assert!(delivered.is_subset(&prior.accepted_snapshot_fingerprints));
-        prior.upload_context_fingerprint = Some("e2-synthetic-destination".into());
+        crate::snapshots::e2_pipeline_scan_fixture::adopt_acked_census_for_test(
+            &mut prior, "e2-synthetic-destination");
         std::fs::write(
             c.support.join("snapshots/claude_code-reemission-exclusions.txt"),
             format!("{:x}\n", Sha256::digest(THIRD.as_bytes())),

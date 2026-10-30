@@ -213,3 +213,15 @@ pub(crate) fn indexed_size(index: &ScanIndex, path: &Path) -> Option<u64> {
         .get(&local_index_key(path))
         .map(|entry| entry.size_bytes)
 }
+
+/// Establish the completed legacy census precondition after the synthetic
+/// uploader has ACKed every current entity. Partial subsets intentionally
+/// retain the previous context; this creates no per-file receipt or ACK.
+pub(crate) fn adopt_acked_census_for_test(index: &mut ScanIndex, context: &str) {
+    let delivered = index.current_snapshot_fingerprints();
+    assert!(!delivered.is_empty());
+    assert!(delivered
+        .iter()
+        .all(|fp| index.accepted_snapshot_fingerprint_recorded(fp)));
+    index.upload_context_fingerprint = Some(context.into());
+}
