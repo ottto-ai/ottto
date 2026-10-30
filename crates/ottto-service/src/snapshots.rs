@@ -57277,6 +57277,8 @@ mod tests {
         // Original October-2 recovery fixture remains a containment control:
         // even a conflict-free cohort must now withhold terminal recovery.
         let mut control = ScanIndex::default();
+        {
+        let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
         for tick in 0..2 {
             let mut page = scan_source_roots_with_limit(
                 SnapshotSource::ClaudeCode,
@@ -57304,6 +57306,7 @@ mod tests {
             assert!(!control.account_claude_usage_authority_census_health(&mut page));
             finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut page, &mut control);
             assert!(!page.census_complete);
+        }
         }
         assert!(
             control.claude_owned_start_census["a-stable"]

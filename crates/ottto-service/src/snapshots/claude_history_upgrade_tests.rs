@@ -334,6 +334,7 @@ fn terminal_off_on_no_list_and_paused_list_states_hold_history_selected_for_anot
 
     let (home, root, index) = families("history-gate-no-list", 2);
     let held_under = |policy: NoListPolicy, support: &Path, cutoff: u64| {
+        let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
         let mut index = index.clone();
         index.claude_no_list_policy = policy;
         index.load_claude_reemission_exclusions(support);
@@ -503,6 +504,7 @@ fn terminal_off_on_installed_empty_list_paces_history_and_differs_from_a_missing
     let (home_missing, root_missing, missing_index) = families("history-gate-missing-list", 2);
     let never = support("history-gate-missing-list-support");
     for (policy, expected) in [(NoListPolicy::HoldUnverified, 0), (NoListPolicy::Pace, 1)] {
+        let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
         let mut missing_index = missing_index.clone();
         missing_index.claude_no_list_policy = policy;
         missing_index.load_claude_reemission_exclusions(&never);
@@ -1094,7 +1096,10 @@ fn member_only_line_protects_its_root_on_a_fresh_index() {
 fn terminal_off_on_member_only_line_protects_its_root_on_a_fresh_index() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    let (home, root, index) = families("history-gate-member-only", 2);
+    let (home, root, index) = {
+        let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
+        families("history-gate-member-only", 2)
+    };
     let support = support("history-gate-member-only-support");
     fs::write(
         ReemissionExclusions::path(&support),

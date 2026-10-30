@@ -1619,6 +1619,7 @@ fn terminal_off_on_claude_contract5_bodies_need_no_cohort_token() {
         fs::write(path, rows.iter().map(|row| row.to_string()+"\n").collect::<String>()).unwrap();
     }
     let run = || {
+        let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
         let mut index = ScanIndex::default();
         let mut scan = scan_source_roots_with_test_limit(SnapshotSource::ClaudeCode, std::slice::from_ref(&dir), &mut index, "2026-08-02T07:10:00Z", 7, 100, false).unwrap();
         crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);

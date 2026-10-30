@@ -238,16 +238,21 @@ fn terminal_off_on_native_batches_cross_512_workers_without_a_store_sweep_per_fi
             fs::write(root.join(name), format!("{header}\n{usage}\n")).unwrap();
         }
         let cache = Arc::new(sampled_scan::SharedCache::default());
-        let (_, control, control_steps) = run_with_limit(
+        let (_, control, control_steps) = {
+            let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
+            run_with_limit(
             &empty_home,
             source,
             &root,
             ScanIndex::default(),
             &cache,
             count,
-        );
-        let (index, launched, launched_steps) =
-            run_with_limit(&home, source, &root, ScanIndex::default(), &cache, count);
+        )
+        };
+        let (index, launched, launched_steps) = {
+            let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
+            run_with_limit(&home, source, &root, ScanIndex::default(), &cache, count)
+        };
         assert_eq!(control.snapshots.len(), count);
         assert_eq!(launched.snapshots.len(), count);
         assert!(launched.snapshots.iter().all(|item| item

@@ -419,6 +419,7 @@ fn terminal_off_on_same_input_finish_pair(outcome: FinishOutcome, conflict: bool
     // no persisted field is normalized after the fact.
     let pair_retry_clock = current_unix_seconds();
     for keep in [true, false] {
+        let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
         std::fs::remove_dir_all(&support).unwrap();
         for (path, bytes, permissions) in &initial {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();

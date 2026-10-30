@@ -2848,6 +2848,7 @@ fn terminal_off_on_api_sidecar_without_trace_sidecar_still_vetoes() {
     fs::write(&path, serde_json::to_string(&row).unwrap() + "\n").unwrap();
     let transcript = dir.join(format!("{SECOND}.jsonl"));
     let run = |veto_rows: bool| {
+        let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
         let mut index = ScanIndex::default();
         let mut scan = scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
@@ -3490,6 +3491,7 @@ fn terminal_off_on_capture_on_bodies_match_the_clear_outside_context_scalars() {
     .unwrap();
     let claude = SnapshotSource::ClaudeCode;
     let run = |rule_on: bool, fence_closed: bool| {
+        let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
         let mut index = ScanIndex::default();
         let mut scan = scan_source_roots_with_test_limit(
             claude,

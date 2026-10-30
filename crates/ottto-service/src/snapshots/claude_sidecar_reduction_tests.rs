@@ -923,7 +923,10 @@ fn terminal_off_on_missing_index_cannot_be_replaced_by_warm_cache_authority() {
 
     let f = Fixture::new(1);
     let cache = Arc::new(SharedCache::default());
-    seed_predecessor(&f, &cache);
+    {
+        let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
+        seed_predecessor(&f, &cache);
+    }
     f.evidence(1);
     let cached = enriched(&f, raw_scan(&f, ScanIndex::default(), Some(cache), |_| {}));
     assert_eq!(cached.modes, (1, 0, 0));

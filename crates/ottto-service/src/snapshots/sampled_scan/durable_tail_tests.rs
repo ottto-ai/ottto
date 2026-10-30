@@ -2529,7 +2529,10 @@ fn terminal_off_on_store_io_failures_emit_cold_production_body_without_holds() {
                 }
                 panic!("scan did not finish");
             };
-            let (_, cold_body) = run(Arc::new(SharedCache::default()), ScanIndex::default());
+            let (_, cold_body) = {
+                let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
+                run(Arc::new(SharedCache::default()), ScanIndex::default())
+            };
             let ds = durable_source(source).unwrap();
             let digest = store::key_digest(ds, &key);
             let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);

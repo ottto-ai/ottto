@@ -718,7 +718,10 @@ fn terminal_off_on_e2_pipeline_dark_matches_fold_absent_publication_and_selectio
     );
     c.evidence(&[api("r1", 10, 100)], &[]);
     let scanner = E2ScanFixture::default();
-    let mut dark = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
+    let mut dark = {
+        let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
+        c.raw(&scanner, ScanIndex::default(), 100, false, &[])
+    };
     let mut reference = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
     without_money_folds(&mut reference.scan);
     dark.enrich(&c);

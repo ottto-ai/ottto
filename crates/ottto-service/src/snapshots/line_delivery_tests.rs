@@ -827,8 +827,10 @@ fn terminal_off_on_registration_changes_no_selection_result_or_step_boundary() {
         append(&root.file(session), &body);
     }
     let recorder = Recorder::default();
-    let (bare_index, bare, bare_steps, _) =
-        claude_page(&root.projects(), ScanIndex::default(), None, None);
+    let (bare_index, bare, bare_steps, _) = {
+        let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
+        claude_page(&root.projects(), ScanIndex::default(), None, None)
+    };
     let (seen_index, seen, seen_steps, _) = claude_page(
         &root.projects(),
         ScanIndex::default(),
