@@ -165,6 +165,37 @@ pub(in super::super) fn published(path: &Path) -> Result<bool> {
     }
     fence::evidence(path)
 }
+/// Priority belongs only to an already adopted Claude runtime. This lookup
+/// never admits a route, probes disk/switches, or adds an OFF-path failure.
+pub(in super::super) fn checkpoint_priority_active(path: &Path) -> bool {
+    if binding(path).is_none() {
+        return false;
+    }
+    let state = states()
+        .lock()
+        .ok()
+        .and_then(|states| states.get(path).cloned());
+    state.is_some_and(|state| {
+        state
+            .lock()
+            .is_ok_and(|state| state.current.as_ref().is_some_and(|runtime| runtime.active))
+    })
+}
+
+#[cfg(test)]
+pub(in super::super) fn checkpoint_priority_fixture(path: &Path, active: bool) {
+    with_state(path, |state| {
+        state.current = active.then(|| {
+            Arc::new(Runtime {
+                active: true,
+                session: Mutex::new(None),
+            })
+        });
+        Ok(())
+    })
+    .unwrap();
+}
+
 pub(super) fn observed(path: &Path) -> bool {
     let state = states()
         .lock()
