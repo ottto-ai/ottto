@@ -142,17 +142,17 @@ fn f8_64_mib_admission_checks_before_read_allocation() {
 }
 
 #[test]
-fn f8_packed_raw_spelling_hashes_and_positional_neighbours_survive() {
+fn f8_json_raw_spelling_hashes_and_positional_neighbours_survive() {
     let raw = br#"{ "source_file_fingerprint":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "raw": {"retry_after_unix_seconds":"mistyped"}, "positional":[7,null,8], "unicode":"\u0041" }"#;
     for chunk in [1, 3, 32, 32768] {
-        let mut encoder = packed::Encoder::new(Vec::new());
+        let mut encoder = codec::Encoder::new(Vec::new());
         for bytes in raw.chunks(chunk) {
             encoder.write_all(bytes).unwrap();
         }
         let encoded = encoder.finish().unwrap();
-        assert!(encoded.len() < raw.len());
+        assert_eq!(encoded, raw);
         let mut out = Vec::new();
-        packed::decode(encoded.as_slice(), &mut out).unwrap();
+        codec::unpack(encoded.as_slice(), &mut out).unwrap();
         assert_eq!(out, raw);
     }
 }
@@ -322,11 +322,11 @@ fn f9_unknown_top_nested_array_tail_and_reserved_money_pause() {
         ),
         (
             r#"{"files":{},"claude_request_census":{"~lost":{"k":1}}}"#,
-            shape::Pause::UnmappedMoney,
+            shape::Pause::Unknown,
         ),
         (
             r#"{"files":{},"claude_copy_removals":{}}"#,
-            shape::Pause::UnmappedMoney,
+            shape::Pause::Unknown,
         ),
     ] {
         assert_eq!(
@@ -353,7 +353,6 @@ fn f9_default_writer_and_complete_root_registry_are_known() {
     let index = super::super::ScanIndex::default();
     let raw = serde_json::to_vec(&index).unwrap();
     assert_eq!(shape::inventory(std::io::Cursor::new(raw)), Ok(()));
-    shape::assert_root_registry_for_test();
 }
 
 #[test]
@@ -636,7 +635,7 @@ fn request_set_candidates_allow_collisions_and_compare_complete_evidence() {
         value_version: 1,
         key: &RowKey::Meta("next_request_set_id".into()),
         fixed: &Fixed::None,
-        value: &packed::Json(&91_u64),
+        value: &codec::Json(&91_u64),
     })
     .unwrap();
     let candidates = tx
@@ -685,7 +684,7 @@ fn colliding_candidate_before_exact_match_is_not_aliased_or_overwritten() {
         value_version: 1,
         key: &RowKey::Meta("next_request_set_id".into()),
         fixed: &Fixed::None,
-        value: &packed::Json(&3_u64),
+        value: &codec::Json(&3_u64),
     })
     .unwrap();
     assert_eq!(intern_request_set(&mut tx, &base).unwrap(), 2);
@@ -1101,37 +1100,14 @@ fn tx_header(key: &RowKey, bytes: &[u8]) -> Header {
     .unwrap()
 }
 fn file_fixed() -> Fixed {
-    Fixed::File {
-        size: 91,
-        mtime_s: u64::MAX,
-        mtime_ns: Some(0),
-        ctime_ns: u64::MAX,
-        birth_ns: 4,
-        witness_rev: 5,
-        flags: 6,
-        source_fp: Some([7; 32]),
-        last_snapshot_fp: None,
-        body_witness: Some([8; 32]),
-    }
+    Fixed::None
 }
 fn census_fixed() -> Fixed {
-    Fixed::Census {
-        fp: [9; 32],
-        derivation: 2,
-        window: u64::MAX,
-        shape: 4,
-        flags: 10,
-        set_id: None,
-        retired: Some(0),
-        old_path_requests: None,
-        old_path_tokens: Some(u64::MAX),
-        modified: Some(u64::MAX),
-        birth: Some([11; 24]),
-    }
+    Fixed::None
 }
 
 #[test]
-fn typed_keys_and_scan_projections_round_trip_every_physical_owner() {
+fn typed_keys_and_json_headers_round_trip_every_physical_owner() {
     let tmp = Scratch::new();
     let mut db = tmp.store();
     let rows = vec![
@@ -1139,22 +1115,11 @@ fn typed_keys_and_scan_projections_round_trip_every_physical_owner() {
         (census("file".into()), census_fixed()),
         (
             RowKey::record("account_window", b"family".to_vec(), 17).unwrap(),
-            Fixed::AccountPending {
-                account_hash: None,
-                evidence_count: u128::MAX,
-                flags: 1,
-                member_count: u64::MAX,
-                set_count: 0,
-            },
+            Fixed::None,
         ),
         (
             RowKey::record("usage.pending", b"family".to_vec(), 0).unwrap(),
-            Fixed::UsagePending {
-                flags: 2,
-                idless_revision: Some([3; 32]),
-                occurrence_count: u64::MAX,
-                member_count: 0,
-            },
+            Fixed::None,
         ),
         (
             RowKey::RequestSet(4),
@@ -1220,38 +1185,6 @@ fn f8_damaged_header_refuses_both_lookup_and_scan_before_owned_copy() {
             )
             .is_err());
     }
-}
-#[test]
-fn format_one_census_can_keep_payload_and_header_changes_do_not_rehash_value() {
-    let tmp = Scratch::new();
-    let mut db = tmp.live_store();
-    let key = census("file".into());
-    let mut f = census_fixed();
-    let bytes = Bytes(b"original boundary spelling".to_vec());
-    let mut digest = None;
-    for generation in 0..2 {
-        if let Fixed::Census { window, .. } = &mut f {
-            *window = generation;
-        }
-        let mut tx = db.begin(TxnMode::Write).unwrap();
-        let h = tx
-            .put(RowInput {
-                value_version: 1,
-                key: &key,
-                fixed: &f,
-                value: &bytes,
-            })
-            .unwrap();
-        if let Some(d) = digest {
-            assert_eq!(h.digest, d);
-        }
-        digest = Some(h.digest);
-        assert_eq!(
-            tx.commit(generation, generation + 1),
-            DurableCommitOutcome::Committed(generation + 1)
-        );
-    }
-    db.validate_parts().unwrap();
 }
 #[test]
 fn format_one_physical_columns_match_the_four_table_contract() {
@@ -1349,31 +1282,6 @@ fn f8_corrupted_refcount_cannot_reclaim_evidence_or_commit_sibling_changes() {
     assert!(tx.get(&RowKey::RequestSet(id)).is_err());
 }
 #[test]
-fn c1_fixed_size_rewrite_and_delete_reinsert_do_not_mark_purge() {
-    let tmp = Scratch::new();
-    let mut db = tmp.live_store();
-    let key = file("file".into());
-    let mut fixed = file_fixed();
-    for g in 0..3 {
-        if let Fixed::File { size, .. } = &mut fixed {
-            *size = g;
-        }
-        let mut tx = db.begin(TxnMode::Write).unwrap();
-        if g == 2 {
-            tx.delete(&key).unwrap();
-        }
-        tx.put(RowInput {
-            value_version: 1,
-            key: &key,
-            fixed: &fixed,
-            value: &Bytes(b"same".to_vec()),
-        })
-        .unwrap();
-        assert_eq!(tx.commit(g, g + 1), DurableCommitOutcome::Committed(g + 1));
-    }
-    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), None);
-}
-#[test]
 fn private_labels_aliases_and_raw_holds_create_erasure_epochs() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
@@ -1398,13 +1306,7 @@ fn positions_and_current_pointer_survive_retirement_without_renumbering() {
     let mut db = tmp.store();
     let kind = "account_window";
     let root = b"family".to_vec();
-    let f = Fixed::AccountPending {
-        account_hash: Some([1; 32]),
-        evidence_count: 0,
-        flags: 0,
-        member_count: 0,
-        set_count: 0,
-    };
+    let f = Fixed::None;
     let mut tx = db.begin(TxnMode::Write).unwrap();
     for pos in [17, 18, 19] {
         let k = RowKey::record(kind, root.clone(), pos).unwrap();

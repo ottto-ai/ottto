@@ -988,15 +988,14 @@ fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> 
         return Ok(());
     }
     ensure!(row_checksum(h)? == h.row_checksum, "state_v2_row_checksum");
-    let mut hash = value_digest_start(h.value_version);
+    let mut stored = Vec::new();
     let mut len = 0_u64;
     let mut consume = |bytes: &[u8]| -> Result<()> {
         len = len
             .checked_add(bytes.len() as u64)
             .filter(|n| *n <= h.len)
             .context("state_v2_part_length")?;
-        hash.update(bytes);
-        out.write_all(bytes)?;
+        stored.extend_from_slice(bytes);
         Ok(())
     };
     let o = chunk_owner(&h.key)?;
@@ -1036,9 +1035,10 @@ fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> 
         ensure!(part == h.parts, "state_v2_missing_parts");
     }
     ensure!(
-        len == h.len && integrity(hash) == h.digest,
+        len == h.len && codec::stored_digest(&h.key, h.value_version, &stored)? == h.digest,
         "state_v2_value_digest"
     );
+    out.write_all(&stored)?;
     super::telemetry::decoded(1, 0, 0);
     Ok(())
 }
@@ -1407,10 +1407,7 @@ impl Transaction for Txn<'_> {
                 self.remember_paths(old)?;
             }
             self.admit_selected(previous.as_ref(), Some(&h), false)?;
-            self.admit_change(
-                row.key,
-                h.len + projection_bytes(&h.fixed)?.map_or(0, |b| b.len()) as u64,
-            )?;
+            self.admit_change(row.key, h.len)?;
             delete_chunks(self.store.conn()?, row.key)?;
             self.removed_keys.remove(row.key);
             let conn = self.store.conn()?;
@@ -1428,6 +1425,13 @@ impl Transaction for Txn<'_> {
                 );
                 Some(bytes)
             } else {
+                let expected = codec::capture(row.value, value_cap(row.key))?;
+                ensure!(
+                    codec::stored_digest(row.key, h.value_version, &expected)? == h.digest,
+                    "state_v2_value_changed_after_preflight"
+                );
+                let mut expected_hash = value_digest_start(h.value_version);
+                expected_hash.update(&expected);
                 let mut writer = PartWriter {
                     conn,
                     owner: chunk_owner(row.key)?,
@@ -1443,7 +1447,8 @@ impl Transaction for Txn<'_> {
                 };
                 row.value.write(&mut writer)?;
                 ensure!(
-                    writer.len == h.len && integrity(writer.hash.clone()) == h.digest,
+                    writer.len == h.len
+                        && integrity(writer.hash.clone()) == integrity(expected_hash),
                     "state_v2_value_changed_after_preflight"
                 );
                 if h.parts == 0 {
@@ -1468,7 +1473,7 @@ impl Transaction for Txn<'_> {
                 Table::Records => {
                     values.extend([
                         SqlValue::Integer(h.value_version.into()),
-                        projection_bytes(&h.fixed)?.map_or(SqlValue::Null, SqlValue::Blob),
+                        SqlValue::Null,
                         SqlValue::Blob(h.digest.to_vec()),
                         SqlValue::Blob(h.row_checksum.to_vec()),
                         SqlValue::Integer(h.len as i64),

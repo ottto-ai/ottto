@@ -20,7 +20,7 @@ coverage! {
     persistence_controls => ("MISC", "runtime"),
     persistence_legacy_recovery => ("MISC", "runtime"),
     decode_holds => ("MISC", "raw_hold.*;v1_field.repair_provenance"),
-    claude_account_window_retention => ("ACCOUNTS", "account.window_retention"),
+    claude_account_window_retention => ("ACCOUNTS", "runtime"),
     schema_version => ("MISC", "control.schema_version"),
     generation => ("MISC", "control.generation"),
     upload_context_fingerprint => ("MISC", "setting.upload_context_fingerprint"),

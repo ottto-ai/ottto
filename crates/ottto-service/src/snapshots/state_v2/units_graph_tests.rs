@@ -197,7 +197,7 @@ fn deferred_binding_and_before_headers_are_authenticated_before_restoration() {
         key: &carry_key().unwrap(),
         fixed: &Fixed::None,
         value_version: 1,
-        value: &packed::Json(&pending),
+        value: &codec::Json(&pending),
     })
     .unwrap();
     assert_eq!(
@@ -267,7 +267,7 @@ fn expanded_custody_admission_precedes_packed_publication() {
     let value = serde_json::json!({"source_file_fingerprint": "a".repeat(64), "version": 1});
     let expanded = serde_json::to_vec(&value).unwrap();
     let mut packed = Vec::new();
-    packed::Json(&value).write(&mut packed).unwrap();
+    codec::Json(&value).write(&mut packed).unwrap();
     assert!(packed.len() < expanded.len());
     assert!(admit_json(&value, packed.len()).is_err());
     admit_json(&value, expanded.len()).unwrap();
@@ -486,7 +486,7 @@ fn legacy_many_small_payloads_reopen_in_one_arena() {
         key: &carry_key().unwrap(),
         fixed: &Fixed::None,
         value_version: 1,
-        value: &packed::Json(&pending),
+        value: &codec::Json(&pending),
     })
     .unwrap();
     assert_eq!(
@@ -586,7 +586,7 @@ fn custody_above_transaction_ceiling_reopens_and_drains_with_persisted_fairness(
         key: &carry_key().unwrap(),
         fixed: &Fixed::None,
         value_version: 2,
-        value: &packed::Json(&manifest),
+        value: &codec::Json(&manifest),
     })
     .unwrap();
     assert_eq!(
@@ -661,7 +661,7 @@ fn custody_above_transaction_ceiling_reopens_and_drains_with_persisted_fairness(
         manifest.generation = generation + 1;
         let key = carry_key().unwrap();
         let value = (!manifest.mutations.is_empty())
-            .then(|| Arc::new(Payload::capture(&packed::Json(&manifest), SCRATCH as u64).unwrap()));
+            .then(|| Arc::new(Payload::capture(&codec::Json(&manifest), SCRATCH as u64).unwrap()));
         let after = value.as_ref().map(|v| {
             preflight(&RowInput {
                 key: &key,

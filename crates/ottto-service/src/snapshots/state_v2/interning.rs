@@ -1,138 +1,7 @@
-//! Stable local references, complete evidence equality and transactional GC.
-//! Lookup digests select candidates; only full bytes authorize reuse.
+//! Complete JSON evidence equality, checked O(changed) ref counts and GC.
 use super::*;
 use anyhow::{ensure, Context};
 use sha2::Digest;
-
-const PAGE: usize = 32;
-const SET_DOMAIN: &[u8] = b"ottto.scan-index.state-v2.request-set.v1\0";
-
-pub(super) enum RequestEvidence<'a> {
-    Account {
-        prefixes: &'a str,
-        fingerprint: &'a str,
-        identity_revision: Option<&'a str>,
-        hash_count: Option<u64>,
-    },
-    Census {
-        /// Existing census codec's full hash stream; never account prefixes.
-        hashes: &'a dyn Value,
-        hash_count: Option<u64>,
-    },
-}
-impl RequestEvidence<'_> {
-    fn count(&self) -> Option<u64> {
-        match self {
-            Self::Account { hash_count, .. } | Self::Census { hash_count, .. } => *hash_count,
-        }
-    }
-}
-fn bytes(out: &mut dyn Write, bytes: &[u8]) -> Result<()> {
-    ensure!(
-        bytes.len() as u64 <= VALUE_BYTES,
-        "state_v2_value_admission"
-    );
-    out.write_all(&(bytes.len() as u64).to_be_bytes())?;
-    out.write_all(bytes)?;
-    Ok(())
-}
-impl Value for RequestEvidence<'_> {
-    fn write(&self, out: &mut dyn Write) -> Result<()> {
-        let count = self.count();
-        ensure!(
-            count.map_or(true, |n| n <= i64::MAX as u64),
-            "state_v2_set_count_admission"
-        );
-        out.write_all(&[1, u8::from(count.is_some())])?;
-        if let Some(count) = count {
-            out.write_all(&count.to_be_bytes())?;
-        }
-        match self {
-            Self::Account {
-                prefixes,
-                fingerprint,
-                identity_revision,
-                ..
-            } => {
-                ensure!(
-                    fingerprint.len() <= KEY_BYTES
-                        && identity_revision.map_or(true, |s| s.len() <= KEY_BYTES),
-                    "state_v2_string_admission"
-                );
-                out.write_all(&[1])?;
-                bytes(out, prefixes.as_bytes())?;
-                bytes(out, fingerprint.as_bytes())?;
-                out.write_all(&[u8::from(identity_revision.is_some())])?;
-                if let Some(revision) = identity_revision {
-                    bytes(out, revision.as_bytes())?;
-                }
-            }
-            Self::Census { hashes, .. } => {
-                out.write_all(&[2])?;
-                // Count before writing, without buffering a family. The later
-                // checked writer rejects a producer that changes between runs.
-                let mut count = BoundedHash::new(std::io::sink());
-                hashes.write(&mut count)?;
-                out.write_all(&count.bytes.to_be_bytes())?;
-                hashes.write(out)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-struct BoundedHash<W> {
-    out: W,
-    hash: sha2::Sha256,
-    bytes: u64,
-}
-impl<W: Write> BoundedHash<W> {
-    fn new(out: W) -> Self {
-        let mut hash = sha2::Sha256::new();
-        hash.update(SET_DOMAIN);
-        Self {
-            out,
-            hash,
-            bytes: 0,
-        }
-    }
-}
-impl<W: Write> Write for BoundedHash<W> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.bytes = self
-            .bytes
-            .checked_add(bytes.len() as u64)
-            .filter(|n| *n <= VALUE_BYTES)
-            .ok_or_else(|| std::io::Error::other("state_v2_value_admission"))?;
-        self.out.write_all(bytes)?;
-        self.hash.update(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.out.flush()
-    }
-}
-fn commitment(value: &dyn Value) -> Result<[u8; 32]> {
-    let mut writer = BoundedHash::new(std::io::sink());
-    value.write(&mut writer)?;
-    Ok(writer.hash.finalize().into())
-}
-struct Checked<'a> {
-    value: &'a dyn Value,
-    commitment: [u8; 32],
-}
-impl Value for Checked<'_> {
-    fn write(&self, out: &mut dyn Write) -> Result<()> {
-        let mut writer = BoundedHash::new(out);
-        self.value.write(&mut writer)?;
-        ensure!(
-            <[u8; 32]>::from(writer.hash.finalize()) == self.commitment,
-            "state_v2_value_changed_after_preflight"
-        );
-        Ok(())
-    }
-}
-
 fn allocate(
     tx: &mut (impl Transaction + ?Sized),
     name: &str,
@@ -164,34 +33,32 @@ fn allocate(
     Ok(id)
 }
 
-pub(super) fn intern_request_set(
+pub(super) fn resolve(
     tx: &mut (impl Transaction + ?Sized),
-    evidence: &RequestEvidence<'_>,
-) -> Result<u64> {
-    let digest = commitment(evidence)?;
-    let value = Checked {
-        value: evidence,
-        commitment: digest,
-    };
+    class: &str,
+    evidence: &serde_json::Value,
+) -> Result<(u64, bool)> {
+    let json = codec::json(&(class, evidence), VALUE_BYTES)?;
+    let mut hash = sha2::Sha256::new();
+    hash.update(b"ottto.scan-index.state-v2.request-set.v1\0");
+    hash.update(&json);
+    let digest: [u8; 32] = hash.finalize().into();
     let mut after = 0;
     loop {
-        let page = tx.request_set_candidates(&digest, after, PAGE)?;
+        let page = tx.request_set_candidates(&digest, after, 32)?;
         if page.is_empty() {
             break;
         }
-        for h in &page {
+        for h in page {
             let RowKey::RequestSet(id) = h.key else {
                 anyhow::bail!("state_v2_set_key");
             };
-            let Fixed::RequestSet { refs, .. } = h.fixed else {
-                anyhow::bail!("state_v2_set_columns");
-            };
-            ensure!(id > after && refs > 0, "state_v2_reference_count");
-            if tx.value_matches(h, &value)? {
-                tx.adjust_refs(&h.key, 1)?;
-                return Ok(id);
-            }
+            ensure!(id > after, "state_v2_set_order");
             after = id;
+            let raw = mapper::bytes(tx, &h)?;
+            if codec::expand(&raw, VALUE_BYTES)? == json {
+                return Ok((id, false));
+            }
         }
     }
     let existing = !tx
@@ -204,119 +71,101 @@ pub(super) fn intern_request_set(
         )?
         .is_empty();
     let id = allocate(tx, "next_request_set_id", existing, RowKey::RequestSet)?;
-    let key = RowKey::RequestSet(id);
-    ensure!(tx.get(&key)?.is_none(), "state_v2_high_water_reused");
+    let bytes = codec::encode(&json)?;
     tx.put(RowInput {
-        value_version: 1,
-        key: &key,
+        key: &RowKey::RequestSet(id),
         fixed: &Fixed::RequestSet {
             commitment: digest,
             refs: 1,
         },
-        value: &value,
+        value_version: 1,
+        value: &codec::Bytes(&bytes),
     })?;
-    Ok(id)
+    Ok((id, true))
 }
-
-pub(super) fn release_request_set(tx: &mut (impl Transaction + ?Sized), id: u64) -> Result<()> {
-    tx.adjust_refs(&RowKey::RequestSet(id), -1)?;
-    Ok(())
+pub(super) fn read(tx: &mut dyn Transaction, expected: &str, id: u64) -> Result<serde_json::Value> {
+    let h = tx
+        .get(&RowKey::RequestSet(id))?
+        .context("state_v2_reference_missing")?;
+    let (class, value): (String, serde_json::Value) =
+        codec::decode(&mapper::bytes(tx, &h)?, VALUE_BYTES)?;
+    ensure!(class == expected, "state_v2_shared_class");
+    Ok(value)
 }
-
-/// Shared evidence can contain exact literal strings. Table membership is not
-/// a privacy class: account evidence, legacy exclusion sets and census-owned
-/// full-string sets all participate in same-transaction erasure debt.
 pub(super) fn private_paths(
-    header: &Header,
+    h: &Header,
     value: &dyn Value,
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
-    ensure!(
-        matches!(header.key, RowKey::RequestSet(_)) && header.value_version == 1,
-        "state_v2_shared_value_version"
-    );
-    let mut writer = BoundedHash::new(Vec::new());
-    value.write(&mut writer)?;
-    let mut r = EvidenceReader(&writer.out);
-    ensure!(r.byte()? == 1, "state_v2_shared_value_version");
-    let count = match r.byte()? {
-        0 => None,
-        1 => Some(r.number()?),
-        _ => anyhow::bail!("state_v2_shared_presence"),
-    };
-    match r.byte()? {
-        1 => {
-            for _ in 0..2 {
-                emit(std::str::from_utf8(r.bytes()?)?)?;
-            }
-            match r.byte()? {
-                0 => {}
-                1 => emit(std::str::from_utf8(r.bytes()?)?)?,
-                _ => anyhow::bail!("state_v2_shared_presence"),
-            }
+    let bytes = codec::capture(value, value_cap(&h.key))?;
+    let (class, value): (String, serde_json::Value) = codec::decode(&bytes, VALUE_BYTES)?;
+    match class.as_str() {
+        // Census b is the v1 base64 serialization of numeric request-hash
+        // prefixes, never private literal text. Other domains keep every key
+        // and string, including literal full hashes and account fingerprints.
+        "census" => {
+            ensure!(value.is_string(), "state_v2_shared_class");
+            Ok(())
         }
-        2 => {
-            let payload = r.bytes()?;
-            let count = count.context("state_v2_shared_count")?;
-            match payload.first() {
-                Some(1) => {
-                    let hashes = &payload[1..];
-                    ensure!(
-                        hashes.len() % 8 == 0 && (hashes.len() / 8) as u64 == count,
-                        "state_v2_shared_count"
-                    );
-                    ensure!(
-                        hashes
-                            .chunks_exact(8)
-                            .zip(hashes.chunks_exact(8).skip(1))
-                            .all(|(a, b)| a < b),
-                        "state_v2_shared_hash_order"
-                    );
-                }
-                Some(2) => {
-                    let mut json = BoundedHash::new(Vec::new());
-                    packed::decode(&payload[1..], &mut json)?;
-                    emit_strings(&json.out, count, emit)?;
-                }
-                Some(b'[') => emit_strings(payload, count, emit)?,
-                _ => anyhow::bail!("state_v2_shared_class"),
-            }
-        }
+        "account" | "requests" => mapper::walk(&value, emit),
+        #[cfg(test)]
+        "fixture" => mapper::walk(&value, emit),
         _ => anyhow::bail!("state_v2_shared_class"),
     }
-    ensure!(r.0.is_empty(), "state_v2_shared_trailer");
-    Ok(())
 }
-fn emit_strings(bytes: &[u8], count: u64, emit: &mut dyn FnMut(&str) -> Result<()>) -> Result<()> {
-    // Decode a sequence first so duplicate source strings cannot disappear in a
-    // set before the count/order proof. The stored full sets are canonical.
-    let strings: Vec<String> = serde_json::from_slice(bytes)?;
-    ensure!(
-        strings.len() as u64 == count && strings.windows(2).all(|w| w[0] < w[1]),
-        "state_v2_shared_count_order"
-    );
-    for text in strings {
-        ensure!(text.len() <= KEY_BYTES, "state_v2_string_admission");
-        emit(&text)?;
+
+#[cfg(test)]
+pub(super) fn intern(
+    tx: &mut (impl Transaction + ?Sized),
+    evidence: &serde_json::Value,
+) -> Result<u64> {
+    let (id, created) = resolve(tx, "fixture", evidence)?;
+    if !created {
+        tx.adjust_refs(&RowKey::RequestSet(id), 1)?;
     }
-    Ok(())
+    Ok(id)
 }
-struct EvidenceReader<'a>(&'a [u8]);
-impl<'a> EvidenceReader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        ensure!(self.0.len() >= n, "state_v2_shared_shape");
-        let (head, tail) = self.0.split_at(n);
-        self.0 = tail;
-        Ok(head)
-    }
-    fn byte(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-    fn number(&mut self) -> Result<u64> {
-        Ok(u64::from_be_bytes(self.take(8)?.try_into()?))
-    }
-    fn bytes(&mut self) -> Result<&'a [u8]> {
-        let n = usize::try_from(self.number()?)?;
-        self.take(n)
-    }
+
+// Low-level collision/corruption fixtures exercise the same generic interner.
+#[cfg(test)]
+pub(super) enum RequestEvidence<'a> {
+    Account {
+        prefixes: &'a str,
+        fingerprint: &'a str,
+        identity_revision: Option<&'a str>,
+        hash_count: Option<u64>,
+    },
+    Census {
+        hashes: &'a dyn Value,
+        hash_count: Option<u64>,
+    },
+}
+#[cfg(test)]
+pub(super) fn intern_request_set(
+    tx: &mut (impl Transaction + ?Sized),
+    e: &RequestEvidence<'_>,
+) -> Result<u64> {
+    let value = match e {
+        RequestEvidence::Account {
+            prefixes,
+            fingerprint,
+            identity_revision,
+            hash_count,
+        } => serde_json::json!([
+            "account",
+            prefixes,
+            fingerprint,
+            identity_revision,
+            hash_count
+        ]),
+        RequestEvidence::Census { hashes, hash_count } => {
+            serde_json::json!(["census", codec::capture(*hashes, VALUE_BYTES)?, hash_count])
+        }
+    };
+    intern(tx, &value)
+}
+#[cfg(test)]
+pub(super) fn release_request_set(tx: &mut (impl Transaction + ?Sized), id: u64) -> Result<()> {
+    tx.adjust_refs(&RowKey::RequestSet(id), -1)?;
+    Ok(())
 }

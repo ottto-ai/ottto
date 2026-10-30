@@ -752,9 +752,7 @@ fn original_shape(input: impl std::io::BufRead) -> Result<()> {
     }
     result.map_err(|p| {
         match p {
-            shape::Pause::Unknown | shape::Pause::UnmappedMoney | shape::Pause::Unsupported => {
-                Pause::UnknownClass
-            }
+            shape::Pause::Unknown => Pause::UnknownClass,
             shape::Pause::Malformed => Pause::Malformed,
             shape::Pause::Oversize => Pause::Oversize,
         }
@@ -1186,9 +1184,18 @@ impl Transaction for ReadBack<'_> {
             row.value
         };
         anyhow::ensure!(
-            h.value_version == row.value_version
-                && &h.fixed == row.fixed
-                && self.inner.value_matches(&h, value)?,
+            h.value_version == row.value_version && &h.fixed == row.fixed && {
+                let mut actual = Vec::new();
+                self.inner.read_value(&h, &mut actual)?;
+                let expected = codec::capture(value, value_cap(row.key))?;
+                if matches!(row.key,RowKey::Record{kind,..} if kind.name().starts_with("raw_hold."))
+                {
+                    actual == expected
+                } else {
+                    codec::expand(&actual, value_cap(row.key))?
+                        == codec::expand(&expected, value_cap(row.key))?
+                }
+            },
             Pause::Mismatch
         );
         if matches!(row.key, RowKey::Record { .. }) {
@@ -1211,13 +1218,13 @@ impl Transaction for ReadBack<'_> {
         self.inner.request_set_candidates(digest, after, limit)
     }
     fn adjust_refs(&mut self, key: &RowKey, delta: i64) -> Result<u64> {
-        anyhow::ensure!(delta == 1, Pause::Mismatch);
+        anyhow::ensure!(delta > 0, Pause::Mismatch);
         anyhow::ensure!(
             self.refs.contains_key(key) || self.refs.len() < 8 * 1024 * 1024 / 128,
             Pause::Oversize
         );
         let count = self.refs.entry(key.clone()).or_default();
-        *count = count.checked_add(1).ok_or(Pause::Oversize)?;
+        *count = count.checked_add(delta as u64).ok_or(Pause::Oversize)?;
         Ok(*count)
     }
     fn scan_prefix(&mut self, _: RowPrefix, _: Option<&RowKey>, _: usize) -> Result<Vec<Header>> {
@@ -1808,7 +1815,31 @@ mod application_cases {
         let mut tx = db.begin(TxnMode::Read).unwrap();
         let verified = verify_normalized(&mut tx, &index, &original, c.binding()).unwrap();
         assert_eq!(verified.presence, original.presence);
-        assert!(!verified.account_rows.is_empty());
+        assert!(verified.accounts_ready);
     }
     include!("import_peak_tests.rs");
+}
+
+#[cfg(test)]
+mod codec_mapper_regressions {
+    use super::*;
+    #[test]
+    fn read_back_counts_aggregated_references_to_repeated_empty_evidence() {
+        let scratch = crate::test_scratch::ScratchDir::new("codec-ref-readback");
+        let index: ScanIndex = serde_json::from_value(serde_json::json!({
+            "schema_version":2,"files":{},"claude_usage_family_pending":{"f":{
+                "census_window_end":"A","invalid":false,
+                "member_request_id_hashes":{"a":[],"b":[]}
+            }}
+        }))
+        .unwrap();
+        let mut db = money_test_support::populate(
+            &scratch.join("state.v2.sqlite.import"),
+            &index,
+            Default::default(),
+        );
+        let original = Original::default();
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        verify_normalized_at(&mut tx, &index, &original, money_test_support::binding(), 1).unwrap();
+    }
 }

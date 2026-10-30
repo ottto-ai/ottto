@@ -656,7 +656,7 @@ impl RecoverySet {
                 "backup_resume",
             )?;
             let mut decoded = units_spool::Builder::new(MUTABLE_VALUE_BYTES)?;
-            packed::decode(reference.encoded.as_slice(), &mut decoded)?;
+            codec::unpack(reference.encoded.as_slice(), &mut decoded)?;
             let decoded = decoded.finish()?;
             let checkpoint: kinds_files::ResumeCheckpoint =
                 serde_json::from_reader(decoded.reader())?;

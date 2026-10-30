@@ -19,17 +19,20 @@ pub(super) use runtime::{
     after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
     idle, load_locked, save_locked,
 };
+mod codec;
 #[cfg(test)]
 mod field_coverage;
+mod ignored;
 mod interning;
 mod kinds;
 mod kinds_accounts;
 mod kinds_census;
 mod kinds_files;
 mod kinds_misc;
-mod packed;
+mod mapper;
 mod recovery_backup;
-mod shape;
+pub(crate) mod resume;
+use codec as shape;
 mod sqlite;
 mod units;
 mod units_graph;
@@ -158,54 +161,12 @@ impl RowKey {
     }
 }
 
-/// Scan projections only. All strings, exact boundary lexemes, reference lists,
-/// selectors and presence payloads live in the typed value. Fixed-width hashes
-/// here never substitute for the original representations in that value.
+/// Shared lookup identity and lifetime are the only typed storage columns.
+/// Record fields stay in their existing serde JSON value.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum Fixed {
     None,
-    File {
-        size: u64,
-        mtime_s: u64,
-        mtime_ns: Option<u64>,
-        ctime_ns: u64,
-        birth_ns: u64,
-        witness_rev: u64,
-        flags: u64,
-        source_fp: Option<[u8; 32]>,
-        last_snapshot_fp: Option<[u8; 32]>,
-        body_witness: Option<[u8; 32]>,
-    },
-    RequestSet {
-        commitment: [u8; 32],
-        refs: u64,
-    },
-    Census {
-        fp: [u8; 32],
-        derivation: u16,
-        window: u64,
-        shape: u16,
-        flags: u64,
-        set_id: Option<u64>,
-        retired: Option<u64>,
-        old_path_requests: Option<u64>,
-        old_path_tokens: Option<u64>,
-        modified: Option<u64>,
-        birth: Option<[u8; 24]>,
-    },
-    AccountPending {
-        account_hash: Option<[u8; 32]>,
-        evidence_count: u128,
-        flags: u64,
-        member_count: u64,
-        set_count: u64,
-    },
-    UsagePending {
-        flags: u64,
-        idless_revision: Option<[u8; 32]>,
-        occurrence_count: u64,
-        member_count: u64,
-    },
+    RequestSet { commitment: [u8; 32], refs: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -374,7 +335,14 @@ fn value_cap(key: &RowKey) -> u64 {
         {
             VALUE_BYTES
         }
-        // Semantic adapters must apply any tighter source bound before storage admission.
+        RowKey::Record { kind, .. }
+            if matches!(
+                kind.name(),
+                "account_window" | "usage.pending" | "file.entities" | "accepted.rebuild_incidence"
+            ) || kind.name().starts_with("v1_field.") =>
+        {
+            8 * 1024 * 1024
+        }
         RowKey::RequestSet(_) => VALUE_BYTES,
         _ => MUTABLE_VALUE_BYTES,
     }
@@ -401,38 +369,14 @@ fn admit_key(key: &RowKey) -> Result<()> {
     Ok(())
 }
 fn admit_header(key: &RowKey, fixed: &Fixed) -> Result<()> {
-    use anyhow::ensure;
     admit_key(key)?;
-    let kind = match key {
-        RowKey::Record { kind, .. } => kind.name(),
-        _ => "",
-    };
-    let valid = match fixed {
-        Fixed::None => {
-            !matches!(key, RowKey::RequestSet(_))
-                && !matches!(
-                    kind,
-                    "file.progress" | "file.census" | "account_window" | "usage.pending"
-                )
-        }
-        Fixed::File { .. } => kind == "file.progress",
-        Fixed::Census { shape, set_id, .. } => {
-            kind == "file.census"
-                && *shape < 5
-                && set_id.map_or(true, |id| id > 0 && id <= i64::MAX as u64)
-        }
-        Fixed::AccountPending { .. } => kind == "account_window",
-        Fixed::UsagePending { .. } => kind == "usage.pending",
-        Fixed::RequestSet { refs, .. } => {
-            matches!(key, RowKey::RequestSet(_)) && *refs > 0 && *refs <= i64::MAX as u64
-        }
-    };
-    ensure!(valid, "state_v2_fixed_type");
-    ensure!(
-        projection_bytes(fixed)?
-            .as_ref()
-            .map_or(true, |b| b.len() <= HEADER_BYTES),
-        "state_v2_header_admission"
+    anyhow::ensure!(
+        match fixed {
+            Fixed::None => !matches!(key, RowKey::RequestSet(_)),
+            Fixed::RequestSet { refs, .. } =>
+                matches!(key, RowKey::RequestSet(_)) && *refs > 0 && *refs <= i64::MAX as u64,
+        },
+        "state_v2_fixed_type"
     );
     Ok(())
 }
@@ -473,6 +417,12 @@ fn preflight(row: &RowInput<'_>) -> Result<Header> {
         cap: value_cap(row.key),
     };
     row.value.write(&mut out)?;
+    let stored = codec::capture(row.value, value_cap(row.key))?;
+    anyhow::ensure!(
+        stored.len() as u64 == out.bytes,
+        "state_v2_value_changed_after_preflight"
+    );
+    let logical_digest = codec::stored_digest(row.key, row.value_version, &stored)?;
     let parts = if matches!(row.key, RowKey::Meta(_)) || out.bytes <= INLINE_BYTES as u64 {
         0
     } else {
@@ -482,7 +432,7 @@ fn preflight(row: &RowInput<'_>) -> Result<Header> {
         key: row.key.clone(),
         fixed: row.fixed.clone(),
         value_version: row.value_version,
-        digest: integrity(out.hash),
+        digest: logical_digest,
         row_checksum: [0; 16],
         len: out.bytes,
         parts,
@@ -506,189 +456,19 @@ fn preflight(row: &RowInput<'_>) -> Result<Header> {
 
 /// Canonical header bytes are explicitly versioned; serde names/order never
 /// participate in this persistent contract. Optional zero stays distinct.
-fn projection_bytes(fixed: &Fixed) -> Result<Option<Vec<u8>>> {
-    let mut b = Vec::new();
-    fn n(b: &mut Vec<u8>, v: u64) {
-        b.extend_from_slice(&v.to_be_bytes());
-    }
-    fn opt(b: &mut Vec<u8>, v: &Option<impl AsRef<[u8]>>) {
-        b.push(u8::from(v.is_some()));
-        if let Some(v) = v {
-            b.extend_from_slice(v.as_ref());
-        }
-    }
-    fn num(b: &mut Vec<u8>, v: Option<u64>) {
-        opt(b, &v.map(u64::to_be_bytes));
-    }
-    match fixed {
-        Fixed::None | Fixed::RequestSet { .. } => return Ok(None),
-        Fixed::File {
-            size,
-            mtime_s,
-            mtime_ns,
-            ctime_ns,
-            birth_ns,
-            witness_rev,
-            flags,
-            source_fp,
-            last_snapshot_fp,
-            body_witness,
-        } => {
-            for v in [size, mtime_s, ctime_ns, birth_ns, witness_rev, flags] {
-                n(&mut b, *v);
-            }
-            num(&mut b, *mtime_ns);
-            opt(&mut b, source_fp);
-            opt(&mut b, last_snapshot_fp);
-            opt(&mut b, body_witness);
-        }
-        Fixed::Census {
-            fp,
-            derivation,
-            window,
-            shape,
-            flags,
-            set_id,
-            retired,
-            old_path_requests,
-            old_path_tokens,
-            modified,
-            birth,
-        } => {
-            b.extend_from_slice(fp);
-            b.extend_from_slice(&derivation.to_be_bytes());
-            n(&mut b, *window);
-            b.extend_from_slice(&shape.to_be_bytes());
-            n(&mut b, *flags);
-            for v in [
-                set_id,
-                retired,
-                old_path_requests,
-                old_path_tokens,
-                modified,
-            ] {
-                num(&mut b, *v);
-            }
-            opt(&mut b, birth);
-        }
-        Fixed::AccountPending {
-            account_hash,
-            evidence_count,
-            flags,
-            member_count,
-            set_count,
-        } => {
-            opt(&mut b, account_hash);
-            b.extend_from_slice(&evidence_count.to_be_bytes());
-            for v in [flags, member_count, set_count] {
-                n(&mut b, *v);
-            }
-        }
-        Fixed::UsagePending {
-            flags,
-            idless_revision,
-            occurrence_count,
-            member_count,
-        } => {
-            n(&mut b, *flags);
-            opt(&mut b, idless_revision);
-            for v in [occurrence_count, member_count] {
-                n(&mut b, *v);
-            }
-        }
-    }
-    anyhow::ensure!(b.len() <= HEADER_BYTES, "state_v2_header_admission");
-    Ok(Some(b))
-}
 fn decode_projection(
     key: &RowKey,
     bytes: Option<&[u8]>,
     shared: Option<([u8; 32], u64)>,
 ) -> Result<Fixed> {
-    use anyhow::{ensure, Context};
-    struct Fields<'a>(&'a [u8]);
-    impl Fields<'_> {
-        fn take<const N: usize>(&mut self) -> Result<[u8; N]> {
-            ensure!(self.0.len() >= N, "state_v2_header_shape");
-            let (b, rest) = self.0.split_at(N);
-            self.0 = rest;
-            Ok(b.try_into()?)
-        }
-        fn n(&mut self) -> Result<u64> {
-            Ok(u64::from_be_bytes(self.take()?))
-        }
-        fn opt<const N: usize>(&mut self) -> Result<Option<[u8; N]>> {
-            Ok(match self.take::<1>()?[0] {
-                0 => None,
-                1 => Some(self.take()?),
-                _ => anyhow::bail!("state_v2_header_shape"),
-            })
-        }
-        fn num(&mut self) -> Result<Option<u64>> {
-            Ok(self.opt()?.map(u64::from_be_bytes))
-        }
+    anyhow::ensure!(bytes.is_none(), "state_v2_header_shape");
+    if matches!(key, RowKey::RequestSet(_)) {
+        let (commitment, refs) = shared.ok_or_else(|| anyhow::anyhow!("state_v2_shared_shape"))?;
+        Ok(Fixed::RequestSet { commitment, refs })
+    } else {
+        anyhow::ensure!(shared.is_none(), "state_v2_header_shape");
+        Ok(Fixed::None)
     }
-    if let RowKey::RequestSet(_) = key {
-        ensure!(bytes.is_none(), "state_v2_header_shape");
-        let (commitment, refs) = shared.context("state_v2_shared_shape")?;
-        return Ok(Fixed::RequestSet { commitment, refs });
-    }
-    ensure!(shared.is_none(), "state_v2_header_shape");
-    let kind = match key {
-        RowKey::Record { kind, .. } => kind.name(),
-        _ => "",
-    };
-    if !matches!(
-        kind,
-        "file.progress" | "file.census" | "account_window" | "usage.pending"
-    ) {
-        ensure!(bytes.is_none(), "state_v2_header_shape");
-        return Ok(Fixed::None);
-    }
-    let mut f = Fields(bytes.context("state_v2_header_missing")?);
-    let fixed = match kind {
-        "file.progress" => Fixed::File {
-            size: f.n()?,
-            mtime_s: f.n()?,
-            ctime_ns: f.n()?,
-            birth_ns: f.n()?,
-            witness_rev: f.n()?,
-            flags: f.n()?,
-            mtime_ns: f.num()?,
-            source_fp: f.opt()?,
-            last_snapshot_fp: f.opt()?,
-            body_witness: f.opt()?,
-        },
-        "file.census" => Fixed::Census {
-            fp: f.take()?,
-            derivation: u16::from_be_bytes(f.take()?),
-            window: f.n()?,
-            shape: u16::from_be_bytes(f.take()?),
-            flags: f.n()?,
-            set_id: f.num()?,
-            retired: f.num()?,
-            old_path_requests: f.num()?,
-            old_path_tokens: f.num()?,
-            modified: f.num()?,
-            birth: f.opt()?,
-        },
-        "account_window" => Fixed::AccountPending {
-            account_hash: f.opt()?,
-            evidence_count: u128::from_be_bytes(f.take()?),
-            flags: f.n()?,
-            member_count: f.n()?,
-            set_count: f.n()?,
-        },
-        "usage.pending" => Fixed::UsagePending {
-            flags: f.n()?,
-            idless_revision: f.opt()?,
-            occurrence_count: f.n()?,
-            member_count: f.n()?,
-        },
-        _ => unreachable!(),
-    };
-    ensure!(f.0.is_empty(), "state_v2_header_shape");
-    Ok(fixed)
 }
 fn row_checksum(h: &Header) -> Result<[u8; 16]> {
     use sha2::Digest;
@@ -724,13 +504,7 @@ fn row_checksum(h: &Header) -> Result<[u8; 16]> {
         hash.update(commitment);
         hash.update(refs.to_be_bytes());
     }
-    match projection_bytes(&h.fixed)? {
-        None => hash.update([0]),
-        Some(b) => {
-            hash.update([1]);
-            bytes(&mut hash, &b);
-        }
-    }
+    hash.update([0]); // Reserved nullable header has no record projection.
     hash.update(h.digest);
     hash.update(h.len.to_be_bytes());
     hash.update(h.parts.to_be_bytes());

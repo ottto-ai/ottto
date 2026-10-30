@@ -208,7 +208,7 @@ fn exact_rec_predecessor_is_protected_until_replacement_bundle_verifies() {
             key: &key,
             fixed: &Fixed::None,
             value_version: 1,
-            value: &packed::Json(&checkpoint),
+            value: &codec::Json(&checkpoint),
         })
         .unwrap();
         assert_eq!(

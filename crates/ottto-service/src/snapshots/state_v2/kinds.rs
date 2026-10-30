@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(super) struct KindCx {
     pub(super) binding: Option<super::super::scan_index_persistence::Binding>,
     pub(super) committed: BTreeMap<String, kinds_files::ResumeCheckpoint>,
-    pub(super) prepared: Option<kinds_files::Prepared>,
+    pub(super) prepared: Option<resume::Prepared>,
     pub(super) ambiguous: bool,
     pub(super) require_preflight: bool,
     pub(super) account_rows: BTreeMap<(String, String), BTreeMap<RowKey, Header>>,
@@ -136,6 +136,13 @@ pub(super) fn hydrate_txn(
     tx: &mut dyn Transaction,
     binding: super::super::scan_index_persistence::Binding,
 ) -> Result<(ScanIndex, KindCx)> {
+    hydrate_txn_with_hooks(tx, binding, &mut kinds_files::NoResumeHooks)
+}
+pub(super) fn hydrate_txn_with_hooks(
+    tx: &mut dyn Transaction,
+    binding: super::super::scan_index_persistence::Binding,
+    hooks: &mut dyn resume::ResumeHooks,
+) -> Result<(ScanIndex, KindCx)> {
     let identity_header = tx
         .get(&RowKey::Meta("identity".into()))?
         .ok_or(Hold::ForeignBinding)?;
@@ -182,6 +189,7 @@ pub(super) fn hydrate_txn(
     kinds_files::hydrate_txn(tx, &mut index, &mut cx)?;
     kinds_accounts::hydrate_txn(tx, &mut index, &mut cx)?;
     kinds_census::hydrate_txn(tx, &mut index, &mut cx)?;
+    hooks.on_open(index.generation, &cx.committed)?;
     cx.valid = true;
     Ok((index, cx))
 }
@@ -249,6 +257,7 @@ pub(super) fn save_selected_graph(
         }
         super::super::lenient_decode::check_held_output(next)?;
         pending.preflight_selected(prev, next, &selection, hooks)?;
+        pending.retain_excluded(prev, next)?;
         let dirty = kinds_misc::dirty_fields(prev, next)?;
         let mut tx = store.begin_selected(selection)?;
         delta(prev, next, &mut tx, &mut pending, dirty)?;
@@ -302,7 +311,7 @@ pub(super) fn save_selected(
     let units_graph::Planned {
         selection,
         rows,
-        graph,
+        mut graph,
         mut context,
         deferred,
     } = plan;
@@ -312,10 +321,8 @@ pub(super) fn save_selected(
     let result = (|| {
         store.validate_selection(&selection)?;
         pending.preflight_selected(prev, &graph, &selection, hooks)?;
-        ensure!(
-            pending.prepared_checkpoints() == Some(&context.committed),
-            "state_v2_resume_plan_changed"
-        );
+        pending.retain_excluded(prev, &mut graph)?;
+        pending.check_planned_checkpoints(Some(&context.committed))?;
         let mut tx = store.begin_selected(selection)?;
         mapper.delta(&mut tx, &graph, Some(&rows))?;
         let outcome = tx.commit(prev.generation, graph.generation);

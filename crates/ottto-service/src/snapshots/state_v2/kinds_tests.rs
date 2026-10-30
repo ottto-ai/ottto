@@ -114,11 +114,7 @@ fn all_groups_share_one_snapshot_and_roundtrip_real_v1_without_losing_context_or
         owners += page.len();
         after = page.last().map(|h| h.key.clone());
     }
-    let expected: usize = index
-        .claude_usage_family_pending
-        .values()
-        .map(|p| 1 + p.member_request_id_hashes.len())
-        .sum();
+    let expected = 1 + index.claude_usage_family_pending.len();
     assert_eq!(owners, expected);
 }
 #[test]
@@ -130,28 +126,6 @@ fn incomplete_census_group_cannot_escape_as_a_partially_hydrated_graph() {
         .unwrap();
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
     assert!(hydrate(&mut db, Scratch::binding()).is_err());
-}
-#[test]
-fn unchanged_groups_preserve_bytes_and_a_context_error_refuses_reuse() {
-    let (_scratch, mut db) = Scratch::store();
-    commit_populate(&mut db, &fixture());
-    let (prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
-    let mut next = prev.clone();
-    next.generation = 2;
-    let before = cx.account_rows.clone();
-    cx.preflight(&prev, &next, &mut kinds_files::NoResumeHooks)
-        .unwrap();
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    delta(&prev, &next, &mut tx, &mut cx, std::iter::empty::<String>()).unwrap();
-    let outcome = tx.commit(1, 2);
-    assert_eq!(outcome, DurableCommitOutcome::Committed(2));
-    cx.post_commit(&outcome, &mut kinds_files::NoResumeHooks)
-        .unwrap();
-    assert_eq!(cx.account_rows, before);
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    assert!(delta(&next, &next, &mut tx, &mut cx, ["unknown_money_class"]).is_err());
-    assert!(!cx.valid);
-    assert!(delta(&next, &next, &mut tx, &mut cx, std::iter::empty::<String>()).is_err());
 }
 #[test]
 fn noop_resume_adapter_cannot_publish_new_file_progress() {
@@ -238,52 +212,26 @@ fn foreign_source_and_registered_but_unmapped_money_kinds_refuse_hydration() {
         .contains("state_v2_unmapped_kind"));
 }
 #[test]
-fn shared_privacy_dispatch_preserves_both_census_domains_and_account_exclusion_literals() {
-    // Census's numeric domain contains no literal text; the string domain and
-    // the independent account exclusion encoding retain exact spellings.
-    for (payload, expected, count) in [
-        (vec![1, 0, 0, 0, 0, 0, 0, 0, 7], None, 1),
-        (
-            {
-                let mut bytes = vec![2];
-                packed::Json(&BTreeSet::from(["/synthetic/private-membership"]))
-                    .write(&mut bytes)
-                    .unwrap();
-                bytes
-            },
-            Some("/synthetic/private-membership"),
-            1,
-        ),
-        (
-            br#"["/synthetic/private-exclusion"]"#.to_vec(),
-            Some("/synthetic/private-exclusion"),
-            1,
-        ),
+fn generic_erasure_extraction_visits_nested_text_keys_and_shared_evidence() {
+    let (_scratch, mut db) = Scratch::store();
+    let payload = serde_json::json!({"/synthetic/private-key":["literal/title",{"nested":"private/evidence"}]});
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let id = interning::intern(&mut tx, &payload).unwrap();
+    let h = tx.get(&RowKey::RequestSet(id)).unwrap().unwrap();
+    let mut raw = Vec::new();
+    tx.read_value(&h, &mut raw).unwrap();
+    let mut strings = BTreeSet::new();
+    private_paths(&h, &Stored(raw), &mut |s| {
+        strings.insert(s.to_owned());
+        Ok(())
+    })
+    .unwrap();
+    for text in [
+        "/synthetic/private-key",
+        "literal/title",
+        "private/evidence",
     ] {
-        let (_scratch, mut db) = Scratch::store();
-        let mut tx = db.begin(TxnMode::Write).unwrap();
-        let id = interning::intern_request_set(
-            &mut tx,
-            &interning::RequestEvidence::Census {
-                hashes: &Stored(payload),
-                hash_count: Some(count),
-            },
-        )
-        .unwrap();
-        let h = tx.get(&RowKey::RequestSet(id)).unwrap().unwrap();
-        let mut bytes = Vec::new();
-        tx.read_value(&h, &mut bytes).unwrap();
-        let mut texts = Vec::new();
-        private_paths(&h, &Stored(bytes), &mut |s| {
-            texts.push(s.to_owned());
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(
-            texts,
-            expected.into_iter().map(str::to_owned).collect::<Vec<_>>()
-        );
-        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+        assert!(strings.contains(text));
     }
 }
 
@@ -492,4 +440,141 @@ fn writer_capability_refuses_selected_save_before_any_r1_side_effect() {
     );
     assert!(hooks.0.is_empty());
     assert_eq!(next.generation, prev.generation);
+}
+
+#[test]
+fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
+    let (_scratch, mut db) = Scratch::store();
+    let mut prev = fixture();
+    prev.files.clear();
+    commit_populate(&mut db, &prev);
+    prev.generation = 1;
+    let mut prior_id = 0;
+    for boundary in ["A", "B", "A", "gone", "A"] {
+        let (_, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+        let mut next = prev.clone();
+        next.generation += 1;
+        if boundary == "gone" {
+            next.claude_account_family_pending.clear();
+        } else {
+            if next.claude_account_family_pending.is_empty() {
+                next.claude_account_family_pending = fixture().claude_account_family_pending;
+            }
+            let p = next
+                .claude_account_family_pending
+                .get_mut("synthetic-family")
+                .unwrap();
+            if p.census_window_end != boundary {
+                p.previous_windows.push(p.current.clone());
+                p.current.census_window_end = boundary.into();
+            }
+        }
+        cx.preflight(&prev, &next, &mut kinds_files::NoResumeHooks)
+            .unwrap();
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        delta(&prev, &next, &mut tx, &mut cx, std::iter::empty::<String>()).unwrap();
+        let key = mapper::key("account.current", "synthetic-family", 1).unwrap();
+        let h = tx.get(&key).unwrap().unwrap();
+        let (id, high, _): (Option<u64>, u64, Vec<u64>) = mapper::read(&mut tx, &h).unwrap();
+        if let Some(id) = id {
+            assert!(id > prior_id);
+            assert!(high > id);
+            prior_id = id;
+        }
+        let outcome = tx.commit(prev.generation, next.generation);
+        assert_eq!(outcome, DurableCommitOutcome::Committed(next.generation));
+        cx.post_commit(&outcome, &mut kinds_files::NoResumeHooks)
+            .unwrap();
+        let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&restored).unwrap(),
+            serde_json::to_vec(&next).unwrap()
+        );
+        prev = next;
+    }
+}
+
+#[test]
+fn on_open_runs_after_complete_hydration_and_per_file_stage_exclusion_retains_progress() {
+    #[derive(Default)]
+    struct Hooks {
+        opened: bool,
+    }
+    impl resume::ResumeHooks for Hooks {
+        fn on_open(
+            &mut self,
+            generation: u64,
+            _: &BTreeMap<String, resume::ResumeCheckpoint>,
+        ) -> Result<()> {
+            assert_eq!(generation, 1);
+            self.opened = true;
+            Ok(())
+        }
+        fn stage(
+            &mut self,
+            _: &ScanIndex,
+            _: &ScanIndex,
+            _: &BTreeMap<String, resume::ResumeCheckpoint>,
+        ) -> Result<resume::StagedCheckpoints> {
+            Ok(resume::StagedCheckpoints {
+                excluded: BTreeSet::from(["synthetic-file".into()]),
+                ..Default::default()
+            })
+        }
+    }
+    let (_scratch, mut db) = Scratch::store();
+    let prev = fixture();
+    commit_populate(&mut db, &prev);
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let mut hooks = Hooks::default();
+    let (prev, mut cx) = hydrate_txn_with_hooks(&mut tx, Scratch::binding(), &mut hooks).unwrap();
+    drop(tx);
+    assert!(hooks.opened);
+    let mut next = prev.clone();
+    next.generation += 1;
+    next.files.get_mut("synthetic-file").unwrap().size_bytes += 1;
+    next.upload_context_fingerprint = Some("independent-change".into());
+    cx.preflight(&prev, &next, &mut hooks).unwrap();
+    cx.retain_excluded(&prev, &mut next).unwrap();
+    assert_eq!(
+        next.files["synthetic-file"].size_bytes,
+        prev.files["synthetic-file"].size_bytes
+    );
+    let dirty = kinds_misc::dirty_fields(&prev, &next).unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    delta(&prev, &next, &mut tx, &mut cx, dirty).unwrap();
+    let result = tx.commit(prev.generation, next.generation);
+    assert_eq!(result, DurableCommitOutcome::Committed(next.generation));
+    cx.post_commit(&result, &mut hooks).unwrap();
+    let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&restored).unwrap(),
+        serde_json::to_vec(&next).unwrap()
+    );
+}
+
+#[test]
+fn census_evidence_larger_than_the_projected_row_cap_roundtrips() {
+    use base64::Engine as _;
+    let (_scratch, mut db) = Scratch::store();
+    let hashes: Vec<_> = (0_u64..100_000).flat_map(u64::to_be_bytes).collect();
+    let mut index = fixture();
+    index.claude_request_census = serde_json::from_value(serde_json::json!({"large-census":{
+        "v":1,"fp":"f".repeat(64),"w":17,"s":"exact",
+        "b":base64::engine::general_purpose::STANDARD.encode(hashes)
+    }}))
+    .unwrap();
+    assert!(
+        serde_json::to_vec(&index.claude_request_census)
+            .unwrap()
+            .len()
+            > MUTABLE_VALUE_BYTES as usize
+    );
+    commit_populate(&mut db, &index);
+    index.generation = 1;
+    let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&restored).unwrap(),
+        serde_json::to_vec(&index).unwrap()
+    );
 }

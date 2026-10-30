@@ -158,7 +158,7 @@ fn debt(last: Option<u64>) -> sampled_audit::GrowthRetention {
 struct PackedDebt<'a>(&'a sampled_audit::GrowthRetention);
 impl Value for PackedDebt<'_> {
     fn write(&self, out: &mut dyn Write) -> Result<()> {
-        let mut encoder = packed::Encoder::new(out);
+        let mut encoder = codec::Encoder::new(out);
         serde_json::to_writer(&mut encoder, self.0)?;
         encoder.finish()?;
         Ok(())

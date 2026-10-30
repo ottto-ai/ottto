@@ -187,7 +187,7 @@ fn carry(
     tx.read_value(&h, &mut bytes)?;
     let bytes = bytes.finish()?;
     let mut json = Builder::new(SCRATCH as u64)?;
-    packed::decode(bytes.reader(), &mut json)?;
+    codec::unpack(bytes.reader(), &mut json)?;
     let json = json.finish()?;
     let carry: Deferred = if h.value_version == 1 {
         // Expanded legacy JSON is already admitted to SCRATCH. Decode its
@@ -951,7 +951,7 @@ pub(super) fn plan(
         if has_deferred {
             admit_json(&manifest, SCRATCH)?;
             let key = carry_key()?;
-            let value = Arc::new(Payload::capture(&packed::Json(&manifest), SCRATCH as u64)?);
+            let value = Arc::new(Payload::capture(&codec::Json(&manifest), SCRATCH as u64)?);
             let h = preflight(&RowInput {
                 key: &key,
                 fixed: &Fixed::None,
