@@ -270,6 +270,8 @@ fn absent_parent_containment_guard_never_promotes_a_database() {
 #[test]
 fn damaged_and_oversized_fence_claims_hold_before_v1_containment() {
     for bytes in [
+        b"{\"storage_format\":2,".to_vec(),
+        b"{\"storage_format\":3,".to_vec(),
         b"{\"schema_version\":4,".to_vec(),
         format!(
             "{{\"schema_version\":4,\"padding\":\"{}\"}}",
@@ -996,4 +998,51 @@ fn sqlite_full_holds_across_reopen_until_a_complete_save_succeeds() {
     recovery().unwrap();
     assert!(save_with(&f.path, &mut retry, &EmptyMapper).unwrap());
     guard_external(&f.path, retry.persistence_v2.as_ref(), retry.generation).unwrap();
+}
+
+#[test]
+fn oversized_v1_storage_format_value_does_not_claim_v2_custody() {
+    let f = Fixture::new();
+    let bytes = format!(
+        "{{\"storage_format\":1,\"schema_version\":3,\"padding\":\"{}\"}}",
+        "x".repeat(8192)
+    );
+    fs::write(&f.path, &bytes).unwrap();
+    assert!(load_with(&f.path, false, &EmptyMapper).unwrap().is_none());
+    assert!(!save_with(&f.path, &mut ScanIndex::default(), &EmptyMapper).unwrap());
+    guard_containment_locked(&f.path).unwrap();
+    assert!(!states().lock().unwrap().contains_key(&f.path));
+    assert_eq!(fs::read(&f.path).unwrap(), bytes.as_bytes());
+}
+
+#[test]
+fn unpublished_import_does_not_reorder_v1_progress_admission() {
+    let f = Fixture::new();
+    fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
+    assert!(load_with(&f.path, true, &EmptyMapper).unwrap().is_none());
+    assert!(states().lock().unwrap().contains_key(&f.path));
+    assert!(!published(&f.path).unwrap());
+    f.published();
+    assert!(published(&f.path).unwrap());
+}
+
+#[test]
+fn tree_erasure_does_not_admit_legacy_or_progress_paths_to_route_cache() {
+    let f = Fixture::new();
+    let root = f.support.join("snapshots");
+    for namespace in 0..70 {
+        let dir = root.join("destinations").join(format!("{namespace:064x}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("claude_code-legacy.json"), b"{}").unwrap();
+        fs::write(dir.join("claude_code-legacy-upload-progress.json"), b"{}").unwrap();
+    }
+    erase_tree(&f.support).unwrap();
+    assert!(!states()
+        .lock()
+        .unwrap()
+        .keys()
+        .any(|p| p.starts_with(&root)));
+    // This hook closes owned runtimes; enclosing Forget owns tree deletion.
+    fs::remove_dir_all(&root).unwrap();
+    assert!(!root.exists());
 }

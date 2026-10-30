@@ -179,6 +179,55 @@ fn route_needed(path: &Path, switched: bool) -> Result<bool> {
             .contains_key(path)
         || fence::evidence(path)?)
 }
+/// Probe custody without admitting a v1 path to the route registry or decoding
+/// its index. A paused, unpublished import does not change progress ordering.
+pub(in super::super) fn published(path: &Path) -> Result<bool> {
+    if binding(path).is_none() {
+        return Ok(false);
+    }
+    let state = states()
+        .lock()
+        .map_err(|_| Hold::DbUnavailable)?
+        .get(path)
+        .cloned();
+    if let Some(state) = state {
+        if state.lock().map_err(|_| Hold::DbUnavailable)?.latched {
+            return Ok(true);
+        }
+    }
+    fence::evidence(path)
+}
+/// Priority belongs only to an already adopted Claude runtime. This lookup
+/// never admits a route, probes disk/switches, or adds an OFF-path failure.
+pub(in super::super) fn checkpoint_priority_active(path: &Path) -> bool {
+    if binding(path).is_none() {
+        return false;
+    }
+    let state = states()
+        .lock()
+        .ok()
+        .and_then(|states| states.get(path).cloned());
+    state.is_some_and(|state| {
+        state
+            .lock()
+            .is_ok_and(|state| state.current.as_ref().is_some_and(|runtime| runtime.active))
+    })
+}
+
+#[cfg(test)]
+pub(in super::super) fn checkpoint_priority_fixture(path: &Path, active: bool) {
+    with_state(path, |state| {
+        state.current = active.then(|| {
+            Arc::new(Runtime {
+                active: true,
+                session: Mutex::new(None),
+            })
+        });
+        Ok(())
+    })
+    .unwrap();
+}
+
 pub(super) fn observed(path: &Path) -> bool {
     let state = states()
         .lock()
@@ -221,6 +270,10 @@ pub(in super::super) fn load_locked(
     path: &Path,
     support: Option<&Path>,
 ) -> Result<Option<ScanIndex>> {
+    // Do not probe the Claude sentinel for Codex, Pi or unbound paths.
+    if binding(path).is_none() {
+        return Ok(None);
+    }
     load_with(path, enabled(support), &ClaudeMapper)
 }
 fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Option<ScanIndex>> {
@@ -233,9 +286,11 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
     let result = held(with_state(path, |state| {
         state.inventory_ready = false;
         state.original = None;
-        state.pass_written_start = telemetry::process_written_bytes();
         state.sample_v1 = switched;
         let pair = fence::reconcile(path, &binding, state.latched)?;
+        state.pass_written_start = (switched || pair.is_some())
+            .then(telemetry::process_written_bytes)
+            .flatten();
         if let Some((identity, db_path)) = pair {
             state.latched = true;
             if !switched {
@@ -928,58 +983,26 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
     })
 }
 
-/// Called by explicit source erasure and identity-forget/uninstall before the
-/// enclosing snapshot tree is removed. Never used by source disable/repair.
+/// Close/erase only live runtimes already owned by this process. The caller's
+/// existing whole-tree removal owns legacy files and unregistered artifacts;
+/// discovering those files here would consume the bounded route registry.
 pub(in super::super) fn erase_tree(support: &Path) -> Result<()> {
     let root = support.join("snapshots");
-    let mut paths: std::collections::BTreeSet<PathBuf> = states()
+    let routes: Vec<_> = states()
         .lock()
         .map_err(|_| Hold::DbUnavailable)?
-        .keys()
-        .filter(|p| p.starts_with(&root))
-        .cloned()
+        .iter()
+        .filter(|(path, _)| path.starts_with(&root))
+        .map(|(path, state)| (path.clone(), state.clone()))
         .collect();
-    fn discover(
-        dir: &Path,
-        depth: u8,
-        paths: &mut std::collections::BTreeSet<PathBuf>,
-    ) -> Result<()> {
-        if depth == 0 {
-            return Ok(());
-        }
-        let entries = match fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
+    for (path, state) in routes {
+        let live = {
+            let state = state.lock().map_err(|_| Hold::DbUnavailable)?;
+            state.runtimes.iter().any(|r| r.strong_count() != 0)
         };
-        for entry in entries {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                discover(&entry.path(), depth - 1, paths)?;
-                continue;
-            }
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if !name.starts_with("claude_code-") {
-                continue;
-            }
-            let name = name
-                .split(".json")
-                .next()
-                .filter(|_| name.contains(".json"));
-            if let Some(name) = name {
-                let path = dir.join(format!("{name}.json"));
-                if binding(&path).is_some() {
-                    paths.insert(path);
-                }
-            }
+        if !live {
+            continue;
         }
-        Ok(())
-    }
-    discover(&root, 4, &mut paths)?;
-    for path in paths {
         if path.parent().is_some_and(Path::is_dir) {
             let _lock = super::super::CheckpointLock::acquire(&path)?;
             erase_locked(&path, None)?;

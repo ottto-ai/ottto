@@ -44701,7 +44701,7 @@ fn take_codex_parse_reason_lines_for_test() -> Vec<String> {
 
 struct CheckpointLock {
     file: File,
-    path: PathBuf,
+    priority_path: Option<PathBuf>,
     maintenance: bool,
 }
 
@@ -44722,13 +44722,27 @@ impl CheckpointLock {
             .truncate(false)
             .open(&lock_path)
             .context("open local snapshot checkpoint lock")?;
-        // Serialize registration with a pending maintenance request. Only the
-        // due Claude source uses priority; ordinary flock behavior is preserved.
-        let mut owners = checkpoint_owners()
-            .0
-            .lock()
-            .map_err(|_| anyhow::anyhow!("checkpoint_owner_registry"))?;
-        if !maintenance && owners.maintenance.contains(path) {
+        // Only an active Claude v2 route participates in maintenance priority.
+        // Legacy Claude, Codex and Pi retain main's nonblocking flock behavior,
+        // including when the v2 checkpoint-owner registry is poisoned.
+        // Maintenance already owns a reservation even if its runtime was
+        // invalidated while it waited for the previous checkpoint owner.
+        let priority = maintenance || state_v2::checkpoint_priority_active(path);
+        let mut owners = if priority {
+            Some(
+                checkpoint_owners()
+                    .0
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("checkpoint_owner_registry"))?,
+            )
+        } else {
+            None
+        };
+        if !maintenance
+            && owners
+                .as_ref()
+                .is_some_and(|o| o.maintenance.contains(path))
+        {
             anyhow::bail!("state_v2_maintenance_pause");
         }
         #[cfg(unix)]
@@ -44739,10 +44753,12 @@ impl CheckpointLock {
                     .context("local snapshot checkpoint is owned by another daemon");
             }
         }
-        owners.owned.insert(path.to_owned());
+        if let Some(owners) = owners.as_mut() {
+            owners.owned.insert(path.to_owned());
+        }
         Ok(Self {
             file,
-            path: path.to_owned(),
+            priority_path: priority.then(|| path.to_owned()),
             maintenance,
         })
     }
@@ -44750,15 +44766,18 @@ impl CheckpointLock {
 
 impl Drop for CheckpointLock {
     fn drop(&mut self) {
-        let mut owners = checkpoint_owners().0.lock().ok();
+        let mut owners = self
+            .priority_path
+            .as_ref()
+            .and_then(|_| checkpoint_owners().0.lock().ok());
         #[cfg(unix)]
         unsafe {
             libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
-        if let Some(owners) = owners.as_mut() {
-            owners.owned.remove(&self.path);
+        if let (Some(owners), Some(path)) = (owners.as_mut(), self.priority_path.as_ref()) {
+            owners.owned.remove(path);
             if self.maintenance {
-                owners.maintenance.remove(&self.path);
+                owners.maintenance.remove(path);
             }
             checkpoint_owners().1.notify_all();
         }
@@ -93354,6 +93373,10 @@ pub(crate) fn state_v2_post_pass_observed() {
     state_v2::telemetry::plateau();
 }
 
+pub(crate) fn state_v2_custody_published(path: &Path) -> Result<bool> {
+    state_v2::published(path)
+}
+
 pub(crate) fn state_v2_before_collection(index: &ScanIndex) -> Result<()> {
     state_v2::before_collection(index)
 }
@@ -93363,7 +93386,19 @@ struct CheckpointOwners {
     owned: BTreeSet<PathBuf>,
     maintenance: BTreeSet<PathBuf>,
 }
+#[cfg(test)]
+thread_local! {
+    static CHECKPOINT_OWNERS_FOR_TEST: std::cell::Cell<Option<&'static (Mutex<CheckpointOwners>, std::sync::Condvar)>> = const { std::cell::Cell::new(None) };
+    static CHECKPOINT_OWNER_ACCESSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 fn checkpoint_owners() -> &'static (Mutex<CheckpointOwners>, std::sync::Condvar) {
+    #[cfg(test)]
+    {
+        CHECKPOINT_OWNER_ACCESSES.with(|count| count.set(count.get() + 1));
+        if let Some(registry) = CHECKPOINT_OWNERS_FOR_TEST.with(|registry| registry.get()) {
+            return registry;
+        }
+    }
     static OWNERS: std::sync::OnceLock<(Mutex<CheckpointOwners>, std::sync::Condvar)> =
         std::sync::OnceLock::new();
     OWNERS.get_or_init(|| {
@@ -93377,6 +93412,10 @@ impl CheckpointLock {
     /// Reserve the next lock turn before waiting for this process's owner.
     /// New normal work yields; another process's flock is a counted failure.
     fn acquire_for_maintenance(path: &Path) -> Result<Self> {
+        anyhow::ensure!(
+            state_v2::checkpoint_priority_active(path),
+            "state_v2_runtime_inactive"
+        );
         let registry = checkpoint_owners();
         let mut owners = registry
             .0
@@ -93423,6 +93462,67 @@ mod state_v2_maintenance_lock_tests {
     use super::*;
 
     #[test]
+    fn off_sources_never_consult_checkpoint_owners_even_when_poisoned() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-off-checkpoint-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let parent = root.join("b".repeat(64));
+        let paths = ["claude_code-test", "codex-test", "pi-test"]
+            .map(|source| parent.join(format!("{source}-scan-index.json")));
+        let registry = Box::leak(Box::new((
+            Mutex::new(CheckpointOwners::default()),
+            std::sync::Condvar::new(),
+        )));
+        // Thread-local isolation avoids poisoning the registry used by parallel
+        // v2 fixtures. Restore the override even if a regression panics.
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CHECKPOINT_OWNERS_FOR_TEST.with(|slot| slot.set(None));
+            }
+        }
+        CHECKPOINT_OWNERS_FOR_TEST.with(|slot| slot.set(Some(registry)));
+        let _restore = Restore;
+        registry.0.lock().unwrap().maintenance.extend(paths.clone());
+        for poisoned in [false, true] {
+            if poisoned {
+                assert!(std::panic::catch_unwind(|| {
+                    let _guard = registry.0.lock().unwrap();
+                    panic!("synthetic checkpoint-owner poison");
+                })
+                .is_err());
+                assert!(registry.0.is_poisoned());
+            }
+            for path in &paths {
+                CHECKPOINT_OWNER_ACCESSES.with(|count| count.set(0));
+                assert!(!state_v2::checkpoint_priority_active(path));
+                let lock = CheckpointLock::acquire(path).unwrap();
+                #[cfg(unix)]
+                {
+                    let error = CheckpointLock::acquire(path).err().unwrap();
+                    assert_eq!(
+                        error.to_string(),
+                        "local snapshot checkpoint is owned by another daemon"
+                    );
+                    assert_eq!(
+                        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                }
+                drop(lock);
+                drop(CheckpointLock::acquire(path).unwrap());
+                CHECKPOINT_OWNER_ACCESSES.with(|count| assert_eq!(count.get(), 0));
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn maintenance_reserves_the_next_turn_ahead_of_our_normal_work() {
         let root = std::env::temp_dir().join(format!(
             "ottto-ops-lock-{}-{}",
@@ -93433,8 +93533,13 @@ mod state_v2_maintenance_lock_tests {
                 .as_nanos()
         ));
         fs::create_dir(&root).unwrap();
-        let path = root.join("index.json");
+        let path = root
+            .join("a".repeat(64))
+            .join("claude_code-test-scan-index.json");
+        state_v2::checkpoint_priority_fixture(&path, true);
+        CHECKPOINT_OWNER_ACCESSES.with(|count| count.set(0));
         let normal = CheckpointLock::acquire(&path).unwrap();
+        CHECKPOINT_OWNER_ACCESSES.with(|count| assert!(count.get() > 0));
         let (entered, acquired) = std::sync::mpsc::channel();
         let (release, finish) = std::sync::mpsc::channel();
         let worker_path = path.clone();
@@ -93457,10 +93562,14 @@ mod state_v2_maintenance_lock_tests {
         assert!(owners.maintenance.contains(&path));
         drop(owners);
         assert!(CheckpointLock::acquire(&path).is_err());
+        // A failed reload may clear the active route before releasing its
+        // checkpoint. Maintenance must still clean up the turn it reserved.
+        state_v2::checkpoint_priority_fixture(&path, false);
         drop(normal);
         acquired
             .recv_timeout(std::time::Duration::from_secs(3))
             .unwrap();
+        state_v2::checkpoint_priority_fixture(&path, true);
         assert!(CheckpointLock::acquire(&path).is_err());
         release.send(()).unwrap();
         worker.join().unwrap();

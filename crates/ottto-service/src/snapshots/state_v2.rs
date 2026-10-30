@@ -12,11 +12,13 @@ mod fence;
 mod import;
 mod runtime;
 pub(super) mod telemetry;
+#[cfg(test)]
+pub(super) use runtime::checkpoint_priority_fixture;
 #[cfg(target_os = "macos")]
 pub(super) use runtime::invalidate_tree;
 pub(super) use runtime::Hold;
 pub(super) use runtime::{
-    after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
+    after_v1_locked, checkpoint_priority_active, published, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
     idle, load_locked, recovery_save_guard, save_locked,
 };
 mod codec;
