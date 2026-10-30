@@ -987,6 +987,8 @@ impl PipelineFixture {
         cycle: &PipelineCycle<'_>,
         before_classify: impl FnOnce(&mut ScanIndex),
     ) -> Vec<PipelinePage> {
+        assert!(crate::snapshots::claude_terminal_off());
+        let before_absence = crate::snapshots::claude_absence_counters_for_test();
         let mut before_classify = Some(before_classify);
         let mut pages: Vec<PipelinePage> = Vec::new();
         let mut parsed = BTreeSet::new();
@@ -1009,6 +1011,10 @@ impl PipelineFixture {
                     .terminal_off_service_round_serviced_for_test(&parsed);
             pages.push(page);
             if ended {
+                assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
+                let mut after = crate::snapshots::claude_absence_counters_for_test();
+                after.tombstone_hits = before_absence.tombstone_hits;
+                assert_eq!(after, before_absence, "ON walks grant no absence or tombstone credit");
                 return pages;
             }
         }
@@ -7242,4 +7248,31 @@ pub(super) fn exact_pipeline_accept(
         client_report: crate::client_report::ClientReport::empty(),
     })?;
     Ok(response)
+}
+
+#[test]
+#[serial(source_manifests)]
+fn terminal_off_new_unindexed_session_is_held_and_counted_behind_closed_fence() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let _manifests = SourceManifestTestGuard::new();
+    let fixture = PipelineFixture::new("terminal-off-new-session-fence");
+    fixture.baseline();
+    let session = "f9999999-9999-4999-8999-999999999999";
+    let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+    let mut state = serde_json::to_value(&index).unwrap();
+    state["claude_duplicate_request_witness_overflowed"] = serde_json::json!(true);
+    index = serde_json::from_value(state).unwrap();
+    index.save(&fixture.index_path).unwrap();
+    let path = fixture.root.join(format!("{session}.jsonl"));
+    assert!(!index.files.contains_key(path.to_string_lossy().as_ref()));
+    assert!(!index.claude_family_tombstoned_for_test(session));
+    std::fs::write(&path, pipeline_transcript_line(session, "req_new_fence", 0)).unwrap();
+    let pages = fixture.walk(9, &ABSENCE_CYCLE);
+    assert!(pages.iter().any(|page| page.parsed.contains(session)));
+    assert!(pages.iter().map(|page| page.scan.held_body_count).sum::<usize>() > 0);
+    assert!(pages.iter().any(|page| !page.held.is_empty()));
+    assert!(pages.iter().all(|page| page.uploaded.is_empty()));
+    assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
 }
