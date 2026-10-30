@@ -601,6 +601,13 @@ impl AcceptedBuckets {
             ..Default::default()
         });
     }
+    fn session_mut(&mut self, session: &str) -> Option<&mut AcceptedSession> {
+        let key = self.1.as_ref()?;
+        let epoch = key_epoch(key);
+        self.0
+            .get_mut(&session_key(key, session))
+            .filter(|state| state.key_epoch == epoch)
+    }
     /// The session's entry, refreshed as the last ACK; a full ledger evicts
     /// its least recently ACKed session (#909 LRU).
     fn session_entry(&mut self, session: &str) -> Option<&mut AcceptedSession> {
@@ -652,7 +659,12 @@ impl AcceptedBuckets {
         if buckets.len() > MAX_BUCKETS {
             return;
         }
-        let Some(entry) = self.session_entry(session) else {
+        // `record` normally settled (and LRU-refreshed) this ACK's session;
+        // refreshing again would only churn persisted bytes.
+        if self.session_mut(session).is_none() {
+            self.session_entry(session);
+        }
+        let Some(entry) = self.session_mut(session) else {
             return;
         };
         let key = entry.bound_key().clone();

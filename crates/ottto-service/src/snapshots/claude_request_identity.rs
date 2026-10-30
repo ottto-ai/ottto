@@ -1140,12 +1140,18 @@ fn apply_grouped_with_accepted(
     }
     // Markers must fit beside the stripped body; the newest ones are kept.
     // A dropped marker is a stripped proved row, so it counts as a refusal.
-    // Measured at the largest refusal count, so the final digits never grow.
-    item.request_identity_refusals = refusals.saturating_add(deferred.rows.len() as u64);
-    let unmarked = grouping
-        .item_bytes(item)
-        .saturating_sub(deferred.marker_bytes());
-    let dropped = deferred.keep_newest(MAX_ITEM_BYTES.saturating_sub(unmarked) / MARKER_BYTES);
+    // Measured at the largest refusal count, so the final digits never grow,
+    // and with a final-length fingerprint.
+    let dropped = if deferred.rows.is_empty() {
+        0
+    } else {
+        item.request_identity_refusals = refusals.saturating_add(deferred.rows.len() as u64);
+        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+        let unmarked = grouping
+            .item_bytes(item)
+            .saturating_sub(deferred.marker_bytes());
+        deferred.keep_newest(MAX_ITEM_BYTES.saturating_sub(unmarked) / MARKER_BYTES)
+    };
     let refusals = refusals.saturating_add(dropped);
     deferred.mark(item);
     deferred.count(item, retained, &mut counts);

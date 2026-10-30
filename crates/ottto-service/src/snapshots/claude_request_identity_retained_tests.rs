@@ -319,6 +319,7 @@ fn retained_gate_off_is_byte_identical_to_the_909_goldens() {
         for case in fixture.as_object().unwrap().values() {
             state.record_proved(&case["snapshots"][0], true, &[]);
         }
+        assert!(!state.is_empty());
     });
     assert_eq!(seeded, sticky_golden_cases(&|_| {}));
     // #909 pins these bytes; its own test owns the remaining receipt cases.
