@@ -3268,10 +3268,10 @@ fn pi_only_e_label_is_recorded_and_names_the_real_ledger_type() {
     );
 }
 
-/// Same-named twins: the pre-M-2 unlabelled `E` field and the labelled one.
+/// Synthetic two-field twins compare the unlabelled and sealed labelled arms.
 mod labelled_e_twins {
     use super::*;
-    pub(super) mod legacy {
+    pub(super) mod unlabelled {
         use super::*;
         #[derive(Default)]
         pub(crate) struct SnapshotAccumulator {
@@ -3310,40 +3310,39 @@ fn twin_bytes<T: Durable>(value: &T) -> Result<Vec<u8>, Refuse> {
 }
 
 /// [format] Pi native accounting and restore contract.
-/// E1 (d), mechanism: the labelled arm is the unlabelled arm for its label
-/// type. Same shape text and digest, same bytes, same refusal; bytes the old
-/// type wrote decode into the new type and re-encode byte-identically.
+/// The two synthetic arms have the same shape, bytes, decode and refusal.
 #[test]
 fn labelled_e_arm_is_wire_identical_to_the_unlabelled_arm() {
-    use labelled_e_twins::{labelled, legacy};
+    use labelled_e_twins::{labelled, unlabelled};
     assert_eq!(
-        twin_shape::<legacy::SnapshotAccumulator>(),
+        twin_shape::<unlabelled::SnapshotAccumulator>(),
         twin_shape::<labelled::SnapshotAccumulator>()
     );
-    let old = legacy::SnapshotAccumulator {
+    let plain = unlabelled::SnapshotAccumulator {
         n: 7,
         ..Default::default()
     };
-    let old_bytes = twin_bytes(&old).unwrap();
+    let plain_bytes = twin_bytes(&plain).unwrap();
     let new = labelled::SnapshotAccumulator {
         n: 7,
         ..Default::default()
     };
-    assert_eq!(twin_bytes(&new).unwrap(), old_bytes);
-    let mut d = Dec::new(&old_bytes);
+    assert_eq!(twin_bytes(&new).unwrap(), plain_bytes);
+    let mut d = Dec::new(&plain_bytes);
     let decoded = <labelled::SnapshotAccumulator as Durable>::take(&mut d).unwrap();
     d.finish().unwrap();
     assert_eq!(decoded.n, 7);
     assert!(decoded.seen_pi_usage_keys.is_empty());
-    assert_eq!(twin_bytes(&decoded).unwrap(), old_bytes);
+    assert_eq!(twin_bytes(&decoded).unwrap(), plain_bytes);
     let refused = Err(Refuse::NonEmpty("SnapshotAccumulator.seen_pi_usage_keys"));
-    let mut old = old;
-    old.seen_pi_usage_keys
+    let mut plain = plain;
+    plain
+        .seen_pi_usage_keys
         .insert("k".into(), PiUsageDedupState::default());
     let mut new = new;
     new.seen_pi_usage_keys
         .insert("k".into(), PiUsageDedupState::default());
-    assert_eq!(twin_bytes(&old), refused);
+    assert_eq!(twin_bytes(&plain), refused);
     assert_eq!(twin_bytes(&new), refused);
 }
 
