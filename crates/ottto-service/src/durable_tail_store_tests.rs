@@ -1762,6 +1762,48 @@ fn gc_verifies_cold_records_and_preserves_corrupt_bodies() {
     );
 }
 
+/// The sweep erases only records of another context that `purge` condemns, so
+/// a live record and a record the settings still permit both survive.
+#[test]
+fn purge_other_context_deletes_only_condemned_records_of_other_contexts() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let transcript = scratch.transcript("t.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let binding_at = |n: usize, context: &str| {
+        let mut b = binding(context, "scope", ("fp", None));
+        b.key = key_digest(DurableSource::ClaudeCode, &format!("key-{n}"));
+        b
+    };
+    let bindings = [
+        binding_at(0, "acct-a"),
+        binding_at(1, "acct-b"),
+        binding_at(2, "acct-b"),
+    ];
+    store
+        .write_after_save(
+            &lock,
+            1,
+            0,
+            bindings
+                .iter()
+                .map(|b| pending(b.clone(), certificate(&transcript), 1))
+                .collect(),
+        )
+        .unwrap();
+    let mut seen = 0;
+    let removed = store
+        .purge_other_context(&lock, &bindings[0].context, |_| {
+            seen += 1;
+            seen == 1
+        })
+        .unwrap();
+    assert_eq!((removed, seen), (1, 2), "the live record is not offered");
+    assert_eq!(store.counters().records_invalidated, 1);
+    assert_eq!(store.counters().disk_records, 2);
+    found(store.read(&bindings[0].key));
+}
+
 /// F2: invalidating held or reverted selections deletes exactly their
 /// records; a later read of them is Missing.
 #[test]

@@ -2163,6 +2163,44 @@ impl DurableTailStore {
         Ok(removed)
     }
 
+    /// Deletes each verified record of this page bound to another context
+    /// whose body `purge` names, whatever its mutation proof: such a record
+    /// can never restore in `live_context`, and its literals may not stay.
+    /// A pending key has its own settlement and keeps its record.
+    pub(crate) fn purge_other_context<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        live_context: &Digest32,
+        mut purge: impl FnMut(&[u8]) -> bool,
+    ) -> io::Result<usize> {
+        self.check_writer(writer)?;
+        if !self.usable(Some(writer)) {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        for key in self.inventory()? {
+            if self.pending.contains_key(&key) {
+                continue;
+            }
+            let ReadOutcome::Found(record) = self.read(&key) else {
+                continue;
+            };
+            if record.record.binding.context == *live_context || !purge(&record.record.body) {
+                continue;
+            }
+            remove_if_present(&self.record_path(&key))?;
+            self.durable.remove(&key);
+            removed += 1;
+        }
+        if removed > 0 {
+            self.sync_store()?;
+            self.counters.records_invalidated += removed as u64;
+            let (on_disk, unlisted) = self.scan_disk()?;
+            self.set_disk_level(&on_disk, unlisted);
+        }
+        Ok(removed)
+    }
+
     fn check_writer<W: SingleWriter + ?Sized>(&self, writer: &W) -> io::Result<()> {
         if self.dir.starts_with(writer.state_dir()) {
             Ok(())
