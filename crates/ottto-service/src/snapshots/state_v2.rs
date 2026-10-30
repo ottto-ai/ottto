@@ -784,6 +784,7 @@ fn control_name(name: &str) -> bool {
             | "baseline_digest"
             | "repair_commitment"
             | "unit_schedule"
+            | "field_presence"
             | "limits"
     )
 }

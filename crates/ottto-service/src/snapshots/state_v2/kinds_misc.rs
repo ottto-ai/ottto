@@ -1271,6 +1271,9 @@ pub(super) fn populate(
 ) -> Result<()> {
     control("schema_version", &index.schema_version, txn, cx)?;
     control("generation", &index.generation, txn, cx)?;
+    // Presence belongs to the original root registry, including fields whose
+    // values are encoded by FILES, ACCOUNTS and CENSUS.
+    control("field_presence", &cx.presence.clone(), txn, cx)?;
     macro_rules! put {
         (claude_desktop_store_inventory, $kind:literal) => {
             // A0 decodes and drops the retired H digest. Only original presence
@@ -1370,6 +1373,13 @@ pub(super) fn hydrate_txn(
 ) -> Result<()> {
     index.schema_version = read_control("schema_version", txn, cx)?;
     index.generation = read_control("generation", txn, cx)?;
+    cx.presence = read_control("field_presence", txn, cx)?;
+    ensure!(
+        cx.presence
+            .keys()
+            .all(|name| super::super::lenient_decode::FIELDS.contains(&name.as_str())),
+        "state_v2_unknown_presence_field"
+    );
     macro_rules! get {
         (known_configured_scan_roots, $kind:literal) => {
             index.known_configured_scan_roots =
@@ -1658,7 +1668,9 @@ pub(super) fn delta(
         write_holds(next, txn, cx)?;
     }
     cx.delta = false;
-    cx.finish(txn, &dirty)
+    cx.finish(txn, &dirty)?;
+    let presence = cx.presence.clone();
+    control("field_presence", &presence, txn, cx)
 }
 
 /// No MISC row refers to shared evidence. Hash strings in accepted incidence,
@@ -1670,7 +1682,7 @@ pub(super) fn references(
 ) -> Result<()> {
     match &header.key {
         RowKey::Meta(name) => ensure!(
-            CONTROLS.contains(&name.as_str()),
+            CONTROLS.contains(&name.as_str()) || name == "field_presence",
             "state_v2_misc_unknown_control"
         ),
         RowKey::Record { kind, .. } => {
