@@ -162,7 +162,7 @@ fn c1b_start(row: &serde_json::Value) -> C1bStart {
 
 /// Whether a page ended its traversal: complete (no traversal is retained) or
 /// red (the retained traversal has nothing left to walk).
-fn c1b_traversal_ended(index: &ScanIndex) -> (bool, bool) {
+pub(in crate::snapshot_sync) fn c1b_traversal_ended(index: &ScanIndex) -> (bool, bool) {
     let saved = serde_json::to_value(index).expect("encode the saved index");
     match saved.get("traversal").filter(|value| !value.is_null()) {
         None => (true, false),

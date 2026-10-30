@@ -1356,3 +1356,334 @@ fn terminal_off_empty_context_memo_is_bounded_counts_eviction_and_never_grants_c
     assert_eq!(memo.evictions, 2);
     assert_eq!(memo.keys.len(), TERMINAL_OFF_EMPTY_CONTEXT_KEYS);
 }
+
+fn freshness_line(member: &str, request: &str) -> String {
+    format!(
+        "{}\n",
+        json!({"timestamp":"2026-08-20T10:01:00Z", "sessionId":member, "type":"assistant", "requestId":format!("{member}:{request}"), "message":{"id":format!("{member}:{request}"), "model":"claude-opus-4-8", "usage":{"input_tokens":10,"output_tokens":2}}})
+    )
+}
+
+fn freshness_at(seconds: u64) -> String {
+    OffsetDateTime::from_unix_timestamp(seconds as i64)
+        .unwrap()
+        .format(&Rfc3339)
+        .unwrap()
+}
+
+/// The real scanner drains a backlog while one selected entry retains genuine
+/// cleared-fingerprint debt. No ACK/receipt or completion is synthesized.
+#[test]
+fn terminal_off_saturated_drain_ceiling_picks_up_unhinted_create_and_rename_over() {
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-saturated-ceiling");
+    let debt = scratch.join(format!("{OFF_ROOT}.jsonl"));
+    fs::write(&debt, freshness_line(OFF_ROOT, "X")).unwrap();
+    let mut index = off_index();
+    off_scan(&mut index, &scratch, W1, 2);
+    let debt_key = local_index_key(&debt);
+    index
+        .files
+        .get_mut(&debt_key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    // 25 ordinary files, page=2: enough backlog for a real 1800s ceiling.
+    for n in 0..25 {
+        let session = format!("{n:08x}-2222-4222-8222-222222222222");
+        fs::write(
+            scratch.join(format!("{session}.jsonl")),
+            freshness_line(&session, "X"),
+        )
+        .unwrap();
+    }
+    let start = rfc3339_unix_seconds(W2).unwrap();
+    let mut walks = 0;
+    let mut coalesced = 0;
+    let mut forced = 0;
+    let mut consumed = BTreeMap::<PathBuf, usize>::new();
+    let newcomer = scratch.join("f1111111-1111-4111-8111-111111111111.jsonl");
+    let mut replaced = None;
+    let mut new_seen = None;
+    let mut replaced_seen = None;
+    let mut ended = false;
+    for pass in 0..40 {
+        let now = start + pass * 300;
+        if pass == 2 {
+            fs::write(
+                &newcomer,
+                freshness_line("f1111111-1111-4111-8111-111111111111", "NEW"),
+            )
+            .unwrap();
+            let path = consumed.keys().find(|p| **p != debt).unwrap().clone();
+            let prior = fs::metadata(&path).unwrap();
+            let temporary = scratch.join("replacement.tmp");
+            // Same path, length and mtime. Only physical identity changes.
+            fs::copy(&path, &temporary).unwrap();
+            File::open(&temporary)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(prior.modified().unwrap()))
+                .unwrap();
+            fs::rename(&temporary, &path).unwrap();
+            assert_ne!(
+                physical_identity(&fs::metadata(&path).unwrap()),
+                physical_identity(&prior)
+            );
+            replaced = Some(path);
+        }
+        let ((scan, reads), rows) = crate::local_resource_diagnostics::capture(|| {
+            terminal_contract_retry::source_acquisitions(|| {
+                off_scan(&mut index, &scratch, &freshness_at(now), 2)
+            })
+        });
+        assert!(scan.scanned_file_count <= 2);
+        assert!(!scan.census_complete);
+        assert!(index.accepted_snapshot_fingerprints.is_empty());
+        for (path, count) in reads {
+            *consumed.entry(path.clone()).or_default() += count;
+            if path == newcomer {
+                new_seen.get_or_insert(now);
+            }
+            if replaced.as_ref() == Some(&path) && pass >= 2 {
+                replaced_seen.get_or_insert(now);
+            }
+        }
+        for pending in &index.traversal.as_ref().unwrap().pending_candidates {
+            if consumed.contains_key(&pending.path)
+                && pending.path != debt
+                && replaced.as_ref() != Some(&pending.path)
+            {
+                panic!("unchanged consumed path re-enqueued: {:?}", pending.path);
+            }
+        }
+        for row in rows {
+            if row["stage"] == "terminal_off_freshness" {
+                coalesced += row["counts"]["rediscovery_coalesced"].as_u64().unwrap();
+                forced += row["counts"]["root_walk_forced_by_freshness_cap"]
+                    .as_u64()
+                    .unwrap();
+                assert!(row["counts"]["walk_interval_seconds"].is_u64());
+                assert!(row["counts"]["oldest_unscanned_age_seconds"].is_u64());
+                assert_eq!(row["counts"]["bytes"], 0);
+            }
+        }
+        // Actual root-walk starts are separately observable in the captured
+        // cadence deadline; no test clock or memo-expiry shortcut.
+        let scope = terminal_off_rediscovery_scope(&index).unwrap();
+        let due = TERMINAL_OFF_REDISCOVERY.with(|m| m.borrow()[&scope]);
+        if due == now + 300 {
+            walks += 1;
+        }
+        // Keep the input's explicit unsettled obligation, without adding a new
+        // object/revision or resetting the retained traversal/round.
+        index
+            .files
+            .get_mut(&debt_key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        ended = crate::snapshot_sync::terminal_off_traversal_ended_for_test(&index);
+        if ended {
+            assert!(pass >= 6, "ceiling must actually be exercised");
+            assert!(
+                walks
+                    <= (pass * 300).div_ceil(
+                        terminal_off_discovery::TERMINAL_OFF_FRESHNESS_WALK_CEILING_SECONDS
+                    ) + 1
+            );
+            break;
+        }
+    }
+    assert!(
+        ended,
+        "c1b_traversal_ended within bounded pages, no queue refill"
+    );
+    assert!(coalesced > 0);
+    assert!(forced > 0);
+    let ceiling = terminal_off_discovery::TERMINAL_OFF_FRESHNESS_WALK_CEILING_SECONDS;
+    assert!(new_seen.unwrap() - (start + 600) <= ceiling);
+    assert!(replaced_seen.unwrap() - (start + 600) <= ceiling);
+    for (path, count) in consumed {
+        if path == debt {
+            assert!(count <= 2, "once-only clear debt per admitted round");
+        } else if replaced.as_ref() == Some(&path) {
+            assert_eq!(count, 2, "original + new inode");
+        } else {
+            assert_eq!(
+                count, 1,
+                "unchanged consumed path is not re-enqueued: {path:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn terminal_off_targeted_adoption_is_page_bounded_deduplicated_and_never_census() {
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-targeted-cohort");
+    for n in 0..9 {
+        let session = format!("{n:08x}-2222-4222-8222-222222222222");
+        fs::write(
+            scratch.join(format!("{session}.jsonl")),
+            freshness_line(&session, "X"),
+        )
+        .unwrap();
+    }
+    let mut index = off_index();
+    off_scan(&mut index, &scratch, W1, 10);
+    assert_eq!(index.files.len(), 9);
+    let prior_context = index.upload_context_fingerprint.clone();
+    let observed = index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .observed_index_keys
+        .clone();
+    let now = rfc3339_unix_seconds(W1).unwrap() + 1;
+    let mut uploader = crate::snapshot_sync::upload_context_receipt_tests::Uploader::new(
+        SnapshotSource::ClaudeCode,
+    );
+    uploader.prepare_for_scan(SnapshotSource::ClaudeCode, "d".repeat(64), &mut index);
+    terminal_off_discovery::prepare(&mut index, now, W1, false);
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        terminal_off_discovery::targeted(&mut index, now, 3)
+    });
+    let queue = &index.traversal.as_ref().unwrap().pending_candidates;
+    assert_eq!(queue.len(), 3);
+    assert!(queue.iter().all(|p| !p.census_member && !p.watcher_hint));
+    assert_eq!(
+        index.traversal.as_ref().unwrap().observed_index_keys,
+        observed
+    );
+    assert_eq!(index.upload_context_fingerprint, prior_context);
+    assert!(index
+        .files
+        .values()
+        .all(|e| e.upload_context_receipt.is_none()));
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["stage"] == "terminal_off_targeted")
+            .count(),
+        3
+    );
+    assert!(rows
+        .iter()
+        .filter(|r| r["stage"] == "terminal_off_targeted")
+        .all(|r| r["counts"]["cause"] == "upload_context" && r["counts"]["bytes"] == 0));
+    terminal_off_discovery::targeted(&mut index, now, 3);
+    let queue = &index.traversal.as_ref().unwrap().pending_candidates;
+    assert_eq!(queue.len(), 6, "next three, not duplicates");
+    assert_eq!(
+        queue.iter().map(|p| &p.path).collect::<BTreeSet<_>>().len(),
+        6
+    );
+    assert!(index.accepted_snapshot_fingerprints.is_empty());
+}
+
+#[test]
+fn terminal_off_watcher_hint_keeps_same_stat_park_then_stat_change_reads_once() {
+    use super::claude_request_census::{ClaudeRequestCensusRecord, ClaudeRequestCensusShape};
+    sampled_audit::reset_open_backoff_for_test();
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-watcher-park");
+    let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
+    fs::write(&path, freshness_line(OFF_ROOT, "X")).unwrap();
+    let mut index = off_index();
+    off_scan(&mut index, &scratch, W1, 10);
+    let key = local_index_key(&path);
+    let now = rfc3339_unix_seconds(W1).unwrap() + 1;
+    let due = now - 1;
+    index.claude_request_census.insert(
+        key.clone(),
+        ClaudeRequestCensusRecord::synthetic_for_test(
+            &"ab".repeat(32),
+            0,
+            ClaudeRequestCensusShape::IdentityIncomplete,
+            vec![1],
+        )
+        .with_unverified_for_test(true),
+    );
+    index.held_audit_progress = Some(sampled_audit::HeldAuditProgress {
+        key: key.clone(),
+        due,
+        attempted: false,
+    });
+    for _ in 0..8 {
+        sampled_audit::progress_open_failed(&mut index, &key, now);
+    }
+    let walk = |index: &mut ScanIndex| {
+        sampled_scan::with_test_now(now, || {
+            scan_source_roots_with_limit_and_attribution(
+                SnapshotSource::ClaudeCode,
+                &[scratch.to_path_buf()],
+                index,
+                W1,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                true,
+                None,
+                None,
+                std::slice::from_ref(&path),
+                false,
+            )
+            .unwrap()
+        })
+    };
+    for _ in 0..3 {
+        let (scan, reads) = terminal_contract_retry::source_acquisitions(|| walk(&mut index));
+        assert_eq!(scan.scanned_file_count, 0);
+        assert!(reads.is_empty());
+        assert_eq!(sampled_audit::failed_open_debt(&key, now), Some(due));
+        assert!(sampled_audit::candidate_open_blocked(&key, now));
+    }
+    use std::io::Write;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(freshness_line(OFF_ROOT, "Y").as_bytes())
+        .unwrap();
+    let (scan, reads) = terminal_contract_retry::source_acquisitions(|| walk(&mut index));
+    assert_eq!(scan.scanned_file_count, 1);
+    assert_eq!(reads.get(&path), Some(&1));
+    assert!(!scan.census_complete);
+    assert!(index.accepted_snapshot_fingerprints.is_empty());
+    sampled_audit::reset_open_backoff_for_test();
+}
+
+#[test]
+fn terminal_off_two_blocking_held_keys_wait_for_the_existing_six_hour_floor() {
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-held-pair-floor");
+    let roots = [OFF_ROOT, "b2222222-2222-4222-8222-222222222222"];
+    for root in roots {
+        fs::write(
+            scratch.join(format!("{root}.jsonl")),
+            freshness_line(root, "X"),
+        )
+        .unwrap();
+    }
+    let mut index = off_index();
+    off_scan(&mut index, &scratch, W1, 10);
+    index
+        .mark_bounded_sweep_held_by_families(Some(&roots.map(str::to_owned).into_iter().collect()));
+    for entry in index.files.values_mut() {
+        entry.source_file_fingerprint.clear();
+    }
+    let start = rfc3339_unix_seconds(W1).unwrap();
+    for delta in [1, 300, 1800, 6 * 3600 - 1] {
+        let (scan, reads) = terminal_contract_retry::source_acquisitions(|| {
+            off_scan(&mut index, &scratch, &freshness_at(start + delta), 10)
+        });
+        assert_eq!(scan.scanned_file_count, 0, "no early held offer");
+        assert!(reads.is_empty());
+        assert!(index.accepted_snapshot_fingerprints.is_empty());
+    }
+    let (scan, reads) = terminal_contract_retry::source_acquisitions(|| {
+        off_scan(&mut index, &scratch, &freshness_at(start + 6 * 3600), 10)
+    });
+    assert_eq!(
+        reads.values().sum::<usize>(),
+        2,
+        "both held obligations, exactly once at the floor"
+    );
+    assert_eq!(scan.scanned_file_count, 2);
+    assert!(!scan.census_complete);
+    assert!(index.accepted_snapshot_fingerprints.is_empty());
+}

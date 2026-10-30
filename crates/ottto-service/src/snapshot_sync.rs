@@ -12071,6 +12071,11 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn terminal_off_traversal_ended_for_test(index: &ScanIndex) -> bool {
+    tests::p12_pipeline_original_tests::proof_rearm_idempotence_pipeline_tests::stale_family_carry_pipeline_tests::c1b_traversal_ended(index).0
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     mod terminal_contract_retry_tests {
@@ -23218,11 +23223,11 @@ mod tests {
     mod p12_base_exit_tests {
         include!("snapshot_sync/p12_base_exit_tests.rs");
     }
-    mod p12_pipeline_original_tests {
+    pub(in crate::snapshot_sync) mod p12_pipeline_original_tests {
         include!("snapshot_sync/p12_pipeline_original_tests.rs");
-        mod proof_rearm_idempotence_pipeline_tests {
+        pub(in crate::snapshot_sync) mod proof_rearm_idempotence_pipeline_tests {
             include!("snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs");
-            mod stale_family_carry_pipeline_tests {
+            pub(in crate::snapshot_sync) mod stale_family_carry_pipeline_tests {
                 include!("snapshot_sync/stale_family_carry_pipeline_tests.rs");
                 mod unhealthy_retry_reread_acceptance_tests {
                     include!("snapshot_sync/unhealthy_retry_reread_acceptance_tests.rs");
