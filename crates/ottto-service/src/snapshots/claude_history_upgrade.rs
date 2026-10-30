@@ -381,6 +381,32 @@ pub(super) fn claude_path_twin_groups(
         .collect()
 }
 
+/// The native read set for readable seeds: twins force every known member
+/// of their root family, as do independent authority-forced roots. Shared by
+/// scoped estimate/apply/preparation and native forced-family selection.
+pub(super) fn claude_read_closure<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    family_keys: impl IntoIterator<Item = &'a String>,
+    twins: &ClaudeTwinGroups,
+    forced_roots: &BTreeSet<String>,
+) -> BTreeSet<PathBuf> {
+    let mut paths = paths
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect::<BTreeSet<_>>();
+    let mut roots = crate::snapshots::claude_request_money::e2::selected_twin_roots(
+        paths.iter().map(PathBuf::as_path),
+        twins,
+    );
+    roots.extend(forced_roots.iter().cloned());
+    paths.extend(family_keys.into_iter().filter_map(|key| {
+        let path = Path::new(key);
+        let member = super::claude_index_path_member_ref(path)?;
+        roots.contains(member.root).then(|| path.to_path_buf())
+    }));
+    paths
+}
+
 /// One opened-birth probe of a path (metadata only, no content read), with
 /// the test seam that stands in for creation time on Linux.
 pub(super) fn probe_opened_birth(

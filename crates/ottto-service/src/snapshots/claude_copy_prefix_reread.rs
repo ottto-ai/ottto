@@ -27,12 +27,19 @@ struct Request {
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Estimate {
     window_days: u64,
+    listed_files: usize,
+    listed_bytes: u64,
+    #[serde(rename = "closure_files")]
     files: usize,
+    #[serde(rename = "closure_bytes")]
     bytes: u64,
+    added_by_twins_files: usize,
+    added_by_twins_bytes: u64,
     pages: usize,
     blocked_files: usize,
     runnable_files: usize,
     runnable_bytes: u64,
+    blocked_bytes: u64,
     pacing_floor_seconds: u64,
     pacing_cold_seconds: u64,
 }
@@ -57,8 +64,8 @@ fn member(path: &Path) -> Result<Member> {
         "scope requires absolute paths"
     );
     ensure!(
-        claude_index_path_member_ref(path).is_some_and(|m| m.subagent_stem.is_none()),
-        "scope requires Claude main files"
+        claude_index_path_member_ref(path).is_some(),
+        "scope requires Claude member files"
     );
     let canonical = fs::canonicalize(path)?;
     ensure!(canonical == path, "scope refuses symlink paths");
@@ -109,35 +116,72 @@ fn runnable(member: &Member, now: u64, days: u64) -> bool {
         && member.bytes <= body_witness_adoption_byte_budget()
         && in_window(member, now, days)
 }
-fn estimate(request: &Request, now: u64) -> Estimate {
+// Native path twins reserve together, including when their combined bytes
+// exceed a page even though every physical member fits by itself.
+fn read_groups(request: &Request) -> Vec<Vec<&Member>> {
+    let mut groups = BTreeMap::new();
+    for member in &request.members {
+        let identity = claude_index_path_member_ref(&member.path).expect("validated member");
+        groups
+            .entry((identity.root, identity.subagent_stem))
+            .or_insert_with(Vec::new)
+            .push(member);
+    }
+    let mut groups = groups.into_values().collect::<Vec<_>>();
+    groups.sort_by(|a, b| (a[0].birth, &a[0].path).cmp(&(b[0].birth, &b[0].path)));
+    groups
+}
+fn group_runnable(group: &[&Member], now: u64, days: u64) -> bool {
+    group.iter().all(|m| runnable(m, now, days))
+        && group.iter().map(|m| m.bytes).sum::<u64>() <= body_witness_adoption_byte_budget()
+}
+fn estimate(
+    request: &Request,
+    listed: &Request,
+    added_by_twins: &BTreeSet<PathBuf>,
+    now: u64,
+) -> Estimate {
     let mut pages: usize = 0;
     let mut files = 0;
     let mut bytes = 0_u64;
     let mut blocked = 0;
     let mut runnable_files = 0;
     let mut runnable_bytes = 0;
-    for m in &request.members {
-        if !runnable(m, now, request.window_days) {
-            blocked += 1;
+    let mut blocked_bytes = 0;
+    for group in read_groups(request) {
+        let group_bytes = group.iter().map(|m| m.bytes).sum::<u64>();
+        if !group_runnable(&group, now, request.window_days) {
+            blocked += group.len();
+            blocked_bytes += group_bytes;
             continue;
         }
         if files == 0
-            || files >= body_witness_adoption_page_budget()
-            || bytes.saturating_add(m.bytes) > body_witness_adoption_byte_budget()
+            || files + group.len() > body_witness_adoption_page_budget()
+            || bytes.saturating_add(group_bytes) > body_witness_adoption_byte_budget()
         {
             pages += 1;
             files = 0;
             bytes = 0;
         }
-        files += 1;
-        bytes += m.bytes;
-        runnable_files += 1;
-        runnable_bytes += m.bytes;
+        files += group.len();
+        bytes += group_bytes;
+        runnable_files += group.len();
+        runnable_bytes += group_bytes;
     }
     let gaps = pages.saturating_sub(1) as u64;
     let (floor, cold) = crate::snapshot_sync::copy_prefix_pacing_seconds();
     Estimate {
         window_days: request.window_days,
+        listed_files: listed.members.len(),
+        listed_bytes: listed.members.iter().map(|m| m.bytes).sum(),
+        added_by_twins_files: added_by_twins.len(),
+        added_by_twins_bytes: request
+            .members
+            .iter()
+            .filter(|m| added_by_twins.contains(&m.path))
+            .map(|m| m.bytes)
+            .sum(),
+        blocked_bytes,
         files: request.members.len(),
         bytes: request.members.iter().map(|m| m.bytes).sum(),
         pages,
@@ -149,21 +193,105 @@ fn estimate(request: &Request, now: u64) -> Estimate {
     }
 }
 
-/// An operator-supplied private JSON array of exact main-file paths defines
-/// the affected copy families. Estimate reads only scope + filesystem metadata.
-/// Apply publishes a private request; it neither enables nor runs collection.
-pub fn run(scope: &Path, support: &Path, apply: bool, window_days: u64) -> Result<Estimate> {
+/// Compute precisely the native family expansion from the index metadata.
+/// All indexed keys are retained here: an unfinished census cannot narrow the
+/// operator's request. Preparation rejects any change before re-owing a file.
+fn closure(index: &ScanIndex, listed: &Request) -> Result<(Request, BTreeSet<PathBuf>)> {
+    let paths = listed
+        .members
+        .iter()
+        .map(|m| m.path.as_path())
+        .collect::<Vec<_>>();
+    let twins = claude_history_upgrade::claude_path_twin_groups(index, &BTreeSet::new());
+    let keys = index
+        .files
+        .keys()
+        .chain(
+            index
+                .traversal
+                .as_ref()
+                .into_iter()
+                .flat_map(|t| t.observed_index_keys.iter()),
+        )
+        .collect::<BTreeSet<_>>();
+    let twin_set = claude_history_upgrade::claude_read_closure(
+        paths.iter().copied(),
+        keys.iter().copied(),
+        &twins,
+        &BTreeSet::new(),
+    );
+    // Authority quarantine can independently force a native family. Scheduling
+    // its complete family is conservative and makes the forecast exact too.
+    let forced = paths
+        .iter()
+        .filter_map(|path| claude_index_path_member_ref(path))
+        .filter(|m| index.claude_usage_authority_quarantine.contains_key(m.root))
+        .map(|m| m.root.to_owned())
+        .collect();
+    let closed = claude_history_upgrade::claude_read_closure(
+        paths.iter().copied(),
+        keys.iter().copied(),
+        &twins,
+        &forced,
+    );
+    let listed_paths = paths.into_iter().collect::<BTreeSet<_>>();
+    let added_by_twins = twin_set
+        .into_iter()
+        .filter(|p| !listed_paths.contains(p.as_path()))
+        .collect();
+    Ok((
+        plan(
+            closed.iter().map(|p| member(p)).collect::<Result<_>>()?,
+            listed.window_days,
+        )?,
+        added_by_twins,
+    ))
+}
+
+/// Private listed main/proof-holder paths plus an explicit native index define
+/// the cohort. Read only index metadata and filesystem metadata, never bodies.
+/// Apply publishes the full closure; it neither enables nor runs collection.
+pub fn run(
+    scope: &Path,
+    support: &Path,
+    index_path: &Path,
+    apply: bool,
+    window_days: u64,
+) -> Result<Estimate> {
     let paths: Vec<PathBuf> = bounded_json(scope)?;
     ensure!(
         !paths.is_empty() && paths.len() <= MAX_BACKFILL_FILES_PER_SOURCE,
         "scope exceeds existing file bound"
     );
-    let request = plan(
+    ensure!(
+        paths
+            .iter()
+            .all(|p| claude_index_path_member_ref(p).is_some_and(|m| m.subagent_stem.is_none())),
+        "scope requires Claude main files"
+    );
+    let listed = plan(
         paths.iter().map(|p| member(p)).collect::<Result<_>>()?,
         window_days,
     )?;
+    // Unlike ScanIndex::load this reader takes no checkpoint lock, repairs
+    // nothing and creates no state. Invalid/incomplete state fails closed.
+    let index = read_scan_index_representation(index_path, "estimate", "claude_code", None)?;
+    ensure!(
+        index.persistence_available() && index.decode_holds.is_empty(),
+        "scope index unavailable"
+    );
+    ensure!(
+        listed
+            .members
+            .iter()
+            .all(|m| index.files.contains_key(&local_index_key(&m.path))),
+        "scope is not indexed"
+    );
+    let (request, added_by_twins) = closure(&index, &listed)?;
     let counts = estimate(
         &request,
+        &listed,
+        &added_by_twins,
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
     );
     if apply {
@@ -232,12 +360,28 @@ pub(crate) fn prepare(
     }
     let request: Request = bounded_json(&path)?;
     let mut request = plan(request.members, request.window_days)?;
+    let (closed, _) = closure(index, &request)?;
+    ensure!(
+        closed
+            .members
+            .iter()
+            .map(|m| &m.path)
+            .collect::<BTreeSet<_>>()
+            == request.members.iter().map(|m| &m.path).collect(),
+        "scope closure changed; request refused"
+    );
     ensure!(
         request.window_days == effective_backfill_window_days(window_days),
         "scope window changed; request refused"
     );
     let scan_now =
         rfc3339_unix_seconds(collected_at).ok_or_else(|| anyhow::anyhow!("invalid scan clock"))?;
+    ensure!(
+        read_groups(&request)
+            .iter()
+            .all(|g| group_runnable(g, scan_now, request.window_days)),
+        "scope outside scan window or native twin-group size bounds"
+    );
     // Match discovery's supported configured-root symlink semantics. Scope
     // members and indexed keys use the resolved spelling, never a descendant
     // symlink or the configured alias.
@@ -275,7 +419,7 @@ pub(crate) fn prepare(
             "scope differs from indexed extent"
         );
         let session = claude_index_path_member_ref(&m.path)
-            .expect("validated main")
+            .expect("validated member")
             .root;
         m.birth = index
             .claude_money_birth_store

@@ -1,7 +1,13 @@
 use super::*;
 
 fn run(scope: &Path, support: &Path, apply: bool) -> Result<Estimate> {
-    super::run(scope, support, apply, BACKFILL_WINDOW_DAYS)
+    super::run(
+        scope,
+        support,
+        &scope.parent().unwrap().join("scan-index.json"),
+        apply,
+        BACKFILL_WINDOW_DAYS,
+    )
 }
 fn prepare(index: &mut ScanIndex, support: &Path, roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let at = time::OffsetDateTime::now_utc()
@@ -476,5 +482,211 @@ fn disabled_or_changed_scope_cannot_rearm() {
     fs::write(&paths[0], "changed").unwrap();
     assert!(prepare(&mut index, &support, &[root]).is_err());
     assert_eq!(serde_json::to_value(&index).unwrap(), before);
+    fs::remove_dir_all(home).unwrap();
+}
+
+/// Establish real, settled native twins before asking for a scoped correction.
+fn twin_setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, PathBuf, BTreeSet<PathBuf>) {
+    let (home, root, mut index, paths) = setup(name);
+    let main = paths[0].clone();
+    let twin = root.join("restored").join(main.file_name().unwrap());
+    fs::create_dir_all(twin.parent().unwrap()).unwrap();
+    fs::copy(&main, &twin).unwrap();
+    let previous = index.clone();
+    let (mut next, mut scanned, _) = walk(&root, index, &[]);
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scanned, &mut next);
+    let accepted = scanned
+        .snapshots
+        .iter()
+        .map(|s| s.snapshot_fingerprint.clone())
+        .collect();
+    index = next.committable_subset(&previous, &accepted, &BTreeMap::new());
+    super::super::e2_pipeline_scan_fixture::adopt_acked_census_for_test(&mut index, "ctx-1");
+    for entry in index.files.values_mut() {
+        entry.effective_upload_body_witness_revision = 3;
+    }
+    index.save(&home.join("scan-index.json")).unwrap();
+    let family = claude_index_path_member_ref(&main).unwrap().root;
+    let expected = index
+        .files
+        .keys()
+        .filter(|key| {
+            claude_index_path_member_ref(Path::new(key)).is_some_and(|m| m.root == family)
+        })
+        .map(PathBuf::from)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected.len(), 3, "main pair and its non-twin subagent");
+    fs::write(
+        home.join("scope.json"),
+        serde_json::to_vec(&vec![&main]).unwrap(),
+    )
+    .unwrap();
+    (home, root, index, main, expected)
+}
+
+#[test]
+fn one_listed_twin_estimates_and_reads_the_complete_native_family() {
+    let (home, root, mut index, main, expected) = twin_setup("copy-prefix-twin-closure");
+    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
+    let support = home.join("twin-support");
+    let counts = run(&home.join("scope.json"), &support, false).unwrap();
+    assert_eq!(
+        (
+            counts.listed_files,
+            counts.files,
+            counts.added_by_twins_files
+        ),
+        (1, 3, 2)
+    );
+    assert_eq!(counts.listed_bytes, fs::metadata(&main).unwrap().len());
+    assert_eq!(
+        counts.bytes,
+        expected
+            .iter()
+            .map(|p| fs::metadata(p).unwrap().len())
+            .sum()
+    );
+    assert_eq!(
+        counts.added_by_twins_bytes,
+        counts.bytes - counts.listed_bytes
+    );
+    assert_eq!(counts.runnable_files, counts.files);
+    assert!(!support.exists());
+    assert_eq!(
+        counts,
+        run(&home.join("scope.json"), &support, true).unwrap()
+    );
+    activate_mode(&mut index, "ctx-1", true, false);
+    let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
+    assert_eq!(pending.iter().cloned().collect::<BTreeSet<_>>(), expected);
+    let (_, scan, opened) = walk(&root, index, &pending);
+    assert_eq!(
+        opened.iter().cloned().collect::<BTreeSet<_>>(),
+        expected,
+        "zero unaffected body reads"
+    );
+    assert_eq!(opened.len(), counts.files, "one read per physical member");
+    assert_eq!(scan.scanned_file_count, counts.files);
+    assert_eq!(
+        opened
+            .iter()
+            .map(|p| fs::metadata(p).unwrap().len())
+            .sum::<u64>(),
+        counts.bytes
+    );
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn no_twins_leave_the_listed_scope_and_forecast_unchanged() {
+    let (home, _, _, _) = setup("copy-prefix-no-twin-closure");
+    let counts = run(&home.join("scope.json"), &home.join("absent"), false).unwrap();
+    assert_eq!(
+        (
+            counts.listed_files,
+            counts.files,
+            counts.added_by_twins_files
+        ),
+        (3, 3, 0)
+    );
+    assert_eq!(counts.listed_bytes, counts.bytes);
+    assert_eq!(counts.added_by_twins_bytes, 0);
+    assert_eq!(
+        (
+            counts.pages,
+            counts.pacing_floor_seconds,
+            counts.pacing_cold_seconds
+        ),
+        (1, 0, 0)
+    );
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn added_twin_family_member_blocks_apply_at_the_existing_native_file_cap() {
+    let (home, _, _, main, expected) = twin_setup("copy-prefix-twin-closure-cap");
+    let added = expected.iter().find(|p| **p != main).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(added)
+        .unwrap()
+        .set_len(max_jsonl_file_bytes(SnapshotSource::ClaudeCode) + 1)
+        .unwrap();
+    let support = home.join("absent-cap-support");
+    let counts = run(&home.join("scope.json"), &support, false).unwrap();
+    assert_eq!(counts.listed_files, 1);
+    assert!(counts.blocked_files >= 1);
+    assert!(counts.blocked_bytes >= max_jsonl_file_bytes(SnapshotSource::ClaudeCode) + 1);
+    assert_eq!(counts.runnable_files + counts.blocked_files, counts.files);
+    assert!(run(&home.join("scope.json"), &support, true).is_err());
+    assert!(!support.exists());
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn closure_growth_refuses_preparation_before_reowing_any_member() {
+    let (home, root, mut index, _, expected) = twin_setup("copy-prefix-twin-closure-growth");
+    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
+    let support = home.join("support");
+    run(&home.join("scope.json"), &support, true).unwrap();
+    let old = expected.iter().next().unwrap();
+    let new = root.join("another-copy").join(old.file_name().unwrap());
+    fs::create_dir_all(new.parent().unwrap()).unwrap();
+    fs::copy(old, &new).unwrap();
+    index.files.insert(
+        local_index_key(&new),
+        index.files[&local_index_key(old)].clone(),
+    );
+    let before = serde_json::to_value(&index).unwrap();
+    assert!(prepare(&mut index, &support, &[root]).is_err());
+    assert_eq!(serde_json::to_value(&index).unwrap(), before);
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn twin_closure_native_reader_keeps_the_existing_byte_budget() {
+    let (home, root, mut index, _, expected) = twin_setup("copy-prefix-twin-closure-byte-budget");
+    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
+    let support = home.join("support");
+    run(&home.join("scope.json"), &support, true).unwrap();
+    activate_mode(&mut index, "ctx-1", true, false);
+    let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
+    with_body_witness_adoption_byte_budget(1, || {
+        let counts = run(&home.join("scope.json"), &home.join("absent-budget"), false).unwrap();
+        assert_eq!(counts.blocked_files, expected.len());
+        let (_, scan, opened) = walk(&root, index, &pending);
+        assert!(opened.is_empty());
+        assert_eq!(scan.scanned_file_count, 0);
+        assert!(scan.snapshots.is_empty());
+    });
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn combined_twin_bytes_are_blocked_without_increasing_the_native_page_cap() {
+    let (home, _, _, _, expected) = twin_setup("copy-prefix-twin-group-bytes");
+    let mains = expected
+        .iter()
+        .filter(|p| {
+            claude_index_path_member_ref(p)
+                .unwrap()
+                .subagent_stem
+                .is_none()
+        })
+        .collect::<Vec<_>>();
+    let twin_bytes = mains
+        .iter()
+        .map(|p| fs::metadata(p).unwrap().len())
+        .sum::<u64>();
+    let cap = twin_bytes - 1;
+    assert!(mains.iter().all(|p| fs::metadata(p).unwrap().len() <= cap));
+    with_body_witness_adoption_byte_budget(cap, || {
+        let support = home.join("absent-group-support");
+        let counts = run(&home.join("scope.json"), &support, false).unwrap();
+        assert_eq!(counts.blocked_files, 2);
+        assert_eq!(counts.blocked_bytes, twin_bytes);
+        assert!(run(&home.join("scope.json"), &support, true).is_err());
+        assert!(!support.exists());
+    });
     fs::remove_dir_all(home).unwrap();
 }

@@ -26978,17 +26978,15 @@ impl OwnedSourceScan {
                 .as_ref()
                 .map(|traversal| traversal.scan_roots.clone())
                 .unwrap_or_default();
-            let missing_family_paths = family_index_keys
-                .into_iter()
-                .filter(|index_key| !already_identified.contains(index_key))
-                .filter_map(|index_key| {
-                    let path = PathBuf::from(&index_key);
-                    let (root_session_id, _) = claude_index_path_family_member(&path)?;
-                    forced_claude_family_reparses
-                        .contains(&root_session_id)
-                        .then_some(path)
-                })
-                .collect::<BTreeSet<_>>();
+            let missing_family_paths = claude_history_upgrade::claude_read_closure(
+                std::iter::empty::<&Path>(),
+                &family_index_keys,
+                claude_twin_groups.get_or_init(Default::default),
+                &forced_claude_family_reparses,
+            )
+            .into_iter()
+            .filter(|path| !already_identified.contains(&local_index_key(path)))
+            .collect::<BTreeSet<_>>();
             if let Some(traversal) = index.traversal.as_mut() {
                 traversal
                     .pending_candidates

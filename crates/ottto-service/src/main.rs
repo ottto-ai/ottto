@@ -49,6 +49,9 @@ enum Command {
         /// Private JSON array of absolute affected main-file paths.
         #[arg(long)]
         scope: PathBuf,
+        /// Exact destination-scoped native Claude scan index (read-only).
+        #[arg(long)]
+        index: PathBuf,
         #[arg(long)]
         support_dir: PathBuf,
         /// Current negotiated scan window, in days (from the ordinary daemon).
@@ -213,6 +216,7 @@ fn main() -> Result<()> {
     // Administrative planning exits before Keychain or daemon initialization.
     if let Some(Command::ClaudeCopyPrefixReread {
         ref scope,
+        ref index,
         ref support_dir,
         apply,
         window_days,
@@ -222,6 +226,7 @@ fn main() -> Result<()> {
         match ottto_service::snapshots::claude_copy_prefix_reread::run(
             scope,
             support_dir,
+            index,
             apply,
             window_days,
         ) {
