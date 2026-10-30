@@ -691,6 +691,44 @@ fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
 }
 
 #[test]
+fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
+    for cause in [
+        UnsettledUploadCause::Shed,
+        UnsettledUploadCause::UploadError,
+    ] {
+        let f = AckFixture::new(true);
+        let (index, mut progress) = f.load();
+        let ledger = &mut progress.accepted_identity_buckets;
+        ledger.bind_test_key(Some([0x42; 32]));
+        ledger.record(&serde_json::json!({
+            "source_session_id": "synthetic",
+            "provenance": {"collector": crate::snapshots::claude_request_identity::COLLECTOR},
+            "request_evidence": [{"identity_basis": "telemetry_login"}],
+            "usage_buckets": [{"bucket_start": "2026-09-01T10:00:00Z", "model_usage": [
+                {"model": "claude-synthetic", "evidence_ref": 0, "account_identifier_hash": "a".repeat(64)}
+            ]}],
+        }));
+        assert!(!progress.accepted_identity_buckets.is_empty());
+        progress.save(&f.progress_path).unwrap();
+        checkpoint_partial_snapshot_index_with_comparison(
+            &index,
+            &index,
+            &progress,
+            std::slice::from_ref(&f.item),
+            None,
+            &BTreeSet::new(),
+            &f.index_path,
+            &f.progress_path,
+            || Ok(()),
+            None,
+            None,
+            Some(cause),
+        )
+        .unwrap_or_else(|error| panic!("{cause:?} partial checkpoint refused: {error:#}"));
+    }
+}
+
+#[test]
 fn partial_index_replacement_retires_only_proven_state_only_ack() {
     let f = AckFixture::new(true);
     let (index, mut progress) = f.load();
