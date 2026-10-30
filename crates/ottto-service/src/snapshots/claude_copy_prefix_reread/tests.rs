@@ -2,6 +2,14 @@ use super::*;
 
 fn setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, Vec<PathBuf>) {
     let (home, root, mut index) = super::super::claude_history_upgrade_tests::families(name, 3);
+    // The shared helper uses a partial-commit subset, which deliberately
+    // preserves the previous (None) source census context even after ACKs.
+    // This fixture models already delivered, fully adopted legacy history;
+    // otherwise unrelated context debt exists BEFORE the switch changes.
+    let delivered = index.current_snapshot_fingerprints();
+    assert!(!delivered.is_empty());
+    assert!(delivered.is_subset(&index.accepted_snapshot_fingerprints));
+    index.upload_context_fingerprint = Some("ctx-1".into());
     let mut paths = index
         .files
         .keys()

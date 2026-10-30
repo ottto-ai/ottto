@@ -3272,7 +3272,14 @@ fn e2_pipeline_resumed_switch_counts_removed_partial_dollars_and_own_turns() {
 fn corrected_family_counter_excludes_history_vetoed_literals() {
     with_e2(|| {
         let mut c = Corpus::new("e2-copy-counter-history-veto");
-        let prior = demo_family(&mut c, &mut e2_progress());
+        let mut prior = demo_family(&mut c, &mut e2_progress());
+        // demo_family uses partial commits, retaining an unadopted source
+        // context. Model the fully adopted ACKed baseline so only THIRD's
+        // genuine change is selected, without unrelated corrected families.
+        let delivered = prior.current_snapshot_fingerprints();
+        assert!(!delivered.is_empty());
+        assert!(delivered.is_subset(&prior.accepted_snapshot_fingerprints));
+        prior.upload_context_fingerprint = Some("e2-synthetic-destination".into());
         std::fs::write(
             c.support.join("snapshots/claude_code-reemission-exclusions.txt"),
             format!("{:x}\n", Sha256::digest(THIRD.as_bytes())),
