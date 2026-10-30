@@ -44720,12 +44720,12 @@ impl CheckpointLock {
             .truncate(false)
             .open(&lock_path)
             .context("open local snapshot checkpoint lock")?;
-        // Only an active Claude v2 route participates in maintenance priority.
+        // Custody is the single authority for Claude v2 maintenance priority.
         // Legacy Claude, Codex and Pi retain main's nonblocking flock behavior,
         // including when the v2 checkpoint-owner registry is poisoned.
         // Maintenance already owns a reservation even if its runtime was
         // invalidated while it waited for the previous checkpoint owner.
-        let priority = maintenance || state_v2::checkpoint_priority_active(path);
+        let priority = maintenance || state_v2::published(path)?;
         let mut owners = if priority {
             Some(
                 checkpoint_owners()
@@ -93411,10 +93411,7 @@ impl CheckpointLock {
     /// Reserve the next lock turn before waiting for this process's owner.
     /// New normal work yields; another process's flock is a counted failure.
     fn acquire_for_maintenance(path: &Path) -> Result<Self> {
-        anyhow::ensure!(
-            state_v2::checkpoint_priority_active(path),
-            "state_v2_runtime_inactive"
-        );
+        anyhow::ensure!(state_v2::published(path)?, "state_v2_runtime_inactive");
         let registry = checkpoint_owners();
         let mut owners = registry
             .0
@@ -93500,7 +93497,7 @@ mod state_v2_maintenance_lock_tests {
             }
             for path in &paths {
                 CHECKPOINT_OWNER_ACCESSES.with(|count| count.set(0));
-                assert!(!state_v2::checkpoint_priority_active(path));
+                assert!(!state_v2::published(path).unwrap());
                 let lock = CheckpointLock::acquire(path).unwrap();
                 #[cfg(unix)]
                 {

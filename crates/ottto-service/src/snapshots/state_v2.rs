@@ -18,9 +18,8 @@ pub(super) use runtime::checkpoint_priority_fixture;
 pub(super) use runtime::invalidate_tree;
 pub(super) use runtime::Hold;
 pub(super) use runtime::{
-    after_v1_locked, checkpoint_priority_active, collection_page_limit, erase_tree,
-    guard_containment_locked, guard_external, idle, load_locked, published, recovery_save_guard,
-    save_locked,
+    after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
+    idle, load_locked, published, recovery_save_guard, save_locked,
 };
 mod codec;
 #[cfg(test)]
