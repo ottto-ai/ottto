@@ -88,7 +88,7 @@ fn native_parser_with(
         match source {
             SnapshotSource::Codex => apply_codex_line,
             SnapshotSource::ClaudeCode => apply_claude_code_line,
-            SnapshotSource::Pi => apply_pi_line,
+            _ => unreachable!(),
         },
         Some(metadata),
         None,
@@ -221,9 +221,7 @@ fn oracle(fixture: &Fixture, source: SnapshotSource) -> Value {
             false,
         )
         .unwrap(),
-        SnapshotSource::Pi => {
-            parse_pi_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap()
-        }
+        _ => unreachable!(),
     };
     apply_upload_policy(source, &mut items, SnapshotUploadPolicy::default());
     serde_json::to_value(items).unwrap()
