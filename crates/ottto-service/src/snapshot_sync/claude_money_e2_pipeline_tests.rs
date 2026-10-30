@@ -198,7 +198,7 @@ impl Page {
     fn enrich_with(
         &mut self,
         corpus: &Corpus,
-        mut accepted: Option<&mut crate::snapshots::claude_request_identity::AcceptedBuckets>,
+        accepted: Option<&mut crate::snapshots::claude_request_identity::AcceptedBuckets>,
     ) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
         let ((mut disposition, _, stats), released) =
             e2::pipeline_test_observer::capture_released(|| {
@@ -215,7 +215,7 @@ impl Page {
                 )
                 .unwrap()
             });
-        if let Some(accepted) = accepted.as_deref_mut() {
+        if let Some(accepted) = accepted {
             accepted.invalidate_copy_derived(&stats.copy_invalidated);
         }
         self.released = released;
@@ -3911,15 +3911,15 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
             let old = ScanIndex::default();
             let page = ready(&c, &scanner, old.clone(), 100, false);
             let prior = settle(&c, &old, page, &mut e2_progress());
-            let [x, b] = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"];
+            let [org_x, org_b] = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"];
             let marker = |org: &str| json!({"type":"attachment", "sessionId":COPY,
                 "attachment":{"type":"credential_org","organizationUuid":org}}).to_string() + "\n";
             let switched = |org: &str| json!({"type":"attachment", "sessionId":COPY,
                 "attachment":{"type":"session_context", "context":{}}}).to_string() + "\n" + &marker(org);
-            let mut text = marker(x) + &resumed(COPY, &[A, C]) + &switched(b)
+            let mut text = marker(org_x) + &resumed(COPY, &[A, C]) + &switched(org_b)
                 + &line_by(COPY, "own", "2026-08-02T08:10:00Z", 10, RESUME_WRITER);
             c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
-            let [x, b] = [x, b].map(|org| ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap());
+            let [x, b] = [org_x, org_b].map(|org| ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap());
             let off = {
                 let _off = e2::ResumedPrefixForTest::set(false);
                 ready(&c, &scanner, prior.clone(), 100, false)
@@ -3975,7 +3975,7 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
             // The invalidated row reads as never accepted: own evidence tags it fresh.
             let (copy, _) = pass(&c, &mut ledger);
             ack(&mut ledger, &copy);
-            text += &switched(b);
+            text += &switched(org_b);
             text += &line_by(COPY, "own-early", "2026-08-02T07:05:00Z", 10, RESUME_WRITER);
             c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
             let (copy, invalidated) = pass(&c, &mut ledger);
