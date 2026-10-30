@@ -79,7 +79,11 @@ impl<'de> Visitor<'de> for BoundedValue<'_> {
         let mut values = Vec::new();
         while let Some(value) = a.next_element_seed(BoundedValue(self.0))? {
             if values.len() == values.capacity() {
-                let cap = values.capacity().max(1).checked_mul(2);
+                let cap = if values.capacity() == 0 {
+                    Some(1)
+                } else {
+                    values.capacity().checked_mul(2)
+                };
                 self.0
                     .charge(cap.and_then(|n| (n as u64).checked_mul(32)))?;
                 let cap = cap.ok_or_else(|| A::Error::custom("bounded content refused"))?;
