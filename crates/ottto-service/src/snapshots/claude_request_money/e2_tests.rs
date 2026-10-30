@@ -74,7 +74,7 @@ fn parse(path: &Path, birth: Option<i128>, index: &ScanIndex, lines: &[Value]) -
     let mut items = a.into_items(path, "2026-08-02T09:00:00Z", "fixture".into(), None);
     // The page's copy decision, as the scan runs it; `publish` decides again
     // over the whole page, where a parsed witness proves its own requests.
-    decide_page_copies(&mut items, index);
+    decide_page_copies(&mut items, index, None);
     items.remove(0)
 }
 /// Parse, then record the read like the scan does (birth + indexed path).
@@ -152,7 +152,7 @@ fn publish(
     telemetry: TelemetryRead,
     index: &ScanIndex,
 ) -> Vec<SnapshotItem> {
-    decide_page_copies(&mut items, index);
+    decide_page_copies(&mut items, index, None);
     if let Some(read) = read {
         attach_page(&mut items, read);
         side_calls_page(
@@ -1842,7 +1842,7 @@ fn tag_owned_with_fallbacks(
     index: &ScanIndex,
     expected_fallbacks: usize,
 ) -> Vec<SnapshotItem> {
-    decide_page_copies(&mut items, index);
+    decide_page_copies(&mut items, index, None);
     let api = ClaudeLocalOtelLoadReport::default();
     let trace = ClaudeTraceOwnershipLoadReport::default();
     let per_file_originals = claude_request_identity::capture_request_owned_originals(&items);

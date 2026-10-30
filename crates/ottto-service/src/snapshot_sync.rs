@@ -9407,7 +9407,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     };
     // E2: every held copy skip is decided (or the session held) before
     // telemetry attaches, so a copy that counts after all can be matched.
-    crate::snapshots::claude_request_money::e2::decide_page_copies_with_accepted(
+    crate::snapshots::claude_request_money::e2::decide_page_copies(
         &mut scan_result.snapshots,
         index,
         accepted_identity_buckets,

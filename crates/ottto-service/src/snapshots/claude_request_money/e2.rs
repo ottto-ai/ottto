@@ -2207,19 +2207,11 @@ fn skipped_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> + '_ {
 /// page's cross-session checks share ONE census walk. Runs in both gate
 /// modes; dark only counts. Returns the removals to store (gate on only):
 /// the caller applies them to the index (`CopyRemovalUpdates::apply`).
-#[cfg(test)]
+/// `accepted`, this cycle's #909 accepted-share hints, keeps accepted usage
+/// where the server holds it (gate on, Lead B F2/F3): a marker re-derivation
+/// never re-tags an accepted row, and a prefix hold over accepted buckets
+/// defers the whole session instead of a shrunken revision.
 pub(crate) fn decide_page_copies(
-    items: &mut [SnapshotItem],
-    index: &ScanIndex,
-) -> CopyRemovalUpdates {
-    decide_page_copies_with_accepted(items, index, None)
-}
-
-/// `decide_page_copies` with this cycle's #909 accepted-share hints. Gate on,
-/// they keep accepted usage where the server holds it (Lead B F2/F3): a
-/// marker re-derivation never re-tags an accepted row, and a prefix hold over
-/// accepted buckets defers the whole session instead of a shrunken revision.
-pub(crate) fn decide_page_copies_with_accepted(
     items: &mut [SnapshotItem],
     index: &ScanIndex,
     accepted: Option<&AcceptedBuckets>,
@@ -2321,19 +2313,30 @@ fn finish_holder_identity(item: &mut SnapshotItem, accepted: Option<&AcceptedBuc
     // untag it with a refusal, and the server then falls back to the parent's
     // starting binding (B31). Such a session keeps the released marker policy
     // (the identity the server already holds); its accepted rows stay tagged.
-    if let (Some(own), Some(accepted)) = (rebuilt.as_ref(), accepted) {
+    // A session the ledger does not know (never ACKed, or evicted past
+    // #909's window) is re-derived: its changed rows are counted as an upper
+    // bound of rows a stored body may hold under the released identity.
+    if let Some(own) = rebuilt.as_ref() {
         let session = source_session_id.as_str();
-        let kept = claude_usage_occurrences
+        let changed = claude_usage_occurrences
             .values()
             .filter(|o| !fold.is_skipped(o.sequence) && !o.usage.is_zero())
             .filter(|o| accounts.account(o.sequence) != own.account(o.sequence))
             .filter_map(|o| fold.occurrence_key(o))
-            .filter(|key| accepted.may_have_accepted(session, &key.0))
             .collect::<BTreeSet<_>>();
-        if !kept.is_empty() {
-            diag("copy_prefix_accepted_authority_kept", kept.len() as u64);
-            record_counts(Counts::one(24, kept.len() as u64));
+        let known = accepted.filter(|accepted| accepted.get(session).is_some());
+        let kept = changed
+            .iter()
+            .filter(|key| known.is_some_and(|accepted| accepted.may_have_accepted(session, &key.0)))
+            .count() as u64;
+        if kept > 0 {
+            diag("copy_prefix_accepted_authority_kept", kept);
+            record_counts(Counts::one(24, kept));
             rebuilt = None;
+        } else if known.is_none() && !changed.is_empty() {
+            let changed = changed.len() as u64;
+            diag("copy_prefix_authority_changed_untracked", changed);
+            record_counts(Counts::one(27, changed));
         }
     }
     if let Some(own) = rebuilt.as_ref() {
@@ -2428,13 +2431,14 @@ fn indexed_main_files(index: &ScanIndex) -> BTreeMap<LocationKey, &str> {
 }
 
 /// A stored removal of `hash` under `holder` (index key): `None` when the
-/// holder's census can no longer answer (retired, over budget or no
-/// record), so the stored decision stands; else whether its record holds
-/// the hash (a record that lacks it disproves the stored ownership).
-fn stored_holder_answer(index: &ScanIndex, holder: &str, hash: u64) -> Option<bool> {
+/// holder is no longer indexed (Lead B F5) or its census can no longer
+/// answer (retired, over budget or no record), so the stored decision
+/// stands; else whether its record holds the hash (a record that lacks it
+/// disproves the stored ownership).
+fn stored_holder_answer(index: &ScanIndex, holder: Option<&str>, hash: u64) -> Option<bool> {
     index
         .claude_request_census
-        .get(holder)
+        .get(holder?)
         .filter(|record| record.proves_scan())
         .and_then(|record| {
             if record.holds_hash(hash) {
@@ -2727,20 +2731,19 @@ fn decide_holders(
             let mut absent = BTreeSet::new();
             if enabled() {
                 for (holder, held) in index.claude_copy_removals.get(order.1) {
-                    let key = live.get_or_init(|| indexed_main_files(index)).get(holder);
+                    let key = live
+                        .get_or_init(|| indexed_main_files(index))
+                        .get(holder)
+                        .copied();
                     for &hash in held.iter() {
-                        if hashes.binary_search(&hash).is_err() {
+                        if hashes.binary_search(&hash).is_err()
+                            || stored_holder_answer(index, key, hash) == Some(false)
+                        {
                             continue;
                         }
-                        match key {
-                            Some(key) if stored_holder_answer(index, key, hash) == Some(false) => {}
-                            Some(_) => {
-                                stored.insert(hash);
-                            }
-                            None => {
-                                stored.insert(hash);
-                                absent.insert(hash);
-                            }
+                        stored.insert(hash);
+                        if key.is_none() {
+                            absent.insert(hash);
                         }
                     }
                 }
@@ -2938,12 +2941,13 @@ fn stored_groups<'a>(
     let mut groups = BTreeMap::<LocationKey, BTreeSet<u64>>::new();
     let old = index.claude_copy_removals.get(file);
     for (holder, hashes) in old {
-        let key = live.get_or_init(|| indexed_main_files(index)).get(holder);
-        let kept = hashes.iter().filter(|&&hash| {
-            key.map_or(true, |key| {
-                stored_holder_answer(index, key, hash) != Some(false)
-            })
-        });
+        let key = live
+            .get_or_init(|| indexed_main_files(index))
+            .get(holder)
+            .copied();
+        let kept = hashes
+            .iter()
+            .filter(|&&hash| stored_holder_answer(index, key, hash) != Some(false));
         let into = groups.entry(*holder).or_default();
         for &hash in kept {
             // Consume covered entries once; never search every holder group
@@ -4333,8 +4337,11 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     "copy_prefix_accepted_authority_kept",
     "copy_prefix_accepted_session_holds",
     "copy_removal_holder_absent_kept",
+    // Rows whose account that re-derivation changes in a session the #909
+    // ledger does not know: an upper bound of unprotected re-tags (F2 reach).
+    "copy_prefix_authority_changed_untracked",
 ];
-const COUNT_LEN: usize = 27;
+const COUNT_LEN: usize = 28;
 static COUNTS: [AtomicU64; COUNT_LEN] = [const { AtomicU64::new(0) }; COUNT_LEN];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(
@@ -4401,7 +4408,7 @@ impl Counts {
         all[14] = overflow;
         Self(all)
     }
-    /// One enable-readiness counter (index 24..27) by `n`.
+    /// One enable-readiness counter (index 24..28) by `n`.
     fn one(at: usize, n: u64) -> Self {
         let mut all = [0; COUNT_LEN];
         all[at] = n;

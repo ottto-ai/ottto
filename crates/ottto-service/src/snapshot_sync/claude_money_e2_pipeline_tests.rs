@@ -3769,20 +3769,7 @@ fn e2_pipeline_proven_prefix_markers_never_lend_identity_to_retained_requests() 
                 (if partial { 3 } else { 2 }, Some(1)));
             let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
             let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
-            let mut shares = BTreeMap::<String, u64>::new();
-            for row in &copy.model_usage {
-                if let Some(parts) = &row.identity_parts {
-                    for part in parts {
-                        if let Some(org) = part.evidence_ref.and_then(|at|
-                            copy.request_evidence[usize::from(at)].provider_workspace_hash.as_ref()) {
-                            *shares.entry(org.clone()).or_default() += part.request_count;
-                        }
-                    }
-                } else if let Some(org) = row.evidence_ref.and_then(|at|
-                    copy.request_evidence[usize::from(at)].provider_workspace_hash.as_ref()) {
-                    *shares.entry(org.clone()).or_default() += row.request_count;
-                }
-            }
+            let shares = org_shares(copy);
             assert!(!shares.contains_key(&a), "removed marker cannot lend account identity");
             assert_eq!(shares.get(&b), Some(&if retained_marker { 3 } else { 1 }));
             assert_eq!(copy.input_tokens, if partial { 30 } else { 20 });
@@ -3884,20 +3871,23 @@ fn e2_pipeline_rewritten_prefix_clears_retry_debt_but_preserves_recorded_removal
     }
 }
 
-/// Requests of `item` whose identity names the organization hash `org`.
-fn org_requests(item: &SnapshotItem, org: &str) -> u64 {
-    let named = |at: Option<u16>| {
-        at.and_then(|at| item.request_evidence[usize::from(at)].provider_workspace_hash.as_deref())
-            == Some(org)
-    };
-    item.model_usage
-        .iter()
-        .map(|row| match &row.identity_parts {
-            Some(parts) => parts.iter().filter(|p| named(p.evidence_ref)).map(|p| p.request_count).sum(),
-            None if named(row.evidence_ref) => row.request_count,
-            None => 0,
-        })
-        .sum()
+/// Requests of `item` per organization hash its identity names.
+fn org_shares(item: &SnapshotItem) -> BTreeMap<String, u64> {
+    let mut shares = BTreeMap::<String, u64>::new();
+    for row in &item.model_usage {
+        if let Some(parts) = &row.identity_parts {
+            for part in parts {
+                if let Some(org) = part.evidence_ref.and_then(|at|
+                    item.request_evidence[usize::from(at)].provider_workspace_hash.as_ref()) {
+                    *shares.entry(org.clone()).or_default() += part.request_count;
+                }
+            }
+        } else if let Some(org) = row.evidence_ref.and_then(|at|
+            item.request_evidence[usize::from(at)].provider_workspace_hash.as_ref()) {
+            *shares.entry(org.clone()).or_default() += row.request_count;
+        }
+    }
+    shares
 }
 
 /// Lead B F2: switch OFF stored a resumed file whose own turn inherited an
@@ -3925,7 +3915,7 @@ fn e2_pipeline_switch_on_keeps_an_accepted_own_turn_on_its_copied_marker_org() {
             ready(&c, &scanner, prior.clone(), 100, false)
         };
         let stored = body(&off, COPY).unwrap();
-        assert_eq!((stored.request_count, org_requests(stored, &org)), (2, 2));
+        assert_eq!((stored.request_count, org_shares(stored).get(&org).copied()), (2, Some(2)));
         let mut accepted = AcceptedBuckets::for_test();
         accepted.record(&serde_json::to_value(stored).unwrap());
         assert!(accepted.may_have_accepted(COPY, &stored.usage_buckets[0].bucket_start));
@@ -3936,10 +3926,14 @@ fn e2_pipeline_switch_on_keeps_an_accepted_own_turn_on_its_copied_marker_org() {
             page.enrich_with(&c, Some(&ledger));
             let copy = body(&page, COPY).expect("the own turn publishes");
             assert_eq!((copy.request_count, copy.removed_request_count), (1, Some(1)));
-            assert_eq!(org_requests(copy, &org), u64::from(kept));
+            assert_eq!(org_shares(copy).get(&org).copied().unwrap_or(0), u64::from(kept));
             let counts = serde_json::to_value(take_identity_counts()).unwrap();
             assert_eq!(counts["identity_cap"]["accepted_share_changed"], json!(0));
-            assert_eq!(copy_diag(&["copy_prefix_accepted_authority_kept"]), [u64::from(kept)]);
+            assert_eq!(
+                copy_diag(&["copy_prefix_accepted_authority_kept",
+                    "copy_prefix_authority_changed_untracked"]),
+                [u64::from(kept), u64::from(!kept)]
+            );
         }
     });
 }
@@ -4015,14 +4009,12 @@ fn e2_pipeline_empty_removal_store_restart_is_not_lost_metadata_but_damage_is() 
             let mut prior: ScanIndex = serde_json::from_value(encoded).unwrap();
             prior = c.reload(&mut prior); // both native and streaming decode
             assert_eq!(prior.claude_copy_removals.metadata_lost(), damaged);
-            e2::pipeline_test_observer::retire_census(&mut prior, &file(ROOT));
-            c.write_at(&file(COPY), &(fork_ref(COPY, ROOT) + &resumed(COPY, &[A, B, C])),
-                "2026-08-02T07:03:00Z");
-            e2::take_diag();
-            let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-            assert_eq!(body(&page, COPY).map(|b| b.request_count), Some(3));
-            assert_eq!(copy_diag(&["copy_prefix_unproven", "copy_removal_metadata_lost"]),
-                [2, if damaged { 2 } else { 0 }]);
+            let written = |on| {
+                let _switch = e2::ResumedPrefixForTest::set(on);
+                serde_json::to_value(&prior).unwrap().get("claude_copy_removals").is_some()
+            };
+            assert_eq!([written(true), written(false)], [damaged, false],
+                "only damage is written back, and never with the switch off");
         });
     }
 }
