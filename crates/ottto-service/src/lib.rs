@@ -8369,6 +8369,13 @@ mod tests {
         )
     }
 
+    /// The support bundle of a daemon holding `cache`, as exported.
+    pub(crate) fn support_bundle_text(cache: Arc<snapshots::sampled_scan::SharedCache>) -> String {
+        let mut daemon = daemon();
+        daemon.transcript_cache = cache;
+        serde_json::to_string(&daemon.diagnostics_stub(TOKEN).unwrap()).unwrap()
+    }
+
     fn diagnostic_item<'a>(
         bundle: &'a DiagnosticsBundle,
         section: &str,
