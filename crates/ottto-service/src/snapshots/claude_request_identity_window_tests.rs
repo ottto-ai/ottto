@@ -1696,9 +1696,12 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
     let mut accepted = identity::AcceptedBuckets::for_test();
     sticky_apply(&mut first, &proof, &accepted).unwrap();
     accepted.record(&serde_json::to_value(first).unwrap());
+    // Complementary cost presence makes every top-level untagged cost known.
+    // A single absent-only untagged cost cannot form a receiver-valid Parts row.
     proof[1].identity = login_key(D64);
+    proof[4].identity = login_key(D64);
     sticky_apply(&mut changed, &proof, &accepted).unwrap();
-    assert_eq!(changed.request_identity_refusals, 1);
+    assert_eq!(changed.request_identity_refusals, 2);
     assert!(changed.usage_buckets[0].model_usage[0]
         .identity_parts
         .as_ref()
