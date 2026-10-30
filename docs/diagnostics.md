@@ -1399,3 +1399,60 @@ values.
 A later complete native parse still emits its exclusive body for a session with
 an earlier state-only row. An emitted total alone does not prove a server-side
 overwrite; backend authority rules independently govern successor acceptance.
+
+### Money freshness (Claude queue and replay)
+
+`money_freshness` uses the existing family census skipped view and bounded
+`FirstPending` stamps. `money_freshness_alarm` carries the same aggregate payload
+when observed changed files remain positive across observed passes for **more
+than 21,600 seconds**. It includes unread count and age. These observations never
+select a file, release a hold, or change uploads. No transcript read or metadata
+stat is added. Codex and Pi are outside this Claude census adapter.
+
+`skipped_tracked_files` counts unique stamped files in queue plus replay;
+`oldest_skipped_age_seconds` and `pending_over_24h_tracked_files` measure pending
+age, **not file mtime or time since last physical read**. A file without an indexed
+scan and outside replay contributes to `discovered_unread_tracked_files`,
+`oldest_discovered_unread_age_seconds` and
+`discovered_unread_over_24h_tracked_files`; indexed held work and replay contribute
+to `indexed_or_replay_tracked_files`. An index may be rebuilt or pruned, so
+"unread" here means no retained indexed scan, not proof of never having opened
+that physical file. A replay occurrence excludes that file from unread even if
+it also occurs in the queue. All ages are process-local lower bounds, reset on
+restart; `ages_are_process_local_lower_bounds` states this explicitly.
+
+`skipped_untracked_entries` and `discovered_unread_untracked_entries` disclose
+coverage lost at the existing 16,384-stamp bound. These are queue/replay entry
+counts, potentially overlapping, rather than invented unique-file counts.
+Tracked file counts and age thresholds are lower bounds on the full discovered
+population. Files outside the skipped view and directories not yet enumerated
+are not covered.
+
+Size/mtime observations already available to selection update the metadata fields
+of an **existing** stamp. They do not admit new stamps or perform a stat.
+`changed_since_scan_files` and `unchanged_since_scan_files` compare those samples
+with the current indexed size and second/nanosecond mtime. A new key, an unindexed
+file, or a stamp without this pass's sample contributes to
+`changed_since_scan_unknown_files`, not unchanged. The first pending page can
+therefore have entirely unknown change coverage. `metadata_observed_files`
+reports sample coverage; `changed_since_scan_complete_count` is null when any
+tracked or untracked change coverage is unknown, including no prior scan.
+
+The alarm tracks positive **observed** changed counts in this scope. Zero
+observed positives (including unknown-only passes), scope change, process restart
+or a backwards clock breaks continuity. A long interval between passes is not
+proof of uninterrupted filesystem state: the alarm describes sampled passes.
+`changed_episode_open`, `changed_episode_age_seconds` and `tracker_initialized`
+expose the episode boundary. The existing carrier provides `process_id`, so a
+log observer can correlate process changes with previously open episodes.
+`restart_reset_open_episode_total` is null: without persisted episode state or
+reading previous logs, a fresh daemon cannot know whether the previous process
+had an open episode. Null is an explicit unavailable metric, not a zero reset
+count. This limitation requires an external log-derived counter or an approved
+existing persistence carrier before a restart-reset count can be claimed.
+
+Memory: the existing bounded stamp grows from 16 to 48 bytes (at most 512 KiB
+additional retained heap). It is included in `cost.runtime_heap_bytes` and the
+retained worst-case bound. Freshness adds at most 16 KiB transient dedup storage
+and one queue pass plus one bounded stamp pass. Enlarged stamp transients add at
+most 1.6 MiB during the existing stamp update. There is no second per-file map.

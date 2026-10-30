@@ -63,6 +63,7 @@ mod claude_history_upgrade_tests;
 mod claude_reemission_exclusions;
 #[cfg(test)]
 mod contract5_cutover_tests;
+mod money_freshness;
 #[cfg(test)]
 pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
 #[path = "snapshots/claude_request_money/birth_store.rs"]
@@ -31835,6 +31836,9 @@ impl OwnedSourceScan {
                     terminal_native_traversal,
                 });
             };
+            if source == SnapshotSource::ClaudeCode {
+                claude_family_census_shadow::observe_freshness_metadata(&candidate, &sampling);
+            }
             // Reject budget debt before opening/constructing any body parser.
             // Requeue the original census membership; absence/completion stays owed.
             if index.context_only_read(&candidate)
@@ -31918,6 +31922,9 @@ impl OwnedSourceScan {
             };
             if verification_rescue {
                 sampled_audit::progress_opened(index, &rescue_key);
+            }
+            if source == SnapshotSource::ClaudeCode {
+                claude_family_census_shadow::observe_freshness_metadata(&candidate, &sampling);
             }
             if preflight_source_file_fingerprint
                 .as_ref()

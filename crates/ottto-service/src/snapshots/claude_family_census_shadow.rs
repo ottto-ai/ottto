@@ -694,7 +694,7 @@ pub(super) fn equality_skip(
         )
 }
 
-fn hash64(bytes: &[u8]) -> u64 {
+pub(super) fn hash64(bytes: &[u8]) -> u64 {
     // Fixed keys: deterministic within one process, never persisted.
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     hasher.write(bytes);
@@ -1447,7 +1447,7 @@ pub(super) fn rotation(
 /// dropped for it.
 #[derive(Debug, Default)]
 pub(super) struct FirstPending {
-    stamps: Vec<(u64, u64)>,
+    stamps: Vec<(u64, u64, super::money_freshness::Metadata)>,
 }
 
 /// Freshness of the skipped set. `count` counts entries (queue + replay) as
@@ -1509,7 +1509,7 @@ impl FirstPending {
             xor ^= mix64(mixed);
             let position = self
                 .stamps
-                .binary_search_by_key(&hash, |(hash, _)| *hash)
+                .binary_search_by_key(&hash, |(hash, _, _)| *hash)
                 .ok();
             if let Some(position) = position {
                 seen[position] = true;
@@ -1517,7 +1517,8 @@ impl FirstPending {
             let previous = position.map(|position| self.stamps[position].1);
             retained += u64::from(previous.is_some());
             pending.replay_repeat += u64::from(entry.replay && previous.is_some());
-            kept.push(std::cmp::Reverse((previous.unwrap_or(now), hash)));
+            let metadata = position.map(|p| self.stamps[p].2).unwrap_or_default();
+            kept.push(std::cmp::Reverse((previous.unwrap_or(now), hash, metadata)));
             if kept.len() > MAX_FIRST_PENDING {
                 kept.pop();
                 pending.pace_evicted += 1;
@@ -1525,12 +1526,14 @@ impl FirstPending {
         }
         let mut current = kept
             .into_iter()
-            .map(|std::cmp::Reverse((stamp, hash))| (hash, stamp))
+            .map(|std::cmp::Reverse((stamp, hash, metadata))| (hash, stamp, metadata))
             .collect::<Vec<_>>();
         current.sort_unstable();
         // A path both queued and in carry replay keeps its oldest stamp.
-        current.dedup_by_key(|(hash, _)| *hash);
-        let ages = current.iter().map(|(_, stamp)| now.saturating_sub(*stamp));
+        current.dedup_by_key(|(hash, _, _)| *hash);
+        let ages = current
+            .iter()
+            .map(|(_, stamp, _)| now.saturating_sub(*stamp));
         pending.oldest_age_s = ages.clone().max().unwrap_or_default();
         pending.over_24h = ages.filter(|age| *age > OVER_24H_SECONDS).count() as u64;
         // Keep stamps of keys that left the queue unresolved.
@@ -1539,13 +1542,13 @@ impl FirstPending {
             .stamps
             .iter()
             .zip(&seen)
-            .filter(|((hash, _), seen)| !**seen && !resolved(*hash))
+            .filter(|((hash, _, _), seen)| !**seen && !resolved(*hash))
             .map(|(stamp, _)| *stamp)
             .collect::<Vec<_>>();
         current.extend(carried);
         if current.len() > MAX_FIRST_PENDING {
             let excess = current.len() - MAX_FIRST_PENDING;
-            current.sort_unstable_by_key(|(hash, stamp)| (*stamp, *hash));
+            current.sort_unstable_by_key(|(hash, stamp, _)| (*stamp, *hash));
             current.drain(..excess);
             pending.pace_evicted += excess as u64;
         }
@@ -1562,8 +1565,39 @@ impl FirstPending {
         (pending, skipped)
     }
 
+    pub(super) fn stamp(
+        &self,
+        hash: u64,
+    ) -> Option<(usize, u64, super::money_freshness::Metadata)> {
+        self.stamps
+            .binary_search_by_key(&hash, |(hash, _, _)| *hash)
+            .ok()
+            .map(|p| (p, self.stamps[p].1, self.stamps[p].2))
+    }
+
+    pub(super) fn observe_metadata(
+        &mut self,
+        hash: u64,
+        metadata: super::money_freshness::Metadata,
+    ) {
+        if let Ok(p) = self
+            .stamps
+            .binary_search_by_key(&hash, |(hash, _, _)| *hash)
+        {
+            self.stamps[p].2 = metadata;
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.stamps.len()
+    }
+
+    pub(super) fn since_at(&self, position: usize) -> u64 {
+        self.stamps[position].1
+    }
+
     fn heap_bytes(&self) -> usize {
-        self.stamps.capacity() * size_of::<(u64, u64)>()
+        self.stamps.capacity() * size_of::<(u64, u64, super::money_freshness::Metadata)>()
     }
 }
 
@@ -1584,6 +1618,8 @@ pub(super) struct Runtime {
     scope_since: Option<u64>,
     cursor: Option<String>,
     first_pending: FirstPending,
+    freshness: super::money_freshness::Episode,
+    metadata_epoch: u64,
     roots: RootCounts,
     attested: Attestations,
     sticky: Sticky,
@@ -1599,6 +1635,8 @@ impl Runtime {
             scope_since: None,
             cursor: None,
             first_pending: FirstPending::new(),
+            freshness: super::money_freshness::Episode::new(),
+            metadata_epoch: 1,
             roots: RootCounts::new(),
             attested: Attestations::new(),
             sticky: Sticky::new(),
@@ -1675,6 +1713,7 @@ pub(super) struct PageCounts {
     pub(super) sticky_vetoes: StickyAges,
     pub(super) pending_census_members: PendingCensusMembers,
     pub(super) skipped_set: SkippedSet,
+    pub(super) money_freshness: super::money_freshness::Counts,
     /// Candidate decisions the shadow itself ran for this page's Skips.
     pub(super) shadow_decision_calls: u64,
     /// Thread CPU spent in `attest_equality_skip` for this page's Skips.
@@ -1721,6 +1760,16 @@ pub(super) fn evaluate_page<'p>(
         now,
     );
     pending_census_members.stamped_for_s = now.saturating_sub(scope_since);
+    let mut money_freshness =
+        super::money_freshness::measure(index, &runtime.first_pending, runtime.metadata_epoch, now);
+    runtime.freshness.update(&mut money_freshness, now);
+    // Epoch wrap only loses metadata coverage; it never affects selection.
+    runtime.metadata_epoch = runtime.metadata_epoch.checked_add(1).unwrap_or(1);
+    if runtime.metadata_epoch == 1 {
+        for (_, _, metadata) in &mut runtime.first_pending.stamps {
+            *metadata = Default::default();
+        }
+    }
     let (vetoes, sticky_vetoes) =
         runtime
             .sticky
@@ -1783,8 +1832,8 @@ pub(super) fn evaluate_page<'p>(
         families_evaluated: families.evaluated,
         root_index_keys_processed: (root_keys + parsed_count) as u64,
         rotation_keys_visited,
-        // The stamp pass and the queued-root pass.
-        queue_entries_visited: 2 * queue_entries as u64,
+        // The stamp pass, freshness pass and queued-root pass.
+        queue_entries_visited: 3 * queue_entries as u64,
         history_gates_visited: if history_gates_overflowed {
             0
         } else {
@@ -1810,6 +1859,7 @@ pub(super) fn evaluate_page<'p>(
         sticky_vetoes,
         pending_census_members,
         skipped_set,
+        money_freshness,
         shadow_decision_calls: meter.decision_calls,
         shadow_attest_micros: meter.micros,
         attest_capped: meter.capped,
@@ -1824,7 +1874,7 @@ pub(super) const RUNTIME_RETAINED_WORST_BYTES: usize = {
     const LONGEST_KEY: usize = 4_096; // Linux PATH_MAX; macOS is 1,024.
     const LONGEST_ROOT: usize = 255; // One path component.
     const FOLLOWUP: usize = size_of::<FamilyRef>() + LONGEST_KEY + LONGEST_ROOT;
-    MAX_FIRST_PENDING * size_of::<(u64, u64)>()
+    MAX_FIRST_PENDING * size_of::<(u64, u64, super::money_freshness::Metadata)>()
         + MAX_ATTESTATIONS * size_of::<(u64, u64)>()
         + ATTESTATION_FLUSH * size_of::<(u64, u64)>()
         + MAX_ATTESTATIONS * size_of::<u64>()
@@ -1838,14 +1888,15 @@ pub(super) const RUNTIME_RETAINED_WORST_BYTES: usize = {
 /// reported per page as `cost.runtime_heap_bytes`.
 ///
 /// Retained heap, worst case, with every cap full (no maps: sorted vectors
-/// only): stamps 16,384 × 16 + attestations 16,384 × 16 + attestation buffer
+/// only): stamps 16,384 × 48 + attestations 16,384 × 16 + attestation buffer
 /// 1,024 × 16 + since-pass keys 16,384 × 8 + root counts 16,384 × 16 = 933,888
-/// bytes, plus follow-up families 256 × (48 + K + R) and the rotation and
+/// bytes before R1 metadata (which adds 524,288 bytes), plus follow-up families 256 × (48 + K + R) and the rotation and
 /// uniqueness cursors 2K, for key length K and root length R. At K = 4,096
-/// (Linux `PATH_MAX`) and R = 255 that is 2,068,224 bytes (1.97 MiB) before
+/// (Linux `PATH_MAX`) and R = 255 that is 2,592,512 bytes (2.47 MiB) before
 /// allocator rounding; at a typical K = 200, R = 36 it is about 1.0 MiB. Inline:
 /// under 512 bytes. A page's transients add at most 1.8 MiB more (1.1 MiB at
-/// typical lengths), outside `runtime_heap_bytes`. Counts only, so nothing is
+/// typical lengths), plus at most 1.6 MiB for enlarged stamp transients and
+/// 16 KiB for gauge dedup, outside `runtime_heap_bytes`. Counts only, so nothing is
 /// refused at the bound.
 ///
 /// `observe_page` holds this lock for its whole evaluation and each equality
@@ -1950,6 +2001,23 @@ pub(super) fn observe_page(
         evaluate_page(runtime, index, touched, parsed, removed_keys, scope, now)
     });
     if let Some(counts) = counts {
+        super::money_freshness::emit(&counts.money_freshness);
         crate::local_resource_diagnostics::claude_family_census_shadow(&counts);
     }
+}
+
+/// Reuse only metadata already observed by this pass. New/untracked keys stay
+/// unknown until FirstPending admits them; no additional per-file map or stat.
+#[inline(never)]
+pub(super) fn observe_freshness_metadata(
+    candidate: &CandidateFile,
+    sampling: &Option<sampled_scan::Context>,
+) {
+    with_runtime(|runtime| {
+        runtime.align_scope(scope_of(sampling));
+        runtime.first_pending.observe_metadata(
+            hash64(candidate.path.as_os_str().as_encoded_bytes()),
+            super::money_freshness::Metadata::new(candidate, runtime.metadata_epoch),
+        );
+    });
 }
