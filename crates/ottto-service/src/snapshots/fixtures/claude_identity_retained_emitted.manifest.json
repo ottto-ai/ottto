@@ -1,7 +1,14 @@
 {
   "producer_repository": "ottto-ai/ottto",
-  "generated_by_ci_commit": "pending",
+  "generated_by_ci_commit": "784e780f5fb01be58413cc1fb7d0c0e4d3c7c225",
   "producer_test": "retained_emitted_wire_goldens_for_the_receiver_contract",
   "producer_path": "crates/ottto-service/src/snapshots/fixtures/claude_identity_retained_emitted.json",
-  "sha256": "pending"
+  "sha256": "ffa9cfec98c534c6849b579ca8ba29b665a6e610a9eda10e1796fe1a5a0e7f76",
+  "item_bytes": {
+    "marker_closed_rows_open_hour_fresh": 8551,
+    "marker_window": 654853,
+    "marker_with_changed_proof_fresh": 10400,
+    "missing_proof_retag_fit": 6643,
+    "missing_proof_retag_unfit": 13574
+  }
 }
