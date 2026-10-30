@@ -2,7 +2,7 @@
 use super::*;
 
 pub(in super::super::super) fn before_collection(index: &ScanIndex) -> Result<()> {
-    let Some(runtime) = &index.persistence_v2 else {
+    let Some(runtime) = &index.v2().persistence_v2 else {
         return Ok(());
     };
     // Release the session lock before acquiring the checkpoint lock, preserving

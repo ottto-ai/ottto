@@ -52,6 +52,84 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.support);
     }
 }
+
+/// [off=main] Unbound v1 loads ignore growth fields for every source and never
+/// consult the v2 registry, even when another route owns it.
+#[test]
+fn off_v1_growth_is_unknown_and_diagnostics_need_no_registry() {
+    let root = crate::test_scratch::private_dir("v1-off-growth");
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let registry = states().lock().unwrap();
+        let root = &root;
+        scope.spawn(move || {
+            for source in ["claude_code", "codex", "pi"] {
+                // An unbound path has no custody-probe exception. The bound
+                // Claude probe is covered by the existing custody regression.
+                let path = root.join(format!("{source}-test-scan-index.json"));
+                for growth in [
+                    serde_json::Value::Null,
+                    serde_json::json!(42),
+                    serde_json::json!({"/synthetic/grown": {"last_growth_full_unix": 100}}),
+                ] {
+                    let mut wire = serde_json::to_value(ScanIndex::default()).unwrap();
+                    wire["growth_retention"] = growth;
+                    fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+                    crate::local_resource_diagnostics::source_prepare(
+                        source,
+                        || {
+                            let mut index = ScanIndex::load(&path).unwrap();
+                            assert!(index.v2.is_none());
+                            assert!(index.decode_holds.is_empty());
+                            index.save(&path).unwrap();
+                            let saved: serde_json::Value =
+                                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                            assert!(saved.get("growth_retention").is_none());
+                        },
+                        |_| false,
+                    );
+                }
+            }
+            done.send(()).unwrap();
+        });
+        let completed = finished.recv_timeout(Duration::from_secs(10));
+        drop(registry);
+        assert!(completed.is_ok(), "OFF loads waited for the v2 registry");
+    });
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// [regress] F5: uninstall must not flock or latch a paused v1 import route.
+#[test]
+fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
+    let f = Fixture::new();
+    fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
+    assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
+    let before = fs::read(&f.path).unwrap();
+    // An ordinary v1 owner must not prevent uninstall from reaching its
+    // established cleanup, and an absent checkpoint lock must stay absent.
+    close_tree(&f.support, false).unwrap();
+    assert!(!f.path.with_extension("lock").exists());
+    let lock = crate::snapshots::CheckpointLock::acquire(&f.path).unwrap();
+    close_tree(&f.support, false).unwrap();
+    drop(lock);
+    with_state(&f.path, |state| {
+        assert!(!state.latched);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+    let live = Fixture::new();
+    live.published();
+    let index = load_with(&live.path, false, &EmptyMapper).unwrap().unwrap();
+    let runtime = index.v2().persistence_v2.as_ref().unwrap();
+    assert!(runtime.session.lock().unwrap().is_some());
+    let fence = fs::read(&live.path).unwrap();
+    close_tree(&live.support, false).unwrap();
+    assert!(runtime.session.lock().unwrap().is_none());
+    assert!(guard_external(&live.path, Some(runtime), index.generation).is_err());
+    assert_eq!(fs::read(&live.path).unwrap(), fence);
+}
 struct EmptyMapper;
 impl Mapper for EmptyMapper {
     fn references(
@@ -307,6 +385,7 @@ fn generation_and_capability_are_checked_before_external_effects() {
         check().unwrap();
         {
             let mut session = index
+                .v2()
                 .persistence_v2
                 .as_ref()
                 .unwrap()
@@ -398,7 +477,7 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
         index.active_upload_context_fingerprint.as_deref(),
         Some("active-synthetic-policy")
     );
-    assert!(index.file_upload_context_enabled && index.persistence_v2.is_some());
+    assert!(index.file_upload_context_enabled && index.v2().persistence_v2.is_some());
     let current = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
     assert_eq!(
         current.upload_context_fingerprint,
@@ -417,14 +496,14 @@ fn newly_adopted_import_can_save_without_an_intervening_load() {
     assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
     let mut index = ScanIndex::default();
     import_with(&f.path, &mut index, &EmptyMapper).unwrap();
-    assert!(index.persistence_v2.is_some());
+    assert!(index.v2().persistence_v2.is_some());
     assert!(fence::sibling(&f.path, ".v2-ack-receipt").is_file());
-    let runtime = index.persistence_v2.clone().unwrap();
+    let runtime = index.v2().persistence_v2.clone().unwrap();
     assert!(save_with(&f.path, &mut index, &EmptyMapper).unwrap());
     assert_eq!(index.generation, 1);
     assert!(Arc::ptr_eq(
         &runtime,
-        index.persistence_v2.as_ref().unwrap()
+        index.v2().persistence_v2.as_ref().unwrap()
     ));
 }
 
@@ -437,7 +516,7 @@ fn import_without_original_inventory_refuses_publication() {
     assert!(load_with(&f.path, true, &EmptyMapper).unwrap().is_none());
     let mut index = ScanIndex::default();
     import_with(&f.path, &mut index, &EmptyMapper).unwrap();
-    assert!(index.persistence_v2.is_none());
+    assert!(index.v2().persistence_v2.is_none());
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
     for (suffix, _, _) in fence::ARTIFACTS
         .iter()
@@ -585,7 +664,7 @@ mod hydrate_parity {
             if !claim_only {
                 working.accepted_snapshot_fingerprints.clear();
             }
-            let runtime = working.persistence_v2.clone().unwrap();
+            let runtime = working.v2().persistence_v2.clone().unwrap();
             let mut guard = runtime.session.lock().unwrap();
             let session = guard.as_mut().unwrap();
             let mut tx = session.db.begin(TxnMode::Read).unwrap();
@@ -925,11 +1004,21 @@ fn ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
     let error = save_with(&f.path, &mut index, &EmptyMapper).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
     assert_eq!(collection_page_limit(&index, 250), 125);
-    assert!(guard_external(&f.path, index.persistence_v2.as_ref(), index.generation).is_err());
+    assert!(guard_external(
+        &f.path,
+        index.v2().persistence_v2.as_ref(),
+        index.generation
+    )
+    .is_err());
     let mut retry = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
     assert_eq!(retry.generation, 0);
     // Reopen cannot clear a failed-save upload fence.
-    assert!(guard_external(&f.path, retry.persistence_v2.as_ref(), retry.generation).is_err());
+    assert!(guard_external(
+        &f.path,
+        retry.v2().persistence_v2.as_ref(),
+        retry.generation
+    )
+    .is_err());
     let recovery = crate::snapshots::state_v2_recovery_save_guard(&f.path, &retry)
         .unwrap()
         .unwrap();
@@ -937,7 +1026,12 @@ fn ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
     assert!(save_with(&f.path, &mut retry, &EmptyMapper).unwrap());
     assert_eq!(retry.generation, 1);
     assert_eq!(collection_page_limit(&retry, 250), 150);
-    guard_external(&f.path, retry.persistence_v2.as_ref(), retry.generation).unwrap();
+    guard_external(
+        &f.path,
+        retry.v2().persistence_v2.as_ref(),
+        retry.generation,
+    )
+    .unwrap();
     for expected in [175, 200, 225, 250, 250] {
         save_with(&f.path, &mut retry, &EmptyMapper).unwrap();
         assert_eq!(collection_page_limit(&retry, 250), expected);
@@ -987,9 +1081,13 @@ fn sqlite_full_holds_across_reopen_until_a_complete_save_succeeds() {
     );
     assert!(save_with_mode(&f.path, &mut retry, &EmptyMapper, true, None).unwrap());
     assert_eq!(
-        guard_external(&f.path, retry.persistence_v2.as_ref(), retry.generation)
-            .unwrap_err()
-            .downcast_ref::<Hold>(),
+        guard_external(
+            &f.path,
+            retry.v2().persistence_v2.as_ref(),
+            retry.generation
+        )
+        .unwrap_err()
+        .downcast_ref::<Hold>(),
         Some(&Hold::SaveFull)
     );
     let recovery = crate::snapshots::state_v2_recovery_save_guard(&f.path, &retry)
@@ -997,7 +1095,12 @@ fn sqlite_full_holds_across_reopen_until_a_complete_save_succeeds() {
         .unwrap();
     recovery().unwrap();
     assert!(save_with(&f.path, &mut retry, &EmptyMapper).unwrap());
-    guard_external(&f.path, retry.persistence_v2.as_ref(), retry.generation).unwrap();
+    guard_external(
+        &f.path,
+        retry.v2().persistence_v2.as_ref(),
+        retry.generation,
+    )
+    .unwrap();
 }
 
 /// [format] unpublished import does not reorder v1 progress admission.
@@ -1028,7 +1131,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
     let legacy = ScanIndex::load(&f.path).unwrap();
     assert!(legacy.persistence_available());
-    assert!(legacy.persistence_v2.is_none());
+    assert!(legacy.v2().persistence_v2.is_none());
     assert_eq!(fs::read(&progress_path).unwrap(), progress);
     assert!(!fence::sibling(&f.path, ".v2.sqlite").exists());
 
@@ -1044,7 +1147,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     current.upload_context_fingerprint = Some("uncommitted-context".into());
     sqlite::fail_commit_full_for_test();
     assert!(save_locked(&f.path, &mut current, false, None).is_err());
-    let restored = load_locked(&f.path, None).unwrap().unwrap();
+    let restored = load_locked(&f.path, None).unwrap().0.unwrap();
     assert_eq!(restored.generation, committed_generation);
     assert_eq!(restored.upload_context_fingerprint, committed_context);
     assert_eq!(fs::read(&progress_path).unwrap(), progress);
@@ -1053,7 +1156,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     let mut unknown = serde_json::to_value(&seed.files[path]).unwrap();
     unknown["future_money"] = serde_json::json!({"owed": 23});
     let encoded = codec::encode(&serde_json::to_vec(&unknown).unwrap()).unwrap();
-    let runtime = restored.persistence_v2.as_ref().unwrap();
+    let runtime = restored.v2().persistence_v2.as_ref().unwrap();
     {
         let mut guard = runtime.session.lock().unwrap();
         let session = guard.as_mut().unwrap();

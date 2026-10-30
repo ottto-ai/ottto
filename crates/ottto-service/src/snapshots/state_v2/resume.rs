@@ -51,7 +51,7 @@ pub(super) fn files_signature(index: &ScanIndex) -> Result<[u8; 32]> {
             &index.confirmed_empty_files,
             &index.terminal_jsonl_dispositions,
             &index.claude_desktop_title_files,
-            &index.growth_retention,
+            &index.v2().growth_retention,
         ),
         b"ottto.state-v2.files-preflight.v1\0",
     )
@@ -299,7 +299,16 @@ impl KindCx {
             restore_map!(files);
             restore_map!(file_snapshot_fingerprints);
             restore_map!(terminal_jsonl_dispositions);
-            restore_map!(growth_retention);
+            match prev.v2().growth_retention.get(path) {
+                Some(value) => {
+                    next.v2_mut()
+                        .growth_retention
+                        .insert(path.clone(), value.clone());
+                }
+                None => {
+                    next.v2_mut().growth_retention.remove(path);
+                }
+            }
             restore_map!(claude_desktop_title_files);
             if prev.confirmed_empty_files.contains(path) {
                 next.confirmed_empty_files.insert(path.clone());

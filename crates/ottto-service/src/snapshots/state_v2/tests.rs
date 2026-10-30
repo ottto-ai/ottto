@@ -893,7 +893,7 @@ fn growth_retention_follows_runtime_custody_through_clones_subsets_and_baselines
     let mut committed = super::super::ScanIndex::default();
     assert!(!state_v2_growth_retention_active(&committed));
     let v1_bytes = serde_json::to_vec(&committed).unwrap();
-    committed.persistence_v2 = Some(Arc::new(Runtime {
+    committed.v2_mut().persistence_v2 = Some(Arc::new(Runtime {
         active: true,
         session: std::sync::Mutex::new(None),
     }));
@@ -901,8 +901,8 @@ fn growth_retention_follows_runtime_custody_through_clones_subsets_and_baselines
     assert_eq!(v1_bytes, serde_json::to_vec(&committed).unwrap());
     let working = committed.clone();
     assert!(Arc::ptr_eq(
-        working.persistence_v2.as_ref().unwrap(),
-        committed.persistence_v2.as_ref().unwrap()
+        working.v2().persistence_v2.as_ref().unwrap(),
+        committed.v2().persistence_v2.as_ref().unwrap()
     ));
     let subset = working.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
     assert!(state_v2_growth_retention_active(&subset));
@@ -1589,7 +1589,7 @@ fn serial_scan_propagates_maintenance_refusal_without_consuming_custody() {
         active: true,
         session: std::sync::Mutex::new(None),
     });
-    index.persistence_v2 = Some(route.clone());
+    index.v2_mut().persistence_v2 = Some(route.clone());
     let before = serde_json::to_vec(&index).unwrap();
     let result = super::super::scan_source_roots_with_test_limit(
         super::super::SnapshotSource::ClaudeCode,
@@ -1603,7 +1603,7 @@ fn serial_scan_propagates_maintenance_refusal_without_consuming_custody() {
     assert!(result.is_err());
     assert_eq!(before, serde_json::to_vec(&index).unwrap());
     assert!(std::sync::Arc::ptr_eq(
-        index.persistence_v2.as_ref().unwrap(),
+        index.v2().persistence_v2.as_ref().unwrap(),
         &route
     ));
 }

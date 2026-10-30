@@ -865,7 +865,7 @@ fn off_large_v1_manifest_load_cas_and_containment_match_compact_v1() {
     // route, v1 CAS writer, and the shared containment admission guard.
     let mut expected = compact.load();
     let mut actual = large.load();
-    assert!(actual.persistence_v2.is_none());
+    assert!(actual.v2().persistence_v2.is_none());
     assert!(actual.persistence_available());
     assert_eq!(
         serde_json::to_vec(&actual).unwrap(),

@@ -13,8 +13,7 @@ macro_rules! coverage {
     };
 }
 coverage! {
-    persistence_v2 => ("MISC", "runtime"),
-    growth_claim_context => ("FILES", "runtime"),
+    v2 => ("FILES", "runtime"),
     persistence_root => ("MISC", "runtime"),
     persistence_unavailable => ("MISC", "runtime"),
     persistence_controls => ("MISC", "runtime"),
@@ -127,7 +126,6 @@ coverage! {
     claude_history_emission => ("MISC", "runtime"),
     claude_money_birth_store => ("MISC", "v1_field.birth_store"),
     claude_desktop_store_inventory => ("MISC", "v1_field.claude_desktop_store_inventory"),
-    growth_retention => ("FILES", "file.growth_retention"),
 }
 /// [format] every scan index field and kind has one owner.
 #[test]

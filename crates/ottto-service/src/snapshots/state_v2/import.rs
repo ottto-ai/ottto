@@ -1318,9 +1318,10 @@ mod application_cases {
         let _lock = super::super::super::CheckpointLock::acquire(&c.path).unwrap();
         let loaded = super::super::runtime::load_locked(&c.path, None)
             .unwrap()
+            .0
             .unwrap();
         assert_eq!(loaded.generation, 10);
-        assert!(loaded.persistence_v2.is_some());
+        assert!(loaded.v2().persistence_v2.is_some());
         // Only this component fixture publishes. Production conversion keeps
         // its explicit R1 staging prerequisite remains until the owner installs hooks.
         assert_eq!(
@@ -1383,7 +1384,7 @@ mod application_cases {
         let original = Original::read(&c.path).unwrap();
         assert!(original.presence["claude_history_cutoff_unix_seconds"]);
         assert!(original.presence["accepted_snapshot_fingerprints"]);
-        assert!(!original.presence["growth_retention"]);
+        assert!(!original.presence.contains_key("growth_retention"));
         assert_eq!(fs::read_dir(c.path.parent().unwrap()).unwrap().count(), 1);
         original.unchanged().unwrap();
         fs::write(&c.path, b"changed-original").unwrap();
@@ -1472,7 +1473,7 @@ mod application_cases {
         let original = Original::read(&c.path).unwrap();
         assert_eq!(original.files.len(), payloads.len() + 1);
         assert!(original.presence["claude_account_family_pending"]);
-        assert!(!original.presence["growth_retention"]);
+        assert!(!original.presence.contains_key("growth_retention"));
         original.preserve(&c.path).unwrap();
         assert_eq!(
             fs::read(fence::sibling(&c.path, ".v1-readonly")).unwrap(),

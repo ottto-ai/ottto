@@ -690,19 +690,13 @@ impl Observation {
 /// Return values and errors pass through; unwinding closes sampling silently.
 pub(crate) fn source_prepare<T>(
     source: &str,
-    v2_path: Option<&std::path::Path>,
     inner: impl FnOnce() -> T,
+    v2_active: impl FnOnce(&T) -> bool,
 ) -> T {
-    let active = || {
-        source == "claude_code" && v2_path.is_some_and(crate::snapshots::state_v2_runtime_active)
-    };
-    if active() {
-        crate::snapshots::state_v2_pass_start();
-    }
     let probe = Probe::start();
     let footprint = footprint::Stage::begin();
     let result = inner();
-    if active() {
+    if source == "claude_code" && v2_active(&result) {
         crate::snapshots::state_v2_prepare_observed();
     }
     emit(&Record {
@@ -2127,9 +2121,11 @@ mod tests {
     fn footprint_fields_are_stage_only_for_all_native_sources() {
         for source in ["claude_code", "codex", "pi"] {
             let (result, records) = capture(|| {
-                source_prepare(source, None, || {
-                    source_finish(source, false, || Ok::<_, anyhow::Error>(17))
-                })
+                source_prepare(
+                    source,
+                    || source_finish(source, false, || Ok::<_, anyhow::Error>(17)),
+                    |_| false,
+                )
             });
             assert_eq!(result.unwrap(), 17);
             assert_eq!(records.len(), 2);

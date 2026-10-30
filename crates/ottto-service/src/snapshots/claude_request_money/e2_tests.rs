@@ -4475,7 +4475,7 @@ fn retained_growth_identity_failure_cannot_suppress_another_sessions_request() {
             index
                 .claude_money_birth_store
                 .record_observation(ROOT, &key, t0());
-            index.growth_retention.insert(
+            index.v2_mut().growth_retention.insert(
                 key.clone(),
                 serde_json::from_value(json!({
                     "predecessor_size":1,
@@ -4495,7 +4495,7 @@ fn retained_growth_identity_failure_cannot_suppress_another_sessions_request() {
             assert!(crate::snapshots::sampled_audit::growth_retirement_excluded(
                 &index, &key
             ));
-            let debt = index.growth_retention.clone();
+            let debt = index.v2().growth_retention.clone();
             let replacement = root.join("replacement");
             fs::write(&replacement, b"{\"requestId\":\"new\"}\n").unwrap();
             fs::File::options()
@@ -4559,7 +4559,8 @@ fn retained_growth_identity_failure_cannot_suppress_another_sessions_request() {
                 invalidate_claude_request_census(&mut index, &path);
             }
             assert_eq!(
-                index.growth_retention, debt,
+                index.v2().growth_retention,
+                debt,
                 "scheduling obligation survives"
             );
             assert!(index.claude_request_census.get(&key).is_none());

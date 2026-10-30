@@ -41,7 +41,10 @@ impl Fixture {
             }))
             .unwrap(),
         );
-        index.growth_retention.insert(key.clone(), debt(None));
+        index
+            .v2_mut()
+            .growth_retention
+            .insert(key.clone(), debt(None));
         let identity = Identity {
             format: FORMAT,
             db_id: "synthetic-growth-lineage".into(),
@@ -87,7 +90,7 @@ impl Fixture {
             None,
             30,
             &index.files,
-            Some(&index.growth_retention),
+            Some(&index.v2().growth_retention),
         )
         .unwrap();
         open_and_identify_scan_candidate_with_growth(
@@ -97,7 +100,7 @@ impl Fixture {
             None,
             30,
             &index.files,
-            Some(&index.growth_retention),
+            Some(&index.v2().growth_retention),
         )
         .unwrap()
         .0
@@ -106,9 +109,10 @@ impl Fixture {
     /// still-gated production planner, then exercise the real receipt hook.
     fn commit_claim(&self, index: &mut ScanIndex, confirmed: bool) {
         index
+            .v2_mut()
             .growth_retention
             .insert(self.key.clone(), debt(Some(NOW)));
-        let runtime = index.persistence_v2.as_ref().unwrap().clone();
+        let runtime = index.v2().persistence_v2.as_ref().unwrap().clone();
         let mut guard = runtime.session.lock().unwrap();
         let session = guard.as_mut().unwrap();
         let mut tx = session.db.begin(TxnMode::Write).unwrap();
@@ -116,7 +120,7 @@ impl Fixture {
             key: &RowKey::record("file.growth_retention", self.key.as_bytes(), 1).unwrap(),
             fixed: &Fixed::None,
             value_version: 1,
-            value: &PackedDebt(&index.growth_retention[&self.key]),
+            value: &PackedDebt(&index.v2().growth_retention[&self.key]),
         })
         .unwrap();
         let next = index.generation + 1;
@@ -194,7 +198,8 @@ fn confirmed_claim_survives_native_reopen_and_clock_rollback() {
     let mut reopened = f.load();
     let candidate = f.candidate(&reopened);
     assert_eq!(
-        serde_json::to_value(&reopened.growth_retention[&f.key]).unwrap()["last_growth_full_unix"],
+        serde_json::to_value(&reopened.v2().growth_retention[&f.key]).unwrap()
+            ["last_growth_full_unix"],
         NOW
     );
     for now in [NOW - 1, NOW, NOW + INTERVAL - 1] {
@@ -226,7 +231,7 @@ fn independent_load_cannot_borrow_claim_generation_even_without_working_debt() {
         None
     );
     assert!(crate::snapshots::state_v2_side_effect_guard(&f.path, &stale)().is_err());
-    stale.growth_retention.clear();
+    stale.v2_mut().growth_retention.clear();
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
         for reason in [FullReason::StateMissing, FullReason::Replaced] {
             assert!(!admitted(&mut stale, &candidate, reason, NOW + INTERVAL));
@@ -243,11 +248,11 @@ fn reopened_owner_and_other_path_cannot_reuse_foreign_claim_context() {
     let f = Fixture::new();
     let mut old = f.load();
     f.commit_claim(&mut old, true);
-    let context = old.growth_claim_context.clone();
+    let context = old.v2().growth_claim_context.clone();
     invalidate_locked(&f.path).unwrap();
     let mut reopened = f.load();
     let candidate = f.candidate(&reopened);
-    reopened.growth_claim_context = context.clone();
+    reopened.v2_mut().growth_claim_context = context.clone();
     assert!(!admitted(
         &mut reopened,
         &candidate,
@@ -256,7 +261,7 @@ fn reopened_owner_and_other_path_cannot_reuse_foreign_claim_context() {
     ));
     let other = Fixture::new();
     let mut foreign = other.load();
-    foreign.growth_claim_context = context;
+    foreign.v2_mut().growth_claim_context = context;
     let candidate = other.candidate(&foreign);
     assert!(!admitted(
         &mut foreign,
@@ -316,13 +321,14 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
     let f = Fixture::new();
     let mut claim = f.load();
     let mut old = claim.clone();
-    let context = claim.growth_claim_context.clone().unwrap();
+    let context = claim.v2().growth_claim_context.clone().unwrap();
     claim
+        .v2_mut()
         .growth_retention
         .insert(f.key.clone(), debt(Some(NOW)));
     claim.save_growth_claim(&f.path).unwrap();
     assert!(Arc::ptr_eq(
-        claim.growth_claim_context.as_ref().unwrap(),
+        claim.v2().growth_claim_context.as_ref().unwrap(),
         &context
     ));
     {
@@ -344,7 +350,7 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
         "an ordinary save ends this claim's authority"
     );
     assert!(!Arc::ptr_eq(
-        old.growth_claim_context.as_ref().unwrap(),
+        old.v2().growth_claim_context.as_ref().unwrap(),
         &context
     ));
     assert_eq!(
@@ -357,7 +363,8 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
         old.upload_context_fingerprint
     );
     assert_eq!(
-        serde_json::to_value(&reopened.growth_retention[&f.key]).unwrap()["last_growth_full_unix"],
+        serde_json::to_value(&reopened.v2().growth_retention[&f.key]).unwrap()
+            ["last_growth_full_unix"],
         serde_json::json!(NOW)
     );
 }

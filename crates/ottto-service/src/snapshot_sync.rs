@@ -1350,7 +1350,7 @@ struct SnapshotUploadProgress {
     schema_version: u16,
     /// V2-only authenticated companion; never serialized into the v1 ledger.
     #[serde(skip)]
-    ack_recovery: Option<crate::snapshots::ProgressRecovery>,
+    ack_recovery: Option<Box<crate::snapshots::ProgressRecovery>>,
     #[serde(default)]
     generation: u64,
     destination_namespace_hash: String,
@@ -1497,7 +1497,7 @@ impl SnapshotUploadProgress {
                 expected_destination_namespace_hash.to_string(),
                 active_quarantine_witness,
             );
-            progress.ack_recovery = ack_recovery;
+            progress.ack_recovery = ack_recovery.map(Box::new);
             return Ok(progress);
         }
         let parsed = std::fs::read(path)
@@ -1608,7 +1608,7 @@ impl SnapshotUploadProgress {
                     }),
                 Some(&active_quarantine_witness),
             ) > 0;
-        progress.ack_recovery = ack_recovery;
+        progress.ack_recovery = ack_recovery.map(Box::new);
         progress.active_quarantine_witness = Some(active_quarantine_witness);
         progress.active_quarantine_retries.clear();
         progress.active_reason_reoffers.clear();
@@ -2812,7 +2812,7 @@ impl SnapshotUploadProgress {
 
 pub(crate) struct SnapshotProgressLock {
     file: std::fs::File,
-    path: PathBuf,
+    path: Option<Box<Path>>,
 }
 
 impl SnapshotProgressLock {
@@ -2836,10 +2836,12 @@ impl SnapshotProgressLock {
                     .context("snapshot upload progress is owned by another daemon");
             }
         }
-        Ok(Self {
-            file,
-            path: path.to_owned(),
-        })
+        Ok(Self { file, path: None })
+    }
+
+    fn for_v2(mut self, path: &Path) -> Self {
+        self.path = Some(path.into());
+        self
     }
 }
 
@@ -3193,6 +3195,11 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     audit_release: Option<AccountAuditRelease<'_>>,
 ) -> Result<ScanIndex> {
     let progress_owner = SnapshotProgressLock::acquire(progress_path)?;
+    let progress_owner = if crate::snapshots::state_v2_growth_retention_active(index) {
+        progress_owner.for_v2(progress_path)
+    } else {
+        progress_owner
+    };
     let mut durable: SnapshotUploadProgress = match match read_limit {
         Some(cap) => crate::snapshot_retry::read_state(progress_path, cap),
         None => std::fs::read(progress_path),
@@ -6055,15 +6062,8 @@ fn prepare_sync_source(
     let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
         source == SnapshotSource::ClaudeCode,
     );
-    let v2_path = (source == SnapshotSource::ClaudeCode).then(|| {
-        snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
-            &snapshot_index_path(support_dir, source),
-            &snapshot_upload_destination_namespace(device, device_secret),
-        ))
-    });
     let result = crate::local_resource_diagnostics::source_prepare(
         source.api_slug(),
-        v2_path.as_deref(),
         || {
             prepare_sync_source_inner(
                 client,
@@ -6078,6 +6078,15 @@ fn prepare_sync_source(
                 account_witness,
                 retry_enabled,
             )
+        },
+        |result| {
+            result
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .is_some_and(|preparation| {
+                    crate::snapshots::state_v2_growth_retention_active(&preparation.committed_index)
+                })
         },
     );
     let counts = diagnostics.finish();
@@ -11950,11 +11959,14 @@ pub(crate) fn with_state_v2_progress_owner<T>(
     let path = snapshot_upload_progress_path(index_path);
     match owner {
         Some(owner) => {
-            anyhow::ensure!(owner.path == path, "state_v2_progress_owner_path");
+            anyhow::ensure!(
+                owner.path.as_deref() == Some(path.as_path()),
+                "state_v2_progress_owner_path"
+            );
             action(owner, &path)
         }
         None => {
-            let owner = SnapshotProgressLock::acquire(&path)?;
+            let owner = SnapshotProgressLock::acquire(&path)?.for_v2(&path);
             action(&owner, &path)
         }
     }

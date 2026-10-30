@@ -3030,7 +3030,11 @@ fn insert_transcript_record(
     }
     let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
     let active = super::sampled_audit::growth_active(index);
-    let growth = &index.growth_retention;
+    let growth = &index
+        .v2
+        .as_deref()
+        .unwrap_or(&super::state_v2::EMPTY_INDEX)
+        .growth_retention;
     let walk = index.traversal.as_ref();
     let excluded = |key: &str| {
         let excluded =
@@ -3324,7 +3328,11 @@ fn retire_claude_transcript_records_excluding(
     }
     let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
     let active = super::sampled_audit::growth_active(index);
-    let growth = &index.growth_retention;
+    let growth = &index
+        .v2
+        .as_deref()
+        .unwrap_or(&super::state_v2::EMPTY_INDEX)
+        .growth_retention;
     let walk = index.traversal.as_ref();
     let excluded = |key: &str| {
         active && super::sampled_audit::growth_excluded_parts(key, growth, walk, terminal_residue)

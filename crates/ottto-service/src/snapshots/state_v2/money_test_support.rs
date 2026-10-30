@@ -51,8 +51,7 @@ pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> ScanIndex {
     // into the oracle. Runtime leases and in-process flags are not custody.
     let bytes = serde_json::to_vec(index).unwrap();
     let mut expected: ScanIndex = serde_json::from_slice(&bytes).unwrap();
-    let mut db = populate(path, &expected, BTreeMap::new());
-    let restored = import::ClaudeMapper.hydrate(&mut db).unwrap();
+    let restored = roundtrip_rows(&expected, path);
     expected.generation += 1;
     assert_eq!(
         serde_json::to_vec(&restored).unwrap(),
@@ -64,6 +63,12 @@ pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> ScanIndex {
         expected.decode_holds.v2_provenance()
     );
     restored
+}
+
+/// Preserve v2-only debt and raw holds through the composed store as well.
+pub(super) fn roundtrip_rows(index: &ScanIndex, path: &Path) -> ScanIndex {
+    let mut db = populate(path, index, BTreeMap::new());
+    import::ClaudeMapper.hydrate(&mut db).unwrap()
 }
 
 use import::Mapper;

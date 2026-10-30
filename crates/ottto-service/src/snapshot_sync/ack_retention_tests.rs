@@ -2401,7 +2401,7 @@ fn bound_progress(
     );
     let recovery = crate::snapshots::ProgressRecovery::synthetic(index_path, namespace, 0);
     recovery.adopt_synthetic(None);
-    progress.ack_recovery = Some(recovery);
+    progress.ack_recovery = Some(Box::new(recovery));
     progress.save(progress_path).unwrap();
     progress
 }
@@ -2589,11 +2589,11 @@ fn v2_runtime_binding_preserves_existing_progress_bytes_and_off_performs_no_rece
     );
     progress.record_body(&"b".repeat(64), &"c".repeat(64));
     let existing_bytes = serde_json::to_vec_pretty(&progress).unwrap();
-    progress.ack_recovery = Some(crate::snapshots::ProgressRecovery::synthetic(
+    progress.ack_recovery = Some(Box::new(crate::snapshots::ProgressRecovery::synthetic(
         &index_path,
         &"a".repeat(64),
         0,
-    ));
+    )));
     assert_eq!(
         serde_json::to_vec_pretty(&progress).unwrap(),
         existing_bytes
@@ -2672,7 +2672,7 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
             );
             let mut working = committed.clone();
             progress.ack_recovery =
-                crate::snapshots::ProgressRecovery::for_index(&committed, &index_path).unwrap();
+                crate::snapshots::ProgressRecovery::for_index(&committed, &index_path).unwrap().map(Box::new);
             // Two exact sibling ACKs followed by a real uploader stop. No file
             // publication changes: R1's activation/staging guard stays intact.
             let upload = |items: &[SnapshotItem],

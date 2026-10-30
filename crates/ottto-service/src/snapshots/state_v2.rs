@@ -7,6 +7,7 @@ use super::ScanIndex;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
+use std::{collections::BTreeMap, sync::Arc};
 
 mod fence;
 mod import;
@@ -19,7 +20,7 @@ pub(super) use runtime::invalidate_tree;
 pub(super) use runtime::Hold;
 pub(super) use runtime::{
     after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
-    idle, load_locked, published, recovery_save_guard, runtime_active, save_locked,
+    idle, load_locked, published, recovery_save_guard, save_locked,
 };
 mod codec;
 #[cfg(test)]
@@ -35,6 +36,29 @@ mod mapper;
 pub(crate) mod resume;
 mod sqlite;
 use kinds::KindCx;
+
+/// One lazy attachment keeps v2 custody, claim lineage and debt out of v1's
+/// inline graph. An absent attachment borrows this immutable empty value.
+#[derive(Clone, Debug, Default)]
+pub(super) struct IndexState {
+    pub(super) persistence_v2: Option<Arc<Runtime>>,
+    pub(super) growth_claim_context: Option<Arc<super::sampled_audit::GrowthClaimContext>>,
+    pub(super) growth_retention: BTreeMap<String, super::sampled_audit::GrowthRetention>,
+}
+pub(super) static EMPTY_INDEX: IndexState = IndexState {
+    persistence_v2: None,
+    growth_claim_context: None,
+    growth_retention: BTreeMap::new(),
+};
+impl ScanIndex {
+    pub(super) fn v2(&self) -> &IndexState {
+        self.v2.as_deref().unwrap_or(&EMPTY_INDEX)
+    }
+    pub(super) fn v2_mut(&mut self) -> &mut IndexState {
+        self.v2.get_or_insert_with(Box::default)
+    }
+}
+crate::heap_layout_bound::fields!(IndexState; persistence_v2, growth_claim_context, growth_retention);
 
 /// Runtime-only custody carrier. Only the verified v2 load route may install it.
 /// Environment/sentinel state alone must never activate growth retention.
@@ -58,6 +82,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for Runtime {
 /// indices carry the committed route; switch changes do not erase custody.
 pub(crate) fn state_v2_growth_retention_active(index: &ScanIndex) -> bool {
     index
+        .v2()
         .persistence_v2
         .as_ref()
         .is_some_and(|runtime| runtime.active)

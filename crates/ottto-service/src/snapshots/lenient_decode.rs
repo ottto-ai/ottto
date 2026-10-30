@@ -111,6 +111,7 @@ impl Holds {
             .iter()
             .copied()
             .find(|f| *f == field)
+            .or_else(|| (field == "growth_retention").then_some("growth_retention"))
             .ok_or_else(|| anyhow::anyhow!("state_v2_unknown_hold"))?;
         anyhow::ensure!(
             matches!(
@@ -411,7 +412,6 @@ impl Serialize for ScanIndex {
             claude_money_birth_store,
             claude_money_birth_store::BirthStore::is_empty
         );
-        field!(held growth_retention);
         map.end()
     }
 }
@@ -504,7 +504,6 @@ pub(super) const FIELDS: &[&str] = &[
     "held_audit_progress",
     "claude_money_birth_store",
     "claude_desktop_store_inventory", // Decoded and ignored; never serialized.
-    "growth_retention",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1303,7 +1302,16 @@ pub(super) fn post_decode_hydrated(
         };
     }
     records!(files);
-    records!(growth_retention);
+    // This debt exists only in authenticated v2 rows, never in the v1 codec.
+    if let Some(span) = decoder.raw_hydrate_input("growth_retention")? {
+        for key in decoder.original_holds.as_ref().unwrap().0["growth_retention"].keys() {
+            index.v2_mut().growth_retention.remove(key);
+        }
+        index
+            .v2_mut()
+            .growth_retention
+            .extend(decoder.records("growth_retention", span, true)?);
+    }
     records!(claude_account_family_witnesses);
     records!(claude_account_family_pending);
     records!(claude_usage_family_witnesses);
@@ -2087,10 +2095,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.upload_context_fingerprint = self.typed(value)?
                         }
                         "files" => index.files = self.records("files", value, true)?,
-                        "growth_retention" => {
-                            index.growth_retention =
-                                self.records("growth_retention", value, true)?
-                        }
                         "session_account_bindings" => {
                             index.session_account_bindings = self.typed(value)?
                         }

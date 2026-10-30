@@ -103,10 +103,10 @@ impl Stage {
             finished: false,
         }
     }
-    pub(in super::super) fn v1(path: &Path) -> Option<Self> {
+    pub(in super::super) fn v1(path: &Path, sample_v1: bool) -> Option<Self> {
         // OFF has no probe/thread/allocation side effects. Only opted-in Claude
         // paths have route state before the mapper pauses the conversion.
-        if !super::runtime::observed(path) {
+        if !sample_v1 {
             return None;
         }
         let mut stage = Self::new(Kind::V1);
@@ -240,6 +240,7 @@ pub(in super::super) fn pass_start() {
     PASS.with(|pass| {
         *pass.borrow_mut() = Pass {
             started: true,
+            active: true,
             cpu_start: crate::local_resource_diagnostics::state_v2_cpu_us(),
             written_start: process_written_bytes(),
             ..Default::default()
@@ -378,7 +379,7 @@ fn retained_heap(index: &ScanIndex) -> RetainedHeap {
 }
 fn side_maps(index: &ScanIndex) -> Option<u64> {
     let mut bytes = 0_u64;
-    bytes = bytes.checked_add(heap(&index.growth_retention)?)?;
+    bytes = bytes.checked_add(heap(&index.v2().growth_retention)?)?;
     bytes = bytes.checked_add(heap(&index.persistence_legacy_recovery)?)?;
     bytes = bytes.checked_add(heap(&index.persistence_root)?)?;
     bytes = bytes.checked_add(heap(&index.persistence_unavailable)?)?;
@@ -585,9 +586,16 @@ mod ops_tests {
         });
         let before = PASS.with(|pass| pass.borrow().clone());
         let (result, records) = crate::local_resource_diagnostics::capture(|| {
-            crate::local_resource_diagnostics::source_prepare("claude_code", Some(&path), || {
-                crate::local_resource_diagnostics::source_finish("claude_code", false, || Ok(17))
-            })
+            crate::local_resource_diagnostics::source_prepare(
+                "claude_code",
+                || {
+                    assert!(Stage::v1(&path, false).is_none());
+                    crate::local_resource_diagnostics::source_finish("claude_code", false, || {
+                        Ok(17)
+                    })
+                },
+                |_| false,
+            )
         });
         let after = PASS.with(|pass| std::mem::replace(&mut *pass.borrow_mut(), previous));
         assert_eq!(result.unwrap(), 17);

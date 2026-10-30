@@ -95,7 +95,6 @@ struct RouteState {
     latched: bool,
     inventory_ready: bool,
     original: Option<import::Original>,
-    sample_v1: bool,
     runtimes: Vec<std::sync::Weak<Runtime>>,
     current: Option<Arc<Runtime>>,
     cached: Option<ScanIndex>,
@@ -146,7 +145,6 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     latched: false,
                     inventory_ready: false,
                     original: None,
-                    sample_v1: false,
                     runtimes: Vec::new(),
                     current: None,
                     cached: None,
@@ -197,23 +195,6 @@ pub(in super::super) fn published(path: &Path) -> Result<bool> {
     }
     held(fence::evidence(path))
 }
-/// Only a verified runtime enables pass diagnostics; custody or the switch alone
-/// cannot start sampling. Reuse the existing route registry without admission.
-pub(in super::super) fn runtime_active(path: &Path) -> bool {
-    if binding(path).is_none() {
-        return false;
-    }
-    let state = states()
-        .lock()
-        .ok()
-        .and_then(|states| states.get(path).cloned());
-    state.is_some_and(|state| {
-        state
-            .lock()
-            .is_ok_and(|state| state.current.as_ref().is_some_and(|runtime| runtime.active))
-    })
-}
-
 #[cfg(test)]
 pub(in super::super) fn checkpoint_priority_fixture(path: &Path, active: bool) {
     with_state(path, |state| {
@@ -229,13 +210,6 @@ pub(in super::super) fn checkpoint_priority_fixture(path: &Path, active: bool) {
     .unwrap();
 }
 
-pub(super) fn observed(path: &Path) -> bool {
-    let state = states()
-        .lock()
-        .ok()
-        .and_then(|states| states.get(path).cloned());
-    state.is_some_and(|state| state.lock().is_ok_and(|state| state.sample_v1))
-}
 fn binding(path: &Path) -> Option<super::super::scan_index_persistence::Binding> {
     super::super::scan_index_integration::scan_index_storage_binding(path)
         .filter(|b| b.source == super::super::scan_index_persistence::Source::Claude)
@@ -270,12 +244,15 @@ fn held<T>(result: Result<T>) -> Result<T> {
 pub(in super::super) fn load_locked(
     path: &Path,
     support: Option<&Path>,
-) -> Result<Option<ScanIndex>> {
+) -> Result<(Option<ScanIndex>, bool)> {
     // Do not probe the Claude sentinel for Codex, Pi or unbound paths.
     if binding(path).is_none() {
-        return Ok(None);
+        return Ok((None, false));
     }
-    load_with(path, enabled(support), &ClaudeMapper)
+    let switched = enabled(support);
+    let index = load_with(path, switched, &ClaudeMapper)?;
+    let sample_v1 = switched && index.is_none();
+    Ok((index, sample_v1))
 }
 fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Option<ScanIndex>> {
     let Some(binding) = binding(path) else {
@@ -287,13 +264,13 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
     let result = held(with_state(path, |state| {
         state.inventory_ready = false;
         state.original = None;
-        state.sample_v1 = switched;
         let pair = fence::reconcile(path, &binding, state.latched)?;
         state.pass_written_start = (switched || pair.is_some())
             .then(telemetry::process_written_bytes)
             .flatten();
         if let Some((identity, db_path)) = pair {
             state.latched = true;
+            telemetry::pass_start();
             if !switched {
                 telemetry::event("switch_off_ignored", &1);
             }
@@ -320,7 +297,7 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
                         ensure!(index.generation == session.stamp.0, Hold::DbUnavailable);
                         normalize_hydrated(&mut index)?;
                         session.cx = cx;
-                        index.persistence_v2 = Some(runtime.clone());
+                        index.v2_mut().persistence_v2 = Some(runtime.clone());
                         state.cached = Some(index.clone());
                         return Ok(Some(index));
                     }
@@ -344,7 +321,7 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
             normalize_hydrated(&mut index)?;
             db.prime_headers()?;
-            index.persistence_v2 = Some(Arc::new(Runtime {
+            index.v2_mut().persistence_v2 = Some(Arc::new(Runtime {
                 active: true,
                 session: Mutex::new(Some(Session {
                     db,
@@ -523,7 +500,7 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             Hold::DbUnavailable
         );
         index.generation = stamp.0;
-        index.persistence_v2 = Some(Arc::new(Runtime {
+        index.v2_mut().persistence_v2 = Some(Arc::new(Runtime {
             active: true,
             session: Mutex::new(Some(Session {
                 db,
@@ -534,6 +511,7 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
                 stamp,
             })),
         }));
+        telemetry::pass_start();
         register(state, index)?;
         state.cached = Some(index.clone());
         Ok(())
@@ -564,17 +542,17 @@ fn save_with_mode<M: Mapper>(
     progress_owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
 ) -> Result<bool> {
     let Some(binding) = binding(path) else {
-        ensure!(index.persistence_v2.is_none(), Hold::ForeignBinding);
+        ensure!(index.v2().persistence_v2.is_none(), Hold::ForeignBinding);
         return Ok(false);
     };
-    if index.persistence_v2.is_none() && !route_needed(path, false)? {
+    if index.v2().persistence_v2.is_none() && !route_needed(path, false)? {
         return Ok(false);
     }
     // This accessor authenticates the owner/session; call before route/session locks.
     let claim_generation = super::super::sampled_audit::own_growth_claim_generation(index, path);
     let mut result = held(with_state(path, |state| {
         let pair = fence::reconcile(path, &binding, state.latched)?;
-        let Some(runtime) = index.persistence_v2.clone() else {
+        let Some(runtime) = index.v2().persistence_v2.clone() else {
             ensure!(pair.is_none(), Hold::DbUnavailable);
             return Ok(false);
         };
@@ -750,7 +728,7 @@ pub(in super::super) fn recovery_save_guard(
     path: &Path,
     index: &ScanIndex,
 ) -> Result<Option<impl Fn() -> Result<()>>> {
-    let Some(runtime) = &index.persistence_v2 else {
+    let Some(runtime) = &index.v2().persistence_v2 else {
         return Ok(None);
     };
     if !with_state(path, |state| Ok(state.save_hold.is_some()))? {
@@ -802,7 +780,7 @@ fn guard_current(
 }
 
 pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usize) -> usize {
-    let Some(runtime) = &index.persistence_v2 else {
+    let Some(runtime) = &index.v2().persistence_v2 else {
         return requested;
     };
     let path = runtime
@@ -832,7 +810,7 @@ pub(super) fn purge_policy() -> (Duration, Duration) {
 }
 
 pub(in super::super) fn idle(path: &Path, index: &ScanIndex, quiet: bool) -> Result<()> {
-    let Some(runtime) = &index.persistence_v2 else {
+    let Some(runtime) = &index.v2().persistence_v2 else {
         return Ok(());
     };
     let _lock = super::super::CheckpointLock::acquire(path)?;
@@ -864,7 +842,7 @@ pub(in super::super) fn idle(path: &Path, index: &ScanIndex, quiet: bool) -> Res
 fn register(state: &mut RouteState, index: &ScanIndex) -> Result<()> {
     state.runtimes.retain(|r| r.strong_count() != 0);
     ensure!(state.runtimes.len() < 16, Hold::DbUnavailable);
-    if let Some(runtime) = &index.persistence_v2 {
+    if let Some(runtime) = &index.v2().persistence_v2 {
         state.runtimes.push(Arc::downgrade(runtime));
         state.current = Some(runtime.clone());
     }
@@ -921,7 +899,6 @@ fn invalidate_locked(path: &Path) -> Result<()> {
     with_state(path, |state| {
         state.latched = true;
         state.inventory_ready = false;
-        state.sample_v1 = false;
         state.cached = None;
         state.current = None;
         for runtime in state.runtimes.drain(..).filter_map(|r| r.upgrade()) {
@@ -938,30 +915,14 @@ fn invalidate_locked(path: &Path) -> Result<()> {
 /// handles first; its established cleanup owner performs all file deletion.
 #[cfg(target_os = "macos")]
 pub(in super::super) fn invalidate_tree(support: &Path) -> Result<()> {
-    let root = support.join("snapshots");
-    let paths: Vec<_> = states()
-        .lock()
-        .map_err(|_| Hold::DbUnavailable)?
-        .keys()
-        .filter(|p| p.starts_with(&root))
-        .cloned()
-        .collect();
-    for path in paths {
-        if path.parent().is_some_and(Path::is_dir) {
-            let _lock = super::super::CheckpointLock::acquire(&path)?;
-            invalidate_locked(&path)?;
-        } else {
-            invalidate_locked(&path)?;
-        }
-    }
-    Ok(())
+    close_tree(support, false)
 }
 
 /// Explicit erasure only. Close the shared session before unlinking all
 /// artifacts, and invalidate clones before releasing CheckpointLock.
 pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> Result<()> {
     invalidate_locked(path)?;
-    if let Some(runtime) = index.and_then(|i| i.persistence_v2.as_ref()) {
+    if let Some(runtime) = index.and_then(|i| i.v2().persistence_v2.as_ref()) {
         runtime
             .session
             .lock()
@@ -993,6 +954,10 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
 /// existing whole-tree removal owns legacy files and unregistered artifacts;
 /// discovering those files here would consume the bounded route registry.
 pub(in super::super) fn erase_tree(support: &Path) -> Result<()> {
+    close_tree(support, true)
+}
+
+fn close_tree(support: &Path, erase: bool) -> Result<()> {
     let root = support.join("snapshots");
     let routes: Vec<_> = states()
         .lock()
@@ -1004,14 +969,30 @@ pub(in super::super) fn erase_tree(support: &Path) -> Result<()> {
     for (path, state) in routes {
         let live = {
             let state = state.lock().map_err(|_| Hold::DbUnavailable)?;
-            state.runtimes.iter().any(|r| r.strong_count() != 0)
+            let mut live = false;
+            for runtime in state.runtimes.iter().filter_map(|r| r.upgrade()) {
+                if runtime
+                    .session
+                    .lock()
+                    .map_err(|_| Hold::DbUnavailable)?
+                    .is_some()
+                {
+                    live = true;
+                    break;
+                }
+            }
+            live
         };
         if !live {
             continue;
         }
         if path.parent().is_some_and(Path::is_dir) {
             let _lock = super::super::CheckpointLock::acquire(&path)?;
-            erase_locked(&path, None)?;
+            if erase {
+                erase_locked(&path, None)?;
+            } else {
+                invalidate_locked(&path)?;
+            }
         } else {
             invalidate_locked(&path)?;
         }
@@ -1035,7 +1016,11 @@ pub(in super::super) fn confirmed_growth_stamp(
     path: &Path,
 ) -> Result<(u64, u64)> {
     held(with_state(path, |state| {
-        let runtime = index.persistence_v2.as_ref().ok_or(Hold::ReloadRequired)?;
+        let runtime = index
+            .v2()
+            .persistence_v2
+            .as_ref()
+            .ok_or(Hold::ReloadRequired)?;
         ensure!(
             state
                 .current

@@ -381,7 +381,7 @@ impl ProgressRecovery {
         let generation =
             super::super::sampled_audit::own_growth_claim_generation(index, index_path)
                 .unwrap_or(index.generation);
-        guard_external(index_path, index.persistence_v2.as_ref(), generation)?;
+        guard_external(index_path, index.v2().persistence_v2.as_ref(), generation)?;
         let binding = super::super::scan_index_integration::scan_index_storage_binding(index_path)
             .context("state_v2_ack_binding")?;
         let (identity, _) =

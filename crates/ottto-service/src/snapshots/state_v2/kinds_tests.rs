@@ -323,7 +323,7 @@ fn streamed_cas_merges_retry_and_growth_maxima_without_resurrecting_removed_quar
     index
         .quarantined_snapshot_fingerprints
         .insert("b".repeat(64), record);
-    index.growth_retention.insert(
+    index.v2_mut().growth_retention.insert(
         "/synthetic/grown".into(),
         serde_json::from_value(serde_json::json!({"last_growth_full_unix":20})).unwrap(),
     );
@@ -338,7 +338,7 @@ fn streamed_cas_merges_retry_and_growth_maxima_without_resurrecting_removed_quar
     working
         .quarantined_snapshot_fingerprints
         .remove(&"b".repeat(64));
-    working.growth_retention.clear();
+    working.v2_mut().growth_retention.clear();
     let mut tx = db.begin(TxnMode::Read).unwrap();
     kinds_misc::merge_cas(&mut tx, &mut working).unwrap();
     kinds_files::merge_growth_cas(&mut tx, &mut working).unwrap();
@@ -350,7 +350,7 @@ fn streamed_cas_merges_retry_and_growth_maxima_without_resurrecting_removed_quar
         .quarantined_snapshot_fingerprints
         .contains_key(&"b".repeat(64)));
     assert_eq!(
-        serde_json::to_value(&working.growth_retention["/synthetic/grown"]).unwrap()
+        serde_json::to_value(&working.v2().growth_retention["/synthetic/grown"]).unwrap()
             ["last_growth_full_unix"],
         20
     );
@@ -549,7 +549,7 @@ fn on_open_runs_after_complete_hydration_and_per_file_stage_exclusion_retains_pr
         serde_json::to_vec(&next.claude_request_census).unwrap(),
         serde_json::to_vec(&prev.claude_request_census).unwrap()
     );
-    assert_eq!(next.growth_retention, prev.growth_retention);
+    assert_eq!(next.v2().growth_retention, prev.v2().growth_retention);
     assert_eq!(
         next.upload_context_fingerprint.as_deref(),
         Some("independent-change")

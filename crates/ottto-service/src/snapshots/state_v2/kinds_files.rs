@@ -20,7 +20,6 @@ macro_rules! maps {
         $m!(files, "file.progress");
         $m!(terminal_jsonl_dispositions, "file.terminal");
         $m!(file_snapshot_fingerprints, "file.entities");
-        $m!(growth_retention, "file.growth_retention");
         $m!(snapshot_activity_at, "accepted.activity");
         $m!(
             claude_desktop_title_files,
@@ -55,6 +54,12 @@ pub(super) fn delta(
         };
     }
     maps!(save);
+    mapper::map_delta(
+        tx,
+        "file.growth_retention",
+        &prev.v2().growth_retention,
+        &next.v2().growth_retention,
+    )?;
     let before = prev
         .confirmed_empty_files
         .iter()
@@ -89,6 +94,7 @@ pub(super) fn hydrate_txn(
         };
     }
     maps!(load);
+    index.v2_mut().growth_retention = mapper::read_map(tx, "file.growth_retention", None)?;
     let empty: BTreeMap<String, bool> = mapper::read_map(tx, "file.confirmed_empty", None)?;
     ensure!(empty.values().all(|v| *v), "state_v2_empty_members");
     index.confirmed_empty_files = empty.into_keys().collect();
@@ -106,7 +112,10 @@ pub(super) fn hydrate_txn(
 }
 pub(super) fn merge_growth_cas(tx: &mut dyn Transaction, working: &mut ScanIndex) -> Result<()> {
     let claims = mapper::read_map(tx, "file.growth_retention", None)?;
-    super::super::sampled_audit::merge_growth_claims(&mut working.growth_retention, &claims);
+    super::super::sampled_audit::merge_growth_claims(
+        &mut working.v2_mut().growth_retention,
+        &claims,
+    );
     Ok(())
 }
 pub(super) use mapper::{private_paths, references};
