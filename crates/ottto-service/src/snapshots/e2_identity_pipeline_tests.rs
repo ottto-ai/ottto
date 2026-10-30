@@ -660,8 +660,14 @@ fn e2_bound_trace_page(
             );
         }
         assert_eq!(index.claude_history_emission.files.len(), 2);
-        let (_, _, stats) =
-            crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, &mut scan, index);
+        let ((_, _, stats), counts) =
+            claude_request_money::e2::pipeline_test_observer::capture_identity_counts(|| {
+                crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, &mut scan, index)
+            });
+        if unhealthy && stats.trace_rows_discarded.is_empty() {
+            assert_eq!(counts["claude_inherited_org_requests"], 5,
+                "non-discard E2 fallback still fills every request from retained A");
+        }
         for gated in index.claude_history_emission.files.values() {
             assert!(gated.permitted, "owed permission is retained");
             assert_eq!(gated.previous.as_ref(), Some(&previous), "custody is kept");
@@ -682,9 +688,10 @@ fn e2_bound_trace_page(
     })
 }
 
-fn e2_bound_trace_assert_logins(items: &[SnapshotItem], root: &str, login: Option<String>) {
+fn e2_bound_trace_assert_logins(items: &[SnapshotItem], root: &str, root_login: Option<String>, child_login: Option<String>) {
     assert_eq!(items.len(), 2, "root and child both emit");
     for item in items {
+        let login = if item.source_session_id == root { root_login.clone() } else { child_login.clone() };
         let requests = if item.source_session_id == root { 4 } else { 1 };
         assert!(e2_is_literal(item));
         assert_eq!(item.request_count, requests);
@@ -725,13 +732,17 @@ fn e2_bound_trace_totals(items: &[SnapshotItem]) -> BTreeMap<String, serde_json:
         .collect()
 }
 
-fn e2_bound_trace_regression(mode: &str) {
+fn e2_bound_trace_regression(mode: &str, split_logins: bool) {
     let (dir, root, _) = claude_account_family_fixture();
     let support = dir.join("support");
     let (mut api, trace) = e2_family_evidence(&root);
     for row in &mut api {
         row.account_identifier_hash = Some("b".repeat(64));
         e2_resign(row);
+    }
+    if split_logins {
+        api[4].account_identifier_hash = Some("c".repeat(64));
+        e2_resign(&mut api[4]);
     }
     e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
     e2_write_rows(&support, "local-otel/claude-code-trace-ownership", &root, &trace);
@@ -747,13 +758,23 @@ fn e2_bound_trace_regression(mode: &str) {
         },
     );
     let (clean, stats) = e2_bound_trace_page(&dir, &support, &root, &mut index, false);
-    e2_bound_trace_assert_logins(&clean, &root, Some("b".repeat(64)));
+    let child_login = if split_logins { "c" } else { "b" }.repeat(64);
+    e2_bound_trace_assert_logins(&clean, &root, Some("b".repeat(64)), Some(child_login.clone()));
     assert_eq!(stats.trace_discard_no_fallback_requests, 0);
     assert!(serde_json::to_value(&stats).unwrap().get("trace_discard_no_fallback_requests").is_none());
     let totals = e2_bound_trace_totals(&clean);
     let fired = std::rc::Rc::new(std::cell::Cell::new(false));
     if mode == "malformed" {
         fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"malformed\n").unwrap();
+        // Stable malformed input is truly unhealthy, even with all valid rows
+        // retained. The reader's frozen-main equality test covers this state.
+        let report = crate::claude_local_otel::load_claude_trace_ownership_evidence(
+            &support, [root.clone()],
+        );
+        assert_eq!(report.malformed_lines, 1);
+        assert!(!report.is_complete(), "the control must take the unhealthy path");
+        assert_eq!(report.evidence[&root], trace);
+        assert!(report.rows_discarded.is_empty());
     } else {
         let expected = path.clone();
         let duplicate = serde_json::to_string(&trace[0]).unwrap();
@@ -777,7 +798,12 @@ fn e2_bound_trace_regression(mode: &str) {
     assert_eq!(stats.trace_incomplete_root_count, 1);
     assert_eq!(e2_bound_trace_totals(&items), totals, "per-session money is unchanged");
     let discarded = mode != "malformed";
-    e2_bound_trace_assert_logins(&items, &root, (!discarded).then(e2_account));
+    // Main preserves uniform API-qualified B on markerless wire rows despite
+    // internal A partitions. Split B/C evidence cannot take that shortcut:
+    // the non-discard control then emits the retained A partitions instead.
+    let control_login = if split_logins { e2_account() } else { "b".repeat(64) };
+    let expected = (!discarded).then_some(control_login);
+    e2_bound_trace_assert_logins(&items, &root, expected.clone(), expected);
     assert_eq!(stats.trace_discard_no_fallback_requests, if discarded { 5 } else { 0 });
     if discarded {
         let line = serde_json::to_value(&stats).unwrap();
@@ -787,11 +813,18 @@ fn e2_bound_trace_regression(mode: &str) {
     } else {
         assert!(stats.trace_rows_discarded.is_empty(), "malformed is not a discard");
         assert!(serde_json::to_value(&stats).unwrap().get("trace_discard_no_fallback_requests").is_none());
+        assert_eq!(stats.complete_sidecar_root_count, 0);
+        assert_eq!(stats.api_incomplete_root_count, 0);
+        assert_eq!(stats.api_evidence_row_count, 0);
+        assert_eq!(stats.trace_evidence_row_count, 0);
+        for item in &items {
+            assert_eq!(item.telemetry_owned_complete, Some(false));
+        }
     }
     // Settle the sidecar; the next page must use B despite the retained A.
     e2_write_rows(&support, "local-otel/claude-code-trace-ownership", &root, &trace);
     let (recovered, stats) = e2_bound_trace_page(&dir, &support, &root, &mut index, false);
-    e2_bound_trace_assert_logins(&recovered, &root, Some("b".repeat(64)));
+    e2_bound_trace_assert_logins(&recovered, &root, Some("b".repeat(64)), Some(child_login));
     assert_eq!(e2_bound_trace_totals(&recovered), totals);
     assert_eq!(stats.trace_discard_no_fallback_requests, 0);
     assert!(stats.trace_rows_discarded.is_empty());
@@ -800,16 +833,35 @@ fn e2_bound_trace_regression(mode: &str) {
 
 #[test]
 fn e2_pipeline_bound_a_own_b_cap_discard_has_no_fallback_then_recovers() {
-    e2_bound_trace_regression("cap");
+    e2_bound_trace_regression("cap", false);
 }
 
 #[cfg(unix)]
 #[test]
 fn e2_pipeline_bound_a_own_b_generation_discard_has_no_fallback_then_recovers() {
-    e2_bound_trace_regression("generation");
+    e2_bound_trace_regression("generation", false);
 }
 
 #[test]
 fn e2_pipeline_bound_a_malformed_trace_keeps_main_fallback() {
-    e2_bound_trace_regression("malformed");
+    e2_bound_trace_regression("malformed", false);
+}
+
+// With no uniform API account, main's markerless shortcut cannot preserve B.
+// The malformed control takes the same unhealthy/no-accepted-rows path as a
+// discard with the new rule disabled, and actually emits retained A.
+#[test]
+fn e2_pipeline_bound_a_split_logins_malformed_trace_matches_main_a() {
+    e2_bound_trace_regression("malformed", true);
+}
+
+#[test]
+fn e2_pipeline_bound_a_split_logins_cap_discard_blocks_retained_a() {
+    e2_bound_trace_regression("cap", true);
+}
+
+#[cfg(unix)]
+#[test]
+fn e2_pipeline_bound_a_split_logins_generation_discard_blocks_retained_a() {
+    e2_bound_trace_regression("generation", true);
 }
