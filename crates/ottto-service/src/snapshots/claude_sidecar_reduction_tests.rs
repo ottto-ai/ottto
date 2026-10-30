@@ -942,7 +942,8 @@ mod durable_restart {
     fn seed_and_persist(f: &Fixture, state: &State) -> ScanIndex {
         let first = Arc::new(SharedCache::default());
         state.begin(&first);
-        let prior = seed_predecessor(f, &first);
+        let mut prior = seed_predecessor(f, &first);
+        prior.save(&state.index_path).unwrap();
         first.durable_write_after_save(state.lock, SOURCE, &prior);
         assert_eq!(
             state.store_records(),
@@ -1046,11 +1047,12 @@ mod durable_restart {
             scanned.files[&key].source_file_fingerprint,
             prior.files[&key].source_file_fingerprint
         );
-        let settled = scanned.into_locally_held_keys_reverted(&prior, &held, &BTreeSet::new());
+        let mut settled = scanned.into_locally_held_keys_reverted(&prior, &held, &BTreeSet::new());
         assert_eq!(
             settled.files[&key].source_file_fingerprint,
             prior.files[&key].source_file_fingerprint
         );
+        settled.save(&state.index_path).unwrap();
         second.durable_write_after_save(state.lock, SOURCE, &settled);
         assert_selection_refused(&second, &state);
         assert_fresh_restart_reads_full(&f, &state, settled);
@@ -1076,7 +1078,7 @@ mod durable_restart {
             raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
         );
         let (scanned, held) = finalized_with_holds(run, &key);
-        let settled = scanned.into_locally_held_keys_reverted(&prior, &held, &held);
+        let mut settled = scanned.into_locally_held_keys_reverted(&prior, &held, &held);
         assert!(settled.files[&key].source_file_fingerprint.is_empty());
         // The record of the committed selection is still on disk here; the
         // cleared selection refuses before it is read.
@@ -1111,6 +1113,7 @@ mod durable_restart {
             (counters.missing, store.records_read, counters.restored),
             (1 - present, present, 0)
         );
+        settled.save(&state.index_path).unwrap();
         second.durable_write_after_save(state.lock, SOURCE, &settled);
         assert_selection_refused(&second, &state);
         assert_fresh_restart_reads_full(&f, &state, settled);
@@ -1146,7 +1149,8 @@ mod durable_restart {
             ahead.index.files[&key].source_file_fingerprint,
             first_pass.index.files[&key].source_file_fingerprint
         );
-        let saved = settle(first_pass);
+        let mut saved = settle(first_pass);
+        saved.save(&state.index_path).unwrap();
         second.durable_write_after_save(state.lock, SOURCE, &saved);
         assert_selection_refused(&second, &state);
         assert_fresh_restart_reads_full(&f, &state, saved);

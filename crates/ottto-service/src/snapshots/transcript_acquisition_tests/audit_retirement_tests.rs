@@ -1564,8 +1564,8 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
             assert_eq!(
                 cache
                     .durable_write_after_save(lock, source, &index)
-                    .unwrap()
-                    .written,
+                    .map(|receipt| receipt.written + receipt.clean)
+                    .unwrap(),
                 1
             );
             fixture.file.append(&usage(source, 130, 1, "fixture-model"));

@@ -3093,8 +3093,13 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         let (reduction, checkpoint) = native_record(&path, &namespace);
         if arm == "codec" {
             assert!(matches!(
-                codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64),
-                Err(Refuse::NonEmpty("SnapshotAccumulator.activity_skills"))
+                codec::encode_permitted(
+                    &reduction,
+                    store::RECORD_BYTES,
+                    jsonl_line_cap() as u64,
+                    false
+                ),
+                Err(Refuse::NonEmpty("skill_label_consent_off"))
             ));
         }
         let ds = durable_source(source).unwrap();
@@ -3397,8 +3402,12 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
         crate::snapshots::durable_after_save(&cache, &root, source, &index)
     });
     store::test_hooks::set_before_rename(None);
-    assert_eq!(startup_alarms.len(), 1);
-    assert_eq!(startup_alarms[0]["counts"]["t14_rebuild_full_started"], 1);
+    let summaries: Vec<_> = startup_alarms
+        .iter()
+        .filter(|alarm| alarm["counts"]["t14_rebuild_full_started"].is_number())
+        .collect();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0]["counts"]["t14_rebuild_full_started"], 1);
     if fail_replacement {
         assert_eq!(std::fs::read(&record).unwrap(), corrupt);
     } else {

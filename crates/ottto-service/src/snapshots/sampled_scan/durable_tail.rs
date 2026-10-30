@@ -4074,6 +4074,7 @@ impl SharedCache {
                     &interpretation.namespace.0,
                     index.active_upload_context_fingerprint.as_deref(),
                 )
+            && record.format != store::FORMAT_V3
             && !audit_carrier_matches(
                 &record,
                 index,
@@ -4188,6 +4189,7 @@ impl SharedCache {
                 &interpretation.namespace.0,
                 index.active_upload_context_fingerprint.as_deref(),
             )
+            && record.format != store::FORMAT_V3
             && !audit_carrier_matches(
                 &record,
                 index,
@@ -4681,13 +4683,15 @@ impl SharedCache {
                     .map(|e| e.size_bytes)
             })
             .unwrap_or(record.record.certificate.length);
-        if held
+        let quiet = held
             .metadata()
             .map_err(|_| Failure::Certificate(CertificateRefusal::ReadError))?
             .len()
             <= committed
-            && v3.is_some()
-        {
+            && v3.is_some();
+        // An empty body cannot restore anything; preserve the no-input quiet
+        // refusal before allocating a decoder for it.
+        if quiet && record.record.body.is_empty() {
             if let Some(mut stores) = self.durable() {
                 stores.counters.restore_pending_quiet[diagnostic_source_slot(source)] += 1;
             }
@@ -4701,11 +4705,22 @@ impl SharedCache {
         lease
             .charge(scope.0.len() as u64)
             .map_err(|_| Failure::Resource("certificate_scope"))?;
-        let (checkpoint, _) = record
-            .record
-            .certificate
-            .restore_grown(held, scope.clone())
-            .map_err(Failure::Certificate)?;
+        let mut certificate = record.record.certificate.clone();
+        if record.format == store::FORMAT_V3 {
+            // The verified envelope carries scheduling debt across the gap
+            // between a write-ahead replacement and its index save.
+            certificate.audit_debt_unix_seconds = record.envelope_audit_debt;
+        }
+        let checkpoint = if quiet {
+            None
+        } else {
+            Some(
+                certificate
+                    .restore_grown(held, scope.clone())
+                    .map_err(Failure::Certificate)?
+                    .0,
+            )
+        };
         let decoded = codec::decode_bounded(&record.record.body, source, lease).map_err(
             |reason| match reason {
                 crate::durable_tail_codec::DecodeFailure::Budget => Failure::Resource("decode"),
@@ -4747,6 +4762,23 @@ impl SharedCache {
         let digest = record.record.binding.key;
         let extent = record.record.certificate.length;
         let content = decoded.has_content();
+        // Quiet input may restore the content-free reduction. Only replay of
+        // private content needs a growth grant and must precede sample reads.
+        if quiet && content {
+            if let Some(mut stores) = self.durable() {
+                stores.counters.restore_pending_quiet[diagnostic_source_slot(source)] += 1;
+            }
+            return Err(Failure::Resource("rederive_quiet"));
+        }
+        let checkpoint = match checkpoint {
+            Some(checkpoint) => checkpoint,
+            None => {
+                certificate
+                    .restore_grown(held, scope.clone())
+                    .map_err(Failure::Certificate)?
+                    .0
+            }
+        };
         if content {
             self.rederive_gate(source, digest, extent, false, false)?;
         }
@@ -5261,16 +5293,14 @@ impl SharedCache {
             }) {
                 Ok(report) => {
                     slot.skill_label_purge_complete = report.refused == 0;
-                    *stores
-                        .counters
-                        .not_persisted
-                        .entry("skill_label_purged")
-                        .or_default() += report.erased;
-                    *stores
-                        .counters
-                        .not_persisted
-                        .entry("skill_label_purge_failed")
-                        .or_default() += report.refused;
+                    for (class, count) in [
+                        ("skill_label_purged", report.erased),
+                        ("skill_label_purge_failed", report.refused),
+                    ] {
+                        if count > 0 {
+                            *stores.counters.not_persisted.entry(class).or_default() += count;
+                        }
+                    }
                 }
                 Err(_) => {
                     Counters::bump(
