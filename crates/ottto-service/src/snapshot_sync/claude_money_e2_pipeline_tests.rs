@@ -5660,11 +5660,18 @@ fn terminal_off_on_deferred_strict_root_never_grants_negative_money() {
     assert!(crate::snapshots::claude_terminal_off());
     with_e2(|| {
         for byte_exhaustion in [false, true] {
-            let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
+            let subject_preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
             let mut c = Corpus::new("on-deferred-negative-money");
             c.root(ROOT, &line(ROOT, "shared-X", AT, 37));
             c.evidence(&[api("shared-X", 37, 123)], &[trace("shared-X", "")]);
-            let deferred = "f338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+            // Put byte-exhaustion debt before the filler roots: this reaches
+            // the byte check while root slots still remain. The count-only
+            // case leaves the duplicate at the far end of the cohort.
+            let deferred = if byte_exhaustion {
+                "2338a80a-f36e-4cbc-a5bb-50fc66430ba5"
+            } else {
+                "f338a80a-f36e-4cbc-a5bb-50fc66430ba5"
+            };
             for n in 0..130 {
                 let session = if n == 129 {
                     deferred.to_string()
@@ -5782,6 +5789,10 @@ fn terminal_off_on_deferred_strict_root_never_grants_negative_money() {
                 display.current.status,
                 crate::snapshots::claude_request_identity::CURRENT_UNKNOWN
             );
+            // Restore the pre-subject discovery state before the independent
+            // index runs. Starting a preview after the subject only snapshots
+            // its already-observed walk and can make the cold arm empty.
+            drop(subject_preview);
             // Independent cold Full executes the same real evidence pipeline;
             // source bytes and money bodies must be identical despite rotation.
             let _control = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
@@ -5792,6 +5803,11 @@ fn terminal_off_on_deferred_strict_root_never_grants_negative_money() {
                 false,
                 &[],
             );
+            assert_eq!(
+                cold.scan.scanned_file_count, 131,
+                "the independent Full control reads every physical input"
+            );
+            assert_eq!(cold.scan.snapshots.len(), 131);
             cold.index = prior;
             cold.scan
                 .snapshots
