@@ -7,6 +7,43 @@ struct ClaudeEmptyMapAdvance {
     previous: Option<String>,
 }
 
+#[derive(Debug)]
+struct ClaudeProofBodyDrain {
+    root: String,
+    member: String,
+    key: String,
+    proof: String,
+    revision: String,
+    fingerprints: BTreeSet<String>,
+    previous: Option<String>,
+}
+
+/// Exact-ACK and proven no-op drains settled on the working index before save
+/// selection, with each drained family's pre-drain record and pending proof.
+/// Not persisted.
+#[derive(Debug, Default)]
+pub(crate) struct ClaudeProofBodyDrains {
+    drains: Vec<ClaudeProofBodyDrain>,
+    families: BTreeMap<
+        String,
+        (
+            ClaudeUsageAuthorityQuarantineRecord,
+            Option<ClaudeUsageFamilyPending>,
+        ),
+    >,
+}
+
+impl ClaudeProofBodyDrains {
+    /// Adds a later settlement's drains. A family keeps its earliest
+    /// pre-drain record and pending proof.
+    pub(crate) fn append(&mut self, later: Self) {
+        self.drains.extend(later.drains);
+        for (root, family) in later.families {
+            self.families.entry(root).or_insert(family);
+        }
+    }
+}
+
 // A positive-proof correction is local checkpoint bookkeeping. It never
 // authorizes collection, ownership, or acceptance of an unacknowledged body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,6 +449,94 @@ impl ScanIndex {
         }
     }
 
+    // R2, the body-drain analogue of the A2 restore above: a drain certifies
+    // only the revision and entity set the selected save keeps. Any other
+    // selected entry leaves the member owed under the same proof with its
+    // pre-drain pair. A record its last drain removed is re-bound with its
+    // pending proof. Returns whether any member owes again.
+    pub(crate) fn restore_unselected_claude_proof_body_drains(
+        &mut self,
+        drains: ClaudeProofBodyDrains,
+    ) -> bool {
+        let ClaudeProofBodyDrains {
+            drains,
+            mut families,
+        } = drains;
+        let (carried, reverted): (Vec<_>, Vec<_>) = drains.into_iter().partition(|drain| {
+            self.files
+                .get(&drain.key)
+                .is_some_and(|entry| entry.source_file_fingerprint == drain.revision)
+                && self.file_snapshot_fingerprints.get(&drain.key) == Some(&drain.fingerprints)
+        });
+        for drain in &reverted {
+            if self
+                .claude_usage_authority_quarantine
+                .contains_key(&drain.root)
+            {
+                continue;
+            }
+            let Some((mut record, pending)) = families.remove(&drain.root) else {
+                continue;
+            };
+            if !self
+                .claude_usage_family_witnesses
+                .get(&drain.root)
+                .is_some_and(|witness| claude_usage_authority_preserves_pending(&record, witness))
+            {
+                continue;
+            }
+            let Some(correction) = record
+                .proof_correction
+                .as_mut()
+                .filter(|correction| correction.proof_witness_fingerprint == drain.proof)
+            else {
+                continue;
+            };
+            // Every member still owed when the record was removed has drained
+            // on this page; only reverted ones owe again, added below.
+            correction.owed_member_ids.clear();
+            for kept in carried.iter().filter(|kept| kept.root == drain.root) {
+                record
+                    .member_source_file_fingerprints
+                    .insert(kept.member.clone(), kept.revision.clone());
+            }
+            self.claude_usage_authority_quarantine
+                .insert(drain.root.clone(), record);
+            if let Some(pending) = pending {
+                self.claude_usage_family_pending
+                    .entry(drain.root.clone())
+                    .or_insert(pending);
+            }
+        }
+        let mut owed_again = false;
+        for drain in reverted {
+            let Some(record) = self.claude_usage_authority_quarantine.get_mut(&drain.root) else {
+                continue;
+            };
+            let Some(correction) = record.proof_correction.as_mut() else {
+                continue;
+            };
+            if correction.proof_witness_fingerprint != drain.proof
+                || !correction.owed_member_ids.insert(drain.member.clone())
+            {
+                continue;
+            }
+            owed_again = true;
+            let previous = drain.previous.unwrap_or_else(|| {
+                // A valid record pairs every owed member; keep the debt with a
+                // domain-separated nonmatching revision, as A2 does.
+                sha256_hex(&[
+                    "claude_proof_body_drain_restore_missing_previous:v1",
+                    &drain.revision,
+                ])
+            });
+            record
+                .member_source_file_fingerprints
+                .insert(drain.member, previous);
+        }
+        owed_again
+    }
+
     // Earlier-page A1 pairs must drain before the generic proof re-arm clears
     // source fingerprints. This is local no-body completion, not entity deletion.
     fn settle_known_empty_claude_proof_corrections(
@@ -745,20 +870,22 @@ impl ScanIndex {
 
     /// Called only at an index settlement boundary. A following save either
     /// commits both exact body state and owed progress, or commits neither.
+    /// Pass the returned drains to `restore_unselected_claude_proof_body_drains`
+    /// after the last selection and the account-audit release.
     pub(crate) fn settle_claude_proof_corrections(
         &mut self,
         previous: &ScanIndex,
         candidates: &[ClaudeProofCorrectionCandidate],
         accepted: &BTreeSet<String>,
         accepted_bodies: &BTreeMap<String, String>,
-    ) {
+    ) -> ClaudeProofBodyDrains {
         self.settle_claude_proof_corrections_with_permanent(
             previous,
             candidates,
             accepted,
             accepted_bodies,
             |_, _| false,
-        );
+        )
     }
 
     pub(crate) fn settle_claude_proof_corrections_with_permanent(
@@ -768,9 +895,10 @@ impl ScanIndex {
         accepted: &BTreeSet<String>,
         accepted_bodies: &BTreeMap<String, String>,
         permanent: impl Fn(&str, &str) -> bool,
-    ) {
+    ) -> ClaudeProofBodyDrains {
+        let mut drains = ClaudeProofBodyDrains::default();
         if !self.claude_authority_proof_correction_pending() {
-            return;
+            return drains;
         }
         let mut by_file = BTreeMap::<&str, Vec<&ClaudeProofCorrectionCandidate>>::new();
         for candidate in candidates {
@@ -861,11 +989,22 @@ impl ScanIndex {
             for item in group.iter().filter(|item| rejected(item)) {
                 eprintln!("local snapshot sync: claude proof correction reason=permanent_rejection drained_members=1 body_witness={}", item.body_witness);
             }
+            drains
+                .families
+                .entry(candidate.root.clone())
+                .or_insert_with(|| {
+                    (
+                        record.clone(),
+                        self.claude_usage_family_pending
+                            .get(&candidate.root)
+                            .cloned(),
+                    )
+                });
             let record = self
                 .claude_usage_authority_quarantine
                 .get_mut(&candidate.root)
                 .unwrap();
-            record
+            let previous = record
                 .member_source_file_fingerprints
                 .insert(candidate.member.clone(), candidate.revision.clone());
             let correction = record.proof_correction.as_mut().unwrap();
@@ -875,6 +1014,16 @@ impl ScanIndex {
                     .remove(&candidate.root);
                 self.claude_usage_family_pending.remove(&candidate.root);
             }
+            drains.drains.push(ClaudeProofBodyDrain {
+                root: candidate.root.clone(),
+                member: candidate.member.clone(),
+                key: key.to_string(),
+                proof: candidate.proof.clone(),
+                revision: candidate.revision.clone(),
+                fingerprints,
+                previous,
+            });
         }
+        drains
     }
 }

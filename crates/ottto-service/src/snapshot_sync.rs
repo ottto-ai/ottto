@@ -972,6 +972,7 @@ pub(crate) fn checkpoint_account_release_for_test(
             roots,
             backfill_window_days: crate::snapshots::BACKFILL_WINDOW_DAYS,
         }),
+        Default::default(),
     )
 }
 
@@ -1057,6 +1058,7 @@ fn settle_index_after_upload(
 
 /// Correction completion depends on the final selected file/empty facts. In
 /// particular, the last M2 no-body drain must precede the completion decision.
+#[allow(clippy::too_many_arguments)]
 fn settle_upload_corrections_after_selection(
     index: &mut ScanIndex,
     scan: &SourceScanResult,
@@ -1065,11 +1067,14 @@ fn settle_upload_corrections_after_selection(
     candidates: &[crate::snapshots::ClaudeProofCorrectionCandidate],
     cutoff_candidates: &[crate::snapshots::ClaudeCutoffCorrectionCandidate],
     transport_fully_settled: bool,
+    body_drains: &mut crate::snapshots::ClaudeProofBodyDrains,
 ) -> bool {
     // D1 is deliberately unavailable to partial/deferred/shed/error outcomes.
     // Both existing durable refusal carriers must bind the exact current body.
+    // It settles against the selected entries, but a later account-audit
+    // release can still clear one; its drains join the finish restore.
     if transport_fully_settled {
-        index.settle_claude_proof_corrections_with_permanent(
+        let drains = index.settle_claude_proof_corrections_with_permanent(
             committed_index,
             candidates,
             &progress.accepted_fingerprints,
@@ -1088,6 +1093,7 @@ fn settle_upload_corrections_after_selection(
                         })
             },
         );
+        body_drains.append(drains);
     }
     index.settle_cutoff_claude_proof_corrections(cutoff_candidates);
     index.settle_empty_claude_proof_corrections(scan);
@@ -3121,6 +3127,7 @@ fn checkpoint_partial_snapshot_index_with_comparison(
         fallback,
         cause,
         None,
+        Default::default(),
     )
 }
 
@@ -3139,6 +3146,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     fallback: Option<NativeSelectedRestore<'_>>,
     cause: Option<UnsettledUploadCause>,
     audit_release: Option<AccountAuditRelease<'_>>,
+    body_drains: crate::snapshots::ClaudeProofBodyDrains,
 ) -> Result<ScanIndex> {
     let _lock = SnapshotProgressLock::acquire(progress_path)?;
     let mut durable: SnapshotUploadProgress = match match read_limit {
@@ -3242,6 +3250,9 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
             release.backfill_window_days,
         );
     }
+    // After every selected-entry restore above: a drain whose entry this
+    // save does not keep stays owed.
+    committable.restore_unselected_claude_proof_body_drains(body_drains);
     match cause {
         Some(cause) => committable.mark_bounded_sweep_unsettled_by(cause),
         None => committable.mark_bounded_sweep_unsettled(),
@@ -7839,10 +7850,13 @@ fn finish_sync_source(
     // Exact progress is durable before this seam. The same subsequent index
     // save carries settled file bodies and correction progress; local-state
     // errors cannot certify an uncertain ACK. UnACKed/held members stay owed.
+    // Selection below may keep a drained member's committed entry; each save
+    // then restores that member's debt (R2).
+    let mut claude_proof_body_drains = crate::snapshots::ClaudeProofBodyDrains::default();
     if !upload_result.as_ref().err().is_some_and(|error| {
         snapshot_upload_error_class(error) == Some(SnapshotUploadErrorClass::LocalState)
     }) {
-        index.settle_claude_proof_corrections(
+        claude_proof_body_drains = index.settle_claude_proof_corrections(
             &committed_index,
             &claude_proof_correction_candidates,
             &upload_progress.accepted_fingerprints,
@@ -7942,6 +7956,7 @@ fn finish_sync_source(
                     roots: claude_scan_roots.as_deref().unwrap_or_default(),
                     backfill_window_days: receipt_window_days,
                 }),
+                std::mem::take(&mut claude_proof_body_drains),
             ) {
                 Ok(committable) => {
                     note_codex_side_saved(daemon, &index_path, false, side_mark);
@@ -8076,6 +8091,7 @@ fn finish_sync_source(
                         roots: claude_scan_roots.as_deref().unwrap_or_default(),
                         backfill_window_days: receipt_window_days,
                     }),
+                    std::mem::take(&mut claude_proof_body_drains),
                 ) {
                     Ok(committable) => {
                         note_codex_side_saved(daemon, &index_path, false, side_mark);
@@ -8268,6 +8284,7 @@ fn finish_sync_source(
         &claude_proof_correction_candidates,
         &claude_cutoff_corrections,
         upload_fully_settled,
+        &mut claude_proof_body_drains,
     );
     if let Some(comparison) = comparison_completion.as_mut() {
         if comparison.restore_selected_paid(&mut index, &committed_index)? {
@@ -8282,6 +8299,12 @@ fn finish_sync_source(
             claude_scan_roots.as_deref().unwrap_or_default(),
             receipt_window_days,
         );
+    }
+    // After every selected-entry restore and the account-audit release, which
+    // can clear a drained entry's revision: a drain (pre-selection or D1)
+    // whose entry this save does not keep stays owed.
+    if index.restore_unselected_claude_proof_body_drains(claude_proof_body_drains) {
+        upload_fully_settled = false;
     }
     let mut retired_upload_acks = upload_progress.stage_selected_ack_retirement(
         &committed_index,
