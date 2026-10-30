@@ -2080,8 +2080,6 @@ mod otlp_proto {
 mod tests {
     #[test]
     fn append_capture_success_requires_complete_write_below_strict_cap() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let row = b"{\"synthetic\":true}\n";
         for (before, writes, succeeds) in [
             (MAX_EVIDENCE_FILE_BYTES - row.len() as u64 - 1, true, true),
@@ -2108,8 +2106,6 @@ mod tests {
 
     #[test]
     fn append_partial_and_zero_byte_write_errors_never_report_capture_success() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         struct FailingWriter {
             bytes: Vec<u8>,
             remaining: usize,
@@ -2145,8 +2141,6 @@ mod tests {
 
     #[test]
     fn api_and_trace_crossing_rows_are_preserved_but_capture_refuses() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use std::io::{Read, Seek, SeekFrom};
         let dir = std::env::temp_dir().join(format!("ottto-cap-crossing-{}", std::process::id()));
         let api_body = identity_json(&[], &[]);
@@ -2204,8 +2198,6 @@ mod tests {
 
     #[test]
     fn api_and_trace_capture_refuse_capped_files_with_consistent_reader_health() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let dir = std::env::temp_dir().join(format!("ottto-cap-refusal-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let api_body = parent_and_subagent_body();
@@ -2344,8 +2336,6 @@ mod tests {
 
     #[test]
     fn claude_api_log_clock_zero_uses_observed_for_both_encodings() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let observed = 1_783_728_000_000_000_000_u64;
         let expected = clock_test_protobuf(0, observed);
         assert_eq!(expected.len(), 1);
@@ -2371,8 +2361,6 @@ mod tests {
 
     #[test]
     fn claude_api_log_clock_both_absent_never_create_epoch_evidence() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         assert!(
             clock_test_protobuf(0, 0).is_empty(),
             "protobuf zero is absent, not epoch"
@@ -2399,8 +2387,6 @@ mod tests {
 
     #[test]
     fn claude_api_log_clock_real_event_wins_even_next_to_epoch() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let observed = 1_783_728_000_000_000_000_u64;
         for event in [1_u64, observed - 1, u64::MAX] {
             let expected = clock_test_protobuf(event, observed);
@@ -2425,8 +2411,6 @@ mod tests {
 
     #[test]
     fn request_pair_malformed_json_identity_preserves_presence_both_origins() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for key in ["user.account_uuid", "organization.id"] {
             for malformed in [
                 serde_json::json!({"arrayValue":{"values":[]}}),
@@ -2483,8 +2467,6 @@ mod tests {
 
     #[test]
     fn request_pair_malformed_protobuf_identity_preserves_presence_both_origins() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use otlp_proto::any_value::Value as ProtoValue;
         for key in ["user.account_uuid", "organization.id"] {
             for malformed in [
@@ -2565,8 +2547,6 @@ mod tests {
 
     #[test]
     fn request_pair_preserves_json_attribute_origins_and_counters() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for (resource, record, expected_origin) in [
             (
                 vec![],
@@ -2625,8 +2605,6 @@ mod tests {
 
     #[test]
     fn request_pair_missing_and_malformed_org_do_not_change_account_evidence() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for organization in [
             None,
             Some(""),
@@ -2662,8 +2640,6 @@ mod tests {
 
     #[test]
     fn request_pair_resource_record_conflict_keeps_both_safe_witnesses() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for key in ["user.account_uuid", "organization.id"] {
             let resource = [(key, OTHER_ORGANIZATION)];
             let record = [
@@ -2696,8 +2672,6 @@ mod tests {
 
     #[test]
     fn request_pair_protobuf_retains_resource_and_record_origins_and_conflict() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for resource_org in [ORGANIZATION, OTHER_ORGANIZATION] {
             let body = otlp_proto::ExportLogsServiceRequest {
                 resource_logs: vec![otlp_proto::ResourceLogs {
@@ -2749,8 +2723,6 @@ mod tests {
 
     #[test]
     fn request_pair_changes_sidecar_fingerprint_and_strict_request_conflict() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let dir = std::env::temp_dir().join(format!("ottto-org-conflict-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         for organization in [ORGANIZATION, ORGANIZATION, OTHER_ORGANIZATION] {
@@ -2790,8 +2762,6 @@ mod tests {
 
     #[test]
     fn request_pair_legacy_omission_is_neutral_and_byte_preserved() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let row = api_evidence_from_json(&identity_json(&[], &[("user.account_uuid", ACCOUNT)]))
             .unwrap()
             .remove(0);
@@ -2828,8 +2798,6 @@ mod tests {
 
     #[test]
     fn request_pair_v2_upgrade_replay_deduplicates_both_orders_without_usage_change() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let dir = std::env::temp_dir().join(format!("ottto-org-upgrade-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let richer = api_evidence_from_json(&identity_json(
@@ -2873,8 +2841,6 @@ mod tests {
 
     #[test]
     fn request_pair_upgrade_neutrality_never_hides_known_identity_or_usage_conflicts() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let dir =
             std::env::temp_dir().join(format!("ottto-org-upgrade-conflict-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -3020,8 +2986,6 @@ mod tests {
 
     #[test]
     fn indexes_effort_by_request_id_across_parent_and_subagent_turns() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let dir = std::env::temp_dir().join(format!("ottto-effort-req-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(
@@ -3041,8 +3005,6 @@ mod tests {
 
     #[test]
     fn effort_index_skips_rows_without_a_request_id() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let dir = std::env::temp_dir().join(format!("ottto-effort-legacy-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         // A pre-request-id row: still valid evidence, but only the aggregate
@@ -3072,8 +3034,6 @@ mod tests {
 
     #[test]
     fn captures_only_allowlisted_api_request_fields_and_dedupes_reads() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let dir = std::env::temp_dir().join(format!("ottto-effort-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let body = br#"{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"claude-code"}},{"key":"service.version","value":{"stringValue":"2.1.226"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1783728000000000000","body":{"stringValue":"claude_code.api_request"},"attributes":[{"key":"session.id","value":{"stringValue":"sess-1"}},{"key":"user.account_uuid","value":{"stringValue":"123E4567-E89B-12D3-A456-426614174000"}},{"key":"model","value":{"stringValue":"claude-opus-4-7"}},{"key":"effort","value":{"stringValue":"xhigh"}},{"key":"request_id","value":{"stringValue":"req-1"}},{"key":"client_request_id","value":{"stringValue":"client-1"}},{"key":"query_source","value":{"stringValue":"main"}},{"key":"speed","value":{"stringValue":"fast"}},{"key":"cost_usd","value":{"stringValue":"0.001234"}},{"key":"event.sequence","value":{"intValue":"17"}},{"key":"input_tokens","value":{"intValue":"12"}},{"key":"output_tokens","value":{"intValue":"3"}},{"key":"cache_creation_tokens","value":{"intValue":"2014"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;
@@ -3117,8 +3077,6 @@ mod tests {
 
     #[test]
     fn captures_protobuf_api_request_for_trace_pairing() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let dir = std::env::temp_dir().join(format!("ottto-api-protobuf-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(
@@ -3142,8 +3100,6 @@ mod tests {
 
     #[test]
     fn captures_root_agent_nested_and_workflow_trace_ownership() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let dir = std::env::temp_dir().join(format!("ottto-trace-owners-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let root = llm_span("req-root", None);
@@ -3187,8 +3143,6 @@ mod tests {
 
     #[test]
     fn trace_loader_dedupes_reexport_and_fails_closed_on_conflicting_owner() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let dir = std::env::temp_dir().join(format!("ottto-trace-dedupe-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let body = trace_body(vec![llm_span("req-same", Some("agent-a"))]);
@@ -3208,8 +3162,6 @@ mod tests {
 
     #[test]
     fn malformed_trace_payload_and_sidecars_fail_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let dir = std::env::temp_dir().join(format!("ottto-trace-bad-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         assert!(
@@ -3228,8 +3180,6 @@ mod tests {
 
     #[test]
     fn decimal_cost_is_rounded_to_integer_micros_without_float_math() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let attrs = BTreeMap::from([
             ("cost_usd".to_string(), "0.00123456".to_string()),
             ("small".to_string(), "0.00000049".to_string()),
@@ -3245,8 +3195,6 @@ mod tests {
 
     #[test]
     fn strict_api_request_loader_reports_malformed_oversized_and_conflicting_rows() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let dir = std::env::temp_dir().join(format!("ottto-log-health-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         capture_claude_api_request_logs(&dir, parent_and_subagent_body(), "application/json")
@@ -3286,8 +3234,6 @@ mod tests {
 
     #[test]
     fn legacy_evidence_without_aggregate_cache_field_still_loads() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let row: ClaudeLocalOtelEvidence = serde_json::from_str(
             r#"{"fingerprint":"legacy","session_id":"sess-1","observed_at":"2026-07-12T15:07:58Z","model":"claude-opus-4-8","effort":"low","input_tokens":2,"output_tokens":9,"cache_read_tokens":0,"cache_creation_5m_tokens":2014,"cache_creation_1h_tokens":0,"reasoning_output_tokens":0,"request_count":1}"#,
         )
@@ -3300,8 +3246,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sidecar_decode_reuse_unchanged_scan_reads_one_api_file() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let dir = crate::test_scratch::private_dir("ottto-decode-overlap");
         let sessions = dir.join("projects");
         fs::create_dir_all(&sessions).unwrap();
@@ -3454,8 +3398,6 @@ mod tests {
 
     #[test]
     fn native_comparison_paid_decoder_reuses_canonical_real_derived_rows() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         if !crate::heap_layout_bound::layout_supported() {
             eprintln!("UNEXECUTED paid canonical evidence: unsupported layout");
             return;
@@ -3505,8 +3447,6 @@ mod tests {
 
     #[test]
     fn native_comparison_paid_decoder_escaped_unicode_refusal_keeps_base_rows() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         if !crate::heap_layout_bound::layout_supported() {
             eprintln!("UNEXECUTED paid lexical BASE parity: unsupported layout");
             return;
@@ -3542,8 +3482,6 @@ mod tests {
 
     #[test]
     fn native_comparison_paid_decoder_identity_replay_and_conflict_match_base() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         if !crate::heap_layout_bound::layout_supported() {
             eprintln!("UNEXECUTED paid identity replay: unsupported layout");
             return;
@@ -3595,8 +3533,6 @@ mod tests {
 
     #[test]
     fn native_comparison_lazy_final_cohort_moves_early_rows_and_loads_rest_once() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (dir, rows) = decode_reuse_fixture("lazy-cohort");
         for row in &rows {
             let mut later = row.clone();
@@ -3628,8 +3564,6 @@ mod tests {
 
     #[test]
     fn native_comparison_lazy_final_changed_input_and_open_failure_keep_base_veto() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (dir, rows) = decode_reuse_fixture("lazy-failures");
         let cohort = BTreeSet::from(["sess-mixed".to_owned()]);
         let mut early = ClaudeApiEvidenceRead::load(&dir, cohort.clone()).unwrap();
@@ -3659,8 +3593,6 @@ mod tests {
 
     #[test]
     fn native_comparison_lazy_strict_only_early_root_never_expands_effort_cohort() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (dir, rows) = decode_reuse_fixture("lazy-strict-only");
         for row in &rows {
             let mut other = row.clone();
@@ -3695,8 +3627,6 @@ mod tests {
 
     #[test]
     fn native_comparison_paid_cohort_uses_existing_credit_and_moves_without_reread() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         if !crate::heap_layout_bound::layout_supported() {
             eprintln!("UNEXECUTED paid cohort resource control: unsupported layout");
             return;
@@ -3739,8 +3669,6 @@ mod tests {
 
     #[test]
     fn sidecar_decode_reuse_preserves_distinct_permissive_and_strict_views() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (dir, rows) = decode_reuse_fixture("views");
         let path = evidence_path(&dir, "sess-mixed");
         let mut bytes = fs::read(&path).unwrap();
@@ -3784,8 +3712,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sidecar_decode_reuse_releases_nonpaired_rows_and_moves_paired_allocation() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (dir, rows) = decode_reuse_fixture("allocation");
         let mut extra = rows[0].clone();
         extra.session_id = "effort-only".into();
@@ -3805,8 +3731,6 @@ mod tests {
 
     #[test]
     fn sidecar_decode_reuse_rereads_append_truncate_and_same_stat_replacement() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for change in ["append", "truncate", "replace", "rewrite"] {
             let (dir, rows) = decode_reuse_fixture(change);
             let path = evidence_path(&dir, "sess-mixed");
@@ -3861,8 +3785,6 @@ mod tests {
 
     #[test]
     fn sidecar_decode_reuse_missing_nonfile_and_cap_never_reuse_rows() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for change in ["missing", "nonfile", "cap", "over-cap"] {
             let (dir, _) = decode_reuse_fixture(change);
             let path = evidence_path(&dir, "sess-mixed");
@@ -3893,8 +3815,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sidecar_decode_reuse_preserves_whole_effort_open_error_and_metadata_skip() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use std::os::unix::fs::{symlink, PermissionsExt};
         let (dir, rows) = decode_reuse_fixture("errors");
         let mut denied = rows[0].clone();
@@ -3937,8 +3857,6 @@ mod tests {
 
     #[test]
     fn sidecar_decode_reuse_io_failure_stops_once_and_keeps_strict_refusal() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         struct FailingReader {
             calls: usize,
         }
@@ -3968,8 +3886,6 @@ mod tests {
     }
     #[test]
     fn sidecar_decode_reuse_lazy_new_root_and_read_snapshot_races_reread() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for phase in ["before-open", "after-read"] {
             let (dir, rows) = decode_reuse_fixture(phase);
             let mut next = rows[0].clone();
@@ -4010,8 +3926,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sidecar_decode_reuse_stat_open_races_refuse_cap_and_fifo() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for change in ["cap", "fifo"] {
             let (dir, _) = decode_reuse_fixture(change);
             API_BEFORE_OPEN.with(|h| {
@@ -4044,8 +3958,6 @@ mod tests {
     }
     #[test]
     fn sidecar_decode_reuse_same_label_fixtures_keep_independent_evidence() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (first, rows) = decode_reuse_fixture("cap");
         let (second, _) = decode_reuse_fixture("cap");
         File::options()

@@ -217,8 +217,6 @@ mod collector_version_tests {
 
     #[test]
     fn collector_version_uses_packaged_release_version() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         assert_eq!(collector_version(), ottto_core::compiled_release_version());
     }
 }
@@ -52512,8 +52510,6 @@ mod tests {
     #[test]
     #[ignore]
     fn measure_synthetic_snapshots() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = PathBuf::from(std::env::var("OTTTO_COMPOSITION_FIXTURE_ROOT").unwrap());
         assert_eq!(
             fs::read(root.join("synthetic-only")).unwrap(),
@@ -52695,8 +52691,6 @@ mod tests {
 
     #[test]
     fn oversized_floor_retries_malformed_clocks_and_keeps_six_hour_cadence() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut traversal = terminal_unhealthy_traversal(String::new());
         traversal.oversized_discovery = serde_json::from_value(serde_json::json!({
             "synthetic_path_hash": { "content_hash": "synthetic_content_hash", "observations": 1 }
@@ -52731,8 +52725,6 @@ mod tests {
 
     #[test]
     fn scan_root_lookups_keep_deepest_and_first_match_rules_under_nested_roots() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let outer = PathBuf::from("/synthetic/projects");
         let nested = outer.join("team").join("projects");
         let sibling = PathBuf::from("/synthetic/projects-other");
@@ -52770,8 +52762,6 @@ mod tests {
 
     #[test]
     fn e2_deferred_retry_root_keeps_service_debt_and_committed_fingerprints() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         claude_request_money::e2::with_enabled(|| {
             let root = "11111111-1111-4111-8111-111111111111";
             let project = PathBuf::from("/synthetic/projects/p");
@@ -52904,8 +52894,6 @@ mod tests {
 
     #[test]
     fn codex_sqlite_spawn_edges_restore_nested_subagent_lineage() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("codex-spawn-lineage");
         let codex_dir = home.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
@@ -53026,8 +53014,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_rows_restore_desktop_delegation_lineage() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("codex-created-thread-lineage");
         let codex_dir = home.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
@@ -53357,8 +53343,6 @@ mod tests {
 
     #[test]
     fn codex_native_created_thread_reaches_clean_census() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("codex-created-thread-fresh-epoch-census");
         let codex_dir = home.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
@@ -53477,8 +53461,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_parent_rejects_untrusted_or_malformed_wrappers() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let child = "01a03e97-49cf-7460-9fd7-f7dbfd2f05e4";
         let valid = format!(
@@ -53513,8 +53495,6 @@ mod tests {
 
     #[test]
     fn codex_rollout_emits_agent_label_without_sqlite_lineage() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("codex-agent-label-without-sqlite");
         let sessions_dir = home.join(".codex/sessions");
         fs::create_dir_all(&sessions_dir).expect("create sessions");
@@ -53569,8 +53549,6 @@ mod tests {
 
     #[test]
     fn skill_md_references_name_every_layout_and_flag_unnamed_ones() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let refs = |material: &str| {
             let mut names = Vec::new();
             let named_all = for_each_skill_md_reference(material, |name| names.push(name));
@@ -53619,8 +53597,6 @@ mod tests {
 
     #[test]
     fn claude_skill_evidence_separates_invocations_from_references() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let tool_use = |id: &str, name: &str, input: Value| json!({"type":"assistant","sessionId":"claude-skills","timestamp":"2026-10-18T06:00:00Z","message":{"id":format!("msg-{id}"),"role":"assistant","content":[{"type":"tool_use","id":id,"name":name,"input":input}]}});
         let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
         for line in [
@@ -53708,8 +53684,6 @@ mod tests {
 
     #[test]
     fn skill_detector_upgrade_republishes_retained_claude_history_once() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("claude-skill-detector-upgrade");
         let projects_root = home.join(".claude").join("projects");
         let project_dir = projects_root.join("-Users-dev-repo");
@@ -53827,8 +53801,6 @@ mod tests {
 
     #[test]
     fn codex_unnamed_skill_reference_keeps_capability_marker_v1() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-unnamed-skill");
         let lines = [
             json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"unnamed-skill-session"}}),
@@ -53862,8 +53834,6 @@ mod tests {
 
     #[test]
     fn codex_activity_summary_counts_actions_without_uploading_content() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-activity-summary");
         let lines = vec![
             json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"activity-session"}}),
@@ -53990,8 +53960,6 @@ mod tests {
 
     #[test]
     fn codex_namespaced_mcp_calls_keep_their_explicit_server_once() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let call = |call_id: &str, name: &str, namespace: Option<&str>| {
             let mut payload =
                 json!({"type":"function_call","name":name,"call_id":call_id,"arguments":"{}"});
@@ -54136,8 +54104,6 @@ mod tests {
 
     #[test]
     fn codex_tool_usage_caps_distinct_names_and_marks_truncation() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-tool-usage-cap");
         let mut lines = vec![
             json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"codex-tool-cap-session"}}),
@@ -54186,8 +54152,6 @@ mod tests {
 
     #[test]
     fn codex_tool_usage_emits_explicit_empty_contract() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-tool-usage-empty");
         fs::write(
             &path,
@@ -54217,8 +54181,6 @@ mod tests {
 
     #[test]
     fn codex_capability_activity_uses_only_allowlisted_tool_surface_metadata() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-capability-activity");
         let lines = vec![
             json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"capability-session"}}),
@@ -54271,8 +54233,6 @@ mod tests {
 
     #[test]
     fn claude_capability_activity_normalizes_built_in_mcp_names_and_dedupes_tool_use_ids() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-capability-activity");
         let lines = vec![
             json!({"timestamp":"2026-08-02T06:00:00Z","type":"user","sessionId":"claude-capability-session","message":{"role":"user","content":"open the page"}}),
@@ -54348,8 +54308,6 @@ mod tests {
 
     #[test]
     fn claude_tool_usage_caps_distinct_names_and_marks_truncation() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-tool-usage-cap");
         let mut lines = vec![json!({
             "timestamp": "2026-08-02T06:00:00Z",
@@ -54406,8 +54364,6 @@ mod tests {
 
     #[test]
     fn claude_tool_usage_emits_explicit_empty_contract() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-tool-usage-empty");
         fs::write(
             &path,
@@ -54436,8 +54392,6 @@ mod tests {
 
     #[test]
     fn scan_index_recovers_from_truncated_json_and_replaces_it_atomically() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("scan-index-recovery");
         let path = root.join("codex-scan-index.json");
         fs::write(&path, r#"{"files":{"partial""#).expect("write truncated index");
@@ -54493,8 +54447,6 @@ mod tests {
     /// index or reads as a clean sweep.
     #[test]
     fn scan_index_load_isolates_a_malformed_unsettled_cause_diagnostic() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("scan-index-malformed-unsettled-causes");
         let malformed = [
             serde_json::json!(null),
@@ -54558,8 +54510,6 @@ mod tests {
 
     #[test]
     fn scan_index_save_drops_only_a_syntactically_valid_corrupt_activity_witness() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("scan-index-corrupt-activity");
         let path = root.join("codex-scan-index-v2.json");
         let fingerprint = "a".repeat(64);
@@ -54602,8 +54552,6 @@ mod tests {
 
     #[test]
     fn quarantine_deadline_never_becomes_authoritative_after_clock_rollback() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let original_now = 1_000_000;
         let record = SnapshotQuarantineRecord {
             contract_retry_claims: None,
@@ -54652,8 +54600,6 @@ mod tests {
     /// set permanently.
     #[test]
     fn legacy_0_1_121_clean_index_is_rearmed_rather_than_sealed_as_accepted() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let accepted = "a".repeat(64);
         let stranded = "b".repeat(64);
         let mut legacy = legacy_shaped_index(ScanIndex {
@@ -54709,8 +54655,6 @@ mod tests {
     /// version is therefore re-opened exactly once and re-proved.
     #[test]
     fn ledger_migrated_without_settlement_proof_reopens_once_then_stays_terminal() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("scan-index-unproven-ledger-reopen");
         let path = root.join("codex-scan-index-v3.json");
         let sealed = "a".repeat(64);
@@ -54780,8 +54724,6 @@ mod tests {
     /// this daemon has not re-proved.
     #[test]
     fn unproven_ledger_is_not_finished_without_the_bounded_reopen() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let sealed = "a".repeat(64);
         let mut index = ScanIndex {
             file_snapshot_fingerprints: BTreeMap::from([(
@@ -54809,8 +54751,6 @@ mod tests {
     /// revision. This is what makes removing the fast path affordable.
     #[test]
     fn legacy_reconciliation_advances_one_page_per_cycle_and_terminates() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let fingerprints = (0..120)
             .map(|value| format!("{value:064x}"))
             .collect::<BTreeSet<_>>();
@@ -54859,8 +54799,6 @@ mod tests {
 
     #[test]
     fn legacy_0_1_121_unfinished_strand_rearms_in_persisted_bounded_pages() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("scan-index-rearm-stranded-revision");
         let path = root.join("codex-scan-index-v3.json");
         let accepted = "a".repeat(64);
@@ -54914,8 +54852,6 @@ mod tests {
 
     #[test]
     fn legacy_reconciliation_bounds_real_scale_and_resumes_from_persisted_cursor() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("scan-index-bounded-legacy-reconciliation");
         let path = root.join("codex-scan-index-v3.json");
         let fingerprints = (0..2_247)
@@ -54955,8 +54891,6 @@ mod tests {
 
     #[test]
     fn snapshot_admission_boundaries_match_backend_640_kib() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         assert_eq!(MAX_SNAPSHOT_ITEM_WIRE_BYTES, 655_360);
         assert_eq!(MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES, 656_384);
         for size in [128 * 1024, 128 * 1024 + 1, 640 * 1024] {
@@ -54987,8 +54921,6 @@ mod tests {
 
     #[test]
     fn admission_reoffer_reconstructs_terminal_file_through_existing_scanner() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("admission-reoffer-scanner");
         fs::create_dir_all(&root).unwrap();
         for id in ["refused", "healthy"] {
@@ -55113,8 +55045,6 @@ mod tests {
 
     #[test]
     fn admission_retry_window_stays_open_until_ack_or_terminal() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let fp = "a".repeat(64);
         let mut index = ScanIndex::default();
         let mut record = snapshot_quarantine_record(SnapshotSource::Pi);
@@ -55149,8 +55079,6 @@ mod tests {
 
     #[test]
     fn admission_reoffer_is_bounded_durable_and_preserves_terminal_disclosure() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut index = ScanIndex::default();
         let current = (0..61)
             .map(|n| format!("{n:064x}"))
@@ -55235,8 +55163,6 @@ mod tests {
 
     #[test]
     fn historical_replay_preserves_absent_terminal_disclosure_and_counters() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("scan-index-replay-absent-terminals");
         let path = root.join("codex-scan-index-v3.json");
         let unproven = "a".repeat(64);
@@ -55276,8 +55202,6 @@ mod tests {
 
     #[test]
     fn scan_index_compare_and_swap_rejects_a_stale_overlapping_daemon() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("scan-index-cas");
         let path = root.join("codex-scan-index-v2.json");
         let mut initial = ScanIndex::default();
@@ -55301,8 +55225,6 @@ mod tests {
 
     #[test]
     fn large_scan_index_save_preserves_bytes_and_generation_fence() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("large-scan-index-durability");
         let path = root.join("scan-index.json");
         let mut index = ScanIndex {
@@ -55356,8 +55278,6 @@ mod tests {
 
     #[test]
     fn bounded_candidate_selection_is_lexicographic_and_resumes_after_cursor() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = Path::new("/opaque-root");
         let mut first = BoundedCandidateSelection::new(None, None, 2);
         for name in ["c.jsonl", "a.jsonl", "b.jsonl"] {
@@ -55406,8 +55326,6 @@ mod tests {
 
     #[test]
     fn frozen_sweep_visits_every_preexisting_key_despite_sustained_tail_churn() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = Path::new("/opaque-root");
         let preexisting = [
             "a.jsonl", "b.jsonl", "c.jsonl", "d.jsonl", "e.jsonl", "f.jsonl",
@@ -55445,8 +55363,6 @@ mod tests {
 
     #[test]
     fn upload_context_transition_forces_a_complete_a_b_a_reparse() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("upload-context-aba");
         let path = root.join("session-019e2700-1111-7000-9000-111111111111.jsonl");
         fs::write(
@@ -55488,8 +55404,6 @@ mod tests {
 
     #[test]
     fn historical_replay_generation_clears_once_then_resumes_its_frozen_cursor() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut index = ScanIndex {
             files: BTreeMap::from([("old.jsonl".to_string(), manifest_index_entry(Some("old")))]),
             resume_after_path: Some("page-one.jsonl".to_string()),
@@ -55521,8 +55435,6 @@ mod tests {
 
     #[test]
     fn context_curve_replay_completion_survives_shed_and_replays_after_toggle() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let previous = ScanIndex::default();
         let generation_zero = "codex:curve:0:destination".to_string();
         let mut in_flight = previous.clone();
@@ -55574,8 +55486,6 @@ mod tests {
 
     #[test]
     fn every_context_curve_derivation_revision_rearms_exactly_one_replay() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let base = context_curve_derivation_revision_key(
             "parser:v1",
             "ownership:v1",
@@ -55633,8 +55543,6 @@ mod tests {
 
     #[test]
     fn opened_object_identity_moves_when_same_inode_content_sample_changes() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("opened-object-sample");
         let path = root.join("session.jsonl");
         fs::write(&path, b"aaaaaaaa\n").expect("write first content");
@@ -55650,8 +55558,6 @@ mod tests {
 
     #[test]
     fn opened_replacement_is_rechecked_against_the_frozen_lookback_window() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("opened-object-age-recheck");
         let path = root.join("session.jsonl");
         fs::write(&path, b"{}\n").expect("write recent discovery object");
@@ -55696,8 +55602,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn opened_object_identity_moves_on_middle_rewrite_with_size_and_mtime_restored() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use std::io::Write;
 
         let root = temp_dir("opened-object-middle-rewrite");
@@ -55747,8 +55651,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn scanner_rejects_symlinks_without_crossing_the_root() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use std::os::unix::fs::symlink;
 
         let root = temp_dir("scan-symlink-root");
@@ -55777,8 +55679,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn scanner_allows_one_configured_root_symlink_but_not_nested_symlinks() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use std::os::unix::fs::symlink;
 
         let parent = temp_dir("scan-configured-root-symlink");
@@ -55817,8 +55717,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn opened_candidate_cannot_escape_through_replaced_intermediate_directory() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use std::os::unix::fs::symlink;
 
         let root = temp_dir("scan-intermediate-root");
@@ -55842,8 +55740,6 @@ mod tests {
 
     #[test]
     fn quarantined_entities_are_excluded_from_non_vacuous_manifest() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let keep = "a".repeat(64);
         let quarantine = "b".repeat(64);
         let mut index = ScanIndex {
@@ -55873,8 +55769,6 @@ mod tests {
 
     #[test]
     fn scan_index_retries_same_fingerprint_after_quarantine_contract_upgrade() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = PathBuf::from("/opaque/session.jsonl");
         let fingerprint = "e".repeat(64);
         let candidate = CandidateFile {
@@ -55952,8 +55846,6 @@ mod tests {
 
     #[test]
     fn claude_authority_quarantine_is_durable_and_retries_on_change_or_deadline() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let root_session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let root = temp_dir("claude-authority-quarantine-retry");
@@ -56136,8 +56028,6 @@ mod tests {
 
     #[test]
     fn claude_authority_preflight_identity_fence_is_family_scoped() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-authority-preflight-family-scope");
         let quarantined_root = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let healthy_root = "11111111-2222-3333-4444-555555555555";
@@ -56180,8 +56070,6 @@ mod tests {
 
     #[test]
     fn claude_authority_family_evolution_reparses_every_quarantined_sibling() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let root_session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let root = temp_dir("claude-authority-family-evolution");
@@ -56330,8 +56218,6 @@ mod tests {
 
     #[test]
     fn legacy_scan_index_reparses_once_to_establish_semantic_activity_witness() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("scan-index-migration");
         let path = root.join("rollout-019e253c-6666-7000-9000-ffffffffffff.jsonl");
         fs::write(
@@ -56418,8 +56304,6 @@ mod tests {
 
     #[test]
     fn legacy_codex_config_presence_forces_one_corrective_snapshot() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("legacy-config-cutover");
         let codex_dir = home.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
@@ -56509,8 +56393,6 @@ mod tests {
 
     #[test]
     fn nanosecond_mtime_change_forces_parse_inside_same_second() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = PathBuf::from("/redacted/session.jsonl");
         let candidate = CandidateFile {
             physical_identity: None,
@@ -56566,8 +56448,6 @@ mod tests {
 
     #[test]
     fn legacy_index_reparses_when_old_sidecar_identity_cannot_be_proven() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = PathBuf::from("/redacted/session.jsonl");
         let candidate = CandidateFile {
             physical_identity: None,
@@ -56620,8 +56500,6 @@ mod tests {
 
     #[test]
     fn legacy_index_targets_config_derived_rows_for_reconciliation() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = PathBuf::from("/redacted/session.jsonl");
         let candidate = CandidateFile {
             physical_identity: None,
@@ -56674,8 +56552,6 @@ mod tests {
 
     #[test]
     fn parsed_semantic_noop_is_not_returned_for_upload() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("semantic-noop");
         let path = root.join("session-019e2700-1111-7000-9000-111111111111.jsonl");
         let base = concat!(
@@ -56732,8 +56608,6 @@ mod tests {
 
     #[test]
     fn due_quarantine_retry_is_not_suppressed_as_a_semantic_noop() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("semantic-noop-quarantine-retry");
         let path = root.join("session.jsonl");
         fs::write(
@@ -56786,8 +56660,6 @@ mod tests {
 
     #[test]
     fn backfill_window_defaults_to_two_years_and_starts_from_now_when_zero() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let now = 1_800_000_000;
         let day_seconds = 24 * 60 * 60;
 
@@ -56808,8 +56680,6 @@ mod tests {
 
     #[test]
     fn scan_policy_caps_recent_files_and_reports_partial_state() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("scan-policy-cap");
         // Inject a tiny cap so we exercise truncation without writing
         // MAX_BACKFILL_FILES_PER_SOURCE (10k) fixture files.
@@ -56869,8 +56739,6 @@ mod tests {
 
     #[test]
     fn wide_single_directory_fails_red_without_materializing_past_budget() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("bounded-wide-directory");
         for index in 0..4 {
             fs::write(root.join(format!("session-{index}.jsonl")), b"{}\n")
@@ -56900,8 +56768,6 @@ mod tests {
 
     #[test]
     fn traversal_restart_after_scan_derivation_upgrade_revisits_consumed_prefix() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("bounded-traversal-derivation-upgrade");
         fs::write(
             root.join("session.jsonl"),
@@ -56963,8 +56829,6 @@ mod tests {
 
     #[test]
     fn bounded_traversal_resumes_after_scan_index_restart() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("bounded-traversal-restart");
         for index in 0..4 {
             fs::write(
@@ -57011,8 +56875,6 @@ mod tests {
 
     #[test]
     fn unsettled_bounded_page_requires_one_clean_followup_generation() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("bounded-traversal-unsettled-followup");
         for index in 0..4 {
             fs::write(
@@ -57078,29 +56940,21 @@ mod tests {
 
     #[test]
     fn claude_stable_owned_start_recovers_after_partial_conflict() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         exercise_claude_partial_census_recovery(false, false);
     }
 
     #[test]
     fn claude_duplicate_across_pages_stays_refused_without_reparse_loop() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         exercise_claude_partial_census_recovery(true, false);
     }
 
     #[test]
     fn claude_pending_census_recovers_without_releasing_future_quarantine() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         exercise_claude_partial_census_recovery(false, true);
     }
 
     #[test]
     fn claude_future_quarantine_preserves_cross_page_duplicate_refusal() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         exercise_claude_partial_census_recovery(true, true);
     }
 
@@ -57310,8 +57164,6 @@ mod tests {
 
     #[test]
     fn census_window_is_pinned_only_while_traversal_scope_matches() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let first_root = temp_dir("bounded-traversal-pinned-scope-first");
         let second_root = temp_dir("bounded-traversal-pinned-scope-second");
         let mut index = ScanIndex::default();
@@ -57360,8 +57212,6 @@ mod tests {
 
     #[test]
     fn new_tail_waits_for_next_bounded_traversal_generation() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("bounded-traversal-new-tail");
         let fixture = |tokens: usize| {
             format!(
@@ -57436,8 +57286,6 @@ mod tests {
 
     #[test]
     fn deletion_reconciliation_is_bounded_and_resumable() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut index = ScanIndex {
             files: ["a", "b", "c", "d"]
                 .into_iter()
@@ -57477,8 +57325,6 @@ mod tests {
 
     #[test]
     fn bounded_watcher_hint_joins_complete_durable_census() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("bounded-watcher-hint");
         let path = root.join("session.jsonl");
         fs::write(
@@ -57511,8 +57357,6 @@ mod tests {
 
     #[test]
     fn repeated_watcher_hints_cannot_starve_bounded_census() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("bounded-repeated-watcher-hint");
         let fixture = |tokens: u64| {
             format!(
@@ -57553,8 +57397,6 @@ mod tests {
 
     #[test]
     fn rename_hint_removes_old_index_key_despite_repeated_active_hints() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("bounded-watcher-rename");
         let fixture = |tokens: u64| {
             format!(
@@ -57620,8 +57462,6 @@ mod tests {
 
     #[test]
     fn late_remove_hint_retires_key_already_passed_by_reconciliation() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("bounded-watcher-late-remove");
         let fixture = |tokens: u64| {
             format!(
@@ -57685,8 +57525,6 @@ mod tests {
 
     #[test]
     fn watcher_overflow_dirties_generation_and_clean_sweep_repairs_missed_change() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("bounded-watcher-overflow");
         let first_path = root.join("a.jsonl");
         let second_path = root.join("b.jsonl");
@@ -57779,8 +57617,6 @@ mod tests {
 
     #[test]
     fn unhealthy_generation_retries_with_backoff_while_hints_still_progress() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("bounded-unhealthy-retry");
         let malformed = root.join("a-malformed.jsonl");
         fs::write(
@@ -58001,8 +57837,6 @@ mod tests {
 
     #[test]
     fn non_progressing_residue_settles_only_without_retryable_problems() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let residue = ScanTraversalCounts {
             ownership_incomplete_file_count: 1,
             zero_snapshot_usage_evidence_count: 1,
@@ -58090,8 +57924,6 @@ mod tests {
     /// the next cycle must re-open the ledger exactly once.
     #[test]
     fn unproven_ledger_behind_non_progressing_codex_residue_completes_and_reopens_once() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let fixture = CodexResidueFixture::create("codex-residue-unproven-ledger");
         fixture.insert_thread(RESIDUE_SESSION, 1_105, "agent_created_thread");
         let residue_path =
@@ -58246,8 +58078,6 @@ mod tests {
     /// are kept.
     #[test]
     fn pre_ledger_sweep_behind_non_progressing_codex_residue_resumes() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let fixture = CodexResidueFixture::create("codex-residue-pre-ledger-sweep");
         fixture.insert_thread(ACTIVE_RESIDUE_SESSION, 577, "agent_created_thread");
         fixture.write_rollout(
@@ -58332,8 +58162,6 @@ mod tests {
     /// has candidates queued keeps the census red and the counts unsettled.
     #[test]
     fn residue_is_not_settled_while_candidates_are_still_pending() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let fixture = CodexResidueFixture::create("codex-residue-pending-candidates");
         fixture.insert_thread(ACTIVE_RESIDUE_SESSION, 577, "agent_created_thread");
         // Sorts before the healthy rollouts so the first bounded page parses it.
@@ -58413,8 +58241,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn retryable_problem_keeps_the_census_red_and_the_latch_bounded() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use std::os::unix::fs::symlink;
 
         let fixture = CodexResidueFixture::create("codex-residue-with-retryable-problem");
@@ -58570,8 +58396,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unhealthy_retry_latch_saturates_at_its_cap_and_a_missing_deadline_is_due_now() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use std::os::unix::fs::symlink;
 
         let root = temp_dir("latch-cap-root");
@@ -58712,8 +58536,6 @@ mod tests {
     /// now completes - the fallback resumes for the threads it may publish.
     #[test]
     fn residue_rollouts_under_archived_and_active_roots_stay_blocked_while_the_fallback_resumes() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let fixture = CodexResidueFixture::create("codex-residue-archived-and-active");
         fixture.insert_thread(RESIDUE_SESSION, 1_105, "agent_created_thread");
         let archived_path =
@@ -58860,8 +58682,6 @@ mod tests {
 
     #[test]
     fn periodic_scan_discovers_root_created_after_watcher_startup() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent = temp_dir("late-scan-root-parent");
         let root = parent.join("sessions-created-later");
         let mut index = ScanIndex::default();
@@ -58903,8 +58723,6 @@ mod tests {
 
     #[test]
     fn previously_observed_root_disappearance_fails_red_until_root_returns() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent = temp_dir("disappearing-scan-root-parent");
         let root = parent.join("sessions");
         fs::create_dir_all(&root).expect("create observed root");
@@ -58963,8 +58781,6 @@ mod tests {
 
     #[test]
     fn old_index_without_root_witness_infers_missing_previously_observed_root() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent = temp_dir("old-index-missing-root");
         let root = parent.join("sessions");
         let index_path = parent.join("scan-index.json");
@@ -59016,8 +58832,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn legacy_vanished_symlink_witness_does_not_promote_optional_roots() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use std::os::unix::fs::symlink;
 
         let parent = temp_dir("legacy-vanished-symlink-root");
@@ -59116,8 +58930,6 @@ mod tests {
 
     #[test]
     fn legacy_root_context_change_does_not_claim_unrelated_optional_root() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent = temp_dir("legacy-root-context-change");
         let old_root = parent.join("old-sessions");
         let new_optional_root = parent.join("new-optional-sessions");
@@ -59160,8 +58972,6 @@ mod tests {
 
     #[test]
     fn bounded_reader_skips_oversized_line_and_keeps_neighbors() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // One pathological line that exceeds the (tiny test) cap sits between two
         // valid lines. The oversized line must be dropped while both neighbors
         // still parse and accumulate in order.
@@ -59187,8 +58997,6 @@ mod tests {
 
     #[test]
     fn bounded_reader_step_moves_without_replay_and_discloses_every_line() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut input = b"{\"n\":1}\r\n\nnot json\n\xff\n".to_vec();
         input.extend_from_slice(format!("{{\"big\":\"{}\"}}\n", "x".repeat(256)).as_bytes());
         input.extend_from_slice(b" \r\n{\"n\":2}");
@@ -59226,8 +59034,6 @@ mod tests {
 
     #[test]
     fn bounded_reader_step_preserves_codex_salvage_and_empty_eof() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let input = format!(
             "{{\"timestamp\":\"2026-07-22T08:00:00Z\",\"ordinal\":42,\"payload\":\"{}\"}}",
             "x".repeat(256)
@@ -59266,8 +59072,6 @@ mod tests {
 
     #[test]
     fn bounded_reader_step_io_error_cannot_resume_a_partial_line() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         struct FailingReader {
             data: &'static [u8],
             offset: usize,
@@ -59338,8 +59142,6 @@ mod tests {
 
     #[test]
     fn bounded_reader_parses_normal_transcript_unchanged() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // A normal multi-line transcript (no line near the cap) parses exactly
         // as the old `lines()` loop would, including a final line without a
         // trailing newline.
@@ -59363,8 +59165,6 @@ mod tests {
 
     #[test]
     fn bounded_reader_preserves_empty_and_malformed_line_semantics() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Blank/whitespace lines and unparseable lines are skipped exactly as
         // before; a trailing newline does not emit a spurious empty value.
         let input = "\n   \n{\"ok\":true}\nnot json at all\n\n{\"ok\":false}\n";
@@ -59381,8 +59181,6 @@ mod tests {
 
     #[test]
     fn scan_policy_skips_oversized_non_codex_transcript_files() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("scan-policy-oversized");
         // Sparse file: logical length over the cap, negligible bytes on disk.
         let oversized_path = root.join("session-oversized.jsonl");
@@ -59421,8 +59219,6 @@ mod tests {
 
     #[test]
     fn bounded_traversal_uses_frozen_census_time_for_age_cutoff() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("bounded-frozen-age-cutoff");
         fs::write(
             root.join("session.jsonl"),
@@ -59451,8 +59247,6 @@ mod tests {
 
     #[test]
     fn watcher_hint_cannot_widen_the_frozen_age_scope() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("bounded-watcher-age-cutoff");
         let path = root.join("session.jsonl");
         fs::write(
@@ -59488,8 +59282,6 @@ mod tests {
 
     #[test]
     fn incomplete_jsonl_never_settles_the_scan_index() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("scan-incomplete-jsonl");
         let path = root.join("session-incomplete.jsonl");
         fs::write(
@@ -59526,8 +59318,6 @@ mod tests {
 
     #[test]
     fn every_lossy_line_class_is_quarantined_or_terminally_disclosed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let session = "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n";
         let usage = "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n";
         // `over-line-cap` stays in this case list deliberately. It is no longer
@@ -59600,8 +59390,6 @@ mod tests {
     /// non-Codex shape directly instead of inferring it from the Codex case.
     #[test]
     fn over_line_cap_is_terminal_with_disclosed_loss_for_non_codex_sources() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let claude = "{\"type\":\"assistant\",\"sessionId\":\"019e2700-5555-7000-9000-555555555555\",\"uuid\":\"019e2700-5555-7000-9000-5555555555a1\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n";
         let pi = concat!(
@@ -59780,8 +59568,6 @@ mod tests {
     /// shape and asserts the file is read exactly once.
     #[test]
     fn terminal_dispositions_settle_for_a_corpus_larger_than_any_fixed_cap() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         use std::io::Write;
 
@@ -59921,8 +59707,6 @@ mod tests {
 
     #[test]
     fn oversized_21mb_line_is_terminal_once_and_salvages_usage_siblings() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("terminal-21mb-line");
         let session_id = "019e2700-1111-7000-9000-111111111111";
         let parent_id = "019e2700-2222-7000-9000-222222222222";
@@ -60031,8 +59815,6 @@ mod tests {
     /// a 127 MB rollout forever.
     #[test]
     fn oversized_parent_of_ordinal_subagent_children_is_read_once() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("terminal-oversized-parent");
         let parent_id = "019e2700-2222-7000-9000-222222222222";
         let child_ids = [
@@ -60166,8 +59948,6 @@ mod tests {
 
     #[test]
     fn positive_usage_without_an_emittable_entity_stays_retryable() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("positive-usage-without-entity");
         fs::write(
             root.join("session.jsonl"),
@@ -60201,8 +59981,6 @@ mod tests {
 
     #[test]
     fn lossy_file_has_no_finalization_side_effects_while_healthy_sibling_progresses() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("scan-lossy-with-healthy-sibling");
         let valid_session = |session_id: &str| {
             format!(
@@ -60257,8 +60035,6 @@ mod tests {
 
     #[test]
     fn codex_allows_larger_streaming_transcripts_than_other_sources() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         assert!(max_jsonl_file_bytes(SnapshotSource::Codex) > MAX_JSONL_FILE_BYTES);
         assert_eq!(
             max_jsonl_file_bytes(SnapshotSource::ClaudeCode),
@@ -60272,8 +60048,6 @@ mod tests {
 
     #[test]
     fn scan_policy_never_expands_past_default_window() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         assert_eq!(
             effective_backfill_window_days(BACKFILL_WINDOW_DAYS + 30),
             BACKFILL_WINDOW_DAYS,
@@ -60283,8 +60057,6 @@ mod tests {
 
     #[test]
     fn codex_default_roots_include_active_and_archived_sessions() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("codex-default-roots");
         let roots = SnapshotSource::Codex.default_roots(&home);
 
@@ -60301,8 +60073,6 @@ mod tests {
 
     #[test]
     fn codex_scan_reads_active_and_archived_session_roots() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let codex_dir = temp_dir("codex-active-archived");
         let sessions_dir = codex_dir.join("sessions");
         let archived_dir = codex_dir.join("archived_sessions");
@@ -60353,8 +60123,6 @@ mod tests {
 
     #[test]
     fn codex_parser_extracts_current_jsonl_shape_without_prompts() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex");
         fs::write(
             &path,
@@ -60425,8 +60193,6 @@ mod tests {
 
     #[test]
     fn codex_parser_forwards_raw_session_origin() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // session_meta.payload carries thread_source/source/originator/agent_role
         // (siblings of id). The backend re-derives the initiator from these.
         let path = temp_file("codex");
@@ -60464,8 +60230,6 @@ mod tests {
 
     #[test]
     fn codex_parser_forwards_top_level_originator_for_chatgpt_work() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // The unified ChatGPT desktop app writes its local "Work" sessions as
         // normal Codex rollout JSONLs with session_meta.originator ==
         // "codex_work_desktop". The daemon forwards that verbatim on the
@@ -60501,8 +60265,6 @@ mod tests {
 
     #[test]
     fn codex_parser_omits_originator_when_session_meta_lacks_it() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Backward compat: a Codex session_meta with no `originator` yields None,
         // and the field is skipped on the wire (additive/optional).
         let path = temp_file("codex-originator-absent");
@@ -60532,8 +60294,6 @@ mod tests {
 
     #[test]
     fn codex_parser_emits_direct_scheduled_and_parent_subagent_facts() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let automation_path = temp_file("codex-automation-attribution");
         fs::write(
             &automation_path,
@@ -60638,8 +60398,6 @@ mod tests {
 
     #[test]
     fn codex_parser_gates_bounded_template_labels_on_existing_title_consent() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("codex-attribution-groups");
         let schedule_dir = home.join(".codex/automations/schedule-landing");
         fs::create_dir_all(&schedule_dir).expect("schedule dir");
@@ -60749,8 +60507,6 @@ mod tests {
 
     #[test]
     fn codex_parser_uses_observed_usage_events_when_request_count_is_missing() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-observed-activity");
         fs::write(
             &path,
@@ -60800,8 +60556,6 @@ mod tests {
 
     #[test]
     fn codex_parser_aggregates_task_complete_latency_per_session() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-latency");
         fs::write(
             &path,
@@ -60833,8 +60587,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_derives_turn_duration_latency_per_session() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Claude Code has no `task_complete` latency event, but every record
         // carries an ms-precision RFC3339 timestamp. A turn's wall-clock
         // duration is the gap from the preceding `type=user` record (real prompt
@@ -60893,8 +60645,6 @@ mod tests {
 
     #[test]
     fn claude_code_turn_duration_skips_responses_without_preceding_user() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // A response with no preceding `type=user` record (e.g. the transcript
         // opens mid-stream after a compaction/resume) has no input moment to
         // measure against and must contribute no latency sample. Only the
@@ -60932,8 +60682,6 @@ mod tests {
 
     #[test]
     fn codex_transcript_title_wins_over_sidecar_titles() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-title-priority");
         fs::write(
             &path,
@@ -60980,8 +60728,6 @@ mod tests {
 
     #[test]
     fn codex_session_index_sidecar_supplies_title_without_jsonl_title() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let codex_dir = temp_dir("codex-session-index");
         let sessions_dir = codex_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
@@ -61024,8 +60770,6 @@ mod tests {
 
     #[test]
     fn malformed_codex_session_index_discards_partial_titles_without_blocking_usage() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let codex_dir = temp_dir("codex-session-index-partial");
         let sessions_dir = codex_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
@@ -61092,8 +60836,6 @@ mod tests {
 
     #[test]
     fn codex_state_sqlite_sidecar_supplies_title_when_session_index_has_none() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let codex_dir = temp_dir("codex-state-sqlite");
         let sessions_dir = codex_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
@@ -61154,8 +60896,6 @@ mod tests {
 
     #[test]
     fn codex_state_sqlite_supplies_total_only_fallback_snapshots() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let codex_dir = temp_dir("codex-state-total-only");
         let sessions_dir = codex_dir.join("sessions");
         let archived_dir = codex_dir.join("archived_sessions");
@@ -61359,8 +61099,6 @@ mod tests {
 
     #[test]
     fn unreadable_codex_state_census_preserves_prior_durable_state_only_entities() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let codex_dir = temp_dir("codex-state-census-failure");
         let sessions_dir = codex_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
@@ -61428,8 +61166,6 @@ mod tests {
 
     #[test]
     fn codex_state_only_skips_sessions_already_parsed_in_a_prior_run() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Regression: the incremental scan skips a rollout file it parsed in an
         // earlier run, so the session is absent from the current run's parsed
         // set. The state-only fallback must NOT then re-emit an unattributed
@@ -61581,8 +61317,6 @@ mod tests {
 
     #[test]
     fn codex_ambiguous_filename_keeps_both_forms_of_committed_exclusive_body() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for owner in [
             "019e253c-9999-7000-9000-cccccccccccc",
             "2026-05-14T10-00-00-019e253c-9999-7000-9000-cccccccccccc",
@@ -61630,8 +61364,6 @@ mod tests {
 
     #[test]
     fn codex_state_only_covers_a_persisted_header_outside_both_filename_candidates() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let owner = "header-outside-both-candidates";
         let (mut metadata, index, native) = ambiguous_state_only_fixture(owner);
         let path = Path::new(index.files.keys().next().unwrap());
@@ -61670,8 +61402,6 @@ mod tests {
 
     #[test]
     fn codex_ambiguous_filename_without_committed_owner_withholds_and_counts() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for (tokens, expected_sum) in [([900, 900], 1800), ([0, 0], 0), ([u64::MAX, 1], u64::MAX)] {
             for binding in [None, Some("malformed".to_string())] {
                 let (mut metadata, mut index, _) =
@@ -61740,8 +61470,6 @@ mod tests {
 
     #[test]
     fn codex_unambiguous_legacy_and_modern_state_only_controls_are_unchanged() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let modern = "019e253c-9999-7000-9000-cccccccccccc";
         let legacy = format!("2026-05-14T10-00-00-{modern}");
         for (name, owner) in [
@@ -61794,8 +61522,6 @@ mod tests {
 
     #[test]
     fn codex_accepted_owner_preserves_unambiguous_filename_coverage() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let owner = "019e253c-9999-7000-9000-cccccccccccc";
         for same in [false, true] {
             for timestamp in [false, true] {
@@ -61859,8 +61585,6 @@ mod tests {
 
     #[test]
     fn codex_ambiguous_observations_are_supported_fingerprinted_and_batched_per_pass() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let owner = "019e253c-9999-7000-9000-cccccccccccc";
         let (metadata, mut index, _) = ambiguous_state_only_fixture(owner);
         let key = index.files.keys().next().unwrap().clone();
@@ -61920,8 +61644,6 @@ mod tests {
 
     #[test]
     fn codex_state_only_falls_back_after_main_retires_quarantined_body() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let owner = "019e253c-9999-7000-9000-cccccccccccc";
         for reconcile in [false, true] {
             let (metadata, mut index, native) = ambiguous_state_only_fixture(owner);
@@ -61961,8 +61683,6 @@ mod tests {
 
     #[test]
     fn codex_state_only_terminal_diagnostic_counts_uncovered_entities() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for n in [0, 1, 3] {
             let dir = temp_dir("codex-state-only-terminal-counts");
             let sessions = dir.join("sessions");
@@ -62031,8 +61751,6 @@ mod tests {
 
     #[test]
     fn codex_state_only_replaces_a_deleted_rollout_in_the_same_complete_census() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let codex_dir = temp_dir("codex-state-deleted-rollout");
         let sessions_dir = codex_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
@@ -62107,8 +61825,6 @@ mod tests {
 
     #[test]
     fn ambiguous_codex_fork_blocks_inclusive_state_only_fallback() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let codex_dir = temp_dir("codex-ambiguous-state-fallback");
         let sessions_dir = codex_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
@@ -62192,8 +61908,6 @@ mod tests {
 
     #[test]
     fn codex_state_only_waits_until_later_candidate_pages_prove_absence() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let codex_dir = temp_dir("codex-state-page-before-ambiguous");
         let sessions_dir = codex_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
@@ -62271,8 +61985,6 @@ mod tests {
 
     #[test]
     fn codex_state_only_preserved_when_rollout_parses_to_no_usage() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Regression guard: a rollout that exists but yields zero usage rows
         // (e.g. only session_meta, or a legacy/unknown token payload) is still
         // recorded in the scan index, but it produced NO split snapshot. Such a
@@ -62403,8 +62115,6 @@ mod tests {
 
     #[test]
     fn scan_checkpoints_pi_zero_parsed_file_until_it_changes() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("pi-retry-zero-parsed");
         let path = root.join("session-019e2700-1111-7000-9000-111111111111.jsonl");
         fs::write(
@@ -62478,8 +62188,6 @@ mod tests {
 
     #[test]
     fn scan_checkpoints_codex_zero_parsed_file_until_it_changes() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("codex-retry-zero-parsed");
         let path =
             root.join("rollout-2026-05-14T10-00-00-019e2700-3333-7000-9000-333333333333.jsonl");
@@ -62547,8 +62255,6 @@ mod tests {
 
     #[test]
     fn codex_census_line_counts_every_parse_reason_and_selection() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut census = ScanCensus::default();
         assert_eq!(census.codex_parse_reasons_line(true), None, "silent page");
         for reason in [
@@ -62610,8 +62316,6 @@ mod tests {
 
     #[test]
     fn codex_scan_logs_selection_reasons_on_the_census_line() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         fn line(upload_context_matches: bool, counts: &[(&str, usize)]) -> String {
             let field = |name: &str| {
                 counts
@@ -62688,8 +62392,6 @@ mod tests {
 
     #[test]
     fn zero_snapshot_usage_evidence_stays_visible_across_bounded_retries() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("pi-zero-snapshot-usage-evidence");
         let path = root.join("session.jsonl");
         fs::write(
@@ -62731,8 +62433,6 @@ mod tests {
 
     #[test]
     fn usage_evidence_is_structural_and_ignores_metadata_limits_and_budgets() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let positive = [
             serde_json::json!({"token_count": {"info": {"total_token_usage": {"input_tokens": 12}}}}),
             serde_json::json!({"message": {"usage": {"output_tokens": 4}}}),
@@ -62770,8 +62470,6 @@ mod tests {
 
     #[test]
     fn authored_usage_shaped_content_does_not_hold_empty_transcript_red() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("pi-authored-usage-content");
         fs::write(
             root.join("session.jsonl"),
@@ -62801,8 +62499,6 @@ mod tests {
 
     #[test]
     fn pi_parser_quarantines_hostile_partial_timestamps_until_corrected() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("pi-hostile-timestamps");
         let path = root.join("session.jsonl");
         fs::write(
@@ -62912,8 +62608,6 @@ mod tests {
 
     #[test]
     fn pi_invalid_provider_timestamp_does_not_fall_back_to_envelope_time() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("pi-invalid-provider-valid-envelope");
         let path = root.join("session.jsonl");
         fs::write(
@@ -62946,8 +62640,6 @@ mod tests {
 
     #[test]
     fn codex_and_claude_partial_timestamp_loss_stays_visible() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let codex_root = temp_dir("codex-partial-timestamp-loss");
         let codex_path = codex_root.join("rollout-019e253c-6666-7000-9000-aaaaaaaaaaaa.jsonl");
@@ -63007,8 +62699,6 @@ mod tests {
 
     #[test]
     fn scan_checkpoints_claude_zero_parsed_file_until_it_changes() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let root = temp_dir("claude-retry-zero-parsed");
         let path = root.join("019e2700-4444-7000-9000-444444444444.jsonl");
@@ -63076,8 +62766,6 @@ mod tests {
 
     #[test]
     fn pi_scan_reprocesses_v6_zero_parse_index_entries() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("pi-v6-index");
         let path = root.join("session-019e2700-2222-7000-9000-222222222222.jsonl");
         fs::write(
@@ -63166,8 +62854,6 @@ mod tests {
 
     #[test]
     fn codex_first_prompt_fallback_is_filtered() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-first-prompt");
         fs::write(
             &path,
@@ -63256,8 +62942,6 @@ mod tests {
 
     #[test]
     fn codex_agent_role_prompt_has_a_bounded_title() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         assert_eq!(
             first_prompt_display_title(
                 SnapshotSource::Codex,
@@ -63289,8 +62973,6 @@ mod tests {
 
     #[test]
     fn codex_agent_role_prompt_rejects_unbounded_or_path_like_roles() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         assert_eq!(
             first_prompt_display_title(
                 SnapshotSource::Codex,
@@ -63325,8 +63007,6 @@ mod tests {
 
     #[test]
     fn first_prompt_material_skips_injected_scaffolding() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
         accumulator.set_first_prompt_title(Some(
             "# AGENTS.md instructions for /repo\n\
@@ -63348,8 +63028,6 @@ mod tests {
 
     #[test]
     fn first_prompt_material_keeps_human_marker_mentions() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
         accumulator.set_first_prompt_title(Some(
             "Update the AGENTS.md instructions and parse the current date: field".to_string(),
@@ -63363,8 +63041,6 @@ mod tests {
 
     #[test]
     fn first_prompt_material_keeps_task_after_injected_prefix() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
         accumulator.set_first_prompt_title(Some(
             "<recommended_plugins>Plugins</recommended_plugins>\n\
@@ -63387,8 +63063,6 @@ mod tests {
 
     #[test]
     fn codex_response_item_skips_separate_injected_content_elements() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let scaffold_message: Value = serde_json::from_str(concat!(
             "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[",
             "{\"type\":\"input_text\",\"text\":\"<recommended_plugins>Here is a deliberately long injected plugin catalog whose closing tag falls beyond the old title normalization boundary. Plugin one. Plugin two. Plugin three. Plugin four. Plugin five. Plugin six. Plugin seven. Plugin eight. Plugin nine. Plugin ten. Plugin eleven. Plugin twelve. Plugin thirteen. Plugin fourteen. Plugin fifteen.</recommended_plugins>\"},",
@@ -63437,8 +63111,6 @@ mod tests {
 
     #[test]
     fn upload_policy_strips_titles_and_workspace_labels_before_upload() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-upload-policy");
         fs::write(
             &path,
@@ -63496,8 +63168,6 @@ mod tests {
 
     #[test]
     fn codex_snapshot_derives_repository_identity_without_uploading_raw_cwd() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let repository = temp_dir("codex-repository-identity");
         let status = std::process::Command::new("git")
             .args(["init", "-q"])
@@ -63554,8 +63224,6 @@ mod tests {
 
     #[test]
     fn extract_session_artifacts_collects_clean_pr_issue_commit() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let text = concat!(
             "Created PR: https://github.com/ottto-ai/repo/pull/42\n",
             "MR https://gitlab.com/group/sub/proj/-/merge_requests/7 ",
@@ -63588,8 +63256,6 @@ mod tests {
 
     #[test]
     fn extract_session_artifacts_canonicalizes_and_rejects_unclean() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Trailing path suffix and query string are dropped to the id.
         let canon = extract_session_artifacts(
             "https://github.com/o/r/pull/42/files https://github.com/o/r/pull/7?w=1",
@@ -63620,8 +63286,6 @@ mod tests {
 
     #[test]
     fn claude_code_artifact_scrape_skipped_when_disabled_and_runs_when_enabled() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Transcript whose tool_result carries a clean PR URL — exactly what the
         // per-line scraper collects when the feature is on.
         let fixture = concat!(
@@ -63677,8 +63341,6 @@ mod tests {
 
     #[test]
     fn apply_upload_policy_strips_artifacts_when_disabled() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let item = sample_session_artifact_item();
         let original_fingerprint = item.snapshot_fingerprint.clone();
         let mut disabled = vec![item.clone()];
@@ -63813,8 +63475,6 @@ mod tests {
 
     #[test]
     fn usage_accounting_contract_is_conditionally_serialized_and_hashed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut item = sample_session_artifact_item();
         let legacy_wire = serde_json::to_value(&item).expect("serialize legacy item");
         assert!(legacy_wire.get("usage_accounting_contract").is_none());
@@ -63838,8 +63498,6 @@ mod tests {
 
     #[test]
     fn semantic_fingerprint_excludes_observation_and_parser_metadata() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut item = sample_session_artifact_item();
         let origin = SnapshotOrigin {
             thread_source: Some("automation".to_string()),
@@ -63872,8 +63530,6 @@ mod tests {
 
     #[test]
     fn semantic_fingerprint_tracks_real_usage_lifecycle_and_latency_changes() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let item = sample_session_artifact_item();
         let baseline = snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
 
@@ -63901,8 +63557,6 @@ mod tests {
 
     #[test]
     fn semantic_fingerprint_tracks_selector_evidence_source() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("selector-evidence-semantic");
         fs::write(
             &path,
@@ -63939,8 +63593,6 @@ mod tests {
 
     #[test]
     fn codex_title_changes_affect_only_that_sessions_sidecar_identity() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-title-fingerprint");
         fs::write(
             &path,
@@ -64022,8 +63674,6 @@ mod tests {
 
     #[test]
     fn scan_identity_is_decoupled_from_parser_build_version() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = Path::new("/redacted/session.jsonl");
         let before_parser_upgrade = scan_file_fingerprint_with_context(
             path,
@@ -64049,8 +63699,6 @@ mod tests {
 
     #[test]
     fn codex_parser_ignores_function_call_names_as_titles() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-tool-name");
         fs::write(
             &path,
@@ -64083,8 +63731,6 @@ mod tests {
 
     #[test]
     fn codex_parser_splits_cumulative_usage_by_selector() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-selector-split");
         fs::write(
             &path,
@@ -64163,8 +63809,6 @@ mod tests {
 
     #[test]
     fn codex_logs2_priority_turn_from_body_extracts_turn_id_for_priority() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let body = priority_request_body(FAST_TURN);
         assert_eq!(
             codex_logs2_priority_turn_from_body(&body).as_deref(),
@@ -64174,8 +63818,6 @@ mod tests {
 
     #[test]
     fn codex_logs2_priority_turn_from_body_ignores_standard_and_non_request() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // No service_tier (standard) -> not a fast turn.
         let standard = "turn{turn.id=019ee421-1b3b-71c3-a0a8-ec9f645bf521}: \
              websocket request: {\"type\":\"response.create\",\"model\":\"gpt-5.5\"}";
@@ -64194,8 +63836,6 @@ mod tests {
 
     #[test]
     fn codex_logs2_span_field_respects_identifier_boundary() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let prefix = "submission.id=XYZ parent_turn_id=AAA turn.id=BBB next=1";
         // `turn.id` sits on a boundary (space before) -> matched.
         assert_eq!(
@@ -64213,8 +63853,6 @@ mod tests {
 
     #[test]
     fn claude_attribution_capture_opt_in_defaults_off() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Default OFF: absent env, and any unrecognized/explicit-off value.
         assert!(!claude_attribution_capture_enabled_from(None));
         for off in ["", "off", "0", "false", "no", "disabled", "nonsense"] {
@@ -64234,8 +63872,6 @@ mod tests {
 
     #[test]
     fn claude_attribution_capture_lifts_all_five_markers_when_enabled() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let line: Value = serde_json::from_str(concat!(
             "{\"type\":\"assistant\",\"sessionId\":\"attr-session\",",
             "\"attributionAgent\":\"general-purpose\",",
@@ -64305,8 +63941,6 @@ mod tests {
 
     #[test]
     fn claude_attribution_mcp_tool_matches_backend_normalization() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let long_name = "x".repeat(MAX_TOOL_USAGE_NAME_LENGTH + 20);
         let line = json!({"attributionMcpTool": long_name});
         let mut truncated = SelectorCapture::default();
@@ -64441,8 +64075,6 @@ mod tests {
 
     #[test]
     fn claude_attribution_mcp_tool_pins_python_lowercase_compatibility() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // CPython applies Unicode SpecialCasing to the whole string. These are
         // pinned outputs from backend normalize_selector_value under Python
         // 3.13.5 / Unicode 15.1, including Final_Sigma and the sole default
@@ -64514,8 +64146,6 @@ mod tests {
 
     #[test]
     fn claude_attribution_mcp_tool_caps_complete_selector_identities() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Exact R2 blocker: 101 normalized tool labels alternate between two
         // independently varying subagent selectors. A name-only budget emitted
         // 101 complete rows after its two unselected fallbacks split by agent.
@@ -64618,8 +64248,6 @@ mod tests {
 
     #[test]
     fn claude_attribution_capture_is_noop_when_disabled() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let line: Value = serde_json::from_str(concat!(
             "{\"type\":\"assistant\",\"attributionAgent\":\"general-purpose\",",
             "\"attributionMcpServer\":\"claude-in-chrome\",",
@@ -64640,8 +64268,6 @@ mod tests {
 
     #[test]
     fn claude_attribution_capture_skips_absent_or_blank_markers() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Enabled, but the line carries no usable attribution: blank string and
         // a non-string value are both ignored (string_at trims + rejects empty).
         let line: Value = serde_json::from_str(concat!(
@@ -64662,8 +64288,6 @@ mod tests {
 
     #[test]
     fn claude_attribution_contract_allows_all_five_keys() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // All five attribution keys cross the wire inside selector_context when
         // attribution capture is enabled; MCP tool has no separate opt-in.
         for key in [
@@ -64752,8 +64376,6 @@ mod tests {
 
     #[test]
     fn claude_attribution_capture_lifts_only_present_markers_mixed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Real-world top-level (non-subagent) transcript shape: the line carries
         // MCP-server/MCP-tool + skill attribution but NO `attributionAgent`
         // (subagent attribution lives in the child `subagents/*.jsonl`
@@ -64809,8 +64431,6 @@ mod tests {
 
     #[test]
     fn claude_attribution_capture_is_per_turn_isolated() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Core per-turn discipline: capture runs on the per-LINE selector, so an
         // attribution marker on one turn's line must NOT bleed onto a later
         // turn's line. Each line gets its own SelectorCapture; the second
@@ -64847,8 +64467,6 @@ mod tests {
 
     #[test]
     fn codex_logs2_reader_collects_priority_turns_from_sqlite() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let codex_dir = temp_dir("codex-logs2-reader");
         let db_path = codex_dir.join("logs_2.sqlite");
         let now = unix_seconds(SystemTime::now()).expect("now") as i64;
@@ -64901,8 +64519,6 @@ mod tests {
 
     #[test]
     fn codex_logs2_tier_stamps_priority_on_fast_turn_only() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Session-cumulative token_count emits one delta per turn. The fast turn
         // (in the logs_2 priority map) must price as priority; the standard turn
         // must carry no service_tier, proving the signal does not bleed forward.
@@ -64967,8 +64583,6 @@ mod tests {
 
     #[test]
     fn codex_logs2_tier_absent_map_leaves_turns_standard() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Same fast turn, but no trace map: the parser is unchanged and stamps
         // no service_tier (regression guard for the default path).
         let path = temp_file("codex-logs2-none");
@@ -65007,8 +64621,6 @@ mod tests {
 
     #[test]
     fn codex_parser_reads_nested_selector_aliases_and_captures_reasoning_effort() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-selector-aliases");
         fs::write(
             &path,
@@ -65058,8 +64670,6 @@ mod tests {
 
     #[test]
     fn codex_parser_captures_max_reasoning_effort_round_trip() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-effort-max");
         fs::write(
             &path,
@@ -65091,8 +64701,6 @@ mod tests {
 
     #[test]
     fn codex_mixed_effort_in_one_hour_keeps_distinct_rows() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-mixed-effort");
         fs::write(
             &path,
@@ -65125,8 +64733,6 @@ mod tests {
 
     #[test]
     fn codex_parser_reads_reasoning_effort_from_turn_context_collaboration_mode() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // No usage-co-located effort; falls back to the turn_context
         // collaboration_mode.settings.reasoning_effort path. The turn_context
         // line precedes the token_count line so latest_reasoning_effort is set
@@ -65159,8 +64765,6 @@ mod tests {
 
     #[test]
     fn codex_parser_does_not_apply_mutable_config_defaults_to_history() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("codex-config-selector");
         let codex_dir = root.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
@@ -65202,8 +64806,6 @@ mod tests {
 
     #[test]
     fn codex_config_defaults_capture_service_tier_model_and_selectors() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("codex-config-defaults");
         let codex_dir = root.join(".codex");
         fs::create_dir_all(&codex_dir).expect("create .codex");
@@ -65252,8 +64854,6 @@ mod tests {
 
     #[test]
     fn codex_config_defaults_fast_when_service_tier_priority() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("codex-config-defaults-priority");
         let codex_dir = root.join(".codex");
         fs::create_dir_all(&codex_dir).expect("create .codex");
@@ -65273,8 +64873,6 @@ mod tests {
 
     #[test]
     fn codex_config_defaults_absent_without_relevant_keys() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("codex-config-defaults-empty");
         let codex_dir = root.join(".codex");
         fs::create_dir_all(&codex_dir).expect("create .codex");
@@ -65320,8 +64918,6 @@ mod tests {
 
     #[test]
     fn claude_settings_defaults_capture_model_permission_mode_fast_and_sandbox() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-settings-defaults");
         let claude_dir = root.join(".claude");
         fs::create_dir_all(&claude_dir).expect("create .claude");
@@ -65381,8 +64977,6 @@ mod tests {
 
     #[test]
     fn claude_settings_defaults_prefer_local_then_managed_scope() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-settings-precedence");
         let claude_dir = root.join(".claude");
         fs::create_dir_all(&claude_dir).expect("create .claude");
@@ -65449,8 +65043,6 @@ mod tests {
 
     #[test]
     fn claude_settings_defaults_prefer_local_effort_level_over_user() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-settings-effort-precedence");
         let claude_dir = root.join(".claude");
         fs::create_dir_all(&claude_dir).expect("create .claude");
@@ -65499,8 +65091,6 @@ mod tests {
     /// matched on Claude Code's canonical key.
     #[test]
     fn claude_settings_defaults_read_model_settings_effort_for_saved_model() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-settings-model-effort");
         let claude_dir = root.join(".claude");
         fs::create_dir_all(&claude_dir).expect("create .claude");
@@ -65561,8 +65151,6 @@ mod tests {
     /// configured.
     #[test]
     fn claude_settings_defaults_model_settings_effort_without_saved_model() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-settings-model-effort-unset");
         let claude_dir = root.join(".claude");
         fs::create_dir_all(&claude_dir).expect("create .claude");
@@ -65640,8 +65228,6 @@ mod tests {
     /// answer wins, and the winning `model` selects the key in every file.
     #[test]
     fn claude_settings_defaults_model_settings_effort_respects_scope_precedence() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-settings-model-effort-scopes");
         let claude_dir = root.join(".claude");
         fs::create_dir_all(&claude_dir).expect("create .claude");
@@ -65732,8 +65318,6 @@ mod tests {
 
     #[test]
     fn claude_model_settings_key_matches_claude_code_canonical_key() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for (model, key) in [
             ("claude-opus-5-5", "claude-opus-5-5"),
             (" Claude-Opus-4-7[1m] ", "claude-opus-4-7"),
@@ -65762,8 +65346,6 @@ mod tests {
     /// what the file says.
     #[test]
     fn claude_settings_defaults_report_effort_level_verbatim() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-settings-effort-verbatim");
         let claude_dir = root.join(".claude");
         fs::create_dir_all(&claude_dir).expect("create .claude");
@@ -65784,8 +65366,6 @@ mod tests {
 
     #[test]
     fn claude_settings_defaults_reject_unsafe_effort_level_values() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-settings-effort-unsafe");
         let claude_dir = root.join(".claude");
         fs::create_dir_all(&claude_dir).expect("create .claude");
@@ -65821,8 +65401,6 @@ mod tests {
 
     #[test]
     fn claude_settings_defaults_treat_per_session_fast_opt_in_as_off() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-settings-fast-opt-in");
         let claude_dir = root.join(".claude");
         fs::create_dir_all(&claude_dir).expect("create .claude");
@@ -65851,8 +65429,6 @@ mod tests {
 
     #[test]
     fn claude_settings_defaults_report_fast_off_only_when_a_file_was_read() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-settings-empty");
         let claude_dir = root.join(".claude");
         fs::create_dir_all(&claude_dir).expect("create .claude");
@@ -65921,8 +65497,6 @@ mod tests {
 
     #[test]
     fn codex_config_without_fast_keys_leaves_fast_mode_unknown() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Codex may default to Fast on some plans (hence `fast_default_opt_out`),
         // so a config without a tier or Fast key does not mean Fast is off.
         let defaults =
@@ -65942,8 +65516,6 @@ mod tests {
 
     #[test]
     fn claude_settings_defaults_never_emit_paths_secrets_or_bypass_permissions() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-settings-redaction");
         let claude_dir = root.join(".claude");
         fs::create_dir_all(&claude_dir).expect("create .claude");
@@ -66008,8 +65580,6 @@ mod tests {
 
     #[test]
     fn claude_settings_defaults_reject_path_shaped_model_values() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-settings-model-path");
         let claude_dir = root.join(".claude");
         fs::create_dir_all(&claude_dir).expect("create .claude");
@@ -66031,8 +65601,6 @@ mod tests {
 
     #[test]
     fn codex_parser_does_not_backdate_fast_opt_out_to_history() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("codex-config-standard-selector");
         let codex_dir = root.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
@@ -66074,8 +65642,6 @@ mod tests {
 
     #[test]
     fn codex_parser_does_not_backdate_notice_fast_opt_out_to_history() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("codex-notice-standard-selector");
         let codex_dir = root.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
@@ -66117,8 +65683,6 @@ mod tests {
 
     #[test]
     fn claude_parser_forwards_raw_session_origin() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Claude JSONL lines carry entrypoint/sessionKind/isSidechain; any
         // sidechain line marks the whole session a subagent.
         let path = temp_file("claude");
@@ -66158,8 +65722,6 @@ mod tests {
 
     #[test]
     fn claude_transcript_effort_is_read_without_any_otlp_sidecar() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // The whole point: no effort index is threaded in, and the tiers still
         // land, because current Claude Code stamps them on the record itself.
         let path = temp_file("claude-transcript-effort");
@@ -66197,8 +65759,6 @@ mod tests {
 
     #[test]
     fn claude_transcript_effort_rejects_an_unknown_tier() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // A tier this build does not know must degrade to unknown, never widen
         // the vocabulary the backend stores.
         let path = temp_file("claude-effort-unknown-tier");
@@ -66223,8 +65783,6 @@ mod tests {
 
     #[test]
     fn claude_local_otel_does_not_supply_missing_transcript_effort() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Parse-stage native hours: gate on, e2::finish_page emits the hours.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let path = temp_file("claude-local-otel-effort-unknown");
@@ -66279,8 +65837,6 @@ mod tests {
 
     #[test]
     fn claude_local_otel_does_not_split_unknown_cache_creation() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Parse-stage native hours: gate on, e2::finish_page emits the hours.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let path = temp_file("claude-effort-cache-ttl");
@@ -66355,8 +65911,6 @@ mod tests {
 
     #[test]
     fn claude_local_otel_account_hash_stamps_unique_and_clears_conflict() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-account-evidence");
         fs::write(
             &path,
@@ -66524,8 +66078,6 @@ mod tests {
 
     #[test]
     fn claude_account_hash_uses_exact_request_ids_when_auxiliary_requests_share_session() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-account-request-id-coverage");
         fs::write(
             &path,
@@ -66826,8 +66378,6 @@ mod tests {
 
     #[test]
     fn claude_cache_split_interpretation_checks_totals_and_counts_rejections() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut row = crate::claude_local_otel::ClaudeLocalOtelEvidence::default();
         for (total, five_m, one_h, expected) in [
             (2014, 2014, 0, Some((2014, 0, 0))),
@@ -66857,8 +66407,6 @@ mod tests {
 
     #[test]
     fn claude_cache_split_matcher_accepts_aggregate_and_split() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (root, parent, items) = cache_split_fixture();
         let occurrence = ClaudeTranscriptUsageOccurrenceWitness::from(
             items[0]
@@ -66875,8 +66423,6 @@ mod tests {
 
     #[test]
     fn claude_cache_split_matcher_preserves_old_aggregate_only() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (root, parent, items) = cache_split_fixture();
         let occurrence = ClaudeTranscriptUsageOccurrenceWitness::from(
             items[0]
@@ -66893,8 +66439,6 @@ mod tests {
 
     #[test]
     fn claude_cache_split_account_accepts_both_shapes() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (root, parent, items) = cache_split_fixture();
         for split in [false, true] {
             let row = cache_split_api_row(&parent, split);
@@ -66911,8 +66455,6 @@ mod tests {
 
     #[test]
     fn claude_cache_split_rebuild_telemetry_only_does_not_double_count() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (root, parent, items) = cache_split_fixture();
         for split in [false, true] {
             let mut item = items[0].clone();
@@ -66939,8 +66481,6 @@ mod tests {
 
     #[test]
     fn claude_cache_split_rebuild_owned_accepts_both_shapes() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (root, parent, items) = cache_split_fixture();
         for split in [false, true] {
             let mut item = items[0].clone();
@@ -66959,8 +66499,6 @@ mod tests {
 
     #[test]
     fn claude_cache_split_inconsistent_row_fails_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (root, parent, items) = cache_split_fixture();
         let mut row = cache_split_api_row(&parent, true);
         row.cache_creation_tokens = 1000;
@@ -67002,8 +66540,6 @@ mod tests {
 
     #[test]
     fn claude_cache_split_new_family_proves_at_healthy_terminal() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -67049,8 +66585,6 @@ mod tests {
 
     #[test]
     fn claude_pending_usage_occurrence_limit_is_replacement_aware() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         assert_eq!(
             claude_pending_occurrence_count_after_replace(
                 MAX_CLAUDE_PENDING_USAGE_OCCURRENCES - 10,
@@ -67116,8 +66650,6 @@ mod tests {
 
     #[test]
     fn claude_reported_usage_union_assigns_aux_and_preserves_graph() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -67728,8 +67260,6 @@ mod tests {
 
     #[test]
     fn claude_invalid_family_can_hide_copy_from_provider_owned_session() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -67964,8 +67494,6 @@ mod tests {
 
     #[test]
     fn claude_duplicate_census_counts_separate_complete_invalid_and_owner_bound() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (root, parent, items) = claude_account_family_fixture();
 
@@ -68226,8 +67754,6 @@ mod tests {
 
     #[test]
     fn claude_duplicate_census_counts_name_each_pending_invalidation_once() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (root, _, items) = claude_account_family_fixture();
         let window = "2026-08-02T07:10:00Z";
         let accumulate = |page: &[SnapshotItem], max_occurrences: usize| {
@@ -68368,8 +67894,6 @@ mod tests {
 
     #[test]
     fn claude_reported_usage_union_refuses_unknown_trace_owner() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (root, parent, mut items) = claude_account_family_fixture();
         let api_rows = vec![complete_api_row(&parent, "req_1", 1, 10, 10, 0)];
         let trace_rows = vec![complete_trace_row(&parent, "req_1", "not-a-member")];
@@ -68412,8 +67936,6 @@ mod tests {
 
     #[test]
     fn claude_reported_usage_union_checks_earlier_page_occurrences() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (root, parent, mut items) = claude_account_family_fixture();
         let child_agent = "a4d1585d310070d0f";
         let mut api_rows = (1..=4)
@@ -68481,8 +68003,6 @@ mod tests {
 
     #[test]
     fn claude_legacy_fork_prefix_is_excluded_only_with_exact_external_owner() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -68748,8 +68268,6 @@ mod tests {
 
     #[test]
     fn claude_legacy_fork_of_fork_excludes_each_exact_inherited_prefix() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let ancestor = "ancestor";
         let middle = "middle";
         let leaf = "leaf";
@@ -68878,8 +68396,6 @@ mod tests {
 
     #[test]
     fn desktop_incomplete_census_preserves_fresh_request_account_proof() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _gate = claude_request_money::e2::GateForTest::off();
         let (dir, root, items) = claude_account_family_fixture();
         let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
@@ -68990,8 +68506,6 @@ mod tests {
 
     #[test]
     fn claude_d1_subagent_own_request_qualification() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (dir, root, items) = claude_account_family_fixture();
@@ -69195,8 +68709,6 @@ mod tests {
 
     #[test]
     fn claude_d1_subagent_coverage_lifecycle_and_shapes() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (dir, root, items) = claude_account_family_fixture();
@@ -69314,8 +68826,6 @@ mod tests {
 
     #[test]
     fn claude_d1_multiple_requests_typed_identity_and_unreadable_import() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (dir, root, items) = claude_account_family_fixture();
@@ -69400,8 +68910,6 @@ mod tests {
 
     #[test]
     fn claude_d1_fresh_reparse_retains_binding_refusal_until_exact_proof_returns() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (dir, root, items) = claude_account_family_fixture();
@@ -69488,8 +68996,6 @@ mod tests {
 
     #[test]
     fn claude_account_hash_stamps_request_complete_parent_subagent_family() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (root, parent, mut items) = claude_account_family_fixture();
         let account_hash = "a".repeat(64);
@@ -69692,8 +69198,6 @@ mod tests {
 
     #[test]
     fn claude_account_pending_v2_parity_and_old_index_upgrade() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -69831,8 +69335,6 @@ mod tests {
 
     #[test]
     fn claude_account_pending_storage_upgrade_keeps_canonical_witness_without_reread() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -69868,8 +69370,6 @@ mod tests {
 
     #[test]
     fn claude_account_pending_prefix_collision_holds_within_and_across_members() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let one = "0123456789abcdef".to_string() + &"1".repeat(48);
         let two = "0123456789abcdef".to_string() + &"2".repeat(48);
         assert!(ClaudeAccountRequestSet::from_full_hashes(&BTreeSet::from([
@@ -69894,8 +69394,6 @@ mod tests {
 
     #[test]
     fn claude_account_pending_v2_old_fingerprint_is_unknown_and_collision_revokes_family_proof() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -69975,8 +69473,6 @@ mod tests {
 
     #[test]
     fn claude_account_pending_old_windows_survive_held_incomplete_and_retry_save() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -70200,48 +69696,36 @@ mod tests {
 
     #[test]
     fn claude_account_pending_current_held_keeps_older_unfinished_window() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         d2_assert_current_window_blocks_older_unfinished_retirement("held");
     }
 
     #[test]
     fn claude_account_pending_current_withheld_keeps_older_unfinished_window() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         d2_assert_current_window_blocks_older_unfinished_retirement("withheld");
     }
 
     #[test]
     fn claude_account_pending_current_retry_pending_keeps_older_unfinished_window() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         d2_assert_current_window_blocks_older_unfinished_retirement("retry_pending");
     }
 
     #[test]
     fn claude_account_pending_current_identity_incomplete_keeps_older_unfinished_window() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         d2_assert_current_window_blocks_older_unfinished_retirement("identity_incomplete");
     }
 
     #[test]
     fn claude_account_pending_current_census_incomplete_keeps_older_unfinished_window() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         d2_assert_current_window_blocks_older_unfinished_retirement("census_incomplete");
     }
 
     #[test]
     fn claude_account_pending_local_resources_count_retained_bytes_and_omit_zero() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use crate::local_resource_diagnostics::{CollectionCounts, Probe};
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -70305,8 +69789,6 @@ mod tests {
 
     #[test]
     fn claude_account_pending_new_identity_cannot_retire_using_prior_revision_acks() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -70360,8 +69842,6 @@ mod tests {
 
     #[test]
     fn claude_account_pending_accepted_singleton_and_completed_owned_start_do_not_grow() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 4]);
@@ -70467,8 +69947,6 @@ mod tests {
 
     #[test]
     fn claude_account_pending_root_only_windows_and_cross_window_members_settle() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -70549,8 +70027,6 @@ mod tests {
 
     #[test]
     fn claude_account_pending_disappearance_and_empty_members_respect_partial_checkpoints() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         for removal in ["guarded", "bounded", "empty"] {
             let empty = removal == "empty";
@@ -70670,8 +70146,6 @@ mod tests {
 
     #[test]
     fn claude_account_pending_disappearance_without_newer_live_identity_retains_old_window() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let mut index = d2_family_index(&dir, &root);
@@ -70713,8 +70187,6 @@ mod tests {
 
     #[test]
     fn claude_account_pending_new_unaccepted_child_omission_is_not_disappearance() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -70796,8 +70268,6 @@ mod tests {
 
     #[test]
     fn claude_account_pending_v2_keeps_legacy_reader_required_shape() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         #[derive(Deserialize)]
         struct LegacyPending {
             census_window_end: String,
@@ -70834,8 +70304,6 @@ mod tests {
 
     #[test]
     fn claude_account_pending_m4_synthetic_serialized_size() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let families = 6_398usize;
         let requests = 347_187usize;
         let mut legacy = serde_json::Map::new();
@@ -70878,8 +70346,6 @@ mod tests {
 
     #[test]
     fn claude_account_family_legacy_witness_schedules_reparse_and_rebuilds() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (root, parent, items) = claude_account_family_fixture();
         let account_hash = "a".repeat(64);
@@ -70975,8 +70441,6 @@ mod tests {
 
     #[test]
     fn claude_account_hash_converges_family_split_across_census_pages() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (root, parent, mut items) = claude_account_family_fixture();
         let account_hash = "a".repeat(64);
@@ -71059,8 +70523,6 @@ mod tests {
 
     #[test]
     fn claude_account_hash_refuses_incomplete_or_conflicting_family_evidence() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (root, parent, items) = claude_account_family_fixture();
         let assert_unknown = |items: &[SnapshotItem]| {
             assert!(items.iter().all(|item| item
@@ -71139,8 +70601,6 @@ mod tests {
 
     #[test]
     fn launched_session_stays_out_of_its_starters_account_family() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let parent_hash = "a".repeat(64);
         let launched_hash = "b".repeat(64);
@@ -71266,8 +70726,6 @@ mod tests {
 
     #[test]
     fn claude_subagent_transcript_ingests_as_its_own_sidechain_session() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Claude Code writes Task-tool subagents to
         // `<projectDir>/<parentSessionId>/subagents/agent-<agentId>.jsonl`, and
         // every line is stamped with the PARENT `sessionId`. The parser must
@@ -71319,8 +70777,6 @@ mod tests {
 
     #[test]
     fn claude_top_level_transcript_keeps_raw_session_id() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // The human-started top-level transcript lives at `<sessionId>.jsonl`,
         // NOT under a `subagents/` directory. Even when it carries an inline
         // sidechain line (older Claude versions inlined them), its
@@ -71350,8 +70806,6 @@ mod tests {
 
     #[test]
     fn claude_subagent_source_session_id_discriminates_by_subagents_ancestor() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Helper contract (v20): a transcript is a subagent transcript when ANY
         // ancestor directory is `subagents`, and the parent session id comes
         // from the PATH -- the directory whose child is `subagents` -- never
@@ -71428,8 +70882,6 @@ mod tests {
 
     #[test]
     fn claude_workflow_subagent_rekeys_off_its_parent_and_carries_tree_facts() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // The live bug: a Workflow-tool agent transcript nested under
         // `subagents/workflows/<wfId>/` carries the PARENT's sessionId on every
         // line, so before v20 it uploaded a snapshot claiming to BE the parent
@@ -71502,8 +70954,6 @@ mod tests {
 
     #[test]
     fn claude_nested_subagent_parent_ref_points_at_the_spawning_agent() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // spawnDepth>1 with a recorded `parentAgentId`: the DIRECT parent is the
         // spawning agent's own re-keyed session, while the root stays the human
         // session so the rollup key is unambiguous.
@@ -71553,8 +71003,6 @@ mod tests {
 
     #[test]
     fn claude_subagent_without_meta_sidecar_degrades_to_path_facts() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // A missing or malformed sidecar must leave the derived facts absent and
         // never drop the session.
         let root = temp_dir("claude-subagent-no-meta");
@@ -71613,8 +71061,6 @@ mod tests {
 
     #[test]
     fn claude_workflow_journal_is_never_collected_or_emitted() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // `journal.jsonl` has no usage rows and no `sessionId`, and its stem
         // collides across the workflow directories of one parent session. It
         // must be dropped at collection time and refused by the parser.
@@ -71716,8 +71162,6 @@ mod tests {
     #[test]
     #[ignore = "reads the developer's real ~/.claude/projects tree"]
     fn claude_real_tree_rekey_audit() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
             eprintln!("no HOME; skipping");
             return;
@@ -71883,8 +71327,6 @@ mod tests {
 
     #[test]
     fn launcher_event_binds_a_worker_transcript_to_its_controller_session() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // End to end through the real intake: a launcher drops the event file at
         // spawn, the worker then writes its transcript, and the scan that parses
         // that transcript states the controller edge.
@@ -71970,8 +71412,6 @@ mod tests {
 
     #[test]
     fn provider_native_parent_edge_outranks_a_launch_event_claim() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // A Codex subagent's parent comes from the provider's own spawn graph,
         // and its session id is a plain UUID -- so a launch event CAN name the
         // same session. When it does, the provider owns that family: the launch
@@ -72058,8 +71498,6 @@ mod tests {
 
     #[test]
     fn claude_subagent_fact_names_are_the_agreed_backend_contract() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // These names are a FIXED contract with the backend session-attribution
         // reader (`SessionAttributionField` in
         // backend/app/domain/telemetry/session_attribution.py). The backend enum
@@ -72102,8 +71540,6 @@ mod tests {
 
     #[test]
     fn claude_subagent_facts_fit_the_bounded_payload_budget() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // The budget is a hard byte ceiling over the serialized fact list and
         // one oversized item 422s the whole batch, so the daemon must trim. At
         // ~269 bytes per fact the retired 2 KiB budget fit only seven and
@@ -72192,8 +71628,6 @@ mod tests {
 
     #[test]
     fn claude_subagent_file_stems_are_unique_within_a_parent_session() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // The `<parentSessionId>_<fileStem>` scheme is only collision-free
         // because Claude mints agent ids that are unique across ALL of one
         // parent session's subagent directories. Pin that assumption: the same
@@ -72218,8 +71652,6 @@ mod tests {
 
     #[test]
     fn claude_agent_meta_sidecar_rejects_unsafe_values() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Provider identifiers only. Anything that could smuggle a local path or
         // free text into an attribution fact is dropped, not sanitized.
         let dir = temp_dir("claude-agent-meta-safety");
@@ -72299,8 +71731,6 @@ mod tests {
 
     #[test]
     fn claude_subagent_never_inherits_the_parent_desktop_title() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // The desktop title store is keyed by CLI session id. A subagent
         // transcript's file stem is an agent id, so a lookup would either miss
         // or hand the subagent its parent's title. Both layouts must refuse.
@@ -72353,8 +71783,6 @@ mod tests {
 
     #[test]
     fn claude_workflow_label_titles_workflow_subagent_sessions() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // The prize path: a Workflow agent is named from the run manifest's
         // `workflowProgress[].label`. Parent provenance remains a separate
         // relationship field rather than being duplicated in the child title.
@@ -72445,8 +71873,6 @@ mod tests {
 
     #[test]
     fn claude_task_agent_description_and_agent_type_title_fallbacks() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // A Task-tool agent has no workflow manifest; its sidecar
         // `description` (the 3-8 word task summary) names it, and a sidecar
         // with only `agentType` still yields that as the last-resort label.
@@ -72523,8 +71949,6 @@ mod tests {
 
     #[test]
     fn claude_subagent_first_prompt_never_becomes_title() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // A subagent's "first user prompt" is the injected Task/Workflow prompt
         // BODY. Titles yes, content no: with no label material at all the
         // session stays unnamed rather than falling back to prompt text.
@@ -72594,8 +72018,6 @@ mod tests {
 
     #[test]
     fn safe_claude_agent_display_label_allowlist_and_truncation() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Real observed values survive unchanged.
         for value in [
             "probe:data-model",
@@ -72643,8 +72065,6 @@ mod tests {
 
     #[test]
     fn codex_agent_path_labels_replay_anonymous_production_subagents() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for (agent_path, expected) in [
             ("/root/repair_baseline_test", "repair baseline test"),
             (
@@ -72681,8 +72101,6 @@ mod tests {
 
     #[test]
     fn claude_subagent_sidecar_fingerprint_tracks_naming_material() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-subagent-sidecar-fp");
         let parent_session = "58e9c6bc-c733-4946-b9e4-aa57c707dbf2";
         let session_dir = root.join(parent_session);
@@ -72749,8 +72167,6 @@ mod tests {
 
     #[test]
     fn claude_parser_detects_workflow_orchestration_footprint() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // The Workflow tool (dynamic orchestration, e.g. `ultracode`) leaves a
         // local manifest at `<projectDir>/<sessionId>/workflows/wf_*.json`, a
         // sibling of the `<sessionId>.jsonl` we parse. Presence -> Some(true).
@@ -72782,8 +72198,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_sums_message_usage_and_uses_summary_title() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Parse-stage native hours: gate on, e2::finish_page emits the hours.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let path = temp_file("claude");
@@ -72844,8 +72258,6 @@ mod tests {
 
     #[test]
     fn claude_code_duplicate_content_block_records_count_usage_once() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Claude Code writes one JSONL record per assistant content block. All
         // records of one API response share message.id + requestId and resolve
         // to one terminal usage occurrence.
@@ -72887,8 +72299,6 @@ mod tests {
 
     #[test]
     fn claude_progressive_sidechain_response_uses_terminal_output_and_late_selector() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-progressive-response");
         let parent = "11111111-2222-3333-4444-555555555555";
         let dir = root.join(parent).join("subagents");
@@ -72928,8 +72338,6 @@ mod tests {
 
     #[test]
     fn claude_out_of_order_progressive_response_uses_provider_time() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-progressive-provider-time");
         fs::write(
             &path,
@@ -72981,8 +72389,6 @@ mod tests {
 
     #[test]
     fn claude_mixed_timestamp_progressive_response_preserves_physical_order() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-progressive-mixed-time");
         fs::write(
             &path,
@@ -73019,8 +72425,6 @@ mod tests {
 
     #[test]
     fn claude_response_record_caps_fail_closed_without_unbounded_buffering() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut response = ClaudeResponseObservation::new(
             0,
             UsageTotals::default(),
@@ -73093,8 +72497,6 @@ mod tests {
 
     #[test]
     fn claude_true_chronological_usage_regression_quarantines_the_file() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let root = temp_dir("claude-progressive-conflict");
@@ -73128,8 +72530,6 @@ mod tests {
 
     #[test]
     fn claude_equal_provider_time_usage_conflict_quarantines_the_file() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let root = temp_dir("claude-progressive-equal-time-conflict");
@@ -73164,8 +72564,6 @@ mod tests {
 
     #[test]
     fn claude_explicit_fork_excludes_copied_history_from_every_session_metric() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-explicit-fork");
         let path = root.join("bbbbbbbb-cccc-dddd-eeee-ffffffffffff.jsonl");
         fs::write(
@@ -73205,8 +72603,6 @@ mod tests {
 
     #[test]
     fn claude_malformed_fork_marker_fails_closed_without_confirming_empty() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-malformed-fork-marker");
         let path = root.join("bbbbbbbb-cccc-dddd-eeee-ffffffffffff.jsonl");
         fs::write(
@@ -73235,8 +72631,6 @@ mod tests {
 
     #[test]
     fn claude_explicit_fork_with_zero_owned_usage_is_confirmed_empty() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-explicit-fork-empty");
         let path = root.join("cccccccc-dddd-eeee-ffff-000000000000.jsonl");
         fs::write(
@@ -73265,8 +72659,6 @@ mod tests {
 
     #[test]
     fn claude_fork_of_fork_counts_only_the_leaf_owned_response() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-fork-of-fork");
         fs::write(
             &path,
@@ -73291,8 +72683,6 @@ mod tests {
 
     #[test]
     fn claude_code_distinct_response_ids_count_separately() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-dedup-distinct-ids");
         fs::write(
             &path,
@@ -73322,8 +72712,6 @@ mod tests {
 
     #[test]
     fn claude_code_usage_without_ids_counts_each_line() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // No message.id and no requestId: nothing to dedup on, so identical
         // usage on consecutive lines still counts per line (legacy behavior).
         let path = temp_file("claude-dedup-no-ids");
@@ -73356,8 +72744,6 @@ mod tests {
 
     #[test]
     fn claude_code_single_id_fallbacks_resolve_progressive_responses() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-dedup-single-ids");
         fs::write(
             &path,
@@ -73384,8 +72770,6 @@ mod tests {
 
     #[test]
     fn claude_resume_appends_owned_responses_to_the_same_session_once() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-resume-same-session");
         let first = concat!(
             "{\"timestamp\":\"2026-08-02T12:00:00Z\",\"type\":\"user\",\"sessionId\":\"resume-1\",\"message\":{\"role\":\"user\",\"content\":\"first\"}}\n",
@@ -73439,8 +72823,6 @@ mod tests {
 
     #[test]
     fn claude_code_same_message_id_different_request_id_counts_separately() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Conservative pair-keying: identical message.id under different
         // requestIds is treated as two distinct API responses (e.g. a retry).
         let path = temp_file("claude-dedup-pair-key");
@@ -73472,8 +72854,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_derives_context_posture_watermarks() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Multi-turn transcript: the first counted response with any effective
         // input context (input + cache reads + cache writes) sets the baseline;
         // the running max across counted responses is the peak. An output-only
@@ -73520,8 +72900,6 @@ mod tests {
 
     #[test]
     fn claude_code_context_posture_reads_iterations_when_top_level_is_zero() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Verbatim first assistant record of resumed session
         // d0d65dac-58ed-4efc-98a9-26a455bc2a5f (line 8 of its transcript), the
         // shape that produced a 532x-low baseline. Every top-level prompt field
@@ -73571,8 +72949,6 @@ mod tests {
 
     #[test]
     fn claude_code_context_posture_takes_max_iteration_not_the_sum() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // A response spanning several API calls carries one `iterations[]` entry
         // per call, each with its own prompt. Figures are the real ones from
         // session 2418d953: top level 708,733 (it tracks only one of the calls),
@@ -73615,8 +72991,6 @@ mod tests {
 
     #[test]
     fn claude_code_context_posture_keeps_the_larger_top_level_over_iterations() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // The reverse disagreement, also real (session 58e9c6bc): the top level
         // reports 104,266 while the two iterations report 82,241 and 82,222. The
         // reconciliation is a MAX against the top level, not a replacement of
@@ -73647,8 +73021,6 @@ mod tests {
 
     #[test]
     fn claude_compaction_matching_preserves_greedy_ties_and_curve_order() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let observation =
             |kind, timestamp: &str, response_count_before| ClaudeCompactionObservation {
                 kind,
@@ -73708,8 +73080,6 @@ mod tests {
 
     #[test]
     fn claude_compaction_matching_keeps_invalid_timestamps_and_valid_metrics() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let observation = |kind, timestamp: Option<&str>, pre_tokens| ClaudeCompactionObservation {
             kind,
             timestamp: timestamp.map(str::to_string),
@@ -73761,8 +73131,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_pairs_current_and_legacy_compaction_records() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-compaction-count");
         fs::write(
             &path,
@@ -73836,8 +73204,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_pairs_compaction_summary_through_its_parent_chain() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let item = parse_claude_compaction_fixture(
             "claude-compaction-structural-pair",
             &[
@@ -73890,8 +73256,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_pairs_only_parentless_compaction_summary_by_time() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let item = parse_claude_compaction_fixture(
             "claude-compaction-fallback-pair",
             &[
@@ -73927,8 +73291,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_counts_a_summary_whose_parent_chain_misses_its_boundary() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-compaction-unlinked-parent");
         let lines = [
             "{\"timestamp\":\"2026-10-20T13:00:00Z\",\"sessionId\":\"claude-unlinked\",\"requestId\":\"req_unlinked_1\",\"message\":{\"id\":\"msg_unlinked_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
@@ -73991,8 +73353,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_time_fallback_never_claims_a_linked_summary() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let item = parse_claude_compaction_fixture(
             "claude-compaction-unlinked-beside-linked",
             &[
@@ -74025,8 +73385,6 @@ mod tests {
 
     #[test]
     fn claude_copied_prefix_filter_drops_a_linked_compaction_pair_together() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut item = parse_claude_compaction_fixture(
             "claude-compaction-copied-prefix-pair",
             &[
@@ -74128,8 +73486,6 @@ mod tests {
 
     #[test]
     fn claude_compaction_events_take_owned_sizes_and_trigger() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let lines = [
             claude_sized_request("2026-10-20T10:00:00Z", "req_s1", 100_000),
             // Zero-size requests are never a before or an after.
@@ -74252,8 +73608,6 @@ mod tests {
 
     #[test]
     fn claude_compaction_events_keep_the_newest_64_and_match_timestamps() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let start = OffsetDateTime::parse("2026-10-20T08:00:00Z", &Rfc3339).unwrap();
         let mut lines = Vec::new();
         for index in 0..70_i64 {
@@ -74327,8 +73681,6 @@ mod tests {
 
     #[test]
     fn claude_compaction_observation_keeps_its_size_with_the_trigger() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // The trigger and the two id-less flags sit in existing padding:
         // retained boundaries do not grow (120 B on today's 64-bit targets).
         assert!(std::mem::size_of::<ClaudeCompactionObservation>() <= 120);
@@ -74340,8 +73692,6 @@ mod tests {
 
     #[test]
     fn claude_context_curve_waits_for_complete_local_ownership_census() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let path = temp_file("claude-context-curve-owned");
         fs::write(
@@ -74418,8 +73768,6 @@ mod tests {
 
     #[test]
     fn claude_forked_owned_start_rearms_an_earlier_bounded_page() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let path = temp_file("claude-forked-owned-start-page");
         let source_session_id = path
@@ -74536,8 +73884,6 @@ mod tests {
 
     #[test]
     fn claude_nonforked_owned_start_accepts_minimal_paired_request_evidence() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -74610,8 +73956,6 @@ mod tests {
 
     #[test]
     fn claude_missing_request_pair_remains_truthfully_unresolved() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-missing-pair-owned-start");
         let source_session_id = path
             .file_stem()
@@ -74658,8 +74002,6 @@ mod tests {
 
     #[test]
     fn claude_context_curve_missing_request_identity_fails_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-context-curve-no-request-id");
         fs::write(
             &path,
@@ -74694,8 +74036,6 @@ mod tests {
 
     #[test]
     fn claude_context_curve_duplicate_request_identity_fails_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-context-curve-duplicate-request-id");
         fs::write(
             &path,
@@ -74732,8 +74072,6 @@ mod tests {
 
     #[test]
     fn claude_explicit_fork_duplicate_owned_request_fails_posture_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let root = temp_dir("claude-explicit-fork-duplicate");
         let child_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -75281,8 +74619,6 @@ mod tests {
 
     #[test]
     fn claude_duplicate_request_witness_is_bounded_hashed_and_backward_compatible() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let first = claude_duplicate_request_owner("raw-root", "raw-source-a");
         let second = claude_duplicate_request_owner("raw-root", "raw-source-b");
         assert_eq!(first.root_session_id_hash.len(), 64);
@@ -75324,8 +74660,6 @@ mod tests {
 
     #[test]
     fn claude_context_curve_multi_iteration_response_is_not_request_indexed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-context-curve-multi-iteration");
         fs::write(
             &path,
@@ -75360,8 +74694,6 @@ mod tests {
 
     #[test]
     fn claude_context_curve_missing_predecessor_does_not_own_copied_prefix() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-context-curve-missing-predecessor");
         fs::write(
             &path,
@@ -75416,8 +74748,6 @@ mod tests {
 
     #[test]
     fn claude_fresh_root_without_provider_marker_remains_unresolved() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-context-curve-native-root");
         let root_timestamp = OffsetDateTime::now_utc()
             .format(&Rfc3339)
@@ -75457,8 +74787,6 @@ mod tests {
 
     #[test]
     fn compaction_timeline_keeps_newest_64_for_snapshot_upload() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut timestamps = (0..72)
             .map(|index| {
                 let day = index / 24 + 1;
@@ -75484,8 +74812,6 @@ mod tests {
 
     #[test]
     fn codex_parser_derives_context_posture_watermarks() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Codex reports each response's own usage in `last_token_usage`, so the
         // watermarks come from there. Shapes asserted, in file order:
         //   * turn 1 (22817) sets the first-turn baseline,
@@ -75564,8 +74890,6 @@ mod tests {
 
     #[test]
     fn codex_context_posture_reads_per_turn_usage_not_the_cumulative() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Regression guard for the two ways the cumulative `total_token_usage`
         // misreports per-turn context, both taken from real rollouts:
         //   * the cumulative is a session-wide SUM, so on turn 2 it is 56022
@@ -75620,8 +74944,6 @@ mod tests {
 
     #[test]
     fn codex_sessions_without_per_turn_usage_claim_no_context() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // A rollout whose `token_count` events carry no `last_token_usage`
         // yields no context reading rather than a guess derived from the
         // cumulative. `compaction_count` is still Some(0): the parser DID read
@@ -75666,8 +74988,6 @@ mod tests {
 
     #[test]
     fn codex_context_posture_fields_change_snapshot_fingerprint() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Codex posture joins the fingerprint payload on purpose: that is what
         // re-uploads every already-collected Codex session once, so the backend
         // can backfill posture for history rather than only new sessions.
@@ -75707,8 +75027,6 @@ mod tests {
 
     #[test]
     fn pi_sessions_emit_no_context_posture_fields() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Pi derives no posture, so all three fields stay None and serialize
         // away — and posture must not be a Pi fingerprint dimension, or every
         // Pi session would re-upload on upgrade carrying nothing new.
@@ -75769,8 +75087,6 @@ mod tests {
     /// purpose and re-pin this hash in the same change.
     #[test]
     fn context_posture_component_is_pinned_against_accidental_identity_churn() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut item = valid_v6_batch_request()
             .snapshots
             .into_iter()
@@ -75797,8 +75113,6 @@ mod tests {
     /// witness, and the points must never reach the wire.
     #[test]
     fn compaction_events_and_local_context_points_are_identity_neutral() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut request = valid_v6_batch_request();
         let policy = request.upload_policy;
         let mut item = request.snapshots.remove(0);
@@ -75856,8 +75170,6 @@ mod tests {
 
     #[test]
     fn context_curve_is_hash_neutral_and_deterministically_bounded() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let first = max_fractional_context_curve_fixture();
         let second = max_fractional_context_curve_fixture();
         assert_eq!(first, second);
@@ -75975,8 +75287,6 @@ mod tests {
 
     #[test]
     fn context_curve_wire_is_content_free_and_field_allowlisted() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         fn collect_keys(value: &Value, keys: &mut BTreeSet<String>) {
             match value {
                 Value::Object(object) => {
@@ -76051,8 +75361,6 @@ mod tests {
 
     #[test]
     fn context_curve_yields_to_the_whole_snapshot_item_budget() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut request = valid_v6_batch_request();
         let policy = request.upload_policy;
         let item = &mut request.snapshots[0];
@@ -76168,8 +75476,6 @@ mod tests {
 
     #[test]
     fn context_curve_collection_is_inert_without_server_capability() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("context-curve-capability-gate");
         let path = root.join("rollout-capability-gate.jsonl");
         fs::write(
@@ -76204,8 +75510,6 @@ mod tests {
 
     #[test]
     fn context_curve_fails_closed_on_unsafe_or_unbounded_model_evidence() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let hostile_path = "/Users/operator/private/repository/session.jsonl";
         let hostile = build_context_curve(
             CODEX_SNAPSHOT_PARSER_VERSION,
@@ -76270,8 +75574,6 @@ mod tests {
 
     #[test]
     fn context_curve_fails_closed_without_exact_boundary_adjacency() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let candidates = [1_u64, 2]
             .into_iter()
             .map(|ordinal| ContextCurveCandidatePoint {
@@ -76313,8 +75615,6 @@ mod tests {
 
     #[test]
     fn context_curve_cross_language_golden_is_canonical_and_current() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let point = |timestamp: &str, tokens: u64, model: &str, window: Option<u64>| {
             ContextCurveCandidatePoint {
                 observed_at: Some(timestamp.to_string()),
@@ -76471,8 +75771,6 @@ mod tests {
 
     #[test]
     fn context_curve_requires_exact_durable_entity_ack_proof() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let curve = build_context_curve(
             CODEX_SNAPSHOT_PARSER_VERSION,
             "codex_owned_rollout_occurrences:v1",
@@ -76601,8 +75899,6 @@ mod tests {
 
     #[test]
     fn body_witness_ack_normalization_fixture_is_canonical_and_current() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let curve = build_context_curve(
             CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
             "claude_owned_request_start_proof:v1",
@@ -76774,8 +76070,6 @@ mod tests {
 
     #[test]
     fn cache_physical_record_loss_preserves_usage_and_accepted_observations() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use std::io::Write;
         let root = temp_dir("cache-physical-record-loss");
         let id = "00000000-0000-7000-8000-000000000001";
@@ -76896,8 +76190,6 @@ mod tests {
 
     #[test]
     fn paired_creator_cache_wire_corpus_matches_exact_ack() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // One physical source stream supplies both creator and owned canonical
         // cache requests. No source identity is grafted onto another session.
         let header = codex_creator_header();
@@ -77135,8 +76427,6 @@ mod tests {
 
     #[test]
     fn sampled_audit_diagnostics_distinguish_semantic_only_change() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for missing_previous_semantic in [false, true] {
             let (home, root, mut index) = projection_adoption_fixture("audit-comparison", 1);
             // Adoption intentionally omits previous witnesses. Select the
@@ -77202,8 +76492,6 @@ mod tests {
 
     #[test]
     fn codex_local_diagnostics_distinguish_loader_faults_and_identity_conflicts() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use crate::codex_scan_diagnostics::LoaderReason;
         let home = temp_dir("codex-local-loader-diagnostics");
         let root = home.join("sessions");
@@ -77294,8 +76582,6 @@ mod tests {
 
     #[test]
     fn codex_local_diagnostics_bind_failed_root_and_sqlite_operation() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("codex-local-root-fault");
         let good = home.join("good");
         let bad = home.join("bad");
@@ -77419,8 +76705,6 @@ mod tests {
 
     #[test]
     fn codex_local_diagnostics_trace_successors_empty_and_incomplete_finalization() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for disposition in [FileReason::Complete, FileReason::ReadOrLineLoss] {
             for empty in [false, true] {
                 let (home, root, mut index) = projection_adoption_fixture("codex-local-lineage", 1);
@@ -77503,8 +76787,6 @@ mod tests {
 
     #[test]
     fn codex_local_diagnostics_rotate_only_four_quarantines() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (home, root, mut index) = projection_adoption_fixture("codex-local-rotation", 7);
         let quarantines: BTreeMap<_, _> = index
             .current_snapshot_fingerprints()
@@ -77556,8 +76838,6 @@ mod tests {
 
     #[test]
     fn projection_adoption_reselects_143_current_files_with_equal_body_once() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (home, root, mut index) = projection_adoption_fixture("projection-adoption-143", 143);
         let unchanged = projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
         assert_eq!(
@@ -77627,8 +76907,6 @@ mod tests {
 
     #[test]
     fn projection_adoption_partial_file_never_stamps_while_sibling_progresses() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (home, root, mut index) = projection_adoption_fixture("projection-adoption-partial", 2);
         let partial_key = index.files.keys().next().unwrap().clone();
         let body = String::from_utf8(fs::read(&partial_key).unwrap()).unwrap();
@@ -77673,8 +76951,6 @@ mod tests {
 
     #[test]
     fn projection_adoption_capped_pages_stamp_and_settle_individually() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (home, root, mut index) = projection_adoption_fixture("projection-adoption-pages", 4);
         for page in 1..=2 {
             index.activate_effective_upload_body_witness_revision(1);
@@ -77711,8 +76987,6 @@ mod tests {
 
     #[test]
     fn projection_adoption_held_and_mixed_file_groups_keep_old_revision() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for mixed in [false, true] {
             let (home, root, mut index) =
                 projection_adoption_fixture("projection-adoption-held", 2);
@@ -77768,8 +77042,6 @@ mod tests {
 
     #[test]
     fn projection_adoption_zero_preserves_legacy_and_default_behavior() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (home, root, mut index) = projection_adoption_fixture("projection-adoption-zero", 1);
         assert!(!serde_json::to_string(&index)
             .unwrap()
@@ -78028,8 +77300,6 @@ mod tests {
     /// exact comparison.
     #[test]
     fn claude_context_backfill_compares_revisions_monotonically() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (home, root, index) =
             claude_context_backfill_fixture("claude-context-backfill-monotone", 1);
         let mut newer = index.clone();
@@ -78075,8 +77345,6 @@ mod tests {
 
     #[test]
     fn claude_context_backfill_leaves_codex_and_pi_unselected() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use crate::snapshot_sync::effective_upload_body_witness_revision as revision;
         assert_eq!(
             (
@@ -78246,8 +77514,6 @@ mod tests {
 
     #[test]
     fn claude_context_backfill_quarantined_family_keeps_its_own_retry_gate() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (home, root, mut index) =
             claude_context_backfill_fixture("claude-context-backfill-quarantine", 1);
         let (root_session_id, members) = {
@@ -78326,8 +77592,6 @@ mod tests {
 
     #[test]
     fn claude_context_backfill_skips_sessions_on_the_local_reemission_list() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (home, root, mut index) =
             claude_context_backfill_fixture("claude-context-backfill-exclusions", 3);
         let support = crate::test_scratch::ScratchDir::new("claude-reemission-exclusions");
@@ -78526,8 +77790,6 @@ mod tests {
 
     #[test]
     fn claude_context_backfill_empty_list_installs_the_marker_and_adopts_old_entities() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use claude_reemission_exclusions::with_no_list_cutoff;
         let (home, root, mut index) =
             claude_context_backfill_fixture("claude-context-backfill-empty-list", 2);
@@ -78559,8 +77821,6 @@ mod tests {
 
     #[test]
     fn claude_context_backfill_pauses_with_an_alarm_when_an_installed_list_goes_missing() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use claude_reemission_exclusions::with_no_list_cutoff;
         let (home, root, mut index) =
             claude_context_backfill_fixture("claude-context-backfill-list-missing", 2);
@@ -78674,8 +77934,6 @@ mod tests {
 
     #[test]
     fn body_witness_finalizer_default_wrapper_preserves_bytes_and_noops() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("body-witness-finalizer-default");
         let mut index = ScanIndex::default();
         for (revision, expected_count) in [(1, 1), (2, 0)] {
@@ -78706,8 +77964,6 @@ mod tests {
 
     #[test]
     fn body_witness_finalizer_effective_projection_changes_only_delivery() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("body-witness-finalizer-effective");
         let mut index = ScanIndex::default();
         let mut first = body_witness_finalizer_scan(&root, &mut index, 1);
@@ -78757,8 +78013,6 @@ mod tests {
 
     #[test]
     fn body_witness_finalizer_quarantine_uses_effective_projection() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("body-witness-finalizer-quarantine");
         let mut index = ScanIndex::default();
         let mut first = body_witness_finalizer_scan(&root, &mut index, 1);
@@ -78885,8 +78139,6 @@ mod tests {
 
     #[test]
     fn context_posture_fields_change_snapshot_fingerprint() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // The posture fields are part of the fingerprint payload on purpose
         // (same one-time backfill rationale as `origin`): a daemon that starts
         // deriving them re-uploads every already-collected Claude session once.
@@ -78921,8 +78173,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_prefers_ai_title_rows() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-ai-title");
         fs::write(
             &path,
@@ -79058,8 +78308,6 @@ mod tests {
 
     #[test]
     fn claude_original_carrier_actual_parse_preserves_identity_and_usage() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let metadata = claude_original_carrier_metadata();
         let complete = claude_original_carrier_fixture(&metadata, "");
         let missing =
@@ -79201,8 +78449,6 @@ mod tests {
 
     #[test]
     fn desktop_unknown_inventory_restarts_once_and_flapping_waits_for_retry() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use crate::local_resource_diagnostics::claude_reread::Scope;
         let root = crate::test_scratch::ScratchDir::new("desktop-inventory-backoff");
         let store = root.join("main");
@@ -79266,8 +78512,6 @@ mod tests {
 
     #[test]
     fn desktop_inventory_census_defers_all_transcript_window_io() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use crate::local_resource_diagnostics::claude_reread::Scope;
         let home = crate::test_scratch::ScratchDir::new("desktop-metadata-only-census");
         let projects = home.join(".claude/projects");
@@ -79339,8 +78583,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_sibling_discovery_restarts_paged_census() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = crate::test_scratch::ScratchDir::new("desktop-inventory-pages");
         let projects = home.join(".claude/projects");
         let support = home.join("Library/Application Support");
@@ -79452,8 +78694,6 @@ mod tests {
 
     #[test]
     fn claude_original_carrier_healthy_paged_refresh_keeps_completed_identity() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-original-paged-stability");
         let bucket = root
             .join("123e4567-e89b-12d3-a456-426614174000")
@@ -79572,8 +78812,6 @@ mod tests {
 
     #[test]
     fn claude_original_carrier_census_loss_revisits_consumed_transcript_page() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let record = |id: &str| {
             json!({"timestamp":"2026-09-30T10:00:00Z", "sessionId":id,
             "message":{"id":id,"model":"claude-opus-4-8","usage":{"input_tokens":5,"output_tokens":2}}}).to_string()
@@ -79669,8 +78907,6 @@ mod tests {
 
     #[test]
     fn claude_original_carrier_creation_never_comes_from_retained_activity() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let metadata = claude_original_carrier_metadata();
         for (created, expected) in [
             (Some("2026-09-30T09:00:00Z"), Some("complete")),
@@ -79707,8 +78943,6 @@ mod tests {
 
     #[test]
     fn claude_original_carrier_requires_owned_id_and_tracks_census_recovery() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let metadata = claude_original_carrier_metadata();
         let root = temp_dir("claude-original-no-owned-id");
         let path = root.join("native-session.jsonl");
@@ -79842,8 +79076,6 @@ mod tests {
 
     #[test]
     fn claude_original_carrier_source_generated_wire_corpus() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Released pre-flip bytes built without e2::finish_page, which emits the hours gate on.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -80049,8 +79281,6 @@ mod tests {
 
     #[test]
     fn claude_original_carrier_request_observations_veto_without_creating_identity() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use crate::claude_local_otel::{
             ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin,
             ClaudeIdentityDisposition, ClaudeLocalOtelEvidence, ClaudeRequestIdentityEvidence,
@@ -80145,8 +79375,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_alt_metadata_supplies_native_identity_and_conflicts_fail_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = crate::test_scratch::ScratchDir::new("desktop-alt-native");
         let projects = home.join(".claude/projects");
         let support = home.join("Library/Application Support");
@@ -80261,8 +79489,6 @@ mod tests {
 
     #[test]
     fn finalized_parentless_desktop_child_counts_only_incomplete_emission() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _gate = claude_request_money::e2::GateForTest::off();
         for complete in [false, true] {
             let child = spawn_cli("parentless-count-child");
@@ -80375,8 +79601,6 @@ mod tests {
 
     #[test]
     fn desktop_root_overflow_holds_new_owner_until_complete_discovery() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _gate = claude_request_money::e2::GateForTest::off();
         let home = crate::test_scratch::ScratchDir::new("desktop-discovery-owner");
         let mut index = ScanIndex::default();
@@ -80488,8 +79712,6 @@ mod tests {
 
     #[test]
     fn desktop_entry_cap_and_discovery_error_revoke_proof_during_backoff() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _gate = claude_request_money::e2::GateForTest::off();
         let home = crate::test_scratch::ScratchDir::new("desktop-discovery-backoff");
         let mut index = ScanIndex::default();
@@ -80610,8 +79832,6 @@ mod tests {
 
     #[test]
     fn desktop_partial_native_proof_holds_new_binding_but_keeps_retained_owner() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _gate = claude_request_money::e2::GateForTest::off();
         let complete = claude_original_carrier_metadata();
         let mut accepted = claude_original_carrier_fixture(&complete, "");
@@ -80688,8 +79908,6 @@ mod tests {
 
     #[test]
     fn desktop_sibling_login_cannot_move_an_accepted_owner() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _gate = claude_request_money::e2::GateForTest::off();
         let home = crate::test_scratch::ScratchDir::new("desktop-retained-owner");
         let mut index = ScanIndex::default();
@@ -80772,8 +79990,6 @@ mod tests {
 
     #[test]
     fn desktop_profiles_deduplicate_one_login_and_defer_different_logins() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _gate = claude_request_money::e2::GateForTest::off();
         let home = crate::test_scratch::ScratchDir::new("desktop-account-dedup");
         let mut index = ScanIndex::default();
@@ -80822,8 +80038,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_lineage_resolves_parent_ids_within_each_app() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = crate::test_scratch::ScratchDir::new("desktop-alt-lineage");
         let projects = home.join(".claude/projects");
         let support = home.join("Library/Application Support");
@@ -80886,8 +80100,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_original_identity_preserves_full_native_pair() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let store = Path::new("native-store");
         let account = "123e4567-e89b-12d3-a456-426614174000";
         let org = "123e4567-e89b-12d3-a456-426614174001";
@@ -80931,8 +80143,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_original_identity_retains_import_veto_without_raw_tag() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("claude-original-import-origin");
         let store = home.join("store");
         let path = store
@@ -80973,8 +80183,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_original_identity_distinguishes_same_account_org_conflict() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("claude-original-org-conflict");
         let store = home.join("store");
         let account = "123e4567-e89b-12d3-a456-426614174000";
@@ -81022,8 +80230,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_original_identity_legacy_omission_rearms_carrier_without_identity() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let entry: ClaudeDesktopTitleIndexEntry = serde_json::from_value(serde_json::json!({
             "cli_session_id":"legacy-session", "title":"Title", "user_set":true,
             "account_identifier_hash":"legacy-account-hash"
@@ -81101,8 +80307,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_spawn_lineage_resolves_each_direct_parent() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let entries = [
             desktop_spawn_entry("root", "local_root", None),
             desktop_spawn_entry("mid", "local_mid", Some("local_root")),
@@ -81122,8 +80326,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_spawn_lineage_refuses_ambiguous_and_cyclic_links() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let entries = [
             // Two store files for one child disagree on who started it.
             desktop_spawn_entry("parent-a", "local_a", None),
@@ -81145,8 +80347,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_spawn_lineage_keeps_the_edge_below_an_unresolved_ancestor() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let entries = [
             // P names a parent the store cannot resolve: C -> P is still exact.
             desktop_spawn_entry("p-missing", "local_p_missing", Some("local_gone")),
@@ -81183,8 +80383,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_spawn_lineage_treats_malformed_spawned_from_as_unknown() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut malformed = desktop_spawn_entry("p-bad", "local_p_bad", None);
         malformed.spawned_from_unresolved = true;
         let entries = [
@@ -81198,8 +80396,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_spawn_lineage_refuses_cycles_of_any_length() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let length = 11;
         let entries = (0..length)
             .map(|position| {
@@ -81232,8 +80428,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_spawn_lineage_never_exports_a_non_uuid_transcript_id() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let child = spawn_cli("child");
         let mut entries = vec![
             // A path-valued or malformed `cliSessionId` cannot be anyone's parent.
@@ -81277,8 +80471,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_spawn_lineage_waits_for_a_complete_store_census() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent = spawn_cli("parent");
         let child = spawn_cli("child");
         let mut index = ScanIndex::default();
@@ -81356,8 +80548,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_spawn_lineage_picks_the_transcript_live_when_the_child_was_created() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // One desktop session switched transcripts: old ran 09-09..09-26, new
         // 09-27..09-28. Each store copy names a different `cliSessionId`.
         let entries = [
@@ -81426,8 +80616,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_spawn_lineage_refuses_overlapping_copied_history() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // The later transcript copied the earlier one's history, so both start
         // with the same stamps; only the earlier one's last event separates them.
         let windows = [
@@ -81482,8 +80670,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_spawn_lineage_refuses_a_switched_parent_without_evidence() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let windows = [
             (
                 "old",
@@ -81546,8 +80732,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_spawn_lineage_dates_switched_transcripts_from_the_index() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-desktop-spawn-by-time");
         let project = root.join("-Users-dev-repo");
         fs::create_dir_all(&project).expect("project dir");
@@ -81653,8 +80837,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_spawned_session_emits_starting_session_lineage() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent = "94bd328b-f2a9-4c31-bbfe-e174d41b4310";
         let child = "da1dc804-1c50-4401-8c3c-0898b126772f";
         let (home, transcript_path, projects_root) = claude_desktop_fixture(
@@ -81759,8 +80941,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_spawned_session_with_a_path_cli_session_id_emits_no_lineage() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent = "94bd328b-f2a9-4c31-bbfe-e174d41b4310";
         let child = "da1dc804-1c50-4401-8c3c-0898b126772f";
         // (child store record, parent store record, link expected). Lineage ids
@@ -81850,8 +81030,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_store_title_applies_to_matching_session() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (home, transcript_path, projects_root) = claude_desktop_fixture(
             "claude-desktop-title",
             "11111111-2222-3333-4444-555555555555",
@@ -82117,8 +81295,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_account_identity_fails_closed_across_accounts() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let session_id = "22222222-3333-4444-5555-666666666666";
         let desktop_json = format!(
             "{{\"cliSessionId\":\"{session_id}\",\"title\":\"Shared session\",\"titleSource\":\"auto\"}}"
@@ -82192,8 +81368,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_auto_title_does_not_override_transcript_title() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (home, transcript_path, projects_root) = claude_desktop_fixture(
             "claude-desktop-auto-vs-transcript",
             "s-1",
@@ -82231,8 +81405,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_user_title_overrides_transcript_title() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (home, transcript_path, projects_root) = claude_desktop_fixture(
             "claude-desktop-user-override",
             "s-2",
@@ -82270,8 +81442,6 @@ mod tests {
 
     #[test]
     fn claude_subagent_transcript_never_inherits_parent_desktop_title() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (home, transcript_path, projects_root) = claude_desktop_fixture(
             "claude-desktop-subagent",
             "parent-1",
@@ -82309,8 +81479,6 @@ mod tests {
 
     #[test]
     fn claude_title_metadata_fingerprint_is_content_stable_and_session_scoped() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let (home, _transcript_path, projects_root) = claude_desktop_fixture(
             "claude-desktop-fingerprint",
             "s-3",
@@ -82363,8 +81531,6 @@ mod tests {
 
     #[test]
     fn claude_desktop_store_pages_past_five_thousand_and_resumes_correction() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let session_id = "late-prefix-session";
         let (home, _transcript_path, projects_root) = claude_desktop_fixture(
             "claude-desktop-paged-title",
@@ -82442,8 +81608,6 @@ mod tests {
 
     #[test]
     fn malformed_claude_title_file_preserves_prior_title_and_marks_census_incomplete() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (home, _transcript_path, projects_root) = claude_desktop_fixture(
             "claude-desktop-malformed-retain",
@@ -82583,8 +81747,6 @@ mod tests {
 
     #[test]
     fn claude_title_store_entry_budget_fails_red_without_unbounded_walk() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-title-entry-budget");
         for index in 0..4 {
             fs::write(
@@ -82612,8 +81774,6 @@ mod tests {
 
     #[test]
     fn unreadable_claude_store_directory_marks_sidecar_census_incomplete() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("claude-desktop-unreadable-directory");
         let not_a_directory = root.join("store-file");
         fs::write(&not_a_directory, b"not a directory").expect("write directory impostor");
@@ -82631,8 +81791,6 @@ mod tests {
 
     #[test]
     fn claude_first_prompt_falls_back_when_no_title_exists() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-first-prompt");
         fs::write(
             &path,
@@ -82667,8 +81825,6 @@ mod tests {
 
     #[test]
     fn claude_custom_title_keeps_dated_word_slugs() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for title in [
             "codex-completeness-owner-oct18",
             "daemon-codex-counting-implementation-20261018",
@@ -82693,8 +81849,6 @@ mod tests {
 
     #[test]
     fn claude_custom_title_dated_slugs_survive_parser_normalization() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for title in [
             "codex-completeness-owner-oct18",
             "daemon-codex-counting-implementation-20261018",
@@ -82738,8 +81892,6 @@ mod tests {
 
     #[test]
     fn claude_custom_title_rejects_identifiers_and_secret_shapes() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let titles = [
             "12345678-abcd-1234-abcd-123456789abc".to_string(),
             "rollout-20261018-abc".to_string(),
@@ -82767,8 +81919,6 @@ mod tests {
 
     #[test]
     fn claude_custom_title_relaxation_does_not_change_other_sources() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let title = "codex-completeness-owner-oct18";
         for source in [
             "first_prompt",
@@ -82799,8 +81949,6 @@ mod tests {
 
     #[test]
     fn claude_transcript_custom_title_beats_first_prompt() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-custom-title");
         fs::write(
             &path,
@@ -82829,8 +81977,6 @@ mod tests {
 
     #[test]
     fn claude_transcript_title_beats_first_prompt_fallback() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-first-prompt-vs-summary");
         fs::write(
             &path,
@@ -82859,8 +82005,6 @@ mod tests {
 
     #[test]
     fn claude_code_zero_token_usage_events_drop_from_buckets() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Parse-stage native hours: gate on, e2::finish_page emits the hours.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let path = temp_file("claude-zero-token-activity");
@@ -82900,8 +82044,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_builds_distinct_hourly_usage_buckets() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Parse-stage native hours: gate on, e2::finish_page emits the hours.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let path = temp_file("claude-activity-buckets");
@@ -82943,8 +82085,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_preserves_speed_region_and_batch_selectors() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-selectors");
         fs::write(
             &path,
@@ -82999,8 +82139,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_extracts_ephemeral_cache_creation_split() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-ephemeral");
         fs::write(
             &path,
@@ -83043,8 +82181,6 @@ mod tests {
 
     #[test]
     fn codex_usage_accepts_official_cache_write_input_tokens_alias() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let value = serde_json::json!({
             "total_token_usage": {
                 "input_tokens": 100,
@@ -83062,8 +82198,6 @@ mod tests {
 
     #[test]
     fn codex_usage_accepts_official_openai_input_details_shape() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let value = serde_json::json!({
             "total_token_usage": {
                 "input_tokens": 100,
@@ -83083,8 +82217,6 @@ mod tests {
 
     #[test]
     fn pi_parser_applies_selector_custom_entries_to_following_messages() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("pi-selector");
         fs::write(
             &path,
@@ -83137,8 +82269,6 @@ mod tests {
 
     #[test]
     fn pi_parser_splits_cache_write_1h_from_flat_total() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("pi-cache-write-1h");
         fs::write(
             &path,
@@ -83177,8 +82307,6 @@ mod tests {
 
     #[test]
     fn pi_cost_parser_preserves_partial_and_invalid_field_coverage() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let partial = serde_json::json!({
             "cost": {
                 "total": null,
@@ -83213,8 +82341,6 @@ mod tests {
 
     #[test]
     fn pi_summary_usage_adds_once_after_assistant_in_the_envelope_hour() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for entry_type in ["compaction", "branch_summary"] {
             let path = temp_file(&format!("pi-{entry_type}-usage"));
             let summary = serde_json::json!({
@@ -83263,8 +82389,6 @@ mod tests {
 
     #[test]
     fn pi_usage_entries_use_own_model_provider_and_count_every_kind_and_occurrence() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("pi-usage-entry-kinds");
         let mut fixture = format!(
             "{}\n",
@@ -83306,8 +82430,6 @@ mod tests {
 
     #[test]
     fn pi_entry_only_files_have_usage_coverage_without_false_drops() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for entry_type in ["compaction", "branch_summary", "usage"] {
             let root = temp_dir(&format!("pi-{entry_type}-only"));
             fs::write(
@@ -83341,8 +82463,6 @@ mod tests {
 
     #[test]
     fn pi_entry_usage_invalid_time_and_malformed_usage_are_counted_as_drops() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for entry_type in ["compaction", "branch_summary", "usage"] {
             for (timestamp, usage) in [
                 ("invalid", serde_json::json!({"input": 20})),
@@ -83374,8 +82494,6 @@ mod tests {
 
     #[test]
     fn pi_summary_without_usage_and_error_turn_keep_existing_request_counts() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("pi-summary-without-usage-error-turn");
         let mut fixture = String::new();
         for entry in [
@@ -83415,8 +82533,6 @@ mod tests {
 
     #[test]
     fn pi_parser_sums_legacy_message_end_usage_and_extracts_session_meta() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("pi-basic");
         fs::write(
             &path,
@@ -83499,8 +82615,6 @@ mod tests {
 
     #[test]
     fn pi_usage_overflow_is_counted_and_keeps_the_file_retryable() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("pi-extreme-usage");
         let path = root.join("session.jsonl");
         let first = serde_json::json!({
@@ -83544,8 +82658,6 @@ mod tests {
 
     #[test]
     fn pi_legacy_message_end_prefers_provider_timestamp_over_envelope_time() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("pi-legacy-timestamp-precedence");
         fs::write(
             &path,
@@ -83574,8 +82686,6 @@ mod tests {
 
     #[test]
     fn pi_parser_reads_current_nested_message_shape() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("pi-current-message");
         fs::write(
             &path,
@@ -83619,8 +82729,6 @@ mod tests {
 
     #[test]
     fn pi_parser_dedupes_transitional_message_and_message_end_records() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("pi-current-legacy-dedup");
         fs::write(
             &path,
@@ -83647,8 +82755,6 @@ mod tests {
 
     #[test]
     fn pi_transitional_pair_uses_provider_time_across_hour_boundary() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("pi-provider-time-dedup");
         fs::write(
             &path,
@@ -83678,8 +82784,6 @@ mod tests {
 
     #[test]
     fn pi_reused_response_id_reconciles_every_cross_shape_occurrence() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("pi-reused-response-id-pairs");
         let path = root.join("session.jsonl");
         fs::write(
@@ -83715,8 +82819,6 @@ mod tests {
 
     #[test]
     fn pi_divergent_cross_shape_response_id_quarantines_the_file() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("pi-divergent-response-id");
         let path = root.join("session.jsonl");
         fs::write(
@@ -83751,8 +82853,6 @@ mod tests {
 
     #[test]
     fn pi_unmatched_divergence_after_exact_pair_quarantines_the_file() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("pi-divergent-response-id-after-pair");
         let path = root.join("session.jsonl");
         fs::write(
@@ -83788,8 +82888,6 @@ mod tests {
 
     #[test]
     fn pi_repeated_identical_occurrence_survives_one_compatibility_pair() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("pi-repeated-identical-with-pair");
         fs::write(
             &path,
@@ -83816,8 +82914,6 @@ mod tests {
 
     #[test]
     fn pi_parser_does_not_dedupe_repeated_same_shape_response_ids() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("pi-same-shape-response-id");
         fs::write(
             &path,
@@ -83844,8 +82940,6 @@ mod tests {
 
     #[test]
     fn pi_parser_keeps_identical_usage_without_response_ids_distinct() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("pi-no-id-distinct");
         fs::write(
             &path,
@@ -83872,8 +82966,6 @@ mod tests {
 
     #[test]
     fn pi_timestamp_order_handles_fractional_rfc3339_and_invalid_fallbacks() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         assert!(timestamp_is_before(
             "2026-07-22T08:00:00Z",
             "2026-07-22T08:00:00.500Z"
@@ -83892,8 +82984,6 @@ mod tests {
 
     #[test]
     fn pi_current_shape_scan_populates_manifest_and_settles_idempotently() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("pi-current-manifest");
         let path = root.join("session.jsonl");
         fs::write(
@@ -83940,8 +83030,6 @@ mod tests {
 
     #[test]
     fn pi_scan_settles_the_observed_populated_and_genuine_empty_mix() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         const POPULATED: usize = 426;
         const EMPTY: usize = 30;
         let root = temp_dir("pi-observed-populated-empty-mix");
@@ -84008,8 +83096,6 @@ mod tests {
 
     #[test]
     fn parser_identity_change_that_yields_zero_clears_the_manifest_contribution() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("pi-parser-regression-clears-manifest");
         let path = root.join("session.jsonl");
         fs::write(
@@ -84067,8 +83153,6 @@ mod tests {
 
     #[test]
     fn pi_parser_handles_multi_model_sessions() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("pi-multimodel");
         fs::write(
             &path,
@@ -84102,8 +83186,6 @@ mod tests {
 
     #[test]
     fn pi_parser_returns_none_for_empty_session() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("pi-empty");
         fs::write(
             &path,
@@ -84121,8 +83203,6 @@ mod tests {
 
     #[test]
     fn pi_ms_timestamp_formats_bounded_rfc3339() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Anchor on epoch 0 and a verifiable mid-2024 date.
         assert_eq!(
             bounded_rfc3339_millis(0).as_deref(),
@@ -84144,8 +83224,6 @@ mod tests {
 
     #[test]
     fn snapshot_parser_streaming_guard() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let source = include_str!("snapshots.rs");
         let forbidden_std_call = ["fs::", "read", "_to", "_string"].concat();
         let forbidden_reader_call = [".", "read", "_to", "_string("].concat();
@@ -84155,8 +83233,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_marks_vertex_routing_from_message_id_prefix() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-vertex-routing");
         fs::write(
             &path,
@@ -84194,8 +83270,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_marks_bedrock_routing_from_message_id_prefix() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-bedrock-routing");
         fs::write(
             &path,
@@ -84228,8 +83302,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_marks_anthropic_routing_when_id_has_no_provider_infix() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("claude-anthropic-routing");
         fs::write(
             &path,
@@ -84257,8 +83329,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_splits_mixed_provider_session_into_distinct_rows() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // A single Claude Code JSONL that interleaves Vertex (`msg_vrtx_*`) and
         // first-party Anthropic (`msg_01*`) turns. v6 emits ONE Item per
         // session with one model_usage row per gateway_provider so each maps
@@ -84387,8 +83457,6 @@ mod tests {
 
     #[test]
     fn provider_price_lines_artifact_pins_the_table_for_the_backend_catalog_check() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Regenerate with OTTTO_PROVIDER_PRICE_LINES_OUT=<path>, then copy the
         // file to the backend's tests/fixtures/daemon_contract/.
         let artifact = provider_price_lines_artifact();
@@ -84415,8 +83483,6 @@ mod tests {
 
     #[test]
     fn provider_price_lines_stamp_only_catalog_models_from_the_effective_date() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let now = Some("2026-10-01T00:00:00Z");
         for (model, line) in [
             (
@@ -84496,8 +83562,6 @@ mod tests {
 
     #[test]
     fn codex_usage_splits_per_request_at_the_272k_price_line() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // gpt-6.1-sol: a 300K prompt (mostly cached) bills the whole request
         // long; a prompt exactly at 272K stays short; a pre-effective-date
         // request keeps its unbucketed row.
@@ -84552,8 +83616,6 @@ mod tests {
 
     #[test]
     fn claude_haiku_5_5_uses_its_100k_price_line_and_only_catalog_flat_models_keep_200k() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Per request, before hourly aggregation: Haiku 5.5 at 100K stays
         // short, 150K and 200K are long; Opus at 150K stays short (200K
         // analysis line); Haiku 4.5 has no catalog line and no bucket.
@@ -84612,8 +83674,6 @@ mod tests {
 
     #[test]
     fn claude_code_parser_splits_long_and_short_context_into_distinct_rows() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Parse-stage native hours: gate on, e2::finish_page emits the hours.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         // One first-party Anthropic session (same model, same gateway, same
@@ -84716,8 +83776,6 @@ mod tests {
 
     #[test]
     fn codex_parser_extracts_pro_subscription_product_from_rate_limits() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-pro-plan");
         // Pro plan fixture mirrors rons's empirical 2026-05-21 personal session.
         fs::write(
@@ -84751,8 +83809,6 @@ mod tests {
 
     #[test]
     fn codex_parser_extracts_team_subscription_product_distinct_from_pro() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-team-plan");
         // Team plan fixture mirrors rons's empirical 2026-05-27 Acme session.
         fs::write(
@@ -84781,8 +83837,6 @@ mod tests {
 
     #[test]
     fn codex_pro_and_team_subscription_products_produce_distinct_fingerprints() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Sanity check: pro and team plans produce distinct row-level
         // subscription_product values and distinct snapshot fingerprints
         // across two separate sessions.
@@ -84828,8 +83882,6 @@ mod tests {
 
     #[test]
     fn pi_parser_emits_one_row_per_gateway_in_multi_provider_session() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Pi can route per-turn to different providers within a single
         // session. v6 emits ONE Item with one model_usage row per gateway.
         let path = temp_file("pi-multi-provider");
@@ -84888,8 +83940,6 @@ mod tests {
 
     #[test]
     fn detect_claude_gateway_provider_recognizes_known_prefixes() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         assert_eq!(
             detect_claude_gateway_provider(&serde_json::json!({
                 "message": { "id": "msg_vrtx_01E8CZoVChX5VsRneeXge7Xn" }
@@ -85148,8 +84198,6 @@ mod tests {
 
     #[test]
     fn codex_legacy_full_fork_excludes_inherited_usage_activity_and_posture() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let values = vec![
             json!({
                 "timestamp":"2026-08-02T06:00:00Z", "type":"session_meta",
@@ -85261,8 +84309,6 @@ mod tests {
 
     #[test]
     fn codex_legacy_none_and_recent_forks_have_distinct_boundaries() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let none_path = write_codex_test_values(
             "codex-legacy-none-exclusive",
             &[
@@ -85353,8 +84399,6 @@ mod tests {
 
     #[test]
     fn codex_native_ordinal_boundary_is_exact_and_incomplete_prefix_fails_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let values = vec![
             json!({"timestamp":"2026-08-02T08:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"child-ordinal","forked_from_id":"root","thread_source":"subagent","history_mode":"paginated","subagent_history_start_ordinal":3}}),
             codex_test_token_line(
@@ -85439,8 +84483,6 @@ mod tests {
 
     #[test]
     fn codex_reordered_header_and_legacy_bootstrap_overflow_fail_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let reordered = write_codex_test_values(
             "codex-reordered-header-fork",
             &[
@@ -85495,8 +84537,6 @@ mod tests {
 
     #[test]
     fn codex_legacy_ordinary_fork_without_parent_prepass_fails_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = write_codex_test_values(
             "codex-ordinary-fork-ambiguous",
             &[
@@ -85519,8 +84559,6 @@ mod tests {
 
     #[test]
     fn codex_legacy_ordinary_fork_and_new_id_resume_use_only_divergent_suffix() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent = vec![
             json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":"legacy-parent","thread_source":"user"}}),
             json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-turn-1","model":"gpt-5.6-sol"}}),
@@ -85582,8 +84620,6 @@ mod tests {
 
     #[test]
     fn codex_parent_prefix_requires_nonempty_match_and_owned_suffix() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent = vec![
             json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":"prefix-parent"}}),
             json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-turn","model":"gpt-5.6-sol"}}),
@@ -85640,8 +84676,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_fresh_checkpoint_copied_from_parent_fails_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let child_id = "01a03e97-49cf-7460-9fd7-f7dbfd2f05e4";
         let parent = vec![
@@ -85687,8 +84721,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_representation_varied_copied_suffix_fails_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent_id = "11111111-1111-4111-8111-111111111111";
         let child_id = "22222222-2222-4222-8222-222222222222";
         let parent_turn = json!({"timestamp":"2026-08-28T10:02:01Z","type":"turn_context","payload":{"turn_id":"parent-turn-2","model":"gpt-5.6-sol"}});
@@ -85749,8 +84781,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_clean_parent_ledger_exhaustion_fails_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent_id = "11111111-1111-4111-8111-111111111111";
         let child_id = "22222222-2222-4222-8222-222222222222";
         let parent_turn = json!({"timestamp":"2026-08-28T10:00:01Z","type":"turn_context","payload":{"turn_id":"parent-turn-0","model":"gpt-5.6-sol"}});
@@ -85802,8 +84832,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_five_native_corpus_shapes_admit_exactly_once() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent_id = "01a03e96-dd4c-7ad1-b516-9c09fea4732b";
         let parent = vec![
             json!({"timestamp":"2026-08-26T15:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
@@ -85876,8 +84904,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_no_marker_internal_parent_omission_never_uses_legacy_prefix() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let child_id = "01a03e98-49cf-7460-9fd7-f7dbfd2f05e4";
         let parent = vec![
@@ -85939,8 +84965,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_native_start_admits_complete_ordinal_stream() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
         let parent = vec![
@@ -86001,8 +85025,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_history_base_requires_the_complete_native_witness() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
         let parent = vec![
@@ -86049,8 +85071,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_projected_extent_must_match_native_eof() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
         let turn_id = "01a03e99-5000-7000-8000-000000000001";
@@ -86098,8 +85118,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_sidecar_path_times_and_byte_extent_cross_check_file() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-created-thread-sidecar-file-cross-check");
         fs::write(&path, b"{}\n").expect("write sidecar file fixture");
         let file_metadata = fs::metadata(&path).expect("stat sidecar file fixture");
@@ -86150,8 +85168,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_native_witness_breaks_fail_the_whole_file_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
         let turn_id = "01a03e99-5000-7000-8000-000000000001";
@@ -86225,8 +85241,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_malformed_crash_tail_is_uncommittable_with_or_without_curve() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
         let turn_id = "01a03e99-5000-7000-8000-000000000001";
@@ -86285,8 +85299,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_state_classification_dodge_fails_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("codex-created-thread-state-classification-dodge");
         let codex_dir = home.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
@@ -86441,8 +85453,6 @@ mod tests {
 
     #[test]
     fn codex_uuid_identity_is_canonical_but_non_uuid_identity_remains_byte_exact() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let lowercase = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
         let mixed = "01A03e99-49CF-7460-9Fd7-F7dBfD2F05E4";
         assert_eq!(resolve_codex_identity(mixed), lowercase);
@@ -86496,8 +85506,6 @@ mod tests {
 
     #[test]
     fn codex_identity_path_state_and_header_resolution_are_identical_for_generated_shapes() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let uuid = "01A03E99-49CF-7460-9FD7-F7DBFD2F05E4";
         let mut shapes = vec![
             uuid.to_string(),
@@ -86564,8 +85572,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_near_and_non_uuid_production_join_fails_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let uuid = "01A03E99-49CF-7460-9FD7-F7DBFD2F05E4";
         let cases = [
             ("35-char", uuid[..35].to_string()),
@@ -86684,8 +85690,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_collision_production_join_is_scoped_and_fail_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("codex-created-thread-collision-production");
         let codex_dir = home.join(".codex");
         let collision_root = codex_dir.join("collision-sessions");
@@ -86811,8 +85815,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_collided_parent_counts_each_direct_child_drop() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("codex-created-thread-collided-parent-children");
         let codex_dir = home.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
@@ -86937,8 +85939,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_unscoped_classification_census_failure_fails_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("codex-created-thread-unscoped-census-failure");
         let codex_dir = home.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
@@ -86990,8 +85990,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_schema_deficiency_is_unscoped_and_additive_growth_is_safe() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let session_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
         let rollout = [
             json!({"timestamp":"2026-08-29T12:00:00Z","type":"session_meta","payload":{"id":session_id,"session_id":session_id,"history_mode":"paginated","history_base":{"cursor":"file-controlled"},"source":"cli"}}),
@@ -87113,8 +86111,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_timestamp_prefixed_legacy_identity_uses_evidence_not_guessing() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("codex-created-thread-timestamp-prefixed-legacy");
         let codex_dir = home.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
@@ -87207,8 +86203,6 @@ mod tests {
 
     #[test]
     fn codex_sidecar_uuid_alias_collision_marks_the_census_incomplete() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("codex-sidecar-uuid-alias-collision");
         let codex_dir = home.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
@@ -87279,8 +86273,6 @@ mod tests {
 
     #[test]
     fn codex_persisted_ownership_maps_canonicalize_uuid_keys_and_reject_conflicts() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let lowercase = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
         let uppercase = lowercase.to_ascii_uppercase();
         let mut index = ScanIndex::default();
@@ -87517,8 +86509,6 @@ mod tests {
 
     #[test]
     fn ownership_created_and_other_parser_sites_keep_their_original_scalar() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let clock = ParentlessClock::now();
         let values = parentless_created_thread_values(&clock, PARENTLESS_CHILD);
         let parsed = parse_parentless_created_thread(
@@ -87553,8 +86543,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_parentless_admits_only_its_own_proven_history() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let clock = ParentlessClock::now();
         let values = parentless_created_thread_values(&clock, PARENTLESS_CHILD);
         let parsed = parse_parentless_created_thread(
@@ -87679,8 +86667,6 @@ mod tests {
     /// subagent stay unretained even where every other reduction conjunct holds.
     #[test]
     fn codex_lineage_lift_keeps_created_ledger_and_pre_trigger_forks_unretained() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         fn reduced(
             path: &Path,
             metadata: &CodexTitleMetadata,
@@ -87867,8 +86853,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_parentless_holds_every_unproven_shape() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let clock = ParentlessClock::now();
         let base = parentless_created_thread_values(&clock, PARENTLESS_CHILD);
         let foreign_turn = "01a02589-5000-7000-8000-000000000009";
@@ -88259,8 +87243,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_parentless_equality_is_not_required_with_a_trusted_parent() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Parented created threads keep their existing proof: a first request
         // whose cumulative total exceeds it is still admitted.
         let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
@@ -88313,8 +87295,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_parentless_lineage_marking_never_removes_a_parent() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let child = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
         let grandchild = "01a03e9a-49cf-7460-9fd7-f7dbfd2f05e4";
@@ -88485,8 +87465,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_parentless_production_lineage_controls() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = temp_dir("codex-parentless-production");
         let codex_dir = home.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
@@ -88641,8 +87619,6 @@ mod tests {
 
     #[test]
     fn codex_created_thread_parentless_segments_stay_held_until_joined_proof() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let clock = ParentlessClock::now();
         let values = parentless_created_thread_values(&clock, PARENTLESS_CHILD);
         for (case, second_member) in [
@@ -88734,8 +87710,6 @@ mod tests {
 
     #[test]
     fn codex_ordinary_paginated_resume_never_acquires_created_thread_admission() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = write_codex_test_values(
             "codex-ordinary-paginated-resume",
             &[
@@ -88773,8 +87747,6 @@ mod tests {
 
     #[test]
     fn codex_ordinary_resume_ignores_generic_edge_and_unrelated_created_state_row() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("codex-ordinary-resume-unrelated-created-state");
         let ordinary_id = "01a03e9c-49cf-7460-9fd7-f7dbfd2f05e4";
         let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
@@ -88840,8 +87812,6 @@ mod tests {
 
     #[test]
     fn codex_truncated_parent_ledger_fails_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let parent_id = "truncated-parent";
         let parent_path = temp_file("codex-truncated-parent");
         let parent_turn = json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"truncated-parent-turn","model":"gpt-5.6-sol"}});
@@ -88895,8 +87865,6 @@ mod tests {
 
     #[test]
     fn codex_parent_prefix_supports_fork_of_fork_and_same_id_resume() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let nested_parent = vec![
             json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":"nested-parent","forked_from_id":"root","thread_source":"user"}}),
             json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"root-inherited","model":"gpt-5.6-sol"}}),
@@ -88983,8 +87951,6 @@ mod tests {
 
     #[test]
     fn codex_parent_prefix_ledger_survives_paged_scan_and_index_restart() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("codex-parent-ledger-paged");
         let child_id = "019fc428-0000-7000-8000-000000000001";
         let parent_id = "019fc428-0000-7000-8000-000000000002";
@@ -89086,8 +88052,6 @@ mod tests {
     /// pass, empty map.
     #[test]
     fn batched_parent_validation_matches_the_per_ledger_fold() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("codex-parent-ledger-batched");
         let current = [
             "019fc428-0000-7000-8000-0000000000ab",
@@ -89194,8 +88158,6 @@ mod tests {
 
     #[test]
     fn codex_changed_parent_invalidates_stale_prefix_before_child_parse() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("codex-parent-ledger-stale");
         let parent_id = "019fc428-0000-7000-8000-000000000011";
         let parent_path = root.join(format!("rollout-2026-08-02T08-00-00-{parent_id}.jsonl"));
@@ -89407,8 +88369,6 @@ mod tests {
 
     #[test]
     fn codex_parent_slot_is_bounded_and_unavailable_census_refuses() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = temp_dir("codex-parent-slot-bound");
         let parent_id = "019fc428-0000-7000-8000-0000000000aa";
         let legacy_id = "legacy-parent";
@@ -89555,8 +88515,6 @@ mod tests {
     /// fresh index does.
     #[test]
     fn l_sb_upgrade_moves_the_blocked_set_to_legacy_once_and_attribution_never_releases_it() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut index = ScanIndex::default();
         index
             .codex_state_only_blocked_session_ids
@@ -89593,8 +88551,6 @@ mod tests {
     /// set to `legacy` again (one jump), and nothing is released.
     #[test]
     fn l_sb_downgrade_and_reupgrade_preserve_every_block() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let fresh = serde_json::to_value(ScanIndex::default()).unwrap();
         for field in [
             "codex_state_only_blocked_by_file",
@@ -89651,8 +88607,6 @@ mod tests {
     /// is released, equal to cold.
     #[test]
     fn l_sb_shared_id_is_released_only_when_its_last_holder_shrinks() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut index = sb_cold(&[]);
         sb_disclose(&mut index, "a", &["x"]);
         sb_disclose(&mut index, "b", &["x"]);
@@ -89679,8 +88633,6 @@ mod tests {
     /// nothing, and its own id is released.
     #[test]
     fn l_sb_zero_usage_cure_legs_release_only_holderless_ids() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for other_names_it in [false, true] {
             let mut index = sb_cold(&[]);
             if other_names_it {
@@ -89728,8 +88680,6 @@ mod tests {
     /// dropped, the other key's kept.
     #[test]
     fn l_sb_boot_unchanged_acceptance_is_holder_checked() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut index = sb_cold(&[]);
         sb_disclose(&mut index, "m1", &["owner"]);
         sb_disclose(&mut index, "m2", &["owner"]);
@@ -89765,8 +88715,6 @@ mod tests {
     /// F is deleted, K still claims X).
     #[test]
     fn l_sb_acceptance_keeps_ids_another_key_still_claims() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut index = sb_cold(&[]);
         sb_disclose(&mut index, "k", &["x", "z"]);
         sb_publish(&mut index, "f", "x");
@@ -89814,8 +88762,6 @@ mod tests {
     /// permitted by D1 and disclosed. A post-upgrade claimant is kept.
     #[test]
     fn l_sb_class_h_legacy_only_claim_is_cleared_by_acceptance_as_on_main() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut index = ScanIndex::default();
         index
             .codex_state_only_blocked_session_ids
@@ -89842,8 +88788,6 @@ mod tests {
     /// releases it.
     #[test]
     fn l_sb_join_release_and_revert_keep_holders() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut index = sb_cold(&[]);
         index
             .codex_state_only_blocked_session_ids
@@ -89891,8 +88835,6 @@ mod tests {
     /// C-1 counts. Only the serialized figure is asserted.
     #[test]
     fn l_sb_by_file_entry_cost_fixture() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let key = |n: usize| {
             format!(
                 "/Users/synthetic-user/.codex/sessions/2026/10/20/rollout-2026-10-20T10-00-00-019fa111-2222-7333-8444-{n:012}.jsonl"
@@ -89948,8 +88890,6 @@ mod tests {
 
     #[test]
     fn codex_north_star_sized_legacy_prefix_emits_only_child_responses() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         const INHERITED_TURNS: u64 = 15_359;
         const OWN_TURNS: u64 = 156;
         const OWN_INPUT: u64 = 20_681_755;
@@ -90011,8 +88951,6 @@ mod tests {
 
     #[test]
     fn codex_cumulative_split_across_plan_window_rollover_buckets_correctly() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Regression: a single Codex session that crosses a `secondary.resets_at`
         // day-boundary must not double-count the cumulative. Cumulative
         // 100/40 → 130/55 is monotonic, so no session restart; the delta is
@@ -90066,8 +89004,6 @@ mod tests {
 
     #[test]
     fn codex_cumulative_restart_keeps_prior_epoch_and_adds_restarted_epoch() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-cumulative-restart");
         fs::write(
             &path,
@@ -90108,8 +89044,6 @@ mod tests {
 
     #[test]
     fn codex_last_usage_remains_exact_across_cumulative_reset() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = write_codex_test_values(
             "codex-last-usage-reset",
             &[
@@ -90147,8 +89081,6 @@ mod tests {
 
     #[test]
     fn codex_exact_usage_event_dedup_does_not_drop_equal_total_restart() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let first = codex_test_token_line(
             "2026-06-01T03:01:00Z",
             None,
@@ -90189,8 +89121,6 @@ mod tests {
 
     #[test]
     fn codex_fractional_timestamps_keep_chronological_lifecycle_and_bucket_extrema() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let path = temp_file("codex-fractional-timestamp-order");
         fs::write(
             &path,
@@ -90237,8 +89167,6 @@ mod tests {
 
     #[test]
     fn pi_unlabeled_turn_lands_in_distinct_row_from_labeled_turn() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Regression: a Pi turn that omits gatewayProvider must NOT inherit
         // the gateway_provider key from a prior labeled turn into its row
         // identity. The unlabeled turn becomes a row with gateway_provider=None
@@ -90281,8 +89209,6 @@ mod tests {
 
     #[test]
     fn v6_snapshot_batch_matches_backend_contract() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Golden daemon<->backend contract guard. Companion to the backend's
         // backend/tests/unit/test_daemon_snapshot_contract.py (master 6fa4deeff),
         // which validates the canonical daemon payload (generated from THIS
@@ -90728,8 +89654,6 @@ mod tests {
 
     #[test]
     fn v6_snapshot_preflight_rejects_missing_usage_buckets() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut request = valid_v6_batch_request();
         request.snapshots[0].usage_buckets.clear();
 
@@ -90740,8 +89664,6 @@ mod tests {
 
     #[test]
     fn v6_snapshot_preflight_rejects_oversized_compaction_timeline() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut request = valid_v6_batch_request();
         request.snapshots[0].compaction_timestamps =
             vec!["2026-07-20T12:00:00Z".to_string(); MAX_COMPACTION_TIMESTAMPS + 1];
@@ -90756,8 +89678,6 @@ mod tests {
 
     #[test]
     fn v6_snapshot_preflight_rejects_oversized_compaction_events() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut request = valid_v6_batch_request();
         request.snapshots[0].compaction_events = vec![
             SnapshotCompactionEvent {
@@ -90776,8 +89696,6 @@ mod tests {
 
     #[test]
     fn v6_snapshot_preflight_rejects_available_curve_for_state_only_codex() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut request = valid_v6_batch_request();
         request.source = SnapshotSource::Codex.api_slug().to_string();
         let item = &mut request.snapshots[0];
@@ -90803,8 +89721,6 @@ mod tests {
 
     #[test]
     fn v6_snapshot_preflight_rejects_bucket_total_mismatch() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut request = valid_v6_batch_request();
         request.snapshots[0].usage_buckets[0].model_usage[0].input_tokens = 99;
 
@@ -90815,8 +89731,6 @@ mod tests {
 
     #[test]
     fn v6_snapshot_preflight_rejects_wire_counter_overflow() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut request = valid_v6_batch_request();
         request.snapshots[0].usage_buckets[0].model_usage[0].input_tokens = u64::MAX;
         let mut second_bucket = request.snapshots[0].usage_buckets[0].clone();
@@ -90831,8 +89745,6 @@ mod tests {
 
     #[test]
     fn v6_snapshot_preflight_rejects_top_level_row_mismatch() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut request = valid_v6_batch_request();
         request.snapshots[0].model_usage[0].gateway_provider = Some("anthropic".to_string());
 
@@ -90843,8 +89755,6 @@ mod tests {
 
     #[test]
     fn codex_explicit_creator_negative_does_not_inherit_home_or_cached_owner() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let home = PathBuf::from("/synthetic/codex-negative");
         let binding = crate::agent_status::CodexHomeBinding {
             home: home.clone(),
@@ -90907,8 +89817,6 @@ mod tests {
 
     #[test]
     fn session_owner_binding_survives_login_switch_and_missing_evidence() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use crate::agent_status::CodexHomeBinding;
 
         let home_a = PathBuf::from("/synthetic/codex-a");
@@ -91092,8 +90000,6 @@ mod tests {
 
     #[test]
     fn claude_incomplete_revision_defers_without_forgetting_verified_owner() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut index = ScanIndex::default();
         let mut item = valid_v6_batch_request().snapshots.remove(0);
         set_session_account_hash(&mut item, Some("verified-account"));
@@ -91168,8 +90074,6 @@ mod tests {
 
     #[test]
     fn codex_creator_parallel_fixtures_keep_their_own_identity() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let start = std::sync::Barrier::new(8);
         std::thread::scope(|scope| {
             let handles = (0..8)
@@ -91229,8 +90133,6 @@ mod tests {
 
     #[test]
     fn codex_child_own_creator_survives_native_history_and_reaches_upload() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut child = codex_child_creator_header();
         let id = child["payload"]["id"].as_str().unwrap().to_string();
         let parent_id = child["payload"]["session_id"].as_str().unwrap().to_string();
@@ -91373,8 +90275,6 @@ mod tests {
 
     #[test]
     fn codex_fork_copied_header_exception_requires_inherited_declared_parent() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut child = codex_child_creator_header();
         child["payload"]["forked_from_id"] = child["payload"]["session_id"].clone();
         child["payload"]["history_mode"] = json!("paginated");
@@ -91420,8 +90320,6 @@ mod tests {
 
     #[test]
     fn codex_depth_two_root_locator_requires_native_structure_for_both_callers() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut header = codex_child_creator_header();
         let id = header["payload"]["id"].as_str().unwrap().to_string();
         let root = "019e253c-3333-7000-9000-cccccccccccc";
@@ -91508,8 +90406,6 @@ mod tests {
 
     #[test]
     fn codex_paginated_fork_own_creation_requires_exact_external_boundary() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let header = codex_paginated_creator_fixture();
         let id = header["payload"]["id"].as_str().unwrap();
         let usage = |ordinal| {
@@ -91695,8 +90591,6 @@ mod tests {
 
     #[test]
     fn codex_paginated_fork_incomplete_acquisition_cannot_certify_creator() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let header = codex_paginated_creator_fixture();
         let id = header["payload"]["id"].as_str().unwrap();
         let root = crate::test_scratch::ScratchDir::new("codex-paginated-creator-incomplete");
@@ -91719,8 +90613,6 @@ mod tests {
 
     #[test]
     fn codex_fork_creator_own_header_ordinal_wire_corpus() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut header = codex_child_creator_header();
         header["payload"]["forked_from_id"] = header["payload"]["session_id"].clone();
         header["payload"]["subagent_history_start_ordinal"] = json!(1);
@@ -91893,8 +90785,6 @@ mod tests {
 
     #[test]
     fn codex_child_creator_source_generated_wire_corpus() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let child = codex_child_creator_header();
         let id = child["payload"]["id"].as_str().unwrap();
         let mut missing_parent = child.clone();
@@ -91983,8 +90873,6 @@ mod tests {
 
     #[test]
     fn codex_child_creator_native_parent_locator_keeps_own_original_pair() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         for parent in [
             "019e253c-2222-7000-9000-bbbbbbbbbbbb",
             "019e253c-3333-7000-9000-cccccccccccc",
@@ -92038,8 +90926,6 @@ mod tests {
 
     #[test]
     fn codex_child_creator_parent_locator_does_not_relax_other_identity_gates() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let header = codex_child_creator_header();
         let id = header["payload"]["id"].as_str().unwrap();
         for pointer in [
@@ -92109,8 +90995,6 @@ mod tests {
 
     #[test]
     fn codex_creator_header_uses_proved_provider_namespace_without_billing_changes() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let header = codex_creator_header();
         let item = codex_creator_item(
             std::slice::from_ref(&header),
@@ -92179,8 +91063,6 @@ mod tests {
 
     #[test]
     fn codex_creator_header_copied_parent_and_conflicts_fail_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let header = codex_creator_header();
         let id = header["payload"]["id"].as_str().unwrap();
         let copied = codex_creator_item(
@@ -92212,8 +91094,6 @@ mod tests {
 
     #[test]
     fn codex_creator_header_missing_malformed_and_time_fail_closed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let header = codex_creator_header();
         let id = header["payload"]["id"].as_str().unwrap();
         for (key, value) in [
@@ -92247,8 +91127,6 @@ mod tests {
 
     #[test]
     fn codex_creator_header_unread_physical_prefix_cannot_certify_creation() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let header = codex_creator_header();
         let root = temp_dir("codex-creator-malformed-prefix");
         let id = header["payload"]["id"].as_str().unwrap();
@@ -92272,8 +91150,6 @@ mod tests {
 
     #[test]
     fn codex_creator_evidence_body_corrections_upload_once_and_preserve_existing_owner() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let header = codex_creator_header();
         let evidence = codex_creator_header_evidence(&header, &header["payload"]).unwrap();
         let root = temp_dir("codex-creator-noop");
@@ -92341,8 +91217,6 @@ mod tests {
 
     #[test]
     fn codex_creator_upload_privacy_and_exact_ack_preserve_hashes_only() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let header = codex_creator_header();
         let mut request = valid_v6_batch_request();
         request.source = "codex".into();
@@ -92434,8 +91308,6 @@ mod tests {
 
     #[test]
     fn session_usage_upload_body_contains_only_account_hashes() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut request = valid_v6_batch_request();
         let raw_account = "raw-account-123";
         set_session_account_hash(&mut request.snapshots[0], Some(raw_account));
@@ -92594,8 +91466,6 @@ mod tests {
 
     #[test]
     fn snapshot_preflight_enforces_item_and_batch_wire_byte_caps() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let source = SnapshotSource::ClaudeCode;
         let mut oversized_item = valid_v6_batch_request();
         oversized_item.snapshots[0].session_display_name =
@@ -92623,8 +91493,6 @@ mod tests {
 
     #[test]
     fn semantic_envelope_cross_language_golden_covers_all_valid_policies() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut base = valid_v6_batch_request()
             .snapshots
             .into_iter()
@@ -92760,8 +91628,6 @@ mod tests {
 
     #[test]
     fn content_hash_ignores_scan_state_parser_provenance_and_display_policy() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // The exclusion list from the identity contract, one mutation each. Any
         // of these changing `content_hash` would re-mint every session's
         // identity on a scan, a parser bump, or a privacy toggle.
@@ -92903,8 +91769,6 @@ mod tests {
 
     #[test]
     fn revision_v2_ignores_retry_clock_and_unrelated_inventory_but_binds_entity_witness() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let source = SnapshotSource::Codex;
         let policy = SnapshotUploadPolicy::default();
         let mut base = valid_v6_batch_request()
@@ -92933,8 +91797,6 @@ mod tests {
 
     #[test]
     fn revision_v2_projection_is_explicit_non_recursive_and_version_sensitive() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let source = SnapshotSource::Codex;
         let policy = SnapshotUploadPolicy::default();
         let item = valid_v6_batch_request()
@@ -92988,8 +91850,6 @@ mod tests {
 
     #[test]
     fn content_hash_moves_with_every_policy_neutral_component() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let source = SnapshotSource::ClaudeCode;
         let base = valid_v6_batch_request()
             .snapshots
@@ -93063,8 +91923,6 @@ mod tests {
 
     #[test]
     fn fenced_census_aggregates_cover_protected_predicates_without_mutation() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let receipt: codex_file_join::AppliedTierReceipt = serde_json::from_value(json!({
             "version": 1, "derivation": "PRIVATE_DERIVATION", "scope": "PRIVATE_SCOPE",
             "records": 1, "prefix_digest": "PRIVATE_DIGEST", "tiers": {}
@@ -93117,8 +91975,6 @@ mod tests {
 
     #[test]
     fn fenced_census_aggregate_caps_and_absent_traversal_stay_unknown() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut index = ScanIndex::default();
         let empty = index.local_codex_census_aggregates();
         assert!(!empty.traversal_present);
@@ -93147,8 +92003,6 @@ mod tests {
     #[test]
     #[ignore = "bounded synthetic aggregate allocation and latency measurement"]
     fn fenced_census_aggregate_native_measurement() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut index = ScanIndex::default();
         let mut traversal = terminal_unhealthy_traversal("private".into());
         let mut entry = manifest_index_entry(None);
@@ -93177,8 +92031,6 @@ mod tests {
 
     #[test]
     fn committable_subset_commits_only_what_the_server_holds() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut committed = ScanIndex::default();
         committed.files.insert(
             "unchanged.jsonl".to_string(),
@@ -93374,8 +92226,6 @@ mod tests {
 
     #[test]
     fn restoration_diagnostics_treat_entity_decode_holds_as_held() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use crate::local_resource_diagnostics::claude_reread::Scope;
         let key = "/opaque/entity-decode-held.jsonl".to_string();
         let head = "a".repeat(64);
@@ -93414,8 +92264,6 @@ mod tests {
 
     #[test]
     fn partial_commit_diagnostics_split_restoration_without_changing_saved_entries() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use crate::local_resource_diagnostics::claude_reread::{Counts, Scope};
         let mut previous = ScanIndex::default();
         for (key, empty) in [
@@ -93494,8 +92342,6 @@ mod tests {
 
     #[test]
     fn partial_commit_preserves_rearm_debt_without_accepting_held_revision() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let key = "/opaque/rearmed.jsonl".to_string();
         let mut previous = ScanIndex::default();
         let mut entry = manifest_index_entry(Some("old-entity"));
@@ -93558,8 +92404,6 @@ mod tests {
     /// Claude family hold keeps its own earlier gate.
     #[test]
     fn reason_reoffer_lease_reparses_unchanged_file_but_never_bypasses_a_family_hold() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let root = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5";
         let key = format!("/opaque/{root}.jsonl");
         let mut index = ScanIndex::default();
@@ -93644,8 +92488,6 @@ mod tests {
     /// the view is runtime only, and deferrals count distinct entities.
     #[test]
     fn reason_reoffer_cooldown_defers_only_the_retained_exact_body_retry() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let key = "/opaque/cooldown.jsonl".to_string();
         let mut index = ScanIndex::default();
         index.activate_quarantine_witness(SnapshotSource::ClaudeCode);
@@ -93816,8 +92658,6 @@ mod tests {
 
     #[test]
     fn partial_commit_reparses_unchanged_rearmed_file_after_held_sibling() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let key = "/opaque/rearmed.jsonl".to_string();
         let mut previous = ScanIndex::default();
         let mut entry = manifest_index_entry(Some("old-entity"));
@@ -93880,8 +92720,6 @@ mod tests {
 
     #[test]
     fn partial_commit_preserves_old_upload_context_and_forces_full_policy_reparse() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut previous = ScanIndex {
             upload_context_fingerprint: Some("context-a".to_string()),
             ..ScanIndex::default()
@@ -93938,8 +92776,6 @@ mod tests {
 
     #[test]
     fn committable_subset_applies_the_same_rule_to_codex_state_only_entities() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut committed = ScanIndex::default();
         committed
             .codex_state_only_snapshot_fingerprints
@@ -93980,8 +92816,6 @@ mod tests {
 
     #[test]
     fn committable_subset_uses_exact_multi_entity_set_and_preserves_quarantine() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let accepted = "a".repeat(64);
         let quarantined = "b".repeat(64);
         let mut scanned = ScanIndex::default();
@@ -94025,8 +92859,6 @@ mod tests {
 
     #[test]
     fn scan_index_manifest_counts_entities_and_folds_their_fingerprints() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut index = ScanIndex::default();
         index
             .files
@@ -94065,8 +92897,6 @@ mod tests {
 
     #[test]
     fn snapshot_manifest_v2_matches_python_golden_byte_for_byte() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let golden: Value = serde_json::from_str(include_str!(
             "../../../fixtures/snapshot-audit/snapshot-manifest-v2-golden.json"
         ))
@@ -94095,8 +92925,6 @@ mod tests {
 
     #[test]
     fn snapshot_manifest_v2_omits_explicit_metadata_only_activity() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let golden: Value = serde_json::from_str(include_str!(
             "../../../fixtures/snapshot-audit/snapshot-manifest-v2-metadata-only-golden.json"
         ))
@@ -94131,8 +92959,6 @@ mod tests {
 
     #[test]
     fn snapshot_manifest_v2_uses_semantic_half_open_window_not_file_mtime() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let inside_start = "a".repeat(64);
         let inside_late_sidecar = "b".repeat(64);
         let excluded_end = "c".repeat(64);
@@ -94205,8 +93031,6 @@ mod tests {
 
     #[test]
     fn scan_index_manifest_ignores_paths_and_insertion_order() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // The fold is over fingerprints only. That is what makes it something
         // the server can recompute — it has the fingerprints and never sees a
         // local path — and it is also why no path can leak through the hash.
@@ -94233,8 +93057,6 @@ mod tests {
 
     #[test]
     fn scan_index_manifest_is_scoped_to_its_source_and_moves_with_content() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut index = ScanIndex::default();
         index
             .files
@@ -94257,8 +93079,6 @@ mod tests {
 
     #[test]
     fn scan_index_manifest_length_prefixes_defeat_fingerprint_splitting() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Two entities "aa"+"bb" and one entity "aabb" are different sets, so a
         // bare concatenation would be a real collision, not a theoretical one.
         let mut split = ScanIndex::default();
@@ -94281,8 +93101,6 @@ mod tests {
 
     #[test]
     fn batch_request_carries_the_client_report_with_its_zeros() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let request = valid_v6_batch_request();
         let value = serde_json::to_value(&request).expect("serialize batch");
         let report = &value["client_report"];
@@ -94307,8 +93125,6 @@ mod tests {
 
     #[test]
     fn wire_envelope_carries_the_content_hash_and_its_epoch() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let request = valid_v6_batch_request();
         let value = serde_json::to_value(&request).expect("serialize batch");
         let envelope = &value["snapshots"][0]["semantic_envelope"];
@@ -94320,8 +93136,6 @@ mod tests {
 
     #[test]
     fn legacy_reconcile_wire_uses_explicit_head_cas_bootstrap_without_a_sibling_token() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let request = valid_v6_batch_request();
         let ordinary = serde_json::to_value(&request).expect("serialize ordinary batch");
         let reconcile = serde_json::to_value(request.wire_with_head_cas())
@@ -94344,8 +93158,6 @@ mod tests {
 
     #[test]
     fn content_identity_body_stays_canonicalizable() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         // Guards the `expect` inside `snapshot_content_hash`: if a future field
         // brings a fractional number into the identity body, this fails here
         // instead of panicking on a customer's machine.
@@ -94399,8 +93211,6 @@ mod tests {
     /// covering every current revision, no sweep cursor, empty pending set.
     #[test]
     fn pre_ledger_accepted_set_is_not_sealed_by_finish_without_the_bounded_sweep() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let accepted = "a".repeat(64);
         let sibling = "b".repeat(64);
         let mut index = pre_ledger_index_with_accepted(ScanIndex {
@@ -94444,8 +93254,6 @@ mod tests {
     /// revision rather than sealing it.
     #[test]
     fn pre_ledger_accepted_set_is_reopened_by_prepare_instead_of_sealed() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let accepted = "a".repeat(64);
         let sibling = "b".repeat(64);
         let mut index = pre_ledger_index_with_accepted(ScanIndex {
@@ -94506,8 +93314,6 @@ mod tests {
     /// has settled every page.
     #[test]
     fn reopened_pre_ledger_sweep_terminates_and_seals_after_the_server_settles() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let fingerprints = (0..120)
             .map(|value| format!("{value:064x}"))
             .collect::<BTreeSet<_>>();
@@ -94556,8 +93362,6 @@ mod tests {
     /// pass, so the guard must not fire once the cursor is set.
     #[test]
     fn pre_ledger_ledger_already_being_swept_is_not_reopened_again() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let proved = "a".repeat(64);
         let first_pending = "b".repeat(64);
         let second_pending = "c".repeat(64);
@@ -94650,8 +93454,6 @@ mod tests {
     /// or reconciliation still holds it open.
     #[test]
     fn f2_traversal_reset_is_scoped_to_the_terminal_unhealthy_shape() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let retained: [(&str, ScanTraversalCheckpoint); 3] = [
             (
                 "mid-walk and healthy",
@@ -94707,8 +93509,6 @@ mod tests {
     /// while its independent retry is not due, so nothing else would clear it.
     #[test]
     fn f2_traversal_reset_still_happens_for_the_terminal_unhealthy_shape() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut index = traversal_reset_scope_index(traversal_reset_scope_checkpoint(
             VecDeque::new(),
             ScanTraversalCounts {
@@ -94782,8 +93582,6 @@ pub(crate) mod cache_adapter_tests {
     /// Optional bounded replay of sanitized numeric research evidence; source text stays outside the public tree.
     #[test]
     fn cache_research_numeric_adapter_replay() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let Ok(path) = std::env::var("OTTTO_CACHE_RESEARCH_REPLAY") else {
             return;
         };
@@ -94918,8 +93716,6 @@ pub(crate) mod cache_adapter_tests {
     }
     #[test]
     fn cache_claude_owned_fixture_is_independent_of_curve_sampling() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Released pre-flip bytes built without e2::finish_page, which emits the hours gate on.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -94980,8 +93776,6 @@ pub(crate) mod cache_adapter_tests {
     }
     #[test]
     fn cache_generated_wire_fixture_and_witness() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let item = cache_fixture_item();
         assert_eq!(
             item.cache_observations.as_ref().unwrap().operations.len(),
@@ -95004,8 +93798,6 @@ pub(crate) mod cache_adapter_tests {
     /// Export metadata from the already generated production-wire fixtures.
     #[test]
     fn cache_contract_manifest_generated_from_provider_wires() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let output = std::env::var("OTTTO_CACHE_MANIFEST_OUT").ok();
         let mut fixtures = serde_json::Map::new();
         for (provider, env, source, expected_version, normalized) in [
@@ -95081,8 +93873,6 @@ pub(crate) mod cache_adapter_tests {
 
     #[test]
     fn cache_codex_adapter_canonical_records_skip_echoes_and_copied_prefix() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut parser = SnapshotAccumulator::new(SnapshotSource::Codex);
         apply_codex_line(
             &json!({"type":"session_meta","payload":{"id":"session"}}),
@@ -95119,8 +93909,6 @@ pub(crate) mod cache_adapter_tests {
     }
     #[test]
     fn cache_claude_resolved_chunks_preserve_nullable_fields() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut parser = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
         for (index, read) in [90_000, 0, 90_000].into_iter().enumerate() {
             for output in [1, 2] {
@@ -95152,8 +93940,6 @@ pub(crate) mod cache_adapter_tests {
     }
     #[test]
     fn cache_wire_overflow_discloses_and_preserves_prior_on_correction() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let warm = OwnedRequest {
             slot: RequestSlot {
                 request_ref: "A".into(),
@@ -95679,8 +94465,6 @@ mod census_unreadable_tests {
 
     #[test]
     fn unreadable_causes_conserve_pages_and_preserve_health_and_legacy_unknowns() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let causes = [
             UnreadableCause::Metadata,
             UnreadableCause::Directory,
@@ -95724,8 +94508,6 @@ mod census_unreadable_tests {
     /// unknown field). They are counts only, never proof.
     #[test]
     fn parent_unresolvable_counts_persist_additively_and_downgrade() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES;
         let old: ScanTraversalCounts =
             serde_json::from_value(json!({"unreadable_path_count": 2})).unwrap();
@@ -95755,8 +94537,6 @@ mod census_unreadable_tests {
 
     #[test]
     fn unreadable_revalidation_keeps_short_circuit_and_exactly_one_existing_open() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         use std::cell::Cell;
         let calls = Cell::new(0);
         assert!(matches!(
@@ -95790,8 +94570,6 @@ mod census_unreadable_tests {
 
     #[test]
     fn unreadable_legacy_hold_persists_its_existing_event_without_new_public_loss() {
-        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
         let mut index = ScanIndex::default();
         let mut scan = scan_source_roots(
             SnapshotSource::Codex,
