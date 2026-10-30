@@ -26103,7 +26103,7 @@ pub(crate) struct OwnedSourceScan {
     claude_twin_only_family_reparses: BTreeSet<String>,
     /// E7-8a: the families this Claude page's selection touched, for the
     /// count-only per-family census shadow.
-    claude_family_shadow: claude_family_census_shadow::Touched,
+    claude_family_shadow: Option<Box<claude_family_census_shadow::Touched>>,
     identified_candidates: VecDeque<CandidateFile>,
     /// The active file and, while it is a paged cursor job, its slot lease.
     /// A dropped frame returns an intact job to the slot.
@@ -27047,13 +27047,11 @@ impl OwnedSourceScan {
             causes,
             ..ScanCensus::default()
         };
-        let claude_family_shadow = if source == SnapshotSource::ClaudeCode {
-            claude_family_census_shadow::Touched::from_paths(
+        let claude_family_shadow = (source == SnapshotSource::ClaudeCode).then(|| {
+            Box::new(claude_family_census_shadow::Touched::from_paths(
                 pending_paths.iter().map(|pending| pending.path.as_path()),
-            )
-        } else {
-            Default::default()
-        };
+            ))
+        });
         let codex_selected_flags =
             if source == SnapshotSource::Codex || index.file_upload_context_enabled {
                 pending_paths
@@ -31625,9 +31623,7 @@ impl OwnedSourceScan {
                         index,
                         &claude_family_shadow,
                         &pending_finalization,
-                        sampling
-                            .as_ref()
-                            .map_or("", |context| context.namespace.0.as_str()),
+                        &sampling,
                         audit_now,
                     );
                 }
@@ -31779,7 +31775,7 @@ impl OwnedSourceScan {
                     .unwrap_or_default()
                     .saturating_add(index.claude_stale_family_carry.replay.len());
                 let skipped_file_count_due_to_limit =
-                    claude_family_census_shadow::skipped_census_members(index).count();
+                    claude_family_census_shadow::skipped_census_member_count(index);
                 let restart_after_hints =
                     traversal_discovery_done && traversal_healthy && !clean_frozen_generation;
                 let terminal_unhealthy = traversal_discovery_done && !traversal_healthy;
@@ -32604,12 +32600,7 @@ impl OwnedSourceScan {
                     // for the shadow family census. Counts only.
                     if source == SnapshotSource::ClaudeCode && parse_reason.is_none() {
                         claude_family_census_shadow::attest_equality_skip(
-                            index,
-                            &candidate,
-                            audit_now,
-                            sampling
-                                .as_ref()
-                                .map_or("", |context| context.namespace.0.as_str()),
+                            index, &candidate, &sampling, audit_now,
                         );
                     }
                     pending!();

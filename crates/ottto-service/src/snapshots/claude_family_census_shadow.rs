@@ -47,6 +47,9 @@ pub(super) const MAX_ROOT_COUNTS: usize = 16_384;
 pub(super) const MAX_ATTESTATIONS: usize = 16_384;
 /// Page attestations buffered before they merge into the sorted set.
 const ATTESTATION_FLUSH: usize = 1_024;
+/// Equality Skips one page may attest. Later ones run no decision and count
+/// `attest_capped`; their members stay `presence_only`.
+pub(super) const MAX_EQUALITY_ATTESTS_PER_PAGE: u64 = 4_096;
 const OVER_24H_SECONDS: u64 = 24 * 60 * 60;
 
 /// First-match reason an evaluated family is incomplete. The order is the
@@ -163,11 +166,11 @@ impl Touched {
         Self::from_keys(paths.into_iter().map(local_index_key), MAX_TOUCHED_FAMILIES)
     }
 
-    fn from_keys(keys: impl IntoIterator<Item = String>, cap: usize) -> Self {
+    fn from_keys(keys: impl IntoIterator<Item = impl AsRef<str>>, cap: usize) -> Self {
         let mut families = BTreeSet::new();
         let mut over_cap = 0_u64;
         for key in keys {
-            let Some(family) = FamilyRef::of_key(&key) else {
+            let Some(family) = FamilyRef::of_key(key.as_ref()) else {
                 continue;
             };
             if families.contains(&family) {
@@ -230,6 +233,12 @@ pub(super) fn skipped_census_members(
     index: &ScanIndex,
 ) -> impl Iterator<Item = &ScanTraversalPath> + '_ {
     skipped_view(index).map(|skipped| skipped.path)
+}
+
+/// Size of the skipped set, without an iterator in the caller's frame.
+#[inline(never)]
+pub(super) fn skipped_census_member_count(index: &ScanIndex) -> usize {
+    skipped_census_members(index).count()
 }
 
 /// Per-family completion counts. `complete + deferred + Σ incomplete ==
@@ -443,6 +452,8 @@ impl Attestations {
             self.evicted += (merged.len() - MAX_ATTESTATIONS) as u64;
             merged.truncate(MAX_ATTESTATIONS);
         }
+        // `append` may have doubled it; keep the retained bound exact.
+        merged.shrink_to(MAX_ATTESTATIONS);
         self.entries = merged;
     }
 
@@ -490,18 +501,28 @@ pub(super) fn generation_tag(traversal: &ScanTraversalCheckpoint) -> u64 {
 /// revision. Re-evaluated against a perturbed revision, that branch alone
 /// turns into `SourceChanged`; a hold, quarantine, decode or terminal
 /// disposition Skip does not. Witness-less context debt held by its backoff
-/// is presence, not attestation. State only; no read.
-pub(super) fn equality_skip(index: &ScanIndex, candidate: &CandidateFile, now: u64) -> bool {
+/// is presence, not attestation. State only; no read. `decision_calls` counts
+/// the candidate decisions this runs.
+#[inline(never)]
+pub(super) fn equality_skip(
+    index: &ScanIndex,
+    candidate: &CandidateFile,
+    now: u64,
+    decision_calls: &mut u64,
+) -> bool {
     let key = local_index_key(&candidate.path);
     if candidate.source_file_fingerprint.is_empty()
         || index.file_upload_context_requires_adoption(&key)
-        || index.candidate_decision_with_reason_at(candidate, now)
-            != (CandidateDecision::Skip, None)
     {
+        return false;
+    }
+    *decision_calls += 1;
+    if index.candidate_decision_with_reason_at(candidate, now) != (CandidateDecision::Skip, None) {
         return false;
     }
     let mut changed = candidate.clone();
     changed.source_file_fingerprint.push_str("\0e7-8a");
+    *decision_calls += 1;
     index.candidate_decision_with_reason_at(&changed, now)
         == (
             CandidateDecision::Parse,
@@ -854,7 +875,7 @@ impl<'a> View<'a> {
 pub(super) fn rotation(
     index: &ScanIndex,
     cursor: &mut Option<String>,
-    exclude: &[FamilyRef],
+    exclude: &[&FamilyRef],
 ) -> Vec<FamilyRef> {
     let after = cursor.clone();
     let tail = match after.as_deref() {
@@ -882,7 +903,7 @@ pub(super) fn rotation(
         let Some(family) = FamilyRef::of_key(key) else {
             continue;
         };
-        if exclude.binary_search(&family).is_err() && seen.insert(family.clone()) {
+        if exclude.binary_search(&&family).is_err() && seen.insert(family.clone()) {
             families.push(family);
         }
     }
@@ -1007,6 +1028,8 @@ impl FirstPending {
             pending.pace_evicted += excess as u64;
         }
         current.sort_unstable();
+        // The heap's allocation came along; keep the retained bound exact.
+        current.shrink_to(MAX_FIRST_PENDING);
         pending.tracked = current.len() as u64;
         pending.unqueued_unresolved = current.len().saturating_sub(queued) as u64;
         self.stamps = current;
@@ -1022,16 +1045,27 @@ impl FirstPending {
     }
 }
 
+/// One page's equality-attestation work, reset at its shadow row.
+#[derive(Debug, Clone, Copy, Default)]
+struct AttestMeter {
+    attempts: u64,
+    decision_calls: u64,
+    micros: u64,
+    capped: u64,
+}
+
 /// Process-local shadow state for one Claude index scope.
 #[derive(Debug, Default)]
 pub(super) struct Runtime {
-    scope: String,
+    /// Hash of the scope, so the state's size depends on no scope string.
+    scope: u64,
     scope_since: Option<u64>,
     cursor: Option<String>,
     first_pending: FirstPending,
     roots: RootCounts,
     attested: Attestations,
     sticky: Sticky,
+    meter: AttestMeter,
     /// Families a page's parses attested, evaluated on the next page.
     followup: Vec<FamilyRef>,
 }
@@ -1039,22 +1073,29 @@ pub(super) struct Runtime {
 impl Runtime {
     const fn new() -> Self {
         Self {
-            scope: String::new(),
+            scope: 0,
             scope_since: None,
             cursor: None,
             first_pending: FirstPending::new(),
             roots: RootCounts::new(),
             attested: Attestations::new(),
             sticky: Sticky::new(),
+            meter: AttestMeter {
+                attempts: 0,
+                decision_calls: 0,
+                micros: 0,
+                capped: 0,
+            },
             followup: Vec::new(),
         }
     }
 
     /// Another index scope: none of this state applies to it.
     fn align_scope(&mut self, scope: &str) {
+        let scope = hash64(scope.as_bytes());
         if self.scope != scope {
             *self = Self::new();
-            self.scope = scope.to_owned();
+            self.scope = scope;
         }
     }
 
@@ -1063,8 +1104,7 @@ impl Runtime {
     }
 
     fn heap_bytes(&self) -> usize {
-        self.scope.capacity()
-            + self.cursor.as_ref().map_or(0, String::capacity)
+        self.cursor.as_ref().map_or(0, String::capacity)
             + self.first_pending.heap_bytes()
             + self.roots.heap_bytes()
             + self.attested.heap_bytes()
@@ -1101,12 +1141,19 @@ pub(super) struct PageCounts {
     pub(super) sticky_vetoes: StickyAges,
     pub(super) pending_census_members: PendingCensusMembers,
     pub(super) skipped_set: SkippedSet,
+    /// Candidate decisions the shadow itself ran for this page's Skips.
+    pub(super) shadow_decision_calls: u64,
+    /// Thread CPU spent in `attest_equality_skip` for this page's Skips.
+    pub(super) shadow_attest_micros: u64,
+    /// Equality Skips past `MAX_EQUALITY_ATTESTS_PER_PAGE`, not attested.
+    pub(super) attest_capped: u64,
     pub(super) cost: Cost,
 }
 
 /// One Claude page's shadow evaluation, against `runtime`. Reads only `index`
 /// (persisted state and the page's traversal checkpoint) and this page's
 /// `parsed` (key, revision) pairs; writes only `runtime`.
+#[inline(never)]
 pub(super) fn evaluate_page<'p>(
     runtime: &mut Runtime,
     index: &ScanIndex,
@@ -1121,10 +1168,11 @@ pub(super) fn evaluate_page<'p>(
     let scope_since = *runtime.scope_since.get_or_insert(now);
     let generation = generation_tag(traversal);
     runtime.attested.align(generation);
+    let meter = std::mem::take(&mut runtime.meter);
     let mut parsed_keys = Vec::new();
     for (key, revision) in parsed {
         runtime.attested.record(generation, key, revision);
-        parsed_keys.push(key.to_owned());
+        parsed_keys.push(key);
     }
     runtime.attested.flush();
     let followup = std::mem::take(&mut runtime.followup);
@@ -1142,8 +1190,7 @@ pub(super) fn evaluate_page<'p>(
     // Unknown membership decides every family before uniqueness matters.
     let root_index_rebuilt =
         !vetoes.membership_unknown() && runtime.roots.refresh(index, traversal);
-    let mut excluded = touched.families.clone();
-    excluded.extend(followup.iter().cloned());
+    let mut excluded = touched.families.iter().chain(&followup).collect::<Vec<_>>();
     excluded.sort_unstable();
     excluded.dedup();
     let rotated = rotation(index, &mut runtime.cursor, &excluded);
@@ -1185,10 +1232,41 @@ pub(super) fn evaluate_page<'p>(
         sticky_vetoes,
         pending_census_members,
         skipped_set,
+        shadow_decision_calls: meter.decision_calls,
+        shadow_attest_micros: meter.micros,
+        attest_capped: meter.capped,
         cost,
     })
 }
 
+/// The retained worst case of one `Runtime`, in bytes, with the key length
+/// assumption spelled out. See `RUNTIME`.
+#[cfg(test)]
+pub(super) const RUNTIME_RETAINED_WORST_BYTES: usize = {
+    const LONGEST_KEY: usize = 4_096; // Linux PATH_MAX; macOS is 1,024.
+    const LONGEST_ROOT: usize = 255; // One path component.
+    const FOLLOWUP: usize = size_of::<FamilyRef>() + LONGEST_KEY + LONGEST_ROOT;
+    MAX_FIRST_PENDING * size_of::<(u64, u64)>()
+        + MAX_ATTESTATIONS * size_of::<(u64, u64)>()
+        + ATTESTATION_FLUSH * size_of::<(u64, u64)>()
+        + MAX_ATTESTATIONS * size_of::<u64>()
+        + MAX_ROOT_COUNTS * size_of::<(u64, u32)>()
+        + MAX_FOLLOWUP_FAMILIES * FOLLOWUP
+        + LONGEST_KEY
+};
+
+/// The shadow's process static. It sits OUTSIDE `heap_layout_bound` admission:
+/// no cycle or overlap budget charges it, so its bound is stated here and
+/// reported per page as `cost.runtime_heap_bytes`.
+///
+/// Retained heap, worst case, with every cap full (no maps: sorted vectors
+/// only): stamps 16,384 × 16 + attestations 16,384 × 16 + attestation buffer
+/// 1,024 × 16 + since-pass keys 16,384 × 8 + root counts 16,384 × 16 = 933,888
+/// bytes, plus follow-up families 256 × (48 + K + R) and one rotation cursor
+/// K, for key length K and root length R. At K = 4,096 (Linux `PATH_MAX`) and
+/// R = 255 that is 2,064,128 bytes (1.97 MiB) before allocator rounding; at a
+/// typical K = 200, R = 36 it is about 1.0 MiB. Inline: under 512 bytes.
+/// Counts only, so nothing is refused at the bound.
 #[cfg(not(test))]
 static RUNTIME: Mutex<Runtime> = Mutex::new(Runtime::new());
 
@@ -1214,39 +1292,61 @@ fn with_runtime<T>(body: impl FnOnce(&mut Runtime) -> T) -> T {
     RUNTIME_FOR_TEST.with(|runtime| body(&mut runtime.borrow_mut()))
 }
 
+fn scope_of(sampling: &Option<sampled_scan::Context>) -> &str {
+    sampling
+        .as_ref()
+        .map_or("", |context| context.namespace.0.as_str())
+}
+
 /// Record the page's ordinary equality Skip of `candidate` as an attestation
-/// of its current revision. Counts only; changes no decision.
+/// of its current revision, up to `MAX_EQUALITY_ATTESTS_PER_PAGE` per page.
+/// Counts only; changes no decision. Called from the scan step, whose debug
+/// frame is near the stack limit: it takes references only and keeps its work
+/// in this frame.
+#[inline(never)]
 pub(super) fn attest_equality_skip(
     index: &ScanIndex,
     candidate: &CandidateFile,
+    sampling: &Option<sampled_scan::Context>,
     now: u64,
-    scope: &str,
 ) {
     let Some(traversal) = index.traversal.as_ref() else {
         return;
     };
-    if !equality_skip(index, candidate, now) {
-        return;
-    }
-    let generation = generation_tag(traversal);
     with_runtime(|runtime| {
-        runtime.align_scope(scope);
-        runtime.attest(
-            generation,
-            &local_index_key(&candidate.path),
-            &candidate.source_file_fingerprint,
+        runtime.align_scope(scope_of(sampling));
+        if runtime.meter.attempts >= MAX_EQUALITY_ATTESTS_PER_PAGE {
+            runtime.meter.capped += 1;
+            return;
+        }
+        runtime.meter.attempts += 1;
+        let started = super::codex_compressed_input::thread_cpu_micros();
+        if equality_skip(index, candidate, now, &mut runtime.meter.decision_calls) {
+            runtime.attest(
+                generation_tag(traversal),
+                &local_index_key(&candidate.path),
+                &candidate.source_file_fingerprint,
+            );
+        }
+        runtime.meter.micros = runtime.meter.micros.saturating_add(
+            super::codex_compressed_input::thread_cpu_micros().saturating_sub(started),
         );
     });
 }
 
-/// Evaluate and emit one Claude page's shadow counts. Counts only.
+/// Evaluate and emit one Claude page's shadow counts. Counts only. Called from
+/// the scan step, like `attest_equality_skip`.
+#[inline(never)]
 pub(super) fn observe_page(
     index: &ScanIndex,
-    touched: &Touched,
+    touched: &Option<Box<Touched>>,
     parsed: &[PendingIndexFinalization],
-    scope: &str,
+    sampling: &Option<sampled_scan::Context>,
     now: u64,
 ) {
+    let none = Touched::default();
+    let touched = touched.as_deref().unwrap_or(&none);
+    let scope = scope_of(sampling);
     let parsed = parsed
         .iter()
         .filter(|finalization| finalization.parse_complete)

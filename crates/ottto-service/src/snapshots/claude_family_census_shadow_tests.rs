@@ -518,8 +518,9 @@ fn coverage_needs_an_attestation_of_the_current_revision() {
     );
 }
 
-#[test]
-fn only_the_ordinary_equality_skip_attests() {
+/// An indexed Claude root whose unchanged candidate reaches the final
+/// equality branch of the decision.
+fn unchanged_member() -> (ScanIndex, CandidateFile) {
     let mut index = index();
     let key = root_key("dir-e", &root_id(1));
     let mut entry = tests::manifest_index_entry(Some("entity"));
@@ -545,11 +546,19 @@ fn only_the_ordinary_equality_skip_attests() {
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
     };
-    assert!(equality_skip(&index, &candidate, 0));
+    (index, candidate)
+}
+
+#[test]
+fn only_the_ordinary_equality_skip_attests() {
+    let (index, candidate) = unchanged_member();
+    let attests =
+        |index: &ScanIndex, candidate: &CandidateFile| equality_skip(index, candidate, 0, &mut 0);
+    assert!(attests(&index, &candidate));
     // A changed revision is a parse, not an attestation.
     let mut changed = candidate.clone();
     changed.source_file_fingerprint = "source-2".into();
-    assert!(!equality_skip(&index, &changed, 0));
+    assert!(!attests(&index, &changed));
     // A held Skip (here the family's authority quarantine) attests nothing.
     let mut quarantined = index.clone();
     quarantined.claude_usage_authority_quarantine.insert(
@@ -564,12 +573,12 @@ fn only_the_ordinary_equality_skip_attests() {
             proof_correction: None,
         },
     );
-    assert!(!equality_skip(&quarantined, &candidate, 0));
+    assert!(!attests(&quarantined, &candidate));
     // Witness-less upload-context debt (#899 R23) is presence, even when its
     // backoff lets the file skip.
     let mut debt = index.clone();
     debt.active_upload_context_fingerprint = Some("context-new".into());
-    assert!(!equality_skip(&debt, &candidate, 0));
+    assert!(!attests(&debt, &candidate));
 }
 
 #[test]
@@ -1049,7 +1058,7 @@ fn rotation_visits_other_families_and_wraps() {
     let refs = (0..100)
         .map(|n| family(&add_family(&mut index, "dir-r", n, 1)[0]))
         .collect::<Vec<_>>();
-    let excluded = vec![refs[0].clone()];
+    let excluded = vec![&refs[0]];
     let mut cursor = None;
     let first = rotation(&index, &mut cursor, &excluded);
     assert_eq!(first.len(), FAMILY_QUANTUM);
@@ -1211,4 +1220,97 @@ fn only_an_attestation_after_leaving_the_queue_resolves_a_stamp() {
     let left = page(&index, &[], NOW + 180);
     assert_eq!((left.tracked, left.unqueued_unresolved), (1, 1));
     assert_eq!(page(&queued, &[], NOW + 240).oldest_age_s, 120);
+}
+
+#[test]
+fn the_shadow_row_carries_attestation_cost_and_the_page_cap_fails_closed() {
+    let (index, candidate) = unchanged_member();
+    let mut other = candidate.clone();
+    other.path = PathBuf::from(root_key("dir-e", &root_id(2)));
+    let row = |index: &ScanIndex| {
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            observe_page(index, &None, &[], &None, NOW)
+        });
+        records
+            .iter()
+            .find(|record| record["stage"] == "claude_family_census_shadow")
+            .expect("a shadow row")["counts"]
+            .clone()
+    };
+    // Drop whatever an earlier test left on this thread's runtime.
+    row(&index);
+    for _ in 0..MAX_EQUALITY_ATTESTS_PER_PAGE {
+        attest_equality_skip(&index, &candidate, &None, 0);
+    }
+    for _ in 0..3 {
+        attest_equality_skip(&index, &other, &None, 0);
+    }
+    let capped = row(&index);
+    assert_eq!(
+        capped["shadow_decision_calls"].as_u64().unwrap(),
+        2 * MAX_EQUALITY_ATTESTS_PER_PAGE
+    );
+    assert!(capped["shadow_attest_micros"].is_u64());
+    assert_eq!(capped["attest_capped"], 3);
+    // A capped Skip attests nothing, so its member stays presence only.
+    assert_eq!(capped["cost"]["attested_keys"], 1);
+    let next = row(&index);
+    assert_eq!(next["shadow_decision_calls"], 0);
+    assert_eq!(next["attest_capped"], 0);
+}
+
+#[test]
+fn runtime_state_at_every_cap_stays_within_the_stated_worst_case() {
+    assert!(size_of::<Runtime>() < 512);
+    let mut index = index();
+    let mut parsed = Vec::new();
+    for n in 0..MAX_ROOT_COUNTS.max(MAX_FIRST_PENDING) {
+        let key = root_key("dir-cap", &root_id(n));
+        queue(&mut index, &key);
+        index
+            .files
+            .insert(key.clone(), tests::manifest_index_entry(None));
+        parsed.push((key, "source".to_string()));
+    }
+    let mut runtime = Runtime::default();
+    let touched = Touched::default();
+    let first = evaluate_page(
+        &mut runtime,
+        &index,
+        &touched,
+        as_parsed(&parsed),
+        "scope",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(
+        first.pending_census_members.tracked as usize,
+        MAX_FIRST_PENDING
+    );
+    // A whole new queue: the old stamps stay unresolved and evict.
+    index.traversal.as_mut().unwrap().pending_candidates.clear();
+    for n in 0..MAX_FIRST_PENDING {
+        queue(&mut index, &root_key("dir-cap-2", &root_id(n)));
+    }
+    let counts = evaluate_page(
+        &mut runtime,
+        &index,
+        &touched,
+        as_parsed(&[]),
+        "scope",
+        NOW + 60,
+    )
+    .unwrap();
+    assert_eq!(
+        counts.pending_census_members.tracked as usize,
+        MAX_FIRST_PENDING
+    );
+    assert_eq!(
+        counts.pending_census_members.pace_evicted as usize,
+        MAX_FIRST_PENDING
+    );
+    assert_eq!(counts.cost.attested_keys as usize, MAX_ATTESTATIONS);
+    let heap = counts.cost.runtime_heap_bytes as usize;
+    assert!(heap <= RUNTIME_RETAINED_WORST_BYTES, "{heap}");
+    assert!(heap >= 256 * 1024 * 3, "{heap}");
 }
