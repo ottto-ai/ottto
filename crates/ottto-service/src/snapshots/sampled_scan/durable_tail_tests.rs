@@ -11,7 +11,7 @@ fn indexed_key(n: usize) -> String {
 }
 
 /// A real committed checkpoint's certificate for `path`.
-fn certificate(path: &Path, scope: &Scope) -> DurableCertificate {
+pub(super) fn certificate(path: &Path, scope: &Scope) -> DurableCertificate {
     let mut file = File::open(path).unwrap();
     let mut plan = ReadPlan::prepare(&mut file, None, scope, None, 1_800_000_000).unwrap();
     let mut bytes = Vec::new();
@@ -220,7 +220,7 @@ fn native_record_of(
     (reduction, checkpoint)
 }
 
-fn native_fixture(path: &Path) {
+pub(super) fn native_fixture(path: &Path) {
     std::fs::write(
         path,
         concat!(
@@ -1494,7 +1494,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
     }
 }
 
-fn known_corrupt_scan(
+pub(super) fn known_corrupt_scan(
     source: SnapshotSource,
     sessions: &Path,
     cache: &Arc<SharedCache>,

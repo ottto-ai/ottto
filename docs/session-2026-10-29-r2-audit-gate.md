@@ -355,3 +355,13 @@ original unattempted D and retries successfully with another post-capture
 rollback. Earlier audit-gate fixture bodies and the exact-root quiet retry are
 unchanged. Future age-aware selection integration must still preserve its frozen
 census clock separately from captured audit time.
+
+
+Round21 merges current main with mechanical composition only. Durable store
+state keeps both the pending quiet-retirement receipts and the new restart-Full
+counter/alarm state, with their existing empty defaults. A failed post-save
+write counts its offered records and returns before any retirement receipt is
+accepted. Successful receipts still pass the unchanged complete-offer and
+budget/deferred-key checks before advancing quiet retirement. Captured audit
+time, the quiet due gate, exact-root partial-save retry and both held-audit
+open callbacks remain unchanged. No read, retirement or credit policy is added.
