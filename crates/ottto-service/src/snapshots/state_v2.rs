@@ -14,6 +14,11 @@ mod sqlite;
 
 const FORMAT: u32 = 1;
 
+// Integration-only placeholder; the store branch owns the real route predicate.
+pub(crate) fn state_v2_growth_retention_active(_index: &super::ScanIndex) -> bool {
+    false
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Identity {
