@@ -704,6 +704,8 @@ fn retained_lost_replacement_then_missing_proof_is_a_counted_refusal() {
 fn copy_unproven_twin_rows_freeze_and_prove_separately() {
     for retained in [false, true] {
         let (mut item, _) = retained_session(1);
+        // A closed hour, so an unchanged witnessed proof marks.
+        item.collected_at = "2026-09-02T00:00:00Z".into();
         let own = item.usage_buckets[0].model_usage[0].clone();
         let mut copy = own.clone();
         copy.copy_unproven = true;

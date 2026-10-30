@@ -3996,12 +3996,16 @@ fn e2_pipeline_prefix_hold_over_accepted_buckets_defers_the_whole_session() {
         with_e2(|| {
             let mut c = Corpus::new("e2-pipeline-accepted-prefix-hold");
             c.root(ROOT, &resumed(ROOT, &[A, B]));
-            let scanner = E2ScanFixture::default();
+            // Tagged, so the stored body's buckets enter the #909 hints.
+            let scanner = E2ScanFixture::capturing_identity();
             let mut progress = e2_progress();
             let old = ScanIndex::default();
             let original = ready(&c, &scanner, old.clone(), 100, false);
             let mut prior = settle(&c, &old, original, &mut progress);
-            c.write_at(&file(COPY), &resumed(COPY, &[A, B, C]), "2026-08-02T07:03:00Z");
+            let marker = json!({"type":"attachment", "sessionId":COPY, "attachment":{
+                "type":"credential_org", "organizationUuid":"11111111-1111-4111-8111-111111111111"}});
+            c.write_at(&file(COPY), &(marker.to_string() + "\n" + &resumed(COPY, &[A, B, C])),
+                "2026-08-02T07:03:00Z");
             let mut ledger = crate::snapshots::claude_request_identity::AcceptedBuckets::for_test();
             if accepted {
                 let _off = e2::ResumedPrefixForTest::set(false);
