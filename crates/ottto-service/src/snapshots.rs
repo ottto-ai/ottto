@@ -21991,17 +21991,9 @@ enum CodexCensusMatch<'a> {
 
 #[cfg(test)]
 thread_local! {
-    /// P-T38: census passes made by `codex_parent_census_matches` (every
-    /// caller: validation, the step-start match, L-5 probes and fences).
-    static CODEX_PARENT_CENSUS_PASSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// P-T14: step-start matching passes only (the matching branch of
     /// `codex_parent_step_start`).
     static CODEX_PARENT_STEP_START_MATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(in crate::snapshots) fn codex_parent_census_passes_for_test() -> u64 {
-    CODEX_PARENT_CENSUS_PASSES.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -22018,8 +22010,6 @@ fn codex_parent_census_matches<'a>(
     census: CodexParentCensus<'a>,
     wanted: &[&str],
 ) -> Vec<CodexCensusMatch<'a>> {
-    #[cfg(test)]
-    CODEX_PARENT_CENSUS_PASSES.with(|passes| passes.set(passes.get() + 1));
     let mut found = vec![CodexCensusMatch::Absent; wanted.len()];
     // An unavailable census is empty: every id is the baseline `Absent`.
     for key in census.paths {
