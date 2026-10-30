@@ -467,19 +467,28 @@ fn windows(
         .into_iter()
         .flat_map(|p| p.previous_windows.iter().chain(std::iter::once(&p.current)))
         .collect();
-    let mut boundaries = BTreeSet::new();
-    ensure!(
-        old.iter().all(|w| boundaries.insert(&w.census_window_end)),
-        "accounts_ambiguous_boundary"
-    );
     let mut plan = Vec::new();
     let mut after = 0;
-    for w in &wanted {
-        let found = old
-            .iter()
-            .enumerate()
-            .skip(after)
-            .find(|(_, old)| old.census_window_end == w.census_window_end);
+    for (ordinal, w) in wanted.iter().enumerate() {
+        // Archives are immutable observations: match the complete window,
+        // not just a possibly repeated/malformed boundary. Current remains
+        // mutable within the same boundary and keeps its own explicit ID,
+        // even when an older archive has identical boundary/evidence.
+        let current = old.len().checked_sub(1).filter(|at| {
+            ordinal + 1 == wanted.len()
+                && *at >= after
+                && old[*at].census_window_end == w.census_window_end
+        });
+        let found = if ordinal + 1 == wanted.len() {
+            // A -> B -> A opens a NEW current window, even if the first A
+            // was archived and its literal boundary/evidence happens to match.
+            current.map(|at| (at, &old[at]))
+        } else {
+            old.iter()
+                .enumerate()
+                .skip(after)
+                .find(|(_, old)| *old == w)
+        };
         let id = if let Some((at, _)) = found {
             after = at + 1;
             ids[at]
@@ -559,17 +568,26 @@ fn usage(s: &mut Scope<'_>, p: &ClaudeUsageFamilyPending) -> Result<()> {
     }
     Ok(())
 }
+fn share_full_set(s: &mut Scope<'_>, path: &[&str], hashes: &BTreeSet<String>) -> Result<()> {
+    // Match hydration admission BEFORE acquiring/publishing any shared row.
+    // v1 typed sets can contain literal strings, not just canonical hashes.
+    ensure!(
+        hashes.iter().all(|hash| hash.len() <= KEY_BYTES),
+        "state_v2_string_admission"
+    );
+    s.shared(
+        path,
+        0,
+        &interning::RequestEvidence::Census {
+            hashes: &ControlJson(hashes),
+            hash_count: Some(hashes.len() as u64),
+        },
+    )
+}
 fn request_map(s: &mut Scope<'_>, map: &BTreeMap<String, BTreeSet<String>>) -> Result<()> {
     s.plain(&[], 0, Data::Number(map.len() as u64))?;
     for (m, hashes) in map {
-        s.shared(
-            &[m],
-            0,
-            &interning::RequestEvidence::Census {
-                hashes: &ControlJson(hashes),
-                hash_count: Some(hashes.len() as u64),
-            },
-        )?;
+        share_full_set(s, &[m], hashes)?;
     }
     Ok(())
 }
@@ -616,14 +634,7 @@ fn usage_proof(s: &mut Scope<'_>, p: &ClaudeUsageFamilyWitness) -> Result<()> {
         }
     }
     for (m, hashes) in &p.legacy_excluded_request_id_hashes {
-        s.shared(
-            &["excluded", m],
-            0,
-            &interning::RequestEvidence::Census {
-                hashes: &ControlJson(hashes),
-                hash_count: Some(hashes.len() as u64),
-            },
-        )?;
+        share_full_set(s, &["excluded", m], hashes)?;
     }
     for m in &p.legacy_owner_roots {
         s.plain(&["owners", m], 0, Data::Empty)?;
@@ -1925,6 +1936,112 @@ mod tests {
         assert!(hydrate(&mut db, &mut b, &mut cx).is_err());
         assert_subset(&before, &b);
         assert!(!cx.ready);
+    }
+    #[test]
+    fn duplicate_boundaries_update_retire_and_aba_stay_distinct() {
+        let (_scratch, mut db) = Scratch::store();
+        let mut a = graph();
+        let p = a.claude_account_family_pending.get_mut("family").unwrap();
+        let mut first = window("A");
+        first.evidence_request_count = 1;
+        let mut later = window("A");
+        later.evidence_request_count = 3;
+        p.previous_windows = vec![first, window("B")];
+        p.current = later;
+        let mut cx = KindCxAccounts::default();
+        save(&mut db, None, &a, &mut cx, 0);
+        let mut b = a.clone();
+        let p = b.claude_account_family_pending.get_mut("family").unwrap();
+        p.previous_windows.remove(0);
+        p.current.members.insert("/opaque/member".into(), 12);
+        save(&mut db, Some(&a), &b, &mut cx, 1);
+        assert_eq!(positions(&cx), [2, 3]);
+        let mut reloaded = ScanIndex::default();
+        hydrate(&mut db, &mut reloaded, &mut cx).unwrap();
+        assert_subset(&b, &reloaded);
+        let mut c = b.clone();
+        let p = c.claude_account_family_pending.get_mut("family").unwrap();
+        let previous = std::mem::replace(&mut p.current, window("B"));
+        p.previous_windows.push(previous);
+        save(&mut db, Some(&b), &c, &mut cx, 2);
+        assert_eq!(positions(&cx), [2, 3, 4]);
+        let mut d = c.clone();
+        d.claude_account_family_pending.clear();
+        save(&mut db, Some(&c), &d, &mut cx, 3);
+        hydrate(&mut db, &mut reloaded, &mut cx).unwrap();
+        assert!(reloaded.claude_account_family_pending.is_empty());
+    }
+    #[test]
+    fn identical_archived_boundary_does_not_steal_the_current_id() {
+        let (_scratch, mut db) = Scratch::store();
+        let mut a = graph();
+        let p = a.claude_account_family_pending.get_mut("family").unwrap();
+        p.previous_windows = vec![window("same"), window("B")];
+        p.current = window("same");
+        let mut cx = KindCxAccounts::default();
+        save(&mut db, None, &a, &mut cx, 0);
+        let mut b = a.clone();
+        let p = b.claude_account_family_pending.get_mut("family").unwrap();
+        p.previous_windows.clear();
+        save(&mut db, Some(&a), &b, &mut cx, 1);
+        assert_eq!(positions(&cx), [3]);
+    }
+    #[test]
+    fn repeated_boundary_new_current_never_reuses_an_archive_id() {
+        let (_scratch, mut db) = Scratch::store();
+        let mut a = graph();
+        let p = a.claude_account_family_pending.get_mut("family").unwrap();
+        p.previous_windows = vec![window("A")];
+        p.current = window("B");
+        let mut cx = KindCxAccounts::default();
+        save(&mut db, None, &a, &mut cx, 0);
+        let mut b = a.clone();
+        let p = b.claude_account_family_pending.get_mut("family").unwrap();
+        p.previous_windows.clear();
+        p.current = window("A");
+        save(&mut db, Some(&a), &b, &mut cx, 1);
+        assert_eq!(positions(&cx), [3]);
+    }
+    #[test]
+    fn shared_string_bound_matches_reader_for_requests_and_exclusions() {
+        for exclusions in [false, true] {
+            let (_scratch, mut db) = Scratch::store();
+            let mut a = graph();
+            let hashes = BTreeSet::from(["x".repeat(KEY_BYTES + 1)]);
+            if exclusions {
+                a.claude_usage_family_witnesses
+                    .get_mut("family")
+                    .unwrap()
+                    .legacy_excluded_request_id_hashes
+                    .insert("oversized".into(), hashes);
+            } else {
+                a.claude_usage_family_pending
+                    .get_mut("family")
+                    .unwrap()
+                    .member_request_id_hashes
+                    .insert("oversized".into(), hashes);
+            }
+            let mut cx = KindCxAccounts::default();
+            let mut tx = db.begin(TxnMode::Write).unwrap();
+            assert!(populate(&a, &mut tx, &mut cx)
+                .unwrap_err()
+                .to_string()
+                .contains("state_v2_string_admission"));
+            assert!(!cx.ready);
+            // The caller drops this unpublished import; no invalid value is committed.
+        }
+        let (_scratch, mut db) = Scratch::store();
+        let mut a = graph();
+        a.claude_usage_family_pending
+            .get_mut("family")
+            .unwrap()
+            .member_request_id_hashes
+            .insert("boundary".into(), BTreeSet::from(["x".repeat(KEY_BYTES)]));
+        let mut cx = KindCxAccounts::default();
+        save(&mut db, None, &a, &mut cx, 0);
+        let mut b = ScanIndex::default();
+        hydrate(&mut db, &mut b, &mut cx).unwrap();
+        assert_subset(&a, &b);
     }
     #[test]
     fn canonical_components_do_not_alias_empty_nul_or_prefixes() {
