@@ -183,8 +183,6 @@ pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
     REDERIVE_HEAD_BYTES[diagnostic_source_slot(source)].load(Ordering::Relaxed)
 }
 
-/// Actual physical class-X bytes, including a later capture/hash refusal.
-/// The success receipt is separate; never hide input behind a refusal label.
 #[cfg(test)]
 thread_local! { static REDERIVE_READ_CALLS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
@@ -208,6 +206,8 @@ fn capture_rederive_reads<T>(run: impl FnOnce() -> T) -> (T, u64) {
     let result = run();
     (result, REDERIVE_READ_CALLS.get().unwrap())
 }
+/// Actual physical class-X bytes, including a later capture/hash refusal.
+/// The success receipt is separate; never hide input behind a refusal label.
 pub(in crate::snapshots) fn record_rederive_input(source: SnapshotSource, bytes: u64) {
     REDERIVE_HEAD_BYTES[diagnostic_source_slot(source)].fetch_add(bytes, Ordering::Relaxed);
     crate::local_resource_diagnostics::durable_tail_alarm(
@@ -3159,7 +3159,7 @@ impl SharedCache {
                 if floor_behind {
                     return RestoreOutcome::FloorHeld;
                 }
-                if matches!(phase, "decode" | "input" | "certificate_scope") {
+                if matches!(phase, "input" | "certificate_scope") {
                     self.restore_active_bound(snapshot_source, key, held, index)
                 } else {
                     self.restore_resource_pending(snapshot_source, phase, key, held, index)

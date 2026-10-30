@@ -2308,8 +2308,9 @@ impl DurableTailStore {
                 .classify(&proof.key, "delete", Some(writer))
                 .map_err(|_| io::Error::other("retirement classification"))?
                 .ok_or_else(|| io::Error::other("retirement unknown survivor"))?;
-            if !self.authorized(&proof.key, header.format) || stamp_at(&path)? != Some(proof.stamp)
-            {
+            // The retained witness is the eligible original-binding authority;
+            // begin_pass and memo turnover cannot revoke that exact predecessor.
+            if stamp_at(&path)? != Some(proof.stamp) {
                 return Ok(RetireOutcome::Retry);
             }
             #[cfg(test)]

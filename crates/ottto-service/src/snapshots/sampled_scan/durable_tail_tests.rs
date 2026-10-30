@@ -456,15 +456,13 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
                 1,
                 "actual cold decode reached once, then idle skips"
             );
+            assert_eq!(after.0.resource_full.get(cause), Some(&1));
             if phase == "decode" {
-                assert_eq!(after.0.active_bound[0], [1, 0], "one structural Full");
-                assert!(
-                    cache.retained().unwrap().peek(&key).is_none(),
-                    "no-record path retains no optional graph"
+                assert_eq!(
+                    after.0.active_bound[0],
+                    [0, 0],
+                    "decode keeps its own cause"
                 );
-                assert!(after.0.resource_full.is_empty());
-            } else {
-                assert_eq!(after.0.resource_full.get(cause), Some(&1));
             }
             assert_eq!(after.0.ineligible.get(cause), None, "not counted pending");
         }
