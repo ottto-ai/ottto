@@ -163,7 +163,7 @@ impl Family {
                     .expect("exact parsed member key");
                 let old = &previous.files[key];
                 PendingIndexFinalization {
-                    restored_behind_accepted: false,
+                    restored_behind_accepted: None,
                     sampled_audit_verified: false,
                     codex_pending_recovery: false,
                     index_key: key.clone(),
@@ -177,7 +177,6 @@ impl Family {
                     diagnostic_reason: FileReason::Complete,
                     parsed_snapshot_count: 1,
                     effective_upload_body_witness_revision: 0,
-                    pi_restored_behind_accepted: None,
                 }
             })
             .collect();

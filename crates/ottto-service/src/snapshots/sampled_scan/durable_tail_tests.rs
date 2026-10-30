@@ -5924,7 +5924,10 @@ fn pi_ledger_cap_counter_prints_in_the_pi_summary_only() {
 /// A Tail or Unchanged read below a known accepted extent is behind it.
 #[test]
 fn tail_behind_accepted_needs_a_continued_read_strictly_below_the_entry() {
-    use crate::snapshots::sampled_scan::tail_behind_accepted as behind;
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    let behind = |mode, frozen, accepted| {
+        restored_tail_below_accepted(SnapshotSource::Pi, true, mode, frozen, accepted).is_some()
+    };
     use crate::transcript_acquisition::{FullReason, ReadMode};
     assert!(behind(ReadMode::Tail, Some(9), Some(10)));
     assert!(!behind(ReadMode::Tail, Some(10), Some(10)), "at accepted");
@@ -15663,11 +15666,12 @@ fn restored_below_accepted_counts_only_complete_codex_pi_tail_publications() {
                         );
                         let expected = source != SnapshotSource::ClaudeCode
                             && restored
-                            && mode == ReadMode::Tail
+                            && (mode == ReadMode::Tail
+                                || (source == SnapshotSource::Pi && mode == ReadMode::Unchanged))
                             && extent == 99
                             && published;
                         let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-                            record_restored_publication(source, behind, published)
+                            record_restored_publication(source, behind.is_some(), published)
                         });
                         assert_eq!(rows.len(), usize::from(expected));
                         if expected {

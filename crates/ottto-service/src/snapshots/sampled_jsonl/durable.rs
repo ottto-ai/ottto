@@ -405,8 +405,13 @@ impl Decoded {
         };
         *digest = Some([0; 32]);
         Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
-            self.reduction.put(e)?;
-            self.rederive.put(e)
+            let (acc, report, scalars) = self.reduction.finish_view();
+            if acc.source == SnapshotSource::Pi {
+                pi::put_body(e, acc, report, scalars, &self.rederive)
+            } else {
+                self.reduction.put(e)?;
+                self.rederive.put(e)
+            }
         })
         .unwrap()
     }

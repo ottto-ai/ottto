@@ -67,7 +67,10 @@ def main():
     head_sha = output(["git", "rev-parse", "HEAD"])
     manifest = {"base": base_sha, "head": head_sha, "base_ref": ref,
                 "arms": ["retained_ram_tail_or_unchanged", "cold_full", "disk_restore"],
-                "disk_restore": {}, "pi_durable_capability": {}, "receipt_counts": {}}
+                "disk_restore": {}, "pi_durable_capability": {}, "receipt_counts": {},
+                # Content-free dispositions are diagnostic observations, not failures
+                # or part of the emitted-body equality comparison.
+                "diagnostic_observations": {"restored_behind_accepted": ["held", "published"]}}
     (receipts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     base = root / "base"
     command(["git", "worktree", "add", "--detach", str(base), base_sha])

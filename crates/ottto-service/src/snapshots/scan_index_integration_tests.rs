@@ -608,7 +608,7 @@ fn recovery_emission_boundaries(
     scan.snapshots = items;
     scan.census_complete = true;
     scan.pending_finalization.push(PendingIndexFinalization {
-        restored_behind_accepted: false,
+        restored_behind_accepted: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: "synthetic-file".into(),
@@ -835,7 +835,7 @@ fn restored_behind_accepted_publication_waits_for_policy_and_noop_suppression() 
                 let mut scan = SourceScanResult::empty(source);
                 scan.snapshots.push(item);
                 scan.pending_finalization.push(PendingIndexFinalization {
-                    restored_behind_accepted: true,
+                    restored_behind_accepted: Some(u64::MAX),
                     sampled_audit_verified: false,
                     codex_pending_recovery: false,
                     index_key: "synthetic-finalized-replay".into(),

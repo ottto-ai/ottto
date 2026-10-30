@@ -1282,15 +1282,15 @@ They also appear on the existing
 saturating process totals since startup, shared across namespaces. They are
 counts and bytes only, with no file names, response ids or content.
 
-`pi_restored_behind_accepted` counts Pi files whose durable-restored Tail or
-Unchanged read ends below the indexed accepted extent and either offers a body
-for upload or commits a smaller index extent. Pi has no accepted-body floor, so
-the offer is the smaller body a cold Full would produce, and accepted state
-moves down with it. A semantic no-op still counts if index size moves down.
-A Full or a RAM-retained read does not count. Claude and Codex never count.
-An upload retry counts again. It settles after page collection, so it appears
-only on `process_retained_cache_lifecycle_totals` (source `unknown`), from the
-next page's line. It is a count only, with no file names, response ids or content.
+`restored_behind_accepted.published` on `durable_tail_alarm` with source `pi`
+counts a durable-restored Tail or Unchanged read ending strictly below the
+frozen indexed accepted extent when it offers a complete body after policy and
+semantic no-op suppression, or commits a smaller index extent. Pi has no
+accepted-body floor. A semantic no-op still counts if index size moves down.
+A Full or RAM-retained read does not count. Upload retries count again. The
+same signal uses source `codex` for surviving restored Tail offers and source
+`claude_code` with outcome `held` for accepted-floor holds. It contains only
+counts, source and outcome, with no file names, response ids or content.
 
 The tag-1 audit-safe bootstrap core is a hard release pair with the grouped
 custody and stored-representation binding completion. The first part preserves
@@ -1465,8 +1465,9 @@ change any persisted format.
 Claude's accepted-floor hold reports `restored_behind_accepted.held` at its
 actual decision edges. The discovery dependency continues to hard-gate the
 production switch; RAM pacing does not establish restart-persistent bounds.
-Codex and Pi report `restored_behind_accepted.published` only when a complete
-restored Tail body below the frozen accepted extent reaches publication.
+Codex reports `restored_behind_accepted.published` when a complete restored
+Tail body below the frozen accepted extent reaches publication. Pi also covers
+restored Unchanged offers and committed extent regressions as described above.
 
 `rederive_failed_first_attempt{source}` and `restore_pending_quiet{source}` are
 **proxies**, emitted once per source pass as cumulative process totals on the

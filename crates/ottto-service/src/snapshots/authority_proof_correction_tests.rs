@@ -853,7 +853,7 @@ fn apc_pending(
     parsed_snapshot_count: usize,
 ) -> PendingIndexFinalization {
     PendingIndexFinalization {
-        restored_behind_accepted: false,
+        restored_behind_accepted: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: apc_keys()[slot].clone(),
@@ -868,7 +868,6 @@ fn apc_pending(
         },
         parsed_snapshot_count,
         effective_upload_body_witness_revision: 0,
-        pi_restored_behind_accepted: None,
     }
 }
 

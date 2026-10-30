@@ -7931,9 +7931,7 @@ struct PendingIndexFinalization {
     diagnostic_reason: FileReason,
     parsed_snapshot_count: usize,
     effective_upload_body_witness_revision: u64,
-    /// `Active::pi_restored_behind_accepted`, settled at finalization.
-    pi_restored_behind_accepted: Option<u64>,
-    restored_behind_accepted: bool,
+    restored_behind_accepted: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -8440,38 +8438,26 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .map(|source_file| !noop_source_files.contains(source_file))
                 .unwrap_or(true)
     });
-    // Count a surviving offer or a committed extent regression. Semantic
-    // no-op suppression alone does not make a smaller index selection safe.
-    for (pending, accepted_extent) in result.pending_finalization.iter().filter_map(|pending| {
-        pending
-            .pi_restored_behind_accepted
-            .map(|extent| (pending, extent))
-    }) {
-        if result.snapshots.iter().any(|snapshot| {
-            snapshot.source_file_fingerprint.as_deref()
-                == Some(pending.source_file_fingerprint.as_str())
-        }) || index
-            .files
-            .get(&pending.index_key)
-            .is_some_and(|entry| entry.size_bytes < accepted_extent)
-        {
-            crate::local_resource_diagnostics::cache_lifecycle::record(
-                crate::local_resource_diagnostics::cache_lifecycle::Event::PiRestoredBehindAccepted,
-            );
-        }
-    }
-
-    // Count publication only after complete-body policy/finalization and
-    // semantic-noop suppression; a restored parser finish alone is no offer.
+    // Settle the frozen restore observation after policy and no-op suppression.
+    // Pi also counts a smaller committed selection even without a surviving offer.
     #[cfg(unix)]
     for pending in &result.pending_finalization {
+        let Some(accepted_extent) = pending.restored_behind_accepted else {
+            continue;
+        };
+        let offered = result.snapshots.iter().any(|snapshot| {
+            snapshot.source_file_fingerprint.as_deref()
+                == Some(pending.source_file_fingerprint.as_str())
+        });
+        let regressed = source == SnapshotSource::Pi
+            && index
+                .files
+                .get(&pending.index_key)
+                .is_some_and(|entry| entry.size_bytes < accepted_extent);
         sampled_scan::durable_tail::record_restored_publication(
             source,
-            pending.parse_complete && pending.restored_behind_accepted,
-            result.snapshots.iter().any(|snapshot| {
-                snapshot.source_file_fingerprint.as_deref()
-                    == Some(pending.source_file_fingerprint.as_str())
-            }),
+            true,
+            (pending.parse_complete && offered) || regressed,
         );
     }
 
@@ -31538,7 +31524,7 @@ impl OwnedSourceScan {
                         }
                         let alias_fingerprint = alias.source_file_fingerprint.clone();
                         pending_finalization.push(PendingIndexFinalization {
-                            restored_behind_accepted: false,
+                            restored_behind_accepted: None,
                             sampled_audit_verified: false,
                             codex_pending_recovery: index
                                 .files
@@ -31553,7 +31539,6 @@ impl OwnedSourceScan {
                             parsed_snapshot_count: parsed.len(),
                             effective_upload_body_witness_revision: index
                                 .active_effective_upload_body_witness_revision,
-                            pi_restored_behind_accepted: None,
                         });
                         let alias_items = parsed
                             .iter()
@@ -31603,7 +31588,7 @@ impl OwnedSourceScan {
                 pending_finalization.push(PendingIndexFinalization {
                     restored_behind_accepted: file_sampling
                         .as_ref()
-                        .is_some_and(|active| active.restored_behind_accepted),
+                        .and_then(|active| active.restored_behind_accepted),
                     sampled_audit_verified,
                     codex_pending_recovery: index
                         .files
@@ -31624,9 +31609,6 @@ impl OwnedSourceScan {
                     parsed_snapshot_count,
                     effective_upload_body_witness_revision: index
                         .active_effective_upload_body_witness_revision,
-                    pi_restored_behind_accepted: file_sampling
-                        .as_ref()
-                        .and_then(|active| active.pi_restored_behind_accepted),
                 });
                 if source == SnapshotSource::Codex
                     && parse_complete
@@ -33900,24 +33882,9 @@ impl OwnedSourceScan {
                 match parser.prepare_acquisition(None, &scope, None, sampled_scan::now_seconds()) {
                     Ok(mode) => {
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
-                        #[cfg(unix)]
-                        let restored_behind_accepted =
-                            sampled_scan::durable_tail::restored_tail_below_accepted(
-                                source,
-                                restored_durable,
-                                mode,
-                                parser
-                                    .reader
-                                    .acquisition
-                                    .as_ref()
-                                    .map(|p| p.frozen_length()),
-                                index.files.get(&key).map(|e| e.size_bytes),
-                            );
-                        #[cfg(not(unix))]
-                        let restored_behind_accepted = false;
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
-                            restored_behind_accepted: false,
+                            restored_behind_accepted: None,
                             key: local_index_key(&candidate.path),
                             scope,
                             mode,
@@ -33925,7 +33892,6 @@ impl OwnedSourceScan {
                             retained_hint: None,
                             retained_finalization_charge: 0,
                             retained_usage: None,
-                            pi_restored_behind_accepted: None,
                             reinsertion: Default::default(),
                         });
                     }
@@ -34282,8 +34248,6 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         let mut restored_durable = false;
                         #[cfg(unix)]
-                        let mut restored_pi = false;
-                        #[cfg(unix)]
                         let (mut retained, taken_admission, debt) = match retained {
                             None if allow_sample
                                 && !native_edit_proven
@@ -34315,7 +34279,6 @@ impl OwnedSourceScan {
                                     ) => {
                                         preparation_lease = Some(lease);
                                         restored_durable = restart_restore::enabled();
-                                        restored_pi = source == SnapshotSource::Pi;
                                         retained_offset =
                                             Some(taken.retained.checkpoint.sealed_offset());
                                         let admission = (
@@ -34748,21 +34711,6 @@ impl OwnedSourceScan {
                         // Pi has no accepted floor (`Interpretation::of`): this
                         // read publishes below the extent the entry still holds.
                         #[cfg(unix)]
-                        let pi_restored_behind_accepted = (restored_pi
-                            && sampled_scan::tail_behind_accepted(
-                                mode,
-                                parser
-                                    .reader
-                                    .acquisition
-                                    .as_ref()
-                                    .map(|plan| plan.frozen_length()),
-                                index.files.get(&key).map(|entry| entry.size_bytes),
-                            ))
-                        .then(|| index.files.get(&key).map(|entry| entry.size_bytes))
-                        .flatten();
-                        #[cfg(not(unix))]
-                        let pi_restored_behind_accepted = None;
-                        #[cfg(unix)]
                         let restored_behind_accepted =
                             sampled_scan::durable_tail::restored_tail_below_accepted(
                                 source,
@@ -34776,7 +34724,7 @@ impl OwnedSourceScan {
                                 index.files.get(&key).map(|e| e.size_bytes),
                             );
                         #[cfg(not(unix))]
-                        let restored_behind_accepted = false;
+                        let restored_behind_accepted = None;
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
                             restored_behind_accepted,
@@ -34788,7 +34736,7 @@ impl OwnedSourceScan {
                             retained_finalization_charge: continued
                                 .map_or(0, |(_, charge, _)| charge),
                             retained_usage: continued.map(|(_, _, usage)| usage),
-                            pi_restored_behind_accepted,
+
                             reinsertion,
                         });
                     }
@@ -34851,24 +34799,9 @@ impl OwnedSourceScan {
                         };
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
                         planned_mode = Some((mode, recovered_audit_due));
-                        #[cfg(unix)]
-                        let restored_behind_accepted =
-                            sampled_scan::durable_tail::restored_tail_below_accepted(
-                                source,
-                                restored_durable,
-                                mode,
-                                parser
-                                    .reader
-                                    .acquisition
-                                    .as_ref()
-                                    .map(|p| p.frozen_length()),
-                                index.files.get(&key).map(|e| e.size_bytes),
-                            );
-                        #[cfg(not(unix))]
-                        let restored_behind_accepted = false;
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
-                            restored_behind_accepted: false,
+                            restored_behind_accepted: None,
                             key,
                             scope,
                             mode,
@@ -34876,7 +34809,6 @@ impl OwnedSourceScan {
                             retained_hint: None,
                             retained_finalization_charge: 0,
                             retained_usage: None,
-                            pi_restored_behind_accepted: None,
                             reinsertion: Default::default(),
                         });
                     }
@@ -41518,6 +41450,15 @@ fn codex_total_usage_has_request_count(value: &Value) -> bool {
         .is_some()
 }
 
+/// Shared content projection; usage and timing stay with the native caller.
+fn pi_content_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    match string_at(value, &["type"]).as_deref() {
+        Some("session") => pi_workspace_content(value, accumulator),
+        Some("message") => pi_prompt_content(value, pi_message_role(value).as_deref(), accumulator),
+        _ => {}
+    }
+}
+
 fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     let event_type = string_at(value, &["type"]);
     match event_type.as_deref() {
@@ -41533,7 +41474,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
                     .or_else(|| string_at(value, &["session_id"]))
                     .or_else(|| string_at(value, &["sessionId"]));
             }
-            pi_workspace_content(value, accumulator);
+            pi_content_line(value, accumulator);
             accumulator.note_pi_time(pi_timestamp_field(value));
         }
         Some("message") => {
@@ -41541,7 +41482,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             // nested `message.role`. This is the only chance to capture prompt
             // text for a title fallback.
             let role = pi_message_role(value);
-            pi_prompt_content(value, role.as_deref(), accumulator);
+            pi_content_line(value, accumulator);
             let timestamp = pi_message_timestamp(value);
             if role.as_deref() == Some("assistant")
                 && (timestamp.is_some() || !pi_message_timestamp_is_present(value))
@@ -95766,7 +95707,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; pending_taken, pending_returns, #[cfg(unix)] pending_funding, #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_publication, native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; pi_restored_behind_accepted, restored_behind_accepted, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; restored_behind_accepted, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {

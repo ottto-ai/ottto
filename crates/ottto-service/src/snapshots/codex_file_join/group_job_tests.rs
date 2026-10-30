@@ -1620,7 +1620,7 @@ fn group_with_legacy_tee_is_byte_charged() {
     )
     .unwrap();
     let sampling = active.sampling.replace(sampled_scan::Active {
-        restored_behind_accepted: false,
+        restored_behind_accepted: None,
         no_record: false,
         key: String::new(),
         scope: Scope("group-fixture".into()),
@@ -1629,7 +1629,6 @@ fn group_with_legacy_tee_is_byte_charged() {
         retained_hint: Some((0, 0)),
         retained_finalization_charge: 0,
         retained_usage: None,
-        pi_restored_behind_accepted: None,
         reinsertion: Default::default(),
     });
     let acquisition = active.parser.reader.acquisition.replace(plan);

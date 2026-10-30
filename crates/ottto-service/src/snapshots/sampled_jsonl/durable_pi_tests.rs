@@ -436,6 +436,7 @@ fn pi_registered_body_rows_preserve_populated_round_one_bytes() {
         &original.report,
         (1, 2, true),
         1024 * 1024,
+        true,
     )
     .unwrap();
     let len = plan.count(RECORD_BYTES).unwrap();

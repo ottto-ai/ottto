@@ -14,7 +14,6 @@
 // cross-build property: it belongs to the money_equivalence base-vs-candidate
 // lane, not to this in-process matrix.
 use super::*;
-use crate::local_resource_diagnostics::cache_lifecycle;
 use crate::snapshots::sampled_scan::transition_fixture::{
     self as fixture, money_oracle, Accepted, IoBytes, Mode, RouteResult, TransitionDriver,
 };
@@ -65,7 +64,7 @@ fn pi_route(
             (entity, Accepted { body, witness })
         })
         .collect();
-    // Head rederive is consumed by the reader; the named-line pread is not.
+    // Bounded head replay uses pread; only native Tail/Full uses consume.
     // Cheap certificate/probe, anchor and raw reads stay UNMEASURED.
     result.io = IoBytes {
         consumed,
@@ -133,8 +132,8 @@ struct PiPage {
     emitted: BTreeMap<String, Accepted>,
     /// The store as this route left it (its own native receipt).
     records: Records,
-    /// This route's process-wide lifecycle events, on this thread.
-    lifecycle: cache_lifecycle::Counts,
+    /// This route's shared restored-behind-accepted publication count.
+    restored_behind: u64,
 }
 
 type Records = BTreeMap<PathBuf, Vec<u8>>;
@@ -278,9 +277,9 @@ impl PiDriver {
         counts.certificate_refused.values().sum()
     }
 
-    /// This route's `pi_restored_behind_accepted` count.
+    /// This route's `restored_behind_accepted.published` count.
     fn restored_behind(&self, mode: Mode) -> u64 {
-        self.pages[&mode].lifecycle.pi_restored_behind_accepted
+        self.pages[&mode].restored_behind
     }
 
     /// This route's cache-admission refusals: (the Pi `cache_transit` Full
@@ -326,8 +325,10 @@ impl TransitionDriver for PiDriver {
             }
         };
         let cache = scanner.cache.clone();
-        let ((mut result, index, emitted), lifecycle) =
-            cache_lifecycle::observe(|| pi_route(&self.c, scanner, self.prior.clone(), mode));
+        let ((mut result, index, emitted), restored_behind) =
+            crate::snapshots::sampled_scan::observe_restored_publications(|| {
+                pi_route(&self.c, scanner, self.prior.clone(), mode)
+            });
         result.accepted = self.accepted.clone();
         let records = store_records(&self.disk);
         self.pages.insert(
@@ -337,7 +338,7 @@ impl TransitionDriver for PiDriver {
                 index,
                 emitted,
                 records,
-                lifecycle,
+                restored_behind,
             },
         );
         result
@@ -402,6 +403,7 @@ impl<F: FnMut()> Drop for Reset<F> {
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_quiet_restart_twice_reads_nothing_and_posts_nothing() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_quiet") {
         return;
     }
@@ -448,6 +450,7 @@ fn pi_quiet_restart_twice_reads_nothing_and_posts_nothing() {
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_append_then_restart_twice_reads_only_tail_and_keeps_the_ledger() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_append") {
         return;
     }
@@ -491,8 +494,8 @@ fn pi_append_then_restart_twice_reads_only_tail_and_keeps_the_ledger() {
             }
             assert_eq!(
                 route.io.consumed,
-                tail + route.io.rederive_head,
-                "page {page} {mode:?}: reader bytes = Tail + counted head rederive"
+                tail,
+                "page {page} {mode:?}: reader bytes = Tail; bounded head pread is counted separately"
             );
             money_oracle::assert_equivalent(&cold, &route);
             whole_body(&cold, &route);
@@ -512,6 +515,7 @@ fn pi_append_then_restart_twice_reads_only_tail_and_keeps_the_ledger() {
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_evict_retry_save_restart_reads_no_full() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_evict") {
         return;
     }
@@ -527,7 +531,7 @@ fn pi_evict_retry_save_restart_reads_no_full() {
     whole_body(&cold, &ram);
     let retry = f.emit_bodies(Mode::EvictRetry);
     assert_eq!((retry.modes, retry.restored), ((0, 1, 0), 1));
-    assert_eq!(retry.io.consumed, tail + retry.io.rederive_head);
+    assert_eq!(retry.io.consumed, tail);
     money_oracle::assert_equivalent(&cold, &retry);
     whole_body(&cold, &retry);
     f.save_gc(Mode::EvictRetry);
@@ -541,7 +545,7 @@ fn pi_evict_retry_save_restart_reads_no_full() {
     let cold = f.emit_bodies(Mode::ColdFull);
     let restart = f.emit_bodies(Mode::Restart);
     assert_eq!((restart.modes, restart.restored), ((0, 1, 0), 1));
-    assert_eq!(restart.io.consumed, tail + restart.io.rederive_head);
+    assert_eq!(restart.io.consumed, tail);
     money_oracle::assert_equivalent(&cold, &restart);
     whole_body(&cold, &restart);
 }
@@ -552,7 +556,7 @@ fn pi_evict_retry_save_restart_reads_no_full() {
 // equals a cold Full of the file, today's Pi behaviour: the floor is
 // Claude-only (`Interpretation::of`). No hold and no Full; the accepted state
 // moves down with it. The extent regression is known independently from the
-// index. `pi_restored_behind_accepted` counts exactly this offer. An
+// index. `restored_behind_accepted.published` counts exactly this offer. An
 // equal-or-larger extent POSTs normally and leaves it at 0. The RAM-resident
 // cut is the in-process control below.
 #[test]
@@ -561,6 +565,7 @@ fn pi_evict_retry_save_restart_reads_no_full() {
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_restored_tail_behind_accepted_extent_publishes_the_cold_body() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_smaller") {
         return;
     }
@@ -643,6 +648,7 @@ fn pi_restored_tail_behind_accepted_extent_publishes_the_cold_body() {
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_restored_unchanged_below_accepted_counts_its_smaller_offer() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_unchanged_smaller") {
         return;
     }
@@ -699,6 +705,7 @@ fn pi_restored_unchanged_below_accepted_counts_its_smaller_offer() {
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_ram_resident_same_head_cut_reads_one_real_edit_full() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_smaller_ram") {
         return;
     }
@@ -760,6 +767,7 @@ fn pi_ram_resident_same_head_cut_reads_one_real_edit_full() {
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_stale_survivor_holds_then_resolves_with_a_counted_tail() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_survivor") {
         return;
     }
@@ -817,11 +825,7 @@ fn pi_stale_survivor_holds_then_resolves_with_a_counted_tail() {
             ((0, 1, 0), restored),
             "{arm}: one Tail"
         );
-        assert_eq!(
-            resolved.io.consumed,
-            tail + resolved.io.rederive_head,
-            "{arm}"
-        );
+        assert_eq!(resolved.io.consumed, tail, "{arm}");
         assert_eq!(resolved.batches.len(), 1, "{arm}: one POST");
         money_oracle::assert_equivalent(&cold, &resolved);
         whole_body(&cold, &resolved);
@@ -850,6 +854,7 @@ fn pi_stale_survivor_holds_then_resolves_with_a_counted_tail() {
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_version_rewrite_after_restart_reads_one_real_edit_full() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::os::unix::fs::MetadataExt;
     if !supported("pi_transition_rewrite") {
         return;
@@ -926,7 +931,7 @@ fn pi_version_rewrite_after_restart_reads_one_real_edit_full() {
             "{arm}: the new record Tails"
         );
         assert_eq!(f.certificates_refused(Mode::Restart), 0, "{arm}: Tail");
-        assert_eq!(restored.io.consumed, tail + restored.io.rederive_head);
+        assert_eq!(restored.io.consumed, tail);
         money_oracle::assert_equivalent(&cold, &restored);
         whole_body(&cold, &restored);
     }
@@ -943,6 +948,7 @@ fn pi_version_rewrite_after_restart_reads_one_real_edit_full() {
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_corrupt_or_truncated_record_rebuilds_once_then_replaces_it() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_t14") {
         return;
     }
@@ -997,7 +1003,7 @@ fn pi_corrupt_or_truncated_record_rebuilds_once_then_replaces_it() {
             ((0, 1, 0), 1),
             "{name}"
         );
-        assert_eq!(restored.io.consumed, tail + restored.io.rederive_head);
+        assert_eq!(restored.io.consumed, tail);
         money_oracle::assert_equivalent(&cold, &restored);
         whole_body(&cold, &restored);
     }
@@ -1013,6 +1019,7 @@ fn pi_corrupt_or_truncated_record_rebuilds_once_then_replaces_it() {
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_unknown_record_holds_without_full_or_post_and_survives_gc() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_unknown") {
         return;
     }
@@ -1067,6 +1074,7 @@ fn pi_unknown_record_holds_without_full_or_post_and_survives_gc() {
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_active_bound_is_one_paced_no_record_full_and_keeps_the_record() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_active_bound") {
         return;
     }
@@ -1170,6 +1178,7 @@ fn pi_active_bound_is_one_paced_no_record_full_and_keeps_the_record() {
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_cache_copy_refusal_is_one_paced_counted_full_then_a_delay() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_cache_copy") {
         return;
     }
@@ -1270,6 +1279,7 @@ fn pi_cache_copy_refusal_is_one_paced_counted_full_then_a_delay() {
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_appended_while_down_over_an_hour_restores_and_tails() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_audit") {
         return;
     }
@@ -1312,11 +1322,7 @@ fn pi_appended_while_down_over_an_hour_restores_and_tails() {
             ((0, 1, 0), 1),
             "{name}: restore + Tail, no Full(AuditDue)"
         );
-        assert_eq!(
-            restored.io.consumed,
-            tail + restored.io.rederive_head,
-            "{name}"
-        );
+        assert_eq!(restored.io.consumed, tail, "{name}");
         money_oracle::assert_equivalent(&cold, &restored);
         whole_body(&cold, &restored);
     }
@@ -1333,6 +1339,7 @@ fn pi_appended_while_down_over_an_hour_restores_and_tails() {
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_downgrade_then_reupgrade_restores_the_kept_record() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_downgrade") {
         return;
     }
@@ -1388,7 +1395,7 @@ fn pi_downgrade_then_reupgrade_restores_the_kept_record() {
     let cold = f.emit_bodies(Mode::ColdFull);
     let restored = f.emit_bodies(Mode::Restart);
     assert_eq!((restored.modes, restored.restored), ((0, 1, 0), 1));
-    assert_eq!(restored.io.consumed, tail + restored.io.rederive_head);
+    assert_eq!(restored.io.consumed, tail);
     money_oracle::assert_equivalent(&cold, &restored);
     whole_body(&cold, &restored);
 }
@@ -1402,6 +1409,7 @@ fn pi_downgrade_then_reupgrade_restores_the_kept_record() {
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_mixed_with_claude_keeps_each_source_cold_equivalent() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_mixed") {
         return;
     }
@@ -1588,6 +1596,7 @@ fn assert_store_private(f: &PiDriver, mode: Mode) {
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_canaries_never_reach_persisted_records_and_the_selector_is_validated() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_canaries") {
         return;
     }
@@ -1618,7 +1627,7 @@ fn pi_canaries_never_reach_persisted_records_and_the_selector_is_validated() {
     let (restored, events) =
         crate::local_resource_diagnostics::capture(|| f.emit_bodies(Mode::Restart));
     assert_eq!((restored.modes, restored.restored), ((0, 1, 0), 1));
-    assert_eq!(restored.io.consumed, tail + restored.io.rederive_head);
+    assert_eq!(restored.io.consumed, tail);
     money_oracle::assert_equivalent(&cold, &restored);
     whole_body(&cold, &restored);
     assert_private("diagnostics", &serde_json::to_vec(&events).unwrap());
@@ -1648,14 +1657,14 @@ fn pi_canaries_never_reach_persisted_records_and_the_selector_is_validated() {
 
 /// restore→Tail on a body with a header cwd and a first prompt: one Tail and
 /// the whole body equal to a cold Full, first-prompt title and money included.
-/// The record stores no first-prompt value, so this is expected red until the
-/// Pi first_prompt head re-derive lands.
+/// The record stores only its H fence; bounded replay rebuilds the prompt.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_restored_tail_publishes_the_first_prompt_title_of_a_cold_full() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_transition_first_prompt") {
         return;
     }

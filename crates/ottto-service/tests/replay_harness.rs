@@ -281,9 +281,6 @@ const LIFECYCLE_COUNTERS: &[(&str, CounterClass)] = &[
     // insertion, a subset of insert_entries_evicted.
     ("cache_evicted_by_pi_claude_code", CounterClass::Observation),
     ("cache_evicted_by_pi_codex", CounterClass::Observation),
-    // snapshots.rs::finalize_scan_after_policy_with_body_witness: a surviving
-    // offer of a restored Pi Tail below the accepted extent; not a refusal.
-    ("pi_restored_behind_accepted", CounterClass::Observation),
     // transcript_cache.rs::evict_until: cursor reservation victim action.
     (
         "cursor_reservation_entries_evicted",
@@ -424,7 +421,28 @@ fn checked_counter_map(
     Ok(counts)
 }
 
+// The shared restore disposition moved off the process lifecycle registry.
+// It remains an observation; it cannot witness or excuse a layout refusal.
+const DURABLE_ALARM_OBSERVATIONS: &[(&str, CounterClass)] =
+    &[("restored_behind_accepted", CounterClass::Observation)];
+
 fn retention_witness(rows: &[Value]) -> Result<RetentionWitness, String> {
+    for row in rows
+        .iter()
+        .filter(|row| row["record"]["stage"] == "durable_tail_alarm")
+    {
+        for (key, _) in DURABLE_ALARM_OBSERVATIONS {
+            if let Some(outcomes) = row["record"]["counts"].get(key) {
+                let outcomes = outcomes.as_object().ok_or("invalid restore observation")?;
+                for (outcome, count) in outcomes {
+                    if !matches!(outcome.as_str(), "held" | "published") || count.as_u64().is_none()
+                    {
+                        return Err("invalid restore observation outcome".into());
+                    }
+                }
+            }
+        }
+    }
     let counts = &rows
         .iter()
         .rev()

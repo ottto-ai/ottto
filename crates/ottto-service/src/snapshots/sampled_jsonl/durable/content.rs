@@ -277,18 +277,7 @@ impl Decoded {
                                 }
                             }
                         }
-                        SnapshotSource::Pi => {
-                            if string_eq_at(value, &["type"], "session") {
-                                pi_workspace_content(value, &mut fresh);
-                            }
-                            if string_eq_at(value, &["type"], "message") {
-                                pi_prompt_content(
-                                    value,
-                                    pi_message_role(value).as_deref(),
-                                    &mut fresh,
-                                );
-                            }
-                        }
+                        SnapshotSource::Pi => pi_content_line(value, &mut fresh),
                     }
                     Ok(())
                 },

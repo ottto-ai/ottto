@@ -164,7 +164,7 @@ pub(in crate::snapshots) fn record_rederive_refused(source: SnapshotSource, clas
     }
 }
 
-/// Only an actual restored Tail may report this disposition. The extent is
+/// A restored Tail (or Pi Unchanged) may report this disposition. The extent is
 /// frozen at native preparation, before index mutations or later appends.
 pub(in crate::snapshots) fn restored_tail_below_accepted(
     source: SnapshotSource,
@@ -172,12 +172,37 @@ pub(in crate::snapshots) fn restored_tail_below_accepted(
     mode: crate::transcript_acquisition::ReadMode,
     frozen: Option<u64>,
     accepted: Option<u64>,
-) -> bool {
-    restart_restore::enabled()
+) -> Option<u64> {
+    (restart_restore::enabled()
         && matches!(source, SnapshotSource::Codex | SnapshotSource::Pi)
         && restored
-        && mode == crate::transcript_acquisition::ReadMode::Tail
-        && frozen.zip(accepted).is_some_and(|(end, floor)| end < floor)
+        && (mode == crate::transcript_acquisition::ReadMode::Tail
+            || (source == SnapshotSource::Pi
+                && mode == crate::transcript_acquisition::ReadMode::Unchanged))
+        && frozen.zip(accepted).is_some_and(|(end, floor)| end < floor))
+    .then_some(accepted)
+    .flatten()
+}
+
+#[cfg(test)]
+thread_local! {
+    static PUBLICATION_OBSERVATIONS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn observe_restored_publications<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    struct Reset(Option<u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PUBLICATION_OBSERVATIONS.with(|slot| slot.set(self.0));
+        }
+    }
+    let _reset = Reset(PUBLICATION_OBSERVATIONS.with(|slot| slot.replace(Some(0))));
+    let result = f();
+    (
+        result,
+        PUBLICATION_OBSERVATIONS.with(|slot| slot.get().unwrap()),
+    )
 }
 
 pub(in crate::snapshots) fn record_restored_publication(
@@ -186,6 +211,12 @@ pub(in crate::snapshots) fn record_restored_publication(
     published: bool,
 ) {
     if behind && published {
+        #[cfg(test)]
+        PUBLICATION_OBSERVATIONS.with(|slot| {
+            if let Some(count) = slot.get() {
+                slot.set(Some(count + 1));
+            }
+        });
         crate::local_resource_diagnostics::durable_tail_alarm(
             source.api_slug(),
             &serde_json::json!({"restored_behind_accepted":{"published":1}}),

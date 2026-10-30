@@ -253,6 +253,11 @@ pub(crate) struct Checkpoint {
 }
 
 impl Checkpoint {
+    /// The interpretation scope this checkpoint was made under.
+    pub(crate) fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
     /// A cache admission hint only. Source validation still uses the complete
     /// stamp, scope, samples and independent audit obligation.
     pub(crate) fn modified_hint(&self) -> (i64, i64) {

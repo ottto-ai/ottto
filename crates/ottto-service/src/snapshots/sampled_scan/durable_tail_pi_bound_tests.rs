@@ -218,6 +218,7 @@ fn pi_pace_map_overflow_reads_evicts_oldest_and_alarms() {
 }
 
 fn pi_structural_transition(overflow: bool) {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -250,6 +251,8 @@ fn pi_structural_transition(overflow: bool) {
                     FullPace {
                         at: now - age,
                         structural: false,
+                        flags: FULL_SPENT,
+                        head_extent: 0,
                     },
                 );
             }
@@ -372,6 +375,7 @@ fn pi_structural_transition(overflow: bool) {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
 fn pi_lease_busy_is_a_counted_fair_delay_then_restore_tail() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -452,6 +456,7 @@ fn pi_cache_copy_pace_map_overflow_reads_and_evicts_oldest() {
 }
 
 fn pi_cache_copy(overflow: bool) {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     const _: () = assert!(PACE_SECS == 6 * 3600, "rule 5: one Full per 6 h");
     if !crate::test_isolation::run_here() {
         return;
@@ -487,6 +492,8 @@ fn pi_cache_copy(overflow: bool) {
                     FullPace {
                         at: now - age,
                         structural: false,
+                        flags: FULL_SPENT,
+                        head_extent: 0,
                     },
                 );
             }

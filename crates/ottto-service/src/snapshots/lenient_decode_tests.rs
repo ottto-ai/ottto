@@ -829,7 +829,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     .unwrap();
     scan.snapshots = vec![snapshot];
     scan.pending_finalization.push(PendingIndexFinalization {
-        restored_behind_accepted: false,
+        restored_behind_accepted: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: key.clone(),
@@ -840,7 +840,6 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
         diagnostic_reason: FileReason::Complete,
         parsed_snapshot_count: 1,
         effective_upload_body_witness_revision: 0,
-        pi_restored_behind_accepted: None,
     });
     finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut loaded);
     assert!(scan.snapshots.is_empty());
@@ -4879,7 +4878,7 @@ fn o3_ambiguous_negative_evidence_refuses_through_every_reader() {
 /// These facts are independent of the native layout a restore needs.
 #[test]
 fn pi_restored_behind_accepted_counts_an_offer_or_an_index_regression() {
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    use crate::local_resource_diagnostics::capture;
     let scratch = crate::test_scratch::ScratchDir::new("lenient-pi-behind-accepted");
     let key = "/synthetic/0.jsonl".to_string();
     let mut body = tests::sample_session_artifact_item();
@@ -4909,14 +4908,17 @@ fn pi_restored_behind_accepted_counts_an_offer_or_an_index_regression() {
             diagnostic_reason: FileReason::Complete,
             parsed_snapshot_count: 1,
             effective_upload_body_witness_revision: 0,
-            pi_restored_behind_accepted: extent,
-            restored_behind_accepted: false,
+
+            restored_behind_accepted: extent,
         });
         let (_, counts) =
-            observe(|| finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut index));
+            capture(|| finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut index));
         let entry = &index.files[&key];
         (
-            counts.pi_restored_behind_accepted,
+            counts
+                .iter()
+                .filter_map(|r| r["counts"]["restored_behind_accepted"]["published"].as_u64())
+                .sum::<u64>(),
             scan.snapshots.len(),
             entry.last_snapshot_fingerprint.clone(),
             entry.last_upload_body_witness.clone(),
