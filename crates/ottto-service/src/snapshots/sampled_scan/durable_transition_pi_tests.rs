@@ -664,6 +664,7 @@ fn pi_restored_unchanged_below_accepted_counts_its_smaller_offer() {
         std::fs::write(path, bytes).unwrap();
     }
     std::fs::write(&f.path, &sealed).unwrap();
+    input_clock(&f.path); // Preserve the survivor certificate's equal-length mtime.
     f.restart();
     let extent = sealed.len() as u64;
     assert!(extent < accepted_size);
