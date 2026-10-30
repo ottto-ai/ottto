@@ -198,9 +198,9 @@ fn receipt(name: &str, bodies: &[ReceiptBody]) {
 
 /// The disk arm's state directory (#806): the committed scan index and,
 /// beside it, the real durable store, under a test-held single-writer lock
-/// (#801). Every arm loads the SAME committed index from here. It is not an
-/// ancestor of the corpus support dir, so the RAM and cold arms hold no
-/// state-directory writer, exactly as before.
+/// (#801). Every arm loads the SAME committed index. A restart forks those
+/// committed bytes before the retained arm can replace its write-ahead record.
+/// Each arm keeps the production single-writer ownership of its own store.
 struct Disk {
     dir: PathBuf,
     index: PathBuf,
@@ -220,7 +220,32 @@ impl Disk {
     }
     /// A new owner: a restarted process with an empty RAM cache, whose pass
     /// begins on the store as the daemon's does.
-    fn owner(&self, source: SnapshotSource) -> E2ScanFixture {
+    fn owner(&mut self, source: SnapshotSource) -> E2ScanFixture {
+        // Native acquisition writes ahead of the index save. Each
+        // counterfactual arm needs the committed predecessor, even after
+        // the retained arm advances its own store on the same transcript.
+        if !self.index.exists() {
+            let owner = E2ScanFixture::default();
+            self.begin(&owner, source);
+            return owner;
+        }
+        let dir = self.dir.join("restart");
+        std::fs::create_dir(&dir).unwrap();
+        crate::locked_state_dir::test_locks::hold(&dir);
+        let index = dir.join("scan-index.json");
+        std::fs::copy(&self.index, &index).unwrap();
+        let old_store = crate::durable_tail_store::store_dir_for_index(&self.index);
+        let new_store = crate::durable_tail_store::store_dir_for_index(&index);
+        std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+            .create(&new_store).unwrap();
+        if old_store.exists() {
+            for entry in std::fs::read_dir(old_store).unwrap() {
+                let entry = entry.unwrap();
+                std::fs::copy(entry.path(), new_store.join(entry.file_name())).unwrap();
+            }
+        }
+        self.dir = dir;
+        self.index = index;
         let owner = E2ScanFixture::default();
         self.begin(&owner, source);
         owner
@@ -295,7 +320,7 @@ fn warm_claude(c: &Corpus, disk: &Disk) -> (E2ScanFixture, ScanIndex) {
 fn compare_claude(
     c: &Corpus,
     retained: &E2ScanFixture,
-    disk: &Disk,
+    disk: &mut Disk,
     prior: ScanIndex,
     mode: (usize, usize, usize),
 ) -> ReceiptBody {
@@ -440,7 +465,7 @@ fn claude_case(name: &str) {
             // being suppressed as an unchanged body before real upload.
             c.evidence(&[api("r1", 10, 100)], &[]);
         }
-        let disk = Disk::new(&c);
+        let mut disk = Disk::new(&c);
         let (scanner, prior) = warm_claude(&c, &disk);
         let mut mode = (0, 1, 0);
         match name {
@@ -639,7 +664,7 @@ fn claude_case(name: &str) {
         if mode.1 > 0 {
             input_clock(&path);
         }
-        receipt(name, &[compare_claude(&c, &scanner, &disk, prior, mode)]);
+        receipt(name, &[compare_claude(&c, &scanner, &mut disk, prior, mode)]);
     });
 }
 
@@ -716,7 +741,7 @@ fn codex_case(legacy: bool, content: bool) {
         return;
     }
     let c = corpus(name);
-    let disk = Disk::new(&c);
+    let mut disk = Disk::new(&c);
     let path = c.root.join("rollout.jsonl");
     let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z","payload":{"id":ROOT,"timestamp":"2026-10-27T07:00:00Z"}}).to_string()+"\n";
     let content_prefix = if content {
@@ -764,6 +789,7 @@ fn codex_case(legacy: bool, content: bool) {
         append(&path, &codex_rows("turn-c", 40));
         input_clock(&path);
     }
+    let restart = disk.owner(source);
     save_inputs(&c);
     let (tail_index, tail, modes) = other_page(&c, &scanner, source, prior.clone());
     assert_eq!(modes, (0, 1, 0), "must reuse retained Codex reduction");
@@ -771,7 +797,6 @@ fn codex_case(legacy: bool, content: bool) {
     assert_eq!(modes, (1, 0, 0));
     // Disk arm (#806): a new owner restores the last commit's record from
     // the real store and Tails, never flipping the counting choice.
-    let restart = disk.owner(source);
     let (disk_index, restored, modes) = other_page(&c, &restart, source, prior);
     assert_eq!(modes, (0, 1, 0), "must restore the Codex record, then Tail");
     assert_eq!(durable_restores(&restart.cache, source).1, 1);
@@ -874,7 +899,7 @@ fn restart_between_pages() {
         return;
     }
     with_e2(|| {
-        let (c, disk, path, scanner, prior) = disk_corpus(name);
+        let (c, mut disk, path, scanner, prior) = disk_corpus(name);
         let mut priors = [prior.clone(), prior.clone(), prior];
         let mut bodies = Vec::new();
         for (request, tokens) in [("r2", 20), ("r3", 30)] {
@@ -912,7 +937,7 @@ fn upgrade_without_semantic_revision() {
         return;
     }
     with_e2(|| {
-        let (c, disk, path, scanner, prior) = disk_corpus(name);
+        let (c, mut disk, path, scanner, prior) = disk_corpus(name);
         let written = disk.record_bytes();
         assert_eq!(written.len(), 1);
         disk.begin(&scanner, SnapshotSource::ClaudeCode);
@@ -958,7 +983,7 @@ fn downgrade_then_reupgrade() {
         return;
     }
     with_e2(|| {
-        let (c, disk, path, _, prior) = disk_corpus(name);
+        let (c, mut disk, path, _, prior) = disk_corpus(name);
         let downgraded = E2ScanFixture::default();
         grow(&path, "r2", 20);
         let mut down = c.raw(&downgraded, prior, 100, true, &[]);

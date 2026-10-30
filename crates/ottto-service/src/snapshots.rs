@@ -49,6 +49,17 @@ pub(crate) struct DurableCustody {
 crate::heap_layout_bound::fields!(DurableCustody; #[cfg(unix)] active, #[cfg(unix)] chain,
     #[cfg(unix)] owed, #[cfg(unix)] retail, #[cfg(unix)] upgrade);
 impl DurableCustody {
+    /// Heap owned by the optional cache box, including its allocation layout.
+    pub(crate) fn retained_bytes(&self, limit: usize) -> Option<usize> {
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        if self.is_empty() {
+            return Some(0);
+        }
+        let mut counter = Counter::new(limit);
+        counter.add(std::mem::size_of::<Self>().checked_add(std::mem::align_of::<Self>())?)?;
+        self.heap_bound(&mut counter)?;
+        Some(counter.bytes)
+    }
     pub(crate) fn is_empty(&self) -> bool {
         #[cfg(unix)]
         {
@@ -30218,9 +30229,15 @@ impl OwnedSourceScan {
                 let m3_route = sampling
                     .as_ref()
                     .zip(file_sampling.as_ref())
-                    .filter(|_| {
+                    .filter(|(_, active)| {
                         restart_restore::enabled()
                             && matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex)
+                            // No new acquisition is written for an ordinary
+                            // Unchanged read. Receipt-owed retries retain their
+                            // exact native owner; quiet debt changes settle only
+                            // through the post-save writer and index CAS.
+                            && (active.mode != crate::transcript_acquisition::ReadMode::Unchanged
+                                || completed_acquisition.as_ref().is_some_and(|c| c.durable.owed().is_some()))
                             && !comparison_target
                             && side_origin.is_none()
                             && aliases.is_empty()

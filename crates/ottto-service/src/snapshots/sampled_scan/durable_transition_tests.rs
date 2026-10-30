@@ -952,7 +952,7 @@ fn shared_transition_crash_edges_reach_sigkill_and_keep_a_valid_survivor() {
                 births: BTreeMap::from([(path.clone(), nanos("2026-08-02T07:00:00Z"))]),
             };
             grow(&path, "recovery-append", 90);
-            let disk = Disk::new(&c);
+            let mut disk = Disk::new(&c);
             let mut cold = c.raw(&E2ScanFixture::default(), index.clone(), 100, true, &[]);
             let owner = disk.owner(SOURCE);
             let mut recovered = c.raw(&owner, index, 100, true, &[]);
@@ -993,7 +993,7 @@ fn shared_codex_dated_legacy_and_v2_receipts_survive_two_restarts() {
         } else {
             "transition-codex-v2"
         });
-        let disk = Disk::new(&c);
+        let mut disk = Disk::new(&c);
         let path = c.root.join("rollout.jsonl");
         let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z",
             "payload":{"id":ROOT,"timestamp":"2026-10-27T07:00:00Z"}})
@@ -1264,7 +1264,7 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         + "\n";
     std::fs::write(&path, header + &codex_rows("initial", 10)).unwrap();
     input_clock(&path);
-    let disk = Disk::new(&c);
+    let mut disk = Disk::new(&c);
     let source = SnapshotSource::Codex;
     let _cutover = crate::snapshots::TestCutover::set(0);
     let writer = disk.owner(source);

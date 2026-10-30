@@ -2342,7 +2342,15 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         assert_eq!(counts.write_deferred, 1, "{arm}: c deferred by bytes");
         assert_eq!(disk.records_written, 2, "{arm}: a and b");
         assert_eq!(disk.disk_records, 3, "{arm}: c's prior, a, b");
-        assert!(counts.not_persisted.is_empty(), "{arm}");
+        assert_eq!(
+            counts.not_persisted,
+            if t14 {
+                BTreeMap::from([("skill_label_purge_failed", 1)])
+            } else {
+                BTreeMap::new()
+            },
+            "{arm}"
+        );
         assert_eq!(disk.records_invalidated, 0, "{arm}");
         let after_first = record_files();
         assert_eq!(after_first.len(), 3, "{arm}");
@@ -2377,8 +2385,13 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         assert_eq!(disk.t14_rebuild_full_started, u64::from(t14));
         assert_eq!(disk.records_written, 3, "{arm}: c's replacement written");
         assert_eq!(disk.disk_records, 3, "{arm}");
-        assert!(
-            counts.not_persisted.is_empty(),
+        assert_eq!(
+            counts.not_persisted,
+            if t14 {
+                BTreeMap::from([("skill_label_purge_failed", 2)])
+            } else {
+                BTreeMap::new()
+            },
             "{arm}: no selection refusal"
         );
         assert_eq!(disk.records_invalidated, 0, "{arm}");
@@ -2910,6 +2923,12 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
             let key = local_index_key(&path);
             let index_path = root.join("index.json");
             let namespace = Scope("access-body".into());
+            std::fs::create_dir_all(root.join("snapshots")).unwrap();
+            std::fs::write(
+                root.join("snapshots/claude_code-reemission-exclusions.txt"),
+                b"# synthetic access fixture\n",
+            )
+            .unwrap();
             let run = |cache: Arc<SharedCache>, index: ScanIndex| {
                 let mut scan = OwnedSourceScan::new(
                     source,
@@ -2919,7 +2938,7 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
                     365,
                     100,
                     false,
-                    None,
+                    Some(&root),
                     &[],
                     false,
                     true,
@@ -3163,9 +3182,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         assert_eq!(stats.t14_rebuild, 1);
         if arm == "codec" {
             assert_eq!(
-                counts
-                    .not_persisted
-                    .get("SnapshotAccumulator.activity_skills"),
+                counts.not_persisted.get("skill_label_consent_off"),
                 Some(&1)
             );
         }
@@ -3404,7 +3421,10 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     store::test_hooks::set_before_rename(None);
     let summaries: Vec<_> = startup_alarms
         .iter()
-        .filter(|alarm| alarm["counts"]["t14_rebuild_full_started"].is_number())
+        .filter(|alarm| {
+            alarm["counts"]["t14_rebuild_full_started"].is_number()
+                && alarm["counts"]["platform"].is_string()
+        })
         .collect();
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0]["counts"]["t14_rebuild_full_started"], 1);
@@ -12062,15 +12082,19 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
         &index,
         &interpretation,
     ) {
-        RestoreOutcome::Restored(taken, lease) => (taken.retained, lease),
+        RestoreOutcome::Restored(taken, lease) => (taken, lease),
         _ => panic!("unscaled sizing restore must succeed"),
     };
-    let incoming_heap = bound(&incoming, crate::transcript_cache::ENTRY_BYTES).unwrap()
-        - std::mem::size_of_val(&incoming);
+    let custody_bytes = incoming
+        .durable
+        .retained_bytes(crate::transcript_cache::ENTRY_BYTES)
+        .unwrap();
+    let incoming_heap = bound(&incoming.retained, crate::transcript_cache::ENTRY_BYTES).unwrap()
+        - std::mem::size_of_val(&incoming.retained);
     let incoming_slot =
         crate::transcript_cache::entry_slot_bytes::<CachedJsonlReduction>(key.capacity()).unwrap();
     let rank = crate::transcript_cache::admission_rank(
-        incoming.checkpoint.modified_hint(),
+        incoming.retained.checkpoint.modified_hint(),
         crate::transcript_cache::admission_now(),
     );
     // Size both admission arms while this graph still owns its one process
@@ -12099,12 +12123,13 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
                     // The empty retained root and the incoming entry's node
                     // are both charged; the incoming inline state lives in
                     // that node, and only its heap is added separately.
-                    let minimum = cursor_bytes + side + empty_retained + incoming_slot + incoming_heap;
+                    let minimum = cursor_bytes + side + empty_retained + incoming_slot + incoming_heap + custody_bytes;
                     assert!(minimum < state_bytes());
                     let one_byte_short = TranscriptCache::with_byte_limit(minimum - 1);
                     assert!(!one_byte_short.insertion_fits(
                         &key,
-                        &incoming,
+                        &incoming.retained,
+                        custody_bytes,
                         cursor_bytes + side,
                         rank,
                         true
@@ -12116,13 +12141,13 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
                          incoming_heap={incoming_heap} minimum={minimum} headers={before} fits={fits}"
                     );
                     assert_eq!(
-                        retained.insertion_fits(&key, &incoming, cursor_bytes + side, rank, true),
+                        retained.insertion_fits(&key, &incoming.retained, custody_bytes, cursor_bytes + side, rank, true),
                         fits,
                         "derived minimum must discriminate the header-free arm"
                     );
                     cursor.headers = headers;
                     let reserved = bound(cursor, state_bytes()).unwrap() + side;
-                    assert!(!retained.insertion_fits(&key, &incoming, reserved, rank, true));
+                    assert!(!retained.insertion_fits(&key, &incoming.retained, custody_bytes, reserved, rank, true));
                 })
                 .unwrap();
         }

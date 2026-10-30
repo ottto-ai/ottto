@@ -364,6 +364,10 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     /// A retained entry without taking it (M1 durable write after an index
     /// save encodes it in place under the retained lock).
     #[cfg_attr(not(unix), allow(dead_code))]
+    /// The same resident's acquisition provenance, borrowed under this cache guard.
+    pub(crate) fn custody(&self, key: &str) -> Option<&crate::snapshots::DurableCustody> {
+        self.entries.get(key)?.durable.as_deref()
+    }
     pub(crate) fn peek(&self, key: &str) -> Option<&Retained<S>> {
         self.entries.get(key).map(|entry| &entry.retained)
     }
@@ -486,6 +490,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         &self,
         key: &String,
         retained: &Retained<S>,
+        custody_bytes: usize,
         reserved: usize,
         rank: (i64, i64),
         victims: bool,
@@ -499,21 +504,27 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             }
             let heap = heap_layout_bound::bound(retained, self.entry_limit)?
                 .checked_sub(std::mem::size_of_val(retained))?;
-            let entry = std::mem::size_of::<Entry<S>>().checked_add(heap)?;
+            let entry = std::mem::size_of::<Entry<S>>()
+                .checked_add(heap)?
+                .checked_add(custody_bytes)?;
             heap_layout_bound::bound(key, self.entry_limit.checked_sub(entry)?)?;
             let limit = self.byte_limit.checked_sub(reserved)?;
             let mut bytes = heap_layout_bound::bound(&Self::new(0, 0, 0), limit)?
                 .checked_add(entry_slot_bytes::<S>(key.capacity())?)?
-                .checked_add(heap)?;
+                .checked_add(heap)?
+                .checked_add(custody_bytes)?;
             let mut count = 1_usize;
             for (other, entry) in &self.entries {
                 if other == key || (victims && entry.modified_hint <= rank) {
                     continue;
                 }
                 count = count.checked_add(1)?;
+                let mut custody = Counter::new(limit);
+                entry.durable.heap_bound(&mut custody)?;
                 bytes = bytes
                     .checked_add(entry_slot_bytes::<S>(other.capacity())?)?
-                    .checked_add(entry.heap_bytes)?;
+                    .checked_add(entry.heap_bytes)?
+                    .checked_add(custody.bytes)?;
             }
             // Header eviction can relieve bytes, never retained-entry count.
             ((!victims || count <= self.count_limit) && bytes <= limit).then_some(())
@@ -574,18 +585,12 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         if !taken.retained.state.supports_frozen_charge() {
             return refuse(Event::InsertFrozenChargeRefused, incoming);
         }
-        let mut custody = Counter::new(self.entry_limit);
-        let custody_box = if taken.durable.is_empty() {
-            Some(0)
-        } else {
-            std::mem::size_of::<crate::snapshots::DurableCustody>()
-                .checked_add(std::mem::align_of::<crate::snapshots::DurableCustody>())
-        };
-        let state_bytes = custody_box
-            .and_then(|bytes| custody.add(bytes))
-            .and_then(|_| taken.durable.heap_bound(&mut custody))
-            .and_then(|_| std::mem::size_of::<Entry<S>>().checked_add(heap_bytes))
-            .and_then(|n| n.checked_add(custody.bytes));
+        let custody_bytes = taken.durable.retained_bytes(self.entry_limit);
+        let state_bytes = custody_bytes.and_then(|bytes| {
+            std::mem::size_of::<Entry<S>>()
+                .checked_add(heap_bytes)?
+                .checked_add(bytes)
+        });
         let Some(state_bytes) = state_bytes.filter(|n| *n <= self.entry_limit) else {
             return refuse(Event::InsertEntryBoundRefused, incoming);
         };
@@ -594,7 +599,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         }
         let extra = entry_slot_bytes::<S>(key.len())
             .and_then(|n| n.checked_add(heap_bytes))
-            .and_then(|n| n.checked_add(custody.bytes));
+            .and_then(|n| n.checked_add(custody_bytes?));
         self.clock = next;
         let mut admitted = true;
         loop {
@@ -907,11 +912,11 @@ mod tests {
                 let key = String::from("new");
                 if reserved == 0 {
                     assert!(
-                        cache.insertion_fits(&key, &incoming, reserved, rank, false),
+                        cache.insertion_fits(&key, &incoming, 0, reserved, rank, false),
                         "count pressure alone must not evict optional headers"
                     );
                 }
-                let predicted = cache.insertion_fits(&key, &incoming, reserved, rank, true);
+                let predicted = cache.insertion_fits(&key, &incoming, 0, reserved, rank, true);
                 assert_eq!(
                     predicted,
                     cache.insert_reserving_at_rank(key, incoming, reserved, 0, Some(rank)),

@@ -5411,7 +5411,7 @@ impl SharedCache {
                 let interpretation =
                     Interpretation::of(snapshot_source, &key, index, identity_capture, namespace);
                 // Only entries the save kept bind; a dropped key has no entry.
-                let Some(expected) = expected(
+                let Some(mut expected) = expected(
                     source,
                     snapshot_source,
                     &key,
@@ -5421,6 +5421,39 @@ impl SharedCache {
                     None,
                 ) else {
                     continue;
+                };
+                // A native-settled resident keeps its V3 identity. Post-save
+                // custody may change the carrier, but must never downgrade its
+                // representation or manufacture a different acquisition.
+                let acquisition = if let Some(chain) =
+                    cache.custody(&key).and_then(DurableCustody::chain)
+                {
+                    if chain.acquired_revision() != effective_revision(snapshot_source)
+                        || chain.file_scope() != retained.checkpoint.scope()
+                    {
+                        not_persisted.push("acquisition");
+                        continue;
+                    }
+                    let Ok(counting) = acquired::ImmutableCounting::from_reduction(&retained.state)
+                    else {
+                        not_persisted.push("acquisition");
+                        continue;
+                    };
+                    expected.binding.entry = [0; 32];
+                    expected.binding.scope = v3_replay_scope(
+                        snapshot_source,
+                        retained.checkpoint.scope(),
+                        index,
+                        &interpretation,
+                        chain.acquired_revision(),
+                        &counting,
+                    );
+                    Some(store::AcquisitionFields {
+                        acquired_revision: chain.acquired_revision(),
+                        protocol: chain.write_protocol(),
+                    })
+                } else {
+                    None
                 };
                 let Some(mut certificate) = certificate_at(
                     &key,
@@ -5468,7 +5501,7 @@ impl SharedCache {
                         }
                         offered.insert(expected.binding.key, key);
                         pending.push(PendingRecord {
-                            acquisition: None,
+                            acquisition,
                             binding: expected.binding,
                             certificate,
                             body,
@@ -5503,6 +5536,21 @@ impl SharedCache {
         for class in not_persisted {
             Counters::bump(&mut counters.not_persisted, class);
         }
+        for key in offered.values() {
+            let digest = store::key_digest(source, key);
+            if let Some(replacement) = pending
+                .iter()
+                .find(|r| r.binding.key == digest && r.acquisition.is_some())
+            {
+                stores.slots[source.slot()]
+                    .as_mut()?
+                    .store
+                    .authorize_native(
+                        &replacement.binding,
+                        replacement.acquisition?.acquired_revision,
+                    );
+            }
+        }
         if source == DurableSource::ClaudeCode {
             for key in offered.values() {
                 let digest = store::key_digest(source, key);
@@ -5516,6 +5564,9 @@ impl SharedCache {
                 }
                 let stores = &mut *stores;
                 let replacement = pending.iter().find(|r| r.binding.key == digest)?;
+                if replacement.acquisition.is_some() {
+                    continue;
+                }
                 authorize_strict(
                     stores.slots[source.slot()].as_mut()?,
                     snapshot_source,

@@ -440,7 +440,8 @@ impl SharedCache {
             .is_ok()
     }
     /// A completion whose durable record the M3 native route already
-    /// settled: admitted like any copy, but never a post-save write offer.
+    /// settled. Keep its post-save offer: the saved audit carrier can change
+    /// after native settlement (in particular, quiet audit retirement).
     #[cfg(unix)]
     pub(super) fn insert_settled(
         &self,
@@ -448,7 +449,7 @@ impl SharedCache {
         completed: sampled_jsonl::CompletedNativeAcquisition,
         live_bytes: usize,
     ) -> bool {
-        self.insert_with_custody(key, completed, live_bytes, false, false, false)
+        self.insert_with_custody(key, completed, live_bytes, false, true, false)
             .is_ok()
     }
     pub(super) fn return_prepared_taken(
@@ -466,10 +467,8 @@ impl SharedCache {
         take_back: bool,
     ) -> Result<Option<crate::transcript_cache::Taken<CachedJsonlReduction>>, I> {
         let taken: &crate::transcript_cache::Taken<CachedJsonlReduction> = incoming.borrow();
-        let fits = taken
-            .durable
-            .heap_bound(&mut Counter::new(state_bytes()))
-            .is_some();
+        let custody_bytes = taken.durable.retained_bytes(state_bytes());
+        let fits = custody_bytes.is_some();
         #[cfg(test)]
         let fits = fits && !sampled_jsonl::preparation_tests::heap_refused();
         if !fits {
@@ -481,13 +480,8 @@ impl SharedCache {
             return Err(incoming);
         };
         let live_bytes = taken.finalization_charge;
-        let reserved = self.retained_reservation(
-            &cache,
-            &key,
-            &taken.retained,
-            live_bytes,
-            taken.modified_hint,
-        );
+        let reserved =
+            self.retained_reservation(&cache, &key, taken, live_bytes, taken.modified_hint);
         let touched = key.clone();
         let result = cache.insert_taken_reserving(key, incoming, reserved);
         self.drop_suspended_proof_if_over(&cache, live_bytes);

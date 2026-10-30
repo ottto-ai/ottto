@@ -1552,7 +1552,7 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                 cache.durable_begin_pass(source, &index_path, &scope, true);
                 cache
             };
-            let cache = begin();
+            let cache = Arc::new(sampled_scan::SharedCache::default());
             let (mut index, _, _) = production_scan(
                 &fixture,
                 source,
@@ -1560,6 +1560,8 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                 Some(cache.clone()),
                 &scope.0,
             );
+            cache.durable_begin_pass(source, &index_path, &scope, true);
+            cache.durable_note_selection(&key, &index.files[&key].source_file_fingerprint);
             index.save(&index_path).unwrap();
             assert_eq!(
                 cache
@@ -1577,8 +1579,8 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
             assert_eq!(
                 cache
                     .durable_write_after_save(lock, source, &index)
-                    .unwrap()
-                    .written,
+                    .map(|receipt| receipt.written + receipt.clean)
+                    .unwrap(),
                 1
             );
             let record_path = fs::read_dir(store::store_dir_for_index(&index_path))
@@ -1588,7 +1590,16 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                 .unwrap()
                 .path();
             let predecessor = fs::read(&record_path).unwrap();
-            assert_eq!(predecessor[311], 1, "#865's envelope carries the debt");
+            let ds = sampled_scan::durable_tail::durable_source(source).unwrap();
+            let mut disk =
+                store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+            let store::ReadOutcome::Found(record) = disk.read(&store::key_digest(ds, &key)) else {
+                panic!("the native predecessor is verified");
+            };
+            assert!(
+                record.envelope_audit_debt.is_some(),
+                "#865's envelope carries the debt"
+            );
             let full_time = cache
                 .retained_checkpoint(&key)
                 .unwrap()

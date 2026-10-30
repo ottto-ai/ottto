@@ -385,7 +385,16 @@ impl SharedCache {
                 lease,
             )
             .ok_or(HeldCause::Incompatible)?;
-        self.authorize_predecessor(lease, source, key, index, &binding, checkpoint, &m)?;
+        self.authorize_predecessor(
+            lease,
+            source,
+            key,
+            index,
+            &binding,
+            checkpoint,
+            &m,
+            write_ahead_eligible,
+        )?;
         acquired::capture_chain(
             acquired::ChainInputs {
                 source,
@@ -442,6 +451,7 @@ impl SharedCache {
             &binding,
             checkpoint,
             &m,
+            false,
         )?;
         chain.rebind(
             opened_object_identity,
@@ -465,6 +475,7 @@ impl SharedCache {
         binding: &Binding,
         checkpoint: &Checkpoint,
         held: &std::fs::Metadata,
+        full: bool,
     ) -> Result<(), HeldCause> {
         let ds = durable_source(source).ok_or(HeldCause::Incompatible)?;
         let digest = binding.key;
@@ -483,6 +494,56 @@ impl SharedCache {
             })
         }) {
             return Ok(());
+        }
+        if full {
+            let mut stores = self.durable().ok_or(HeldCause::Fence)?;
+            let slot = stores.slot(ds).as_mut().ok_or(HeldCause::Fence)?;
+            match slot
+                .store
+                .read_bounded(&digest, lease)
+                .map_err(|_| HeldCause::CustodyBound)?
+            {
+                ReadOutcome::Found(record) => {
+                    let same_context = record.record.binding.context == binding.context;
+                    let native = record.format == store::FORMAT_V3
+                        && record
+                            .record
+                            .acquisition
+                            .is_some_and(|a| a.acquired_revision == effective_revision(source));
+                    let missing_carrier = !index.files.contains_key(key)
+                        && record.format == store::FORMAT_V1
+                        && record.envelope_audit_debt.is_some();
+                    if same_context
+                        && (native || missing_carrier)
+                        && record.record.allowlist == ds.properties().allowlist()
+                    {
+                        // A completed byte-zero read replaces a verified current
+                        // representation; it never reuses the predecessor's body.
+                        // Native commit still checks this read's O, checkpoint and
+                        // PRE index, and the store checks this exact predecessor.
+                        slot.store.authorize(
+                            &record,
+                            &Expected {
+                                binding: record.record.binding.clone(),
+                                committed_generation: record.index_generation,
+                            },
+                        );
+                        return Ok(());
+                    }
+                    if !same_context {
+                        // This namespace cannot mutate the foreign record. Keep
+                        // the ordinary Full publication, without a staged write.
+                        return Err(HeldCause::Incompatible);
+                    }
+                }
+                ReadOutcome::Refused(reason) => return Err(HeldCause::Protected(reason)),
+                ReadOutcome::Missing => return Ok(()),
+            }
+            // The unmatched probe is gone before strict legacy authorization
+            // reads its predecessor. Its allocations no longer own this credit.
+            lease
+                .refund(store::RESTORE_INPUT_BYTES)
+                .map_err(|_| HeldCause::CustodyBound)?;
         }
         // A cold v3 predecessor is read once, then every warm mutation uses
         // the saved stamp. It owes no v1 old-byte witness/custody slot.
