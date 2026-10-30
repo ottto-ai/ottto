@@ -423,28 +423,76 @@ fn pi_lease_busy_is_a_counted_fair_delay_then_restore_tail() {
     assert_eq!(cache.durable().unwrap().counters.restored, 1);
 }
 
-// P-CACHE-COPY (E1 ruling (b)): a decoded Pi graph over the RAM cache entry
-// bound is refused at cache admission (`insert_taken`), so the restore takes
+// P-CACHE-COPY (E1 ruling (b); Lead B signed 2026-10-30 with conditions): a
+// decoded Pi graph over the RAM cache entry bound is refused at cache
+// admission (`insert_taken`), so the restore takes
 // `restore_resource_pending("cache_transit")`: exactly ONE paced, counted
-// Full under that existing cause and the shared pace, counted for Pi as
-// `resource_full{cache_transit.pi}`. Growth inside the pace window is a
-// counted delay with 0 Full; past it, the next paced Full reads it.
+// Full under that existing cause, on the existing shared pace stamp
+// (`full_pace_key`, `PACE_SECS` = 6 h; no new cause or pace key). It is
+// counted for Pi as `resource_full{cache_transit.pi}` and alarmed by the
+// existing `durable_tail_alarm{restore_resource_full{cache_transit}}`, once
+// per counted Full. Growth inside the window, up to its last second, is a
+// counted delay with 0 Full; at 6 h the next paced Full reads it.
 // Revisit trigger: if the Pi cache_transit count is ever > 0 on M4 or the
 // fleet, a cache-less restore -> Tail path becomes next-release work.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
 fn pi_over_entry_graph_is_one_paced_counted_cache_transit_full() {
+    pi_cache_copy(false);
+}
+
+// Rule 7 on this path: the shared pace map is full when the over-entry Pi
+// key first grows. It fails toward reading: the cache_transit Full runs, the
+// oldest stamp is evicted (`pace_evicted` == 1 on the Pi slot, its own
+// alarm) and the Pi key is stamped, so the window still holds afterwards.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
+fn pi_cache_copy_pace_map_overflow_reads_and_evicts_oldest() {
+    pi_cache_copy(true);
+}
+
+fn pi_cache_copy(overflow: bool) {
+    const _: () = assert!(PACE_SECS == 6 * 3600, "rule 5: one Full per 6 h");
     if !crate::test_isolation::run_here() {
         return;
     }
     assert!(crate::heap_layout_bound::layout_supported());
     let _clear = ClearPreparationFault;
-    let f = PiBound::new("pi-cache-copy");
+    let f = PiBound::new(if overflow {
+        "pi-cache-copy-overflow"
+    } else {
+        "pi-cache-copy"
+    });
     let (cache, index) = f.warm();
     cache.retained().unwrap().clear();
+    let kept = f.disk();
     let end = f.grow("over-entry-1", 20);
     let now = std::time::SystemTime::now();
-    cache.durable().unwrap().retail_full_now = Some(now);
+    let pace_key = full_pace_key(SOURCE, &f.key);
+    let oldest = store::key_digest(DurableSource::ClaudeCode, "paced-oldest");
+    {
+        let mut stores = cache.durable().unwrap();
+        stores.retail_full_now = Some(now);
+        assert!(!stores.retail_full_at.contains_key(&pace_key));
+        if overflow {
+            for n in 0..2 * store::MAX_RECORDS {
+                let key = if n == 0 {
+                    oldest
+                } else {
+                    store::key_digest(DurableSource::ClaudeCode, &format!("paced-other-{n}"))
+                };
+                let age = std::time::Duration::from_secs(u64::from(n == 0));
+                stores.retail_full_at.insert(
+                    key,
+                    FullPace {
+                        at: now - age,
+                        structural: false,
+                    },
+                );
+            }
+        }
+    }
+    let pace_len = cache.durable().unwrap().retail_full_at.len();
     let records_read = cache.durable_counters(SOURCE).unwrap().1.records_read;
     let counts = |cache: &SharedCache| {
         let (counters, _) = cache.durable_counters(SOURCE).unwrap();
@@ -456,6 +504,21 @@ fn pi_over_entry_graph_is_one_paced_counted_cache_transit_full() {
             counters.active_bound[2],
         )
     };
+    // The Pi key's one stamp in the shared map: (at, structural, map size).
+    let stamp = |cache: &SharedCache| {
+        let stores = cache.durable().unwrap();
+        let stamp = stores.retail_full_at.get(&pace_key).copied();
+        stamp.map(|s| (s.at, s.structural, stores.retail_full_at.len()))
+    };
+    // The existing durable_tail alarm lines for this cause, source=pi.
+    let alarms = |events: &[serde_json::Value], class: &str| {
+        events
+            .iter()
+            .filter(|e| e["source"] == "pi" && e["stage"] == "durable_tail_alarm")
+            .filter_map(|e| e.pointer(&format!("/counts/{class}/cache_transit")))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
     sampled_jsonl::preparation_tests::refuse_heap(true);
     let prior = index.clone();
     let ((mut next, mut caught, modes), events) =
@@ -466,6 +529,7 @@ fn pi_over_entry_graph_is_one_paced_counted_cache_transit_full() {
         1,
         "the record was restored, then refused at cache admission"
     );
+    assert_eq!(caught.snapshots.len(), 1, "one body, one POST");
     assert_eq!(caught.snapshots[0].request_count, 2, "cumulative, once");
     assert_eq!(next.files[&f.key].size_bytes, end);
     assert_eq!(
@@ -473,40 +537,98 @@ fn pi_over_entry_graph_is_one_paced_counted_cache_transit_full() {
         (Some(1), Some(1), None, [1, 0], [0, 0]),
         "the Pi count goes to 1 under the existing cause and pace, not structural"
     );
-    assert!(
-        pi_events(&events, "/counts/restore_resource_full/cache_transit").any(|v| v == 1),
-        "existing alarm, source=pi"
+    assert_eq!(
+        stamp(&cache),
+        Some((now, false, pace_len + usize::from(!overflow))),
+        "the existing per-key pace stamp; no second pace key"
     );
+    assert_eq!(
+        alarms(&events, "restore_resource_full"),
+        [serde_json::json!(1)],
+        "the existing alarm for count > 0"
+    );
+    assert!(alarms(&events, "restore_resource_pending").is_empty());
+    let evictions = pi_events(&events, "/counts/pace_evicted").collect::<Vec<_>>();
+    {
+        let stores = cache.durable().unwrap();
+        assert_eq!(stores.counters.pace_evicted[2], u64::from(overflow));
+        assert!(!stores.retail_full_at.contains_key(&oldest));
+    }
+    if overflow {
+        assert_eq!(
+            evictions,
+            [&serde_json::json!([1, 1])],
+            "fails toward reading"
+        );
+    } else {
+        assert!(evictions.is_empty());
+    }
     let actual = pi_wire(&mut next, &mut caught);
     assert_eq!(
         actual,
         f.cold_wire(prior, end),
-        "whole body equals cold Full"
+        "whole body equals an independent cold Full"
     );
     f.commit(&cache, &mut next, &caught);
+    let after = f.disk();
+    let records = |disk: &BTreeMap<PathBuf, (Vec<u8>, Vec<i128>)>| {
+        disk.keys()
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rec"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(records(&kept).len(), 1, "the warm Pi record");
+    assert_eq!(
+        records(&after),
+        records(&kept),
+        "the kept durable record is not lost"
+    );
     let index = next;
 
     let grown = f.grow("over-entry-2", 30);
     let entry = serde_json::to_value(&index.files[&f.key]).unwrap();
+    let last_second = now + std::time::Duration::from_secs(PACE_SECS - 1);
+    cache.durable().unwrap().retail_full_now = Some(last_second);
     let ((held, output, modes), events) =
         crate::local_resource_diagnostics::capture(|| f.run(cache.clone(), index));
-    assert!(output.snapshots.is_empty(), "delayed, not published");
+    assert!(output.snapshots.is_empty(), "delayed, no POST");
     assert_eq!((modes.0, modes.1), (0, 0), "0 Full inside the pace window");
     assert_eq!(
         serde_json::to_value(&held.files[&f.key]).unwrap(),
         entry,
-        "entry kept with its old size, never pruned"
+        "accepted entry kept with its size, never regressed or pruned"
     );
     assert_eq!(
         counts(&cache),
         (Some(1), Some(1), Some(1), [1, 1], [0, 0]),
         "a counted delay; the Pi Full count stays 1"
     );
-    assert!(pi_events(&events, "/counts/restore_resource_pending/cache_transit").any(|v| v == 1));
-    cache.durable().unwrap().retail_full_now =
-        Some(now + std::time::Duration::from_secs(PACE_SECS));
-    let (_, caught, modes) = f.run(cache.clone(), held);
-    assert_eq!(modes, (1, 0, grown), "the next paced Full reads it");
+    assert_eq!(
+        stamp(&cache).map(|s| s.0),
+        Some(now),
+        "a delay never restamps"
+    );
+    assert!(alarms(&events, "restore_resource_full").is_empty());
+    assert_eq!(
+        alarms(&events, "restore_resource_pending"),
+        [serde_json::json!(1)]
+    );
+    assert_eq!(f.disk(), after, "a delay writes no record");
+
+    let window = now + std::time::Duration::from_secs(PACE_SECS);
+    cache.durable().unwrap().retail_full_now = Some(window);
+    let ((_, caught, modes), events) =
+        crate::local_resource_diagnostics::capture(|| f.run(cache.clone(), held));
+    assert_eq!(modes, (1, 0, grown), "at 6 h the next paced Full reads it");
     assert_eq!(caught.snapshots[0].request_count, 3);
     assert_eq!(counts(&cache).0, Some(2));
+    assert_eq!(stamp(&cache).map(|s| s.0), Some(window));
+    assert_eq!(
+        alarms(&events, "restore_resource_full"),
+        [serde_json::json!(1)]
+    );
+    assert_eq!(
+        cache.durable().unwrap().counters.pace_evicted[2],
+        u64::from(overflow)
+    );
 }

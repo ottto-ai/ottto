@@ -854,12 +854,18 @@ fn pi_active_bound_is_one_paced_no_record_full_and_keeps_the_record() {
     whole_body(&cold, &restored);
 }
 
-// P-CACHE-COPY (E1 ruling (b)): the decoded Pi graph is over the RAM cache's
-// entry bound, so its restore is refused at cache admission and takes the
-// existing `cache_transit` resource path: ONE paced, counted Full equal to
-// cold Full (the Pi count, `resource_full{cache_transit.pi}`, goes to 1);
-// growth inside the pace window is then a counted delay with 0 Full that
-// holds the accepted body. No new Full cause and no new pace key.
+// P-CACHE-COPY (E1 ruling (b); Lead B signed 2026-10-30 with conditions):
+// the decoded Pi graph is over the RAM cache's entry bound, so its restore
+// is refused at cache admission and takes the existing `cache_transit`
+// resource path: ONE paced, counted Full (the Pi count,
+// `resource_full{cache_transit.pi}`, goes to 1) that publishes exactly what
+// restore -> Tail and cold Full publish (body, witness, usage), in one POST,
+// keeping the durable record and the accepted state. Growth inside the pace
+// window is then a counted delay with 0 Full that holds the accepted body.
+// Once admission fits, the kept record restores and Tails; a quiet restart
+// POSTs nothing. No new Full cause and no new pace key; the pace key, 6 h
+// window, map overflow and alarm are asserted on the shared owner in
+// `durable_tail_pi_bound_tests.rs` (`pi_cache_copy`).
 // Revisit trigger: if the Pi cache_transit count is ever > 0 on M4 or the
 // fleet, a cache-less restore -> Tail path becomes next-release work.
 #[test]
@@ -874,6 +880,7 @@ fn pi_cache_copy_refusal_is_one_paced_counted_full_then_a_delay() {
     let _reset = Reset(|| fixture::refuse_cache_admission(false));
     let mut f = PiDriver::warm("transition-pi-cache-copy", &pi_seed());
     f.restart();
+    let record_paths = store_records(&f.disk).into_keys().collect::<Vec<_>>();
     f.grow(&[pi_turn(
         "message",
         Some("over-entry-one"),
@@ -881,6 +888,9 @@ fn pi_cache_copy_refusal_is_one_paced_counted_full_then_a_delay() {
         "2026-10-27T06:01:00Z",
     )]);
     let cold = f.emit_bodies(Mode::ColdFull);
+    // What restore -> Tail publishes when admission fits (its own owner).
+    let tail = f.emit_bodies(Mode::DiskRestore);
+    assert_eq!((tail.modes, tail.restored), ((0, 1, 0), 1));
     fixture::refuse_cache_admission(true);
     let full = f.emit_bodies(Mode::Ram);
     assert_eq!((full.modes, full.restored), ((1, 0, 0), 0));
@@ -890,11 +900,38 @@ fn pi_cache_copy_refusal_is_one_paced_counted_full_then_a_delay() {
         "ONE paced Full, counted for Pi"
     );
     assert_eq!(f.active_bound(Mode::Ram), [0, 0], "not structural");
-    money_oracle::assert_equivalent(&cold, &full);
-    whole_body(&cold, &full);
+    for control in [&cold, &tail] {
+        money_oracle::assert_equivalent(control, &full);
+        whole_body(control, &full);
+    }
+    let emitted = |mode: Mode| f.pages[&mode].emitted.get(&f.entity).cloned();
+    let paced = emitted(Mode::Ram);
+    assert!(paced.is_some());
+    assert_eq!(paced, emitted(Mode::ColdFull), "body + witness");
+    assert_eq!(paced, emitted(Mode::DiskRestore), "body + witness");
+    assert_eq!(
+        (full.batches.len(), full.snapshots.len()),
+        (1, 1),
+        "one POST"
+    );
     f.save_gc(Mode::Ram);
+    assert_eq!(
+        f.accepted.get(&f.entity).cloned(),
+        paced,
+        "accepted advanced"
+    );
     let accepted = stored_bodies(&f.prior);
-    f.grow(&[pi_turn(
+    assert_eq!(
+        accepted,
+        stored_bodies(&f.pages[&Mode::DiskRestore].index),
+        "the committed body fingerprint/witness restore -> Tail would commit"
+    );
+    assert_eq!(
+        store_records(&f.disk).into_keys().collect::<Vec<_>>(),
+        record_paths,
+        "the kept durable record is not lost"
+    );
+    let unread = f.grow(&[pi_turn(
         "message",
         Some("over-entry-two"),
         30,
@@ -909,8 +946,23 @@ fn pi_cache_copy_refusal_is_one_paced_counted_full_then_a_delay() {
         "0 Full inside the pace window: a counted delay"
     );
     money_oracle::assert_held(&f.entity, &cold, &delayed, &cold);
-    assert!(delayed.batches.is_empty());
+    assert!(delayed.batches.is_empty(), "no duplicate POST");
     assert_eq!(stored_bodies(&f.pages[&Mode::Ram].index), accepted);
+
+    // Admission fits again: the kept record restores and Tails, once.
+    fixture::refuse_cache_admission(false);
+    f.restart();
+    let cold = f.emit_bodies(Mode::ColdFull);
+    let restored = f.emit_bodies(Mode::Restart);
+    assert_eq!((restored.modes, restored.restored), ((0, 1, 0), 1));
+    assert!(restored.io.consumed >= unread, "Tail from the kept record");
+    money_oracle::assert_equivalent(&cold, &restored);
+    whole_body(&cold, &restored);
+    f.save_gc(Mode::Restart);
+    f.restart();
+    let quiet = f.emit_bodies(Mode::Restart);
+    assert_eq!((quiet.modes.0, quiet.modes.1), (0, 0));
+    assert!(quiet.batches.is_empty(), "no duplicate POST after catch-up");
 }
 
 // LA-1: a Pi file appended while the daemon was down for over an hour (or
