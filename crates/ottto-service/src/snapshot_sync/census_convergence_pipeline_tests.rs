@@ -754,6 +754,7 @@ impl PipelineFixture {
             &[],
             &[],
             settlement.fully_settled,
+            &mut Default::default(),
         );
         let census_complete = scan.census_complete;
         settle_context_curve_replay_state(
