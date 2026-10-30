@@ -1732,10 +1732,12 @@ fn a_memory_dropped_job_backs_off_and_rereads_nothing_inside_the_backoff() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let now = sampled_scan::now_seconds();
     // P's fence, then one step: P is not done.
     let leftover = codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES;
     let mut scene = Scene::owed("hook-refused-suspend");
+    // After the scene: it seals P's side record at its own clock read, and
+    // an earlier `now` is a clock regression to the side fence.
+    let now = sampled_scan::now_seconds();
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut read = Vec::new();
     for _ in 0..5 {
@@ -2022,8 +2024,10 @@ fn an_invalid_page_whose_suspend_fails_backs_off_and_publishes_nothing() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let now = sampled_scan::now_seconds();
     let mut scene = Scene::owed("hook-invalid-refused");
+    // After the scene: it seals P's side record at its own clock read, and
+    // an earlier `now` is a clock regression to the side fence.
+    let now = sampled_scan::now_seconds();
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut page = page_with(codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES);
     scene.hook_in(&cache, &hook_pass(), &mut page, now);
@@ -2712,8 +2716,10 @@ fn a_rewritten_proof_wake_fires_on_a_metadata_only_change() {
         panic!("chmod never moved ctime");
     };
     for parent_changed in [false, true] {
-        let now = sampled_scan::now_seconds();
         let mut scene = Scene::owed("hook-rewritten-ctime");
+        // After the scene: it seals P's side record at its own clock read, and
+        // an earlier `now` is a clock regression to the side fence.
+        let now = sampled_scan::now_seconds();
         let key = scene.key();
         let Some(CodexParentProofState::Owed(owed)) =
             scene.index.codex_parent_prefix_proofs.get_mut(&key)
