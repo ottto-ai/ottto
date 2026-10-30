@@ -52,10 +52,11 @@ pub(super) struct Counts {
     pub(super) changed_episode_age_seconds: u64,
     pub(super) changed_over_6h_alarm: bool,
     pub(super) tracker_initialized: bool,
-    /// Previous process memory is unavailable without persisted state. The
-    /// log carrier's process_id + episode_open allow an external observer to
-    /// detect a restart; this daemon cannot truthfully report that count.
-    pub(super) restart_reset_open_episode_total: Option<u64>,
+    /// Startup-condition proxy, emitted on the first completed observation
+    /// of this process/source/scope only. It does not prove a prior episode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) restart_started_with_open_condition: Option<u64>,
+    pub(super) restart_scope_tracking_full: bool,
 }
 
 /// One queue pass plus one bit per EXISTING stamp. O(queue × log(stamps)),
@@ -159,6 +160,51 @@ impl Episode {
             self.since = None;
         }
     }
+}
+
+/// Fixed process-local scope ledger, not a per-file map. Keep it outside
+/// Runtime so switching away from a scope and back cannot count it twice.
+/// Hash collisions or exhausted coverage can suppress a count, never duplicate it.
+struct ScopeStarts {
+    scopes: [Option<u64>; 64],
+}
+impl ScopeStarts {
+    const fn new() -> Self {
+        Self { scopes: [None; 64] }
+    }
+
+    fn observe(&mut self, scope: u64, row: &mut Counts) {
+        row.restart_started_with_open_condition = None;
+        row.restart_scope_tracking_full = false;
+        if self.scopes.contains(&Some(scope)) {
+            return;
+        }
+        if let Some(slot) = self.scopes.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(scope);
+            row.restart_started_with_open_condition =
+                Some(u64::from(row.changed_since_scan_files > 0));
+        } else {
+            row.restart_scope_tracking_full = true;
+        }
+    }
+}
+
+#[cfg(not(test))]
+static STARTS: std::sync::Mutex<ScopeStarts> = std::sync::Mutex::new(ScopeStarts::new());
+#[cfg(test)]
+thread_local! {
+    static STARTS: std::cell::RefCell<ScopeStarts> = const { std::cell::RefCell::new(ScopeStarts::new()) };
+}
+
+pub(super) fn observe_start(scope: &str, row: &mut Counts) {
+    let scope = shadow::hash64(scope.as_bytes());
+    #[cfg(not(test))]
+    STARTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .observe(scope, row);
+    #[cfg(test)]
+    STARTS.with(|starts| starts.borrow_mut().observe(scope, row));
 }
 
 pub(super) fn emit(row: &Counts) {

@@ -139,7 +139,7 @@ fn eviction_is_reported_as_missing_coverage_and_restart_ages_reset() {
     assert_eq!(restarted.oldest_skipped_age_seconds, 0);
     assert_eq!(restarted.discovered_unread_over_24h_tracked_files, 0);
     assert!(restarted.ages_are_process_local_lower_bounds);
-    assert_eq!(restarted.restart_reset_open_episode_total, None);
+    assert_eq!(restarted.restart_started_with_open_condition, None);
 }
 
 fn positive() -> Counts {
@@ -176,7 +176,7 @@ fn alarm_strict_edge_zero_unknown_restart_clock_and_scope_isolation() {
     restarted.update(&mut restart_row, NOW + 2 * ALARM_AFTER + 1);
     assert!(restart_row.tracker_initialized);
     assert!(!restart_row.changed_over_6h_alarm);
-    assert_eq!(restart_row.restart_reset_open_episode_total, None);
+    assert_eq!(restart_row.restart_started_with_open_condition, None);
     let mut rollback = positive();
     a.update(&mut rollback, NOW - 1);
     assert_eq!(rollback.changed_episode_age_seconds, 0);
@@ -196,7 +196,9 @@ fn alarm_payload_uses_existing_carrier_and_contains_only_aggregates() {
     assert_eq!(records.len(), 2);
     assert_eq!(records[1]["stage"], "money_freshness_alarm");
     assert_eq!(records[1]["counts"]["discovered_unread_tracked_files"], 3);
-    assert!(records[1]["counts"]["restart_reset_open_episode_total"].is_null());
+    assert!(records[1]["counts"]
+        .get("restart_reset_open_episode_total")
+        .is_none());
     let text = serde_json::to_string(&records).unwrap();
     for private in [
         "/synthetic",
@@ -206,4 +208,47 @@ fn alarm_payload_uses_existing_carrier_and_contains_only_aggregates() {
     ] {
         assert!(!text.contains(private));
     }
+}
+
+#[test]
+fn startup_condition_proxy_counts_only_first_observation_per_process_scope() {
+    let mut starts = ScopeStarts::new();
+    let mut first = positive();
+    starts.observe(1, &mut first);
+    assert_eq!(first.restart_started_with_open_condition, Some(1));
+    let mut next = positive();
+    starts.observe(1, &mut next);
+    assert_eq!(next.restart_started_with_open_condition, None);
+    let mut clear = Counts::default();
+    starts.observe(2, &mut clear);
+    assert_eq!(clear.restart_started_with_open_condition, Some(0));
+    starts.observe(2, &mut next);
+    assert_eq!(next.restart_started_with_open_condition, None);
+    // Returning to an earlier scope must not re-emit the process proxy.
+    starts.observe(1, &mut next);
+    assert_eq!(next.restart_started_with_open_condition, None);
+    let mut restarted = ScopeStarts::new();
+    restarted.observe(1, &mut next);
+    assert_eq!(next.restart_started_with_open_condition, Some(1));
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        emit(&first);
+        let mut later = positive();
+        starts.observe(1, &mut later);
+        emit(&later);
+    });
+    assert_eq!(rows[0]["counts"]["restart_started_with_open_condition"], 1);
+    assert!(rows[0]["process_id"].is_number());
+    assert!(rows[1]["counts"]
+        .get("restart_started_with_open_condition")
+        .is_none());
+    // Bounded coverage overflow is explicit and never re-counts an old scope.
+    for scope in 3..=64 {
+        starts.observe(scope, &mut positive());
+    }
+    starts.observe(65, &mut next);
+    assert!(next.restart_scope_tracking_full);
+    assert_eq!(next.restart_started_with_open_condition, None);
+    starts.observe(1, &mut next);
+    assert!(!next.restart_scope_tracking_full);
+    assert_eq!(next.restart_started_with_open_condition, None);
 }

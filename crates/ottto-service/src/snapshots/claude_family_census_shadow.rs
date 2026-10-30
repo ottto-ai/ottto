@@ -1713,6 +1713,7 @@ pub(super) struct PageCounts {
     pub(super) sticky_vetoes: StickyAges,
     pub(super) pending_census_members: PendingCensusMembers,
     pub(super) skipped_set: SkippedSet,
+    #[serde(skip)]
     pub(super) money_freshness: super::money_freshness::Counts,
     /// Candidate decisions the shadow itself ran for this page's Skips.
     pub(super) shadow_decision_calls: u64,
@@ -2000,7 +2001,8 @@ pub(super) fn observe_page(
     let counts = with_runtime(|runtime| {
         evaluate_page(runtime, index, touched, parsed, removed_keys, scope, now)
     });
-    if let Some(counts) = counts {
+    if let Some(mut counts) = counts {
+        super::money_freshness::observe_start(scope, &mut counts.money_freshness);
         super::money_freshness::emit(&counts.money_freshness);
         crate::local_resource_diagnostics::claude_family_census_shadow(&counts);
     }

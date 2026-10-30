@@ -1445,11 +1445,21 @@ proof of uninterrupted filesystem state: the alarm describes sampled passes.
 `changed_episode_open`, `changed_episode_age_seconds` and `tracker_initialized`
 expose the episode boundary. The existing carrier provides `process_id`, so a
 log observer can correlate process changes with previously open episodes.
-`restart_reset_open_episode_total` is null: without persisted episode state or
-reading previous logs, a fresh daemon cannot know whether the previous process
-had an open episode. Null is an explicit unavailable metric, not a zero reset
-count. This limitation requires an external log-derived counter or an approved
-existing persistence carrier before a restart-reset count can be claimed.
+`restart_started_with_open_condition` is a **proxy**, emitted once on the first
+completed observation per process/source/scope: 1 if that observation already has
+an observed changed-skipped count >0, otherwise 0. Later rows omit the field.
+The existing `process_id` and source on `money_freshness` let server/log readers
+sum these startup observations across restarts. This counts restarts that began
+with a positive observed condition; it does not prove the previous process had
+an open episode. A restart during a positive condition that clears before the
+first pass is not counted. Missing metadata on that first pass also cannot prove
+a positive condition. No prior logs or persisted episode state are read.
+A fixed process-local ledger remembers at most 64 scope hashes (1 KiB inline),
+including scopes switched away from, so returning to a scope never emits twice.
+A hash collision can suppress a new scope's count. If all slots are occupied,
+new scopes omit the proxy and set `restart_scope_tracking_full`; existing scopes
+still never re-emit. Scope hashes are never logged. The nested family-shadow row
+omits the freshness payload so the proxy appears on only one carrier row.
 
 Memory: the existing bounded stamp grows from 16 to 48 bytes (at most 512 KiB
 additional retained heap). It is included in `cost.runtime_heap_bytes` and the
