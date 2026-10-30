@@ -83,6 +83,7 @@ mod compaction_events;
 pub(crate) use compaction_events::bounded_compaction_events;
 pub use compaction_events::SnapshotCompactionEvent;
 use compaction_events::{ClaudeCompactionTrigger, CodexCompactionSizes};
+pub(crate) use desktop_identity::classify_desktop_identity_reoffers;
 #[cfg(test)]
 mod codex_context_window_tests;
 #[cfg(test)]
@@ -8215,6 +8216,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 pending,
                 &result.snapshots,
                 noop_source_files.contains(&pending.source_file_fingerprint),
+                &carried_noop_entities,
             );
         }
     }

@@ -35,62 +35,83 @@ const LATCH_RECORD_BYTES: usize = 2 + 1 + 18 + 1;
 /// An eviction or a new process costs at most one more counted refused re-offer.
 /// Selection history only: never authority, never a payload input.
 const REFUSED_MEMO_CAP: usize = MAX_EDGES;
-struct RefusedMemo {
-    evidence: BTreeMap<[u8; 32], [u8; 32]>,
+struct BoundedMemo<V> {
+    values: BTreeMap<[u8; 32], V>,
     order: VecDeque<[u8; 32]>,
     cap: usize,
 }
-impl RefusedMemo {
+impl<V> BoundedMemo<V> {
     const fn new(cap: usize) -> Self {
         Self {
-            evidence: BTreeMap::new(),
+            values: BTreeMap::new(),
             order: VecDeque::new(),
             cap,
         }
     }
-    fn holds(&self, key: &[u8; 32], evidence: &[u8; 32]) -> bool {
-        self.evidence.get(key) == Some(evidence)
-    }
-    fn record(&mut self, key: [u8; 32], evidence: [u8; 32]) {
-        if self.evidence.insert(key, evidence).is_none() {
+    fn record(&mut self, key: [u8; 32], value: V) {
+        if self.values.insert(key, value).is_none() {
             self.order.push_back(key);
         }
         if self.order.len() > self.cap {
             if let Some(oldest) = self.order.pop_front() {
-                self.evidence.remove(&oldest);
+                self.values.remove(&oldest);
             }
+        }
+    }
+    fn take(&mut self, key: &[u8; 32]) -> Option<V> {
+        let value = self.values.remove(key)?;
+        self.order.retain(|entry| entry != key);
+        Some(value)
+    }
+}
+impl BoundedMemo<[u8; 32]> {
+    fn holds(&self, key: &[u8; 32], evidence: &[u8; 32]) -> bool {
+        self.values.get(key) == Some(evidence)
+    }
+}
+/// `posted` holds a re-offer on its way to the backend, keyed by SHA-256 of
+/// its body's fingerprint, until a response names that body. An eviction or a
+/// new process loses at most that count.
+struct ReofferMemos {
+    refused: BoundedMemo<[u8; 32]>,
+    posted: BoundedMemo<(IdentityReoffer, u64)>,
+}
+impl ReofferMemos {
+    const fn new() -> Self {
+        Self {
+            refused: BoundedMemo::new(REFUSED_MEMO_CAP),
+            posted: BoundedMemo::new(REFUSED_MEMO_CAP),
         }
     }
 }
 #[cfg(not(test))]
-static REFUSED_MEMO: std::sync::Mutex<RefusedMemo> =
-    std::sync::Mutex::new(RefusedMemo::new(REFUSED_MEMO_CAP));
+static REOFFER_MEMOS: std::sync::Mutex<ReofferMemos> = std::sync::Mutex::new(ReofferMemos::new());
 #[cfg(test)]
 thread_local! {
-    static REFUSED_MEMO: std::cell::RefCell<RefusedMemo> =
-        const { std::cell::RefCell::new(RefusedMemo::new(REFUSED_MEMO_CAP)) };
+    static REOFFER_MEMOS: std::cell::RefCell<ReofferMemos> =
+        const { std::cell::RefCell::new(ReofferMemos::new()) };
 }
 /// A leaf lock: `run` never takes another lock or re-enters.
-fn with_refused_memo<T>(run: impl FnOnce(&mut RefusedMemo) -> T) -> T {
+fn with_reoffer_memos<T>(run: impl FnOnce(&mut ReofferMemos) -> T) -> T {
     #[cfg(not(test))]
     {
-        run(&mut REFUSED_MEMO
+        run(&mut REOFFER_MEMOS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
     #[cfg(test)]
-    REFUSED_MEMO.with(|memo| run(&mut memo.borrow_mut()))
+    REOFFER_MEMOS.with(|memos| run(&mut memos.borrow_mut()))
 }
 fn memo_key(key: &str) -> [u8; 32] {
     Sha256::digest(key.as_bytes()).into()
 }
 fn remember_refused(key: &str, evidence: [u8; 32]) {
-    with_refused_memo(|memo| memo.record(memo_key(key), evidence));
+    with_reoffer_memos(|memos| memos.refused.record(memo_key(key), evidence));
 }
-/// A new process: the memo is RAM only.
+/// A new process: the memos are RAM only.
 #[cfg(test)]
 pub(super) fn reset_refused_memo_for_test() {
-    with_refused_memo(|memo| *memo = RefusedMemo::new(REFUSED_MEMO_CAP));
+    with_reoffer_memos(|memos| *memos = ReofferMemos::new());
 }
 /// Real cap eviction of everything older.
 #[cfg(test)]
@@ -195,6 +216,46 @@ fn edge_bytes(edges: &BTreeMap<String, String>) -> usize {
     }
 }
 
+/// Counts each posted re-offer from the backend's per-entity lists, once. Never
+/// from `response.accepted`, which sums accepted and unchanged. A conflict stays
+/// owed to the retry; a count-only ACK names no entity, so it counts nothing.
+pub(crate) fn classify_desktop_identity_reoffers(
+    response: &crate::snapshot_client::SnapshotBatchResponse,
+) {
+    use crate::local_resource_diagnostics::claude_reread::{
+        desktop_identity_reoffer, IdentityReoffered,
+    };
+    let accepted = response
+        .accepted_entities
+        .iter()
+        .map(|entity| (&entity.snapshot_fingerprint, IdentityReoffered::Posted));
+    let unchanged = response
+        .unchanged_entities
+        .iter()
+        .map(|entity| (&entity.snapshot_fingerprint, IdentityReoffered::Unchanged));
+    let rejected = response
+        .rejected_entities
+        .iter()
+        .map(|entity| (&entity.snapshot_fingerprint, IdentityReoffered::Refused));
+    for (fingerprint, outcome) in accepted.chain(unchanged).chain(rejected) {
+        let key = memo_key(fingerprint);
+        if let Some((kind, bytes)) = with_reoffer_memos(|memos| memos.posted.take(&key)) {
+            desktop_identity_reoffer(kind == IdentityReoffer::Adoption, outcome, bytes);
+        }
+    }
+}
+
+fn own_bodies<'a>(
+    items: &'a [SnapshotItem],
+    source_file_fingerprint: &'a str,
+    session: &'a str,
+) -> impl Iterator<Item = &'a SnapshotItem> {
+    items.iter().filter(move |item| {
+        item.source_file_fingerprint.as_deref() == Some(source_file_fingerprint)
+            && item.source_session_id == session
+    })
+}
+
 /// The child's own emitted disposition across its bodies in this file:
 /// complete only when every own body says complete; None without a body.
 /// `pair` is whether every body carried this child's own account and org.
@@ -203,13 +264,9 @@ fn emitted_disposition(
     source_file_fingerprint: &str,
     session: &str,
 ) -> (Option<&'static str>, bool) {
-    let own = items.iter().filter(|item| {
-        item.source_file_fingerprint.as_deref() == Some(source_file_fingerprint)
-            && item.source_session_id == session
-    });
     let mut disposition = None;
     let mut pair = true;
-    for item in own {
+    for item in own_bodies(items, source_file_fingerprint, session) {
         let evidence = item
             .session_account_evidence
             .as_ref()
@@ -262,7 +319,7 @@ impl ScanIndex {
             &candidate.path,
             &candidate.source_file_fingerprint,
         )?;
-        if with_refused_memo(|memo| memo.holds(&memo_key(&key), &evidence)) {
+        if with_reoffer_memos(|memos| memos.refused.holds(&memo_key(&key), &evidence)) {
             return None;
         }
         match latch {
@@ -288,6 +345,7 @@ impl ScanIndex {
         pending: &PendingIndexFinalization,
         items: &[SnapshotItem],
         unchanged: bool,
+        carried: &BTreeSet<String>,
     ) {
         let path = Path::new(&pending.index_key);
         if claude_subagent_identity(path).is_some() {
@@ -300,18 +358,31 @@ impl ScanIndex {
         let complete = emitted == Some("complete");
         let next = if let Some((kind, bytes)) = pending.desktop_identity_reoffer {
             use crate::local_resource_diagnostics::claude_reread::IdentityReoffered;
-            let outcome = if !complete {
-                IdentityReoffered::Refused
-            } else if unchanged {
-                IdentityReoffered::Unchanged
+            let body = own_bodies(items, &pending.source_file_fingerprint, session)
+                .next()
+                .map(|item| item.snapshot_fingerprint.as_str());
+            // Only a body that is not sent has a local outcome. A sent body
+            // waits for the backend's lists: its first body stands for it.
+            let local = if !complete {
+                Some(IdentityReoffered::Refused)
+            } else if unchanged || body.is_some_and(|body| carried.contains(body)) {
+                Some(IdentityReoffered::Unchanged)
             } else {
-                IdentityReoffered::Posted
+                None
             };
-            crate::local_resource_diagnostics::claude_reread::desktop_identity_reoffer(
-                kind == IdentityReoffer::Adoption,
-                outcome,
-                bytes,
-            );
+            match (local, body) {
+                (Some(outcome), _) => {
+                    crate::local_resource_diagnostics::claude_reread::desktop_identity_reoffer(
+                        kind == IdentityReoffer::Adoption,
+                        outcome,
+                        bytes,
+                    );
+                }
+                (None, Some(body)) => with_reoffer_memos(|memos| {
+                    memos.posted.record(memo_key(body), (kind, bytes));
+                }),
+                (None, None) => {}
+            }
             complete.then_some(IdentityLatch::Settled)
         } else {
             match emitted {
@@ -385,7 +456,7 @@ mod tests {
     fn desktop_identity_refused_memo_is_keyed_by_evidence_and_evicts_oldest_first() {
         let (first, second, third) = ([1; 32], [2; 32], [3; 32]);
         let (evidence, changed) = ([8; 32], [9; 32]);
-        let mut memo = RefusedMemo::new(2);
+        let mut memo = BoundedMemo::new(2);
         memo.record(first, evidence);
         assert!(memo.holds(&first, &evidence));
         assert!(!memo.holds(&first, &changed), "new evidence is a new offer");
@@ -394,8 +465,11 @@ mod tests {
         assert_eq!(memo.order.len(), 1, "same child, one slot");
         memo.record(second, evidence);
         memo.record(third, evidence);
-        assert_eq!((memo.evidence.len(), memo.order.len()), (2, 2));
+        assert_eq!((memo.values.len(), memo.order.len()), (2, 2));
         assert!(!memo.holds(&first, &changed), "the oldest child is evicted");
         assert!(memo.holds(&second, &evidence) && memo.holds(&third, &evidence));
+        assert_eq!(memo.take(&second), Some(evidence));
+        assert_eq!(memo.take(&second), None, "taken once");
+        assert_eq!((memo.values.len(), memo.order.len()), (1, 1));
     }
 }

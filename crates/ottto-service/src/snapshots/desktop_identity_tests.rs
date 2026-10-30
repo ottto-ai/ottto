@@ -1,6 +1,7 @@
 //! Identity re-offer latch through the production scanner, finalizer and
 //! ACK custody, over synthetic Desktop stores; never live provider state.
 use super::*;
+use crate::snapshot_client::{SnapshotBatchResponse, SnapshotEntityRef, SnapshotEntityRejection};
 use desktop_identity::IdentityLatch::{Pending, Settled};
 
 const ACCOUNT: &str = "123e4567-e89b-12d3-a456-426614174000";
@@ -17,6 +18,64 @@ struct Reoffers {
     recovered: [u64; 4],
     adoption: [u64; 4],
     refused: u64,
+}
+
+/// What the backend said about the bodies a pass put on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backend {
+    Accepted,
+    Unchanged,
+    Rejected,
+    Conflict,
+    /// The legacy ACK: a count and no entity lists.
+    CountOnly,
+    /// The upload failed: no response to classify.
+    Silent,
+}
+impl Backend {
+    /// `accepted` is what the backend reports: accepted PLUS unchanged.
+    fn response(self, items: &[SnapshotItem]) -> Option<SnapshotBatchResponse> {
+        let refs = || {
+            items
+                .iter()
+                .map(|item| SnapshotEntityRef {
+                    source_session_id: item.source_session_id.clone(),
+                    snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                    occurrence_count: 1,
+                    body_witness_version: None,
+                    body_witness_digest: None,
+                    head_etag: None,
+                    head_challenge: None,
+                    unchanged_basis: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let list = |wanted: Self| if self == wanted { refs() } else { Vec::new() };
+        let counted = matches!(self, Self::Accepted | Self::Unchanged | Self::CountOnly);
+        (self != Self::Silent).then(|| SnapshotBatchResponse {
+            accepted: if counted { items.len() as u64 } else { 0 },
+            sessions_reconciled: 0,
+            session_ids: Vec::new(),
+            disabled: false,
+            disabled_reason: None,
+            entity_ack_contract: (self != Self::CountOnly)
+                .then(|| SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
+            accepted_entities: list(Self::Accepted),
+            unchanged_entities: list(Self::Unchanged),
+            conflict_entities: list(Self::Conflict),
+            rejected_entities: list(Self::Rejected)
+                .into_iter()
+                .map(|entity| SnapshotEntityRejection {
+                    source_session_id: entity.source_session_id,
+                    snapshot_fingerprint: entity.snapshot_fingerprint,
+                    reason: "usage_accounting_authority_downgrade".into(),
+                    detail: "not logged".into(),
+                    permanent: true,
+                    occurrence_count: 1,
+                })
+                .collect(),
+        })
+    }
 }
 
 struct IdentityFixture {
@@ -81,6 +140,15 @@ impl IdentityFixture {
         self.run_with(index, Arc::new(SharedCache::default()), at)
     }
     fn run_with(&self, index: ScanIndex, cache: Arc<SharedCache>, at: &str) -> (Run, Reoffers) {
+        self.run_answered(index, cache, at, Backend::Accepted)
+    }
+    fn run_answered(
+        &self,
+        index: ScanIndex,
+        cache: Arc<SharedCache>,
+        at: &str,
+        backend: Backend,
+    ) -> (Run, Reoffers) {
         let (run, rows) = crate::local_resource_diagnostics::capture(|| {
             let mut run = raw_scan_at(&self.native, index, Some(cache), true, at, |_| {});
             finalize_scan_after_policy_with_body_witness(
@@ -89,6 +157,9 @@ impl IdentityFixture {
                 &mut run.index,
                 snapshot_upload_body_witness,
             );
+            if let Some(response) = backend.response(&run.result.snapshots) {
+                classify_desktop_identity_reoffers(&response);
+            }
             run
         });
         let diagnostics = serde_json::to_string(&rows).unwrap();
@@ -217,7 +288,12 @@ fn desktop_identity_missing_to_complete_reoffers_once_and_settles_only_on_ack() 
     assert_eq!(f.latch(&flap.index), Some(Pending));
 
     // Recovery: exactly one full-body re-offer naming the child's own pair.
-    let (recovered, counts) = f.run(committed.clone(), "2026-08-02T07:12:00Z");
+    let (recovered, counts) = f.run_answered(
+        committed.clone(),
+        Arc::new(SharedCache::default()),
+        "2026-08-02T07:12:00Z",
+        Backend::Silent,
+    );
     let complete = f.child(&recovered);
     assert_eq!(disposition(complete), Some("complete"));
     assert_eq!(
@@ -227,8 +303,7 @@ fn desktop_identity_missing_to_complete_reoffers_once_and_settles_only_on_ack() 
     );
     let bytes = f.len();
     assert_eq!(recovered.native_bytes, bytes, "uncached: counted read");
-    assert_eq!(counts.recovered, [1, 0, 0, bytes]);
-    assert_eq!(counts.adoption, [0; 4]);
+    assert_eq!(counts, Reoffers::default(), "no response, nothing counted");
 
     // A failed upload / partial save keeps it pending, so it retries.
     let failed = recovered
@@ -238,7 +313,8 @@ fn desktop_identity_missing_to_complete_reoffers_once_and_settles_only_on_ack() 
     let failed = f.restart(failed);
     let (retried, counts) = f.run(failed, "2026-08-02T07:13:00Z");
     assert_eq!(disposition(f.child(&retried)), Some("complete"));
-    assert_eq!(counts.recovered, [1, 0, 0, bytes]);
+    assert_eq!(counts.recovered, [1, 0, 0, bytes], "counted once, retried");
+    assert_eq!(counts.adoption, [0; 4]);
     let settled = ack(retried);
     assert_eq!(f.latch(&settled), Some(Settled));
 
@@ -255,6 +331,65 @@ fn desktop_identity_missing_to_complete_reoffers_once_and_settles_only_on_ack() 
     let index = f.quiet(index, &["2026-08-02T07:20:00Z"]);
     let index = f.quiet(f.restart(index), &["2026-08-02T07:31:00Z"]);
     assert_eq!(f.latch(&index), Some(Settled));
+}
+
+#[test]
+fn desktop_identity_counters_read_the_response_lists_never_the_accepted_count() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let at = "2026-08-02T07:12:00Z";
+    for (backend, outcome, refused) in [
+        (Backend::Accepted, [1, 0, 0], 0),
+        (Backend::Unchanged, [0, 1, 0], 0),
+        (Backend::Rejected, [0, 0, 1], 1),
+        (Backend::Conflict, [0, 0, 0], 0),
+        (Backend::CountOnly, [0, 0, 0], 0),
+    ] {
+        desktop_identity::reset_refused_memo_for_test();
+        let f = IdentityFixture::new(CREATED);
+        let (first, _) = f.run(f.loaded_incomplete("2026-08-02T07:11:00Z"), COLLECTED);
+        let committed = f.restart(ack(first));
+
+        // Recovered: `accepted` is 1 for an unchanged body, which is never posted.
+        let cache = Arc::new(SharedCache::default());
+        let (recovered, counts) = f.run_answered(committed, cache, at, backend);
+        assert_eq!(disposition(f.child(&recovered)), Some("complete"));
+        let [posted, unchanged, rejected] = outcome;
+        let bytes = if outcome == [0; 3] { 0 } else { f.len() };
+        assert_eq!(
+            counts,
+            Reoffers {
+                recovered: [posted, unchanged, rejected, bytes],
+                refused,
+                ..Reoffers::default()
+            },
+            "{backend:?}"
+        );
+    }
+}
+
+#[test]
+fn desktop_identity_adoption_counters_read_the_response_lists() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let f = IdentityFixture::new(CREATED);
+    let (stored, _) = f.run(f.loaded_incomplete("2026-08-02T07:11:00Z"), COLLECTED);
+    let stored = ack(stored);
+    let cache = Arc::new(SharedCache::default());
+    let (retained, _) = f.run_with(ScanIndex::default(), cache.clone(), COLLECTED);
+    let mut index = ack(retained);
+    let key = f.key();
+    let entry = index.files.get_mut(&key).unwrap();
+    entry.last_snapshot_fingerprint = stored.files[&key].last_snapshot_fingerprint.clone();
+    entry.last_upload_body_witness = stored.files[&key].last_upload_body_witness.clone();
+    index.file_snapshot_fingerprints = stored.file_snapshot_fingerprints.clone();
+    index.accepted_snapshot_fingerprints = stored.accepted_snapshot_fingerprints.clone();
+    index.claude_desktop_identity_latches.clear();
+    let (cold, _) = f.run(f.restart(index), "2026-08-02T07:12:00Z");
+    let supported = u64::from(crate::heap_layout_bound::layout_supported());
+    let at = "2026-08-02T07:13:00Z";
+    let (warm, counts) = f.run_answered(ack(cold), cache, at, Backend::Unchanged);
+    assert_eq!(warm.result.snapshots.len() as u64, supported);
+    assert_eq!(counts.adoption, [0, supported, 0, 0], "unchanged, not sent");
+    assert_eq!(counts.recovered, [0; 4]);
 }
 
 #[test]

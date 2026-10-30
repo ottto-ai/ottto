@@ -320,7 +320,8 @@ pub(crate) fn desktop_identity_reoffer(adoption: bool, outcome: IdentityReoffere
     if active() {
         update(|current| current.desktop_metadata.merge(counts.desktop_metadata));
     } else {
-        // Finalization can run outside the scan's step scope, as for lineage.
+        // Finalization and the upload response can run outside the scan's
+        // step scope, as for lineage.
         super::rearm_collection(counts);
     }
 }

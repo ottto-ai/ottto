@@ -7461,6 +7461,7 @@ fn finish_sync_source(
                 // leaves the counters in place so the losses are reported on the
                 // next batch instead of vanishing with the request that died.
                 client_report.commit();
+                crate::snapshots::classify_desktop_identity_reoffers(&response);
                 Ok(response)
             },
             |progress| progress.save(&upload_progress_path),
