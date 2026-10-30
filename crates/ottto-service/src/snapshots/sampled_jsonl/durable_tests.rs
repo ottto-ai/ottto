@@ -846,6 +846,95 @@ fn restore_rederives_the_exact_retained_copy() {
     }
 }
 
+/// A Pi session: header `cwd`, optionally a first user prompt, one turn.
+fn pi_lines(first_prompt: bool) -> Vec<String> {
+    let mut lines = vec![
+        json!({"type":"session","version":3,"id":"synthetic-pi-restore",
+        "timestamp":"2026-10-27T06:00:00Z","cwd":"/synthetic/pi-work"})
+        .to_string(),
+    ];
+    if first_prompt {
+        lines.push(
+            json!({"type":"message","id":"a0000001","parentId":null,
+            "message":{"role":"user","timestamp":1793080800000u64,
+                "content":[{"type":"text","text":"Synthetic first prompt."}]}})
+            .to_string(),
+        );
+    }
+    lines.push(
+        json!({"type":"message","id":"a0000002","parentId":"a0000001",
+        "timestamp":"2026-10-27T07:00:01Z","message":{"role":"assistant",
+            "provider":"openai","model":"gpt-5.4","api":"openai-responses",
+            "timestamp":"2026-10-27T07:00:01Z","stopReason":"stop","responseId":"seed",
+            "content":[{"type":"text","text":"Synthetic answer."}],
+            "usage":{"input":10,"output":2,"cacheRead":0,"cacheWrite":0,
+                "totalTokens":12,"cost":{"total":0.001}}}})
+        .to_string(),
+    );
+    lines
+}
+
+/// The retained copy of a real Pi parse and its decoded body, before any
+/// re-derivation. `decode` needs no native layout, unlike `decode_bounded`.
+fn pi_decoded(path: &Path) -> (CachedJsonlReduction, Decoded) {
+    let (reduction, _) = full_read(path, SnapshotSource::Pi);
+    let body = encode(
+        &reduction,
+        crate::durable_tail_store::RECORD_BYTES,
+        line_cap(),
+    )
+    .unwrap();
+    let decoded = decode(&body, SnapshotSource::Pi).expect("decode");
+    (reduction, decoded)
+}
+
+/// B1, the desired behaviour: restore admits a Pi body with a header `cwd` and
+/// a first user prompt, and gives both values back. `content_charge` and
+/// `rederive_content` are the production steps B1 refuses, so this reaches the
+/// refusal on every platform; `durable_restore_record` itself is layout-gated.
+#[test]
+#[ignore = "B1: Pi workspace/first-prompt restore refusal (lead-B/to-e5-pi-r2.md); un-ignore with the fix"]
+fn pi_cwd_and_first_prompt_body_is_admitted_for_restore() {
+    let scratch = Scratch::new("pi-admitted");
+    let path = scratch.write("pi.jsonl", &pi_lines(true));
+    let (reduction, decoded) = pi_decoded(&path);
+    let cold = &reduction.accumulator;
+    assert!(cold.workspace_path.is_some() && cold.first_prompt_material.is_some());
+    decoded.content_charge().expect("no RederiveUnfunded");
+    let (restored, _) = decoded
+        .rederive_content(&File::open(&path).unwrap())
+        .expect("restore admitted");
+    let restored = restored.accumulator;
+    assert_eq!(restored.workspace_path, cold.workspace_path);
+    assert_eq!(restored.first_prompt_material, cold.first_prompt_material);
+    assert_eq!(restored.first_prompt_title, cold.first_prompt_title);
+}
+
+/// B1 as it stands, so the fix flips this visibly; delete it with the `ignore`
+/// above. A first prompt refuses before input at `content.rs:96-101`
+/// (`durable_tail.rs:3928-3930` maps it to `rederive_unfunded`). A workspace
+/// alone is funded, then the head row refuses at `content.rs:177`
+/// (`durable_tail.rs:3645`, the same `rederive_unfunded` phase).
+#[test]
+fn pi_cwd_and_first_prompt_body_refuses_restore_today() {
+    let scratch = Scratch::new("pi-refused");
+    let path = scratch.write("prompt.jsonl", &pi_lines(true));
+    let (_, decoded) = pi_decoded(&path);
+    assert!(decoded.rederive.first_prompt.is_some());
+    assert!(decoded.rederive.workspace.is_some());
+    assert!(matches!(decoded.content_charge(), Err(RederiveUnfunded)));
+
+    let path = scratch.write("workspace.jsonl", &pi_lines(false));
+    let (_, decoded) = pi_decoded(&path);
+    assert!(decoded.rederive.first_prompt.is_none());
+    assert!(decoded.rederive.workspace.is_some());
+    assert!(decoded.content_charge().unwrap() > 0, "funded");
+    assert!(matches!(
+        decoded.rederive_content(&File::open(&path).unwrap()),
+        Err(Refuse::NotRederivable("workspace_source"))
+    ));
+}
+
 /// Full-equivalence control per source: a restored copy continued by Tail
 /// finishes to the same upload items as a cold Full of the grown file.
 #[test]
