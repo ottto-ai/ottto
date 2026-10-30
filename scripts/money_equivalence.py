@@ -213,7 +213,8 @@ def main():
     head_sha = output(["git", "rev-parse", "HEAD"])
     manifest = {"base": base_sha, "head": head_sha, "base_ref": ref,
                 "arms": ["retained_ram_tail_or_unchanged", "cold_full", "disk_restore"],
-                "disk_restore": "EXECUTED: " + ", ".join(DISK_FIXTURES)}
+                "disk_restore": "EXECUTED: " + ", ".join(DISK_FIXTURES),
+                "terminal_off_on": "UNEXECUTED"}
     (receipts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     base = root / "base"
     command(["git", "worktree", "add", "--detach", str(base), base_sha])
@@ -243,21 +244,33 @@ def main():
         include = '\nmod money_equivalence_tests { include!("money_equivalence_tests.rs"); }\n'
         if "mod money_equivalence_tests" not in tests.read_text():
             tests.write_text(tests.read_text() + include)
-        for arm, tree in [("base", base), ("head", repo)]:
+        head_binary = None
+        for arm, tree, test_filter in [
+                ("base", base, "money_equivalence_tests::"),
+                ("head", repo, "money_equivalence_tests::"),
+                ("head-on", repo, "terminal_off_on_money_receipts::")]:
             env = dict(os.environ, CARGO_TARGET_DIR=str(root / f"{arm}-target"),
                        OTTTO_MONEY_EQUIVALENCE_ROOT=str(root / "inputs"),
                        OTTTO_MONEY_EQUIVALENCE_OUTPUT=str(receipts / arm))
-            build = receipts / f"{arm}-build.jsonl"
-            with build.open("w") as log:
-                command(["cargo", "test", "-p", "ottto-service", "--lib", "--locked",
-                         "--no-run", "--message-format=json"], cwd=tree, env=env, stdout=log)
-            bins = [r["executable"] for r in map(json.loads, build.read_text().splitlines())
-                    if r.get("reason") == "compiler-artifact" and r.get("executable")]
-            if len(bins) != 1:
-                raise RuntimeError(f"expected one test binary: {bins}")
+            if arm == "head-on":
+                # Same executable, separate process, inputs and output directory.
+                # Only the ON module's scoped guard changes runtime policy.
+                binary = head_binary
+            else:
+                build = receipts / f"{arm}-build.jsonl"
+                with build.open("w") as log:
+                    command(["cargo", "test", "-p", "ottto-service", "--lib", "--locked",
+                             "--no-run", "--message-format=json"], cwd=tree, env=env, stdout=log)
+                bins = [r["executable"] for r in map(json.loads, build.read_text().splitlines())
+                        if r.get("reason") == "compiler-artifact" and r.get("executable")]
+                if len(bins) != 1:
+                    raise RuntimeError(f"expected one test binary: {bins}")
+                binary = bins[0]
+                if arm == "head":
+                    head_binary = binary
             # Native tests must emit a VERIFIED receipt each; Linux's explicit
             # UNEXECUTED line or a zero-match test result cannot pass this job.
-            result = subprocess.run([bins[0], "money_equivalence_tests::", "--nocapture",
+            result = subprocess.run([binary, test_filter, "--nocapture",
                               "--test-threads=1"], cwd=tree, env=env,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             print(result.stdout, flush=True)
@@ -278,38 +291,42 @@ def main():
                 raise RuntimeError(f"incomplete disk-restore coverage: {disk}")
             if len(verified) + len(disk) != len(expected) + len(DISK_FIXTURES):
                 raise RuntimeError(f"expected {len(expected)} + {len(DISK_FIXTURES)} receipts")
-        left, right = receipts / "base", receipts / "head"
-        names = sorted(p.name for p in left.glob("*.json") if not p.name.endswith(".cross-build.json"))
-        if len(names) != 10 or names != sorted(p.name for p in right.glob("*.json") if not p.name.endswith(".cross-build.json")):
-            raise RuntimeError("missing or extra fixture receipts")
+        manifest["terminal_off_on"] = "EXECUTED"
+        (receipts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         failures = []
-        for name in names:
-            inputs = Path(name).with_suffix(".inputs")
-            if (left / inputs).read_bytes() != (right / inputs).read_bytes():
-                raise RuntimeError(f"synthetic inputs differ across base/head: {inputs}")
-            # Raw bodies/digests remain artifact evidence. Only the separately
-            # guarded physical-identity exclusion is compared across builds.
-            cross_name = Path(name).with_suffix(".cross-build.json")
-            for directory in (left, right):
-                for body_name in (Path(name), cross_name):
-                    data = (directory / body_name).read_bytes()
-                    digest = directory / body_name.with_suffix(".sha256")
-                    if digest.read_text() != hashlib.sha256(data).hexdigest():
-                        raise RuntimeError(f"invalid saved digest: {directory}/{body_name}")
-            diff = receipt_diff((left / cross_name).read_bytes(),
-                                (right / cross_name).read_bytes())
-            print(f"MONEY_EQUIVALENCE_DIFF {name} " + json.dumps(diff, sort_keys=True), flush=True)
-            if has_forbidden_diff(diff):
-                failures.append(name)
+        for candidate_arm, diff_label in [("head", "MONEY_EQUIVALENCE_DIFF"),
+                                          ("head-on", "MONEY_EQUIVALENCE_ON_DIFF")]:
+            left, right = receipts / "base", receipts / candidate_arm
+            names = sorted(p.name for p in left.glob("*.json") if not p.name.endswith(".cross-build.json"))
+            if len(names) != 10 or names != sorted(p.name for p in right.glob("*.json") if not p.name.endswith(".cross-build.json")):
+                raise RuntimeError("missing or extra fixture receipts")
+            for name in names:
+                inputs = Path(name).with_suffix(".inputs")
+                if (left / inputs).read_bytes() != (right / inputs).read_bytes():
+                    raise RuntimeError(f"synthetic inputs differ across base/{candidate_arm}: {inputs}")
+                # Raw bodies/digests remain artifact evidence. Only the separately
+                # guarded physical-identity exclusion is compared across builds.
+                cross_name = Path(name).with_suffix(".cross-build.json")
+                for directory in (left, right):
+                    for body_name in (Path(name), cross_name):
+                        data = (directory / body_name).read_bytes()
+                        digest = directory / body_name.with_suffix(".sha256")
+                        if digest.read_text() != hashlib.sha256(data).hexdigest():
+                            raise RuntimeError(f"invalid saved digest: {directory}/{body_name}")
+                diff = receipt_diff((left / cross_name).read_bytes(),
+                                    (right / cross_name).read_bytes())
+                print(f"{diff_label} {name} " + json.dumps(diff, sort_keys=True), flush=True)
+                if has_forbidden_diff(diff):
+                    failures.append(f"{candidate_arm}/{name}")
         if failures:
-            raise RuntimeError("base/head decoded cross-build bodies differ: " + ", ".join(failures))
+            raise RuntimeError("base/candidate decoded cross-build bodies differ: " + ", ".join(failures))
         manifest.update(verdict="VERIFIED", fixtures=names, disk_fixtures=list(DISK_FIXTURES),
                         runtime_seconds=time.monotonic()-started)
         (receipts / "summary.json").write_text(json.dumps(manifest, indent=2) + "\n")
         summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
         with summary.open("a") as f:
             f.write(f"Money equivalence VERIFIED: {len(names)} + {len(DISK_FIXTURES)} disk-restore fixtures, "
-                    f"base `{base_sha}`, head `{head_sha}`. "
+                    f"base-OFF `{base_sha}`, head-OFF and head-ON `{head_sha}` (ON EXECUTED). "
                     f"{manifest['runtime_seconds']:.1f}s. Family vector/Pi remain ignored.\n")
     finally:
         command(["git", "worktree", "remove", "--force", str(base)])

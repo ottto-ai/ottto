@@ -143,3 +143,24 @@ Existing per-class retention gauges/alarms remain ON-only. Ron accepted
 usage-proof retirement and the CAS peak are next-release top priorities.
 Ordinary held-history total remains a post-release gauge gap. F4 and #876 remain
 paired next-release work; no new absence shortcut is introduced here.
+
+
+## R10 native money coverage
+
+The unchanged money-equivalence harness is also included by
+`terminal_off_on_money_receipts`, whose scoped guard opts into production ON.
+The dispatch runs base-OFF, head-OFF and head-ON, each requiring all ten native
+money receipts and three disk lifecycle receipts. Head-ON uses the same head
+binary in a separate process and output directory. Both head arms compare with
+base-OFF through the existing decoded-body comparison; its sole exact envelope
+capability addition remains `usage_decrease_hold_ack_contract`. No ON-specific
+comparison exclusions are permitted. Bases keep their own scanner fixture and
+post-save production step.
+
+The R10 readiness sentinel stays ignored until both native ON execution and
+head-ON/base-OFF comparison pass on macOS. Linux explicitly reports the native
+harness UNEXECUTED. The ON harness's retained, Full and restart arms share one
+test thread's containment RAM memos; these can suppress work and cause mode
+mismatches, so a green result does not claim cold-process memo fidelity.
+The warm page still has no ACK or receipts. Real sidecar/retry work under ON
+uses ordinary read budgets; pure context catch-up retains one-file pacing.

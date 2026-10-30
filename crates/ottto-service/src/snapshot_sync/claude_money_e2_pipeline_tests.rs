@@ -5253,6 +5253,17 @@ mod money_equivalence_tests {
     include!("money_equivalence_tests.rs");
 }
 
+// Keep this module name outside the OFF script's money_equivalence_tests::
+// filter. The included harness is byte-identical; only its scoped policy differs.
+mod terminal_off_on_money_receipts {
+    fn with_e2<T>(f: impl FnOnce() -> T) -> T {
+        let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+        assert!(crate::snapshots::claude_terminal_off());
+        super::with_e2(f)
+    }
+    include!("money_equivalence_tests.rs");
+}
+
 #[test]
 fn e2_page_never_creates_p1_ledger_or_diagnostics() {
     with_e2(|| {
