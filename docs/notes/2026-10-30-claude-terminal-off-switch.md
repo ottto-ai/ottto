@@ -139,12 +139,26 @@ cannot close it. The C6 held-correction adapter now activates real file context
 and uses validated uploader ACK receipts; its strict `[2,0]` assertion stays.
 If that twin remains red it returns to R5.
 
-`history_upgrade_page.history_upgrade_page` diagnostics expose `admitted_files`,
+The `history_upgrade_page` diagnostic object under `counts` exposes `admitted_files`,
 `budget` and `extra_files` (actual history files read beyond that page's upgrade
 budget). The shared ON history fixture uses the collected-at audit clock and
 retains the serialized upload ledger across cycles. The held → index rebuild →
 release control counts resend bytes and requires zero second acceptance.
 These controls need runtime evidence before ON readiness can be claimed.
+
+NBF (non-blocking hold floors) is BLOCKS-RELEASE until its runtime control
+passes. Account-deferred keys and bound members of committed families now
+register explicit held-key custody in the existing bounded RAM observations.
+Unchanged objects in the same context are read at most once per six hours;
+only an actual acquisition renews the timestamp. The floor crosses traversal
+starts without changing sweep-held family roots, proof state or disk formats.
+Object/context changes and observation eviction fail toward another read.
+
+**M4-ON disclosure / fleet gate:** NBF adds up to six hours of held
+release/re-read latency before ordinary page scheduling. Resolving that added
+latency is a separate gate before fleet default-ON. The three census twins and
+three p12 wrappers retain their exact read/money assertions at the six-hour
+fixture rounds; they remain ignored as NBF pending runtime verification.
 
 Additional accepted containment disclosures, S3–S8:
 
