@@ -23,7 +23,7 @@ pub(super) fn check_current(conn: &Connection) -> Result<()> {
     );
     Ok(())
 }
-fn supported(conn: &Connection) -> Result<u32> {
+pub(super) fn supported(conn: &Connection) -> Result<u32> {
     let revision = revision(conn)?;
     if revision > REVISION {
         super::super::telemetry::event("newer_schema_refused", &1);

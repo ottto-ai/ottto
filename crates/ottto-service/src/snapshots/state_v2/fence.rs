@@ -100,33 +100,40 @@ fn read(path: &Path) -> Result<Option<Fence>> {
 // A damaged/oversized fence must not become v1 containment just because the
 // complete strict parse fails. Published fences put schema_version first.
 fn declares_v2(bytes: &[u8]) -> bool {
-    struct Hint;
-    impl<'de> serde::de::Visitor<'de> for Hint {
-        type Value = bool;
+    struct Hint<'a>(&'a std::cell::Cell<bool>);
+    impl<'de> serde::de::Visitor<'de> for Hint<'_> {
+        type Value = ();
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("index header")
         }
         fn visit_map<M: serde::de::MapAccess<'de>>(
             self,
             mut map: M,
-        ) -> std::result::Result<bool, M::Error> {
+        ) -> std::result::Result<(), M::Error> {
             while let Some(key) = map.next_key::<String>()? {
                 if key == "storage_format" {
-                    return Ok(true);
+                    self.0.set(true);
+                    return Ok(());
                 }
                 if key == "schema_version" {
                     if map.next_value::<u64>()? >= 4 {
-                        return Ok(true);
+                        self.0.set(true);
+                        return Ok(());
                     }
                 } else {
                     map.next_value::<serde::de::IgnoredAny>()?;
                 }
             }
-            Ok(false)
+            Ok(())
         }
     }
-    serde::de::Deserializer::deserialize_map(&mut serde_json::Deserializer::from_slice(bytes), Hint)
-        .unwrap_or(false)
+    let claim = std::cell::Cell::new(false);
+    let _ = serde::de::Deserializer::deserialize_map(
+        &mut serde_json::Deserializer::from_slice(bytes),
+        Hint(&claim),
+    );
+    // end_map may reject an unconsumed suffix. The custody claim survives it.
+    claim.get()
 }
 
 /// None permits v1 only when there is no evidence of publication. `latched`

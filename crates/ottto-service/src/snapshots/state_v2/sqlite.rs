@@ -717,8 +717,9 @@ impl Sqlite {
             before.dev() == after.dev() && before.ino() == after.ino(),
             "state_v2_object_changed"
         );
-        migrations::run(&conn)?;
+        migrations::supported(&conn)?;
         settings(&conn, false)?;
+        migrations::run(&conn)?;
         validate_schema(&conn)?;
         let generation: u64 = read_json(&conn, &RowKey::Meta("generation".into()))?
             .ok_or_else(|| anyhow::anyhow!("state_v2_generation_missing"))?;
