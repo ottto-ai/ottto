@@ -41663,7 +41663,7 @@ impl crate::durable_tail_codec::DurableEmpty for PiLedger {
             && self
                 .fork
                 .as_deref()
-                .is_none_or(|fork| *fork == PiFork::default())
+                .map_or(true, |fork| *fork == PiFork::default())
     }
 }
 
