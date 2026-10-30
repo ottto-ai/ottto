@@ -803,8 +803,8 @@ fn phase1_replay_frozen_scan_index_guard_comparison() {
             compacted_families += u64::from(compacted);
             totals[0] += count;
             totals[1] += if compacted { 0 } else { count };
-            for with in 0..2 {
-                invalid_families[with] += u64::from(pending.invalid);
+            for family in &mut invalid_families {
+                *family += u64::from(pending.invalid);
             }
         }
         for with in 0..2 {

@@ -750,7 +750,7 @@ mod tests {
         // binds only part of the file's entity set.
         let mut index = fixture();
         index.files.get_mut(KEY).unwrap().last_snapshot_fingerprint = Some(codex_digest_hex(
-            &snapshot_file_entity_set_digest(&BTreeSet::from(["1".repeat(64)])),
+            &snapshot_file_entity_set_digest(BTreeSet::from(["1".repeat(64)])),
         ));
         assert!(index.file_snapshot_fingerprints[KEY]
             .iter()
