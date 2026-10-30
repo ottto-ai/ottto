@@ -2179,14 +2179,66 @@ fn missing_published_index_with_claim_only_ledger_refuses_without_reread() {
     // Drop all warm process custody as a restart would; the disk witness must
     // keep the source closed without consulting a transcript or contacting upload.
     pipeline.daemon = test_daemon("otm_test");
-    let (prepared, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
-        crate::snapshots::with_transcript_io_denied(|| pipeline.prepare_cycle(t0 + 60))
+    let ((prepared, reads), records) = crate::local_resource_diagnostics::capture(|| {
+        crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+            crate::snapshots::with_transcript_io_denied(|| pipeline.prepare_cycle(t0 + 60))
+        })
     });
     let error = match prepared {
         Err(error) => error,
         Ok(_) => panic!("a missing published root must refuse before collection"),
     };
     assert!(format!("{error:#}").contains("scan_index_prior_state_requires_repair"));
+    let health = pipeline
+        .daemon
+        .status("token")
+        .unwrap()
+        .canonical_health
+        .unwrap();
+    let repair_code = crate::snapshots::scan_index_health::SHARD_CODE;
+    let blockers: Vec<_> = health
+        .blockers
+        .iter()
+        .filter(|b| b.code == repair_code)
+        .collect();
+    assert_eq!(blockers.len(), 1, "reuse the existing repair surface");
+    assert_eq!(blockers[0].source, "claude_code");
+    assert_eq!(
+        blockers[0].clear_condition,
+        crate::snapshots::scan_index_health::SHARD_DETAIL
+    );
+    let row = health
+        .sources
+        .iter()
+        .find(|s| s.app == SourceKind::ClaudeCode)
+        .unwrap();
+    assert_eq!(row.blocking_reason.as_deref(), Some(repair_code));
+    assert_eq!(row.next_action.as_deref(), Some("contact_support"));
+    assert!(health
+        .sources
+        .iter()
+        .filter(|s| s.app != SourceKind::ClaudeCode)
+        .all(|s| s.blocking_reason.as_deref() != Some(repair_code)));
+    let alarms: Vec<_> = records
+        .iter()
+        .filter(|r| r["counts"]["index_shard_unavailable_alarm"] == 1)
+        .collect();
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(alarms[0]["source"], "claude_code");
+    let counters: Vec<_> = records
+        .iter()
+        .filter(|r| r["counts"].get("scan_index_repair_required").is_some())
+        .collect();
+    assert_eq!(counters.len(), 1);
+    assert_eq!(counters[0]["source"], "claude_code");
+    assert_eq!(
+        counters[0]["counts"]["scan_index_repair_required"]["cause"],
+        "prior_state"
+    );
+    assert_eq!(
+        counters[0]["counts"]["scan_index_repair_required"]["delta"], 1,
+        "one refused-load counter increment"
+    );
     assert!(reads.is_empty(), "no transcript acquisition while held");
     assert!(
         !first.index_path.exists(),

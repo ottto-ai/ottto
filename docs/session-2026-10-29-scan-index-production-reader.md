@@ -77,3 +77,27 @@ this change does not introduce an unattended reset or reread exception.
 No local tests or macOS workflow dispatch. A later native run must qualify the
 corrected fixture; compiling it on this Mac and Linux CI do not substitute for
 that runtime receipt.
+
+## Root-loss repair visibility
+
+Root-loss `scan_index_prior_state_requires_repair` and
+`scan_index_storage_generation_requires_repair` now use the same per-source
+`index_shard_unavailable` repair blocker, approved label/hover and contact-support
+action as unavailable maps. The loader's typed `storage generation requires
+repair` refusal maps to the same surface. Matching is exact through error
+contexts; unrelated IO/shape errors and version refusals keep their existing
+behavior. No guards or acquisition, persistence, repair or money rules change.
+
+The existing repair alarm fires once per continuous blocked-source episode.
+`scan_index_repair_required{cause=prior_state|storage_generation}` counts each
+refused load on the existing storage diagnostics line: delta1 and a saturating
+process total, fixed source/cause only, no original error, IDs, paths or digests.
+A complete successful load clears; missing/quarantined state cannot prove repair.
+Two AtomicU64 totals add16 B scalar static payload, no retained state/entry field.
+
+The published-root-loss fixture now asserts the existing canonical blocker for
+only Claude, contact support, one alarm and counter delta1, alongside zero
+transcript acquisitions, no re-upload/replacement and unchanged witness/ledger.
+Portable observer tests cover both causes plus the typed loader refusal, repeated
+loads/one alarm, good-load clearing, new episodes and unrelated-error lookalikes.
+No local tests or Mac dispatch; only the requested Linux workflow is dispatched.
