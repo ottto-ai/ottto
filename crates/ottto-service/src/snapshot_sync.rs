@@ -8728,6 +8728,9 @@ pub struct ClaudeLocalEvidenceStats {
     pub complete_sidecar_root_count: usize,
     pub api_incomplete_root_count: usize,
     pub trace_incomplete_root_count: usize,
+    /// Strict trace reads dropped as grown or replaced; absent while empty.
+    #[serde(skip_serializing_if = "crate::claude_local_otel::ClaudeTraceRowsDiscarded::is_empty")]
+    pub trace_rows_discarded: crate::claude_local_otel::ClaudeTraceRowsDiscarded,
     pub api_evidence_row_count: usize,
     pub trace_evidence_row_count: usize,
     pub exact_request_set_root_count: usize,
@@ -9347,6 +9350,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         if !trace.is_complete() {
             stats.trace_incomplete_root_count += 1;
         }
+        stats.trace_rows_discarded.add(&trace.rows_discarded);
         if !api.health.is_complete() || !trace.is_complete() {
             full_rearm_evidence_complete = false;
             if let Some(rows) = api.evidence.remove(&root_session_id) {
