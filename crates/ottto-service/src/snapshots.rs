@@ -3989,6 +3989,17 @@ pub struct ScanIndex {
         deserialize_with = "deserialize_lenient_default"
     )]
     pub(crate) claude_money_birth_store: claude_money_birth_store::BirthStore,
+    /// #851's Desktop store inventory, decoded and ignored. Nothing reads it and
+    /// no save writes it: like any unknown key it is gone after the next save,
+    /// so a stale digest cannot vouch for a census that never saw its stores.
+    /// Registered so sharded metadata carrying it loads. Appended to preserve
+    /// every older positional index slot.
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "deserialize_lenient_default"
+    )]
+    claude_desktop_store_inventory: Option<String>,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
@@ -4194,6 +4205,7 @@ impl Default for ScanIndex {
             claude_full_rearm_progress: ClaudeFullRearmProgress::default(),
             claude_request_identity_contract: None,
             claude_request_identity_contract_changed: false,
+            claude_desktop_store_inventory: None,
             claude_desktop_store_cursor: None,
             claude_desktop_store_upper_bound: None,
             claude_desktop_store_sweep_had_errors: false,
@@ -8341,6 +8353,56 @@ pub fn finalize_scan_after_policy_with_body_witness(
         .retain(|fingerprint, _| current_fingerprints.contains(fingerprint));
 }
 
+/// Observe only offers that survived policy, holds and semantic no-op removal.
+/// Cached Desktop child metadata is already resident; no source reads or durable
+/// state are needed. Scratch is bounded by this page's emitted items.
+pub(crate) fn record_lineage_parentless_while_incomplete(
+    source: SnapshotSource,
+    snapshots: &[SnapshotItem],
+    index: &ScanIndex,
+) {
+    if source != SnapshotSource::ClaudeCode
+        || index.claude_desktop_lineage_census_complete
+        || snapshots.is_empty()
+    {
+        return;
+    }
+    let mut parentless: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for snapshot in snapshots {
+        if snapshot
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.parent_session_ref.as_deref())
+            .is_none()
+            && !snapshot
+                .attribution_facts
+                .iter()
+                .any(|fact| fact.field == "parent_session_ref")
+        {
+            if let Some(file) = snapshot.source_file_fingerprint.as_deref() {
+                parentless
+                    .entry(&snapshot.source_session_id)
+                    .or_default()
+                    .insert(file);
+            }
+        }
+    }
+    if parentless.is_empty() {
+        return;
+    }
+    let mut files = BTreeSet::new();
+    for entry in index.claude_desktop_title_files.values() {
+        if entry.spawned_from_desktop_session_id.is_some() || entry.spawned_from_unresolved {
+            if let Some(emitted) = parentless.remove(entry.cli_session_id.as_str()) {
+                files.extend(emitted);
+            }
+        }
+    }
+    crate::local_resource_diagnostics::claude_reread::lineage_parentless_while_incomplete(
+        files.len() as u64,
+    );
+}
+
 /// The producer-side event clock mirrored by the accepted-log append path.
 /// The maximum activity clock is stable across retries and reconstructible on
 /// both sides. `collected_at` is deliberately excluded because it is an
@@ -11276,8 +11338,8 @@ pub(crate) struct ClaudeAbsenceCounters {
     pub(crate) tombstone_hits: u64,
     /// Raw-complete censuses whose retirement a guard refused.
     pub(crate) retirements_refused: u64,
-    /// Malformed tombstone entries, or a malformed tombstone container,
-    /// dropped while decoding an index.
+    /// Malformed tombstone entries, a malformed tombstone container, or a
+    /// malformed decode-and-drop Desktop inventory, dropped decoding an index.
     pub(crate) tombstone_decode_drops: u64,
     /// Tombstones cleared because the returning family re-proved.
     pub(crate) tombstones_cleared: u64,
@@ -15234,6 +15296,7 @@ struct UsageTotals {
 }
 
 const USD_PICO_SCALE: u128 = 1_000_000_000_000;
+const PI_COST_FIELD_CEILING_PICOS: u128 = 100_000 * USD_PICO_SCALE;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct UsageCosts {
@@ -16239,9 +16302,17 @@ struct ClaudeTitleMetadata {
     /// (`spawnedFrom`), resolved through the store to the parent's own
     /// transcript id. Only unambiguous, acyclic links are kept.
     spawn_lineage: BTreeMap<String, ClaudeDesktopSpawnLineage>,
+    /// This cycle's existing held retries with recovered proof; counts only.
+    recovered_account_holds: BTreeSet<String>,
     legacy_sidecar_fingerprint: String,
     sidecar_census_incomplete: bool,
     original_identity_census_incomplete: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    // true = transcript-window open, false = Desktop metadata open.
+    static CLAUDE_DESKTOP_READ_FOR_TEST: std::cell::Cell<Option<fn(bool)>> = const { std::cell::Cell::new(None) };
 }
 
 /// A launched session's direct starting session. No root or depth: the child
@@ -16403,6 +16474,19 @@ impl ClaudeTitleMetadata {
 
     fn spawn_lineage(&self, source_session_id: &str) -> Option<&ClaudeDesktopSpawnLineage> {
         self.spawn_lineage.get(source_session_id)
+    }
+
+    fn note_completed_account_holds(&mut self, index: &ScanIndex) {
+        for key in index.claude_account_deferred_holds.keys() {
+            let Some(session) = Path::new(key).file_stem().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if index.files.contains_key(key)
+                && self.session_account_evidence(session).identity_disposition == Some("complete")
+            {
+                self.recovered_account_holds.insert(key.clone());
+            }
+        }
     }
 
     #[cfg(test)]
@@ -16888,6 +16972,12 @@ fn read_claude_transcript_live_window(
     struct Stamp {
         timestamp: Option<String>,
     }
+    #[cfg(test)]
+    CLAUDE_DESKTOP_READ_FOR_TEST.with(|hook| {
+        if let Some(observe) = hook.get() {
+            observe(true);
+        }
+    });
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -16897,6 +16987,7 @@ fn read_claude_transcript_live_window(
     if !metadata.is_file() {
         return Err(anyhow::anyhow!("Claude transcript was not a file"));
     }
+    crate::local_resource_diagnostics::claude_reread::desktop_lineage_window_read();
     let len = metadata.len();
     let bound = CLAUDE_TRANSCRIPT_WINDOW_READ_BYTES;
     // (bytes, starts at a line start, ends at a line end)
@@ -17155,6 +17246,12 @@ fn load_claude_desktop_session_title(
     account_identifier_hash: Option<String>,
     mut original_identity: Option<ClaudeDesktopIdentityEvidence>,
 ) -> Result<Option<ClaudeDesktopTitleIndexEntry>> {
+    #[cfg(test)]
+    CLAUDE_DESKTOP_READ_FOR_TEST.with(|hook| {
+        if let Some(observe) = hook.get() {
+            observe(false);
+        }
+    });
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -26395,7 +26492,7 @@ impl OwnedSourceScan {
                 .is_some()
                 || index.claude_desktop_store_cursor.is_some()
                 || index.claude_desktop_store_sweep_had_errors);
-        let claude_title_metadata = if source == SnapshotSource::ClaudeCode {
+        let mut claude_title_metadata = if source == SnapshotSource::ClaudeCode {
             ClaudeTitleMetadata::load_from_roots_with_index(
                 roots,
                 index,
@@ -26405,6 +26502,14 @@ impl OwnedSourceScan {
         } else {
             ClaudeTitleMetadata::default()
         };
+        if source == SnapshotSource::ClaudeCode
+            && !claude_identity_census_was_complete
+            && !claude_title_metadata.original_identity_census_incomplete
+        {
+            // Attribute the existing account-held retry reads to their recovered
+            // metadata proof. This does not select, rearm or authorize any file.
+            claude_title_metadata.note_completed_account_holds(index);
+        }
         let state_census_complete =
             source != SnapshotSource::Codex || !codex_title_metadata.state_census_incomplete;
         let sidecar_census_complete = match source {
@@ -28422,6 +28527,34 @@ impl OwnedSourceScan {
                         .consumed_bytes()
                         .saturating_sub(before_body_read),
                 );
+                if source == SnapshotSource::ClaudeCode
+                    && before_body_read == 0
+                    && active.parser.reader.consumed_bytes() > 0
+                {
+                    // Count only the first actual body bytes. SourceChanged
+                    // includes Desktop/usage sidecar and object revisions;
+                    // ScopeChanged also catches a metadata change concurrent
+                    // with growth (whose selection reason is TranscriptChanged).
+                    // LegacyIdentity is the separate one-time legacy upgrade.
+                    if claude_title_metadata
+                        .recovered_account_holds
+                        .contains(&local_index_key(&active.candidate.path))
+                    {
+                        crate::local_resource_diagnostics::claude_reread::desktop_recovered_hold_body_read();
+                    } else {
+                        match index.candidate_decision_with_reason_at(&active.candidate, audit_now).1 {
+                            Some(CandidateParseReason::LegacyIdentity) => {
+                                crate::local_resource_diagnostics::claude_reread::desktop_revision_body_read(true);
+                            }
+                            reason if reason == Some(CandidateParseReason::SourceChanged)
+                                || active.sampling.as_ref().is_some_and(|read| matches!(read.mode,
+                                    crate::transcript_acquisition::ReadMode::Full(crate::transcript_acquisition::FullReason::ScopeChanged))) => {
+                                crate::local_resource_diagnostics::claude_reread::desktop_revision_body_read(false);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 if source == SnapshotSource::Codex {
                     let consumed = active.parser.reader.consumed_bytes();
                     let moved = codex_file_join::take_charge(&mut active);
@@ -30395,6 +30528,22 @@ impl OwnedSourceScan {
                                     || recognized_usage_drop_count > 0
                                     || report.over_line_cap_count > 0,
                                 source_verified,
+                                // Unchanged already checked physical identity and
+                                // acquisition scope against the prior checkpoint.
+                                // Keep census authority separate from Full credit.
+                                unchanged_source: cursor_fragment.is_none()
+                                    && file_sampling.as_ref().is_some_and(|active| {
+                                        active.mode
+                                            == crate::transcript_acquisition::ReadMode::Unchanged
+                                    })
+                                    && completed_acquisition.as_ref().is_some_and(|completed| {
+                                        completed.checkpoint.audit_debt().is_none()
+                                    })
+                                    && sampled_jsonl::loss_free_source_report(
+                                        &report,
+                                        recognized_usage_drop_count,
+                                        dropped_usage_record_count,
+                                    ),
                                 itemless_request_hashes: claude_itemless_request_hashes,
                                 opened_birth: claude_opened_birth,
                                 modified_unix_seconds: candidate.modified_unix_seconds,
@@ -38688,6 +38837,17 @@ fn codex_total_usage_has_request_count(value: &Value) -> bool {
 }
 
 fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    // Count per observed usage line, before response deduplication and timestamp
+    // drops; rereads count again. Usage-shape probes remain side-effect-free.
+    if pi_usage_event(value) {
+        if let Some(usage) = pi_usage_value(value) {
+            let (_, observations) = pi_usage_costs_with_observations(usage);
+            crate::local_resource_diagnostics::pi_cost_observations(
+                observations.refused,
+                observations.rounded,
+            );
+        }
+    }
     let event_type = string_at(value, &["type"]);
     match event_type.as_deref() {
         Some("custom") => {
@@ -39117,49 +39277,160 @@ fn pi_cache_creation_split(usage: &Value) -> (u64, u64) {
     (flat.saturating_sub(cache_1h), cache_1h)
 }
 
+#[derive(Default)]
+struct PiCostObservations {
+    refused: u64,
+    rounded: u64,
+}
+
 fn pi_usage_costs(usage: &Value) -> UsageCosts {
+    pi_usage_costs_with_observations(usage).0
+}
+
+fn pi_usage_costs_with_observations(usage: &Value) -> (UsageCosts, PiCostObservations) {
+    let mut observations = PiCostObservations::default();
     let Some(cost) = usage.get("cost") else {
-        return UsageCosts {
-            observed: true,
-            ..UsageCosts::default()
-        };
+        return (
+            UsageCosts {
+                observed: true,
+                ..UsageCosts::default()
+            },
+            observations,
+        );
     };
-    let total = usd_picos_at(cost, &["total"]);
-    let input = usd_picos_at(cost, &["input"]);
-    let output = usd_picos_at(cost, &["output"]);
-    let cache_read = usd_picos_at(cost, &["cacheRead", "cache_read"]);
-    let cache_creation = usd_picos_at(cost, &["cacheWrite", "cache_write"]);
+    let mut parse = |keys: &[&str]| match usd_picos_at(cost, keys) {
+        Ok((picos, rounded)) => {
+            observations.rounded += u64::from(rounded);
+            Some(picos)
+        }
+        Err(PiCostParseError::Overflow) => {
+            observations.refused += 1;
+            None
+        }
+        Err(PiCostParseError::Invalid) => None,
+    };
+    let total = parse(&["total"]);
+    let input = parse(&["input"]);
+    let output = parse(&["output"]);
+    let cache_read = parse(&["cacheRead", "cache_read"]);
+    let cache_creation = parse(&["cacheWrite", "cache_write"]);
     let reported = [total, input, output, cache_read, cache_creation]
         .iter()
         .any(Option::is_some);
-    if !reported {
-        return UsageCosts {
+    (
+        UsageCosts {
             observed: true,
-            ..UsageCosts::default()
-        };
-    }
-    UsageCosts {
-        observed: true,
-        reported: true,
-        total,
-        input,
-        output,
-        cache_read,
-        cache_creation,
+            reported,
+            total,
+            input,
+            output,
+            cache_read,
+            cache_creation,
+        },
+        observations,
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PiCostParseError {
+    Invalid,
+    Overflow,
+}
+
+fn usd_picos_at(value: &Value, keys: &[&str]) -> Result<(u128, bool), PiCostParseError> {
+    let raw = keys.iter().find_map(|key| value.get(*key));
+    match raw {
+        // serde_json has no arbitrary_precision feature here; integers remain exact.
+        // The number form is exact only to f64's shortest round-trip representation; the string form is exact to its lexeme.
+        Some(Value::Number(number)) => parse_pi_usd_picos(&number.to_string()),
+        Some(Value::String(text)) => parse_pi_usd_picos(text),
+        _ => Err(PiCostParseError::Invalid),
     }
 }
 
-fn usd_picos_at(value: &Value, keys: &[&str]) -> Option<u128> {
-    let raw = keys.iter().find_map(|key| value.get(*key))?;
-    let parsed = match raw {
-        Value::Number(number) => number.as_f64(),
-        Value::String(text) => text.parse::<f64>().ok(),
-        _ => None,
-    }?;
-    if !parsed.is_finite() || parsed < 0.0 {
-        return None;
+/// Checked decimal dollars to picos; the bool records sub-pico precision.
+fn parse_pi_usd_picos(text: &str) -> Result<(u128, bool), PiCostParseError> {
+    use PiCostParseError::{Invalid, Overflow};
+    let (mantissa, exponent) = text.split_once(['e', 'E']).unwrap_or((text, "0"));
+    let mantissa = mantissa.strip_prefix('+').unwrap_or(mantissa);
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (whole.is_empty() && fraction.is_empty())
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return Err(Invalid);
     }
-    Some((parsed * USD_PICO_SCALE as f64).round() as u128)
+    let (negative_exponent, exponent_digits) = if let Some(digits) = exponent.strip_prefix('-') {
+        (true, digits)
+    } else {
+        (false, exponent.strip_prefix('+').unwrap_or(exponent))
+    };
+    if exponent_digits.is_empty() || !exponent_digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Invalid);
+    }
+    let coefficient = whole
+        .bytes()
+        .chain(fraction.bytes())
+        .try_fold(0u128, |n, b| {
+            n.checked_mul(10)?.checked_add(u128::from(b - b'0'))
+        })
+        .ok_or(Overflow)?;
+    let exponent = exponent_digits
+        .bytes()
+        .try_fold(0i128, |n, b| {
+            n.checked_mul(10)?.checked_add(i128::from(b - b'0'))
+        })
+        .ok_or(Overflow)?;
+    let exponent = if negative_exponent {
+        -exponent
+    } else {
+        exponent
+    };
+    let shift = exponent
+        .checked_sub(i128::try_from(fraction.len()).map_err(|_| Overflow)?)
+        .and_then(|n| n.checked_add(12))
+        .ok_or(Overflow)?;
+    let (picos, rounded) = if shift >= 0 {
+        let picos = if coefficient == 0 {
+            0
+        } else {
+            let power = u32::try_from(shift).map_err(|_| Overflow)?;
+            coefficient
+                .checked_mul(10u128.checked_pow(power).ok_or(Overflow)?)
+                .ok_or(Overflow)?
+        };
+        (picos, false)
+    } else {
+        // 10^39 exceeds u128::MAX, so every representable coefficient is
+        // strictly below its halfway point (and rounds to zero).
+        let Some(power) = shift
+            .checked_neg()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n <= 38)
+        else {
+            return Ok((0, true));
+        };
+        let divisor = 10u128.checked_pow(power).ok_or(Overflow)?;
+        let floor = coefficient / divisor;
+        let remainder = coefficient % divisor;
+        // Refuse even a sub-pico excess above the dollar ceiling, before rounding.
+        if floor > PI_COST_FIELD_CEILING_PICOS
+            || (floor == PI_COST_FIELD_CEILING_PICOS && remainder != 0)
+        {
+            return Err(Overflow);
+        }
+        let round_up = remainder > divisor / 2 || (remainder == divisor / 2 && floor % 2 != 0);
+        (
+            floor.checked_add(u128::from(round_up)).ok_or(Overflow)?,
+            true,
+        )
+    };
+    if picos > PI_COST_FIELD_CEILING_PICOS {
+        return Err(Overflow);
+    }
+    Ok((picos, rounded))
 }
 
 fn usd_picos_string(value: u128) -> String {
@@ -49182,6 +49453,7 @@ impl ScanIndex {
             // saved terminal that re-armed every family file may.
             claude_request_identity_contract_changed: self.claude_request_identity_contract_changed
                 || previous.claude_request_identity_contract_changed,
+            claude_desktop_store_inventory: self.claude_desktop_store_inventory.clone(),
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
             claude_desktop_store_upper_bound: self.claude_desktop_store_upper_bound.clone(),
             claude_desktop_store_sweep_had_errors: self.claude_desktop_store_sweep_had_errors,
@@ -77956,6 +78228,118 @@ mod tests {
         )
     }
 
+    #[test]
+    fn finalized_parentless_desktop_child_counts_only_incomplete_emission() {
+        let _gate = claude_request_money::e2::GateForTest::off();
+        for complete in [false, true] {
+            let child = spawn_cli("parentless-count-child");
+            let parent = spawn_cli("parentless-count-parent");
+            let mut index = ScanIndex {
+                claude_desktop_lineage_census_complete: complete,
+                ..ScanIndex::default()
+            };
+            index.claude_desktop_title_files.insert(
+                "child".into(),
+                desktop_spawn_entry_raw(&child, "local_child", Some("local_parent")),
+            );
+            index.claude_desktop_title_files.insert(
+                "parent".into(),
+                desktop_spawn_entry_raw(&parent, "local_parent", None),
+            );
+            let metadata = ClaudeTitleMetadata::from_durable_index(&index, !complete);
+            let home = crate::test_scratch::ScratchDir::new("parentless-offer-count");
+            let path = home.join(format!("{child}.jsonl"));
+            fs::write(
+                &path,
+                json!({"timestamp":"2026-09-30T10:00:00Z",
+                "type":"assistant", "sessionId":child, "requestId":"child-request",
+                "message":{"id":"child-message", "model":"claude-opus-4-8",
+                    "usage":{"input_tokens":10,"output_tokens":2}}})
+                .to_string(),
+            )
+            .unwrap();
+            let item = parse_claude_code_jsonl_file_with_title_metadata(
+                &path,
+                "2026-09-30T10:05:00Z",
+                "f".repeat(64),
+                &metadata,
+                false,
+            )
+            .unwrap()
+            .remove(0);
+            assert_eq!(
+                item.attribution_facts
+                    .iter()
+                    .any(|fact| fact.field == "parent_session_ref"),
+                complete
+            );
+            let mut result = SourceScanResult::empty(SnapshotSource::ClaudeCode);
+            result.snapshots.push(item);
+            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+            crate::snapshot_sync::classify_holds_for_test(
+                SnapshotSource::ClaudeCode,
+                &mut index,
+                &mut result,
+            );
+            assert_eq!(result.snapshots.len(), 1, "the child is actually offered");
+            let counts = serde_json::to_value(scope.finish()).unwrap();
+            assert_eq!(
+                counts["lineage_parentless_while_incomplete"]["files"]
+                    .as_u64()
+                    .unwrap_or(0),
+                u64::from(!complete)
+            );
+            if !complete {
+                // Repeated entities for one physical file count once; ordinary
+                // sessions and files already carrying a parent count zero.
+                result.snapshots.push(result.snapshots[0].clone());
+                let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+                finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+                record_lineage_parentless_while_incomplete(
+                    SnapshotSource::ClaudeCode,
+                    &result.snapshots,
+                    &index,
+                );
+                assert_eq!(
+                    serde_json::to_value(scope.finish()).unwrap()
+                        ["lineage_parentless_while_incomplete"]["files"],
+                    1
+                );
+                result.snapshots.truncate(1);
+                result.snapshots[0]
+                    .origin
+                    .get_or_insert_with(SnapshotOrigin::default)
+                    .parent_session_ref = Some(parent.clone());
+                let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+                finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+                record_lineage_parentless_while_incomplete(
+                    SnapshotSource::ClaudeCode,
+                    &result.snapshots,
+                    &index,
+                );
+                assert!(serde_json::to_value(scope.finish())
+                    .unwrap()
+                    .get("lineage_parentless_while_incomplete")
+                    .is_none());
+                result.snapshots[0].origin = None;
+                result.snapshots[0].source_session_id = "ordinary".into();
+                result.snapshots.truncate(1);
+                let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+                finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+                record_lineage_parentless_while_incomplete(
+                    SnapshotSource::ClaudeCode,
+                    &result.snapshots,
+                    &index,
+                );
+                assert!(serde_json::to_value(scope.finish())
+                    .unwrap()
+                    .get("lineage_parentless_while_incomplete")
+                    .is_none());
+            }
+        }
+    }
+
     fn desktop_spawn_entry_raw(
         cli: &str,
         desktop: &str,
@@ -80006,6 +80390,168 @@ mod tests {
         aggregate.add(&invalid);
         assert!(!aggregate.reported);
         assert_eq!(aggregate.snapshot_cost(), None);
+    }
+
+    #[test]
+    fn pi_cost_decimal_lexemes_are_exact_and_match_realistic_numbers() {
+        for (text, expected) in [
+            ("0.000123456789", 123_456_789),
+            ("0.1", 100_000_000_000),
+            ("3", 3_000_000_000_000),
+            ("+3.", 3_000_000_000_000),
+            (".1", 100_000_000_000),
+            ("1e-3", 1_000_000_000),
+            ("2.5E2", 250_000_000_000_000),
+            ("0.0042", 4_200_000_000),
+            ("0.0011", 1_100_000_000),
+            ("0.0006", 600_000_000),
+            ("100000", PI_COST_FIELD_CEILING_PICOS),
+            ("99999.999999999999", PI_COST_FIELD_CEILING_PICOS - 1),
+        ] {
+            assert_eq!(parse_pi_usd_picos(text), Ok((expected, false)), "{text}");
+        }
+        for text in ["0.000123456789", "0.1", "3", "1e-3", "2.5E2", "0.0042"] {
+            let number: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                usd_picos_at(&serde_json::json!({"total": number}), &["total"]),
+                usd_picos_at(&serde_json::json!({"total": text}), &["total"]),
+                "{text}",
+            );
+        }
+        for text in [
+            "", "-1", "-0", "NaN", "inf", "1e", "1e+", "1e2e3", "1..2", " 1", ".",
+        ] {
+            assert_eq!(
+                parse_pi_usd_picos(text),
+                Err(PiCostParseError::Invalid),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn pi_cost_number_display_matches_realistic_decimal_strings() {
+        // Every pair has at most 15 significant digits. Include precision
+        // rounding and half-even ties as well as ordinary multi-dollar costs.
+        for (text, picos, rounded) in [
+            ("0.000123456789012", 123_456_789, true),
+            ("12.3456789", 12_345_678_900_000, false),
+            ("99999.999999", 99_999_999_999_000_000, false),
+            ("0.0000000000015", 2, true),
+            ("0.0000000000025", 2, true),
+            ("0.0000000000035", 4, true),
+        ] {
+            for raw in [serde_json::from_str::<Value>(text).unwrap(), json!(text)] {
+                let (costs, observations) = pi_usage_costs_with_observations(&json!({
+                    "cost": {"total": raw}
+                }));
+                assert_eq!(costs.total, Some(picos), "{raw}");
+                assert_eq!(observations.rounded, u64::from(rounded), "{raw}");
+                assert_eq!(observations.refused, 0, "{raw}");
+            }
+        }
+    }
+
+    #[test]
+    fn pi_cost_refuses_overflow_and_ceiling_excess_in_every_field() {
+        use crate::local_resource_diagnostics::cache_lifecycle;
+        for field in [
+            "total",
+            "input",
+            "output",
+            "cacheRead",
+            "cacheWrite",
+            "cache_read",
+            "cache_write",
+        ] {
+            for raw in [
+                serde_json::json!(1e30),
+                serde_json::json!("1e400"),
+                serde_json::json!("340282366920938463463374607431768211456e-40"),
+                serde_json::json!("100000.000000000001"),
+                serde_json::json!("100000.0000000000001"),
+            ] {
+                let event = serde_json::json!({"type": "message_end", "message": {
+                    "usage": {"input": 1, "cost": {field: raw}}
+                }});
+                let (costs, observations) =
+                    pi_usage_costs_with_observations(&event["message"]["usage"]);
+                assert!(!costs.reported, "{field}: {raw}");
+                assert_eq!(costs.snapshot_cost(), None);
+                assert_eq!(observations.refused, 1);
+                assert_eq!(observations.rounded, 0);
+                let (_, counts) = cache_lifecycle::observe(|| {
+                    // Repeated probes must not record extra observations.
+                    assert!(recognized_positive_usage_shape(SnapshotSource::Pi, &event));
+                    assert!(!recognized_usage_shape_was_dropped(
+                        SnapshotSource::Pi,
+                        &event
+                    ));
+                    apply_pi_line(&event, &mut SnapshotAccumulator::new(SnapshotSource::Pi));
+                });
+                assert_eq!(counts.pi_cost_refused_overflow, 1);
+                assert_eq!(counts.pi_cost_precision_rounded, 0);
+            }
+            let (costs, observations) = pi_usage_costs_with_observations(&serde_json::json!({
+                "cost": {field: 100_000}
+            }));
+            assert!(costs.reported);
+            assert_eq!(observations.refused, 0);
+        }
+        let (partial, observations) = pi_usage_costs_with_observations(&serde_json::json!({
+            "cost": {"total": "1e400", "input": "0.1"}
+        }));
+        assert_eq!(partial.total, None);
+        assert_eq!(partial.input, Some(100_000_000_000));
+        assert!(partial.reported);
+        assert_eq!(observations.refused, 1);
+    }
+
+    #[test]
+    fn pi_cost_sub_pico_precision_rounds_half_to_even_and_counts_each_field() {
+        use crate::local_resource_diagnostics::cache_lifecycle;
+        for (text, expected) in [
+            ("0.0000000000015", 2),
+            ("0.0000000000025", 2),
+            ("0.0000000000035", 4),
+            ("15e-13", 2),
+            ("25e-13", 2),
+            ("0.0000000000014", 1),
+            ("0.0000000000026", 3),
+            ("0.0000000000020", 2),
+            ("1e-400", 0),
+        ] {
+            assert_eq!(parse_pi_usd_picos(text), Ok((expected, true)), "{text}");
+            let usage = serde_json::json!({"input": 1, "cost": {
+                "total": text, "input": text, "output": text,
+                "cacheRead": text, "cacheWrite": text
+            }});
+            let (costs, observations) = pi_usage_costs_with_observations(&usage);
+            assert_eq!(
+                [
+                    costs.total,
+                    costs.input,
+                    costs.output,
+                    costs.cache_read,
+                    costs.cache_creation
+                ],
+                [Some(expected); 5]
+            );
+            assert_eq!(observations.rounded, 5);
+            let (_, counts) = cache_lifecycle::observe(|| {
+                for event in [
+                    serde_json::json!({"type": "message_end", "message": {"usage": usage}}),
+                    serde_json::json!({"type": "message", "message": {"role": "assistant", "usage": usage}}),
+                    serde_json::json!({"type": "usage", "usage": usage}),
+                    serde_json::json!({"type": "compaction", "usage": usage}),
+                    serde_json::json!({"type": "branch_summary", "usage": usage}),
+                ] {
+                    apply_pi_line(&event, &mut SnapshotAccumulator::new(SnapshotSource::Pi));
+                }
+            });
+            assert_eq!(counts.pi_cost_precision_rounded, 25);
+            assert_eq!(counts.pi_cost_refused_overflow, 0);
+        }
     }
 
     #[test]
@@ -91684,7 +92230,7 @@ crate::durable_tail_codec::durable_struct!(ClaudeResponseObservation {
     N desktop_request: bool,
 });
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
-crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
+crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, recovered_account_holds, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, desktop_request, effective_input_context, telemetry_attached, e2_inherited);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrenceWitness; sequence, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, model, speed_mode, reasoning_effort);
 crate::heap_layout_bound::fields!(ClaudeUsageAuthorityQuarantineRecord; contract, proven_witness_fingerprint, member_source_file_fingerprints, failed_reconstruction_count, disposition, retry_after_unix_seconds, proof_correction);
@@ -91738,7 +92284,7 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U subscription_product: Option<String>,
 });
 crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; persistence_legacy_recovery, persistence_root, persistence_unavailable, persistence_controls, decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, file_upload_context_enabled, context_read_counts, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store);
+crate::heap_layout_bound::fields!(ScanIndex; persistence_legacy_recovery, persistence_root, persistence_unavailable, persistence_controls, decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, file_upload_context_enabled, context_read_counts, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store, claude_desktop_store_inventory);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
