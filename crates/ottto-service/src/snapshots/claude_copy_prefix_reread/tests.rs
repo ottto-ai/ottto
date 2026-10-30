@@ -378,7 +378,7 @@ fn estimate_is_metadata_only_and_changes_no_files_or_index() {
 fn scheduled_set_matches_estimate_scoped_order_and_native_page_budget() {
     let (home, root, mut index, paths) = setup("copy-prefix-scheduled");
     let _switch = claude_request_money::e2::ResumedPrefixForTest::set(true);
-    let support = home.join("support");
+    let support = home.join("new-parent/nested-support");
     let got = run(&home.join("scope.json"), &support, true).unwrap();
     let roots = vec![root.clone()];
     let pending = prepare(&mut index, &support, &roots).unwrap();

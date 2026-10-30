@@ -176,8 +176,17 @@ pub fn run(scope: &Path, support: &Path, apply: bool, window_days: u64) -> Resul
             encoded.len() as u64 <= MAX_REQUEST_BYTES,
             "scope exceeds existing local bound"
         );
-        let dir = support.join("snapshots");
+        let dir = std::path::absolute(support.join("snapshots"))?;
+        let created = dir
+            .ancestors()
+            .take_while(|path| !path.is_dir())
+            .collect::<Vec<_>>();
         fs::create_dir_all(&dir)?;
+        // Persist every new directory entry, starting at its existing parent.
+        // An apply success must survive a crash even for a new support path.
+        for path in created.into_iter().rev() {
+            sync_checkpoint_parent(path)?;
+        }
         // A create-new private file is published by atomic hard link; daemon
         // readers never see a partially written request. Existing intent wins.
         let temp = dir.join(format!(".copy-prefix-request-{}", std::process::id()));
@@ -193,7 +202,9 @@ pub fn run(scope: &Path, support: &Path, apply: bool, window_days: u64) -> Resul
             use std::io::Write;
             file.write_all(&encoded)?;
             file.sync_all()?;
-            fs::hard_link(&temp, dir.join(REQUEST))?;
+            let published = dir.join(REQUEST);
+            fs::hard_link(&temp, &published)?;
+            sync_checkpoint_parent(&published)?;
             Ok(())
         })();
         let _ = fs::remove_file(&temp);
