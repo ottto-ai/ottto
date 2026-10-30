@@ -704,12 +704,13 @@ fn other_wire(source: SnapshotSource, scan: &SourceScanResult) -> Vec<u8> {
     validate_snapshot_batch_request(&wire).unwrap();
     canonical(&wire)
 }
-fn codex_case(legacy: bool) {
+fn codex_case(legacy: bool, content: bool) {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let name = if legacy {
-        "codex_legacy_acked_sticky"
-    } else {
-        "codex_v2_sticky"
+    let name = match (legacy, content) {
+        (true, false) => "codex_legacy_acked_sticky",
+        (false, false) => "codex_v2_sticky",
+        (true, true) => "codex_content_legacy",
+        (false, true) => "codex_content_v2",
     };
     if !supported(name) {
         return;
@@ -718,7 +719,15 @@ fn codex_case(legacy: bool) {
     let disk = Disk::new(&c);
     let path = c.root.join("rollout.jsonl");
     let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z","payload":{"id":ROOT,"timestamp":"2026-10-27T07:00:00Z"}}).to_string()+"\n";
-    std::fs::write(&path, header + &codex_rows("turn-a", 10)).unwrap();
+    let content_prefix = if content {
+        [
+            json!({"type":"turn_context","timestamp":"2026-10-27T07:00:00Z",
+                "payload":{"turn_id":"turn-a","cwd":"/synthetic/codex","model":"gpt-5.2"}}),
+            json!({"type":"event_msg","timestamp":"2026-10-27T07:00:00Z",
+                "payload":{"type":"user_message","message":"Synthetic content-only replay prompt"}}),
+        ].iter().map(|line| line.to_string()+"\n").collect::<String>()
+    } else { String::new() };
+    std::fs::write(&path, header + &content_prefix + &codex_rows("turn-a", 10)).unwrap();
     input_clock(&path);
     let scanner = E2ScanFixture::default();
     let source = SnapshotSource::Codex;
@@ -784,6 +793,9 @@ fn codex_case(legacy: bool) {
     assert_eq!(d, a, "disk-restored envelope differs from the RAM arm");
     assert_eq!(Sha256::digest(&a), Sha256::digest(&b));
     assert_eq!(Sha256::digest(&d), Sha256::digest(&b));
+    // The existing cross-build exporter has a fixed receipt catalog. This
+    // additional same-build content fence proof emits no catalog entry.
+    if content { return; }
     receipt(
         name,
         &[ReceiptBody {
@@ -796,12 +808,21 @@ fn codex_case(legacy: bool) {
 #[test]
 fn codex_v2_sticky() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    codex_case(false);
+    codex_case(false, false);
 }
 #[test]
 fn codex_legacy_acked_sticky() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    codex_case(true);
+    codex_case(true, false);
+}
+
+/// [money] Content-only Legacy/V2 replay preserves the emitted body and never
+/// adds the restored prefix twice; a cold Full is the independent body oracle.
+#[test]
+fn codex_content_only_caller_matches_cold_full() {
+    for legacy in [false, true] {
+        codex_case(legacy, true);
+    }
 }
 
 /// Disk-only lifecycle fixtures (#806). scripts/money_equivalence.py counts
