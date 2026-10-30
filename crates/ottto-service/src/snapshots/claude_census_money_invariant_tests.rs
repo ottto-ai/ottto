@@ -357,16 +357,26 @@ fn indexed_census(
 }
 
 /// One complete terminal over every indexed key; the diagnostics it emits.
+/// The retirement decision reads 0 transcript bytes: transcript I/O is denied
+/// and no transcript is opened.
 fn retirement_terminal(index: &mut ScanIndex) -> Vec<serde_json::Value> {
     let keys = index.files.keys().cloned().collect::<BTreeSet<_>>();
-    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-        crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
-            index,
-            &keys,
-            &BTreeSet::new(),
-            MONEY_WINDOW,
-        )
+    let opens = crate::snapshots::all_transcript_opens_for_test();
+    let (_, rows) = crate::snapshots::with_transcript_io_denied(|| {
+        crate::local_resource_diagnostics::capture(|| {
+            crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+                index,
+                &keys,
+                &BTreeSet::new(),
+                MONEY_WINDOW,
+            )
+        })
     });
+    assert_eq!(
+        crate::snapshots::all_transcript_opens_for_test(),
+        opens,
+        "retirement reads no transcript"
+    );
     let census = index.claude_request_census_for_test();
     assert_eq!(census.totals_for_test(), census.recounted_for_test());
     rows
@@ -384,10 +394,10 @@ fn kept_overlap(rows: &[serde_json::Value], stage: &str) -> Option<(u64, u64, u6
     assert_eq!(
         names,
         [
+            "census_retire_kept_overflow",
+            "census_retire_kept_overflow_total",
             "census_retire_kept_overlap_hashes",
             "census_retire_kept_overlap_hashes_total",
-            "census_retire_kept_overlap_overflow",
-            "census_retire_kept_overlap_overflow_total",
             "census_retire_kept_overlap_records",
             "census_retire_kept_overlap_records_total",
         ]
@@ -401,7 +411,7 @@ fn kept_overlap(rows: &[serde_json::Value], stage: &str) -> Option<(u64, u64, u6
     Some((
         count("census_retire_kept_overlap_records"),
         count("census_retire_kept_overlap_hashes"),
-        count("census_retire_kept_overlap_overflow"),
+        count("census_retire_kept_overflow"),
     ))
 }
 
@@ -497,6 +507,58 @@ fn census_retirement_overlap_cap_retires_the_oldest_and_alarms() {
     assert_eq!(retired(&middle), None);
     assert_eq!(retired(&newest), None);
     assert_eq!(census.hash_total_for_test(), 2 * SIZE as usize);
+}
+
+/// Lead B condition: one index yields one kept set. Past the cap the oldest
+/// overlapping record retires; of two equally old ones, the first by key.
+/// The same records inserted in another order, and a second run of the
+/// decision on a copy, retire exactly the same record.
+#[test]
+fn census_retirement_overlap_decision_is_deterministic() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    const SIZE: u64 = 200_000;
+    let chain = |at: u64| (at * (SIZE - 1)..at * (SIZE - 1) + SIZE).collect::<Vec<_>>();
+    // (name, seed, age in days, chain link): "a-tie" and "b-tie" are equally
+    // old and the oldest, so the cap retires "a-tie" (first by key).
+    let records: [(&str, char, u64, u64); 3] = [
+        ("b-tie", 'b', 50, 1),
+        ("newest", 'c', 40, 2),
+        ("a-tie", 'a', 50, 0),
+    ];
+    let build = |order: Vec<&(&str, char, u64, u64)>| {
+        let mut index = ScanIndex::default();
+        for &(name, seed, age, link) in order {
+            indexed_census(&mut index, name, seed, age, chain(link));
+        }
+        index
+    };
+    let forward = build(records.iter().collect());
+    let reverse = build(records.iter().rev().collect());
+    assert_eq!(
+        forward.claude_request_census_for_test(),
+        reverse.claude_request_census_for_test()
+    );
+    let mut outcomes = Vec::new();
+    for mut index in [forward.clone(), forward, reverse] {
+        let rows = retirement_terminal(&mut index);
+        let counts = kept_overlap(&rows, "claude_census_retire_kept_overlap");
+        assert_eq!(counts, Some((2, 2 * SIZE, 1)));
+        let census = index.claude_request_census_for_test().clone();
+        let retired = census
+            .keys_for_test()
+            .into_iter()
+            .filter(|key| {
+                census
+                    .record_for_test(key)
+                    .unwrap()
+                    .retired_for_test()
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retired, ["/money/projects/a-tie.jsonl"]);
+        outcomes.push(census);
+    }
+    assert!(outcomes.windows(2).all(|pair| pair[0] == pair[1]));
 }
 
 /// The overlap is decided again at every terminal: once the partner is

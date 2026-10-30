@@ -2493,21 +2493,27 @@ fn e2_pipeline_aged_original_sharing_ids_with_its_copy_keeps_the_copy_proven() {
             .format(&Rfc3339)
             .unwrap();
         let keys = prior.files.keys().cloned().collect::<BTreeSet<_>>();
-        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-            crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
-                &mut prior,
-                &keys,
-                &BTreeSet::new(),
-                &window,
-            )
+        // The retirement decision reads 0 transcript bytes: transcript I/O
+        // is denied and no transcript is opened.
+        let opens = crate::snapshots::all_transcript_opens_for_test();
+        let (_, rows) = crate::snapshots::with_transcript_io_denied(|| {
+            crate::local_resource_diagnostics::capture(|| {
+                crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+                    &mut prior,
+                    &keys,
+                    &BTreeSet::new(),
+                    &window,
+                )
+            })
         });
+        assert_eq!(crate::snapshots::all_transcript_opens_for_test(), opens);
         let kept = rows
             .iter()
             .find(|row| row["stage"] == "claude_census_retire_kept_overlap")
             .expect("the terminal reports the kept records");
         assert_eq!(kept["counts"]["census_retire_kept_overlap_records"], 2);
         assert_eq!(kept["counts"]["census_retire_kept_overlap_hashes"], 3);
-        assert_eq!(kept["counts"]["census_retire_kept_overlap_overflow"], 0);
+        assert_eq!(kept["counts"]["census_retire_kept_overflow"], 0);
         let census = prior.claude_request_census_for_test();
         let record = |session: &str| {
             let name = format!("{session}.jsonl");

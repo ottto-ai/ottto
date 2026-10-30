@@ -2834,11 +2834,11 @@ fn note_transcript_retirements(retirement: TranscriptRetirement, vanished: u64) 
     use std::sync::atomic::Ordering;
     TRANSCRIPT_RETIRED[0].fetch_add(retirement.aged, Ordering::Relaxed);
     TRANSCRIPT_RETIRED[1].fetch_add(vanished, Ordering::Relaxed);
-    if retirement.kept_overlap_records > 0 || retirement.kept_overlap_overflow > 0 {
+    if retirement.kept_overlap_records > 0 || retirement.kept_overflow > 0 {
         crate::local_resource_diagnostics::claude_census_retire_kept_overlap(
             retirement.kept_overlap_records,
             retirement.kept_overlap_hashes,
-            retirement.kept_overlap_overflow,
+            retirement.kept_overflow,
         );
     }
 }
@@ -2864,7 +2864,7 @@ struct TranscriptRetirement {
     aged: u64,
     kept_overlap_records: u64,
     kept_overlap_hashes: u64,
-    kept_overlap_overflow: u64,
+    kept_overflow: u64,
 }
 
 /// P1 ledger transcript retirement, by the record's own mtime (never the
@@ -2942,8 +2942,10 @@ fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> Trans
 
 /// Removes from `aged` (census order, kept that way) every record that shares
 /// a request hash with another unretired record, up to the kept-hash cap: the
-/// oldest by mtime retire first past it. One transient sorted copy of the
-/// census hashes (at most the budget, 16 MiB) is freed before returning.
+/// oldest by mtime retire first past it, equal mtimes in key order (a census
+/// position is its key's rank), so one index always yields one kept set. One
+/// transient sorted copy of the census hashes (8 bytes per hash: at most
+/// 16 MiB at the budget) is freed before returning.
 fn keep_overlapping_records(
     census: &ClaudeRequestCensus,
     aged: &mut Vec<(u64, usize, usize)>,
@@ -2953,23 +2955,33 @@ fn keep_overlapping_records(
     if shared.is_empty() {
         return;
     }
+    // One flag per candidate, in census order; the hash copy is freed before
+    // the overlapping candidates are moved out.
     let mut records = census.records.values().enumerate();
+    let overlaps = aged
+        .iter()
+        .map(|&(_, position, _)| {
+            records
+                .find(|(at, _)| *at == position)
+                .is_some_and(|(_, record)| {
+                    record
+                        .request_hashes()
+                        .iter()
+                        .any(|hash| shared.binary_search(hash).is_ok())
+                })
+        })
+        .collect::<Vec<_>>();
+    drop(shared);
+    let mut overlaps = overlaps.into_iter();
     let mut overlapping = Vec::new();
     aged.retain(|&candidate| {
-        let overlaps = records
-            .find(|(position, _)| *position == candidate.1)
-            .is_some_and(|(_, record)| {
-                record
-                    .request_hashes()
-                    .iter()
-                    .any(|hash| shared.binary_search(hash).is_ok())
-            });
-        if overlaps {
+        let overlap = overlaps.next().unwrap_or(false);
+        if overlap {
             overlapping.push(candidate);
         }
-        !overlaps
+        !overlap
     });
-    drop(shared);
+    // (mtime, position): oldest first, then key order.
     overlapping.sort_unstable();
     let mut kept_hashes = overlapping
         .iter()
@@ -2982,7 +2994,7 @@ fn keep_overlapping_records(
         };
         kept_hashes -= oldest.2;
         aged.push(oldest);
-        retirement.kept_overlap_overflow += 1;
+        retirement.kept_overflow += 1;
         kept = rest;
     }
     retirement.kept_overlap_records = kept.len() as u64;

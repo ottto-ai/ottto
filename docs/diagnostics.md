@@ -382,9 +382,10 @@ shares a request id with another unretired census record is kept instead, so a
 resumed copy keeps its cross-session copy proof while both files stay indexed.
 The terminal then emits `claude_census_retire_kept_overlap` with
 `census_retire_kept_overlap_records`, `census_retire_kept_overlap_hashes` and
-`census_retire_kept_overlap_overflow`, each with a `_total` process total.
+`census_retire_kept_overflow`, each with a `_total` process total.
 Kept hashes are capped at a quarter of the census hash budget (524,288); past
-it, the oldest overlapping records retire anyway and count as overflow. A
+it, the oldest overlapping records (equal ages in path order) retire anyway
+and count as overflow, so one index always yields one kept set. A
 positive overflow also emits `claude_census_retire_kept_overlap_alarm` with
 the same counts. Each terminal decides again, so a kept record retires once
 its partner is pruned or retired. Counts only; no path, id or wire event.

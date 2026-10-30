@@ -855,10 +855,10 @@ static CENSUS_RETIRE_KEPT_OVERLAP_TOTAL: [std::sync::atomic::AtomicU64; 3] = [
 struct CensusRetireKeptOverlap {
     census_retire_kept_overlap_records: u64,
     census_retire_kept_overlap_hashes: u64,
-    census_retire_kept_overlap_overflow: u64,
+    census_retire_kept_overflow: u64,
     census_retire_kept_overlap_records_total: u64,
     census_retire_kept_overlap_hashes_total: u64,
-    census_retire_kept_overlap_overflow_total: u64,
+    census_retire_kept_overflow_total: u64,
 }
 
 /// Local counter (E7 stopgap): aged Claude transcript census records a
@@ -881,10 +881,10 @@ pub(crate) fn claude_census_retire_kept_overlap(records: u64, hashes: u64, overf
     let counts = CensusRetireKeptOverlap {
         census_retire_kept_overlap_records: records,
         census_retire_kept_overlap_hashes: hashes,
-        census_retire_kept_overlap_overflow: overflow,
+        census_retire_kept_overflow: overflow,
         census_retire_kept_overlap_records_total: add(0, records),
         census_retire_kept_overlap_hashes_total: add(1, hashes),
-        census_retire_kept_overlap_overflow_total: add(2, overflow),
+        census_retire_kept_overflow_total: add(2, overflow),
     };
     traversal_point("claude_census_retire_kept_overlap", "claude_code", &counts);
     if overflow > 0 {
