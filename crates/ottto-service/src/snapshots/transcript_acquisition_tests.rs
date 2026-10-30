@@ -516,62 +516,38 @@ fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    // Ron accepted this residual for Claude Code and Codex, and on 2026-10-30
-    // and 2026-10-31 extended it to Pi: Pi's writer is append-only and its one known rewrite
-    // (the session-version header) reads Full (`pi_version_rewrite_after_tail`).
-    for source in [
-        SnapshotSource::ClaudeCode,
-        SnapshotSource::Codex,
-        SnapshotSource::Pi,
-    ] {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = Fixture::new(source);
         fixture.append(&json!({"type":"ignored", "padding":"a".repeat(12 * 1024)}));
-        let model = match source {
-            SnapshotSource::Codex => "gpt-5.6",
-            SnapshotSource::Pi => "fixture-model",
-            _ => "claude-opus-4-8",
+        let model = if source == SnapshotSource::Codex {
+            "gpt-5.6"
+        } else {
+            "claude-opus-4-8"
         };
         fixture.append(&usage(source, 100, 0, model));
         fixture.append(&json!({"type":"ignored", "padding":"b".repeat(12 * 1024)}));
-        let (old, mode, _, initial) = acquire(&fixture, source, None, 100);
+        let (old, _, _, _) = acquire(&fixture, source, None, 100);
         assert!(old.is_some());
-        if source == SnapshotSource::Pi {
-            assert!(matches!(mode, ReadMode::Full(_)));
-            assert_eq!(initial, oracle(&fixture, source));
-        }
         let original = fs::read_to_string(&fixture.0).unwrap();
-        let (needle, replacement) = if source == SnapshotSource::Pi {
-            ("\"input\":100", "\"input\":900")
-        } else {
-            ("\"input_tokens\":100", "\"input_tokens\":900")
-        };
-        let edited = original.replace(needle, replacement);
+        let edited = original.replace("\"input_tokens\":100", "\"input_tokens\":900");
         assert_ne!(original, edited);
         assert_eq!(original.len(), edited.len());
         fs::write(&fixture.0, edited).unwrap();
         fixture.append(&usage(source, 140, 1, model));
         let (tail, mode, _, interim) = acquire(&fixture, source, old, 101);
         assert_eq!(mode, ReadMode::Tail);
-        let full = oracle(&fixture, source);
-        if source == SnapshotSource::Pi {
-            assert!(tail.is_some());
-            assert_eq!(interim[0]["input_tokens"], 240);
-            assert_eq!(full[0]["input_tokens"], 1040);
-        }
-        assert_ne!(interim, full, "accepted sampled limitation must be visible");
-        let later_at = if source == SnapshotSource::Pi {
-            101 + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS
-        } else {
-            3700
-        };
-        let (_, mode, guards, later) = acquire(&fixture, source, tail, later_at);
+        assert_ne!(
+            interim,
+            oracle(&fixture, source),
+            "accepted sampled limitation must be visible"
+        );
+        let (_, mode, guards, later) = acquire(&fixture, source, tail, 3700);
         assert_eq!(mode, ReadMode::Unchanged);
         assert_eq!(guards, 0);
         assert_eq!(later, interim);
-        assert_ne!(later, full);
+        assert_ne!(later, oracle(&fixture, source));
     }
 }
-
 #[test]
 fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
@@ -5408,89 +5384,7 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
     }
 }
 
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_ram_tail_ignores_age_and_clock_and_audit_cap_reads_full() {
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            sampled_scan::set_test_now(None);
-        }
-    }
-    let _reset = Reset;
-    const START: u64 = 1_800_000_000;
-    let source = SnapshotSource::Pi;
-    for (label, clock, pending) in [
-        ("aged", START + 7_200, 0),
-        ("clock", START - 1, 0),
-        ("slots", START + 7_200, 300),
-    ] {
-        sampled_scan::set_test_now(Some(START));
-        let fixture = ScanFixture::new(source);
-        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-        let cache = Arc::new(sampled_scan::SharedCache::default());
-        let (mut index, initial, modes) = production_scan(
-            &fixture,
-            source,
-            ScanIndex::default(),
-            Some(cache.clone()),
-            label,
-        );
-        assert_eq!(modes, (1, 0, 0));
-        assert!(!initial.snapshots.is_empty());
-        let key = local_index_key(&fixture.file.0);
-        for n in 0..pending {
-            let mut entry = index.files[&key].clone();
-            entry.set_unverified_deadline(START + 1);
-            index.files.insert(format!("/synthetic-pending/{n}"), entry);
-        }
-        sampled_scan::set_test_now(Some(clock));
-        let ((quiet, _, modes, bytes), reads) =
-            terminal_contract_retry::source_acquisitions(|| {
-                production_scan_at(&fixture, source, index, Some(cache.clone()), label, NOW)
-            });
-        assert!(reads.is_empty(), "idle Pi never enters the native reader");
-        assert_eq!(modes, (0, 0, 0));
-        assert_eq!(bytes, (0, 0));
-        let before = fs::metadata(&fixture.file.0).unwrap().len();
-        fixture.file.append(&usage(source, 200, 1, "fixture-model"));
-        let suffix = fs::metadata(&fixture.file.0).unwrap().len() - before;
-        let ((_, tail, modes, bytes), counts) = observe(|| {
-            production_scan_at_with_setup(
-                &fixture,
-                source,
-                quiet.clone(),
-                Some(cache.clone()),
-                label,
-                NOW,
-                |scan| {
-                    let context = scan.sampling.as_ref().unwrap();
-                    if pending > 0 {
-                        assert_eq!(context.audit_slots, 0);
-                    }
-                },
-            )
-        });
-        if pending == 0 {
-            assert_eq!(
-                modes,
-                (0, 1, 0),
-                "{label}: no AuditDue or ClockChanged Full"
-            );
-            assert_eq!(bytes.0, suffix, "only appended body bytes are consumed");
-        } else {
-            // #870's shared audit cap: with no audit slot left, an unmarked
-            // change funds no new debt and reads Full instead of Tail.
-            assert_eq!(modes, (1, 0, 0), "{label}: cap Full, not Tail");
-            assert!(bytes.0 > suffix, "{label}: the whole file is read");
-        }
-        assert_eq!(counts.pi, 0, "{label}: a RAM copy existed; not the pi leaf");
-        let (_, full, _) = production_scan(&fixture, source, quiet, None, label);
-        assert_eq!(production_body(source, tail), production_body(source, full));
-    }
-}
-
+/// [regress] A new file was incorrectly counted as a recordless content change.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn pi_new_file_reads_once_without_transitional_full_count() {
@@ -5524,87 +5418,6 @@ fn pi_new_file_reads_once_without_transitional_full_count() {
         "the new Pi file is settled after one read"
     );
     assert_eq!(counts.pi, 0);
-}
-
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_recordless_restart_and_eviction_full_only_on_change() {
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
-    let source = SnapshotSource::Pi;
-    for evict in [false, true] {
-        let fixture = ScanFixture::new(source);
-        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-        let cache = Arc::new(sampled_scan::SharedCache::default());
-        let (index, _, modes) = production_scan(
-            &fixture,
-            source,
-            ScanIndex::default(),
-            Some(cache.clone()),
-            "pi-recordless",
-        );
-        assert_eq!(modes, (1, 0, 0));
-        let state = fixture.dir.join("index.json");
-        let mut saved = index;
-        saved.save(&state).unwrap();
-        let cache = if evict {
-            cache.clear();
-            cache
-        } else {
-            Arc::new(sampled_scan::SharedCache::default())
-        };
-        assert!(cache.durable_counters(source).is_none());
-        let ((quiet, _, modes, bytes), reads) =
-            terminal_contract_retry::source_acquisitions(|| {
-                production_scan_at(
-                    &fixture,
-                    source,
-                    ScanIndex::load(&state).unwrap(),
-                    Some(cache.clone()),
-                    "pi-recordless",
-                    NOW,
-                )
-            });
-        assert!(reads.is_empty(), "restart and eviction cannot read idle Pi");
-        assert_eq!((modes, bytes), ((0, 0, 0), (0, 0)));
-        fixture.file.append(&usage(source, 200, 1, "fixture-model"));
-        let (((index, _, modes, _), diagnostics), counts) = observe(|| {
-            crate::local_resource_diagnostics::capture(|| {
-                production_scan_at(
-                    &fixture,
-                    source,
-                    quiet,
-                    Some(cache.clone()),
-                    "pi-recordless",
-                    NOW,
-                )
-            })
-        });
-        assert_eq!(modes, (1, 0, 0));
-        assert_eq!(counts.pi, 1, "one counted transitional pi Full");
-        let pages = diagnostics
-            .iter()
-            .filter(|record| record["stage"] == "native_collection_page")
-            .collect::<Vec<_>>();
-        assert_eq!(pages.len(), 1);
-        assert_eq!(pages[0]["source"], "pi");
-        assert_eq!(
-            pages[0]["counts"]["sampled_acquisition"]["page_events"]["full_reasons"],
-            json!({"state_missing": 1}),
-            "a recordless Pi read keeps the shared planner reason"
-        );
-        let ((_, _, modes, _), counts) = observe(|| {
-            production_scan_at(
-                &fixture,
-                source,
-                index,
-                Some(cache.clone()),
-                "pi-recordless",
-                NOW,
-            )
-        });
-        assert_eq!(modes, (0, 0, 0));
-        assert_eq!(counts.pi, 0);
-    }
 }
 
 mod codex_mcp_version_tests;

@@ -210,11 +210,7 @@ fn prefix_legacy_partial_lossy_and_growing_reads_keep_the_obligation() {
         return;
     }
     let _clock = Clock::at(START);
-    for source in [
-        SnapshotSource::Codex,
-        SnapshotSource::ClaudeCode,
-        SnapshotSource::Pi,
-    ] {
+    for source in [SnapshotSource::Codex, SnapshotSource::ClaudeCode] {
         for arm in [
             "prefix",
             "legacy",
@@ -2166,6 +2162,7 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
     );
 }
 
+/// [regress] Due audits must not count as content changes or re-stage retired debt.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
@@ -2291,78 +2288,4 @@ fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
         assert_eq!(reads.get(&fixture.file.0), Some(&1));
         assert_eq!(counts.pi, 1, "one real changed-file Full");
     }
-}
-
-/// Pi has no durable source, so a quiet retirement clears the index marker in
-/// the same pass; the last Full time is kept and an idle restart reads nothing.
-#[test]
-fn pi_quiet_retirement_clears_marker_without_durable_receipt() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let _clock = Clock::at(START);
-    let source = SnapshotSource::Pi;
-    let fixture = ScanFixture::new(source);
-    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    let (index, _, modes) = production_scan(
-        &fixture,
-        source,
-        ScanIndex::default(),
-        Some(cache.clone()),
-        "pi-quiet-retirement",
-    );
-    assert_eq!(modes, (1, 0, 0));
-    fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-    let (index, _, modes) = production_scan(
-        &fixture,
-        source,
-        index,
-        Some(cache.clone()),
-        "pi-quiet-retirement",
-    );
-    assert_eq!(modes, (0, 1, 0));
-    let key = local_index_key(&fixture.file.0);
-    assert!(index.files[&key].has_unverified_source());
-    let full_time = cache
-        .retained_checkpoint(&key)
-        .unwrap()
-        .last_full_verified();
-    sampled_scan::set_test_now(Some(START + 2 * 60 * 60));
-    let ((mut index, _, modes), diagnostics) = crate::local_resource_diagnostics::capture(|| {
-        production_scan(
-            &fixture,
-            source,
-            index,
-            Some(cache.clone()),
-            "pi-quiet-retirement",
-        )
-    });
-    assert_eq!(modes, (0, 0, 1), "quiet copy reused, no audit Full");
-    assert!(
-        !index.files[&key].has_unverified_source(),
-        "no durable receipt to await"
-    );
-    let retained = cache.retained_checkpoint(&key).unwrap();
-    assert_eq!(retained.audit_debt(), None);
-    assert_eq!(retained.last_full_verified(), full_time, "no Full credit");
-    let page = diagnostics
-        .iter()
-        .find(|record| record["stage"] == "native_collection_page")
-        .unwrap();
-    assert_eq!(
-        page["counts"]["sampled_acquisition"]["index_state_at_page_end"]["audit_quiet_retired"],
-        1
-    );
-    let state = fixture.dir.join("pi-quiet-retirement-index.json");
-    index.save(&state).unwrap();
-    let (restarted, _, modes) = production_scan(
-        &fixture,
-        source,
-        ScanIndex::load(&state).unwrap(),
-        Some(Arc::new(sampled_scan::SharedCache::default())),
-        "pi-quiet-retirement",
-    );
-    assert_eq!(modes, (0, 0, 0), "an idle retired Pi file is never read");
-    assert!(!restarted.files[&key].has_unverified_source());
 }

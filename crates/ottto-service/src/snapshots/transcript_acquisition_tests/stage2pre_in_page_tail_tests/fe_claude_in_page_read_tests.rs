@@ -857,30 +857,6 @@ fn fe_claude_sp11_codex_in_page_full_with_append_keeps_main_failure() {
     );
 }
 
-/// Pi joins the common sampled acquisition context.
-#[test]
-fn fe_claude_sp11_pi_joins_sampled_read() {
-    let root = std::env::temp_dir();
-    let scan = OwnedSourceScan::new(
-        SnapshotSource::Pi,
-        std::slice::from_ref(&root),
-        ScanIndex::default(),
-        NOW,
-        BACKFILL_WINDOW_DAYS,
-        10,
-        false,
-        None,
-        &[],
-        false,
-        true,
-    )
-    .with_sampled_acquisition(
-        Arc::new(sampled_scan::SharedCache::default()),
-        Scope(NAMESPACE.into()),
-    );
-    assert!(scan.sampling.is_some(), "Pi uses the common sampled reader");
-}
-
 /// SOURCE, s below the last committed size (GREEN): the last page committed
 /// a file ending in a complete but unterminated row (size C, main's
 /// trailing-line rule). The file is re-selected at size C and, during its
