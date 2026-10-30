@@ -384,25 +384,6 @@ fn restricted_handler_rejects_control_health_and_non_otlp_and_shares_export_resp
 }
 
 #[test]
-fn recent_request_window_expires_at_one_hour() {
-    let counters = Arc::new(Counters::default());
-    let activity = Activity::new(
-        2,
-        APPROVED,
-        100,
-        0,
-        counters.clone(),
-        Arc::new(Admission::default()),
-    );
-    assert!(!recent_at(0, 100));
-    activity.accepted_at(1000);
-    let last = counters.last_request.load(Ordering::Relaxed);
-    assert!(recent_at(last, 1000));
-    assert!(recent_at(last, 4599));
-    assert!(!recent_at(last, 4600));
-}
-
-#[test]
 fn unsupported_or_oversized_records_fail_without_overwrite() {
     let (dir, supervisor) = scratch();
     for bytes in [

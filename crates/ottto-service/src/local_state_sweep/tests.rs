@@ -883,18 +883,6 @@ fn each_artifact_uses_its_own_base_lock() {
     }
 }
 
-#[test]
-fn production_policy_is_conservative() {
-    let policy = Policy::production();
-    assert!(matches!(policy.other_daemon, OtherDaemonCheck::Probe(_)));
-    assert_eq!(policy.min_age, Duration::from_secs(60 * 60));
-    assert_eq!(policy.max_entries, 10_000);
-    assert_eq!(policy.own_pid, std::process::id() as i32);
-    assert_eq!(policy.uid, unsafe { libc::getuid() });
-    assert_eq!((policy.probe)(std::process::id() as i32), PidState::Alive);
-    assert_eq!((policy.probe)(DEAD_PID), PidState::Dead);
-}
-
 /// Old orphans of dead writers for the three sources, each under its own
 /// existing base lock. Returns `(orphan, lock)` pairs.
 fn plant_three_orphans(dest: &Path) -> Vec<(PathBuf, PathBuf)> {

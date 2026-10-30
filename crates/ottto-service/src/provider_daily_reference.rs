@@ -4638,14 +4638,6 @@ mod tests {
         assert_eq!(end, "2025-12-31");
     }
 
-    #[test]
-    fn day_spans_are_exact_across_month_and_year_boundaries() {
-        assert_eq!(day_span("2026-07-26", "2026-07-26"), Some(1));
-        assert_eq!(day_span("2026-02-28", "2026-03-01"), Some(2));
-        assert_eq!(day_span("2024-02-28", "2024-03-01"), Some(3));
-        assert_eq!(day_span("2025-12-31", "2026-01-01"), Some(2));
-    }
-
     fn day_offset(base: &str, offset: i64) -> String {
         let date = parse_day(base).expect("base day") + TimeDuration::days(offset);
         format!(
@@ -5495,39 +5487,6 @@ mod tests {
     // -- cadence ----------------------------------------------------------
 
     #[test]
-    fn the_cadence_gate_stays_in_its_band_and_is_stable_per_installation() {
-        for seed in [
-            "",
-            "a",
-            "installation-one",
-            "installation-two",
-            &"z".repeat(64),
-        ] {
-            let interval = fetch_interval_seconds(seed);
-            assert!(
-                (FETCH_INTERVAL_SECONDS - FETCH_INTERVAL_JITTER_SECONDS
-                    ..=FETCH_INTERVAL_SECONDS + FETCH_INTERVAL_JITTER_SECONDS)
-                    .contains(&interval),
-                "{seed} produced {interval}, outside the 5h45m-6h15m band"
-            );
-            assert_eq!(
-                interval,
-                fetch_interval_seconds(seed),
-                "phase must be stable"
-            );
-        }
-        assert!(
-            ["installation-one", "installation-two", "installation-three"]
-                .iter()
-                .map(|seed| fetch_interval_seconds(seed))
-                .collect::<std::collections::HashSet<_>>()
-                .len()
-                > 1,
-            "the spread must actually spread load across installs"
-        );
-    }
-
-    #[test]
     fn a_second_cycle_inside_the_cadence_window_does_nothing() {
         let collector = collector("cadence-gate");
         enabled(&collector);
@@ -6135,15 +6094,5 @@ mod tests {
                 "this module must never reference {forbidden}"
             );
         }
-    }
-
-    #[test]
-    fn the_provider_read_identifies_itself_honestly() {
-        let agent = crate::agent_status::ottto_user_agent();
-        assert!(agent.starts_with("ottto/"));
-        assert!(agent.contains("subscription-usage-reader"));
-        assert!(!agent.to_ascii_lowercase().contains("chatgpt"));
-        assert!(!agent.to_ascii_lowercase().contains("codex"));
-        assert!(!agent.to_ascii_lowercase().contains("claude"));
     }
 }

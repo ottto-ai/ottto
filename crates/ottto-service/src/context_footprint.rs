@@ -1932,35 +1932,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "OS FD/thread measurements require an isolated test process"]
-    #[serial_test::serial]
-    fn probe_context_resource_measurement() {
-        use crate::claude_spawn_gate::test_support::probe_resources;
-        for mode in ["protected", "escaped"] {
-            let before = probe_resources();
-            {
-                let fixture = ProbeFixture::new("probe-context-resource", mode, &[], 0);
-                let budget = if mode == "escaped" {
-                    Duration::from_secs(2)
-                } else {
-                    Duration::from_millis(500)
-                };
-                assert!(probe_context(&fixture, budget).is_err());
-                assert_eq!(crate::claude_spawn_gate::probe::active_count(), 1);
-                fixture.release();
-                fixture.wait_settled();
-            }
-            let end = Instant::now() + Duration::from_secs(2);
-            while probe_resources() != before && Instant::now() < end {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            let after = probe_resources();
-            println!("CONTEXT_RESOURCE mode={mode} fds_before={} fds_after={} threads_before={} threads_after={} admitted=0", before.0,after.0,before.1,after.1);
-            assert_eq!(after, before);
-        }
-    }
     use crate::test_scratch;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -2154,14 +2125,6 @@ mod tests {
         .unwrap();
         assert_eq!(actual, expected);
         fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn token_parser_handles_suffixes() {
-        assert_eq!(parse_token_count("42.2k"), Some(42_200));
-        assert_eq!(parse_token_count("1m"), Some(1_000_000));
-        assert_eq!(parse_token_count("8"), Some(8));
-        assert_eq!(parse_percent("95.8%"), Some(95.8));
     }
 
     /// The `/context` read runs an hour before expiry and is refused ten

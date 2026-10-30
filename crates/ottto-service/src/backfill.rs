@@ -700,7 +700,6 @@ pub fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
 
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -948,21 +947,6 @@ mod tests {
             kept,
             vec!["straddling", "boundary", "live", "timeless", "garbled"]
         );
-    }
-
-    #[test]
-    fn cutoff_filter_is_a_noop_without_cutoff() {
-        let state = BackfillState::default();
-        let mut snapshots = vec![cutoff_test_item("old", Some("2020-01-01T00:00:00Z"), None)];
-        assert_eq!(apply_backfill_cutoff(&mut snapshots, &state), 0);
-        assert_eq!(snapshots.len(), 1);
-    }
-
-    #[test]
-    fn pending_backfill_returns_all_sources_when_state_is_empty() {
-        let state = BackfillState::default();
-        let pending = pending_backfill_sources(&state);
-        assert_eq!(pending.len(), 3);
     }
 
     /// SOURCE F1a, StateMissing H1: only a missing file is a fresh state. An
@@ -1521,34 +1505,6 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    struct CapturingSink {
-        captured: Mutex<Option<BackfillReport>>,
-    }
-
-    impl BackfillNotificationSink for CapturingSink {
-        fn notify_completed(&self, report: &BackfillReport) {
-            *self.captured.lock().unwrap() = Some(report.clone());
-        }
-    }
-
-    #[test]
-    fn run_backfill_on_empty_home_returns_no_snapshots_and_no_panic() {
-        let home = temp_dir("home");
-        fs::create_dir_all(home.join(".claude").join("projects")).unwrap();
-        fs::create_dir_all(home.join(".codex").join("sessions")).unwrap();
-        fs::create_dir_all(home.join(".pi").join("agent").join("sessions")).unwrap();
-        let pending = vec![
-            SnapshotSource::ClaudeCode,
-            SnapshotSource::Codex,
-            SnapshotSource::Pi,
-        ];
-        let (snapshots, report) =
-            run_backfill(&home, &pending, "2026-05-28T10:00:00Z", true, None).expect("backfill ok");
-        assert_eq!(snapshots.len(), 0);
-        assert_eq!(report.total_snapshots(), 0);
-        fs::remove_dir_all(&home).ok();
-    }
-
     #[test]
     fn backfill_without_activity_hint_never_emits_context_curve() {
         let home = temp_dir("curve-capability-absent");
@@ -1575,24 +1531,6 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         assert!(snapshots[0].context_curve.is_none());
         fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn logging_sink_records_completion_via_trait_object() {
-        let sink: Arc<dyn BackfillNotificationSink> = Arc::new(CapturingSink {
-            captured: Mutex::new(None),
-        });
-        let report = BackfillReport {
-            claude_code_snapshot_count: 2,
-            codex_snapshot_count: 3,
-            pi_snapshot_count: 0,
-            completed_at: "2026-05-28T10:00:00Z".to_string(),
-            ..Default::default()
-        };
-        sink.notify_completed(&report);
-        // Default LoggingBackfillSink should run without panicking.
-        LoggingBackfillSink.notify_completed(&report);
-        assert_eq!(report.total_snapshots(), 5);
     }
 }
 

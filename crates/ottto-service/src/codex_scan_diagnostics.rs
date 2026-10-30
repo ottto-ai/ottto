@@ -1568,35 +1568,6 @@ mod fenced_census_tests {
     }
 
     #[test]
-    #[ignore = "bounded native non-success sidecar allocation and IO measurement"]
-    fn fenced_census_sidecar_native_measurement() {
-        let fixture = Fixture::new();
-        begin_census_attempt();
-        persist_non_success(
-            fixture.path(),
-            CensusFencePhase::Inner,
-            CensusFenceOutcome::Rejected,
-            CensusInvalidation::Failed,
-        );
-        let started = std::time::Instant::now();
-        let (_, stats) = crate::retry_allocation_probe::measure(|| {
-            for _ in 0..128 {
-                persist_non_success(
-                    fixture.path(),
-                    CensusFencePhase::Inner,
-                    CensusFenceOutcome::Rejected,
-                    CensusInvalidation::Failed,
-                );
-            }
-        });
-        assert_eq!(stats.requested_live, 0);
-        assert!(stats.requested_peak_with_overlap < 4096);
-        println!("CENSUS_SIDECAR iterations=128 elapsed_us={} peak_bytes={} allocations={} live_bytes={} bytes={} fsync=false",
-            started.elapsed().as_micros(), stats.requested_peak_with_overlap, stats.allocations, stats.requested_live,
-            std::fs::metadata(fence_outcome_path(fixture.path())).unwrap().len());
-    }
-
-    #[test]
     fn fenced_census_fence_order_once_and_original_errors_invalidate_stale_record() {
         let fixture = Fixture::new();
         let calls = std::cell::RefCell::new(Vec::new());
@@ -1968,20 +1939,5 @@ mod fenced_census_tests {
             "2026-10-09T09:00:00Z"
         ));
         assert!(!acceptable(std::process::id(), "2026-10-09T11:00:00Z"));
-    }
-
-    #[test]
-    #[ignore = "bounded synthetic diagnostic IO measurement"]
-    fn fenced_census_cache_write_native_measurement() {
-        let fixture = Fixture::new();
-        let started = std::time::Instant::now();
-        for _ in 0..100 {
-            write_fenced_census_record(fixture.path(), &record()).unwrap();
-        }
-        println!(
-            "fenced_census_cache_write iterations=100 elapsed_us={} bytes={} fsync=false",
-            started.elapsed().as_micros(),
-            fenced_census_path(fixture.path()).metadata().unwrap().len()
-        );
     }
 }

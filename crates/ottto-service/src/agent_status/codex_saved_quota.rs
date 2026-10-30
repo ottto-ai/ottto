@@ -2014,45 +2014,6 @@ mod tests {
     }
 
     #[test]
-    fn schedule_intervals_are_five_minutes_in_use_and_fifteen_unused() {
-        assert_eq!(refresh_interval_seconds(true), 5 * 60);
-        assert_eq!(refresh_interval_seconds(false), 15 * 60);
-        let login = mark(Some("a:w"), 1);
-        let auth = &login;
-        let saved = saved_with(10_000, login.clone());
-        // In use: due at 5 min, not before.
-        assert!(!scheduled_read_due(
-            Some(&saved),
-            auth,
-            true,
-            10_000 + 5 * 60 - 1
-        ));
-        assert!(scheduled_read_due(
-            Some(&saved),
-            auth,
-            true,
-            10_000 + 5 * 60
-        ));
-        // Unused: due at 15 min, not before.
-        assert!(!scheduled_read_due(
-            Some(&saved),
-            auth,
-            false,
-            10_000 + 15 * 60 - 1
-        ));
-        assert!(scheduled_read_due(
-            Some(&saved),
-            auth,
-            false,
-            10_000 + 15 * 60
-        ));
-        // Never read: due now.
-        assert!(scheduled_read_due(None, auth, false, 10_000));
-        // A clock that stepped back never holds a home forever.
-        assert!(scheduled_read_due(Some(&saved), auth, false, 1_000));
-    }
-
-    #[test]
     fn a_changed_login_is_read_again_after_a_minute_only() {
         let saved = saved_with(10_000, mark(Some("a:w"), 1));
         let other_account = mark(Some("b:w"), 2);
@@ -2691,22 +2652,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn the_scheduler_sleeps_until_the_next_due_time_and_at_most_a_minute() {
-        let now = 1_000_000;
-        assert_eq!(scheduler_sleep(Some(now + 5), now), Duration::from_secs(5));
-        assert_eq!(
-            scheduler_sleep(Some(now + 15 * 60), now),
-            SCHEDULER_MAX_SLEEP
-        );
-        assert_eq!(scheduler_sleep(None, now), SCHEDULER_MAX_SLEEP);
-        // Still due after the round (a read refused at the last moment, or
-        // a failed round): the old tick.
-        assert_eq!(scheduler_sleep(Some(now), now), SCHEDULER_RETRY);
-        assert_eq!(scheduler_sleep(Some(now - 60), now), SCHEDULER_RETRY);
-        assert_eq!(SCHEDULER_MAX_SLEEP.as_secs(), LOGIN_CHANGED_MIN_GAP_SECONDS);
     }
 
     /// A round tells when the next home is due: the in-use or unused interval

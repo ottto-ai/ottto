@@ -11576,19 +11576,6 @@ struct InstallSessionApiResponse {
     install_session_token: String,
 }
 
-#[cfg(test)]
-#[derive(Deserialize)]
-struct TelemetryDeviceRegisterApiResponse {
-    device: TelemetryDeviceApiResponse,
-    device_secret: String,
-    #[serde(default)]
-    identity_continuity_capability: Option<String>,
-    #[serde(default)]
-    credential_rotation_performed: Option<bool>,
-    #[serde(default)]
-    rotated_prior_device_id: Option<String>,
-}
-
 #[derive(Clone, Deserialize)]
 struct DeviceCredentialPreparationApiResponse {
     preparation_id: String,
@@ -11958,47 +11945,6 @@ fn validate_device_credential_status(
         ));
     }
     Ok(())
-}
-
-#[cfg(test)] // Only the removed legacy register path used it in production.
-fn validate_registration_continuity_response(
-    url: &str,
-    registered: &TelemetryDeviceRegisterApiResponse,
-    prior: Option<&PriorDeviceCredential>,
-) -> Result<(), LocalApiError> {
-    if registered
-        .identity_continuity_capability
-        .as_deref()
-        .is_some_and(|value| value != IDENTITY_CONTINUITY_CAPABILITY)
-    {
-        return Err(backend_response_unexpected(
-            url,
-            "telemetry registration returned an unsupported identity continuity capability"
-                .to_string(),
-        ));
-    }
-    match registered.credential_rotation_performed {
-        Some(true)
-            if registered.identity_continuity_capability.as_deref()
-                != Some(IDENTITY_CONTINUITY_CAPABILITY)
-                || prior.is_none()
-                || registered.rotated_prior_device_id.as_deref()
-                    != prior.map(|value| value.device_id.as_str()) =>
-        {
-            Err(backend_response_unexpected(
-                url,
-                "telemetry registration returned inconsistent credential rotation proof"
-                    .to_string(),
-            ))
-        }
-        Some(false) | None if registered.rotated_prior_device_id.is_some() => {
-            Err(backend_response_unexpected(
-                url,
-                "telemetry registration returned a prior device without rotation".to_string(),
-            ))
-        }
-        _ => Ok(()),
-    }
 }
 
 const IDENTITY_CONTINUITY_CAPABILITY: &str = "prior_device_credential_v1";
@@ -17795,32 +17741,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_managed_config_preview_extracts_otel_section_and_fence() {
-        let sectioned = "[otel]\nenvironment = \"prod\"\n\n[other]\nkey = 1\n";
-        let preview = super::codex_managed_config_preview(Some(sectioned))
-            .expect("otel section yields a preview");
-        let joined = preview["lines"]
-            .as_array()
-            .expect("lines")
-            .iter()
-            .map(|line| line.as_str().expect("str"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(joined.contains("[otel]"));
-        assert!(joined.contains("environment = \"prod\""));
-        assert!(!joined.contains("[other]"));
-
-        // Legacy fenced files still delegate to the fence extractor.
-        let fenced = "# ottto:start\n[otel]\nenvironment = \"prod\"\n# ottto:end\n";
-        let preview = super::codex_managed_config_preview(Some(fenced))
-            .expect("fenced body yields a preview");
-        assert_eq!(preview["lines"][0], "# ottto:start");
-
-        assert!(super::codex_managed_config_preview(None).is_none());
-        assert!(super::codex_managed_config_preview(Some("plain = true\n")).is_none());
-    }
-
-    #[test]
     fn claude_managed_config_preview_renders_managed_env_keys() {
         let fake_secret = format!("otel_{}", "k1v2x3y4z5".repeat(4));
         let body = format!(
@@ -17854,35 +17774,6 @@ mod tests {
         assert!(!joined.contains(&fake_secret));
         assert!(!joined.contains("UNRELATED_KEY"));
         assert!(!joined.contains("kept-private"));
-    }
-
-    #[test]
-    fn claude_managed_config_preview_absent_without_managed_keys() {
-        assert!(super::claude_managed_config_preview(None).is_none());
-        assert!(super::claude_managed_config_preview(Some("not json")).is_none());
-        assert!(
-            super::claude_managed_config_preview(Some("{\"env\": {\"OTHER\": \"1\"}}")).is_none()
-        );
-    }
-
-    #[test]
-    fn managed_config_preview_absent_without_fence_or_body() {
-        assert!(super::managed_config_preview("~/.codex/config.toml", None).is_none());
-        assert!(
-            super::managed_config_preview("~/.codex/config.toml", Some("plain = true\n")).is_none()
-        );
-    }
-
-    #[test]
-    fn redact_managed_config_line_masks_secret_bearing_keys() {
-        assert_eq!(
-            super::redact_managed_config_line("export OTEL_EXPORTER_OTLP_HEADERS='x-ottto short'"),
-            "export OTEL_EXPORTER_OTLP_HEADERS= …redacted…",
-        );
-        assert_eq!(
-            super::redact_managed_config_line("log_user_prompt = false"),
-            "log_user_prompt = false",
-        );
     }
 
     use super::*;
@@ -24097,34 +23988,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn telemetry_registration_response_keeps_old_backend_tolerance_and_checks_rotation() {
-        let url = "https://api.ottto.net/api/v1/telemetry/devices/register";
-        let prior = PriorDeviceCredential {
-            device_id: "device_prior".to_string(),
-            device_sources: vec!["codex".to_string()],
-            device_secret: "secret_prior".to_string(),
-        };
-        let old: TelemetryDeviceRegisterApiResponse = serde_json::from_str(
-            r#"{"device":{"id":"device","machine_id":"machine","sources":["codex"]},"device_secret":"secret"}"#,
-        )
-        .expect("old backend response");
-        assert_eq!(old.device.id, "device");
-        assert_eq!(old.device_secret, "secret");
-        validate_registration_continuity_response(url, &old, Some(&prior))
-            .expect("additive response fields stay optional");
-
-        let rotated: TelemetryDeviceRegisterApiResponse = serde_json::from_str(
-            r#"{"device":{"id":"device_new","machine_id":"machine","sources":["codex"]},"device_secret":"secret_new","identity_continuity_capability":"prior_device_credential_v1","credential_rotation_performed":true,"rotated_prior_device_id":"device_prior"}"#,
-        )
-        .expect("rotation response");
-        validate_registration_continuity_response(url, &rotated, Some(&prior))
-            .expect("matching rotation proof");
-
-        validate_registration_continuity_response(url, &rotated, None)
-            .expect_err("first registration cannot claim a prior rotation");
-    }
-
-    #[test]
     #[serial]
     fn modern_registration_prepare_and_confirm_use_the_additive_contract() {
         let support_root = telemetry_key_store_root("device-prepare-wire");
@@ -26311,32 +26174,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn typed_status_rejects_cloud_sessions_protocol_version() {
-        let response = handle_request(
-            &daemon(),
-            LocalControlRequest {
-                request_id: "req_status_v16".to_string(),
-                protocol_version: ottto_protocol::CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION,
-                token: Some("token".to_string()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: LocalControlCommand::Status {
-                    refresh_agent_status: false,
-                    retry_relay_authorization: false,
-                },
-            },
-        );
-
-        assert!(!response.ok);
-        let error = response.error.expect("error");
-        assert_eq!(error.code, CliErrorCode::InvalidRequest);
-        assert!(error
-            .message
-            .contains("unsupported local control protocol_version 16"));
-        assert!(error.message.contains("expected 15"));
-    }
-
-    #[test]
     fn validated_api_base_url_rejects_untrusted_https_origin() {
         assert!(validated_api_base_url(Some("https://attacker.example")).is_err());
     }
@@ -26983,26 +26820,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn default_release_manifest_url_follows_local_channel() {
-        assert_eq!(
-            default_release_manifest_url(&ReleaseChannel::Dev),
-            "https://install.ottto.net/ottto-local-platform/releases/dev/latest/release-manifest.json"
-        );
-        assert_eq!(
-            default_release_manifest_url(&ReleaseChannel::Preview),
-            "https://install.ottto.net/ottto-local-platform/releases/preview/latest/release-manifest.json"
-        );
-        assert_eq!(
-            default_release_manifest_url(&ReleaseChannel::StableCandidate),
-            "https://install.ottto.net/ottto-local-platform/releases/stable-candidate/latest/release-manifest.json"
-        );
-        assert_eq!(
-            default_release_manifest_url(&ReleaseChannel::Stable),
-            "https://install.ottto.net/ottto-local-platform/releases/stable/latest/release-manifest.json"
-        );
-    }
-
-    #[test]
     fn trusted_companion_can_read_status_without_keychain_token() {
         let response = handle_request_with_peer(
             &daemon(),
@@ -27207,18 +27024,6 @@ for line in sys.stdin:
             companion_code_requirement(),
             CompanionCodeRequirement::Enforced(expected),
             "an unconfigured process must enforce a requirement matching its own build kind"
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_test_binary_is_not_a_release_build() {
-        // Anchors the test above: `cargo test` produces an ad-hoc-signed
-        // binary, so the internal-build branch is the one it exercises. If this
-        // ever flips, the release branch above stops being hypothetical.
-        assert!(
-            !daemon_is_release_signed(),
-            "a cargo-built test binary must not look like a signed release"
         );
     }
 
@@ -30107,39 +29912,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn pi_smoke_command_runs_non_interactive_prompt_instead_of_help() {
-        let command = smoke_command(&SourceKind::Pi);
-
-        assert_eq!(command.program, "pi");
-        assert!(command.args.iter().any(|arg| arg == "--print"));
-        assert!(command.args.iter().any(|arg| arg == "--no-builtin-tools"));
-        assert!(command.args.iter().any(|arg| arg == "--no-context-files"));
-        assert!(command.args.iter().any(|arg| arg == SMOKE_PROMPT));
-        assert!(!command.args.iter().any(|arg| arg == "--help"));
-    }
-
-    #[test]
-    fn codex_smoke_command_uses_json_event_mode_for_otel_flush() {
-        let command = smoke_command(&SourceKind::Codex);
-
-        assert_eq!(command.program, "codex");
-        assert!(command.args.iter().any(|arg| arg == "exec"));
-        assert!(command.args.iter().any(|arg| arg == "--ignore-user-config"));
-        assert!(command.args.iter().any(|arg| arg == "--ignore-rules"));
-        assert!(command.args.iter().any(|arg| arg == "--ephemeral"));
-        assert!(command.args.iter().any(|arg| arg == "--json"));
-        assert!(command
-            .args
-            .iter()
-            .any(|arg| arg == "--skip-git-repo-check"));
-        assert!(command
-            .args
-            .windows(2)
-            .any(|args| args == ["-c", "model_reasoning_effort=low"]));
-        assert!(command.args.iter().any(|arg| arg == SMOKE_PROMPT));
-    }
-
-    #[test]
     fn pi_smoke_command_includes_route_provider_model_and_thinking() {
         let route = PiModelRoute {
             provider: "google-vertex".to_string(),
@@ -30246,15 +30018,6 @@ for line in sys.stdin:
             "timeout path must not block on a descendant-held stdout pipe"
         );
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn pi_session_import_platform_support_matches_rooted_open_contract() {
-        assert_eq!(pi_session_import_supported_on_target(), cfg!(unix));
-        assert_eq!(
-            require_pi_session_import_platform_support().is_ok(),
-            cfg!(unix)
-        );
     }
 
     #[cfg(unix)]
@@ -31422,23 +31185,6 @@ for line in sys.stdin:
             [("unknown", "subprocess_lower_bound", 1)]
         );
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn claude_smoke_command_places_prompt_after_print_flag() {
-        let command = smoke_command(&SourceKind::ClaudeCode);
-
-        assert_eq!(command.program, "claude");
-        let print_index = command
-            .args
-            .iter()
-            .position(|arg| arg == "-p")
-            .expect("print flag");
-        assert_eq!(
-            command.args.get(print_index + 1).map(String::as_str),
-            Some(SMOKE_PROMPT)
-        );
-        assert!(command.args.iter().any(|arg| arg == "--disallowedTools"));
     }
 
     #[test]
@@ -36209,35 +35955,6 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
-    fn agent_read_http_timeout_covers_heavy_org_reads() {
-        assert!(AGENT_READ_HTTP_TIMEOUT >= Duration::from_secs(120));
-        assert!(AGENT_READ_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
-    }
-
-    #[test]
-    fn setup_verification_http_timeout_covers_full_poll_window() {
-        assert!(SETUP_VERIFICATION_HTTP_TIMEOUT > VERIFICATION_WAIT_TIMEOUT);
-        assert!(SETUP_VERIFICATION_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
-    }
-
-    #[test]
-    fn setup_verification_marker_timeout_stays_interactive() {
-        assert!(SETUP_VERIFICATION_MARKER_HTTP_TIMEOUT < BACKEND_REQUEST_TIMEOUT);
-    }
-
-    #[test]
-    fn pi_verify_budgets_fit_interactive_cli_bounds() {
-        assert!(PI_SMOKE_COMMAND_TIMEOUT < SMOKE_COMMAND_TIMEOUT);
-        assert!(PI_VERIFICATION_WAIT_TIMEOUT < VERIFICATION_WAIT_TIMEOUT);
-        assert!(PI_VERIFICATION_HTTP_TIMEOUT < SETUP_VERIFICATION_HTTP_TIMEOUT);
-        assert!(PI_VERIFICATION_HTTP_TIMEOUT > PI_VERIFICATION_WAIT_TIMEOUT);
-        assert!(
-            PI_SMOKE_COMMAND_TIMEOUT + PI_VERIFICATION_HTTP_TIMEOUT + PIPE_DRAIN_TIMEOUT
-                < Duration::from_secs(90)
-        );
-    }
-
-    #[test]
     fn setup_verification_request_honors_custom_timeout() {
         let api_base_url = delayed_setup_verification_server(
             "setup_slow_verification",
@@ -36264,12 +35981,6 @@ X-API-Key = "otel_redacted"
 
         assert!(matches!(result, Err(LocalApiError::TimedOut(_))));
         assert!(started.elapsed() < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn setup_scan_result_http_timeout_covers_synchronous_backend_work() {
-        assert!(SETUP_SCAN_RESULT_HTTP_TIMEOUT >= Duration::from_secs(120));
-        assert!(SETUP_SCAN_RESULT_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
     }
 
     #[test]

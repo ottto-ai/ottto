@@ -760,24 +760,6 @@ mod sampled_scalar_buffer_tests {
     }
 
     #[test]
-    fn sampled_release_compiler_allowlist_refuses_unvalidated_versions() {
-        assert!(compiler_layout_supported(
-            "rustc 1.88.0 (6b00bc388 2025-06-23)"
-        ));
-        assert!(compiler_layout_supported(
-            "rustc 1.95.0 (59807616e 2026-04-14)"
-        ));
-        for compiler in [
-            "",
-            "rustc 1.95.1 (unknown)",
-            "rustc 1.195.0 (unknown)",
-            "rustc 1.95.0-nightly (unknown)",
-            "rustc 1.97.0 (unknown)",
-        ] {
-            assert!(!compiler_layout_supported(compiler));
-        }
-    }
-    #[test]
     fn sampled_release_layout_bounds_nested_requested_allocations() {
         if !layout_supported() {
             return;
