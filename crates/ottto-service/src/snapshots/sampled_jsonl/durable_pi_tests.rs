@@ -77,7 +77,7 @@ fn body(reduction: &CachedJsonlReduction) -> Result<Vec<u8>, Refuse> {
 fn section(keys: &BTreeMap<String, PiUsageDedupState>) -> Vec<u8> {
     let mut e = Enc::bytes(RECORD_BYTES);
     e.section(SECTION_TAG, |e| {
-        PiSection::put_borrowed(e, keys, &None, &false, &None)
+        PiSection::put_borrowed(e, keys, &None, &false, &None, &false)
     })
     .unwrap();
     e.into_bytes()
@@ -100,6 +100,7 @@ fn back_patched(reduction: &CachedJsonlReduction) -> Vec<u8> {
         &None,
         &false,
         &None,
+        &false,
     )
     .unwrap();
     out.extend(e.into_bytes());
@@ -504,6 +505,7 @@ fn prompt_fields_round_trip_and_verify_without_allocation() {
         wire: Some(wire.clone()),
         prompt_seen: true,
         key_epoch: Some([9; 32]),
+        not_uploaded: false,
     }));
     let bytes = body(&reduction).unwrap();
     assert_eq!(verify_without_allocation(&bytes), Ok(()));
