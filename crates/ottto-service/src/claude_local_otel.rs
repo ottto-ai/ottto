@@ -30,6 +30,9 @@ pub(crate) mod support_health;
 mod bounded_read;
 #[cfg(test)]
 mod decoder_tests;
+pub(crate) mod strict_budget;
+#[cfg(test)]
+mod strict_budget_tests;
 #[cfg(test)]
 mod trace_read_bound_tests;
 
@@ -1095,6 +1098,10 @@ fn decode_api_sidecar(
     support_dir: &Path,
     session_id: &str,
 ) -> Result<(Vec<ClaudeLocalOtelEvidence>, ApiReadWitness)> {
+    if !crate::snapshots::claude_terminal_off() {
+        return decode_api_sidecar_main(support_dir, session_id);
+    }
+
     let path = evidence_path(support_dir, session_id);
     let mut health = ClaudeLocalOtelLoadHealth::default();
     let empty = |health| {
@@ -1121,7 +1128,7 @@ fn decode_api_sidecar(
     if !metadata.is_file() {
         anyhow::bail!("Claude effort evidence is not a regular file");
     }
-    if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+    if metadata.len() >= strict_budget::allowance() {
         health.oversized_files += 1;
         return Ok(empty(health));
     }
@@ -1152,21 +1159,24 @@ fn decode_api_sidecar(
     if !opened.is_file() {
         anyhow::bail!("opened Claude effort evidence is not a regular file");
     }
-    if opened.len() >= MAX_EVIDENCE_FILE_BYTES {
+    if opened.len() >= strict_budget::allowance() {
         health.oversized_files += 1;
         return Ok(empty(health));
     }
     let before_opened = api_file_generation(&opened);
     // A concurrent writer must not defeat the existing per-file read bound.
-    let mut reader = BufReader::new((&file).take(MAX_EVIDENCE_FILE_BYTES));
-    let (rows, bytes) = decode_api_rows(&mut reader, session_id, &mut health);
+    let limit = strict_budget::allowance().min(opened.len().saturating_add(1));
+    let mut reader = BufReader::new((&file).take(limit));
+    let (rows, _) = decode_api_rows(&mut reader, session_id, &mut health);
+    let bytes = limit - reader.get_ref().limit();
+    strict_budget::consumed(bytes);
     #[cfg(test)]
     API_AFTER_READ.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
             hook(&path);
         }
     });
-    if bytes >= MAX_EVIDENCE_FILE_BYTES {
+    if bytes >= limit {
         health.oversized_files += 1;
         return Ok(empty(health));
     }
@@ -1261,6 +1271,20 @@ impl ApiSidecarDecoder<'_> {
     }
 }
 
+/// Metadata-only pre-I/O charge, including an EOF/growth sentinel per file.
+pub(crate) fn strict_cohort_bytes(support_dir: &Path, root: &str) -> u64 {
+    [
+        evidence_path(support_dir, root),
+        trace_evidence_path(support_dir, root),
+    ]
+    .iter()
+    .fold(0u64, |sum, path| {
+        sum.saturating_add(
+            fs::metadata(path).map_or(MAX_EVIDENCE_FILE_BYTES, |m| m.len().saturating_add(1)),
+        )
+    })
+}
+
 pub fn load_claude_trace_ownership_evidence(
     support_dir: &Path,
     session_ids: impl IntoIterator<Item = String>,
@@ -1283,7 +1307,7 @@ pub fn load_claude_trace_ownership_evidence(
             report.unreadable_lines += 1;
             continue;
         }
-        if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+        if metadata.len() >= strict_budget::allowance() {
             report.oversized_files += 1;
             continue;
         }
@@ -1305,13 +1329,13 @@ pub fn load_claude_trace_ownership_evidence(
             report.unreadable_lines += 1;
             continue;
         };
-        if !opened.is_file() || opened.len() >= MAX_EVIDENCE_FILE_BYTES {
+        if !opened.is_file() || opened.len() >= strict_budget::allowance() {
             report.oversized_files += 1;
             continue;
         }
         // A concurrent writer must not extend the read past the opened
         // length; one extra byte is the growth sentinel.
-        let limit = opened.len() + 1;
+        let limit = strict_budget::allowance().min(opened.len().saturating_add(1));
         #[cfg(test)]
         TRACE_BEFORE_READ.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
@@ -1332,6 +1356,7 @@ pub fn load_claude_trace_ownership_evidence(
             decoder.push_line(line.as_bytes());
         }
         let bytes = limit - reader.get_ref().limit();
+        strict_budget::consumed(bytes);
         #[cfg(test)]
         TRACE_BYTES_FOR_TEST.with(|count| count.set(count.get() + bytes));
         let generation = api_file_generation(&opened);
@@ -4030,4 +4055,104 @@ impl crate::heap_layout_bound::HeapLayoutBound for ClaudeIdentityAttributeOrigin
             }
         }
     }
+}
+
+fn decode_api_sidecar_main(
+    support_dir: &Path,
+    session_id: &str,
+) -> Result<(Vec<ClaudeLocalOtelEvidence>, ApiReadWitness)> {
+    let path = evidence_path(support_dir, session_id);
+    let mut health = ClaudeLocalOtelLoadHealth::default();
+    let empty = |health| {
+        (
+            Vec::new(),
+            ApiReadWitness {
+                health,
+                generation: None,
+            },
+        )
+    };
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                health.missing_files += 1;
+            } else {
+                health.unreadable_lines += 1;
+            }
+            return Ok(empty(health));
+        }
+    };
+    // Refuse before opening: a directory/erroring stream must never loop.
+    if !metadata.is_file() {
+        anyhow::bail!("Claude effort evidence is not a regular file");
+    }
+    if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+        health.oversized_files += 1;
+        return Ok(empty(health));
+    }
+    let before_path = api_file_generation(&metadata);
+    #[cfg(test)]
+    API_BEFORE_OPEN.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook(&path);
+        }
+    });
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A stat/open race to a FIFO must refuse without blocking at open.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(&path).context("open Claude effort evidence")?;
+    #[cfg(test)]
+    API_READ_RECEIPT.with(|r| {
+        let (opens, bytes, force) = r.get();
+        r.set((opens + 1, bytes, force));
+    });
+    let opened = file
+        .metadata()
+        .context("stat opened Claude effort evidence")?;
+    if !opened.is_file() {
+        anyhow::bail!("opened Claude effort evidence is not a regular file");
+    }
+    if opened.len() >= MAX_EVIDENCE_FILE_BYTES {
+        health.oversized_files += 1;
+        return Ok(empty(health));
+    }
+    let before_opened = api_file_generation(&opened);
+    // A concurrent writer must not defeat the existing per-file read bound.
+    let mut reader = BufReader::new((&file).take(MAX_EVIDENCE_FILE_BYTES));
+    let (rows, bytes) = decode_api_rows(&mut reader, session_id, &mut health);
+    #[cfg(test)]
+    API_AFTER_READ.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook(&path);
+        }
+    });
+    if bytes >= MAX_EVIDENCE_FILE_BYTES {
+        health.oversized_files += 1;
+        return Ok(empty(health));
+    }
+    let after_opened = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| api_file_generation(&metadata));
+    let after_path = fs::metadata(&path)
+        .ok()
+        .and_then(|metadata| api_file_generation(&metadata));
+    let generation = if before_opened.is_some()
+        && before_path == before_opened
+        && before_opened == after_opened
+        && before_opened == after_path
+        && bytes == opened.len()
+        && health.is_complete()
+    {
+        before_opened
+    } else {
+        None
+    };
+    Ok((rows, ApiReadWitness { health, generation }))
 }

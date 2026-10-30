@@ -647,6 +647,13 @@ pub(super) struct ClaudeTelemetryTripwire {
 }
 
 impl ClaudeTelemetryTripwire {
+    /// Missing strict cohort rows may still contain a cross-root negative.
+    /// Preserve healthy per-root accounting, but do not treat those unread
+    /// negative dependencies as absence for the scalar birth fallback.
+    pub(super) fn refuse_incomplete_dependencies(&mut self) {
+        self.refused = true;
+    }
+
     pub(super) fn build(
         items: &[SnapshotItem],
         max_requests: usize,
