@@ -10180,11 +10180,14 @@ where
         );
     }
     let mut replaced_retained_proof = false;
-    for item in &batch {
-        let value = serde_json::to_value(item)?;
-        replaced_retained_proof |= progress
-            .accepted_identity_buckets
-            .invalidate_replaced(&value);
+    // Only proof the ledger holds can be replaced, whatever the capability.
+    if progress.accepted_identity_buckets.has_retained() {
+        for item in &batch {
+            let value = serde_json::to_value(item)?;
+            replaced_retained_proof |= progress
+                .accepted_identity_buckets
+                .invalidate_replaced(&value);
+        }
     }
     // Option (ii): the server may store a replacement proof even if this
     // reply is lost; drop the superseded one durably so no later marker can

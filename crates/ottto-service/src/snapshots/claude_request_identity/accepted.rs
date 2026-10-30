@@ -618,7 +618,7 @@ impl AcceptedBuckets {
             (live.count(), state.missing.len())
         })
     }
-    fn has_retained(&self) -> bool {
+    pub(crate) fn has_retained(&self) -> bool {
         self.0
             .values()
             .any(|state| !state.proved.is_empty() || !state.missing.is_empty())
