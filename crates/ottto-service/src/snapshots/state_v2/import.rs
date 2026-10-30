@@ -4,7 +4,7 @@ use anyhow::bail;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Pause {
     PublicationPending,
@@ -91,8 +91,25 @@ pub(super) trait Mapper {
         refs: &mut dyn FnMut(&RowKey) -> Result<()>,
     ) -> Result<()>;
     fn inventory(&self, path: &Path) -> std::result::Result<(), Pause>;
+    fn inventory_context(&self, path: &Path) -> std::result::Result<Option<Original>, Pause> {
+        self.inventory(path)?;
+        Ok(None)
+    }
     fn preflight(&self, index: &ScanIndex) -> std::result::Result<(), Pause>;
     fn populate<S: Store>(&self, store: &mut S, index: &ScanIndex) -> Result<()>;
+    fn populate_context<S: Store>(&self, store: &mut S, index: &ScanIndex) -> Result<KindCx> {
+        self.populate(store, index)?;
+        Ok(KindCx::default())
+    }
+    fn populate_original<S: Store>(
+        &self,
+        store: &mut S,
+        index: &ScanIndex,
+        original: Option<&Original>,
+    ) -> Result<KindCx> {
+        let _ = original;
+        self.populate_context(store, index)
+    }
     // Proof mismatch/oversize must return a typed Pause; engine/IO failures
     // remain transient. The framework never guesses from provider text.
     fn verify<S: Store>(&self, store: &mut S, index: &ScanIndex) -> Result<()>;
@@ -100,6 +117,9 @@ pub(super) trait Mapper {
     /// projection-bearing rows: it verifies value digests while decoding. Never return
     /// a partially hydrated graph or normalize unknown raw holds away.
     fn hydrate<S: Store>(&self, store: &mut S) -> Result<ScanIndex>;
+    fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)> {
+        Ok((self.hydrate(store)?, KindCx::default()))
+    }
     /// Uses the SAME claim maxima/hold and repair comparisons as v1; the
     /// adapter streams current custody through txn, without a second graph.
     fn merge_cas<T: Transaction>(&self, txn: &mut T, index: &mut ScanIndex) -> Result<()>;
@@ -130,8 +150,11 @@ impl Mapper for ClaudeMapper {
     ) -> Result<()> {
         kinds::private_paths(header, value, paths)
     }
-    fn inventory(&self, _: &Path) -> std::result::Result<(), Pause> {
-        Err(Pause::PublicationPending)
+    fn inventory(&self, path: &Path) -> std::result::Result<(), Pause> {
+        Original::read(path).map(|_| ())
+    }
+    fn inventory_context(&self, path: &Path) -> std::result::Result<Option<Original>, Pause> {
+        Original::read(path).map(Some)
     }
     fn preflight(&self, _: &ScanIndex) -> std::result::Result<(), Pause> {
         Err(Pause::PublicationPending)
@@ -143,6 +166,9 @@ impl Mapper for ClaudeMapper {
         bail!(Pause::PublicationPending)
     }
     fn hydrate<S: Store>(&self, store: &mut S) -> Result<ScanIndex> {
+        self.hydrate_context(store).map(|(index, _)| index)
+    }
+    fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)> {
         let mut tx = store.begin(TxnMode::Read)?;
         let header = tx
             .get(&RowKey::Meta("identity".into()))?
@@ -155,8 +181,7 @@ impl Mapper for ClaudeMapper {
             identity.binding.source == super::super::scan_index_persistence::Source::Claude,
             Hold::ForeignBinding
         );
-        let (index, _) = kinds::hydrate_txn(&mut tx, identity.binding)?;
-        Ok(index)
+        kinds::hydrate_txn(&mut tx, identity.binding)
     }
     fn merge_cas<T: Transaction>(&self, _: &mut T, _: &mut ScanIndex) -> Result<()> {
         bail!(Pause::PublicationPending)
@@ -191,5 +216,1204 @@ mod tests {
         assert_eq!(pace.start(now + Duration::from_secs(86400)), Some(false));
         // Restart allowance is explicitly process-local, not wall-clock paced.
         assert_eq!(Pace::default().start(now), Some(true));
+    }
+}
+
+/// Evidence is collected before lenient decoding. It contains only bounded
+/// descriptors/presence and exact file commitments, never a second index graph.
+/// Kept private; filenames, commitments and namespace bindings are not telemetry.
+#[derive(Default, Debug)]
+pub(super) struct Original {
+    pub(super) presence: std::collections::BTreeMap<String, bool>,
+    files: Vec<OriginalFile>,
+    missing: Option<std::path::PathBuf>,
+}
+#[derive(Debug)]
+struct OriginalFile {
+    path: std::path::PathBuf,
+    stamp: OriginalStamp,
+    digest: [u8; 32],
+}
+#[derive(Debug, PartialEq, Eq)]
+struct OriginalStamp(u64, u64, u64, i64, i64, i64, i64);
+impl OriginalStamp {
+    fn read(file: &std::fs::File) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let m = file.metadata()?;
+        anyhow::ensure!(
+            m.is_file()
+                && m.nlink() == 1
+                && m.uid() == unsafe { libc::geteuid() }
+                && m.mode() & 0o022 == 0,
+            Pause::UnsafeParent
+        );
+        Ok(Self(
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        ))
+    }
+}
+fn original_open(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    for ancestor in path.parent().into_iter().flat_map(Path::ancestors) {
+        let m = std::fs::symlink_metadata(ancestor)?;
+        anyhow::ensure!(
+            m.is_dir() && !m.file_type().is_symlink(),
+            Pause::UnsafeParent
+        );
+    }
+    let parent = std::fs::metadata(path.parent().ok_or(Pause::UnsafeParent)?)?;
+    anyhow::ensure!(
+        parent.uid() == unsafe { libc::geteuid() } && parent.mode() & 0o022 == 0,
+        Pause::UnsafeParent
+    );
+    Ok(std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?)
+}
+fn original_hash(file: &mut std::fs::File) -> Result<[u8; 32]> {
+    use sha2::Digest;
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))?;
+    let mut hash = sha2::Sha256::new();
+    let mut buf = [0; 32 * 1024 + 3];
+    let mut pending = 0;
+    let mut strings = JsonStrings::Outside;
+    loop {
+        let n = file.read(&mut buf[pending..])?;
+        if n == 0 {
+            break;
+        }
+        let end = pending + n;
+        hash.update(&buf[pending..end]);
+        for byte in &buf[pending..end] {
+            strings.byte(*byte)?;
+        }
+        pending = match std::str::from_utf8(&buf[..end]) {
+            Ok(_) => 0,
+            Err(e) if e.error_len().is_none() => {
+                let n = end - e.valid_up_to();
+                anyhow::ensure!(n <= 3, Pause::Malformed);
+                buf.copy_within(e.valid_up_to()..end, 0);
+                n
+            }
+            Err(_) => bail!(Pause::Malformed),
+        };
+    }
+    anyhow::ensure!(
+        pending == 0 && matches!(strings, JsonStrings::Outside),
+        Pause::Malformed
+    );
+    Ok(hash.finalize().into())
+}
+/// Serde's IgnoredAny deliberately accepts invalid UTF-8 and unpaired surrogate
+/// escapes. Validate string encoding while hashing, with constant retained state.
+#[derive(Clone, Copy)]
+enum JsonStrings {
+    Outside,
+    Text,
+    Escape,
+    Hex {
+        remaining: u8,
+        value: u16,
+        low: bool,
+    },
+    LowSlash,
+    LowU,
+}
+impl JsonStrings {
+    fn byte(&mut self, b: u8) -> Result<()> {
+        use JsonStrings::*;
+        *self = match *self {
+            Outside if b == b'"' => Text,
+            Outside => Outside,
+            Text if b == b'"' => Outside,
+            Text if b == b'\\' => Escape,
+            Text => {
+                anyhow::ensure!(b >= 0x20, Pause::Malformed);
+                Text
+            }
+            Escape if b == b'u' => Hex {
+                remaining: 4,
+                value: 0,
+                low: false,
+            },
+            Escape if b"\"\\/bfnrt".contains(&b) => Text,
+            Escape => bail!(Pause::Malformed),
+            Hex {
+                remaining,
+                value,
+                low,
+            } => {
+                let digit = match b {
+                    b'0'..=b'9' => b - b'0',
+                    b'a'..=b'f' => b - b'a' + 10,
+                    b'A'..=b'F' => b - b'A' + 10,
+                    _ => bail!(Pause::Malformed),
+                };
+                let value = (value << 4) | u16::from(digit);
+                if remaining > 1 {
+                    Hex {
+                        remaining: remaining - 1,
+                        value,
+                        low,
+                    }
+                } else if low {
+                    anyhow::ensure!((0xdc00..=0xdfff).contains(&value), Pause::Malformed);
+                    Text
+                } else if (0xd800..=0xdbff).contains(&value) {
+                    LowSlash
+                } else {
+                    anyhow::ensure!(!(0xdc00..=0xdfff).contains(&value), Pause::Malformed);
+                    Text
+                }
+            }
+            LowSlash => {
+                anyhow::ensure!(b == b'\\', Pause::Malformed);
+                LowU
+            }
+            LowU => {
+                anyhow::ensure!(b == b'u', Pause::Malformed);
+                Hex {
+                    remaining: 4,
+                    value: 0,
+                    low: true,
+                }
+            }
+        };
+        Ok(())
+    }
+}
+impl OriginalFile {
+    fn capture(path: &Path, file: &mut std::fs::File, stamp: OriginalStamp) -> Result<Self> {
+        let digest = original_hash(file)?;
+        let named = original_open(path)?;
+        anyhow::ensure!(
+            stamp == OriginalStamp::read(file)? && stamp == OriginalStamp::read(&named)?,
+            Pause::Mismatch
+        );
+        Ok(Self {
+            path: path.to_owned(),
+            stamp,
+            digest,
+        })
+    }
+    fn unchanged(&self) -> Result<()> {
+        let mut file = original_open(&self.path)?;
+        anyhow::ensure!(
+            self.stamp == OriginalStamp::read(&file)?
+                && self.digest == original_hash(&mut file)?
+                && self.stamp == OriginalStamp::read(&file)?,
+            Pause::Mismatch
+        );
+        Ok(())
+    }
+}
+
+// This is the existing outer v1 storage envelope, not a semantic decoder.
+// Strict duplicate/unknown rejection is essential BEFORE calling its normal
+// opener, which may recover fresh initialization or clean up v1 artifacts.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginalManifest {
+    schema_version: u16,
+    files: std::collections::BTreeMap<String, serde_json::Value>,
+    storage_format: u16,
+    logical_schema_version: u16,
+    generation: u64,
+    binding: super::super::scan_index_persistence::Binding,
+    padding_bytes: u64,
+    maps: Vec<OriginalMap>,
+    objects: Vec<OriginalObject>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginalMap {
+    field: super::super::scan_index_persistence::Field,
+    generation: u64,
+    buckets: Vec<u8>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginalObject {
+    slot: super::super::scan_index_persistence::Slot,
+    generation: u64,
+    bytes: u64,
+    digest: String,
+}
+impl OriginalObject {
+    fn name(&self) -> String {
+        use super::super::scan_index_persistence::{Field, Slot};
+        let label = match self.slot {
+            Slot::Metadata => "metadata".into(),
+            Slot::Bucket { field, bucket } => format!(
+                "{}-{bucket:02x}",
+                match field {
+                    Field::AccountPending => "account",
+                    Field::UsagePending => "usage",
+                    Field::RequestCensus => "census",
+                }
+            ),
+        };
+        format!("{label}-{}.json", self.digest)
+    }
+}
+/// Stream root presence and validate JSON grammar without allocating leaf
+/// strings. The hashing pass separately validates their Unicode encoding.
+struct Presence;
+impl<'de> serde::de::Visitor<'de> for Presence {
+    type Value = std::collections::BTreeMap<String, bool>;
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("original index")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        let mut fields = super::super::lenient_decode::FIELDS
+            .iter()
+            .map(|f| ((*f).into(), false))
+            .collect::<Self::Value>();
+        while let Some(name) = map.next_key::<String>()? {
+            let present = fields
+                .get_mut(&name)
+                .ok_or_else(|| serde::de::Error::custom("unknown original field"))?;
+            if *present {
+                return Err(serde::de::Error::custom("duplicate original field"));
+            }
+            *present = true;
+            map.next_value::<serde::de::IgnoredAny>()?;
+        }
+        Ok(fields)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        let mut fields = std::collections::BTreeMap::new();
+        let mut ended = false;
+        for name in super::super::lenient_decode::FIELDS {
+            let present = !ended && seq.next_element::<serde::de::IgnoredAny>()?.is_some();
+            ended |= !present;
+            fields.insert((*name).into(), present);
+        }
+        if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+            return Err(serde::de::Error::custom("unknown original slot"));
+        }
+        Ok(fields)
+    }
+}
+fn original_presence(input: impl Read) -> Result<std::collections::BTreeMap<String, bool>> {
+    use serde::de::Deserializer;
+    let mut de = serde_json::Deserializer::from_reader(input);
+    let presence = (&mut de).deserialize_any(Presence)?;
+    de.end()?;
+    Ok(presence)
+}
+fn original_shape(input: impl std::io::BufRead) -> Result<()> {
+    struct Observed<R> {
+        input: R,
+        failed: bool,
+    }
+    impl<R: std::io::BufRead> Read for Observed<R> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let result = self.input.read(out);
+            self.failed |= result.is_err();
+            result
+        }
+    }
+    impl<R: std::io::BufRead> std::io::BufRead for Observed<R> {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            let result = self.input.fill_buf();
+            self.failed |= result.is_err();
+            result
+        }
+        fn consume(&mut self, n: usize) {
+            self.input.consume(n);
+        }
+    }
+    let mut observed = Observed {
+        input,
+        failed: false,
+    };
+    let result = shape::inventory(&mut observed);
+    if observed.failed {
+        bail!(Pause::Io);
+    }
+    result.map_err(|p| {
+        match p {
+            shape::Pause::Unknown | shape::Pause::UnmappedMoney | shape::Pause::Unsupported => {
+                Pause::UnknownClass
+            }
+            shape::Pause::Malformed => Pause::Malformed,
+            shape::Pause::Oversize => Pause::Oversize,
+        }
+        .into()
+    })
+}
+fn original_schema(file: &mut std::fs::File) -> Result<u16> {
+    use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
+    struct Probe<'a>(&'a std::cell::Cell<Option<u16>>);
+    impl<'de> Visitor<'de> for Probe<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("v1 header")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<(), A::Error> {
+            while let Some(name) = map.next_key::<String>()? {
+                if name == "schema_version" {
+                    self.0.set(Some(map.next_value()?));
+                    return Ok(());
+                }
+                map.next_value::<IgnoredAny>()?;
+            }
+            Err(serde::de::Error::custom("missing schema"))
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<(), A::Error> {
+            self.0.set(seq.next_element()?);
+            Ok(())
+        }
+    }
+    let mut de = serde_json::Deserializer::from_reader(
+        file.take(super::super::scan_index_persistence::MAX_ROOT_BYTES as u64 + 1),
+    );
+    // The rest is deliberately unconsumed here, then fully checked by the
+    // appropriate shape/manifest reader. Serde may report that suffix as an
+    // error; a captured header only chooses a reader and never grants custody.
+    let schema = std::cell::Cell::new(None);
+    let _ = (&mut de).deserialize_any(Probe(&schema));
+    schema.get().ok_or_else(|| Pause::Malformed.into())
+}
+impl Original {
+    pub(super) fn read(path: &Path) -> std::result::Result<Self, Pause> {
+        Self::read_inner(path).map_err(|e| {
+            e.downcast_ref::<Pause>().copied().unwrap_or_else(|| {
+                if e.downcast_ref::<std::io::Error>().is_some()
+                    || e.downcast_ref::<serde_json::Error>()
+                        .is_some_and(|e| e.is_io())
+                {
+                    Pause::Io
+                } else {
+                    Pause::Malformed
+                }
+            })
+        })
+    }
+    fn read_inner(path: &Path) -> Result<Self> {
+        use super::super::scan_index_persistence::{
+            Field, Slot, LOGICAL_SCHEMA, MAX_ROOT_BYTES, OUTER_SCHEMA, STORAGE_FORMAT,
+        };
+        use sha2::Digest;
+        use std::io::{BufReader, Seek, SeekFrom};
+        let mut result = Self::default();
+        if !fence::exists(path)? {
+            anyhow::ensure!(
+                !fence::exists(&fence::sibling(path, ".shards"))?,
+                Pause::Partial
+            );
+            result.missing = Some(path.to_owned());
+            return Ok(result);
+        }
+        let mut root = original_open(path)?;
+        let stamp = OriginalStamp::read(&root)?;
+        let schema = original_schema(&mut root)?;
+        root.seek(SeekFrom::Start(0))?;
+        if schema == LOGICAL_SCHEMA {
+            // A legacy root references no shards. Existing v1 marker/orphan
+            // directories do not add authority to this original logical graph.
+            original_shape(BufReader::new(&mut root))?;
+            root.seek(SeekFrom::Start(0))?;
+            result.presence = original_presence(BufReader::new(&mut root))?;
+        } else {
+            anyhow::ensure!(schema == OUTER_SCHEMA, Pause::UnknownClass);
+            anyhow::ensure!(stamp.2 <= MAX_ROOT_BYTES as u64, Pause::Oversize);
+            let manifest: OriginalManifest = serde_json::from_reader(BufReader::new(
+                (&mut root).take(MAX_ROOT_BYTES as u64 + 1),
+            ))?;
+            let binding = super::super::scan_index_integration::scan_index_storage_binding(path)
+                .ok_or(Pause::Mismatch)?;
+            anyhow::ensure!(
+                manifest.schema_version == OUTER_SCHEMA
+                    && manifest.storage_format == STORAGE_FORMAT
+                    && manifest.logical_schema_version == LOGICAL_SCHEMA
+                    && manifest.files.is_empty()
+                    && manifest.binding == binding,
+                Pause::Mismatch
+            );
+            anyhow::ensure!(
+                !manifest.objects.is_empty()
+                    && manifest.objects.len() <= 769
+                    && manifest.objects[0].slot == Slot::Metadata
+                    && manifest.objects.windows(2).all(|p| p[0].slot < p[1].slot)
+                    && manifest.maps.len() == 3,
+                Pause::Partial
+            );
+            let mut total = 0_u64;
+            for object in &manifest.objects {
+                anyhow::ensure!(
+                    object.generation == manifest.generation
+                        && object.bytes >= 2
+                        && object.digest.len() == 64
+                        && object
+                            .digest
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                    Pause::Mismatch
+                );
+                total = total.checked_add(object.bytes).ok_or(Pause::Oversize)?;
+            }
+            anyhow::ensure!(
+                manifest.padding_bytes <= total
+                    && total
+                        .checked_add(manifest.padding_bytes)
+                        .is_some_and(|n| n <= i64::MAX as u64 - MAX_ROOT_BYTES as u64),
+                Pause::Oversize
+            );
+            for field in [
+                Field::AccountPending,
+                Field::UsagePending,
+                Field::RequestCensus,
+            ] {
+                let mut maps = manifest.maps.iter().filter(|m| m.field == field);
+                let map = maps.next().ok_or(Pause::Partial)?;
+                anyhow::ensure!(
+                    maps.next().is_none() && map.generation == manifest.generation,
+                    Pause::Partial
+                );
+                let buckets: Vec<_> = manifest
+                    .objects
+                    .iter()
+                    .filter_map(|o| match o.slot {
+                        Slot::Bucket { field: f, bucket } if f == field => Some(bucket),
+                        _ => None,
+                    })
+                    .collect();
+                anyhow::ensure!(map.buckets == buckets, Pause::Partial);
+            }
+            for object in &manifest.objects {
+                let shard_path = fence::sibling(path, ".shards").join(object.name());
+                let mut file = original_open(&shard_path).map_err(|e| {
+                    if e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        Pause::Partial.into()
+                    } else {
+                        e
+                    }
+                })?;
+                let before = OriginalStamp::read(&file)?;
+                anyhow::ensure!(before.2 == object.bytes, Pause::Mismatch);
+                let prefix = match object.slot {
+                    Slot::Metadata => String::new(),
+                    Slot::Bucket { field, .. } => format!("{{\"{}\":", field.name()),
+                };
+                let suffix = if prefix.is_empty() { "" } else { "}" };
+                original_shape(BufReader::new(
+                    prefix.as_bytes().chain(&mut file).chain(suffix.as_bytes()),
+                ))?;
+                file.seek(SeekFrom::Start(0))?;
+                if object.slot == Slot::Metadata {
+                    result.presence = original_presence(BufReader::new(&mut file))?;
+                    anyhow::ensure!(
+                        !result.presence["schema_version"]
+                            && !result.presence["generation"]
+                            && [
+                                Field::AccountPending,
+                                Field::UsagePending,
+                                Field::RequestCensus
+                            ]
+                            .iter()
+                            .all(|f| !result.presence[f.name()]),
+                        Pause::Mismatch
+                    );
+                } else {
+                    // Validate string grammar without allocating the map.
+                    let mut de = serde_json::Deserializer::from_reader(BufReader::new(&mut file));
+                    serde::de::IgnoredAny::deserialize(&mut de)?;
+                    de.end()?;
+                }
+                file.seek(SeekFrom::Start(0))?;
+                let mut hash = sha2::Sha256::new();
+                hash.update(b"ottto.scan-index.storage.v1\0object\0");
+                hash.update(serde_json::to_vec(&(&binding, object.slot))?);
+                hash.update([0]);
+                let mut buf = [0; 32 * 1024];
+                loop {
+                    let n = file.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hash.update(&buf[..n]);
+                }
+                hash.update(object.bytes.to_le_bytes());
+                let digest = hash
+                    .finalize()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                anyhow::ensure!(digest == object.digest, Pause::Mismatch);
+                result
+                    .files
+                    .push(OriginalFile::capture(&shard_path, &mut file, before)?);
+            }
+            // These fields are explicitly present in the authenticated logical view,
+            // including each empty money map whose descriptor has no buckets.
+            for name in [
+                "schema_version",
+                "generation",
+                Field::AccountPending.name(),
+                Field::UsagePending.name(),
+                Field::RequestCensus.name(),
+            ] {
+                result.presence.insert(name.into(), true);
+            }
+        }
+        result
+            .files
+            .insert(0, OriginalFile::capture(path, &mut root, stamp)?);
+        result.unchanged()?;
+        Ok(result)
+    }
+    pub(super) fn unchanged(&self) -> Result<()> {
+        if let Some(path) = &self.missing {
+            anyhow::ensure!(
+                !fence::exists(path)? && !fence::exists(&fence::sibling(path, ".shards"))?,
+                Pause::Mismatch
+            );
+        }
+        for file in &self.files {
+            file.unchanged()?;
+        }
+        Ok(())
+    }
+    pub(super) fn preserve(&self, path: &Path) -> Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        self.unchanged()?;
+        let mut bytes = 0_u64;
+        let shards = fence::sibling(path, ".v1-readonly.shards");
+        if self.files.len() > 1 {
+            std::fs::DirBuilder::new().mode(0o700).create(&shards)?;
+        }
+        for (n, source) in self.files.iter().enumerate() {
+            let target = if n == 0 {
+                fence::sibling(path, ".v1-readonly")
+            } else {
+                shards.join(source.path.file_name().ok_or(Pause::Mismatch)?)
+            };
+            bytes = bytes
+                .checked_add(fence::preserve_file(&source.path, &target)?)
+                .ok_or(Pause::Oversize)?;
+            let mut preserved = original_open(&target)?;
+            anyhow::ensure!(
+                source.digest == original_hash(&mut preserved)?,
+                Pause::Mismatch
+            );
+        }
+        if self.files.len() > 1 {
+            super::super::sync_checkpoint_parent(&shards.join("unused"))?;
+            fence::boundary(fence::Boundary::BaselineDirectorySynced)?;
+        }
+        if !self.files.is_empty() {
+            super::super::sync_checkpoint_parent(path)?;
+        }
+        self.unchanged()?;
+        telemetry::event("baseline_bytes", &bytes);
+        Ok(())
+    }
+}
+
+/// Re-emit normalized semantic rows into a read-only comparator. This consumes
+/// every value through the backend's checked streaming comparison, without
+/// hydrating a second ScanIndex or retaining any packed history payloads.
+/// The returned context is the one installed for the verified graph.
+#[allow(dead_code)] // Conversion remains gated on CAS, R1 and application parity.
+fn verify_normalized(
+    tx: &mut dyn Transaction,
+    index: &ScanIndex,
+    original: &Original,
+    binding: super::super::scan_index_persistence::Binding,
+) -> Result<KindCx> {
+    let mut proof = ReadBack {
+        inner: tx,
+        records: 0,
+        refs: std::collections::BTreeMap::new(),
+    };
+    let mut cx = KindCx::default();
+    cx.binding = Some(binding);
+    cx.presence = original.presence.clone();
+    kinds::populate(index, &mut proof, &mut cx)?;
+    let mut count = 0_u64;
+    let mut after = None;
+    loop {
+        let page = proof.inner.scan_prefix(
+            RowPrefix {
+                table: Table::Records,
+            },
+            after.as_ref(),
+            128,
+        )?;
+        if page.is_empty() {
+            break;
+        }
+        count = count
+            .checked_add(page.len() as u64)
+            .ok_or(Pause::Oversize)?;
+        after = page.last().map(|h| h.key.clone());
+    }
+    anyhow::ensure!(count == proof.records, Pause::Mismatch);
+    let mut after = None;
+    loop {
+        let page = proof.inner.scan_prefix(
+            RowPrefix {
+                table: Table::RequestSets,
+            },
+            after.as_ref(),
+            128,
+        )?;
+        if page.is_empty() {
+            break;
+        }
+        for h in &page {
+            let Fixed::RequestSet { refs, .. } = h.fixed else {
+                bail!(Pause::Mismatch);
+            };
+            anyhow::ensure!(proof.refs.remove(&h.key) == Some(refs), Pause::Mismatch);
+        }
+        after = page.last().map(|h| h.key.clone());
+    }
+    anyhow::ensure!(proof.refs.is_empty(), Pause::Mismatch);
+    Ok(cx)
+}
+struct ReadBack<'a> {
+    inner: &'a mut dyn Transaction,
+    records: u64,
+    refs: std::collections::BTreeMap<RowKey, u64>,
+}
+impl Transaction for ReadBack<'_> {
+    // Present a fresh import to the semantic encoders. The real rows are read
+    // only by put/value_matches/candidate lookup, never rewritten by the proof.
+    fn get(&mut self, _: &RowKey) -> Result<Option<Header>> {
+        Ok(None)
+    }
+    fn read_value(&mut self, h: &Header, out: &mut dyn Write) -> Result<()> {
+        self.inner.read_value(h, out)
+    }
+    fn put(&mut self, row: RowInput<'_>) -> Result<Header> {
+        let h = self.inner.get(row.key)?.ok_or(Pause::Mismatch)?;
+        anyhow::ensure!(
+            h.value_version == row.value_version
+                && &h.fixed == row.fixed
+                && self.inner.value_matches(&h, row.value)?,
+            Pause::Mismatch
+        );
+        if matches!(row.key, RowKey::Record { .. }) {
+            self.records = self.records.checked_add(1).ok_or(Pause::Oversize)?;
+        }
+        Ok(h)
+    }
+    fn delete(&mut self, _: &RowKey) -> Result<bool> {
+        bail!(Pause::Mismatch)
+    }
+    fn value_matches(&mut self, h: &Header, value: &dyn Value) -> Result<bool> {
+        self.inner.value_matches(h, value)
+    }
+    fn request_set_candidates(
+        &mut self,
+        digest: &[u8; 32],
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<Header>> {
+        self.inner.request_set_candidates(digest, after, limit)
+    }
+    fn adjust_refs(&mut self, key: &RowKey, delta: i64) -> Result<u64> {
+        anyhow::ensure!(delta == 1, Pause::Mismatch);
+        let count = self.refs.entry(key.clone()).or_default();
+        *count = count.checked_add(1).ok_or(Pause::Oversize)?;
+        Ok(*count)
+    }
+    fn scan_prefix(&mut self, _: RowPrefix, _: Option<&RowKey>, _: usize) -> Result<Vec<Header>> {
+        Ok(Vec::new())
+    }
+    fn scan_kind(&mut self, _: &RecordKind, _: Option<&RowKey>, _: usize) -> Result<Vec<Header>> {
+        Ok(Vec::new())
+    }
+    fn scan_family(
+        &mut self,
+        _: &RecordKind,
+        _: &[u8],
+        _: Option<u64>,
+        _: usize,
+    ) -> Result<Vec<Header>> {
+        Ok(Vec::new())
+    }
+    fn commit(self, _: u64, _: u64) -> DurableCommitOutcome {
+        DurableCommitOutcome::NotPublished
+    }
+}
+
+#[cfg(test)]
+mod application_cases {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Corpus {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+    impl Corpus {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
+                "ottto-import-cases-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            let parent = dir.join("a".repeat(64));
+            fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+            Self {
+                path: parent.join("claude_code-synthetic-scan-index.json"),
+                dir,
+            }
+        }
+        fn binding(&self) -> super::super::super::scan_index_persistence::Binding {
+            super::super::super::scan_index_integration::scan_index_storage_binding(&self.path)
+                .unwrap()
+        }
+        fn sharded(&self) -> BTreeMap<String, String> {
+            let fixture: serde_json::Value = serde_json::from_str(include_str!(
+                "../../../tests/fixtures/scan_index/real-shaped-v1.json"
+            ))
+            .unwrap();
+            fs::write(&self.path, fixture["root"].as_str().unwrap()).unwrap();
+            fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600)).unwrap();
+            let shards = fence::sibling(&self.path, ".shards");
+            fs::DirBuilder::new().mode(0o700).create(&shards).unwrap();
+            let mut out = BTreeMap::new();
+            for (name, value) in fixture["payloads"].as_object().unwrap() {
+                let text = value.as_str().unwrap();
+                fs::write(shards.join(name), text).unwrap();
+                fs::set_permissions(shards.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+                out.insert(name.clone(), text.into());
+            }
+            out
+        }
+        fn store(&self) -> sqlite::Sqlite {
+            let mut db = sqlite::Sqlite::create_import(&self.dir.join("proof.import")).unwrap();
+            db.path_extractor(kinds::private_paths);
+            db.reference_extractor(kinds::references);
+            db.control(
+                "identity",
+                &Identity {
+                    format: FORMAT,
+                    db_id: "synthetic-proof".into(),
+                    binding: self.binding(),
+                    fence_generation: 0,
+                },
+            )
+            .unwrap();
+            db.control("generation", &0_u64).unwrap();
+            db
+        }
+    }
+    impl Drop for Corpus {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn original_presence_precedes_normalization_and_inventory_has_no_write_side_effects() {
+        let c = Corpus::new();
+        let bytes = br#"{"schema_version":2,"generation":0,"files":{},"claude_history_cutoff_unix_seconds":null,"accepted_snapshot_fingerprints":[]}"#;
+        fs::write(&c.path, bytes).unwrap();
+        let original = Original::read(&c.path).unwrap();
+        assert!(original.presence["claude_history_cutoff_unix_seconds"]);
+        assert!(original.presence["accepted_snapshot_fingerprints"]);
+        assert!(!original.presence["growth_retention"]);
+        assert_eq!(fs::read_dir(c.path.parent().unwrap()).unwrap().count(), 1);
+        original.unchanged().unwrap();
+        fs::write(&c.path, b"changed-original").unwrap();
+        assert!(original.unchanged().is_err());
+        assert_eq!(fs::read(&c.path).unwrap(), b"changed-original");
+    }
+
+    #[test]
+    fn duplicate_unknown_and_invalid_escaped_originals_pause_before_baseline() {
+        for bytes in [
+            br#"{"schema_version":2,"files":{},"future_money":{"n":1}}"#.as_slice(),
+            br#"{"schema_version":2,"files":{},"files":{}}"#,
+            br#"{"schema_version":2,"files":{},"upload_context_fingerprint":"\q"}"#,
+            br#"{"schema_version":2,"files":{},"upload_context_fingerprint":"\ud800"}"#,
+            b"{\"schema_version\":2,\"files\":{},\"upload_context_fingerprint\":\"\xff\"}",
+            br#"{"schema_version":2,"files":{},"claude_request_census":{"~lost":{}}}"#,
+        ] {
+            let c = Corpus::new();
+            fs::write(&c.path, bytes).unwrap();
+            assert!(Original::read(&c.path).is_err());
+            assert_eq!(fs::read(&c.path).unwrap(), bytes);
+            assert!(!fence::sibling(&c.path, ".v1-readonly").exists());
+            assert!(!fence::sibling(&c.path, ".v2.sqlite.import").exists());
+        }
+    }
+
+    #[test]
+    fn all_referenced_shards_are_inventoried_and_preserved_without_unreferenced_files() {
+        let c = Corpus::new();
+        let payloads = c.sharded();
+        let shards = fence::sibling(&c.path, ".shards");
+        fs::write(shards.join("unreferenced.json"), b"not-authority").unwrap();
+        let original = Original::read(&c.path).unwrap();
+        assert_eq!(original.files.len(), payloads.len() + 1);
+        assert!(original.presence["claude_account_family_pending"]);
+        assert!(!original.presence["growth_retention"]);
+        original.preserve(&c.path).unwrap();
+        assert_eq!(
+            fs::read(fence::sibling(&c.path, ".v1-readonly")).unwrap(),
+            fs::read(&c.path).unwrap()
+        );
+        for (name, bytes) in &payloads {
+            assert_eq!(
+                fs::read(fence::sibling(&c.path, ".v1-readonly.shards").join(name)).unwrap(),
+                bytes.as_bytes()
+            );
+        }
+        assert!(!fence::sibling(&c.path, ".v1-readonly.shards")
+            .join("unreferenced.json")
+            .exists());
+        let last = payloads.keys().find(|k| k.starts_with("census-")).unwrap();
+        fs::remove_file(shards.join(last)).unwrap();
+        assert!(Original::read(&c.path).is_err());
+        assert!(original.unchanged().is_err());
+    }
+
+    #[test]
+    fn fifo_referenced_shard_refuses_without_blocking_the_owner_lock() {
+        use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+        let c = Corpus::new();
+        let payloads = c.sharded();
+        let name = payloads
+            .keys()
+            .find(|name| name.starts_with("census-"))
+            .unwrap();
+        let fifo = fence::sibling(&c.path, ".shards").join(name);
+        fs::remove_file(&fifo).unwrap();
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let path = c.path.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || send.send(Original::read(&path)).unwrap());
+        let result = receive.recv_timeout(Duration::from_secs(5));
+        // Unblock a regressed reader before joining, so failure stays bounded
+        // and leaves no thread holding the synthetic corpus open.
+        let unblock = if result.is_err() {
+            fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+                .open(&fifo)
+                .ok()
+        } else {
+            None
+        };
+        worker.join().unwrap();
+        drop(unblock);
+        assert_eq!(
+            result
+                .expect("inventory blocked on a nonregular shard")
+                .unwrap_err(),
+            Pause::UnsafeParent
+        );
+        assert!(!fence::sibling(&c.path, ".v1-readonly").exists());
+    }
+
+    #[test]
+    fn unknown_nested_field_in_final_shard_pauses_even_with_valid_descriptor_digest() {
+        use sha2::Digest;
+        let c = Corpus::new();
+        c.sharded();
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&fs::read(&c.path).unwrap()).unwrap();
+        let object = root["objects"].as_array_mut().unwrap().last_mut().unwrap();
+        let body = br#"{"synthetic-file":{"v":1,"future_money":{"n":1}}}"#;
+        let slot: super::super::super::scan_index_persistence::Slot =
+            serde_json::from_value(object["slot"].clone()).unwrap();
+        let mut hash = sha2::Sha256::new();
+        hash.update(b"ottto.scan-index.storage.v1\0object\0");
+        hash.update(serde_json::to_vec(&(c.binding(), slot)).unwrap());
+        hash.update([0]);
+        hash.update(body);
+        hash.update((body.len() as u64).to_le_bytes());
+        let digest = hash
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        object["digest"] = digest.clone().into();
+        object["bytes"] = body.len().into();
+        fs::write(
+            fence::sibling(&c.path, ".shards").join(format!("census-9c-{digest}.json")),
+            body,
+        )
+        .unwrap();
+        fs::write(&c.path, serde_json::to_vec(&root).unwrap()).unwrap();
+        assert_eq!(Original::read(&c.path).unwrap_err(), Pause::UnknownClass);
+        assert!(!fence::sibling(&c.path, ".v1-readonly").exists());
+    }
+
+    #[test]
+    fn f7_baseline_failures_remain_unpublished_and_keep_original_authority() {
+        for point in [
+            fence::Boundary::BaselineFileSynced,
+            fence::Boundary::BaselineParentSynced,
+            fence::Boundary::BaselineDirectorySynced,
+        ] {
+            let c = Corpus::new();
+            c.sharded();
+            let original = Original::read(&c.path).unwrap();
+            let bytes = fs::read(&c.path).unwrap();
+            fence::fail_at(point);
+            assert!(original.preserve(&c.path).is_err());
+            assert_eq!(fs::read(&c.path).unwrap(), bytes);
+            assert!(!fence::evidence(&c.path).unwrap());
+            fence::cleanup_unpublished(&c.path, false).unwrap();
+            original.unchanged().unwrap();
+            original.preserve(&c.path).unwrap();
+        }
+    }
+
+    #[test]
+    fn normalized_readback_checks_all_groups_raw_custody_presence_and_extra_rows() {
+        let c = Corpus::new();
+        fs::write(&c.path, br#"{"schema_version":2,"generation":0,"files":{},"accepted_snapshot_fingerprints":[]}"#).unwrap();
+        let original = Original::read(&c.path).unwrap();
+        let mut index = ScanIndex::default();
+        index
+            .decode_holds
+            .v2_insert(
+                "claude_account_family_pending",
+                "synthetic-raw".into(),
+                br#"{ "retry_after_unix_seconds": "bad", "text": "\u0061" }"#.to_vec(),
+                None,
+                128,
+            )
+            .unwrap();
+        index.decode_holds.v2_finish((u128::MAX, 7));
+        index.accepted_snapshot_fingerprints.insert("f".repeat(64));
+        let mut db = c.store();
+        let mut cx = KindCx::default();
+        cx.binding = Some(c.binding());
+        cx.presence = original.presence.clone();
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        kinds::populate(&index, &mut tx, &mut cx).unwrap();
+        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+        index.generation = 1;
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let verified = verify_normalized(&mut tx, &index, &original, c.binding()).unwrap();
+        assert_eq!(verified.presence, original.presence);
+        drop(tx);
+        let (restored, loaded) = kinds::hydrate(&mut db, c.binding()).unwrap();
+        assert!(restored.decode_holds.same_as(&index.decode_holds));
+        assert_eq!(restored.decode_holds.v2_provenance(), (u128::MAX, 7));
+        assert_eq!(loaded.presence, original.presence);
+        assert_eq!(
+            serde_json::to_vec(&restored).unwrap(),
+            serde_json::to_vec(&index).unwrap()
+        );
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        tx.put(RowInput {
+            key: &RowKey::record("file.confirmed_empty", b"orphan", 0).unwrap(),
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: &ControlJson(&true),
+        })
+        .unwrap();
+        assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+        index.generation = 2;
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        assert!(verify_normalized(&mut tx, &index, &original, c.binding()).is_err());
+    }
+    #[test]
+    fn f4_original_unbound_authority_repair_preserves_freeze_raw_bytes_and_provenance() {
+        let c = Corpus::new();
+        let mut seed = ScanIndex::default();
+        seed.insert_retry_pending_claude_authority_for_test("family");
+        seed.accepted_snapshot_fingerprints.insert("f".repeat(64));
+        let mut value = serde_json::to_value(&seed).unwrap();
+        value["claude_usage_family_witnesses"]["family"]["legacy_owner_roots"] =
+            serde_json::json!(["different-owner"]);
+        value["claude_usage_authority_quarantine"]["family"]["retry_after_unix_seconds"] =
+            serde_json::json!("mistyped-original");
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(&c.path, &bytes).unwrap();
+        let original = Original::read(&c.path).unwrap();
+        // The production v1 loader owns all original-span repair/freeze ordering.
+        let mut normalized = ScanIndex::load(&c.path).unwrap();
+        assert!(normalized.decode_holds_family("family"));
+        assert!(normalized.claude_usage_authority_quarantine.is_empty());
+        assert!(normalized.claude_usage_family_witnesses.is_empty());
+        assert_eq!(normalized.decode_holds.v2_provenance().1, 0);
+        let mut db = c.store();
+        let mut cx = KindCx::default();
+        cx.binding = Some(c.binding());
+        cx.presence = original.presence.clone();
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        kinds::populate(&normalized, &mut tx, &mut cx).unwrap();
+        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+        normalized.generation = 1;
+        let (restored, loaded) = kinds::hydrate(&mut db, c.binding()).unwrap();
+        assert_eq!(loaded.presence, original.presence);
+        assert!(restored.decode_holds.same_as(&normalized.decode_holds));
+        assert_eq!(
+            restored.decode_holds.v2_provenance(),
+            normalized.decode_holds.v2_provenance()
+        );
+        assert_eq!(
+            restored.accepted_snapshot_fingerprints,
+            normalized.accepted_snapshot_fingerprints
+        );
+        assert_eq!(
+            serde_json::to_vec(&restored).unwrap(),
+            serde_json::to_vec(&normalized).unwrap()
+        );
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        verify_normalized(&mut tx, &normalized, &original, c.binding()).unwrap();
+    }
+
+    #[test]
+    fn complete_real_shaped_money_graph_passes_streaming_readback_with_shared_membership() {
+        let c = Corpus::new();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/scan_index/real-shaped-v1.json"
+        ))
+        .unwrap();
+        let mut index: ScanIndex = serde_json::from_value(fixture["logical"].clone()).unwrap();
+        index.generation = 0;
+        let raw = serde_json::to_vec(&index).unwrap();
+        fs::write(&c.path, &raw).unwrap();
+        let original = Original::read(&c.path).unwrap();
+        let mut db = c.store();
+        let mut cx = KindCx::default();
+        cx.binding = Some(c.binding());
+        cx.presence = original.presence.clone();
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        kinds::populate(&index, &mut tx, &mut cx).unwrap();
+        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+        index.generation = 1;
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let verified = verify_normalized(&mut tx, &index, &original, c.binding()).unwrap();
+        assert_eq!(verified.presence, original.presence);
+        assert!(!verified.account_rows.is_empty());
+    }
+    /// CI opt-in qualification. Uses separate fresh child processes so the
+    /// corpus generator and the other route cannot contaminate high-water RSS.
+    /// It deliberately refuses to qualify the currently paused production route.
+    #[test]
+    #[ignore = "CI qualification after production publication is complete"]
+    fn ci_import_peak_does_not_exceed_same_corpus_v1_load() {
+        const NAME: &str = "snapshots::state_v2::import::application_cases::ci_import_peak_does_not_exceed_same_corpus_v1_load";
+        const MODE: &str = "OTTTO_TEST_IMPORT_PEAK_MODE";
+        const CORPUS: &str = "OTTTO_TEST_IMPORT_PEAK_PATH";
+        if let Ok(mode) = std::env::var(MODE) {
+            assert!(matches!(mode.as_str(), "v1" | "v2"));
+            let path = PathBuf::from(std::env::var_os(CORPUS).unwrap());
+            let support = path.parent().unwrap().parent().unwrap();
+            let (index, _) = ScanIndex::load_inner_with_support(
+                &path,
+                Some(super::super::super::SnapshotSource::ClaudeCode),
+                Some(support),
+                std::time::SystemTime::now(),
+            )
+            .unwrap();
+            if mode == "v2" {
+                assert!(
+                    index.persistence_v2.is_some(),
+                    "publication is still paused; this run cannot qualify import peak"
+                );
+            } else {
+                assert!(index.persistence_v2.is_none());
+            }
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            assert_eq!(
+                unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+                0
+            );
+            let peak = unsafe { usage.assume_init() }.ru_maxrss;
+            let peak = u64::try_from(peak).unwrap();
+            #[cfg(not(target_os = "macos"))]
+            let peak = peak.checked_mul(1024).unwrap();
+            assert!(peak > 0);
+            println!("S1_IMPORT_PEAK_BYTES={peak}");
+            std::hint::black_box(index);
+            return;
+        }
+        let c = Corpus::new();
+        let mut writer = std::io::BufWriter::new(fs::File::create(&c.path).unwrap());
+        writer
+            .write_all(br#"{"schema_version":2,"generation":0,"files":{"#)
+            .unwrap();
+        let entry = super::super::super::tests::manifest_index_entry(Some(&"f".repeat(64)));
+        for n in 0..15_000 {
+            if n > 0 {
+                writer.write_all(b",").unwrap();
+            }
+            serde_json::to_writer(&mut writer, &format!("synthetic-file-{n}")).unwrap();
+            writer.write_all(b":").unwrap();
+            serde_json::to_writer(&mut writer, &entry).unwrap();
+        }
+        writer.write_all(b"}}").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let mut peaks = Vec::new();
+        for mode in ["v1", "v2"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    NAME,
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(MODE, mode)
+                .env(CORPUS, &c.path)
+                .env(
+                    "OTTTO_CLAUDE_STATE_V2",
+                    if mode == "v2" { "1" } else { "0" },
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode} peak child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let peak = stdout
+                .lines()
+                .find_map(|line| {
+                    line.split_once("S1_IMPORT_PEAK_BYTES=")
+                        .map(|(_, value)| value.parse::<u64>().unwrap())
+                })
+                .expect("peak child reached the measurement edge");
+            peaks.push(peak);
+        }
+        assert!(
+            peaks[1] <= peaks[0],
+            "import peak {} exceeds same-corpus v1 load peak {}",
+            peaks[1],
+            peaks[0]
+        );
     }
 }

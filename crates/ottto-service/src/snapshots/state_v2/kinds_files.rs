@@ -544,6 +544,9 @@ pub(super) struct FinishProof {
 }
 #[derive(Default)]
 pub(super) struct StagedCheckpoints {
+    /// Actual immutable record bytes fsynced by R1, including replaced records.
+    /// The owner reserves these bytes during committable-unit admission.
+    pub bytes: u64,
     pub replacements: BTreeMap<String, ResumeCheckpoint>,
     pub finished: BTreeMap<String, FinishProof>,
 }
@@ -591,6 +594,15 @@ impl KindCx {
         next: &ScanIndex,
         hooks: &mut dyn ResumeHooks,
     ) -> Result<()> {
+        self.preflight_reserved(prev, next, hooks, 0)
+    }
+    pub(super) fn preflight_reserved(
+        &mut self,
+        prev: &ScanIndex,
+        next: &ScanIndex,
+        hooks: &mut dyn ResumeHooks,
+        reserved_staging_bytes: u64,
+    ) -> Result<()> {
         ensure!(
             !self.ambiguous && self.prepared.is_none(),
             "state_v2_resume_reopen_required"
@@ -598,6 +610,11 @@ impl KindCx {
         self.require_preflight = true;
         let binding = self.binding.as_ref().context("state_v2_resume_binding")?;
         let staged = hooks.stage(prev, next, &self.committed)?;
+        ensure!(
+            staged.bytes <= reserved_staging_bytes
+                && (staged.replacements.is_empty() || staged.bytes > 0),
+            "state_v2_resume_staging_admission"
+        );
         let mut checkpoints = self.committed.clone();
         let finished_paths: BTreeSet<_> = staged.finished.keys().cloned().collect();
         for (path, proof) in staged.finished {
@@ -667,8 +684,7 @@ impl KindCx {
         hooks: &mut dyn ResumeHooks,
     ) -> Result<()> {
         match outcome {
-            DurableCommitOutcome::Committed(generation)
-            | DurableCommitOutcome::Published(generation) => {
+            DurableCommitOutcome::Committed(generation) => {
                 if self.prepared.as_ref().map(|p| p.generation) != Some(*generation) {
                     self.ambiguous = true;
                     anyhow::bail!("state_v2_resume_commit_generation");
@@ -678,14 +694,21 @@ impl KindCx {
                     .take()
                     .context("state_v2_resume_preflight_required")?;
                 self.committed = prepared.checkpoints;
-                hooks.post_commit(*generation, &self.committed)
+                let result = hooks.post_commit(*generation, &self.committed);
+                if result.is_err() {
+                    self.ambiguous = true;
+                }
+                result
             }
-            DurableCommitOutcome::Ambiguous => {
+            DurableCommitOutcome::Published(_) | DurableCommitOutcome::Ambiguous => {
                 self.ambiguous = true;
                 anyhow::bail!("state_v2_resume_reopen_required")
             }
             DurableCommitOutcome::NotPublished => {
                 self.prepared = None;
+                // Encoders update resident headers before COMMIT. Even a
+                // definite rollback needs a fresh context before another save.
+                self.ambiguous = true;
                 Ok(())
             }
         }
@@ -1399,7 +1422,10 @@ mod tests {
             _: &BTreeMap<String, ResumeCheckpoint>,
         ) -> Result<StagedCheckpoints> {
             self.events.push("stage");
-            Ok(std::mem::take(&mut self.staged))
+            let mut staged = std::mem::take(&mut self.staged);
+            // Synthetic immutable record size; no provider files are opened.
+            staged.bytes = 1024 * staged.replacements.len() as u64;
+            Ok(staged)
         }
         fn post_commit(&mut self, _: u64, _: &BTreeMap<String, ResumeCheckpoint>) -> Result<()> {
             self.events.push("post_commit");
@@ -1421,7 +1447,9 @@ mod tests {
             .replacements
             .insert("/synthetic/a".into(), cp.clone());
         let mut context = cx();
-        context.preflight(&prev, &next, &mut hooks).unwrap();
+        context
+            .preflight_reserved(&prev, &next, &mut hooks, 1024)
+            .unwrap();
         assert_eq!(hooks.events, ["stage"]);
         let mut txn = store.begin(TxnMode::Write).unwrap();
         populate(&next, &mut txn, &mut context).unwrap();
@@ -1438,7 +1466,9 @@ mod tests {
         assert_eq!(reopened.checkpoints()["/synthetic/a"], cp);
         let mut later = next.clone();
         later.generation = 2;
-        context.preflight(&next, &later, &mut hooks).unwrap();
+        context
+            .preflight_reserved(&next, &later, &mut hooks, 1024)
+            .unwrap();
         let mut txn = store.begin(TxnMode::Write).unwrap();
         let mut count = Count {
             inner: &mut txn,
@@ -1454,7 +1484,9 @@ mod tests {
         assert_eq!(reopened.checkpoints()["/synthetic/a"], cp);
         let mut held = later.clone();
         held.generation = 3;
-        context.preflight(&later, &held, &mut hooks).unwrap();
+        context
+            .preflight_reserved(&later, &held, &mut hooks, 1024)
+            .unwrap();
         assert!(context
             .post_commit(&DurableCommitOutcome::Ambiguous, &mut hooks)
             .is_err());
@@ -1477,7 +1509,9 @@ mod tests {
         next.files.remove("");
         let mut context = cx();
         let mut hooks = Hooks::default();
-        assert!(context.preflight(&prev, &next, &mut hooks).is_err());
+        assert!(context
+            .preflight_reserved(&prev, &next, &mut hooks, 1024)
+            .is_err());
         let cp = reference("/synthetic/a", &next.files["/synthetic/a"], 1);
         let mut unsafe_cp = cp.clone();
         unsafe_cp.record_name = "../escape.rec".into();
@@ -1485,12 +1519,16 @@ mod tests {
             .staged
             .replacements
             .insert("/synthetic/a".into(), unsafe_cp);
-        assert!(context.preflight(&prev, &next, &mut hooks).is_err());
+        assert!(context
+            .preflight_reserved(&prev, &next, &mut hooks, 1024)
+            .is_err());
         hooks
             .staged
             .replacements
             .insert("/synthetic/a".into(), cp.clone());
-        context.preflight(&prev, &next, &mut hooks).unwrap();
+        context
+            .preflight_reserved(&prev, &next, &mut hooks, 1024)
+            .unwrap();
         let scratch = Scratch::new();
         let mut store = scratch.store();
         let mut txn = store.begin(TxnMode::Write).unwrap();
@@ -1518,7 +1556,9 @@ mod tests {
         let mut removed = next.clone();
         removed.generation = 2;
         removed.files.clear();
-        assert!(context.preflight(&next, &removed, &mut hooks).is_err());
+        assert!(context
+            .preflight_reserved(&next, &removed, &mut hooks, 1024)
+            .is_err());
         hooks.staged.finished.insert(
             "/synthetic/a".into(),
             FinishProof {
@@ -1528,7 +1568,9 @@ mod tests {
                 settled_dependencies: [10; 32],
             },
         );
-        context.preflight(&next, &removed, &mut hooks).unwrap();
+        context
+            .preflight_reserved(&next, &removed, &mut hooks, 1024)
+            .unwrap();
         let mut txn = store.begin(TxnMode::Write).unwrap();
         delta(&next, &removed, &mut txn, &mut context).unwrap();
         assert!(txn
@@ -1547,5 +1589,45 @@ mod tests {
         assert!(loaded.files.is_empty() && reopened.checkpoints().is_empty());
         let mut txn = store.begin(TxnMode::Write).unwrap();
         assert!(delta(&loaded, &loaded, &mut txn, &mut reopened).is_err());
+    }
+    #[test]
+    #[cfg(unix)]
+    fn staging_reservation_and_every_noncommitted_outcome_require_safe_reopen() {
+        let prev = ScanIndex::default();
+        let mut next = fixture();
+        next.files.remove("");
+        let cp = reference("/synthetic/a", &next.files["/synthetic/a"], 1);
+        let mut hooks = Hooks::default();
+        hooks
+            .staged
+            .replacements
+            .insert("/synthetic/a".into(), cp.clone());
+        let mut context = cx();
+        assert!(context
+            .preflight_reserved(&prev, &next, &mut hooks, 1023)
+            .is_err());
+        assert!(context.prepared.is_none());
+        assert_eq!(hooks.events, ["stage"]);
+        for outcome in [
+            DurableCommitOutcome::Published(1),
+            DurableCommitOutcome::Ambiguous,
+            DurableCommitOutcome::NotPublished,
+        ] {
+            let mut hooks = Hooks::default();
+            hooks
+                .staged
+                .replacements
+                .insert("/synthetic/a".into(), cp.clone());
+            let mut context = cx();
+            context
+                .preflight_reserved(&prev, &next, &mut hooks, 1024)
+                .unwrap();
+            let _ = context.post_commit(&outcome, &mut hooks);
+            assert_eq!(hooks.events, ["stage"]); // never reconcile/GC either record set
+            assert!(context
+                .preflight_reserved(&prev, &next, &mut hooks, 1024)
+                .is_err());
+            assert!(context.checkpoints().is_empty());
+        }
     }
 }

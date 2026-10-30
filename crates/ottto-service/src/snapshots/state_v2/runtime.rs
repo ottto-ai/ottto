@@ -87,6 +87,7 @@ struct RouteState {
     pace: Pace,
     latched: bool,
     inventory_ready: bool,
+    original: Option<import::Original>,
     sample_v1: bool,
     runtimes: Vec<std::sync::Weak<Runtime>>,
     current: Option<Arc<Runtime>>,
@@ -114,6 +115,7 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     pace: Pace::default(),
                     latched: false,
                     inventory_ready: false,
+                    original: None,
                     sample_v1: false,
                     runtimes: Vec::new(),
                     current: None,
@@ -159,6 +161,7 @@ fn binding(path: &Path) -> Option<super::super::scan_index_persistence::Binding>
 
 pub(in super::super) struct Session {
     db: sqlite::Sqlite,
+    cx: KindCx,
     identity: Identity,
     path: PathBuf,
     reload: bool,
@@ -197,6 +200,7 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
     }
     let result = held(with_state(path, |state| {
         state.inventory_ready = false;
+        state.original = None;
         state.pass_written_start = telemetry::process_written_bytes();
         state.sample_v1 = switched;
         let pair = fence::reconcile(path, &binding, state.latched)?;
@@ -221,8 +225,9 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
                         // on the same connection; never acquire another owner.
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
                         telemetry::event("hydrate_count", &1);
-                        let mut index = mapper.hydrate(&mut session.db)?;
+                        let (mut index, cx) = mapper.hydrate_context(&mut session.db)?;
                         ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+                        session.cx = cx;
                         index.persistence_v2 = Some(runtime.clone());
                         state.cached = Some(index.clone());
                         return Ok(Some(index));
@@ -241,13 +246,14 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
             db.path_extractor(M::private_paths);
             db.reference_extractor(M::references);
             let stamp = db.stamp()?;
-            let mut index = mapper.hydrate(&mut db)?;
+            let (mut index, cx) = mapper.hydrate_context(&mut db)?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
             db.prime_headers()?;
             index.persistence_v2 = Some(Arc::new(Runtime {
                 active: true,
                 session: Mutex::new(Some(Session {
                     db,
+                    cx,
                     identity,
                     path: path.to_owned(),
                     reload: false,
@@ -275,10 +281,11 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
             {
                 telemetry::event("import_restart_attempt", &1);
             }
-            // The inventory stub pauses before cleanup/baseline/DB creation.
-            match mapper.inventory(path) {
-                Ok(()) => {
+            // Inventory precedes v1 recovery/decoding and never creates artifacts.
+            match mapper.inventory_context(path) {
+                Ok(original) => {
                     state.inventory_ready = true;
+                    state.original = original;
                 }
                 Err(class) => {
                     pause(state, now, class);
@@ -305,6 +312,7 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
 }
 fn pause(state: &mut RouteState, now: Instant, class: Pause) {
     state.inventory_ready = false;
+    state.original = None;
     state.pace.failed(now, class);
     telemetry::event("import_paused", &class);
     telemetry::event("import_paused_alarm", &1);
@@ -344,7 +352,10 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             pause(state, now, class);
             return Ok(());
         }
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<KindCx> {
+            if let Some(original) = &state.original {
+                original.unchanged()?;
+            }
             telemetry::event(
                 "orphan_removed",
                 &fence::cleanup_unpublished(path, state.latched)?,
@@ -357,22 +368,27 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
                 binding,
                 fence_generation: index.generation,
             };
-            preserve_baseline(path)?;
+            preserve_baseline(path, state.original.as_ref())?;
             let import = fence::sibling(path, ".v2.sqlite.import");
             let mut db = sqlite::Sqlite::create_import(&import)?;
             db.path_extractor(M::private_paths);
             db.reference_extractor(M::references);
             db.control("identity", &identity)?;
             db.control("generation", &index.generation)?;
-            mapper.populate(&mut db, index)?;
+            let cx = mapper.populate_original(&mut db, index, state.original.as_ref())?;
             mapper.verify(&mut db, index)?;
             db.finish_import()?;
+            fence::boundary(fence::Boundary::ImportFinished)?;
+            if let Some(original) = &state.original {
+                original.unchanged()?;
+            }
             fence::publish(path, &identity, &mut state.latched)?;
-            Ok(())
+            Ok(cx)
         })();
-        match result {
-            Ok(()) => {
+        let cx = match result {
+            Ok(cx) => {
                 telemetry::event("import_done", &1);
+                cx
             }
             Err(error) if state.latched => return Err(Hold::storage(error)),
             Err(error) => {
@@ -380,7 +396,7 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
                 pause(state, now, class);
                 return Ok(());
             }
-        }
+        };
         // Publication succeeded: adoption failure is a hold, never a v1 result.
         let (identity, db_path) =
             fence::reconcile(path, &binding_for(path)?, true)?.ok_or(Hold::DbUnavailable)?;
@@ -395,6 +411,7 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             active: true,
             session: Mutex::new(Some(Session {
                 db,
+                cx,
                 identity,
                 path: path.to_owned(),
                 reload: false,
@@ -409,7 +426,10 @@ fn binding_for(path: &Path) -> Result<super::super::scan_index_persistence::Bind
     binding(path).ok_or_else(|| Hold::ForeignBinding.into())
 }
 
-fn preserve_baseline(path: &Path) -> Result<()> {
+fn preserve_baseline(path: &Path, original: Option<&import::Original>) -> Result<()> {
+    if let Some(original) = original {
+        return original.preserve(path);
+    }
     if !fence::exists(path)? {
         return Ok(());
     }

@@ -184,7 +184,7 @@ pub(super) fn create_private(path: &Path) -> Result<File> {
 pub(super) fn preserve_file(from: &Path, to: &Path) -> Result<u64> {
     let mut input = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(from)?;
     let before = input.metadata()?;
     ensure!(
@@ -210,7 +210,9 @@ pub(super) fn preserve_file(from: &Path, to: &Path) -> Result<u64> {
     );
     output.set_permissions(fs::Permissions::from_mode(0o400))?;
     output.sync_all()?;
+    boundary(Boundary::BaselineFileSynced)?;
     super::super::sync_checkpoint_parent(to)?;
+    boundary(Boundary::BaselineParentSynced)?;
     Ok(bytes)
 }
 
@@ -276,6 +278,10 @@ pub(super) fn evidence(path: &Path) -> Result<bool> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Boundary {
+    BaselineFileSynced,
+    BaselineParentSynced,
+    BaselineDirectorySynced,
+    ImportFinished,
     FenceAttempt,
     FenceRenamed,
     FenceSynced,
@@ -288,7 +294,7 @@ thread_local! { static FAILURE: std::cell::Cell<Option<Boundary>> = const { std:
 pub(super) fn fail_at(boundary: Boundary) {
     FAILURE.with(|f| f.set(Some(boundary)));
 }
-fn boundary(point: Boundary) -> Result<()> {
+pub(super) fn boundary(point: Boundary) -> Result<()> {
     #[cfg(test)]
     if FAILURE.with(|f| {
         if f.get() == Some(point) {
