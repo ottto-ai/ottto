@@ -39210,7 +39210,6 @@ fn codex_creator_header_evidence(value: &Value, meta: &Value) -> Option<SessionA
     })
 }
 
-
 // Content projection shared with growth-only durable replay. Keep native N/U
 // processing at its existing call sites; these helpers never publish usage.
 enum JsonlLineText<'a> {

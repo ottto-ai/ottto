@@ -2304,7 +2304,7 @@ impl DurableTailStore {
                 }
                 Some(_) => {}
             }
-            let header = self
+            let _header = self
                 .classify(&proof.key, "delete", Some(writer))
                 .map_err(|_| io::Error::other("retirement classification"))?
                 .ok_or_else(|| io::Error::other("retirement unknown survivor"))?;

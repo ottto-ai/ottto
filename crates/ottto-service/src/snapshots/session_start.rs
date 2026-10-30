@@ -716,7 +716,9 @@ impl SessionStartState {
         self.content_end
     }
 
-    pub(super) fn content_window_open(&self) -> bool { !self.frozen }
+    pub(super) fn content_window_open(&self) -> bool {
+        !self.frozen
+    }
 
     fn charge(&mut self, bytes: usize) -> bool {
         let held = self.held_bytes.saturating_add(bytes);

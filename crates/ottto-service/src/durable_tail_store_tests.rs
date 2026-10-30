@@ -5092,6 +5092,8 @@ fn exact_retirement_retries_unlink_and_absent_path_directory_barrier() {
         };
         store.authorize(&record, &expected);
         let proof = store.mutation_witness(&record, &expected).unwrap();
+        store.begin_pass();
+        store.durable.clear(); // writer custody outlives memo/permission turnover
         let mut sync_due = false;
         let fault = fail_store_at(point, 1);
         assert!(matches!(
