@@ -351,8 +351,6 @@ impl ApcFixture {
         let root = apc_member_session(None);
         let hour = grant.hour + 1;
         {
-            let _legacy =
-                crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
             self.withheld_owners.borrow_mut().insert(root.clone());
             let pages = self.generation(hour, |_| ApcUpload::Accept);
             self.withheld_owners.borrow_mut().clear();
@@ -3192,6 +3190,8 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
 /// (`is_request_owned_literal` candidates). A `no_op` body needs owed members
 /// whose accepted bodies are unchanged, but after the flip every literal is
 /// new; the ON arm first accepts them (`ApcFixture::reowe_accepted_literals`).
+/// Its withheld-owner hold is the legacy account path, which contract 5 leaves
+/// to untagged bodies, so that arm models pre-cutover evidence from the grant.
 fn apc_gate_arms(
     case: &'static str,
     owners: bool,
@@ -3200,13 +3200,16 @@ fn apc_gate_arms(
 ) {
     for gate_on in [true, false] {
         eprintln!("{case}: E2 gate on={gate_on}");
-        let fixture = ApcFixture::new(case, owners || (gate_on && no_op));
+        let reowe = gate_on && no_op;
+        let _legacy = reowe
+            .then(crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter);
+        let fixture = ApcFixture::new(case, owners || reowe);
         let grant = {
             let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
             fixture.reach_grant().1
         };
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(gate_on);
-        let grant = if gate_on && no_op {
+        let grant = if reowe {
             fixture.reowe_accepted_literals(grant)
         } else {
             grant
