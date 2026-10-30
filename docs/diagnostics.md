@@ -378,6 +378,38 @@ on the durable pass summary are process totals; `take_pass` store receipts reset
 their flows while retaining disk levels. Alarm counts retain the delta/total
 contract above.
 
+### Claude Census Retirement Overlap
+
+A complete Claude terminal retires transcript census records whose file was
+last modified more than 35 days before the census window. An aged record that
+shares a request id with another unretired census record is kept instead, so a
+resumed copy keeps its cross-session copy proof while both files stay indexed.
+The terminal then emits `claude_census_retire_kept_overlap` with
+`census_retire_kept_overlap_records`, `census_retire_kept_overlap_hashes`,
+`census_retire_kept_overflow` and its two reasons,
+`census_retire_kept_overflow_occupancy` and
+`census_retire_kept_overflow_admission`, each with a `_total` process total,
+and `census_missing_over_budget`: the same terminal's census-full tombstone
+count (the shadow's `missing_over_budget`), so both read together.
+Kept records stay while the census, after the other aged records retire, is
+at most 90% full by both its hash budget and its serialized budget. Above
+that, the oldest kept records (equal ages in path order) retire until it is
+back at 90%, counted as occupancy overflow, so one index always yields one
+kept set. Kept records never cost another record its admission: a transcript
+record that does not fit whole first retires, oldest first, the records the
+age rule would retire at that window but that still hold their hashes, only
+as many as it needs; if retiring all of them would still not admit it, none
+retires and the record is tombstoned as before. Each such insert emits a row with zero kept counts, no
+`census_missing_over_budget`, and the records it retired as admission
+overflow. The census holds at most 65,536 records, live as on load: a new
+transcript key past that gets no record (read as missing) and emits a row
+with `census_record_limit_refused` = 1 and no `census_missing_over_budget`.
+Every row carries `census_record_limit_refused` and its `_total`. A positive
+overflow, by either reason, or a positive refusal also emits
+`claude_census_retire_kept_overlap_alarm` with the same counts. Each terminal
+decides again, so a kept record retires once its partner is pruned or
+retired. Counts only; no path, id or wire event.
+
 ## Credential File Cap Refusals
 
 Schema 2 adds `credential_file_cap_refusal` point records on the same
