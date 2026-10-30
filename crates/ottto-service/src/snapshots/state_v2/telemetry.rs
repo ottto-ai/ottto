@@ -243,7 +243,11 @@ thread_local! {
 }
 pub(in super::super) fn pass_start() {
     PASS.with(|pass| {
-        *pass.borrow_mut() = Pass::default();
+        *pass.borrow_mut() = Pass {
+            cpu_start: crate::local_resource_diagnostics::state_v2_cpu_us(),
+            written_start: process_written_bytes(),
+            ..Default::default()
+        }
     });
 }
 pub(super) fn sample_cached_graph() -> bool {
@@ -273,12 +277,7 @@ pub(in super::super) fn acquired(index: &ScanIndex) {
     let first = PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         pass.active = true;
-        let first = !std::mem::replace(&mut pass.acquire_sampled, true);
-        if first {
-            pass.cpu_start = crate::local_resource_diagnostics::state_v2_cpu_us();
-            pass.written_start = process_written_bytes();
-        }
-        first
+        !std::mem::replace(&mut pass.acquire_sampled, true)
     });
     if first {
         phase("acquire");
