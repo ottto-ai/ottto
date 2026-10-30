@@ -117,9 +117,7 @@ fn rederive_digests(acc: &SnapshotAccumulator, line_cap: u64) -> Result<Rederive
     let wire_prompt = pi::wire_obligation(acc)?;
     if wire_prompt.is_some() {
         out.first_prompt = wire_prompt;
-    } else if !acc.pi_not_uploaded()
-        && (acc.first_prompt_material.is_some() || acc.first_prompt_title.is_some())
-    {
+    } else if acc.first_prompt_material.is_some() || acc.first_prompt_title.is_some() {
         head_mark(
             marks.first_prompt,
             "SnapshotAccumulator.first_prompt_material",
@@ -138,7 +136,7 @@ fn rederive_digests(acc: &SnapshotAccumulator, line_cap: u64) -> Result<Rederive
         .session_start
         .durable_content_digest(HEAD_BOUND)?
         .map(|(digest, _)| digest);
-    if acc.title.is_some() && wire_prompt.is_none() && !acc.pi_not_uploaded() {
+    if acc.title.is_some() && wire_prompt.is_none() {
         marks
             .title_line
             .filter(|(_, len)| *len <= line_cap)

@@ -63,23 +63,20 @@ pub(in crate::snapshots) struct PiPromptCarry {
     wire: Option<PiWirePrompt>,
     prompt_seen: bool,
     key_epoch: Option<HmacKeyEpoch>,
-    not_uploaded: bool,
 }
-crate::heap_layout_bound::fields!(PiPromptCarry; wire, prompt_seen, key_epoch, not_uploaded);
+crate::heap_layout_bound::fields!(PiPromptCarry; wire, prompt_seen, key_epoch);
 
 struct PiSection {
     usage_keys: BTreeMap<String, PiUsageDedupState>,
     wire_prompt: Option<PiWirePrompt>,
     prompt_seen: bool,
     hmac_key_epoch: Option<HmacKeyEpoch>,
-    not_uploaded: bool,
 }
 crate::durable_tail_codec::durable_struct!(borrowed PiSection {
     H usage_keys: BTreeMap<String, PiUsageDedupState>,
     N wire_prompt: Option<PiWirePrompt>,
     N prompt_seen: bool,
     H hmac_key_epoch: Option<HmacKeyEpoch>,
-    N not_uploaded: bool,
 });
 
 /// What `A_P` adds after the shared shapes.
@@ -119,14 +116,7 @@ pub(in crate::snapshots) fn put_body(
     let wire = carry.map_or(&none, |carry| &carry.wire);
     let key_epoch = carry.and_then(|carry| carry.key_epoch);
     e.section(SECTION_TAG, |e| {
-        PiSection::put_borrowed(
-            e,
-            keys,
-            wire,
-            &acc.pi_prompt_seen(),
-            &key_epoch,
-            &acc.pi_not_uploaded(),
-        )
+        PiSection::put_borrowed(e, keys, wire, &acc.pi_prompt_seen(), &key_epoch)
     })
 }
 
@@ -160,12 +150,11 @@ pub(crate) fn take_body(d: &mut Dec<'_>) -> Result<Decoded, Corrupt> {
     let section = take_section(d)?;
     reduction.accumulator.seen_pi_usage_keys = section.usage_keys;
     reduction.accumulator.pi_prompt =
-        (section.prompt_seen || section.wire_prompt.is_some() || section.not_uploaded).then(|| {
+        (section.prompt_seen || section.wire_prompt.is_some()).then(|| {
             Box::new(PiPromptCarry {
                 wire: section.wire_prompt,
                 prompt_seen: section.prompt_seen,
                 key_epoch: section.hmac_key_epoch,
-                not_uploaded: section.not_uploaded,
             })
         });
     d.refilled_section();
@@ -260,13 +249,6 @@ impl PiWirePrompt {
 }
 
 impl SnapshotAccumulator {
-    /// No first-prompt or title value was uploaded under the known policy.
-    pub(in crate::snapshots) fn pi_not_uploaded(&self) -> bool {
-        self.pi_prompt
-            .as_ref()
-            .is_some_and(|carry| carry.not_uploaded)
-    }
-
     /// Any prompt was assigned, here or before this copy was restored.
     pub(in crate::snapshots) fn pi_prompt_seen(&self) -> bool {
         self.first_prompt_material.is_some()
@@ -316,7 +298,6 @@ impl SnapshotAccumulator {
         let seen = self.pi_prompt_seen();
         let carried = self.pi_prompt.take();
         let context = context.filter(|_| gates.is_some_and(|gates| gates.attribution));
-        let not_uploaded = gates.is_some_and(|gates| !gates.titles && !gates.attribution);
         let wire = gates.and_then(|gates| self.pi_wire_prompt(context, gates, carried.as_deref()));
         let key_epoch = current_hmac_key_epoch(context).filter(|_| wire.is_some());
         self.pi_prompt = seen.then(|| {
@@ -324,7 +305,6 @@ impl SnapshotAccumulator {
                 wire,
                 prompt_seen: seen,
                 key_epoch,
-                not_uploaded,
             })
         });
     }
@@ -335,9 +315,6 @@ impl SnapshotAccumulator {
         gates: UploadGates,
         carried: Option<&PiPromptCarry>,
     ) -> Option<PiWirePrompt> {
-        if carried.is_some_and(|carry| carry.not_uploaded) && self.first_prompt_material.is_none() {
-            return None;
-        }
         if !gates.titles && context.is_none() {
             return None;
         }
@@ -385,7 +362,6 @@ pub(super) fn wire_obligation(acc: &SnapshotAccumulator) -> Result<Option<[u8; 3
         Some(PiPromptCarry {
             wire: Some(wire), ..
         }) => digest(WIRE_PROMPT_DOMAIN, |e| wire.put(e)).map(Some),
-        Some(carry) if carry.not_uploaded => Ok(None),
         Some(_) if acc.first_prompt_material.is_none() && acc.first_prompt_title.is_none() => Err(
             Refuse::NotRederivable("SnapshotAccumulator.first_prompt_material"),
         ),
@@ -402,11 +378,6 @@ impl Decoded {
         let Some(carry) = acc.pi_prompt.as_deref_mut() else {
             return;
         };
-        if carry.not_uploaded {
-            self.rederive.first_prompt = None;
-            self.rederive.title = None;
-            return;
-        }
         let Some(wire) = carry.wire.as_ref() else {
             return;
         };
@@ -460,7 +431,6 @@ pub(crate) fn stored_literal_verdict(
         let wire = <Option<PiWirePrompt> as Durable>::take(d)?;
         bool::verify(d)?;
         let key_epoch = <Option<HmacKeyEpoch> as crate::durable_tail_codec::HDigest>::take_h(d)?;
-        bool::verify(d)?;
         Ok((wire, key_epoch))
     })?;
     d.refilled_section();

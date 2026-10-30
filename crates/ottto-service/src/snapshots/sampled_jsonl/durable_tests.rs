@@ -1208,69 +1208,29 @@ fn pi_each_upload_setting_gates_its_own_stored_fields() {
     }
 }
 
-/// Consent off carries no literal or prompt obligation and continues by Tail.
+/// Condition 2: nothing uploaded, nothing stored, and today's refusal stands.
 #[test]
-fn pi_consent_off_restores_without_rederive_and_matches_cold_upload() {
-    let policy = SnapshotUploadPolicy {
-        session_titles_enabled: false,
-        session_attribution_enabled: false,
-        session_attribution_labels_enabled: false,
-        ..SnapshotUploadPolicy::default()
-    };
-    pi_restore_tail_case(false, policy);
+fn pi_consent_off_stores_nothing_and_keeps_the_counted_full() {
     let scratch = Scratch::new("pi-wire-off");
     let path = scratch.write("t.jsonl", &pi_wire_lines(false));
-    let (_, mut decoded) = pi_carried(&path, None, policy.into());
-    assert!(decoded.reduction.accumulator.pi_not_uploaded());
-    assert!(decoded.rederive.first_prompt.is_none());
-    assert!(decoded.rederive.title.is_none());
-    decoded.settle_pi_wire_prompt(None);
-    assert_eq!(decoded.content_charge().unwrap(), 0);
-    let body = encode(
-        &decoded.reduction,
-        crate::durable_tail_store::RECORD_BYTES,
-        line_cap(),
-    )
-    .unwrap();
-    assert!(!contains(&body, PI_MARKER));
-
-    // Re-enabling a field requires a fresh Full rather than an empty capture.
-    decoded
-        .reduction
-        .accumulator
-        .capture_pi_wire_prompt(None, Some(pi_all_on().into()));
-    assert!(matches!(
-        encode(
-            &decoded.reduction,
+    for gates in [Some(pi_gates(false, false, false)), None] {
+        let mut parser = parser(&path, SnapshotSource::Pi);
+        while !parser.step().unwrap() {}
+        let shared = first_prompt_digest(&parser.accumulator).unwrap();
+        parser.accumulator.capture_pi_wire_prompt(None, gates);
+        let reduction = parser.reduction_copy();
+        let body = encode(
+            &reduction,
             crate::durable_tail_store::RECORD_BYTES,
-            line_cap()
-        ),
-        Err(Refuse::NotRederivable(
-            "SnapshotAccumulator.first_prompt_material"
-        ))
-    ));
-}
-
-/// An unknown policy cannot claim that nothing was uploaded.
-#[test]
-fn pi_unknown_consent_keeps_the_counted_full() {
-    let scratch = Scratch::new("pi-wire-unknown");
-    let path = scratch.write("t.jsonl", &pi_wire_lines(false));
-    let mut parser = parser(&path, SnapshotSource::Pi);
-    while !parser.step().unwrap() {}
-    let shared = first_prompt_digest(&parser.accumulator).unwrap();
-    parser.accumulator.capture_pi_wire_prompt(None, None);
-    let body = encode(
-        &parser.reduction_copy(),
-        crate::durable_tail_store::RECORD_BYTES,
-        line_cap(),
-    )
-    .unwrap();
-    assert!(!contains(&body, PI_MARKER));
-    let mut decoded = decode(&body, SnapshotSource::Pi).unwrap();
-    decoded.settle_pi_wire_prompt(None);
-    assert_eq!(decoded.rederive.first_prompt, Some(shared));
-    assert!(matches!(decoded.content_charge(), Err(RederiveUnfunded)));
+            line_cap(),
+        )
+        .unwrap();
+        assert!(!contains(&body, PI_MARKER));
+        let mut decoded = decode(&body, SnapshotSource::Pi).unwrap();
+        decoded.settle_pi_wire_prompt(None);
+        assert_eq!(decoded.rederive.first_prompt, Some(shared));
+        assert!(matches!(decoded.content_charge(), Err(RederiveUnfunded)));
+    }
 }
 
 /// `prompt_seen` freezes only the first-prompt fields: a later title replaces
