@@ -43727,18 +43727,22 @@ fn advance_bounded_directory_traversal_with_budget(
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 continue;
             }
-            if source == SnapshotSource::ClaudeCode
-                && claude_terminal_off()
-                && terminal_off_discovery::walk_path(
+            let walk_path = if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+                terminal_off_discovery::walk_path(
                     traversal,
                     &path,
                     &metadata,
                     pending.contains_key(&path),
                     directory.watcher_hint,
                 )
-            {
+            } else {
+                terminal_off_discovery::WalkPath::Enqueue
+            };
+            if walk_path == terminal_off_discovery::WalkPath::SkipAlreadyObserved {
                 continue;
             }
+            // Presence and enqueue authority are separate. A new-round walk
+            // sees pending/floor-blocked files even when it adds no read work.
             traversal.counts.discovered_file_count += 1;
             traversal.observed_index_keys.insert(local_index_key(&path));
             if metadata.len() > max_jsonl_file_bytes(source) {
@@ -43750,6 +43754,11 @@ fn advance_bounded_directory_traversal_with_budget(
                     &mut traversal.oversized_discovery,
                 );
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
+                continue;
+            }
+            if walk_path == terminal_off_discovery::WalkPath::ObserveOnly
+                && !pending.contains_key(&path)
+            {
                 continue;
             }
             if let Some(&position) = pending.get(&path) {

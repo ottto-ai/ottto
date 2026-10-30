@@ -241,11 +241,13 @@ pub(super) fn hint_allowed(traversal: &ScanTraversalCheckpoint, path: &Path) -> 
     let stat = fs::symlink_metadata(path)
         .ok()
         .and_then(|m| Stat::capture(&m));
-    let (now, floor_blocked) = with_walks(|memo| {
+    let floor_blocked = with_walks(|memo| {
         memo.get(&scope)
-            .map_or((0, false), |w| (w.now, blocked(w, &key, stat, None)))
+            .is_some_and(|w| blocked(w, &key, stat, None))
     });
-    !floor_blocked && !sampled_audit::candidate_open_blocked(&key, now)
+    // A one-shot watcher hint keeps its queue custody through backoff.
+    // The ordinary selector owns the #903 open gate, not this enqueue.
+    !floor_blocked
 }
 
 /// `false`: coalesce a requested walk; `true`: start it. Targeted work is
@@ -360,25 +362,30 @@ pub(super) fn prepare(index: &mut ScanIndex, now: u64, at: &str, requested: bool
     start
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum WalkPath {
+    Enqueue,
+    ObserveOnly,
+    SkipAlreadyObserved,
+}
+
 pub(super) fn walk_path(
     traversal: &ScanTraversalCheckpoint,
     path: &Path,
     metadata: &fs::Metadata,
     pending: bool,
     watcher: bool,
-) -> bool {
+) -> WalkPath {
     let Some(scope) = terminal_off_traversal_scope(traversal) else {
-        return false;
+        return WalkPath::Enqueue;
     };
     let key = local_index_key(path);
     let stat = Stat::capture(metadata);
     with_walks(|memo| {
         let Some(walk) = memo.get_mut(&scope) else {
-            return false;
+            return WalkPath::Enqueue;
         };
-        if !watcher && (pending || blocked(walk, &key, stat, None)) {
-            return true;
-        }
+        let enqueue_suppressed = !watcher && (pending || blocked(walk, &key, stat, None));
         if !watcher
             && walk.suppressing
             && stat.is_some_and(|s| s.identity.is_some() && s.modified.is_some() && s.birth > 0)
@@ -387,7 +394,7 @@ pub(super) fn walk_path(
                 .get(&digest(&key))
                 .is_some_and(|o| o.round == walk.round && o.stat == stat)
         {
-            return true;
+            return WalkPath::SkipAlreadyObserved;
         }
         let now = walk.now;
         let round = walk.round;
@@ -400,7 +407,11 @@ pub(super) fn walk_path(
         if metadata.len() > MAX_CLAUDE_JSONL_FILE_BYTES {
             o.served = Some((stat, [0; 32]));
         }
-        false
+        if enqueue_suppressed {
+            WalkPath::ObserveOnly
+        } else {
+            WalkPath::Enqueue
+        }
     })
 }
 

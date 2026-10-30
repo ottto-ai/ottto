@@ -1747,3 +1747,109 @@ fn terminal_off_two_blocking_held_keys_wait_for_the_existing_six_hour_floor() {
     assert!(!scan.census_complete);
     assert!(index.accepted_snapshot_fingerprints.is_empty());
 }
+
+#[test]
+fn terminal_off_new_round_observes_targeted_pending_and_floor_blocked_presence() {
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-new-round-presence");
+    let held = "b2222222-2222-4222-8222-222222222222";
+    for root in [OFF_ROOT, held] {
+        fs::write(
+            scratch.join(format!("{root}.jsonl")),
+            freshness_line(root, "X"),
+        )
+        .unwrap();
+    }
+    let mut index = off_index();
+    off_scan(&mut index, &scratch, W1, 10);
+    let pending_key = local_index_key(&scratch.join(format!("{OFF_ROOT}.jsonl")));
+    let held_key = local_index_key(&scratch.join(format!("{held}.jsonl")));
+    index.mark_bounded_sweep_held_by_families(Some(&BTreeSet::from([held.to_owned()])));
+    index
+        .files
+        .get_mut(&pending_key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    index.traversal.as_mut().unwrap().pending_candidates.clear();
+    index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_directories
+        .clear();
+    refresh_terminal_off_discovery_at_test(
+        &mut index,
+        &[scratch.to_path_buf()],
+        "2026-08-20T10:07:00Z",
+        false,
+    );
+    assert!(
+        index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .observed_index_keys
+            .is_empty(),
+        "new round reset"
+    );
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .iter()
+        .any(|p| local_index_key(&p.path) == pending_key && !p.census_member));
+    assert!(!index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .iter()
+        .any(|p| local_index_key(&p.path) == held_key));
+    let discovered = index.traversal.as_ref().unwrap().counts.discovered_file_count;
+    advance_bounded_directory_traversal(
+        SnapshotSource::ClaudeCode,
+        index.traversal.as_mut().unwrap(),
+        BACKFILL_WINDOW_DAYS,
+        &index.files,
+    );
+    for key in [&pending_key, &held_key] {
+        assert!(index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .observed_index_keys
+            .contains(key));
+    }
+    assert_eq!(
+        index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .counts
+            .discovered_file_count,
+        2
+    );
+    assert!(
+        !index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .iter()
+            .any(|p| local_index_key(&p.path) == held_key),
+        "presence does not bypass floor"
+    );
+    let before = index.files.clone();
+    {
+        let _completion = ClaudeCompletionPathsForTest::enable();
+        index.traversal.as_mut().unwrap().reconciliation_upper_bound =
+            index.files.keys().next_back().cloned();
+        while !reconcile_missing_index_entries_with_limit(&mut index, 10) {}
+    }
+    assert_eq!(
+        index.files, before,
+        "real reconcile must retain both observed on-disk files"
+    );
+    assert!(index.accepted_snapshot_fingerprints.is_empty());
+}
