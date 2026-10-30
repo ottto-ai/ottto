@@ -148,8 +148,9 @@ Files/bytes cover the exact scope; runnable files/bytes exclude oversized
 and out-of-window members. The existing Claude 512 MiB per-file limit also
 applies, independently of the 1 GiB page limit. Any blocked member means apply
 refuses the whole request. Required `--window-days` is the ordinary daemon
-scan window, at most the existing 183-day limit; it never widens scanning. Scope is bounded by the existing 10,000-file scan
-limit and a 4 MiB local request envelope.
+scan window, bounded by the existing `BACKFILL_WINDOW_DAYS` policy; it never
+widens scanning. Scope is bounded by the existing 10,000-file scan limit and
+a 4 MiB local request envelope.
 
 After the change is merged and installed, money sign-off and a same-cohort
 PLAN are prerequisites for the authorized operator to replace `--estimate`
