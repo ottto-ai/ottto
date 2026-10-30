@@ -702,7 +702,7 @@ fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
             {"model": "claude-synthetic", "evidence_ref": 0, "account_identifier_hash": "a".repeat(64)}
         ]}],
     });
-    let cases: [(&str, Option<[u8; 32]>, bool, Option<Option<[u8; 32]>>); 4] = [
+    let cases = [
         ("bound with a saved hint", Some([0x42; 32]), true, None),
         ("bound with no hints", Some([0x42; 32]), false, None),
         (
