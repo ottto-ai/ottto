@@ -10,6 +10,10 @@ the earlier holder. While that holder remains indexed, retirement or loss of its
 census hashes does not restore a recorded removal. A positive id hit in a Lossy
 holder remains proof. Absence in a Lossy holder is unknown and never invalidates
 a recorded removal; only an answering loss-free record can disprove it.
+Account-marker decisions follow the exact removed or held requests. Such
+markers cannot lend identity to retained usage. Emitted prefix markers and
+later own markers keep their scope; both identified and id-less inherited
+grains wait for this decision before account reconciliation.
 
 Storage shares a global 4 MiB charged bound: 40 bytes per file, 32 per holder
 group, and 8 per request hash. A file with prefix retry debt and no removals
@@ -27,6 +31,8 @@ through ACK, semantic no-op, and restart and reselects the unchanged file. The
 third decision pass emits any still-unproven prefix flagged and clears the debt,
 counted by `copy_prefix_hold_expired`. If debt cannot fit, it expires immediately.
 `copy_prefix_held_requests` and `copy_prefix_held_files` disclose pending holds.
+An intervening page cannot prune retry debt merely because a new whole-body
+held file is absent from the settled index. Confirmed source removal clears it.
 
 The local CCR2 encoding accepts CCR1 removal records. Absent, damaged or
 downgraded metadata is uncertainty. The read already happening re-derives any
@@ -64,6 +70,8 @@ damaged metadata, Lossy positive and negative evidence, capacity refusal, and
 three-pass prefix expiry with own-turn ACK and restart; capability-off byte/hash
 identity and capability-on mixed-grain flags/counts (Full and sampled/cache),
 partial-ACK restart and deletion of disproven removals at capacity. Tests run
-in Linux CI, never locally. Before release, measure local files, holder groups, copied
+in Linux CI, never locally. Marker exclusion covers full/partial proof,
+restored prefix markers and id-less usage; retry debt covers intervening page
+pruning and restart. Before release, measure local files, holder groups, copied
 requests, longest resume chain and charged bytes; occupancy above 50% needs
 review before release.

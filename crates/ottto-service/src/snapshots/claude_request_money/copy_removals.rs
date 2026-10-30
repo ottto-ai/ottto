@@ -204,8 +204,11 @@ impl CopyRemovals {
     /// Keep only files `live` still indexes (every removal path included).
     pub(crate) fn retain_files(&mut self, live: impl Fn(LocationKey) -> bool) {
         let mut bytes = self.bytes;
-        self.files.retain(|(file, _, groups)| {
-            let keep = live(*file);
+        self.files.retain(|(file, attempts, groups)| {
+            // Whole-body-held new files are absent from the settled files
+            // map. Their debt is not absence evidence; only explicit source
+            // removal (`forget`) or a decision may clear their attempts.
+            let keep = *attempts > 0 || live(*file);
             if !keep {
                 bytes -= charge(groups).max(FILE_BYTES);
             }
@@ -487,6 +490,25 @@ mod tests {
             state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
             assert!(state.metadata_lost());
         }
+        assert_eq!(state.bytes(), 0);
+    }
+
+    #[test]
+    fn held_new_file_debt_survives_intervening_page_pruning() {
+        let file = location_key("new-held-file");
+        let mut state = CopyRemovals::default();
+        for pass in 1..=HOLD_PASSES {
+            assert_eq!(state.advance_hold(file), pass < HOLD_PASSES);
+            // A different page sees no settled entry for the whole-body-held
+            // new file. This is not proof that its source disappeared.
+            state.retain_files(|_| false);
+            state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+            assert_eq!(state.pending(file), pass < HOLD_PASSES);
+        }
+        assert_eq!(state.bytes(), 0);
+        assert!(state.advance_hold(file));
+        state.forget(file); // ordinary confirmed source-removal path
+        assert!(!state.pending(file));
         assert_eq!(state.bytes(), 0);
     }
 

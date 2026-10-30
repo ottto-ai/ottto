@@ -500,6 +500,8 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
         skipped,
         copy,
         idless_copy,
+        idless_inherited,
+        first_idless,
         proof,
         prefix_inherited,
         copied: _,
@@ -524,6 +526,8 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
     *skipped = Vec::new();
     *copy = None;
     *idless_copy = None;
+    *idless_inherited = None;
+    *first_idless = None;
     *proof = None;
     *prefix_inherited = None;
     *first_own = None;
@@ -1065,6 +1069,11 @@ pub(crate) struct FileFold {
     /// Held copies without a request id: no census can prove them, so a
     /// proof-checked skip counts them after all. Rare, so boxed.
     idless_copy: Option<Box<ClaudeEntityBody>>,
+    /// Id-less copied usage staged by its native marker until that marker's
+    /// request is decided. At most one body per bounded marker run.
+    #[allow(clippy::box_collection)]
+    idless_inherited: Option<Box<BTreeMap<u64, ClaudeEntityBody>>>,
+    first_idless: Option<u64>,
     /// The proof `decide_page_copies` checks per request before the page
     /// treats the held copies as removed.
     proof: Option<CopyProof>,
@@ -1089,7 +1098,7 @@ pub(crate) struct FileFold {
     /// The copied prefix's page outcome (local diagnostics only).
     prefix: PrefixTally,
 }
-money_heap_fields!(FileFold; inline: [copy_unproven_wire, money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, proof, prefix_inherited, ambiguous, telemetry, accounts]);
+money_heap_fields!(FileFold; inline: [copy_unproven_wire, money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts]);
 
 /// What the finish hands a gate-on fold, sized for
 /// [`FileFold::finish_heap_bound`] (X_out's E term).
@@ -1201,7 +1210,7 @@ impl FileFold {
             grains,
             absorb,
             held,
-            inherited,
+            inherited.checked_mul(2)?,
             base_selector,
             bucket_fallback,
             fallbacks,
@@ -1299,6 +1308,8 @@ impl FileFold {
             skipped: Vec::new(),
             copy: Default::default(),
             idless_copy: None,
+            idless_inherited: None,
+            first_idless: None,
             proof: None,
             prefix_inherited: None,
             copied: 0,
@@ -1468,6 +1479,9 @@ impl FileFold {
             accounts.observe(sequence, copied == Some(true));
             accounts.account(sequence)
         });
+        if !has_request_id {
+            self.first_idless.get_or_insert(sequence);
+        }
         let tokens = ClaudeMoneyTokens::from_usage(usage);
         let requests = usage.request_count;
         if copied == Some(true) {
@@ -1475,13 +1489,19 @@ impl FileFold {
             self.entity.removed.add(&tokens);
             self.entity.removed_requests += requests;
             if !has_request_id {
-                key.put(
-                    self.idless_copy.get_or_insert_with(Box::default),
-                    &tokens,
-                    requests,
-                    at,
-                    account,
-                );
+                let marker = self
+                    .accounts
+                    .as_deref()
+                    .and_then(|accounts| accounts.copied_marker_position(sequence));
+                let into = match marker {
+                    Some(position) => self
+                        .idless_inherited
+                        .get_or_insert_with(Box::default)
+                        .entry(position)
+                        .or_default(),
+                    None => self.idless_copy.get_or_insert_with(Box::default),
+                };
+                key.put(into, &tokens, requests, at, account);
                 return;
             }
             match self.skipped.last_mut() {
@@ -1573,6 +1593,7 @@ impl FileFold {
         if certified && !needs_original {
             // Timestamp skip: id-less copies stay skipped with the rest.
             self.idless_copy = None;
+            self.idless_inherited = None;
             self.keep_copies(true, markers);
             return;
         }
@@ -1594,7 +1615,10 @@ impl FileFold {
             self.proof = Some(CopyProof::Holders(parent));
             // Should the page find no holder, the restored copies keep the
             // accounts their own markers give them (QUOTA: never moved).
-            self.keep_copies(false, markers);
+            // Keep marker-dependent grains staged until the page decides
+            // individual requests; provisional markers must not become own
+            // account evidence before proof removes their copied request.
+            self.copy = None;
             return;
         }
         if let Some(mut copy) = self.copy.take() {
@@ -1603,13 +1627,7 @@ impl FileFold {
             }
             self.entity.absorb_grains(&copy);
         }
-        if let Some(mut idless) = self.idless_copy.take() {
-            if self.copy_unproven_wire {
-                idless.mark_copy_unproven();
-            }
-            self.prefix.unproven_idless = idless.totals().1;
-            self.entity.absorb_grains(&idless);
-        }
+        self.restore_idless();
         if let Some(accounts) = self.accounts.as_deref_mut() {
             accounts.restore_copies();
         }
@@ -1638,13 +1656,18 @@ impl FileFold {
     ) {
         if let Some(accounts) = self.accounts.as_deref_mut() {
             accounts.finish_native(markers, prefix_excluded);
-            if let Some(inherited) = self.prefix_inherited.take() {
-                for (position, mut inherited) in *inherited {
-                    if prefix_excluded {
-                        inherited.repartition(accounts.account(position));
-                    }
-                    self.entity.absorb_grains(&inherited);
+        }
+        self.absorb_prefix_inherited(prefix_excluded);
+    }
+
+    fn absorb_prefix_inherited(&mut self, repartition: bool) {
+        if let Some(inherited) = self.prefix_inherited.take() {
+            for (position, mut inherited) in *inherited {
+                if repartition {
+                    inherited
+                        .repartition(self.accounts.as_deref().and_then(|a| a.account(position)));
                 }
+                self.entity.absorb_grains(&inherited);
             }
         }
     }
@@ -1772,9 +1795,17 @@ impl FileFold {
 
     /// Held id-less copies count: no census can prove them.
     fn restore_idless(&mut self) {
-        let Some(mut idless) = self.idless_copy.take() else {
-            return;
-        };
+        if let Some(idless) = self.idless_copy.take() {
+            self.restore_idless_body(*idless, None);
+        }
+        if let Some(inherited) = self.idless_inherited.take() {
+            for (position, idless) in *inherited {
+                self.restore_idless_body(idless, Some(position));
+            }
+        }
+    }
+
+    fn restore_idless_body(&mut self, mut idless: ClaudeEntityBody, position: Option<u64>) {
         if self.copy_unproven_wire {
             idless.mark_copy_unproven();
         }
@@ -1787,9 +1818,17 @@ impl FileFold {
             (Some(removed), Some(removed_requests)) => {
                 self.entity.removed = removed;
                 self.entity.removed_requests = removed_requests;
-                self.entity.absorb_grains(&idless);
+                match position {
+                    Some(position) => self
+                        .prefix_inherited
+                        .get_or_insert_with(Box::default)
+                        .entry(position)
+                        .or_default()
+                        .absorb_grains(&idless),
+                    None => self.entity.absorb_grains(&idless),
+                }
                 self.copied = self.copied.saturating_sub(responses);
-                self.prefix.unproven_idless = requests;
+                self.prefix.unproven_idless += requests;
                 self.disclose("copy_idless", responses);
             }
             _ => self.entity.certificate_ok = false,
@@ -2108,11 +2147,61 @@ pub(crate) fn decide_page_copies(
         decide_holders(items, &holders, index)
     };
     if enabled() {
+        for at in holders {
+            finish_holder_identity(&mut items[at]);
+        }
         for item in items.iter_mut() {
             tally_unproven_prefix(item, index.claude_copy_removals.metadata_lost());
         }
     }
     updates
+}
+
+/// Apply the money decision to the existing native account policy before
+/// telemetry attachment. Only the decided skipped marker positions disappear.
+fn finish_holder_identity(item: &mut SnapshotItem) {
+    let SnapshotItem {
+        claude_money: Some(fold),
+        claude_org_markers,
+        claude_usage_occurrences,
+        ..
+    } = item
+    else {
+        return;
+    };
+    let Some(mut accounts) = fold.accounts.take() else {
+        return;
+    };
+    let first_retained = claude_usage_occurrences
+        .values()
+        .filter(|o| !fold.is_skipped(o.sequence) && !o.usage.is_zero())
+        .map(|o| o.sequence)
+        .chain(fold.first_idless)
+        .min();
+    let rebuilt =
+        accounts.after_copy_decision(claude_org_markers.as_deref(), &fold.skipped, first_retained);
+    if let Some(own) = rebuilt.as_ref() {
+        // Restored identified prefix grains were placed with the original
+        // native policy. Own/id-less marker-dependent grains are still staged.
+        for occurrence in claude_usage_occurrences.values() {
+            if !fold.unproven_copy(occurrence) {
+                continue;
+            }
+            place_request_identity(
+                fold,
+                occurrence,
+                None,
+                accounts.account(occurrence.sequence),
+                own.account(occurrence.sequence),
+            );
+        }
+    }
+    let changed = rebuilt.is_some();
+    if let Some(own) = rebuilt {
+        *accounts = own;
+    }
+    fold.accounts = Some(accounts);
+    fold.absorb_prefix_inherited(changed);
 }
 
 /// The flagged range of a decided fold: its copied-prefix requests that
@@ -2784,6 +2873,7 @@ fn restore_uncovered(item: &mut SnapshotItem, uncovered: &[String]) {
     else {
         return;
     };
+    let holder_proof = matches!(fold.proof, Some(CopyProof::Holders(_)));
     for id in uncovered {
         if fold.is_ambiguous(id) {
             // Two responses claim it: no single grain to give back.
@@ -2799,6 +2889,9 @@ fn restore_uncovered(item: &mut SnapshotItem, uncovered: &[String]) {
         if let Some(accounts) = fold.accounts.as_deref_mut() {
             accounts.restore_copies();
         }
+    }
+    if !holder_proof {
+        fold.absorb_prefix_inherited(false);
     }
 }
 

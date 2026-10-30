@@ -3275,3 +3275,64 @@ fn e2_pipeline_copy_unproven_wire_is_capability_gated_and_partitions_own_rows() 
     });
     }
 }
+
+#[test]
+fn e2_pipeline_proven_prefix_markers_never_lend_identity_to_retained_requests() {
+    // Full proof, partial proof, an emitted prefix's own marker, and id-less
+    // prefix usage all pass through production identity reconciliation.
+    for (partial, retained_marker, idless) in [
+        (false, false, false), (true, false, false),
+        (true, true, false), (true, false, true),
+    ] {
+        with_e2(|| {
+            let mut c = Corpus::new("e2-pipeline-copy-marker-exclusion");
+            let scanner = E2ScanFixture::default();
+            c.root(ROOT, &resumed(ROOT, &[A]));
+            let old = ScanIndex::default();
+            let page = ready(&c, &scanner, old.clone(), 100, false);
+            let prior = settle(&c, &old, page, &mut e2_progress());
+            let org_a = "11111111-1111-4111-8111-111111111111";
+            let org_b = "22222222-2222-4222-8222-222222222222";
+            let marker = |org: &str| json!({"type":"attachment", "sessionId":COPY,
+                "attachment":{"type":"credential_org","organizationUuid":org}}).to_string() + "\n";
+            let mut text = marker(org_a) + &resumed(COPY, &[A]);
+            if partial {
+                if retained_marker { text += &marker(org_b); }
+                let mut b: serde_json::Value = serde_json::from_str(
+                    &line_by(COPY, B.0, B.1, 10, RESUME_WRITER)).unwrap();
+                if idless { b.as_object_mut().unwrap().remove("requestId"); }
+                text += &(b.to_string() + "\n");
+            }
+            text += &resumed(COPY, &[C]);
+            // A later own marker stays authoritative only from its own turn.
+            text += &marker(org_b);
+            text += &line_by(COPY, "later", "2026-08-02T07:03:20Z", 10, RESUME_WRITER);
+            c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
+            c.evidence_for(COPY, &[api_for(COPY, "c", 10, 250),
+                api_for(COPY, "later", 10, 400)], &[]);
+            let page = ready(&c, &scanner, prior, 100, false);
+            let copy = body(&page, COPY).expect("retained usage publishes");
+            assert_eq!((copy.request_count, copy.removed_request_count),
+                (if partial { 3 } else { 2 }, Some(1)));
+            let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
+            let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
+            let mut shares = BTreeMap::<String, u64>::new();
+            for row in &copy.model_usage {
+                if let Some(parts) = &row.identity_parts {
+                    for part in parts {
+                        if let Some(org) = part.evidence_ref.and_then(|at|
+                            copy.request_evidence[usize::from(at)].provider_workspace_hash.as_ref()) {
+                            *shares.entry(org.clone()).or_default() += part.request_count;
+                        }
+                    }
+                } else if let Some(org) = row.evidence_ref.and_then(|at|
+                    copy.request_evidence[usize::from(at)].provider_workspace_hash.as_ref()) {
+                    *shares.entry(org.clone()).or_default() += row.request_count;
+                }
+            }
+            assert!(!shares.contains_key(&a), "removed marker cannot lend account identity");
+            assert_eq!(shares.get(&b), Some(&if retained_marker { 3 } else { 1 }));
+            assert_eq!(copy.cost.as_ref().unwrap().total_cost_usd.as_deref(), Some("0.00065"));
+        });
+    }
+}

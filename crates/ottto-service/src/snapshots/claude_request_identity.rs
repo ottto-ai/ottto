@@ -1835,6 +1835,46 @@ impl RequestAccounts {
             .inherited
             .saturating_add(std::mem::take(&mut self.skipped_inherited));
     }
+
+    /// The money owner has decided individual copies. Exclude only markers
+    /// on still-removed/held requests; an emitted unproven prefix keeps its
+    /// own markers. Build beside the original so its grains can be moved.
+    pub(crate) fn after_copy_decision(
+        &self,
+        markers: Option<&OrgMarkers>,
+        skipped: &[(u64, u64)],
+        first_retained: Option<u64>,
+    ) -> Option<Self> {
+        if self.subagent {
+            return None;
+        }
+        let excluded = self
+            .runs
+            .iter()
+            .filter(|run| {
+                let at = skipped.partition_point(|(_, end)| *end <= run.position);
+                run.copied == Some(true)
+                    && skipped
+                        .get(at)
+                        .is_some_and(|(start, _)| *start <= run.position)
+            })
+            .map(|run| run.position)
+            .collect::<Vec<_>>();
+        if excluded.is_empty() {
+            return None;
+        }
+        let mut own = request_accounts(
+            markers,
+            self.bound.as_ref().and_then(|key| key.login.as_deref()),
+            first_retained.or(self.first_retained),
+            false,
+            &excluded,
+        );
+        own.inherited = self.inherited;
+        own.skipped_inherited = self.skipped_inherited;
+        own.first_retained = first_retained.or(self.first_retained);
+        Some(own)
+    }
 }
 
 /// Own exact telemetry uses the existing request classifier, with the same
