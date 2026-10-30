@@ -845,29 +845,49 @@ pub(crate) fn claude_reemission_family_closure_root_absent_excluded(members: u64
         },
     );
 }
-static CENSUS_RETIRE_KEPT_OVERLAP_TOTAL: [std::sync::atomic::AtomicU64; 3] = [
+static CENSUS_RETIRE_KEPT_OVERLAP_TOTAL: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
+
+/// One `claude_census_retire_kept_overlap` row (E7 stopgap): a complete
+/// terminal's kept records, their hashes and those retired past the kept
+/// cap, with the terminal's census-full tombstone count; or the records an
+/// insert retired so it fits (admission overflow, no terminal count).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CensusRetireKeptOverlapCounts {
+    pub(crate) records: u64,
+    pub(crate) hashes: u64,
+    pub(crate) overflow_cap: u64,
+    pub(crate) overflow_admission: u64,
+    /// The terminal's shadow `missing_over_budget`; None on admission rows.
+    pub(crate) missing_over_budget: Option<u64>,
+}
 
 #[derive(Serialize)]
 struct CensusRetireKeptOverlap {
     census_retire_kept_overlap_records: u64,
     census_retire_kept_overlap_hashes: u64,
     census_retire_kept_overflow: u64,
+    census_retire_kept_overflow_admission: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    census_missing_over_budget: Option<u64>,
     census_retire_kept_overlap_records_total: u64,
     census_retire_kept_overlap_hashes_total: u64,
     census_retire_kept_overflow_total: u64,
+    census_retire_kept_overflow_admission_total: u64,
 }
 
-/// Local counter (E7 stopgap): aged Claude transcript census records a
-/// complete terminal kept because they share a request id with another
-/// unretired record, their hashes, and those retired anyway past the kept
-/// cap. This terminal's counts and saturating process totals. A positive
+/// Local counter (E7 stopgap): aged Claude transcript census records kept
+/// because they share a request id with another unretired record, and those
+/// retired anyway, past the kept cap at a terminal or so an insert fits.
+/// `census_retire_kept_overflow` counts both reasons, `_admission` the
+/// second. The row's counts and saturating process totals; a positive
 /// overflow also emits `claude_census_retire_kept_overlap_alarm`. Counts
 /// only; no path, id or wire event.
-pub(crate) fn claude_census_retire_kept_overlap(records: u64, hashes: u64, overflow: u64) {
+pub(crate) fn claude_census_retire_kept_overlap(counts: CensusRetireKeptOverlapCounts) {
     let add = |slot: usize, count: u64| {
         CENSUS_RETIRE_KEPT_OVERLAP_TOTAL[slot]
             .fetch_update(
@@ -878,20 +898,26 @@ pub(crate) fn claude_census_retire_kept_overlap(records: u64, hashes: u64, overf
             .unwrap_or(u64::MAX)
             .saturating_add(count)
     };
-    let counts = CensusRetireKeptOverlap {
-        census_retire_kept_overlap_records: records,
-        census_retire_kept_overlap_hashes: hashes,
+    let overflow = counts
+        .overflow_cap
+        .saturating_add(counts.overflow_admission);
+    let row = CensusRetireKeptOverlap {
+        census_retire_kept_overlap_records: counts.records,
+        census_retire_kept_overlap_hashes: counts.hashes,
         census_retire_kept_overflow: overflow,
-        census_retire_kept_overlap_records_total: add(0, records),
-        census_retire_kept_overlap_hashes_total: add(1, hashes),
+        census_retire_kept_overflow_admission: counts.overflow_admission,
+        census_missing_over_budget: counts.missing_over_budget,
+        census_retire_kept_overlap_records_total: add(0, counts.records),
+        census_retire_kept_overlap_hashes_total: add(1, counts.hashes),
         census_retire_kept_overflow_total: add(2, overflow),
+        census_retire_kept_overflow_admission_total: add(3, counts.overflow_admission),
     };
-    traversal_point("claude_census_retire_kept_overlap", "claude_code", &counts);
+    traversal_point("claude_census_retire_kept_overlap", "claude_code", &row);
     if overflow > 0 {
         traversal_point(
             "claude_census_retire_kept_overlap_alarm",
             "claude_code",
-            &counts,
+            &row,
         );
     }
 }

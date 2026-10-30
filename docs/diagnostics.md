@@ -381,14 +381,23 @@ last modified more than 35 days before the census window. An aged record that
 shares a request id with another unretired census record is kept instead, so a
 resumed copy keeps its cross-session copy proof while both files stay indexed.
 The terminal then emits `claude_census_retire_kept_overlap` with
-`census_retire_kept_overlap_records`, `census_retire_kept_overlap_hashes` and
-`census_retire_kept_overflow`, each with a `_total` process total.
+`census_retire_kept_overlap_records`, `census_retire_kept_overlap_hashes`,
+`census_retire_kept_overflow` and `census_retire_kept_overflow_admission`,
+each with a `_total` process total, and `census_missing_over_budget`: the
+same terminal's census-full tombstone count (the shadow's
+`missing_over_budget`), so both read together.
 Kept hashes are capped at a quarter of the census hash budget (524,288); past
 it, the oldest overlapping records (equal ages in path order) retire anyway
-and count as overflow, so one index always yields one kept set. A
-positive overflow also emits `claude_census_retire_kept_overlap_alarm` with
-the same counts. Each terminal decides again, so a kept record retires once
-its partner is pruned or retired. Counts only; no path, id or wire event.
+and count as overflow, so one index always yields one kept set. Kept records
+never cost another record its admission: a transcript record that does not
+fit whole first retires, oldest first, the records the age rule would retire
+at that window but that still hold their hashes. Each emits a row with zero
+kept counts, no `census_missing_over_budget`, and the records it retired as
+both `census_retire_kept_overflow` and `census_retire_kept_overflow_admission`.
+A positive overflow, by either reason, also emits
+`claude_census_retire_kept_overlap_alarm` with the same counts. Each terminal
+decides again, so a kept record retires once its partner is pruned or
+retired. Counts only; no path, id or wire event.
 
 ## Credential File Cap Refusals
 
