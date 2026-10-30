@@ -1638,10 +1638,8 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
     }
     let clock = TestClock;
     let interval = crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
-    // Lever (i) is undecided, so P1 runs outcome D (strict `AuditDue`).
-    // Under G a tail would also be permitted while an audit is queued; the
-    // per-page tail check below holds under both outcomes.
-    const LEVER_GRACE: bool = false;
+    // Ordinary checkpoint admission/completion ignores age, while debt
+    // and the original verification time remain owed across later Tails.
     const B: u64 = 2048;
     with_test_limits(B, 8192, 64, || {
         // (i) and (ii): a short page interval, well inside the deadline.
@@ -1702,8 +1700,8 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
         // (iii) scaled `L > L_max` for two large files, both appended every
         // page, pages 600 s apart so each read of `ceil(L/B)` pages outlives
         // the interval. Rotation, not a monopoly (K7): the files alternate,
-        // each certifies once per census generation, and a completed attempt
-        // ends that file's census hold, so generations turn over.
+        // each initial Full certifies, then both progress through overdue
+        // ordinary Tails without requiring a new census generation or audit.
         let fixture = ScanRoot::with_sessions(&[(SESSION, 80), (SESSION_B, 80)]);
         let sessions = [SESSION, SESSION_B];
         let keys = sessions.map(|session| local_index_key(&fixture.file(session)));
@@ -1712,6 +1710,7 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
         let mut opened = BTreeMap::new();
         let mut completions = Vec::new();
         let mut tails = 0;
+        let mut overdue_tail_progress = BTreeMap::new();
         for page_number in 0..192_u64 {
             clock.set(now);
             let started = counter(&cache, |c| c.jobs_started);
@@ -1728,14 +1727,23 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
             );
             index = next;
             if modes.1 > 0 {
-                // Every tail is permitted by its deadline or by G's grace.
-                let permitted = retained
-                    .iter()
-                    .flatten()
-                    .all(|retained| now < retained.last_full_verified() + interval);
-                assert!(permitted || LEVER_GRACE, "tail past the audit deadline");
                 tails += modes.1;
+                for (key, prior) in keys.iter().zip(&retained) {
+                    let Some(prior) = prior else { continue };
+                    let Some(next) = cache.retained_checkpoint(key) else {
+                        continue;
+                    };
+                    if next.sealed_offset() > prior.sealed_offset() {
+                        assert!(!scan.snapshots.is_empty(), "completed Tail publishes");
+                        assert_eq!(next.last_full_verified(), prior.last_full_verified());
+                        assert_eq!(next.audit_debt(), prior.audit_debt(), "no audit credit");
+                        if now >= prior.last_full_verified() + interval {
+                            overdue_tail_progress.insert(key.clone(), (now, next.sealed_offset()));
+                        }
+                    }
+                }
             }
+            assert_eq!(counter(&cache, |c| c.jobs_audit_restarted), 0);
             if counter(&cache, |c| c.jobs_started) > started {
                 let key = cache.cursor_job_key().expect("the new job paused");
                 let file = keys.iter().position(|known| *known == key).unwrap();
@@ -1761,15 +1769,12 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
                     .audit_obligation(now)
                     .map(|debt| debt.due_unix_seconds);
                 assert!(due.is_some_and(|due| due <= t_start + interval && due <= now));
-                completions.push((key, census_token(&index)));
-                if completions.len() == 4 {
-                    break;
-                }
-            } else {
-                assert!(
-                    scan.snapshots.is_empty(),
-                    "nothing publishes between audits"
-                );
+                completions.push((key, now, checkpoint.sealed_offset()));
+            } else if modes.1 == 0 {
+                assert!(scan.snapshots.is_empty(), "paused job publishes nothing");
+            }
+            if completions.len() == 2 && overdue_tail_progress.len() == 2 {
+                break;
             }
             for (session, line) in sessions.iter().zip([next_line, next_line + 1]) {
                 fixture.append(session, &token_line(line));
@@ -1777,19 +1782,29 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
             next_line += 2;
             now += 600;
         }
-        assert_eq!(completions.len(), 4, "four audits: {}", counters(&cache));
-        // Rotation: each pair of completions serves both files.
-        assert_ne!(completions[0].0, completions[1].0, "{}", counters(&cache));
-        assert_ne!(completions[2].0, completions[3].0, "{}", counters(&cache));
-        // The fence ended each file's hold after its attempt, so the census
-        // generation turned over between the two rounds.
-        assert_ne!(completions[0].1, completions[2].1);
-        assert!(counter(&cache, |c| c.deferred_next_generation) > 0);
-        assert_eq!(counter(&cache, |c| c.audit_overdue), 4);
-        assert!(counter(&cache, |c| c.audit_overdue_max_age_seconds) > 0);
-        if !LEVER_GRACE {
-            assert_eq!(tails, 0, "outcome D: no tails above L_max");
+        assert_eq!(
+            completions.len(),
+            2,
+            "two initial cursors: {}",
+            counters(&cache)
+        );
+        assert_ne!(completions[0].0, completions[1].0, "both files served");
+        assert!(tails > 0, "overdue appends keep tailing");
+        assert_eq!(overdue_tail_progress.len(), 2, "neither file starves");
+        for (key, completed_at, certified_offset) in completions {
+            let (tailed_at, tailed_offset) = overdue_tail_progress[&key];
+            assert!(
+                tailed_at > completed_at,
+                "Tail follows initial certification"
+            );
+            assert!(
+                tailed_offset > certified_offset,
+                "each file consumes its append"
+            );
         }
+        assert!(counter(&cache, |c| c.deferred_next_generation) > 0);
+        assert_eq!(counter(&cache, |c| c.audit_overdue), 2);
+        assert!(counter(&cache, |c| c.audit_overdue_max_age_seconds) > 0);
     });
 }
 
@@ -2908,9 +2923,8 @@ fn unchanged_candidate(fixture: &ScanRoot, index: &ScanIndex) -> CandidateFile {
 /// Selection semantics after convergence: in later census generations, past
 /// `commit + I`, the scheduler skips the file (`Skip`: same fingerprint, no
 /// marker), so no acquisition opens it: neither `Unchanged` nor `AuditDue`
-/// is selected. This is not "an unchanged file never needs an audit": the
-/// retained copy's horizon runs from the commit, so the next change after
-/// `commit + I` is read in full as `AuditDue`, not tailed.
+/// is selected. After R2's gate removal, a later append reuses the
+/// retained checkpoint as Tail even beyond `commit + I`.
 #[test]
 fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2951,11 +2965,7 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 case == "grown",
             );
             index = next;
-            let reason = if case == "due marker" {
-                FullReason::AuditDue
-            } else {
-                FullReason::StateMissing
-            };
+            let reason = FullReason::StateMissing;
             assert_eq!(reasons[reason.slot()], 1, "{case}: {reasons:?}");
             assert!(
                 committed >= opened + interval,
@@ -2972,6 +2982,11 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                     Some(opened + interval),
                     "{case}: due marker"
                 );
+                // Keep AD-1's stable Full-completion control distinct from
+                // R2's valid-checkpoint Tail case below. No RAM state survives
+                // this explicit eviction; missing state determines the reason.
+                cache.clear();
+                assert!(cache.retained_checkpoint(&key).is_none());
                 let (next, opened, committed, reasons) = certify_job(
                     &fixture,
                     &cache,
@@ -2982,9 +2997,9 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                     false,
                 );
                 index = next;
-                // The due marker selects a stable `Full(AuditDue)` read.
+                // Selection is due, but checkpoint absence is the Full cause.
                 assert_eq!(
-                    reasons[FullReason::AuditDue.slot()],
+                    reasons[FullReason::StateMissing.slot()],
                     1,
                     "{case}: {reasons:?}"
                 );
@@ -3031,12 +3046,15 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 assert_eq!(selections.unchanged, 0, "{case}: not an acquisition");
             }
             assert_eq!(counter(&cache, |c| c.jobs_started), jobs, "{case}");
-            // What `+I` still means: the next change, after `commit + I`, is
-            // a full audit read of the retained copy, not a tail.
+            // A valid retained checkpoint is not reread for its age: the
+            // next append selects Tail even after the old audit horizon.
             assert!(now >= committed + interval);
+            let before = fixture.len(SESSION);
             fixture.append(SESSION, &token_line(90));
+            let suffix = fixture.len(SESSION) - before;
+            assert!(suffix > 0 && suffix <= Limits::current().singleton());
             page_number += 1;
-            let (_, _, selections) = page_selections(
+            let (next, scan, selections) = page_selections(
                 &fixture,
                 index,
                 Some(Arc::clone(&cache)),
@@ -3045,13 +3063,43 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 |_| {},
                 10_000,
             );
-            assert_eq!(selections.modes, (1, 0), "{case}: a full read");
+            assert_eq!(selections.modes, (0, 1), "{case}: a tail read");
             assert_eq!(
                 selections.full_reasons[FullReason::AuditDue.slot()],
-                1,
+                0,
                 "{case}: {selections:?}"
             );
-            assert_eq!(counter(&cache, |c| c.jobs_started), jobs + 1, "{case}");
+            assert_eq!(
+                counter(&cache, |c| c.jobs_started),
+                jobs,
+                "{case}: singleton Tail"
+            );
+            assert_eq!(
+                counter(&cache, |c| c.jobs_certified),
+                jobs,
+                "{case}: no cursor job"
+            );
+            assert!(
+                !scan.snapshots.is_empty(),
+                "{case}: Tail publishes the append"
+            );
+            let tailed = cache.retained_checkpoint(&key).expect("Tail retained");
+            assert_eq!(tailed.sealed_offset(), fixture.len(SESSION), "{case}");
+            assert!(tailed.sealed_offset() > retained.sealed_offset(), "{case}");
+            assert_eq!(
+                tailed.last_full_verified(),
+                committed,
+                "{case}: no audit credit"
+            );
+            assert_eq!(
+                tailed.audit_debt().map(|debt| debt.due_unix_seconds),
+                Some(committed + interval),
+                "{case}: original verification determines debt, not Tail time"
+            );
+            assert_eq!(
+                next.files[&key].unverified_deadline(),
+                Some(committed + interval)
+            );
         });
     }
 }
@@ -10742,6 +10790,10 @@ fn proof_room_keeps_the_headroom() {
         priority_replays: 0,
         audits_started: 0,
         audits_completed: 0,
+        audit_quiet_retired: 0,
+        audit_cap_full: 0,
+        audit_cap_delay: 0,
+        pace_evicted: 0,
         start_overdue_seconds: 0,
         completion_overdue_seconds: 0,
         admission: Default::default(),
@@ -10967,6 +11019,10 @@ fn main_context(cache: &Arc<SharedCache>) -> super::super::Context {
         priority_replays: 0,
         audits_started: 0,
         audits_completed: 0,
+        audit_quiet_retired: 0,
+        audit_cap_full: 0,
+        audit_cap_delay: 0,
+        pace_evicted: 0,
         start_overdue_seconds: 0,
         completion_overdue_seconds: 0,
         admission: Default::default(),

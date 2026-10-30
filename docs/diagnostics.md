@@ -80,9 +80,11 @@ Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
 full/tail/unchanged selection counts describe acquisition decisions, including
 repeated or subsequently failed plans; they are not distinct file counts.
-`completed_native_bytes` and `completed_guard_bytes` count only completed
-sampled JSONL read plans. Failed reads, joined-file replay, discovery, headers,
-sidecars and independent identity reads are excluded. Zero here does not prove
+`completed_native_bytes` counts completed sampled JSONL read plans.
+`completed_guard_bytes` also includes actual returned head/boundary bytes from
+quiet-retirement validation attempts, including attempts that keep their debt.
+Other failed reads, joined-file replay, discovery, headers, sidecars and
+independent identity reads are excluded. Zero here does not prove
 zero filesystem work. Collection timing covers native initialization and steps,
 including time parked between steps, and ends before post-policy finalization
 and upload. A capped/partial page is still a completed page.
@@ -95,8 +97,59 @@ Their sum equals `full_selections`. It also records `priority_full_replays`,
 `audits_started`, `audits_completed`, `max_start_overdue_seconds` and
 `max_completion_overdue_seconds`. Separate `index_state_at_page_end` gauges
 record `pending_audits`, `overdue_audits` and `oldest_due_age_seconds` using the
-existing index calculations. These are state, not events; overdue work remains
-owed until full verification. Both objects are absent when sampling is null.
+existing index calculations. These three fields are state gauges. The same
+object adds page-event counts `audit_quiet_retired` and `audit_cap_full`.
+To keep the existing native page under its 4 KiB budget, `audit_cap_delay`
+emits a separate nonzero-only `sampled_audit_cap_delay` record on this carrier;
+`pace_evicted` is emitted by `sampled_audit_pace_alarm`. Values remain exact.
+Full counts actual per-file cap fallbacks; refused prefix/lossy completions and
+paced candidates count as delays. The RAM
+pace is six hours per key, 256 fixed slots, oldest-evicted on overflow. Its
+SystemTime clock expires on backwards time or jumps beyond 30 days. A restart
+allows at most one extra cap Full per key. Existing marked Tails stay enabled.
+A positive Full count emits `sampled_audit_cap_alarm` immediately (`> 0`);
+positive `pace_evicted` emits its own `sampled_audit_pace_alarm` immediately.
+Delayed paths keep their committed size and clear the existing source
+fingerprint as a durable reparse witness. It remains age-exempt across partial
+saves, restarts and context-changing traversal replacements; the watcher queue
+alone is not its custody.
+The clear uses the process-local rearm wrapper: a later Full reports
+`rearm_cleared{audit_cap_delay}` with its count and completed native bytes.
+That tag survives an index reload in the same process; a process restart loses
+the diagnostic tag while retaining the persisted retry witness.
+
+Due complete-c quiet retirement requires both samples, stable EOF/stamp and native
+completion/RAM admission. With an active durable store the scheduling marker
+remains until the same writer durably stores no debt and a second index CAS
+clears the marker. The existing diagnostics carrier then emits
+`sampled_audit_retirement` with `audit_quiet_retired` and `pending_audits`.
+The page's retirement count is zero while that receipt remains outstanding.
+Writer errors, skipped records and deferrals keep the obligation scheduled.
+Freed slots become usable on the next committed scan; the current page reserves
+them because partial-save reconciliation can restore an unacknowledged marker.
+Quiet retirement keeps the old Full verification time and grants no
+`audits_completed`, source, census or ACK credit.
+Before the deadline, incidental telemetry-only Unchanged reuse keeps the exact
+index and checkpoint debt. A cap Full keeps its frozen acquisition extent even
+though it cannot sample; independent grown-prefix/marker refusals still apply.
+
+`audit_retired_absent{events}` counts an obligation retired on positively proven absence:
+ENOENT on a no-follow descriptor chain from a readable configured root.
+A missing intermediate directory counts only beneath the nearest securely
+opened readable ancestor; all pinned directories are revalidated. Symlinks,
+dangling links, unreadable/missing roots and other errors keep it owed. Codex-protected history
+remains retained; this counter grants no Full or source/census credit. Account
+removal also emits `withheld_hold_released{deleted}`. Ordinary unavailable audit
+markers are never evicted.
+The absence predicate is shared with the hardened account-hold proof. The
+`audit_retired_absent` and deleted-hold counts currently use temporary traversal
+point carriers; integration must replace them with the shared account/absence
+diagnostics, preserving both retirement paths without double counting.
+Both keys and their count meanings are shared with the integrated diagnostics.
+Deleted-hold tokens aren't reported until the shared withheld-account
+bookkeeping lands. Whichever change integrates second must use one emitter for
+each count; the deletion fixture pins one emission per key, then none on retry.
+The sampled acquisition objects are absent when sampling is null.
 
 Additive version 2 Claude counts on the existing page/check-in carrier classify
 refused census-member NotFounds by the **existing immediate-parent metadata
