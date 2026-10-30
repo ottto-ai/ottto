@@ -305,7 +305,7 @@ impl SnapshotAccumulator {
         gates: UploadGates,
         epoch: Option<HmacKeyEpoch>,
     ) -> bool {
-        self.pi_prompt.as_ref().is_none_or(|carry| {
+        self.pi_prompt.as_ref().map_or(true, |carry| {
             carry.capture_context == Some(context)
                 && carry.capture_gates == Some(gates)
                 && (carry.wire.is_none() || !key_epoch_changed(carry.key_epoch, epoch))

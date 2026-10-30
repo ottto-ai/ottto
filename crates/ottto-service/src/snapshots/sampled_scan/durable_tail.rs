@@ -4927,6 +4927,11 @@ impl SharedCache {
         Ok(Some(guard))
     }
 
+    pub(in crate::snapshots) fn durable_pi_namespace(&self) -> Option<Scope> {
+        let mut stores = self.durable()?;
+        Some(stores.slot(DurableSource::Pi).as_ref()?.namespace.clone())
+    }
+
     pub(in crate::snapshots) fn durable_pi_context(
         &self,
         index: &ScanIndex,
