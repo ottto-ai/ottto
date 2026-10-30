@@ -49,6 +49,7 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_e2_unhealthy_root_holds_owed_agent_history_too", "r25-code-unclassified"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_e2_unlisting_replays_the_legacy_money_mark_once", "completion-fold"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_explicit_full_move_paces_history_born_before_the_claim", "prior-code-unclassified"),
+    ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_held_list_closure_invalidates_context_hit", "R5"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_historical_replay_after_bootstrap_paces_history_without_a_list", "prior-code-unclassified"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_installed_list_paces_rebuilt_history_and_denies_listed_families", "prior-code-unclassified"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_intended_list_holds_listed_families_and_paces_the_rest_after_a_quarantine", "prior-code-unclassified"),
@@ -61,6 +62,12 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_session_created_after_a_pre_gate_index_last_receipt_is_uploaded", "r25-code-unclassified"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_upload_context_change_does_not_carry_history_past_the_gate", "R5"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_user_repair_override_carries_accepted_history_through_census_and_release", "R5"),
+    ("snapshot_sync/money_equivalence_on_tests.rs", "twin_branch_copy", "E3"),
+    ("snapshot_sync/money_equivalence_on_tests.rs", "twin_mixed_accounts", "E3"),
+    ("snapshot_sync/money_equivalence_on_tests.rs", "twin_moved_file", "E1/E3"),
+    ("snapshot_sync/money_equivalence_on_tests.rs", "twin_one_member_grows", "E3"),
+    ("snapshot_sync/money_equivalence_on_tests.rs", "twin_resume_copy", "E3"),
+    ("snapshot_sync/money_equivalence_on_tests.rs", "twin_stale_or_queued_holder", "E3"),
     ("snapshot_sync/oversized_discovery_pipeline_tests.rs", "terminal_off_on_oversized_blocking_hold_is_reoffered_once_per_six_hour_floor", "R12"),
     ("snapshot_sync/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_account_deferred_hold_lets_a_bounded_claude_traversal_converge", "NBF/C6"),
     ("snapshot_sync/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_terminal_family_member_controls_keep_blocking_pruning_and_rebinding", "NBF/C6"),
@@ -142,7 +149,7 @@ fn terminal_off_on_readiness_ignores_equal_the_checked_in_manifest() {
     assert_eq!(expected, sorted, "keep the manifest sorted");
     assert_eq!(ignored_for_readiness(), expected);
     // The count is the ON gate: it must reach 0 before ON anywhere.
-    assert_eq!(READINESS_MANIFEST.len(), 88);
+    assert_eq!(READINESS_MANIFEST.len(), 95);
 }
 
 #[test]

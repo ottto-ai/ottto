@@ -6267,3 +6267,11 @@ fn terminal_off_on_e2_restamp_carries_the_retired_permit_bit() {
         })
     });
 }
+
+#[test]
+#[ignore = "terminal-off ON-readiness: R5"]
+fn terminal_off_on_held_list_closure_invalidates_context_hit() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    ScanIndex::assert_terminal_off_held_list_closure_for_test();
+}
