@@ -37387,9 +37387,6 @@ exit 0
         }
     }
 
-    /// Resolution fails after the gate passed: two logins wrote the slot
-    /// (credential plan contradicts the identity), in the slot loop.
-
     #[test]
     #[serial]
     fn single_slot_gate_never_lets_a_passive_reading_through() {
@@ -37408,6 +37405,8 @@ exit 0
         );
     }
 
+    /// Resolution fails after the gate passed: two logins wrote the slot
+    /// (credential plan contradicts the identity), in the slot loop.
     #[test]
     #[serial]
     fn slot_resolution_conflict_never_lets_a_passive_reading_through() {

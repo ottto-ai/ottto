@@ -1977,6 +1977,7 @@ mod tests {
         // harmless and leaves the daemon ready for when the network returns.
         assert!(state.streak.should_rebuild(long_after));
     }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn probe_targets_parse_from_api_base_urls() {
