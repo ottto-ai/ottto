@@ -1,6 +1,5 @@
 //! Regression: unretained history must be reread after appended usage.
 use super::*;
-use crate::local_resource_diagnostics::cache_lifecycle;
 use crate::transcript_acquisition::Scope;
 use std::io::{BufWriter, Write};
 
