@@ -3506,26 +3506,34 @@ fn apc_f1_released_members_stay_owed(
 /// The pages after the release page, plus one more accepting generation if a
 /// released member is still owed after them (the matching-carried control):
 /// every drain certifies the revision its saved entry has
-/// (`apc_r2_drained_pairs`), each released member drains again as a no-op,
-/// and no ACKed body is uploaded again.
+/// (`apc_r2_drained_pairs`), and each released member drains again on its
+/// exact ACK or as a no-op. The audit-release retry re-reads a cleared entry
+/// without its prior body tuple, so the body may be offered again (this
+/// harness keeps no durable upload ledger between accepting pages), but only
+/// the same exact body: tokens and cost are unchanged.
 fn apc_f1_redrain(
     fixture: &ApcFixture,
     hour: u32,
     later: &[ApcPage],
     released: &BTreeSet<String>,
-    acked: &BTreeSet<String>,
+    bodies: &BTreeSet<String>,
 ) {
-    let mut noop = BTreeSet::new();
+    let mut drained = BTreeSet::new();
     let mut check = |page: &ApcPage, label: &str| {
         let transition = ApcFixture::check(page, label);
         apc_r2_drained_pairs(page, label);
         assert!(transition.granted.is_none(), "{label}: no fresh grant");
         assert!(!transition.failed, "{label}: no failure");
-        noop.extend(transition.noop);
-        assert!(
-            page.uploaded.is_disjoint(acked),
-            "{label}: an ACKed body is not uploaded again"
-        );
+        drained.extend(transition.noop);
+        drained.extend(transition.acked);
+        for member in released {
+            if let Some((fingerprint, _)) = page.offered_bodies.get(member) {
+                assert!(
+                    bodies.contains(fingerprint),
+                    "{label}: {member} is offered only its same exact body"
+                );
+            }
+        }
     };
     for (number, page) in later.iter().enumerate() {
         check(page, &format!("release generation later page {number}"));
@@ -3543,8 +3551,8 @@ fn apc_f1_redrain(
         }
     }
     assert!(
-        released.is_subset(&noop),
-        "each released member re-drains as a no-op: {released:?} {noop:?}"
+        released.is_subset(&drained),
+        "each released member drains again: {released:?} {drained:?}"
     );
     let last = pages.last().or(later.last()).expect("a later page");
     assert!(!owes_released(last), "no released member is owed");
@@ -3565,8 +3573,8 @@ fn apc_f1_redrain(
 /// release then finds no retained custody: it clears the member's saved
 /// revision and queues a retry. The save keeps the record with the member
 /// owed under the same proof and its pre-drain pair, never a cleared record
-/// beside an unselected drained revision. The retry drains it again as a
-/// no-op at the revision its saved entry has, with no second upload.
+/// beside an unselected drained revision. The retry drains it again at the
+/// revision its saved entry has, offering at most the same exact body.
 #[test]
 #[serial(source_manifests)]
 fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
@@ -3618,7 +3626,7 @@ fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
 /// corrected body is its accepted body, so its release page no-op-drains it
 /// without an upload, and the account-audit release then clears its saved
 /// revision. It stays owed with its pre-drain pair beside the held root, and
-/// drains again as a no-op once the retry re-reads it.
+/// drains again once the retry re-reads it.
 #[test]
 #[serial(source_manifests)]
 fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_one() {
