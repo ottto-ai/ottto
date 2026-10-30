@@ -189,9 +189,12 @@ crate::heap_layout_bound::fields!(Runtime; slots, slot_occurrences, paced, withh
 #[derive(Clone, Debug, Default)]
 struct UnreadKeys {
     keys: BTreeSet<String>,
+    // Refused keys whose own complete parse was published since: cleared
+    // once their member's growth is recorded. Exact keys, never a twin's.
+    read: BTreeSet<String>,
     saturated: bool,
 }
-crate::heap_layout_bound::fields!(UnreadKeys; keys, saturated);
+crate::heap_layout_bound::fields!(UnreadKeys; keys, read, saturated);
 pub(super) const HELD_UNREAD_KEYS_PER_FAMILY: usize = 64;
 
 /// The daemon reloads its ScanIndex every sync cycle, so runtime custody
@@ -323,11 +326,18 @@ impl Holds {
             },
         );
         runtime.slot_occurrences = next;
-        // The member's data reached its slot: its refused keys are read.
+        // The member's data reached its slot: the refused keys whose own
+        // parse was published are read. A path twin's read clears nothing.
         if let Some(unread) = runtime.unread.get_mut(root) {
-            unread.keys.retain(|key| {
-                claude_index_path_member_ref(Path::new(key))
-                    .map_or(true, |at| at.into_owned().1 != member)
+            let UnreadKeys { keys, read, .. } = &mut *unread;
+            keys.retain(|key| {
+                let cleared = read.contains(key)
+                    && claude_index_path_member_ref(Path::new(key))
+                        .is_some_and(|at| at.into_owned().1 == member);
+                if cleared {
+                    read.remove(key);
+                }
+                !cleared
             });
             if unread.keys.is_empty() && !unread.saturated {
                 runtime.unread.remove(root);
@@ -823,6 +833,8 @@ impl ScanIndex {
             .unread
             .entry(member.root.to_owned())
             .or_default();
+        // New refused data: an earlier published read no longer covers it.
+        unread.read.remove(&key);
         if unread.saturated || unread.keys.contains(&key) {
             return;
         }
@@ -836,6 +848,21 @@ impl ScanIndex {
             );
         } else {
             unread.keys.insert(key);
+        }
+    }
+}
+
+impl ScanIndex {
+    /// A complete parse of this exact refused key was published to the page.
+    pub(super) fn usage_guard_note_read(&mut self, path: &Path) {
+        let Some(member) = claude_index_path_member_ref(path) else {
+            return;
+        };
+        let key = local_index_key(path);
+        if let Some(unread) = self.usage_guard_holds.runtime.unread.get_mut(member.root) {
+            if unread.keys.contains(&key) {
+                unread.read.insert(key);
+            }
         }
     }
 }

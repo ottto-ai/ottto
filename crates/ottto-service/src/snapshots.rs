@@ -30019,6 +30019,7 @@ impl OwnedSourceScan {
                         usage_pending_guard::withheld_incomplete();
                         pending!();
                     }
+                    index.usage_guard_note_read(&candidate.path);
                     index.usage_guard_record_withheld(&parsed_file.snapshots, &census_window_end);
                     index.usage_guard_mark_audited(&local_index_key(&candidate.path));
                     let budget = if completed_acquisition
@@ -31177,6 +31178,9 @@ impl OwnedSourceScan {
                 // A bounded oversized line is different: its loss is terminal and
                 // disclosed, so independently parsed sibling records remain usable.
                 if parse_complete {
+                    if source == SnapshotSource::ClaudeCode {
+                        index.usage_guard_note_read(&candidate.path);
+                    }
                     snapshots.extend(parsed);
                 }
                 if let Some(bytes) = target_finalization_credit {

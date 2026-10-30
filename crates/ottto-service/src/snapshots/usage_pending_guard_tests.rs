@@ -471,7 +471,11 @@ fn unread_scope_marks_clear_on_recorded_growth_and_saturate_conservatively() {
     // A projection install keeps the mark while the family stays held.
     index.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
     assert!(usage_pending_guard::unread_scope(&index, CARRY_RETRY).contains(&root));
-    // The parent's growth reaching its held slot is what reads it.
+    // Growth of the same member from another path (a twin) reads nothing.
+    accumulate_guarded(&mut index, &items[..1]);
+    assert!(usage_pending_guard::unread_scope(&index, CARRY_RETRY).contains(&root));
+    // This key's own published parse, then its growth in the held slot.
+    index.usage_guard_note_read(Path::new(&parent));
     accumulate_guarded(&mut index, &items[..1]);
     assert!(usage_pending_guard::unread_scope(&index, CARRY_RETRY).is_empty());
     // Past the per-family bound the family stays unread until the hold ends.
