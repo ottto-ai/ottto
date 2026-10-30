@@ -1386,3 +1386,36 @@ buckets; already stripped proof cannot be recovered from the hint ledger.
 Upstream authority-key allocation loss remains fail-closed: inherited partitions
 are not reclassified as request proof by budget recovery or a uniform starting-account
 retry. Only an intact current grouping can enter the cap allocator.
+
+### Option (ii): `identity_retained` bucket rows
+
+Off unless the activity hint carries exactly
+`session_request_identity_retained_contract: "session_request_identity_retained:v1"`;
+any other value keeps the bodies above byte-identical. When on, the backend
+retains per-row proof, so the accepted priority is not used: fresh tags take
+the plain newest-first order within the unchanged caps.
+
+A bucket row enters the local proved-row ledger only when a stored-body entity
+ACK (no `unchanged_basis`) with a body witness covers a body where that row
+carried a positive tag, and only while the capability is on. The ledger keeps
+truncated keyed digests of the row key and of that proof (authorities plus the
+eight counts and five costs); later positive proof replaces it. Per revision,
+a proved row whose current proof equals the ACKed proof in a closed hour, or
+whose transcript no longer proves it, is sent untagged with full amounts and
+`identity_retained: true`; it is not a refusal. Different proof, the open
+hour and never-proved rows get fresh tags. A row is never both tagged and
+marked; top-level rows are never marked.
+
+A stored-body ACK's optional `retained_proof_missing` bucket starts remove that
+body's marked rows, so a later revision re-tags them through the same
+allocator. A destination namespace or historical replay generation change
+clears all proved rows, as do key rotation and session eviction. Limits:
+1,536 proved rows and 1,536 pending missing buckets per session, 40 inline
+bytes per proved row; with the class L hints above the requested-layout
+maximum stays below 4 MiB.
+
+Sparse `identity_cap` counters, omitted while zero: `retained_marker_rows`,
+`retained_proof_missing_received`, `retained_set_cleared` and
+`retained_missing_unfit` (a missing-proof bucket whose fresh proof did not fit
+and kept today's untagged/refused rule). `accepted_share_changed` also counts
+proved rows sent with different proof.

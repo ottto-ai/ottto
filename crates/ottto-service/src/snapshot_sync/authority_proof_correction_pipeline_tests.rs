@@ -722,6 +722,7 @@ impl ApcFixture {
                                     head_etag: None,
                                     head_challenge: None,
                                     unchanged_basis: None,
+                                    retained_proof_missing: Vec::new(),
                                 })
                                 .collect(),
                         };

@@ -1,0 +1,7 @@
+{
+  "producer_repository": "ottto-ai/ottto",
+  "generated_by_ci_commit": "pending",
+  "producer_test": "retained_emitted_wire_goldens_for_the_receiver_contract",
+  "producer_path": "crates/ottto-service/src/snapshots/fixtures/claude_identity_retained_emitted.json",
+  "sha256": "pending"
+}

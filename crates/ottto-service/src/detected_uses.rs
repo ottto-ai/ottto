@@ -326,6 +326,7 @@ mod tests {
         SnapshotModelUsage {
             evidence_ref: None,
             identity_parts: None,
+            identity_retained: false,
             model: "test-model".to_string(),
             input_tokens,
             output_tokens,

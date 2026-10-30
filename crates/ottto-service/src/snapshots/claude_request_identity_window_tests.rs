@@ -1622,11 +1622,14 @@ fn sticky_wire(item: SnapshotItem) -> Value {
     request.snapshots = vec![item];
     serde_json::to_value(request).unwrap()
 }
-#[test]
-fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
-    use base64::Engine;
-    use sha2::Digest;
-    use std::io::Write;
+/// #909's emitted cases. `seed` may pre-load ledger state into every
+/// accepted set (option (ii) gate-off proof: it must not change a byte).
+fn sticky_golden_cases(seed: &dyn Fn(&mut identity::AcceptedBuckets)) -> Value {
+    let fresh = || {
+        let mut state = identity::AcceptedBuckets::for_test();
+        seed(&mut state);
+        state
+    };
     let mut cases = BTreeMap::new();
     let (mut mixed, mut proof) = sticky_session(4);
     sticky_price_fixture(&mut mixed, &mut proof);
@@ -1655,13 +1658,13 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
     row.cache_creation_1h_tokens = 60;
     row.reasoning_output_tokens = 72;
     row.unattributed_total_tokens = 84;
-    sticky_apply(&mut mixed, &proof, &identity::AcceptedBuckets::for_test()).unwrap();
+    sticky_apply(&mut mixed, &proof, &fresh()).unwrap();
     sticky_assert_reconciled(&mixed);
     cases.insert("mixed_presence", sticky_wire(mixed));
 
     let (mut window, mut proof) = sticky_session(576);
     sticky_price_fixture(&mut window, &mut proof);
-    sticky_apply(&mut window, &proof, &identity::AcceptedBuckets::for_test()).unwrap();
+    sticky_apply(&mut window, &proof, &fresh()).unwrap();
     assert!(window.request_identity_refusals > 0);
     assert!(sticky_tagged(&window.usage_buckets[575].model_usage[0]));
     sticky_assert_reconciled(&window);
@@ -1676,7 +1679,7 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
     original.repository_label_source = Some("user_approved".into());
     sticky_price_fixture(&mut original, &mut original_proof);
     let mut tagged = original.clone();
-    let mut accepted = identity::AcceptedBuckets::for_test();
+    let mut accepted = fresh();
     sticky_apply(&mut tagged, &original_proof, &accepted).unwrap();
     accepted.record(&serde_json::to_value(&tagged).unwrap());
     let clean = stripped(&tagged);
@@ -1699,7 +1702,7 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
     let (mut changed, mut proof) = sticky_session(4);
     sticky_price_fixture(&mut changed, &mut proof);
     let mut first = changed.clone();
-    let mut accepted = identity::AcceptedBuckets::for_test();
+    let mut accepted = fresh();
     sticky_apply(&mut first, &proof, &accepted).unwrap();
     accepted.record(&serde_json::to_value(first).unwrap());
     // Complementary cost presence makes every top-level untagged cost known.
@@ -1759,7 +1762,14 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
     assert_eq!(untagged.cache_creation_cost_usd.as_deref(), Some("0"));
     sticky_assert_reconciled(&zero);
     cases.insert("zero_priced_part_kept", sticky_wire(zero));
-    let actual = serde_json::to_value(cases).unwrap();
+    serde_json::to_value(cases).unwrap()
+}
+#[test]
+fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
+    use base64::Engine;
+    use sha2::Digest;
+    use std::io::Write;
+    let actual = sticky_golden_cases(&|_| {});
     let fixture = include_str!("fixtures/claude_identity_cap_emitted.json");
     let expected: Value = serde_json::from_str(fixture).unwrap();
     for case in [

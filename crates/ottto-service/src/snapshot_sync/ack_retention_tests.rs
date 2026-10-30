@@ -152,6 +152,7 @@ fn exact_ack(items: Vec<SnapshotItem>) -> Result<crate::snapshot_client::Snapsho
                 head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
                 head_challenge: None,
                 unchanged_basis: None,
+                retained_proof_missing: Vec::new(),
             });
     }
     response.validate_entity_ack_with_head_cas(&request, false)?;

@@ -42,6 +42,10 @@ pub(crate) use accepted::AcceptedBuckets;
 pub(crate) use budget::Measurement as CapMeasurement;
 
 pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:v1";
+/// Option (ii) activation: the exact activity-hint capability token
+/// (`session_request_identity_retained_contract`). Any other value keeps
+/// `identity_retained` off and the #909 accepted-priority body byte-identical.
+pub(crate) const IDENTITY_RETAINED_CONTRACT: &str = "session_request_identity_retained:v1";
 pub(crate) const E2_GROUPING: &str =
     "claude_code_jsonl:own_request_identity_rows:v1/e2_grouping:v1";
 
@@ -804,7 +808,7 @@ pub(crate) fn apply_with_reserved_bytes_for_test(
     }
     let known = accepted.get(&item.source_session_id);
     grouping.accepted_miss = accepted.miss_cause();
-    apply_grouped_with_accepted(item, grouping, known)
+    apply_grouped_with_accepted(item, grouping, known, accepted.retained_enabled())
 }
 
 /// `apply` with each request's own transcript time (`None`: auxiliary),
@@ -836,14 +840,23 @@ pub(crate) fn apply_grouped(
     item: &mut SnapshotItem,
     grouping: Grouping,
 ) -> Result<Tagged, Ineligible> {
-    apply_grouped_with_accepted(item, grouping, None)
+    apply_grouped_with_accepted(item, grouping, None, false)
 }
 
+/// `retained` is option (ii): the server retains proof per bucket row, so the
+/// accepted set is the witnessed proved-row ledger (markers) instead of an
+/// allocation priority, and fresh tags use the plain newest-first order.
 fn apply_grouped_with_accepted(
     item: &mut SnapshotItem,
     mut grouping: Grouping,
-    accepted: Option<&accepted::AcceptedSession>,
+    known: Option<&accepted::AcceptedSession>,
+    retained: bool,
 ) -> Result<Tagged, Ineligible> {
+    let (accepted, proved) = if retained {
+        (None, known)
+    } else {
+        (known, None)
+    };
     if let Some(ineligible) = grouping.failed {
         return Err(ineligible);
     }
@@ -901,6 +914,12 @@ fn apply_grouped_with_accepted(
             group.refused = true;
         }
     }
+    let deferred = defer_retained_rows(item, &mut grouping, proved);
+    // Marker bytes are constant across every tag selection; markers go on
+    // the item only after measurement, as the last change before hashing.
+    grouping.extra_wire_bytes = grouping
+        .extra_wire_bytes
+        .saturating_add(deferred.marker_bytes());
     let display = |withheld: bool| Some(Box::new(account_display(&grouping, withheld)));
 
     let evidence = grouping
@@ -1024,8 +1043,11 @@ fn apply_grouped_with_accepted(
         if grouping.item_bytes(item) <= MAX_ITEM_BYTES {
             let mut counts = cap_counts(item, &grouping, accepted, None);
             unpriced.count(&mut counts);
+            deferred.mark(item);
+            deferred.count(item, retained, &mut counts);
             budget::record(&counts);
             untag_groups(&mut grouping, &unpriced.keys);
+            deferred.restore(&mut grouping);
             item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
             item.claude_account_display = Some(Box::new(account_display(
                 &grouping,
@@ -1068,6 +1090,8 @@ fn apply_grouped_with_accepted(
     if let Some((kept, measurement, unpriced)) = selected {
         let mut counts = cap_counts(item, &grouping, accepted, Some(&measurement));
         unpriced.count(&mut counts);
+        deferred.mark(item);
+        deferred.count(item, retained, &mut counts);
         budget::record(&counts);
         let mut visible = grouping;
         untag_groups(&mut visible, &unpriced.keys);
@@ -1083,6 +1107,7 @@ fn apply_grouped_with_accepted(
                 }
             }
         }
+        deferred.restore(&mut visible);
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         // account_display checks the newest request against the filtered rows.
         // Withholding only that request must not anonymize retained history.
@@ -1106,9 +1131,11 @@ fn apply_grouped_with_accepted(
                     .any(|group| group.by_key.keys().any(Option::is_some))
         })
         .count() as u64;
-    budget::record(&counts);
     let refusals = lost.max(1).saturating_add(prior_refusals);
     strip(item);
+    deferred.mark(item);
+    deferred.count(item, retained, &mut counts);
+    budget::record(&counts);
     item.provenance.collector = COLLECTOR.to_string();
     #[cfg(test)]
     {
@@ -1122,6 +1149,193 @@ fn apply_grouped_with_accepted(
         over_cap: over_cap.into_iter().collect(),
         refusals,
     })
+}
+
+/// Bytes one `identity_retained` member adds to a compact wire row.
+const MARKER_BYTES: usize = r#","identity_retained":true"#.len();
+
+/// One marked bucket row with today's identities, restored only for display.
+struct DeferredRow {
+    bucket: String,
+    row: RowKey,
+    by_key: BTreeMap<Option<AuthorityKey>, Amounts>,
+    refused: bool,
+}
+
+/// Option (ii) bucket rows that defer to server-retained proof. Each is sent
+/// untagged with its full amounts plus the marker, and is not a refusal.
+#[derive(Default)]
+struct Deferred {
+    rows: Vec<DeferredRow>,
+    /// Buckets reported `retained_proof_missing` that hold fresh proof now.
+    missing: BTreeSet<String>,
+}
+
+impl Deferred {
+    fn marker_bytes(&self) -> usize {
+        self.rows.len().saturating_mul(MARKER_BYTES)
+    }
+
+    fn mark(&self, item: &mut SnapshotItem) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let marked = self
+            .rows
+            .iter()
+            .map(|deferred| (deferred.bucket.as_str(), &deferred.row))
+            .collect::<BTreeSet<_>>();
+        for bucket in &mut item.usage_buckets {
+            for row in &mut bucket.model_usage {
+                if marked.contains(&(bucket.bucket_start.as_str(), &row_key_from_model_usage(row)))
+                {
+                    debug_assert!(row.evidence_ref.is_none() && row.identity_parts.is_none());
+                    row.identity_retained = true;
+                }
+            }
+        }
+    }
+
+    fn restore(&self, grouping: &mut Grouping) {
+        for deferred in &self.rows {
+            if let Some(group) = grouping
+                .groups
+                .get_mut(&deferred.bucket)
+                .and_then(|rows| rows.get_mut(&deferred.row))
+            {
+                group.by_key = deferred.by_key.clone();
+                group.refused = deferred.refused;
+            }
+        }
+    }
+
+    /// Option (ii) counters on the final body. #909's accepted-priority
+    /// ledger state is not an input in this mode.
+    fn count(&self, item: &SnapshotItem, retained: bool, counts: &mut budget::Counts) {
+        if !retained {
+            return;
+        }
+        counts.accepted_state_unknown = 0;
+        counts.retained_marker_rows = self.rows.len() as u64;
+        counts.retained_missing_unfit = item
+            .usage_buckets
+            .iter()
+            .filter(|bucket| {
+                self.missing.contains(&bucket.bucket_start)
+                    && !bucket.model_usage.iter().any(|row| {
+                        row.evidence_ref.is_some()
+                            || row.identity_parts.as_ref().is_some_and(|parts| {
+                                parts.iter().any(|part| part.evidence_ref.is_some())
+                            })
+                    })
+            })
+            .count() as u64;
+    }
+}
+
+/// A row's fresh-tag wire form and its evidence list, exactly as `install`
+/// would emit them, so today's proof digest matches an ACKed body's.
+fn fresh_row_value(
+    row: &SnapshotModelUsage,
+    by_key: &BTreeMap<Option<AuthorityKey>, Amounts>,
+) -> Option<(Value, Value)> {
+    let evidence = by_key
+        .keys()
+        .flatten()
+        .map(AuthorityKey::evidence)
+        .collect::<BTreeSet<_>>();
+    let index = evidence
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| (entry.clone(), position as u16))
+        .collect();
+    let identity = row_identity(row, by_key, &index).ok()?;
+    let mut fresh = row.clone();
+    set_row(&mut fresh, identity, &index);
+    let evidence = evidence
+        .into_iter()
+        .map(|entry| SnapshotRequestEvidence {
+            identity_basis: entry.basis.to_string(),
+            provider_workspace_hash: entry.org,
+        })
+        .collect::<Vec<_>>();
+    Some((
+        serde_json::to_value(fresh).ok()?,
+        serde_json::to_value(evidence).ok()?,
+    ))
+}
+
+/// SOURCE option (ii), per bucket row, against the witnessed proved ledger:
+/// - today's proof equals the ACKed proof in a closed hour: marker;
+/// - today's transcript no longer proves the row (none, refused): marker;
+/// - different proof: fresh tags, counted `accepted_share_changed`;
+/// - the open hour with proof, and rows never proved: fresh tags.
+///
+/// A row is never both tagged and marked. Runs after the unsplittable-money
+/// strip, so a row that cannot carry tags today defers instead.
+fn defer_retained_rows(
+    item: &SnapshotItem,
+    grouping: &mut Grouping,
+    proved: Option<&accepted::AcceptedSession>,
+) -> Deferred {
+    let mut deferred = Deferred::default();
+    let Some(proved) = proved else {
+        return deferred;
+    };
+    let open_hour = accepted::bucket_key(&item.collected_at).map(|at| at.div_euclid(3600));
+    let mut changed = BTreeSet::new();
+    for bucket in &item.usage_buckets {
+        let Some(start) = accepted::bucket_key(&bucket.bucket_start) else {
+            continue;
+        };
+        let open = open_hour == Some(start.div_euclid(3600));
+        for row in &bucket.model_usage {
+            let key = row_key_from_model_usage(row);
+            let Some(group) = grouping
+                .groups
+                .get_mut(&bucket.bucket_start)
+                .and_then(|rows| rows.get_mut(&key))
+            else {
+                continue;
+            };
+            let proves = !group.refused
+                && !group.truncated
+                && group
+                    .by_key
+                    .iter()
+                    .any(|(key, amount)| key.is_some() && amount.counts != [0; 8]);
+            if proves && proved.proof_missing(start) {
+                deferred.missing.insert(bucket.bucket_start.clone());
+            }
+            let Some(prior) = proved.proved_row(start, &key) else {
+                continue;
+            };
+            if proves {
+                let today = fresh_row_value(row, &group.by_key)
+                    .and_then(|(fresh, evidence)| proved.row_proof(&fresh, &evidence));
+                if today != Some(prior) {
+                    changed.insert(bucket.bucket_start.clone());
+                    continue;
+                }
+                if open {
+                    continue;
+                }
+            }
+            let by_key = std::mem::replace(
+                &mut group.by_key,
+                BTreeMap::from([(None, group.total.clone())]),
+            );
+            let refused = std::mem::replace(&mut group.refused, false);
+            deferred.rows.push(DeferredRow {
+                bucket: bucket.bucket_start.clone(),
+                row: key,
+                by_key,
+                refused,
+            });
+        }
+    }
+    grouping.accepted_share_changed.extend(changed);
+    deferred
 }
 
 fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::AcceptedSession>) {
@@ -1215,6 +1429,7 @@ fn cap_counts(
         unpriced_part_untagged: 0,
         accepted_row_vanished: grouping.accepted_rows_vanished,
         accepted_state_unknown_cause: unknown.map(budget::UnknownCauses::one).unwrap_or_default(),
+        ..Default::default()
     }
 }
 
@@ -1638,6 +1853,7 @@ fn set_row(
     row.account_identifier_hash = None;
     row.evidence_ref = None;
     row.identity_parts = None;
+    row.identity_retained = false;
     match identity {
         RowIdentity::Untagged => {}
         RowIdentity::Single(key) => {
@@ -1693,6 +1909,7 @@ fn strip(item: &mut SnapshotItem) {
         row.account_identifier_hash = None;
         row.evidence_ref = None;
         row.identity_parts = None;
+        row.identity_retained = false;
     }
 }
 
@@ -2032,6 +2249,10 @@ fn deref(
 }
 
 fn row_leaf(row: &SnapshotModelUsage, evidence: &[SnapshotRequestEvidence]) -> Value {
+    // Option (ii): the receiver's leaf for a row deferring to retained proof.
+    if row.identity_retained {
+        return json!({"retained": true});
+    }
     if let Some(parts) = &row.identity_parts {
         let mut leaves = parts
             .iter()
@@ -4527,6 +4748,9 @@ fn tag_item(
     let miss = evidence
         .accepted_buckets
         .map_or(accepted::UnknownCause::NoKey, AcceptedBuckets::miss_cause);
+    let retained = evidence
+        .accepted_buckets
+        .is_some_and(AcceptedBuckets::retained_enabled);
     if super::claude_request_money::e2::enabled()
         && super::claude_history_upgrade::is_request_owned_literal(item)
     {
@@ -4558,7 +4782,7 @@ fn tag_item(
             .wire_size_reservation
             .map_or(0, |reserve| reserve(item));
         grouping.accepted_miss = miss;
-        let tagged = apply_grouped_with_accepted(item, grouping, accepted);
+            let tagged = apply_grouped_with_accepted(item, grouping, accepted, retained);
         if tagged.is_err() {
             (
                 item.source_started_at,
@@ -4624,7 +4848,7 @@ fn tag_item(
     let desktop_recent = std::mem::take(&mut grouping.desktop_recent);
     let owned = !grouping.unowned_request;
     grouping.accepted_miss = miss;
-    let tagged = apply_grouped_with_accepted(item, grouping, accepted);
+    let tagged = apply_grouped_with_accepted(item, grouping, accepted, retained);
     if tagged.is_ok() && owned {
         crate::desktop_recent::publish(desktop_recent);
     }

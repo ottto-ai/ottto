@@ -65,6 +65,7 @@ pub(super) fn grain_row(
         account_identifier_hash: account,
         evidence_ref: None,
         identity_parts: None,
+        identity_retained: false,
         cost_usd: grain.cost().map(dollars),
         input_cost_usd: None,
         output_cost_usd: None,

@@ -87,6 +87,7 @@ fn only_a_stored_body_ack_records_bucket_keys() {
                     head_etag: None,
                     head_challenge: None,
                     unchanged_basis: (!stored).then(|| "usage_identical".into()),
+                    retained_proof_missing: Vec::new(),
                 };
                 Ok(crate::snapshot_client::SnapshotBatchResponse {
                     accepted: u64::from(stored),
@@ -208,4 +209,155 @@ fn maximum_accepted_ledger_progress_json_and_actual_load_peak_are_bounded() {
     assert!(json_bytes < 8 * 1024 * 1024, "json={json_bytes}");
     assert!(load_peak < 32 * 1024 * 1024, "peak={load_peak}");
     std::fs::remove_dir_all(root).unwrap();
+}
+// Option (ii): only a stored-body entity ACK with a body witness admits rows to
+// the proved ledger; `retained_proof_missing` is optional and only removes.
+fn retained_ack(
+    progress: &mut SnapshotUploadProgress,
+    items: &[Value],
+    legacy: bool,
+    stored: bool,
+    digest: bool,
+    missing: Vec<String>,
+) {
+    let mut accepted = 0;
+    attempt_snapshot_page(
+        items,
+        &[0],
+        "synthetic-retained-ack",
+        progress,
+        &mut accepted,
+        &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
+        &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap().to_string(),
+        &|value: &Value| value["source_session_id"].as_str(),
+        &mut |_| {
+            let entity = crate::snapshot_client::SnapshotEntityRef {
+                source_session_id: "synthetic-sticky-session".into(),
+                snapshot_fingerprint: items[0]["snapshot_fingerprint"].as_str().unwrap().into(),
+                occurrence_count: 1,
+                body_witness_version: digest.then_some(3),
+                body_witness_digest: digest.then(|| "d".repeat(64)),
+                head_etag: None,
+                head_challenge: None,
+                unchanged_basis: (!stored).then(|| "usage_identical".into()),
+                retained_proof_missing: missing.clone(),
+            };
+            Ok(crate::snapshot_client::SnapshotBatchResponse {
+                accepted: 1,
+                sessions_reconciled: 0,
+                session_ids: vec![],
+                disabled: false,
+                disabled_reason: None,
+                entity_ack_contract: (!legacy)
+                    .then(|| crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
+                accepted_entities: if stored { vec![entity.clone()] } else { vec![] },
+                unchanged_entities: if stored { vec![] } else { vec![entity] },
+                rejected_entities: vec![],
+                conflict_entities: vec![],
+            })
+        },
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+}
+fn retained_rows(progress: &SnapshotUploadProgress) -> Option<(usize, usize)> {
+    progress
+        .accepted_identity_buckets
+        .proved_rows_for_test("synthetic-sticky-session")
+}
+fn retained_progress() -> SnapshotUploadProgress {
+    let mut progress = progress();
+    progress
+        .accepted_identity_buckets
+        .set_retained_enabled(true);
+    progress
+}
+#[test]
+fn retained_proof_needs_a_witnessed_stored_body_entity_ack() {
+    for (legacy, stored, digest) in [
+        (true, true, false),
+        (false, false, true),
+        (false, true, false),
+    ] {
+        let mut progress = retained_progress();
+        let mut item = body();
+        item["snapshot_fingerprint"] = json!(format!(
+            "{:064x}",
+            u8::from(legacy) * 4 + u8::from(stored) * 2 + u8::from(digest)
+        ));
+        retained_ack(&mut progress, &[item], legacy, stored, digest, vec![]);
+        assert_eq!(
+            retained_rows(&progress).map_or(0, |rows| rows.0),
+            0,
+            "legacy={legacy} stored={stored} digest={digest}"
+        );
+    }
+    // Before the server advertises retention, a witnessed ACK proves nothing.
+    let mut progress = progress();
+    retained_ack(&mut progress, &[body()], false, true, true, vec![]);
+    assert_eq!(retained_rows(&progress), Some((0, 0)));
+    let mut progress = retained_progress();
+    retained_ack(&mut progress, &[body()], false, true, true, vec![]);
+    assert_eq!(retained_rows(&progress), Some((1, 0)));
+    // An older server omits the field; a newer one may list a marked bucket.
+    let mut marked = body();
+    marked["snapshot_fingerprint"] = json!("e".repeat(64));
+    marked["usage_buckets"][0]["model_usage"][0] =
+        json!({"model":"claude-synthetic","identity_retained":true});
+    crate::snapshots::claude_request_identity::take_identity_counts();
+    retained_ack(
+        &mut progress,
+        &[marked],
+        false,
+        true,
+        true,
+        vec!["2026-09-01T10:00:00Z".into()],
+    );
+    assert_eq!(retained_rows(&progress), Some((0, 1)));
+    let counts =
+        serde_json::to_value(crate::snapshots::claude_request_identity::take_identity_counts())
+            .unwrap();
+    assert_eq!(
+        counts["identity_cap"]["retained_proof_missing_received"],
+        json!(1)
+    );
+    let decoded: crate::snapshot_client::SnapshotEntityRef = serde_json::from_value(json!({
+        "source_session_id":"s","snapshot_fingerprint":"b".repeat(64)
+    }))
+    .unwrap();
+    assert!(decoded.retained_proof_missing.is_empty());
+}
+#[test]
+fn replay_generation_or_namespace_change_clears_retained_proof() {
+    let mut progress = retained_progress();
+    retained_ack(&mut progress, &[body()], false, true, true, vec![]);
+    assert_eq!(retained_rows(&progress), Some((1, 0)));
+    let path = crate::test_scratch::unique_path("ottto-e2-optii-namespace").join("progress.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    progress.save(&path).unwrap();
+    crate::snapshots::claude_request_identity::take_identity_counts();
+    let mut other = SnapshotUploadProgress::load(
+        &path,
+        &"f".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .unwrap();
+    other
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x42; 32]));
+    assert_eq!(retained_rows(&other), None);
+    assert!(progress.prepare_historical_replay("next-generation"));
+    assert_eq!(retained_rows(&progress), Some((0, 0)));
+    assert!(
+        progress
+            .accepted_identity_buckets
+            .get("synthetic-sticky-session")
+            .is_some_and(|known| known.len() == 1),
+        "#909 hints are not option (ii) state"
+    );
+    let counts =
+        serde_json::to_value(crate::snapshots::claude_request_identity::take_identity_counts())
+            .unwrap();
+    assert_eq!(counts["identity_cap"]["retained_set_cleared"], json!(2));
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }

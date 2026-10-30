@@ -1055,6 +1055,7 @@ mod tests {
         SnapshotModelUsage {
             evidence_ref: None,
             identity_parts: None,
+            identity_retained: false,
             model: model.to_string(),
             input_tokens: 0,
             output_tokens: tokens,
@@ -3030,6 +3031,7 @@ mod tests {
         let model_usage = SnapshotModelUsage {
             evidence_ref: None,
             identity_parts: None,
+            identity_retained: false,
             model: "gpt-5.6-codex".to_string(),
             input_tokens: 100,
             output_tokens: 20,

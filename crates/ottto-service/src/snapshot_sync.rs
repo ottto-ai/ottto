@@ -1477,6 +1477,14 @@ impl SnapshotUploadProgress {
                 serde_json::from_slice::<Self>(&bytes)
                     .context("parse v3 local snapshot upload progress")
             });
+        // Option (ii) proof is scoped to the namespace that ACKed it.
+        if let Ok(progress) = &parsed {
+            if progress.destination_namespace_hash != expected_destination_namespace_hash {
+                progress
+                    .accepted_identity_buckets
+                    .count_retained_cleared_if_any();
+            }
+        }
         let mut progress = match parsed {
             Ok(progress)
                 if progress.schema_version == SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
@@ -2043,6 +2051,7 @@ impl SnapshotUploadProgress {
             return false;
         }
         self.historical_replay_generation = Some(generation.to_string());
+        self.accepted_identity_buckets.clear_retained();
         self.accepted_fingerprints.clear();
         self.accepted_body_witnesses.clear();
         self.accepted_body_contexts.clear();
@@ -2147,6 +2156,21 @@ impl SnapshotUploadProgress {
         item: &T,
         head_changed_without_proof: bool,
     ) -> Result<()> {
+        self.record_stored_state(item, head_changed_without_proof, None)
+    }
+
+    /// `stored_ref` is the item's stored-body entity ACK (fingerprint-exact,
+    /// no `unchanged_basis`). Option (ii) admits positive tags only when that
+    /// ref carries a body witness, which the entity-ACK validator already
+    /// requires to equal this body's, and only while the server advertises
+    /// retention. Count-only and legacy ACKs pass `None`.
+    /// `retained_proof_missing` only removes, so it is always applied.
+    fn record_stored_state<T: Serialize>(
+        &mut self,
+        item: &T,
+        head_changed_without_proof: bool,
+        stored_ref: Option<&crate::snapshot_client::SnapshotEntityRef>,
+    ) -> Result<()> {
         let value = serde_json::to_value(item)?;
         let Some(session) = value
             .get("source_session_id")
@@ -2156,6 +2180,17 @@ impl SnapshotUploadProgress {
         };
         self.accepted_account_hashes.record(&value);
         self.accepted_identity_buckets.record(&value);
+        if let Some(entity) = stored_ref {
+            let witnessed = entity.body_witness_digest.is_some()
+                && self.accepted_identity_buckets.retained_enabled();
+            if witnessed || !entity.retained_proof_missing.is_empty() {
+                self.accepted_identity_buckets.record_proved(
+                    &value,
+                    witnessed,
+                    &entity.retained_proof_missing,
+                );
+            }
+        }
         let key = cache_session_key(session);
         // Count-only legacy ACKs cannot distinguish changed from unchanged.
         // Recover authority through the same bootstrap rather than retaining
@@ -7116,6 +7151,15 @@ fn finish_sync_source(
     upload_progress
         .accepted_identity_buckets
         .bind_context(attribution_context.as_ref());
+    upload_progress
+        .accepted_identity_buckets
+        .set_retained_enabled(
+            source == SnapshotSource::ClaudeCode
+                && activity_hint
+                    .session_request_identity_retained_contract
+                    .as_deref()
+                    == Some(crate::snapshots::claude_request_identity::IDENTITY_RETAINED_CONTRACT),
+        );
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
     if let Some(lease) = native_comparison_lease.as_mut() {
@@ -10183,6 +10227,13 @@ where
             .map(|entity| entity.snapshot_fingerprint.as_str())
             .filter(|fingerprint| !not_stored.contains(fingerprint))
             .collect::<BTreeSet<_>>();
+        let stored_refs = response
+            .accepted_entities
+            .iter()
+            .chain(&response.unchanged_entities)
+            .filter(|entity| entity.unchanged_basis.is_none())
+            .map(|entity| (entity.snapshot_fingerprint.as_str(), entity))
+            .collect::<BTreeMap<_, _>>();
         for index in indices {
             let item = &items[*index];
             let item_fingerprint = fingerprint(item);
@@ -10197,7 +10248,11 @@ where
                 progress
                     .fresh_context_body_acks
                     .insert(item_fingerprint.to_string(), body);
-                progress.record_cache_state(item, false)?;
+                progress.record_stored_state(
+                    item,
+                    false,
+                    stored_refs.get(item_fingerprint).copied(),
+                )?;
             } else if not_stored.contains(item_fingerprint) {
                 progress.hold_unstored_body(item_fingerprint, &body_witness(item));
                 progress
@@ -12353,6 +12408,7 @@ mod tests {
                         head_etag: enforce.then(|| "e".repeat(64)),
                         head_challenge: None,
                         unchanged_basis: None,
+                        retained_proof_missing: Vec::new(),
                     });
                 response.validate_entity_ack_with_head_cas(&request, enforce)?;
                 Ok(response)
@@ -12665,6 +12721,7 @@ mod tests {
                         head_etag: enforce.then(|| "e".repeat(64)),
                         head_challenge: None,
                         unchanged_basis: None,
+                        retained_proof_missing: Vec::new(),
                     })
                     .collect();
                 response.validate_entity_ack_with_head_cas(&request, enforce)?;
@@ -12712,6 +12769,7 @@ mod tests {
                         head_challenge: (item.snapshot_fingerprint == sibling.snapshot_fingerprint)
                             .then(|| "c".repeat(64)),
                         unchanged_basis: None,
+                        retained_proof_missing: Vec::new(),
                     };
                     if item.snapshot_fingerprint == sibling.snapshot_fingerprint {
                         response.conflict_entities.push(reference);
@@ -12837,6 +12895,7 @@ mod tests {
                         head_etag: Some("e".repeat(64)),
                         head_challenge: None,
                         unchanged_basis: None,
+                        retained_proof_missing: Vec::new(),
                     });
                 response.validate_entity_ack_with_head_cas(&request, true)?;
                 Ok(response)
@@ -13037,6 +13096,7 @@ mod tests {
                         head_etag: enforce.then(|| "e".repeat(64)),
                         head_challenge: None,
                         unchanged_basis: None,
+                        retained_proof_missing: Vec::new(),
                     });
                 response.validate_entity_ack_with_head_cas(&request, enforce)?;
                 Ok(response)
@@ -13273,6 +13333,7 @@ mod tests {
                         head_etag: None,
                         head_challenge: None,
                         unchanged_basis: None,
+                        retained_proof_missing: Vec::new(),
                     });
                 response.validate_entity_ack(&request)?;
                 Ok(response)
@@ -13355,6 +13416,7 @@ mod tests {
                         head_etag: Some("e".repeat(64)),
                         head_challenge: None,
                         unchanged_basis: None,
+                        retained_proof_missing: Vec::new(),
                     });
                 response.validate_entity_ack_with_head_cas(&request, true)?;
                 Ok(response)
@@ -13524,6 +13586,7 @@ mod tests {
                     head_etag: head,
                     head_challenge: None,
                     unchanged_basis: None,
+                    retained_proof_missing: Vec::new(),
                 });
             ack.validate_entity_ack_with_head_cas(&request, enforce)?;
             Ok(ack)
@@ -13946,6 +14009,7 @@ mod tests {
                         head_etag: Some("f".repeat(64)),
                         head_challenge: None,
                         unchanged_basis: None,
+                        retained_proof_missing: Vec::new(),
                     });
                 response.validate_entity_ack_with_head_cas(&request, true)?;
                 Ok(response)
@@ -14064,6 +14128,7 @@ mod tests {
                         head_etag: None,
                         head_challenge: None,
                         unchanged_basis: None,
+                        retained_proof_missing: Vec::new(),
                     });
                 response.validate_entity_ack(&request)?;
                 Ok(response)
@@ -14138,6 +14203,7 @@ mod tests {
                         head_etag: enforce.then(|| "e".repeat(64)),
                         head_challenge: None,
                         unchanged_basis: None,
+                        retained_proof_missing: Vec::new(),
                     });
                 response.validate_entity_ack_with_head_cas(&request, enforce)?;
                 Ok(response)
@@ -14188,6 +14254,7 @@ mod tests {
                         head_etag: Some("f".repeat(64)),
                         head_challenge: None,
                         unchanged_basis: None,
+                        retained_proof_missing: Vec::new(),
                     });
                 response.validate_entity_ack_with_head_cas(&request, true)?;
                 Ok(response)
@@ -14288,6 +14355,7 @@ mod tests {
                     head_etag: enforce.then(|| "e".repeat(64)),
                     head_challenge: None,
                     unchanged_basis: None,
+                    retained_proof_missing: Vec::new(),
                 };
                 if enforce {
                     response.unchanged_entities.push(reference);
@@ -14361,6 +14429,7 @@ mod tests {
                     head_etag: None,
                     head_challenge: None,
                     unchanged_basis: basis.map(str::to_string),
+                    retained_proof_missing: Vec::new(),
                 });
             let mut progress = test_upload_progress();
             let mut requests = 0;
@@ -14447,6 +14516,7 @@ mod tests {
                     head_etag: None,
                     head_challenge: None,
                     unchanged_basis: unchanged.then(|| basis.to_string()),
+                    retained_proof_missing: Vec::new(),
                 };
                 if unchanged {
                     response.unchanged_entities.push(reference);
@@ -14558,6 +14628,7 @@ mod tests {
                     head_etag: None,
                     head_challenge: None,
                     unchanged_basis: None,
+                    retained_proof_missing: Vec::new(),
                 };
                 if outcome == "accepted" {
                     response.accepted_entities.push(reference);
@@ -14613,6 +14684,7 @@ mod tests {
                             head_etag: Some("2".repeat(64)),
                             head_challenge: None,
                             unchanged_basis: None,
+                            retained_proof_missing: Vec::new(),
                         });
                     let mut request = request.clone();
                     request.snapshots = items;
@@ -14756,6 +14828,7 @@ mod tests {
                     }),
                     head_challenge: None,
                     unchanged_basis: None,
+                    retained_proof_missing: Vec::new(),
                 });
             response.validate_entity_ack(&request).unwrap();
             let mut accepted = 0;
@@ -14893,6 +14966,7 @@ mod tests {
                 head_etag: Some("e".repeat(64)),
                 head_challenge: None,
                 unchanged_basis: None,
+                retained_proof_missing: Vec::new(),
             }],
             unchanged_entities: Vec::new(),
             rejected_entities: Vec::new(),
@@ -15309,6 +15383,7 @@ mod tests {
                     head_etag: None,
                     head_challenge: None,
                     unchanged_basis: None,
+                    retained_proof_missing: Vec::new(),
                 };
                 let response = crate::snapshot_client::SnapshotBatchResponse {
                     accepted: 1,
@@ -15562,6 +15637,7 @@ mod tests {
                         head_etag: None,
                         head_challenge: None,
                         unchanged_basis: None,
+                        retained_proof_missing: Vec::new(),
                     }],
                 })
             },
@@ -15867,6 +15943,7 @@ mod tests {
             head_etag: None,
             head_challenge: None,
             unchanged_basis: None,
+            retained_proof_missing: Vec::new(),
         }
     }
 
@@ -15994,6 +16071,7 @@ mod tests {
                         head_etag: None,
                         head_challenge: None,
                         unchanged_basis: None,
+                        retained_proof_missing: Vec::new(),
                     }],
                     unchanged_entities: Vec::new(),
                     rejected_entities: vec![crate::snapshot_client::SnapshotEntityRejection {
@@ -25141,6 +25219,7 @@ mod tests {
                         head_etag: Some("f".repeat(64)),
                         head_challenge: None,
                         unchanged_basis: None,
+                        retained_proof_missing: Vec::new(),
                     });
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,

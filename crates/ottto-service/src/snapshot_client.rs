@@ -688,6 +688,11 @@ pub struct ActivityHintResponse {
     /// Exact accepted-log cache evidence capability; absent or unknown disables wire emission.
     #[serde(default)]
     pub session_cache_observations_contract: Option<String>,
+    /// Option (ii) server capability: the accept path retains per-row proof
+    /// and admits `identity_retained` bucket rows. Missing/null/unknown keeps
+    /// the field off, so older servers never receive it.
+    #[serde(default)]
+    pub session_request_identity_retained_contract: Option<String>,
     /// Existing server mandate: ordinary bootstrap may not bypass required CAS.
     #[serde(default)]
     pub snapshot_head_cas_required: bool,
@@ -772,6 +777,11 @@ pub struct SnapshotEntityRef {
     /// body-scoped state may be recorded as stored. Read, never persisted.
     #[serde(default)]
     pub unchanged_basis: Option<String>,
+    /// Option (ii), stored-body refs only: bucket starts whose
+    /// `identity_retained` rows had no server-retained proof. Optional and
+    /// default-empty; older servers never send it. Read, never persisted.
+    #[serde(default)]
+    pub retained_proof_missing: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1110,6 +1120,7 @@ impl SnapshotBatchResponse {
                 head_etag: None,
                 head_challenge: None,
                 unchanged_basis: None,
+                retained_proof_missing: Vec::new(),
             };
             validate_snapshot_entity_ref(&reference)?;
             if !rejection.permanent && !rejection.usage_decrease_hold() {
@@ -3640,6 +3651,30 @@ mod tests {
     }
 
     #[test]
+    fn identity_retained_capability_defaults_off_and_requires_exact_contract() {
+        for extra in [
+            "",
+            r#", "session_request_identity_retained_contract":null"#,
+            r#", "session_request_identity_retained_contract":"session_request_identity_retained:v2""#,
+        ] {
+            let hint: ActivityHintResponse =
+                serde_json::from_str(&activity_hint_json(extra)).unwrap();
+            assert_ne!(
+                hint.session_request_identity_retained_contract.as_deref(),
+                Some(crate::snapshots::claude_request_identity::IDENTITY_RETAINED_CONTRACT)
+            );
+        }
+        let hint: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
+            r#", "session_request_identity_retained_contract":"session_request_identity_retained:v1""#,
+        ))
+        .unwrap();
+        assert_eq!(
+            hint.session_request_identity_retained_contract.as_deref(),
+            Some(crate::snapshots::claude_request_identity::IDENTITY_RETAINED_CONTRACT)
+        );
+    }
+
+    #[test]
     fn context_curve_capability_defaults_off_and_requires_exact_contract() {
         let old_backend: ActivityHintResponse =
             serde_json::from_str(&activity_hint_json("")).expect("old activity hint");
@@ -4609,6 +4644,7 @@ mod tests {
             head_etag: None,
             head_challenge: None,
             unchanged_basis: None,
+            retained_proof_missing: Vec::new(),
         }
     }
 
@@ -4714,6 +4750,7 @@ mod tests {
                 head_etag: Some("e".repeat(64)),
                 head_challenge: None,
                 unchanged_basis: None,
+                retained_proof_missing: Vec::new(),
             }],
         );
         let reference = &ack.accepted_entities[0];
@@ -5307,7 +5344,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, session_request_identity_retained_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
