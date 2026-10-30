@@ -1317,10 +1317,11 @@ fn budget_bounds_hold() {
     // re-parse of at most 1 MiB and at most NAMED_LINES capped lines.
     assert_eq!(HEAD_BOUND, 1024 * 1024);
     assert_eq!(NAMED_LINES, 4);
-    // Beside the cache, outside its state budget: both stores' digest maps.
+    // Prepaid beside retained state: both stores' maps and the bounded
+    // diagnostic set (512 full 440-byte nodes plus one retained root).
     assert_eq!(
         crate::snapshots::sampled_scan::durable_tail::STORES_RESIDENT_BOUND,
-        1_978_368
+        1_978_368 + (2 * MAX_RECORDS + 1) * 440
     );
     // Per write pass: at most MAX_BATCH records of at most RECORD_BYTES.
     assert_eq!(MAX_BATCH, 32);

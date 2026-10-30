@@ -1,13 +1,15 @@
 //! Lead B's condition for #882: count the restart Fulls left by a failed
 //! post-save store write, and the write failures themselves. Counters and
 //! alarm only; the requeue fix is E1 / M3 D3.
-use super::tests::{certificate, codex_budget_fixture, native_fixture};
+use super::tests::{certificate, codex_budget_fixture};
 use super::*;
 use crate::locked_state_dir::test_locks;
 use crate::transcript_acquisition::ReadMode;
 use std::time::{Duration, Instant};
 
-const SOURCE: SnapshotSource = SnapshotSource::ClaudeCode;
+// EntryChanged is the Codex strict-binding observation. Claude keeps its
+// original-v1 adapter and accepted-floor holds; it is not this counter premise.
+const SOURCE: SnapshotSource = SnapshotSource::Codex;
 
 struct Restarted {
     root: PathBuf,
@@ -20,10 +22,10 @@ struct Restarted {
 }
 
 impl Restarted {
-    fn restore_label(&self) -> &'static str {
+    fn restore(&self) -> RestoreOutcome {
         let interpretation =
             Interpretation::of(SOURCE, &self.key, &self.index, false, &self.namespace);
-        match self.cache.durable_restore(
+        self.cache.durable_restore(
             SOURCE,
             &self.key,
             &self.path,
@@ -31,7 +33,11 @@ impl Restarted {
             &mut File::open(&self.path).unwrap(),
             &self.index,
             &interpretation,
-        ) {
+        )
+    }
+
+    fn restore_label(&self) -> &'static str {
+        match self.restore() {
             RestoreOutcome::Miss(class) => class.label(),
             RestoreOutcome::Restored(taken, lease) => {
                 drop(taken);
@@ -73,7 +79,7 @@ fn restart_over(name: &str, stale: Option<bool>) -> Restarted {
     let root = crate::test_scratch::private_dir(name);
     let lock = test_locks::hold(&root);
     let path = root.join("fixture.jsonl");
-    native_fixture(&path);
+    codex_budget_fixture(&path, "019fa111-2222-7333-8444-555555555555", None);
     let key = local_index_key(&path);
     let namespace = Scope("store-write-failed".into());
     let scope = Scope("store-write-failed-file".into());
@@ -83,11 +89,11 @@ fn restart_over(name: &str, stale: Option<bool>) -> Restarted {
         key.clone(),
         serde_json::from_value(serde_json::json!({
             "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp-accepted",
-            "effective_upload_body_witness_revision":3
+            "effective_upload_body_witness_revision":effective_revision(SOURCE)
         }))
         .unwrap(),
     );
-    index.active_effective_upload_body_witness_revision = 3;
+    index.active_effective_upload_body_witness_revision = effective_revision(SOURCE);
     if let Some(stale) = stale {
         let ds = durable_source(SOURCE).unwrap();
         let interpretation = Interpretation::of(SOURCE, &key, &index, false, &namespace);
@@ -177,8 +183,21 @@ fn fault_free_restart_leaves_the_counters_at_zero() {
         ("ottto-dt-restart-current", Some(false)),
     ] {
         let run = restart_over(name, record);
-        let label = run.restore_label();
-        assert_ne!(label, "ineligible.entry_changed", "{name}");
+        match run.restore() {
+            RestoreOutcome::Miss(class) => {
+                assert_ne!(class.label(), "ineligible.entry_changed", "{name}")
+            }
+            RestoreOutcome::Restored(taken, lease) => {
+                drop(taken);
+                lease.release();
+            }
+            RestoreOutcome::Degraded if !crate::heap_layout_bound::layout_supported() => {
+                // Correct binding, but this binary cannot retain a decoded v1
+                // graph. This is eligibility only: no Full is started here.
+                assert_eq!(run.counts().restored, 0);
+            }
+            _ => panic!("fault-free control unexpectedly held or lost its binding"),
+        }
         let bytes = std::fs::metadata(&run.path).unwrap().len();
         run.cache.durable_acquisition_completed(
             &run.key,
