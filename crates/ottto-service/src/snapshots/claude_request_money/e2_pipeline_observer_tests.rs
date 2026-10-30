@@ -88,6 +88,7 @@ pub(crate) fn legacy_excluded(index: &ScanIndex, member: &str) -> usize {
 pub(crate) struct Released {
     pub(crate) root_fallbacks: u64,
     pub(crate) disclosed: u64,
+    pub(crate) removed_requests: u64,
 }
 thread_local! {
     static RELEASED: std::cell::Cell<Option<Released>> = const { std::cell::Cell::new(None) };
@@ -111,6 +112,7 @@ pub(crate) fn releasing(fold: &FileFold) {
         if let Some(mut page) = counts.get() {
             page.root_fallbacks += fold.root_fallbacks;
             page.disclosed += fold.disclosed;
+            page.removed_requests += fold.entity.removed_requests;
             counts.set(Some(page));
         }
     });

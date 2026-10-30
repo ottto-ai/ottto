@@ -3273,21 +3273,25 @@ fn corrected_family_counter_excludes_history_vetoed_literals() {
     with_e2(|| {
         let mut c = Corpus::new("e2-copy-counter-history-veto");
         let mut prior = demo_family(&mut c, &mut e2_progress());
-        // demo_family uses partial commits, retaining an unadopted source
-        // context. Model the fully adopted ACKed baseline so only THIRD's
-        // genuine change is selected, without unrelated corrected families.
-        crate::snapshots::e2_pipeline_scan_fixture::adopt_acked_census_for_test(
-            &mut prior, "e2-synthetic-destination");
-        std::fs::write(
-            c.support.join("snapshots/claude_code-reemission-exclusions.txt"),
-            format!("{:x}\n", Sha256::digest(THIRD.as_bytes())),
-        ).unwrap();
-        append(&c.root.join(file(THIRD)), &line_by(THIRD, "new-own", "2026-08-02T07:07:00Z", 10, RESUME_WRITER));
+        prior.activate_effective_upload_body_witness_revision(3);
+        let path = c.root.join(file(THIRD));
+        assert!(prior.re_owe_effective_upload_body_witness_revision(
+            path.to_string_lossy().as_ref(), 2));
+        // Unlisted ordinary context debt still parses locally when history
+        // is held. This is intentionally not a scoped REOWED acquisition:
+        // it exercises a successfully rebuilt literal that is later vetoed.
+        let mut page = crate::snapshots::e2_pipeline_scan_fixture::with_history_byte_limit(1, || {
+            c.raw(&E2ScanFixture::default(), prior, 100, false, &[])
+        });
+        page.scan.snapshots.retain(|item| item.source_session_id == THIRD);
+        assert_eq!(page.scan.snapshots.len(), 1, "actual native read of the held member");
         e2::take_diag();
-        let mut page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        page.enrich(&c);
+        assert_eq!(page.released.removed_requests, 3, "the literal actually removed its proven prefix");
         assert_eq!(copy_diag(&["copy_prefix_families_corrected"]), [0]);
+        assert!(body(&page, THIRD).is_none(), "history-held literal is vetoed");
         page.finish();
-        assert!(body(&page, THIRD).is_none(), "listed literal is vetoed");
+        assert!(body(&page, THIRD).is_none(), "finalization cannot restore the vetoed literal");
     });
 }
 
