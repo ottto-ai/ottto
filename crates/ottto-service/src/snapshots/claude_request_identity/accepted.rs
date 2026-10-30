@@ -566,6 +566,16 @@ impl AcceptedBuckets {
         }
         self.1 = key;
     }
+    /// The key and per-cycle flags never persist, so a copy reread from disk
+    /// takes them from the live ledger before comparing settled state.
+    pub(crate) fn adopt_runtime_from(&mut self, live: &Self) {
+        self.1 = live.1.clone();
+        self.2 = live.2;
+        self.3 = live.3;
+        for state in self.0.values_mut() {
+            state.key = live.1.clone();
+        }
+    }
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

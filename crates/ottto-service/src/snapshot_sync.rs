@@ -3214,6 +3214,9 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     durable.fresh_context_body_acks = progress.fresh_context_body_acks.clone();
     durable.context_receipt_candidates = progress.context_receipt_candidates.clone();
     durable.context_resend = progress.context_resend.clone();
+    durable
+        .accepted_identity_buckets
+        .adopt_runtime_from(&progress.accepted_identity_buckets);
     if durable != *progress || durable.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION {
         return Err(anyhow!(
             "snapshot progress changed before partial checkpoint"
