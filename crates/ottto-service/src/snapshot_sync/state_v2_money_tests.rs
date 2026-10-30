@@ -73,8 +73,23 @@ fn add_class(index: &mut ScanIndex, path: &Path, class: &str) {
                 "claude_usage_family_pending",
             ] {
                 let mut pending = shaped["logical"][field]["synthetic-family"].clone();
+                assert!(pending.is_object(), "pending fixture must be present");
                 for member_field in ["members", "member_request_id_hashes", "member_occurrences"] {
-                    if let Some(members) = pending[member_field].as_object_mut() {
+                    // IndexMut would insert null for absent optional maps,
+                    // which the v1 decoder correctly refuses as a non-map.
+                    if let Some(members) =
+                        pending.get_mut(member_field).and_then(Value::as_object_mut)
+                    {
+                        let value = members.remove("synthetic-file").unwrap();
+                        members.insert(key.into(), value);
+                    }
+                }
+                if let Some(windows) = pending
+                    .get_mut("previous_windows")
+                    .and_then(Value::as_array_mut)
+                {
+                    for window in windows {
+                        let members = window["members"].as_object_mut().unwrap();
                         let value = members.remove("synthetic-file").unwrap();
                         members.insert(key.into(), value);
                     }
@@ -138,7 +153,7 @@ fn add_class(index: &mut ScanIndex, path: &Path, class: &str) {
             births.set_money_marks(key, 1 | 2 | 4);
             return;
         }
-        "identity" => {}
+        "identity" | "identity_inheritance" => {}
         _ => panic!("uncovered money class {class}"),
     }
     *index = serde_json::from_value(raw).unwrap();
@@ -146,6 +161,10 @@ fn add_class(index: &mut ScanIndex, path: &Path, class: &str) {
 
 fn condition_b(class: &str) {
     with_e2(|| {
+        // Contract-5's per-request classifier refuses invalid telemetry. E2
+        // account reconciliation instead inherits the preceding account, so
+        // that path cannot supply this fixture's invalid-r2 refusal premise.
+        let _classifier = (class == "identity").then(e2::GateForTest::off);
         let mut c = corpus(&format!("v2-condition-b-{class}"));
         let path = c.root(ROOT, &line(ROOT, "r1", AT, 10));
         input_clock(&path);
@@ -154,7 +173,7 @@ fn condition_b(class: &str) {
             &[trace("r1", "")],
         );
         let mut warm = c.raw(
-            &E2ScanFixture::default(),
+            &E2ScanFixture::with_identity_capture(class.starts_with("identity")),
             ScanIndex::default(),
             100,
             false,
@@ -181,8 +200,15 @@ fn condition_b(class: &str) {
             ],
             &[trace("r1", ""), trace("r2", "")],
         );
-        let mut pages = [v1.clone(), v1, v2]
-            .map(|prior| c.raw(&E2ScanFixture::default(), prior, 100, false, &[]));
+        let mut pages = [v1.clone(), v1, v2].map(|prior| {
+            c.raw(
+                &E2ScanFixture::with_identity_capture(class.starts_with("identity")),
+                prior,
+                100,
+                false,
+                &[],
+            )
+        });
         finish_claude_pages(&c, &mut pages);
         for candidate in &pages[1..] {
             assert_eq!(
@@ -200,7 +226,7 @@ fn condition_b(class: &str) {
                 "authority refusal"
             );
         }
-        if class == "identity" {
+        if matches!(class, "identity" | "identity_inheritance") {
             assert!(
                 pages[0]
                     .scan
@@ -209,6 +235,8 @@ fn condition_b(class: &str) {
                     .any(|item| !item.request_evidence.is_empty()),
                 "tagged r1 must survive"
             );
+        }
+        if class == "identity" {
             assert!(
                 pages[0]
                     .scan
@@ -217,6 +245,16 @@ fn condition_b(class: &str) {
                     .any(|item| item.request_identity_refusals > 0),
                 "invalid r2 must disclose its refusal"
             );
+        }
+        if class == "identity_inheritance" {
+            // Preserve coverage of the original E2 path too: its invalid
+            // login inherits r1's account rather than emitting a refusal.
+            assert!(e2::enabled());
+            assert!(pages[0]
+                .scan
+                .snapshots
+                .iter()
+                .all(|item| item.request_identity_refusals == 0));
         }
         if pages[0].scan.snapshots.is_empty() {
             assert!(
@@ -293,20 +331,29 @@ classes! {
     v2_snapshot_quarantine_preserves_terminal_refusal => "snapshot_quarantine",
     v2_e2_copy_removal_and_rule_marks_preserve_next_body => "copy_removal",
     v2_909_identity_tags_and_refusals_preserve_next_body => "identity",
+    v2_e2_invalid_identity_inheritance_preserves_next_body => "identity_inheritance",
 }
 
 #[test]
 fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload() {
     with_e2(|| {
         let mut c = corpus("v2-accepted-identity-buckets");
-        let path = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+        // #909 deliberately retains uniform markerless E2 bodies in D1's
+        // existing wire shape. An own captured marker exercises identity rows.
+        let marker = json!({"type":"attachment", "sessionId":ROOT,
+            "attachment":{"type":"credential_org",
+                "organizationUuid":"11111111-1111-4111-8111-111111111111"}});
+        let path = c.root(
+            ROOT,
+            &(marker.to_string() + "\n" + &line(ROOT, "r1", AT, 10)),
+        );
         input_clock(&path);
         c.evidence(
             &[tagged_api("r1", 10, Some(&"a".repeat(64)))],
             &[trace("r1", "")],
         );
         let mut warm = c.raw(
-            &E2ScanFixture::default(),
+            &E2ScanFixture::with_identity_capture(true),
             ScanIndex::default(),
             100,
             false,
@@ -360,8 +407,15 @@ fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload()
             ],
             &[trace("r1", ""), trace("r2", "")],
         );
-        let mut pages = [v1.clone(), v1, v2]
-            .map(|prior| c.raw(&E2ScanFixture::default(), prior, 100, false, &[]));
+        let mut pages = [v1.clone(), v1, v2].map(|prior| {
+            c.raw(
+                &E2ScanFixture::with_identity_capture(true),
+                prior,
+                100,
+                false,
+                &[],
+            )
+        });
         let mut bodies = Vec::new();
         for page in &mut pages {
             let mut restored: SnapshotUploadProgress = serde_json::from_slice(&bytes).unwrap();
