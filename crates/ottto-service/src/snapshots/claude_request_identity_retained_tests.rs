@@ -884,6 +884,29 @@ fn retained_deferral_never_triggers_the_unpriced_strip() {
     retained_assert_exclusive(&lost);
     sticky_assert_reconciled(&lost);
 
+    // Over the caps the same holds after tag selection: the newest hour lacks
+    // a cost field, and the strip must never untag the model row.
+    let (mut window, mut window_proof) = retained_session(576);
+    sticky_price_rows(&mut window, &mut window_proof, |hour, field| {
+        hour < 575 || field != 4
+    });
+    let mut window_state = retained_state();
+    let mut window_first = window.clone();
+    sticky_apply(&mut window_first, &window_proof, &window_state).unwrap();
+    retained_ack(&mut window_state, &window_first, &[]);
+    identity::take_identity_counts();
+    let mut window_next = window.clone();
+    sticky_apply(&mut window_next, &window_proof, &window_state).unwrap();
+    assert_eq!(
+        retained_count(&retained_counts(), "unpriced_part_untagged"),
+        0
+    );
+    assert!(sticky_tagged(
+        &window_next.usage_buckets.last().unwrap().model_usage[0]
+    ));
+    retained_assert_exclusive(&window_next);
+    sticky_assert_reconciled(&window_next);
+
     // With equal presence the closed hours still mark (no un-deferral).
     let (original, proof) = retained_session(4);
     let mut state = retained_state();
