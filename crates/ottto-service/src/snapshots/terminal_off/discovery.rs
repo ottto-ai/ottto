@@ -622,18 +622,25 @@ pub(super) fn retry_blocked(index: &ScanIndex, key: &str) -> bool {
         .and_then(|m| Stat::capture(&m));
     let token = revision(index, key);
     with_walks(|m| {
-        let Some(walk) = m.get(&scope) else { return false; };
+        let Some(walk) = m.get(&scope) else {
+            return false;
+        };
         // Explicit non-blocking custody survives traversal starts in the same
         // bounded RAM observation map. It never borrows held_family_roots,
         // which owns distinct sweep/proof semantics. Real object/context
         // changes and unknown identity fail toward another read.
-        let held_key_blocked = stat.is_some_and(|s| s.identity.is_some() && s.modified.is_some() && s.birth > 0)
-            && m.values().any(|prior| prior.observations.get(&digest(key)).is_some_and(|o| {
-                o.held_retry
-                    && o.served_at.is_some_and(|at| walk.now < at.saturating_add(6 * 3600))
-                    && o.served == Some((stat, token))
-            }));
-        held_key_blocked || blocked(walk, key, stat, Some(token))
+        let held_key_blocked = stat
+            .is_some_and(|s| s.identity.is_some() && s.modified.is_some() && s.birth > 0)
+            && m.values().any(|prior| {
+                prior.observations.get(&digest(key)).is_some_and(|o| {
+                    o.held_retry
+                        && o.served_at
+                            .is_some_and(|at| walk.now < at.saturating_add(6 * 3600))
+                        && o.served == Some((stat, token))
+                })
+            });
+        held_key_blocked
+            || blocked(walk, key, stat, Some(token))
             || sampled_audit::candidate_open_blocked(key, walk.now)
     })
 }
@@ -641,10 +648,15 @@ pub(super) fn retry_blocked(index: &ScanIndex, key: &str) -> bool {
 /// Register the keys actually returned by local hold settlement. Querying or
 /// re-enqueueing never renews served_at; only an actual parse can do that.
 pub(super) fn held_retry_blocked(index: &ScanIndex, key: &str) -> bool {
-    if !claude_terminal_off() { return false; }
+    if !claude_terminal_off() {
+        return false;
+    }
     if let Some(scope) = terminal_off_rediscovery_scope(index) {
         with_walks(|memo| {
-            if let Some(o) = memo.get_mut(&scope).and_then(|walk| walk.observations.get_mut(&digest(key))) {
+            if let Some(o) = memo
+                .get_mut(&scope)
+                .and_then(|walk| walk.observations.get_mut(&digest(key)))
+            {
                 o.held_retry = true;
             }
         });

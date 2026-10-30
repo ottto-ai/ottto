@@ -516,15 +516,15 @@ impl PipelineFixture {
             OffsetDateTime::parse(collected_at, &Rfc3339).unwrap().unix_timestamp() as u64,
             || {
                 crate::snapshots::scan_source_roots_with_test_limit(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&self.root),
-            &mut index,
-            collected_at,
-            183,
-            self.page_files,
-            true,
-        )
-        .expect("scan bounded Claude page")
+                    SnapshotSource::ClaudeCode,
+                    std::slice::from_ref(&self.root),
+                    &mut index,
+                    collected_at,
+                    183,
+                    self.page_files,
+                    true,
+                )
+                .expect("scan bounded Claude page")
             },
         );
         let parsed = scan
@@ -7239,7 +7239,9 @@ fn terminal_off_nonblocking_held_keys_read_at_six_hours_not_every_page() {
     for bound in [false, true] {
         let (fixture, baseline, initial) = if bound {
             let (fixture, baseline, first, last) = terminal_bound_hold_traversal(
-                "nbf-bound-committed-member", PipelineUpload::Accept, false,
+                "nbf-bound-committed-member",
+                PipelineUpload::Accept,
+                false,
             );
             assert!(!first.progress_blocking);
             assert_eq!(first.held.len(), 1);
@@ -7249,33 +7251,52 @@ fn terminal_off_nonblocking_held_keys_read_at_six_hours_not_every_page() {
             let baseline = fixture.baseline();
             fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
             let mut pages = fixture.traversal(9, &PIPELINE_HOLD_CYCLE);
-            assert!(pages.iter().any(|page| !page.held.is_empty() && !page.progress_blocking));
+            assert!(pages
+                .iter()
+                .any(|page| !page.held.is_empty() && !page.progress_blocking));
             (fixture, baseline, pages.pop().unwrap())
         };
         let key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
-        let path = PathBuf::from(&key);
         let old_entities = &baseline.file_snapshot_fingerprints[&key];
-        let cycle = if bound { PipelineCycle {
-            proven_owner_session: Some(PIPELINE_HELD_SESSION), ..PIPELINE_HOLD_CYCLE
-        }} else { PIPELINE_HOLD_CYCLE };
+        let cycle = if bound {
+            PipelineCycle {
+                proven_owner_session: Some(PIPELINE_HELD_SESSION),
+                ..PIPELINE_HOLD_CYCLE
+            }
+        } else {
+            PIPELINE_HOLD_CYCLE
+        };
         let assert_custody = |page: &PipelinePage| {
             assert!(!page.scan.census_complete);
             assert!(!page.index.bounded_sweep_had_unsettled_upload());
             assert_eq!(&page.index.file_snapshot_fingerprints[&key], old_entities);
-            assert!(old_entities.iter().all(|fp| page.index.accepted_snapshot_fingerprint_recorded(fp)));
+            assert!(old_entities
+                .iter()
+                .all(|fp| page.index.accepted_snapshot_fingerprint_recorded(fp)));
             assert!(page.uploaded.is_disjoint(&page.held));
             if bound {
-                assert!(page.index.bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION).is_some());
+                assert!(page
+                    .index
+                    .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION)
+                    .is_some());
             } else {
                 assert_eq!(page.index.claude_account_deferred_hold_count(), 1);
             }
         };
         assert_custody(&initial);
         for (at, expected) in [("15:00:00", 1), ("15:05:00", 0), ("21:00:00", 1)] {
-            let (page, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
-                fixture.page(&format!("2026-08-02T{at}Z"), &cycle, PipelineUpload::Accept)
-            });
-            assert_eq!(reads.get(&path).copied().unwrap_or(0), expected, "bound={bound}/{at}");
+            let (page, reads) =
+                crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+                    fixture.page(&format!("2026-08-02T{at}Z"), &cycle, PipelineUpload::Accept)
+                });
+            let held_reads = reads
+                .iter()
+                .filter(|(path, _)| {
+                    path.file_stem().and_then(|stem| stem.to_str()) == Some(PIPELINE_HELD_SESSION)
+                })
+                .map(|(_, reads)| reads)
+                .sum::<usize>();
+            assert_eq!(held_reads, expected, "bound={bound}/{at}");
             assert_custody(&page);
             assert!(page.uploaded.is_empty(), "held body must never upload");
         }
