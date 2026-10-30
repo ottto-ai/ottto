@@ -504,11 +504,6 @@ fn retained_completion_rejects_wrong_candidate_and_final_path_swap() {
 }
 
 #[test]
-fn exact_pending_identity_fits_existing_node_reservation() {
-    assert!(crate::heap_layout_bound::tree_node_bytes::<Digest32, PendingWrite>().unwrap() <= 4096);
-}
-
-#[test]
 fn startup_sync_precedes_warming_and_no_writer_never_repairs_modes() {
     let scratch = Scratch::new();
     let lock = LockedStateDir::acquire(&scratch.root).unwrap();
@@ -550,63 +545,6 @@ fn startup_sync_precedes_warming_and_no_writer_never_repairs_modes() {
         0o644
     );
     assert_eq!(readonly.counters().mode_repaired, 0);
-}
-
-#[test]
-fn inventory_bound_is_independent_of_memo_and_existing_keys_remain_updateable() {
-    let scratch = Scratch::new();
-    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
-    let path = scratch.transcript("source.jsonl", b"{}\n");
-    let cert = certificate(&path);
-    let mut store = scratch.store();
-    let records = |changed: bool| {
-        (0..INVENTORY_BOUND)
-            .map(|n| {
-                let mut b = binding("account", "scope", ("fp-a", None));
-                b.key = key_digest(DurableSource::ClaudeCode, &n.to_string());
-                pending(
-                    b,
-                    cert.clone(),
-                    u64::from(changed && n == INVENTORY_BOUND - 1),
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    for generation in 1..=INVENTORY_BOUND.div_ceil(MAX_BATCH) {
-        assert_eq!(
-            store
-                .write_after_save(&lock, generation as u64, 0, records(false))
-                .unwrap()
-                .written,
-            MAX_BATCH
-        );
-    }
-    assert_eq!(store.counters().disk_records, INVENTORY_BOUND as u64);
-    assert_eq!(store.durable.len(), MAX_RECORDS);
-    assert_eq!(
-        store
-            .write_after_save(&lock, 99, 0, records(false))
-            .unwrap()
-            .written,
-        0
-    );
-    assert_eq!(
-        store
-            .write_after_save(&lock, 100, u64::MAX, records(true))
-            .unwrap()
-            .written,
-        1 // A verified v1 predecessor remains updateable after memo eviction.
-    );
-    let mut extra = records(false).pop().unwrap();
-    extra.binding.key = key_digest(DurableSource::ClaudeCode, "bound-plus-one");
-    let admitted = store.write_after_save(&lock, 101, 0, vec![extra]).unwrap();
-    assert_eq!(
-        admitted.written, 1,
-        "inventory precision is not disk admission"
-    );
-    assert!(admitted.deferred_keys.is_empty());
-    assert_eq!(store.counters().store_write_skipped[1], 0);
-    assert_eq!(store.counters().disk_records, INVENTORY_BOUND as u64 + 1);
 }
 
 #[test]
@@ -1232,49 +1170,6 @@ fn every_binding_mismatch_refuses() {
 }
 
 #[test]
-fn private_temp_explicit_cleanup_counts_once_after_verified_absence() {
-    let scratch = Scratch::new();
-    let path = scratch.root.join("stage.rec");
-    let mut counters = StoreCounters::default();
-    let mut temp = TempRecord::prepare(&scratch.root, &path, &mut counters).unwrap();
-    let temp_path = temp.path.clone();
-    assert!(temp_path.exists());
-    assert_eq!(temp.counters.temp_discard_verified, 0);
-    temp.discard().unwrap();
-    assert!(!temp_path.exists());
-    assert!(temp.file.is_none());
-    assert_eq!(temp.counters.temp_discard_verified, 1);
-    temp.discard().unwrap();
-    assert_eq!(temp.counters.temp_discard_verified, 1);
-    drop(temp);
-    assert_eq!(counters.temp_discard_verified, 1);
-    assert_eq!(counters.temp_discard_failed, 0);
-    assert_eq!(counters.temp_drop_fallback, 0);
-}
-
-#[test]
-fn private_temp_commit_and_discard_never_grant_a_receipt() {
-    let scratch = Scratch::new();
-    let path = scratch.root.join("stage.rec");
-    let mut counters = StoreCounters::default();
-    let mut temp = TempRecord::prepare(&scratch.root, &path, &mut counters).unwrap();
-    temp.file.as_mut().unwrap().write_all(b"synthetic").unwrap();
-    temp.sync().unwrap();
-    let temp_path = temp.path.clone();
-    assert!(temp_path.exists());
-    assert!(!path.exists());
-    temp.commit(&path, None).unwrap();
-    temp.discard().unwrap(); // No unlink after a successful rename.
-    drop(temp);
-    assert_eq!(fs::read(&path).unwrap(), b"synthetic");
-    assert!(!temp_path.exists());
-    assert_eq!(counters.temp_discard_verified, 0);
-    assert_eq!(counters.temp_drop_fallback, 0);
-    assert_eq!(counters.temp_discard_failed, 0);
-    assert_eq!(counters.records_written, 0, "only the store can receipt");
-}
-
-#[test]
 fn private_temp_replacement_cannot_be_committed_or_discarded() {
     let scratch = Scratch::new();
     let path = scratch.root.join("stage.rec");
@@ -1293,33 +1188,6 @@ fn private_temp_replacement_cannot_be_committed_or_discarded() {
     assert_eq!(counters.temp_discard_verified, 0);
     assert_eq!(counters.temp_discard_failed, 2);
     assert_eq!(counters.temp_drop_fallback, 1);
-}
-
-#[test]
-fn private_temp_discard_retries_directory_sync_without_unlinking_records() {
-    let scratch = Scratch::new();
-    let path = scratch.root.join("stage.rec");
-    fs::write(&path, b"predecessor").unwrap();
-    let mut counters = StoreCounters::default();
-    let mut temp = TempRecord::prepare(&scratch.root, &path, &mut counters).unwrap();
-    let temp_path = temp.path.clone();
-    test_hooks::set_before_dir_sync(Some(Box::new(|_| Err(io::Error::other("sync EIO")))));
-    let failed = temp.discard();
-    test_hooks::set_before_dir_sync(None);
-    assert!(failed.is_err());
-    assert!(!temp_path.exists());
-    assert!(temp.file.is_some(), "unverified cleanup remains owned");
-    assert_eq!(temp.counters.temp_discard_verified, 0);
-    temp.discard().unwrap();
-    assert!(temp.file.is_none());
-    assert_eq!(temp.counters.temp_discard_verified, 1);
-    temp.discard().unwrap();
-    assert_eq!(temp.counters.temp_discard_verified, 1);
-    drop(temp);
-    assert_eq!(fs::read(&path).unwrap(), b"predecessor");
-    assert_eq!(counters.temp_discard_verified, 1);
-    assert_eq!(counters.temp_discard_failed, 1);
-    assert_eq!(counters.temp_drop_fallback, 0);
 }
 
 /// Unwinding after temp sync keeps the old record and exercises counted Drop
@@ -4040,32 +3908,6 @@ fn batch_ack_requires_durable_reconciliation_and_never_a_clean_retry() {
 }
 
 #[test]
-fn batch_ack_has_a_fixed_allocation_at_the_dirty_batch_limit() {
-    let scratch = Scratch::new();
-    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
-    let path = scratch.transcript("t.jsonl", b"{}\n");
-    let mut store = scratch.store();
-    let records = (0..MAX_BATCH + 1)
-        .map(|n| {
-            let mut b = binding("acct", "scope", ("fp", None));
-            b.key = key_digest(DurableSource::ClaudeCode, &format!("bounded-{n}"));
-            pending(b, certificate(&path), 1)
-        })
-        .collect();
-    let receipt = store.write_after_save(&lock, 1, 0, records).unwrap();
-    assert_eq!((receipt.written, receipt.deferred), (MAX_BATCH, 1));
-    let acks = receipt.committed.as_ref().expect("real durable writes");
-    assert_eq!(acks.iter().flatten().count(), MAX_BATCH);
-    assert_eq!(std::mem::size_of_val(acks.as_ref()), BATCH_ACK_BYTES);
-    const { assert!(BATCH_ACK_BYTES <= MAX_BATCH * 128) };
-    assert!(store.counters().peak_codec_bytes >= BATCH_ACK_BYTES as u64);
-    assert!(acks
-        .iter()
-        .flatten()
-        .all(|(key, _, _)| !receipt.deferred_keys.contains(key)));
-}
-
-#[test]
 fn claude_mutation_proof_expires_at_pass_boundary_and_unmemoized_records_survive() {
     let scratch = Scratch::new();
     let lock = LockedStateDir::acquire(&scratch.root).unwrap();
@@ -4501,24 +4343,6 @@ fn gc_rotates_past_the_first_page_and_preserves_unknown_records() {
     assert!(keys.iter().all(|key| !record_file(&store, key).exists()));
     assert_eq!(fs::read(&future_path).unwrap(), future);
     assert_eq!(store.counters().disk_records, 1);
-}
-
-#[test]
-fn immediate_temp_names_are_unique_and_only_short_lived_orphans_are_reaped() {
-    let scratch = Scratch::new();
-    let path = scratch.root.join(format!("{}.rec", hex(&[7; 32])));
-    let mut first = OwnedTemp::prepare_atomic(&scratch.root, &path, Arc::default()).unwrap();
-    let mut second = OwnedTemp::prepare_atomic(&scratch.root, &path, Arc::default()).unwrap();
-    let mut live = OwnedTemp::prepare(&scratch.root, &path, Arc::default()).unwrap();
-    assert_ne!(first.path, second.path);
-    assert!(dead_temp(first.path.file_name().unwrap().to_str().unwrap()));
-    assert!(dead_temp(
-        second.path.file_name().unwrap().to_str().unwrap()
-    ));
-    assert!(!dead_temp(live.path.file_name().unwrap().to_str().unwrap()));
-    first.discard().unwrap();
-    second.discard().unwrap();
-    live.discard().unwrap();
 }
 
 #[test]

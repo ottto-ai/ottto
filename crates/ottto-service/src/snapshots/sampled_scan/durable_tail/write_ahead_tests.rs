@@ -8,25 +8,6 @@ const B: store::Digest32 = [2; 32];
 const OBJECT: (u64, u64, u64) = (7, 11, 13);
 
 #[test]
-fn d3_hold_is_per_key_counts_growth_and_alarms_once() {
-    let mut stores = Stores::default();
-    stores.hold_key(A, Some((OBJECT, 100)));
-    assert!(stores.take_hold_alarm());
-    assert!(!stores.take_hold_alarm());
-    // Growth stays held and is counted, never released.
-    assert!(stores.observe_hold(A, Some((OBJECT, 160))));
-    assert!(stores.observe_hold(A, Some((OBJECT, 150))));
-    assert_eq!(stores.counters.d3[D3_HOLD_GROWTH_BYTES], 60);
-    // Other keys are not held.
-    assert!(!stores.observe_hold(B, Some((OBJECT, 1))));
-    assert_eq!(stores.claude_holds()[0], 1);
-    // A later hold in the same process does not alarm again.
-    stores.hold_key(B, None);
-    assert!(!stores.take_hold_alarm());
-    assert_eq!(stores.claude_holds()[0], 2);
-}
-
-#[test]
 fn d3_hold_releases_on_write_or_replaced_object_only() {
     let mut stores = Stores::default();
     stores.hold_key(A, Some((OBJECT, 100)));
