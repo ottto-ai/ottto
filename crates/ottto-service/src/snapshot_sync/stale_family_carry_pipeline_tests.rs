@@ -2798,6 +2798,16 @@ fn terminal_off_on_latch_contract_money_both_arms_preserve_accepted_grown_held_a
                     assert_eq!(saved["claude_request_identity_contract_changed"], true);
                     assert_eq!(saved["claude_duplicate_request_witness_overflowed"], true);
                     assert!(retry.iter().all(|page| !page.scan.census_complete));
+                    if case == "accepted" && !base {
+                        let (second, rows) = source_latch_generation(&fixture, 25, RearmUpload::Accept, None);
+                        assert!(!rearm_parsed(&second).contains(session), "second latched start stays quiet {e2}");
+                        assert_eq!(fixture.body_trace.borrow().finalizer_bodies[session], accepted);
+                        for row in &rows {
+                            if let Some(rearmed) = row["counts"]["rearmed_index_files"].as_u64() {
+                                eprintln!("r11_second_start rearmed_index_files={rearmed} e2={e2}");
+                            }
+                        }
+                    }
                     if case == "accepted" {
                         RearmFixture::append(
                             &path,

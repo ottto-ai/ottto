@@ -272,6 +272,11 @@ impl ScanIndex {
     }
 
     pub(super) fn file_upload_context_requires_adoption(&self, key: &str) -> bool {
+        // Observe invalidations even when another context gate already settles
+        // this query, so switching back cannot resurrect an earlier held hit.
+        let held_context_seen = claude_terminal_off()
+            && self.mixed_context_view.claude
+            && terminal_off_held_context_seen(self, key);
         // Per-file evidence narrows the existing source-wide debt. An already
         // adopted source stays quiet even without receipts (including upgrades).
         if self.upload_context_fingerprint == self.active_upload_context_fingerprint {
@@ -296,7 +301,7 @@ impl ScanIndex {
                 && self.mixed_context_view.claude
                 && terminal_off_empty_context_seen(self, key));
         }
-        !(self.mixed_context_view.claude && terminal_off_held_context_seen(self, key))
+        !held_context_seen
             && !self.mixed_terminal_context_settled(key)
             && self
                 .files
