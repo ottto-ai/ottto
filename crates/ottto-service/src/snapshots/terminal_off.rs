@@ -1054,7 +1054,7 @@ impl ScanIndex {
         }
         let runnable = keys
             .iter()
-            .filter(|key| !terminal_off_discovery::retry_blocked(self, key))
+            .filter(|key| !terminal_off_discovery::held_retry_blocked(self, key))
             .cloned()
             .collect::<Vec<_>>();
         if let Some(traversal) = self.traversal.as_mut() {

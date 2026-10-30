@@ -40,6 +40,8 @@ struct Observation {
     served: Option<(Option<Stat>, [u8; 32])>,
     served_root: Option<[u8; 32]>,
     served_at: Option<u64>,
+    // Explicit per-key hold custody, independent of sweep/proof family roots.
+    held_retry: bool,
 }
 #[derive(Clone, Default)]
 struct Walk {
@@ -416,6 +418,7 @@ pub(super) fn walk_path(
         if metadata.len() > MAX_CLAUDE_JSONL_FILE_BYTES {
             o.served = Some((stat, [0; 32]));
             o.served_at = Some(now);
+            o.held_retry = false; // Classification belongs to this parse's settlement.
         }
         if enqueue_suppressed {
             WalkPath::ObserveOnly
@@ -604,7 +607,7 @@ pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
 }
 
 crate::heap_layout_bound::fields!(Stat; length, modified, identity, birth);
-crate::heap_layout_bound::fields!(Observation; stat, round, first_seen, targeted, served, served_root, served_at);
+crate::heap_layout_bound::fields!(Observation; stat, round, first_seen, targeted, served, served_root, served_at, held_retry);
 crate::heap_layout_bound::fields!(Walk; now, last_walk, coalesced_since, round, suppressing, target_cursor, held_roots, oversized, observations);
 
 pub(super) fn retry_blocked(index: &ScanIndex, key: &str) -> bool {
@@ -619,8 +622,32 @@ pub(super) fn retry_blocked(index: &ScanIndex, key: &str) -> bool {
         .and_then(|m| Stat::capture(&m));
     let token = revision(index, key);
     with_walks(|m| {
-        m.get(&scope).is_some_and(|w| {
-            blocked(w, key, stat, Some(token)) || sampled_audit::candidate_open_blocked(key, w.now)
-        })
+        let Some(walk) = m.get(&scope) else { return false; };
+        // Explicit non-blocking custody survives traversal starts in the same
+        // bounded RAM observation map. It never borrows held_family_roots,
+        // which owns distinct sweep/proof semantics. Real object/context
+        // changes and unknown identity fail toward another read.
+        let held_key_blocked = stat.is_some_and(|s| s.identity.is_some() && s.modified.is_some() && s.birth > 0)
+            && m.values().any(|prior| prior.observations.get(&digest(key)).is_some_and(|o| {
+                o.held_retry
+                    && o.served_at.is_some_and(|at| walk.now < at.saturating_add(6 * 3600))
+                    && o.served == Some((stat, token))
+            }));
+        held_key_blocked || blocked(walk, key, stat, Some(token))
+            || sampled_audit::candidate_open_blocked(key, walk.now)
     })
+}
+
+/// Register the keys actually returned by local hold settlement. Querying or
+/// re-enqueueing never renews served_at; only an actual parse can do that.
+pub(super) fn held_retry_blocked(index: &ScanIndex, key: &str) -> bool {
+    if !claude_terminal_off() { return false; }
+    if let Some(scope) = terminal_off_rediscovery_scope(index) {
+        with_walks(|memo| {
+            if let Some(o) = memo.get_mut(&scope).and_then(|walk| walk.observations.get_mut(&digest(key))) {
+                o.held_retry = true;
+            }
+        });
+    }
+    retry_blocked(index, key)
 }
