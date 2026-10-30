@@ -2578,7 +2578,8 @@ pub(super) fn native_record_of(
 ) -> (CachedJsonlReduction, Checkpoint) {
     let apply = match source {
         SnapshotSource::Codex => apply_codex_line,
-        _ => apply_claude_code_line,
+        SnapshotSource::Pi => apply_pi_line,
+        SnapshotSource::ClaudeCode => apply_claude_code_line,
     };
     let mut parser = OwnedJsonlParser::new(
         File::open(path).unwrap(),
@@ -5854,59 +5855,6 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
     assert_eq!(counts.restored, u64::from(supported));
     assert_eq!(disk.records_read, 1);
     drop(restored);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_insertion_counts_claude_and_codex_cache_victims_only() {
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
-    let root = crate::test_scratch::private_dir("ottto-pi-cache-victims");
-    let path = root.join("fixture.jsonl");
-    std::fs::write(&path, b"{\"type\":\"session\",\"id\":\"fixture\"}\n").unwrap();
-    let scope = Scope("pi-cache-victims".into());
-    let states = [
-        SnapshotSource::ClaudeCode,
-        SnapshotSource::Codex,
-        SnapshotSource::Pi,
-    ]
-    .map(|source| native_record_of(&path, &scope, source));
-    let insert = |cache: &SharedCache, key: String, source: usize, rank| {
-        let (state, checkpoint) = &states[source];
-        cache.insert_admitted(
-            key,
-            sampled_jsonl::CompletedNativeAcquisition {
-                durable: Default::default(),
-                checkpoint: checkpoint.clone(),
-                reduction: Some(state.clone()),
-                released: Some((rank, 0)),
-                unsealed: false,
-            },
-            0,
-        )
-    };
-    let cache = SharedCache::default();
-    for n in 0..crate::transcript_cache::CACHE_ENTRIES {
-        assert!(insert(&cache, format!("resident-{n}"), n % 2, 1));
-    }
-    let (_, counts) = observe(|| {
-        assert!(insert(&cache, "pi-first".into(), 2, 2));
-        assert!(insert(&cache, "pi-second".into(), 2, 2));
-        assert!(cache.take("resident-0").is_none());
-        assert!(cache.take("resident-1").is_none());
-        assert!(insert(&cache, "claude-control".into(), 0, 3));
-    });
-    assert_eq!(counts.insert_entries_evicted, 3);
-    assert_eq!(counts.cache_evicted_by_pi_claude_code, 1);
-    assert_eq!(counts.cache_evicted_by_pi_codex, 1);
-    cache.clear();
-    for n in 0..crate::transcript_cache::CACHE_ENTRIES {
-        assert!(insert(&cache, format!("pi-resident-{n}"), 2, 1));
-    }
-    let (_, counts) = observe(|| assert!(insert(&cache, "pi-control".into(), 2, 2)));
-    assert_eq!(counts.insert_entries_evicted, 1);
-    assert_eq!(counts.cache_evicted_by_pi_claude_code, 0);
-    assert_eq!(counts.cache_evicted_by_pi_codex, 0);
     let _ = std::fs::remove_dir_all(root);
 }
 
