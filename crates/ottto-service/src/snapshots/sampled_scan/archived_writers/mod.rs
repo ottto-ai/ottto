@@ -188,7 +188,7 @@ fn synthetic_tokens_sha256() -> String {
     format!("{:x}", Sha256::digest(tokens.as_bytes()))
 }
 
-/// A second, minimal archive, in the file form Lead B's writer would take.
+/// A second, minimal archive, in the same file form as a real one.
 fn synthetic_archive(sha: &str, pinned: &str) -> String {
     format!(
         "const SOURCE_SHA: &str = \"{sha}\";\n\
@@ -321,6 +321,11 @@ fn archived_writer_cannot_reach_production_paths() {
     assert_text_edit_refused(
         "use sha2::{Digest, Sha256};\n\npub(crate) struct W_53d05a43;",
         "use crate::snapshots::SnapshotSource;\n\npub(crate) struct W_53d05a43;",
+        "archive reaches outside itself",
+    );
+    assert_text_edit_refused(
+        "use super::{decode_hex,",
+        "use super::super::{decode_hex,",
         "archive reaches outside itself",
     );
 }
@@ -493,18 +498,4 @@ fn archived_writer_git_mode_compares_the_named_commit() {
         error.contains("archive region differs from its commit"),
         "{error}"
     );
-}
-
-// TEMPORARY golden capture; removed once BODY_GOLDENS is filled in.
-#[test]
-fn archived_writer_capture_body_goldens() {
-    use crate::snapshots::SnapshotSource;
-    for (tag, source) in [(1, SnapshotSource::ClaudeCode), (2, SnapshotSource::Codex)] {
-        let body = crate::snapshots::durable_store_fixture_body(source, 1, 7);
-        let hex = body
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        println!("GOLDEN-CAPTURE {tag} {hex}");
-    }
 }

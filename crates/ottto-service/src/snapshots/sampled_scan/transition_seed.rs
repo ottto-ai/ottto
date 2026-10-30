@@ -494,9 +494,12 @@ fn pinned_v1_accepts_test_only_serializers_outside_catalog() {
         verify_pinned_sources(Some(("fixture_added_source.rs", changed))),
         Ok(())
     );
-    let changed = "crate::durable_tail_codec::durable_struct!(Added { N n: u64 });";
+    // This file owns the archive modules, so a stand-in must still declare them.
+    let changed = format!(
+        "#[path = \"archived_writers/mod.rs\"] mod archived_writers;\n{ADDED_SERIALIZER}"
+    );
     assert_eq!(
-        verify_pinned_sources(Some(("snapshots/sampled_scan/transition_seed.rs", changed))),
+        verify_pinned_sources(Some(("snapshots/sampled_scan/transition_seed.rs", &changed))),
         Ok(())
     );
 }

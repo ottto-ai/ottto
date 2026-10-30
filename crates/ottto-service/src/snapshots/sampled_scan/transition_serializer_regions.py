@@ -701,6 +701,8 @@ def verify_archive(sources, wanted, text_only, source_root):
         if token == "crate" and all_tokens[at + 1:at + 2] == [":"]:
             if all_tokens[at:at + len(prefix)] != prefix:
                 raise ValueError("archive reaches outside itself: " + "".join(all_tokens[at:at + 9]))
+        if all_tokens[at:at + 4] == ["super", ":", ":", "super"]:
+            raise ValueError("archive reaches outside itself: super::super")
     blocks = archive_blocks(text)
     declared = ARCHIVE_REGION.findall(text)
     if {unit for unit, _, _ in declared} != set(blocks) or len(declared) != len(blocks):
@@ -754,7 +756,7 @@ def main():
     parser.add_argument("--archive")
     parser.add_argument("--archive-text-only", action="store_true")
     args = parser.parse_args()
-    if args.archive:
+    if args.archive is not None:
         sources = archive_sources(args.source_root)
         sources.update(json.load(sys.stdin))
         result = verify_archive(sources, args.archive, args.archive_text_only, args.source_root)

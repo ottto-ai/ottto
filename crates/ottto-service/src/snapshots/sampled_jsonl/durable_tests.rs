@@ -1517,3 +1517,28 @@ fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
         );
     });
 }
+
+/// The seed's archive comparison runs only in the native rows; this covers the
+/// same rewrite for populated bodies on every platform.
+#[test]
+fn populated_bodies_match_the_archived_v1_writer() {
+    use crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::{
+        ArchivedWriter, W_53d05a43,
+    };
+    for case in cases() {
+        let scratch = Scratch::new("archived-writer");
+        let path = scratch.write("t.jsonl", &case.lines);
+        let (reduction, _) = full_read(&path, case.source);
+        let body = encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        )
+        .unwrap();
+        let source_tag = match case.source {
+            SnapshotSource::ClaudeCode => 1,
+            _ => 2,
+        };
+        assert_eq!(W_53d05a43::encode_body(source_tag, &body), Ok(body));
+    }
+}
