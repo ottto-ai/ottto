@@ -23920,11 +23920,31 @@ mod tests {
                     assert_eq!(result.is_err(), disposition == "partial");
                     for item in &items {
                         assert!(
-                            !negative.contains_body(
+                            !negative
+                                .accepted_fingerprints
+                                .contains(&item.snapshot_fingerprint),
+                            "{source:?}/{disposition}"
+                        );
+                        assert!(
+                            !negative
+                                .accepted_body_witnesses
+                                .contains_key(&item.snapshot_fingerprint),
+                            "{source:?}/{disposition}"
+                        );
+                        assert!(
+                            !negative
+                                .fresh_context_body_acks
+                                .contains_key(&item.snapshot_fingerprint),
+                            "{source:?}/{disposition}"
+                        );
+                        // Held/refused bodies retain intentional resend
+                        // suppression, which is separate from stored ACK credit.
+                        assert_eq!(
+                            negative.contains_body(
                                 &item.snapshot_fingerprint,
                                 &snapshot_upload_body_witness(item)
                             ),
-                            "{source:?}/{disposition}"
+                            disposition != "partial"
                         );
                     }
                 }
