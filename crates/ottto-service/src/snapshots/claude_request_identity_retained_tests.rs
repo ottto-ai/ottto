@@ -423,7 +423,8 @@ fn retained_fallback_keeps_only_the_newest_markers_that_fit() {
 fn retained_golden_cases() -> Value {
     let mut cases = BTreeMap::new();
     let (mut original, mut proof) = retained_session(4);
-    sticky_price_fixture(&mut original, &mut proof);
+    // Every cost everywhere: an unpriced rollup would strip these markers.
+    sticky_price_rows(&mut original, &mut proof, |_, _| true);
     let mut state = retained_state();
     let mut first = original.clone();
     sticky_apply(&mut first, &proof, &state).unwrap();
@@ -431,6 +432,8 @@ fn retained_golden_cases() -> Value {
     let mut marked = original.clone();
     sticky_apply(&mut marked, &proof, &state).unwrap();
     sticky_assert_reconciled(&marked);
+    assert_eq!(retained_marked(&marked), vec![true, true, true, false]);
+    assert!(sticky_tagged(&marked.usage_buckets[3].model_usage[0]));
     cases.insert("marker_closed_rows_open_hour_fresh_proving", sticky_wire(first.clone()));
     cases.insert("marker_with_changed_proof_fresh_proving", sticky_wire(first.clone()));
     cases.insert("marker_closed_rows_open_hour_fresh", sticky_wire(marked));
@@ -439,15 +442,17 @@ fn retained_golden_cases() -> Value {
     let mut changed = original.clone();
     sticky_apply(&mut changed, &changed_proof, &state).unwrap();
     sticky_assert_reconciled(&changed);
+    assert_eq!(retained_marked(&changed), vec![true, false, true, false]);
     cases.insert("marker_with_changed_proof_fresh", sticky_wire(changed));
 
     let (mut window, mut window_proof) = retained_session(576);
-    sticky_price_fixture(&mut window, &mut window_proof);
+    sticky_price_rows(&mut window, &mut window_proof, |_, _| true);
     let mut window_state = retained_state();
     let mut tagged = window.clone();
     sticky_apply(&mut tagged, &window_proof, &window_state).unwrap();
     retained_ack(&mut window_state, &tagged, &[]);
     sticky_apply(&mut window, &window_proof, &window_state).unwrap();
+    assert!(retained_marked(&window).iter().any(|marked| *marked));
     cases.insert("marker_window_proving", sticky_wire(tagged));
     cases.insert("marker_window", sticky_wire(window));
 
@@ -498,6 +503,18 @@ fn retained_golden_cases() -> Value {
     assert!(refusal.request_identity_refusals > 0);
     cases.insert("counted_refusal_after_proof_proving", sticky_wire(login_first));
     cases.insert("counted_refusal_after_proof", sticky_wire(refusal));
+    // r7's strip wins over proof: refused and counted, never marked.
+    let (mut unpriced, mut unpriced_proof) = retained_session(4);
+    sticky_price_fixture(&mut unpriced, &mut unpriced_proof);
+    let mut unpriced_state = retained_state();
+    let mut unpriced_first = unpriced.clone();
+    sticky_apply(&mut unpriced_first, &unpriced_proof, &unpriced_state).unwrap();
+    retained_ack(&mut unpriced_state, &unpriced_first, &[]);
+    sticky_apply(&mut unpriced, &unpriced_proof, &unpriced_state).unwrap();
+    assert_eq!(retained_marked(&unpriced), vec![false; 4]);
+    assert!(unpriced.request_identity_refusals > 0);
+    cases.insert("unpriced_strip_after_proof_proving", sticky_wire(unpriced_first));
+    cases.insert("unpriced_strip_after_proof", sticky_wire(unpriced));
     for case in cases.values() {
         assert!(
             serde_json::to_vec(&case["snapshots"][0]).unwrap().len() <= identity::MAX_ITEM_BYTES

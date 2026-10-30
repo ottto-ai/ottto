@@ -1578,10 +1578,17 @@ fn sticky_new_untagged_presence_does_not_bless_a_later_missing_share() {
 }
 
 fn sticky_price_fixture(item: &mut SnapshotItem, proof: &mut [Contribution]) {
+    sticky_price_rows(item, proof, |hour, field| (hour + field) % 4 != 0);
+}
+fn sticky_price_rows(
+    item: &mut SnapshotItem,
+    proof: &mut [Contribution],
+    priced: impl Fn(usize, usize) -> bool,
+) {
     for (hour, bucket) in item.usage_buckets.iter_mut().enumerate() {
         let row = &mut bucket.model_usage[0];
         let money = std::array::from_fn::<_, 5, _>(|field| {
-            ((hour + field) % 4 != 0).then_some((field as u128 + 1) * 1_000_000)
+            priced(hour, field).then_some((field as u128 + 1) * 1_000_000)
         });
         for (slot, value) in [
             &mut row.cost_usd,
