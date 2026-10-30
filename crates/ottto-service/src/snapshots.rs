@@ -215,6 +215,9 @@ mod collector_version_tests {
 pub const SNAPSHOT_SCHEMA_VERSION: u16 = 6;
 pub const SNAPSHOT_ENTITY_ACK_CONTRACT: &str = "snapshot_entity_ack:v1";
 pub const SNAPSHOT_HEAD_CAS_CONTRACT: &str = "snapshot_head_etag:v1";
+/// Backend money-decrease holds: a held request-owned literal body is
+/// refused as retryable (`permanent=false`) instead of being applied.
+pub const USAGE_DECREASE_HOLD_ACK_CONTRACT: &str = "usage_decrease_hold_ack:v1";
 // SnapshotStatusRequest endpoint stayed at v5; only the batch endpoint
 // cut over to v6 in this change. Backend's AgentSessionSnapshotStatusRequest
 // is still Literal[5] (backend/app/schemas/agent_session_snapshots.py).
@@ -1491,6 +1494,16 @@ impl SnapshotBatchRequest {
     }
 }
 
+/// The batch declares `usage_decrease_hold_ack:v1`: a Claude batch carrying
+/// at least one request-owned literal body.
+pub(crate) fn declares_usage_decrease_hold_ack(request: &SnapshotBatchRequest) -> bool {
+    snapshot_source_from_api_slug(&request.source) == Some(SnapshotSource::ClaudeCode)
+        && request
+            .snapshots
+            .iter()
+            .any(claude_history_upgrade::is_request_owned_literal)
+}
+
 fn serialize_snapshot_batch<S: Serializer>(
     request: &SnapshotBatchRequest,
     enforce_head_cas: bool,
@@ -1517,7 +1530,7 @@ fn serialize_snapshot_batch<S: Serializer>(
             })
         })
         .collect::<Result<Vec<_>, S::Error>>()?;
-    let mut state = serializer.serialize_struct("SnapshotBatchRequest", 8)?;
+    let mut state = serializer.serialize_struct("SnapshotBatchRequest", 9)?;
     state.serialize_field("schema_version", &request.schema_version)?;
     state.serialize_field("source", &request.source)?;
     state.serialize_field("machine_id", &request.machine_id)?;
@@ -1526,6 +1539,14 @@ fn serialize_snapshot_batch<S: Serializer>(
     // forward-tolerant ingest model and ignore it; capable backends echo it
     // and may return a complete per-entity outcome partition.
     state.serialize_field("entity_ack_contract", SNAPSHOT_ENTITY_ACK_CONTRACT)?;
+    // Only Claude request-owned literal batches opt into money-decrease
+    // holds; every other batch keeps its released envelope bytes.
+    if declares_usage_decrease_hold_ack(request) {
+        state.serialize_field(
+            "usage_decrease_hold_ack_contract",
+            USAGE_DECREASE_HOLD_ACK_CONTRACT,
+        )?;
+    }
     if enforce_head_cas {
         state.serialize_field("head_cas_contract", SNAPSHOT_HEAD_CAS_CONTRACT)?;
     }
@@ -14825,9 +14846,9 @@ fn snapshot_upload_body_witness_payload(item: &SnapshotItem) -> serde_json::Valu
     if let Some(observations) = &item.cache_observations {
         payload.insert(
             "cache_observations_state".into(),
-            item.cache_observations_state
-                .clone()
-                .unwrap_or_else(|| cache_state_from_patch(None, observations)),
+            item.cache_observations_state.clone().unwrap_or_else(|| {
+                cache_state_from_patch(None, observations).expect("no accepted rows to parse")
+            }),
         );
     }
     if let Some(context_curve) = &item.context_curve {
@@ -18479,6 +18500,13 @@ impl SnapshotAccumulator {
         } else if has_history_base {
             // Paginated forks keep inherited history behind an external
             // history_base reference. Physical records in this file are local.
+            // Only a first physical own header may start the optional creator
+            // sequence. Other AllLocal arms leave this cursor unset.
+            if self.codex_creator_header_id.is_some()
+                && codex_paginated_fork_creation_header(value, meta)
+            {
+                self.codex_ordinal_expected = u64_at(value, &["ordinal"]);
+            }
             CodexOwnershipBoundary::AllLocal
         } else if is_subagent && forked_from_id.is_some() {
             CodexOwnershipBoundary::AwaitingLegacyTrigger
@@ -18568,6 +18596,15 @@ impl SnapshotAccumulator {
                 false
             }
             CodexOwnershipBoundary::AllLocal => {
+                // Validate only the optional creation witness. Usage retains its
+                // existing AllLocal semantics even if this sequence is broken.
+                if self.codex_ordinal_expected.is_some() {
+                    let ordinal = u64_at(value, &["ordinal"]);
+                    if ordinal.is_none() || ordinal != self.codex_ordinal_expected {
+                        self.codex_ordinal_sequence_valid = false;
+                    }
+                    self.codex_ordinal_expected = ordinal.and_then(|at| at.checked_add(1));
+                }
                 self.codex_owned_record_seen = true;
                 true
             }
@@ -20560,12 +20597,17 @@ impl SnapshotAccumulator {
             // Native ordinal forks have their own creation-time creator pair.
             // The first physical header/file/time gates prove its origin;
             // the independently validated boundary still owns usage, not identity.
+            // AllLocal has a cursor only for the exact external paginated own
+            // header; its local sequence and complete acquisition must survive.
             && (!self.codex_is_fork
                 || matches!(
                     self.codex_ownership_boundary,
                     CodexOwnershipBoundary::NativeCreatedThread
                         | CodexOwnershipBoundary::Ordinal { .. }
-                )))
+                )
+                || (self.codex_ownership_boundary == CodexOwnershipBoundary::AllLocal
+                    && self.codex_ordinal_sequence_valid
+                    && self.codex_ordinal_expected.is_some())))
         .then(|| self.codex_creator_evidence.clone())
         .flatten()
         .filter(|evidence| {
@@ -20909,6 +20951,8 @@ impl SnapshotAccumulator {
             self.cache_observations =
                 codex_cache_wire_for_requests(&source_session_id, &self.cache_requests);
             if !self.cache_requests_complete {
+                // The book exceeded 65,536 records or the physical read report
+                // was incomplete: neither can certify an exact overflow count.
                 self.cache_observations = Some(CacheObservations {
                     schema_version: 1,
                     operations: Vec::new(),
@@ -28642,6 +28686,12 @@ impl OwnedSourceScan {
                     if let Some(plan) = active.parser.reader.acquisition.as_ref() {
                         context.record_input(plan.metrics());
                         resource_probe.rearm_full_completed(
+                            &local_index_key(&active.candidate.path),
+                            plan.mode(),
+                            plan.metrics().native_bytes,
+                        );
+                        #[cfg(unix)]
+                        context.cache.durable_acquisition_completed(
                             &local_index_key(&active.candidate.path),
                             plan.mode(),
                             plan.metrics().native_bytes,
@@ -36554,6 +36604,34 @@ fn codex_session_id_is_native_parent(meta: &Value, session_id: &str) -> bool {
                 .is_some_and(|id| id != parent && id != session_id))
 }
 
+/// The referenced parent history is external: local ordinals begin exactly
+/// where that parent's paginated base ends. This proves only this header's own
+/// creation claim; the caller must still prove first-record/file/stream ownership.
+fn codex_paginated_fork_creation_header(value: &Value, meta: &Value) -> bool {
+    if !string_eq_at(meta, &["history_mode"], "paginated")
+        || string_eq_at(meta, &["thread_source"], "subagent")
+        || string_eq_at(meta, &["thread_source"], "agent_created_thread")
+        || meta.pointer("/source/subagent").is_some()
+        || meta.get("subagent_history_start_ordinal").is_some()
+    {
+        return false;
+    }
+    let Some(id) = resolve_codex_identity_option(codex_identity_at(meta, &["id"])) else {
+        return false;
+    };
+    let Some(parent) = resolve_codex_identity_option(codex_identity_at(meta, &["forked_from_id"]))
+    else {
+        return false;
+    };
+    id != parent
+        && resolve_codex_identity_option(codex_identity_at(meta, &["session_id"])) == Some(id)
+        && resolve_codex_identity_option(codex_identity_at(meta, &["history_base", "thread_id"]))
+            == Some(parent)
+        && u64_at(value, &["ordinal"]).is_some_and(|ordinal| {
+            u64_at(meta, &["history_base", "end_ordinal_exclusive"]) == Some(ordinal)
+        })
+}
+
 /// Capture the first physical header before applying the ownership boundary.
 /// Raw creator fields are accepted only as a complete provider pair/time.
 /// The caller separately proves first physical record and logical-session ownership.
@@ -36565,8 +36643,12 @@ fn codex_creator_header_evidence(value: &Value, meta: &Value) -> Option<SessionA
             return None;
         }
     }
-    // A later physical ordinal cannot prove original logical-session creation.
-    if value.get("ordinal").is_some() && u64_at(value, &["ordinal"]) != Some(0) {
+    // A positive ordinal needs the exact external parent boundary. First
+    // physical record, complete acquisition and local sequence are gated later.
+    if value.get("ordinal").is_some()
+        && u64_at(value, &["ordinal"]) != Some(0)
+        && !codex_paginated_fork_creation_header(value, meta)
+    {
         return None;
     }
     let account_identifier_hash = ottto_core::billing_identity_hash(
@@ -36670,17 +36752,18 @@ fn apply_codex_envelope_line(value: &Value, accumulator: &mut SnapshotAccumulato
     accumulator.codex_session_meta_seen = true;
 }
 
-pub(crate) fn cache_state_from_patch(previous: Option<&Value>, patch: &CacheObservations) -> Value {
+/// Refuse a malformed accepted row rather than silently dropping its bytes/row
+/// from the cumulative bound. No patch can authorize that implicit deletion.
+pub(crate) fn cache_state_from_patch(
+    previous: Option<&Value>,
+    patch: &CacheObservations,
+) -> Option<Value> {
     let mut observations = BTreeMap::<String, cache_observations::Observation>::new();
-    if let Some(rows) = previous
-        .and_then(|state| state.get("observations"))
-        .and_then(Value::as_array)
-    {
-        for row in rows {
-            if let Ok(row) = serde_json::from_value::<cache_observations::Observation>(row.clone())
-            {
-                observations.insert(row.event_id.clone(), row);
-            }
+    if let Some(previous) = previous {
+        for row in previous.get("observations")?.as_array()? {
+            let row =
+                serde_json::from_value::<cache_observations::Observation>(row.clone()).ok()?;
+            observations.insert(row.event_id.clone(), row);
         }
     }
     for operation in &patch.operations {
@@ -36697,7 +36780,9 @@ pub(crate) fn cache_state_from_patch(previous: Option<&Value>, patch: &CacheObse
             }
         }
     }
-    json!({"schema_version":1,"observations":observations.into_values().collect::<Vec<_>>(),"coverage":patch.coverage,"omitted_observation_count":patch.omitted_observation_count})
+    Some(
+        json!({"schema_version":1,"observations":observations.into_values().collect::<Vec<_>>(),"coverage":patch.coverage,"omitted_observation_count":patch.omitted_observation_count}),
+    )
 }
 
 /// Preflight the exact wire and its completion against the ACKed predecessor.
@@ -36706,7 +36791,7 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
     let Some(patch) = item.cache_observations.as_ref() else {
         return;
     };
-    let desired = cache_state_from_patch(None, patch);
+    let desired = cache_state_from_patch(None, patch).expect("no accepted rows to parse");
     let ids = desired["observations"]
         .as_array()
         .into_iter()
@@ -36715,6 +36800,19 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
         .collect::<BTreeSet<_>>();
     let mut wire = patch.clone();
     if patch.coverage == "complete" {
+        // Keep the established complete-patch wire order. The selected Codex
+        // patch stays in session order for the partial fallback below.
+        wire.operations.sort_by(|a, b| {
+            let a = match a {
+                cache_observations::Operation::Upsert { observation } => &observation.event_id,
+                cache_observations::Operation::Retract { event_id } => event_id,
+            };
+            let b = match b {
+                cache_observations::Operation::Upsert { observation } => &observation.event_id,
+                cache_observations::Operation::Retract { event_id } => event_id,
+            };
+            a.cmp(b)
+        });
         for row in prior
             .and_then(|p| p["observations"].as_array())
             .into_iter()
@@ -36729,7 +36827,11 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
                 }
             }
         }
-        let state = cache_state_from_patch(prior, &wire);
+        let Some(state) = cache_state_from_patch(prior, &wire) else {
+            item.cache_observations = None;
+            item.cache_observations_state = None;
+            return;
+        };
         if wire.validate() && cache_state_within_limits(&state) {
             item.cache_observations_state = Some(state);
             item.cache_observations = Some(wire);
@@ -36753,23 +36855,25 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
     } else {
         None
     };
+    wire = patch.clone();
     wire.coverage = "partial".into();
     wire.operations.retain(|operation| {
         matches!(operation,
         cache_observations::Operation::Upsert { observation } if observation.status != "retracted")
     });
     loop {
-        let mut state = cache_state_from_patch(prior, &wire);
-        let missing = ids
+        let Some(mut state) = cache_state_from_patch(prior, &wire) else {
+            item.cache_observations = None;
+            item.cache_observations_state = None;
+            return;
+        };
+        let present = state["observations"]
+            .as_array()
+            .unwrap()
             .iter()
-            .filter(|id| {
-                !state["observations"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|row| row["event_id"].as_str() == Some(**id))
-            })
-            .count() as u64;
+            .filter_map(|row| row["event_id"].as_str())
+            .collect::<BTreeSet<_>>();
+        let missing = ids.difference(&present).count() as u64;
         wire.omitted_observation_count = overflow.and_then(|count| count.checked_add(missing));
         state["omitted_observation_count"] = json!(wire.omitted_observation_count);
         if wire.validate() && cache_state_within_limits(&state) {
@@ -36780,6 +36884,9 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
         // Removing a shrinking replacement can INCREASE completed bytes. Always
         // recompute the actual merge; do not assume monotonic sizes.
         if wire.operations.pop().is_none() {
+            // Withholding preserves accepted evidence, including possibly stale
+            // server coverage="complete": no cache metadata reaches the server.
+            // The Claude-only reread diagnostics do not count this upload refusal.
             item.cache_observations = None;
             item.cache_observations_state = None;
             return;
@@ -36830,6 +36937,8 @@ fn cache_wire_for_requests_inner(
         }
     }
     if conflict {
+        // Conflicting duplicate slots or unparseable timestamps cannot certify
+        // an overflow count. Identical replays were deduplicated above.
         return Some(CacheObservations {
             schema_version: 1,
             operations: Vec::new(),
@@ -36838,11 +36947,10 @@ fn cache_wire_for_requests_inner(
         });
     }
     if codex_prefix {
-        let (mut rows, overflow) = cache_observations::detect_unique_prefix(session, &unique);
-        if overflow == 0 {
-            // Preserve existing under-cap wire order and canonical body bytes.
-            rows.sort_by(|a, b| a.event_id.cmp(&b.event_id));
-        }
+        // Keep at most 64 selected rows in session order, including under cap:
+        // a byte-budget fallback must trim the latest selected request first.
+        // Preparation restores event-ID wire order when a complete patch fits.
+        let (rows, overflow) = cache_observations::detect_unique_prefix(session, &unique);
         return Some(CacheObservations {
             schema_version: 1,
             operations: rows
@@ -88530,6 +88638,225 @@ mod tests {
         }
     }
 
+    fn codex_paginated_creator_fixture() -> Value {
+        let mut header = codex_creator_header();
+        header["ordinal"] = json!(1361);
+        header["payload"]["thread_source"] = json!("user");
+        header["payload"]["forked_from_id"] = json!("019e253c-2222-7000-9000-bbbbbbbbbbbb");
+        header["payload"]["history_mode"] = json!("paginated");
+        header["payload"]["history_base"] = json!({
+            "thread_id":"019e253c-2222-7000-9000-bbbbbbbbbbbb",
+            "end_ordinal_exclusive":1361,"end_byte_offset":4096});
+        header
+    }
+
+    #[test]
+    fn codex_paginated_fork_own_creation_requires_exact_external_boundary() {
+        let header = codex_paginated_creator_fixture();
+        let id = header["payload"]["id"].as_str().unwrap();
+        let usage = |ordinal| {
+            json!({"timestamp":"2026-09-30T10:01:00Z","ordinal":ordinal,
+            "type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"input_tokens":100,"output_tokens":5},"model":"gpt-5.5"}}})
+        };
+        let mut cases = vec![("external_own_pair", vec![header.clone(), usage(1362)], true)];
+        for (name, pointer, value) in [
+            ("alias", "/payload/session_id", json!("other-session")),
+            ("missing_alias", "/payload/session_id", Value::Null),
+            ("partial_pair", "/payload/creator_user_id", Value::Null),
+            ("missing_pair", "/payload/creator_account_id", json!(" ")),
+            (
+                "wrong_parent",
+                "/payload/history_base/thread_id",
+                json!("other-parent"),
+            ),
+            (
+                "internal_parent",
+                "/payload/history_base/thread_id",
+                json!(id),
+            ),
+            (
+                "wrong_end",
+                "/payload/history_base/end_ordinal_exclusive",
+                json!(1360),
+            ),
+            ("internal_base", "/payload/history_mode", json!("inline")),
+            ("missing_parent", "/payload/forked_from_id", Value::Null),
+            ("subagent", "/payload/thread_source", json!("subagent")),
+            ("subagent_source", "/payload/source", json!({"subagent":{}})),
+            (
+                "future_creation",
+                "/payload/timestamp",
+                json!("2026-09-30T10:02:00Z"),
+            ),
+            ("missing_ordinal", "/ordinal", Value::Null),
+        ] {
+            let mut altered = header.clone();
+            *altered.pointer_mut(pointer).unwrap() = value;
+            cases.push((name, vec![altered, usage(1362)], false));
+        }
+        let mut self_fork = header.clone();
+        self_fork["payload"]["forked_from_id"] = json!(id);
+        self_fork["payload"]["history_base"]["thread_id"] = json!(id);
+        cases.push(("self_fork", vec![self_fork, usage(1362)], false));
+        cases.push((
+            "not_first_record",
+            vec![json!({"type":"turn_context"}), header.clone(), usage(1362)],
+            false,
+        ));
+        let mut zero = header.clone();
+        zero["ordinal"] = json!(0);
+        zero["payload"]["history_base"]["end_ordinal_exclusive"] = json!(0);
+        cases.push(("external_ordinal_zero", vec![zero.clone(), usage(1)], true));
+        zero["payload"]["history_base"] = json!({"cursor":"unproven"});
+        cases.push(("all_local_without_proof", vec![zero, usage(1)], false));
+        let mut conflict = header.clone();
+        conflict["ordinal"] = json!(1362);
+        conflict["payload"]["history_base"]["end_ordinal_exclusive"] = json!(1362);
+        conflict["payload"]["creator_user_id"] = json!("synthetic-conflicting-user");
+        assert!(codex_creator_header_evidence(&conflict, &conflict["payload"]).is_some());
+        cases.push((
+            "own_conflict",
+            vec![header.clone(), conflict, usage(1363)],
+            false,
+        ));
+        let mut parent = codex_creator_header();
+        parent["ordinal"] = json!(1362);
+        parent["payload"]["id"] = header["payload"]["forked_from_id"].clone();
+        parent["payload"]["session_id"] = parent["payload"]["id"].clone();
+        parent["payload"]["creator_user_id"] = json!("synthetic-parent-user");
+        cases.push((
+            "parent_pair_never_inherited",
+            vec![header.clone(), parent, usage(1363)],
+            false,
+        ));
+        cases.push(("ordinal_gap", vec![header.clone(), usage(1363)], false));
+        cases.push((
+            "ordinal_duplicate",
+            vec![header.clone(), usage(1361)],
+            false,
+        ));
+        let mut no_ordinal = usage(1362);
+        no_ordinal.as_object_mut().unwrap().remove("ordinal");
+        cases.push((
+            "local_ordinal_missing",
+            vec![header.clone(), no_ordinal, usage(1363)],
+            false,
+        ));
+        let mut subagent = codex_child_creator_header();
+        subagent["payload"]["forked_from_id"] = subagent["payload"]["session_id"].clone();
+        subagent["payload"]["subagent_history_start_ordinal"] = json!(1);
+        cases.push(("subagent_896_unchanged", vec![subagent, usage(1)], true));
+        for (name, records, expected) in cases {
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+            for record in &records {
+                apply_codex_line(record, &mut accumulator);
+            }
+            assert!(accumulator.codex_usage_accounting_complete(), "{name}");
+            if name != "subagent_896_unchanged" {
+                assert_eq!(
+                    accumulator.codex_ownership_boundary,
+                    CodexOwnershipBoundary::AllLocal,
+                    "{name}"
+                );
+            }
+            let mut items = codex_fork_creator_items(&records, id);
+            assert_eq!(items.len(), 1, "{name}");
+            assert_eq!(
+                (items[0].input_tokens, items[0].output_tokens),
+                (100, 5),
+                "{name}"
+            );
+            assert_eq!(
+                items[0].session_account_evidence.is_some(),
+                expected,
+                "{name}"
+            );
+            let mut legacy_records = records.clone();
+            for record in &mut legacy_records {
+                if let Some(meta) = record.get_mut("payload").and_then(Value::as_object_mut) {
+                    meta.remove("creator_user_id");
+                    meta.remove("creator_account_id");
+                }
+            }
+            let legacy = codex_fork_creator_items(&legacy_records, id);
+            let mut without_creator = serde_json::to_value(&items).unwrap();
+            for item in without_creator.as_array_mut().unwrap() {
+                item.as_object_mut()
+                    .unwrap()
+                    .remove("session_account_evidence");
+            }
+            assert_eq!(
+                without_creator,
+                serde_json::to_value(&legacy).unwrap(),
+                "creator-free {name}"
+            );
+            let mut request = valid_v6_batch_request();
+            request.source = "codex".into();
+            apply_upload_policy(SnapshotSource::Codex, &mut items, request.upload_policy);
+            request.snapshots = items;
+            let expected_pair = expected.then(|| json!({
+                "provider":"openai",
+                "account_identifier_hash":ottto_core::billing_identity_hash("openai", "account", "synthetic-user").unwrap(),
+                "provider_workspace_hash":ottto_core::billing_identity_hash("openai", "workspace", "synthetic-workspace").unwrap(),
+                "identity_hash_scheme":"provider-sha256:v1","evidence_source":"codex_creator_header:v1",
+                "source_created_at":"2026-09-30T10:00:00Z"}));
+            for wire in [
+                serde_json::to_value(&request).unwrap(),
+                serde_json::to_value(request.wire_with_head_cas()).unwrap(),
+            ] {
+                assert_eq!(
+                    wire["snapshots"][0].get("session_account_evidence"),
+                    expected_pair.as_ref(),
+                    "{name}"
+                );
+                assert!(
+                    !wire.to_string().contains("synthetic-"),
+                    "raw creator leaked: {name}"
+                );
+            }
+        }
+        let mut no_base = header.clone();
+        no_base["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("history_base");
+        assert!(codex_creator_header_evidence(&no_base, &no_base["payload"]).is_none());
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+        apply_codex_line(&no_base, &mut accumulator);
+        assert!(accumulator.codex_creator_evidence.is_none());
+        assert!(accumulator.codex_ordinal_expected.is_none());
+        assert!(codex_fork_creator_items(&[no_base, usage(1362)], id).is_empty());
+        assert!(codex_fork_creator_items(
+            &[header, usage(1362)],
+            "019e253c-3333-7000-9000-cccccccccccc"
+        )[0]
+        .session_account_evidence
+        .is_none());
+    }
+
+    #[test]
+    fn codex_paginated_fork_incomplete_acquisition_cannot_certify_creator() {
+        let header = codex_paginated_creator_fixture();
+        let id = header["payload"]["id"].as_str().unwrap();
+        let root = crate::test_scratch::ScratchDir::new("codex-paginated-creator-incomplete");
+        let path = root.join(format!("rollout-2026-09-30T10-00-00-{id}.jsonl"));
+        let usage = json!({"timestamp":"2026-09-30T10:01:00Z","ordinal":1362,
+            "type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"input_tokens":100,"output_tokens":5},"model":"gpt-5.5"}}});
+        for body in [
+            format!("malformed\n{header}\n{usage}\n"),
+            format!("{header}\n{usage}\nmalformed\n"),
+        ] {
+            fs::write(&path, body).unwrap();
+            let items =
+                parse_codex_jsonl_file(&path, "2026-09-30T10:05:00Z", "f".repeat(64)).unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!((items[0].input_tokens, items[0].output_tokens), (100, 5));
+            assert!(items[0].session_account_evidence.is_none());
+        }
+    }
+
     #[test]
     fn codex_fork_creator_own_header_ordinal_wire_corpus() {
         let mut header = codex_child_creator_header();
@@ -91877,7 +92204,7 @@ pub(crate) mod cache_adapter_tests {
         assert_eq!(overflow.coverage, "partial");
         assert_eq!(overflow.omitted_observation_count, Some(65));
         let patch = cache_wire_for_requests("s", &[warm.clone(), cold]).unwrap();
-        let prior = cache_state_from_patch(None, &patch);
+        let prior = cache_state_from_patch(None, &patch).unwrap();
         let current = cache_wire_for_requests("s", &[warm]).unwrap();
         let mut item = super::tests::sample_session_artifact_item();
         item.cache_observations = Some(current);
