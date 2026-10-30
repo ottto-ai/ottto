@@ -562,6 +562,66 @@ fn census_derivation_canary_pins_ids_and_shapes() {
     );
 }
 
+/// SOURCE early condition: the canary provably goes red when extraction
+/// changes without a bump. Each mutation is what the parser would yield after
+/// the named extraction change on the same fixture.
+#[test]
+fn census_derivation_canary_fails_on_a_missed_bump() {
+    let scratch = crate::test_scratch::ScratchDir::new("census-derivation-canary-red");
+    let root = scratch.join("projects");
+    write_census_corpus(&root);
+    let mut index = ScanIndex::default();
+    census_scan(&root, &mut index, FIRST_WINDOW);
+    let observed = observed_census_table(&index, &root);
+    assert_eq!(
+        canary_verdict(CLAUDE_REQUEST_CENSUS_DERIVATION, &observed),
+        Ok(())
+    );
+    let mutate = |name: &str, change: &dyn Fn(&mut CanaryRow)| {
+        let mut table = observed.clone();
+        change(table.get_mut(name).expect("canary fixture"));
+        table
+    };
+    let changes = [
+        // Zero-usage (API error) ids no longer collected.
+        mutate("canary-zero-usage.jsonl", &|entry| {
+            entry
+                .1
+                .retain(|hash| *hash != claude_request_hash("req_zero_err"))
+        }),
+        // An id-less response starts reporting its message id.
+        mutate("canary-id-less.jsonl", &|entry| {
+            entry.1.push(claude_request_hash("msg_idless_2"));
+            entry.1.sort_unstable();
+        }),
+        // A repeated id no longer marks the identity incomplete.
+        mutate("canary-repeated.jsonl", &|entry| {
+            entry.0 = "exact".to_string()
+        }),
+        // A provider-marked fork prefix is no longer excluded.
+        mutate("canary-forked.jsonl", &|entry| {
+            entry.1.push(claude_request_hash("req_fork_parent"));
+            entry.1.sort_unstable();
+        }),
+        // A dropped response becomes loss-free.
+        mutate("canary-invalid-fork.jsonl", &|entry| {
+            entry.0 = "exact".to_string()
+        }),
+    ];
+    for changed in &changes {
+        assert_ne!(changed, &observed);
+        let verdict = canary_verdict(CLAUDE_REQUEST_CENSUS_DERIVATION, changed);
+        assert!(
+            verdict
+                .as_ref()
+                .is_err_and(|reason| reason.contains("bump CLAUDE_REQUEST_CENSUS_DERIVATION")),
+            "{verdict:?}"
+        );
+    }
+    // A bump without a re-pinned digest is red too.
+    assert!(canary_verdict(CLAUDE_REQUEST_CENSUS_DERIVATION + 1, &observed).is_err());
+}
+
 /// TD1f (review F1, SOURCE S2(c)): a re-parse of a previously complete key
 /// that ends as residue, with copied ids, replaces the old record. The key is
 /// never covered by the old revision, and the copied ids join the census.
