@@ -507,16 +507,21 @@ fsynced staging precede BEGIN. The restart owner receives `post_commit` only aft
 an unambiguous durable COMMIT; Published/Ambiguous outcomes require reopening.
 
 The 5,000-mutation / 32 MiB soft target sizes the next collection page. A save over
-target still commits and halves the next page; a save under target grows it by
-25 files up to the requested page. Charged work includes old/new values, chunks,
+target still commits and halves the next page; a collection save under target
+grows it by 25 files up to the requested page. Claim-only saves preserve the page
+limit and any save-pressure hold. Charged work includes old/new values, chunks,
 reference updates, metadata, tombstones and restart staging. More than 256 MiB
 rolls back the whole save, reloads the committed graph and halves the page for a
 retry from committed checkpoints. If a page of one is still too large, the source
 holds with `state_v2_save_oversize` and an alarm. Uploads and ACKs stay fenced
-until a complete save succeeds. A held cycle retries through the existing local
-partial-checkpoint settlement path before any upload, then starts a fresh pass;
-unACKed file progress stays owed. SQLITE_FULL likewise rolls back and holds for
-retry. No partial publication or deferred-work journal exists; transcripts and
+until a completed native retry and its recovery save succeed. UnACKed file
+entries keep their accepted progress during recovery. That file retries at most
+once per six hours, using the existing durable growth Full claim before payload
+acquisition; intervening passes skip its transcript reads. The source-wide fence
+remains because upload recovery and accepted progress share the source owner.
+A held cycle uses the existing local partial-checkpoint settlement path before
+any upload, then starts a fresh pass; unACKed file progress stays owed.
+SQLITE_FULL likewise rolls back and holds for retry. No partial publication or deferred-work journal exists; transcripts and
 committed checkpoints retain retry custody. Unknown persisted kinds are refused.
 
 WAL above 64 MiB, save payload above 32 MiB and page reduction are alarms, not

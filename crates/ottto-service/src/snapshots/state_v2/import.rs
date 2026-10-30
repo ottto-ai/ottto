@@ -303,6 +303,10 @@ impl ClaudeMapper {
             kinds_misc::merge_cas_at(&mut tx, next, prev.generation)?;
             kinds_files::merge_growth_cas(&mut tx, next)?;
         }
+        super::super::sampled_audit::prune_growth_retention(
+            next,
+            super::super::sampled_scan::now_seconds(),
+        );
         if !options.claim_only {
             next.retire_committed_claude_account_pending_windows();
         }

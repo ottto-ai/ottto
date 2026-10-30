@@ -1327,9 +1327,12 @@ impl ClaudeRequestCensus {
             if !may_age(record, cutoff) {
                 continue;
             }
-            let modified = (!excluded(key))
-                .then(|| transcript_retirement_age(files, cutoff, key, record))
-                .flatten();
+            let age = transcript_retirement_age(files, cutoff, key, record);
+            let excluded = excluded(key);
+            if all_or_none && excluded && age.is_some() {
+                crate::local_resource_diagnostics::census_retire_skipped_grown();
+            }
+            let modified = age.filter(|_| !excluded);
             let Some(modified) = modified else {
                 suspects = suspects
                     .filter(|suspects: &Vec<String>| suspects.len() < MAX_RELEASE_MEMO_SUSPECTS)
@@ -2903,11 +2906,6 @@ pub(crate) fn record_claude_request_census(
     if records_disabled_for_test(parse.path) {
         return;
     }
-    if (!parse.complete || parse.lossy)
-        && super::sampled_audit::growth_retirement_excluded(index, parse.index_key)
-    {
-        return;
-    }
     let was_held = index
         .claude_request_census
         .get(parse.index_key)
@@ -2923,9 +2921,6 @@ pub(crate) fn record_claude_request_census(
         parse.lossy,
         !parse.source_verified,
     ) else {
-        if super::sampled_audit::growth_retirement_excluded(index, parse.index_key) {
-            return;
-        }
         index
             .claude_request_census
             .invalidate_keeping_birth(parse.index_key);
@@ -3036,21 +3031,20 @@ fn insert_transcript_record(
         .unwrap_or(&super::state_v2::EMPTY_INDEX)
         .growth_retention;
     let walk = index.traversal.as_ref();
-    let excluded = |key: &str| {
-        let excluded =
-            active && super::sampled_audit::growth_excluded_parts(key, growth, walk, None);
-        if excluded {
-            crate::local_resource_diagnostics::census_retire_skipped_grown();
-        }
-        excluded
-    };
-    let retained = excluded(key)
-        .then(|| index.claude_request_census.get(key).cloned())
-        .flatten();
-    // A new debt can invalidate the memo's previously freeable population.
-    if active {
-        index.claude_request_census.release_memo = None;
-    }
+    let excluded =
+        |key: &str| active && super::sampled_audit::growth_excluded_parts(key, growth, walk, None);
+    let retained = super::sampled_audit::growth_retirement_excluded(index, key)
+        .then(|| index.claude_request_census.get(key))
+        .flatten()
+        .filter(|old| {
+            old.source_file_fingerprint == record.source_file_fingerprint
+                && !record.unverified
+                && !matches!(
+                    record.shape,
+                    ClaudeRequestCensusShape::Lossy | ClaudeRequestCensusShape::OverBudget
+                )
+        })
+        .cloned();
     let files = &index.files;
     let mut released = 0;
     let outcome =
@@ -3341,7 +3335,7 @@ fn retire_claude_transcript_records_excluding(
     let census = &mut index.claude_request_census;
     if active {
         for (key, record) in &census.records {
-            if may_age(record, cutoff) && excluded(key) {
+            if excluded(key) && transcript_retirement_age(files, cutoff, key, record).is_some() {
                 crate::local_resource_diagnostics::census_retire_skipped_grown();
             }
         }
@@ -3390,11 +3384,27 @@ fn retire_claude_transcript_records_excluding(
     drop(aged);
     // Above 90% occupancy, the kept records (now the only unretired aged
     // ones) retire oldest first until it is back at 90%.
-    if retirement.kept_overlap_records > 0
-        && !within_keep_occupancy(census.hash_total, census.serialized_total)
-    {
-        let (records, hashes) =
-            census.release_aged(files, cutoff, &within_keep_occupancy, false, &excluded);
+    let excluded_charge = if active {
+        census.records.iter().filter(|(key, _)| excluded(key)).fold(
+            (0_usize, 0_usize),
+            |(hashes, bytes), (key, record)| {
+                (
+                    hashes + record.hash_count(),
+                    bytes + entry_serialized_bytes(key, record),
+                )
+            },
+        )
+    } else {
+        (0, 0)
+    };
+    let fits = |hashes: usize, bytes: usize| {
+        within_keep_occupancy(
+            hashes.saturating_sub(excluded_charge.0),
+            bytes.saturating_sub(excluded_charge.1),
+        )
+    };
+    if retirement.kept_overlap_records > 0 && !fits(census.hash_total, census.serialized_total) {
+        let (records, hashes) = census.release_aged(files, cutoff, &fits, false, &excluded);
         retirement.overflow_occupancy = records;
         retirement.kept_overlap_records -= records;
         retirement.kept_overlap_hashes -= hashes;

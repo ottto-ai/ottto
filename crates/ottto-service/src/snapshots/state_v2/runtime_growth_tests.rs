@@ -19,6 +19,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_claims(BTreeMap::new())
+    }
+    fn with_claims(claims: BTreeMap<String, sampled_audit::GrowthRetention>) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let support = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "ottto-growth-lineage-{}-{}",
@@ -41,10 +44,8 @@ impl Fixture {
             }))
             .unwrap(),
         );
-        index
-            .v2_mut()
-            .growth_retention
-            .insert(key.clone(), debt(None));
+        index.v2_mut().growth_retention = claims;
+        index.v2_mut().growth_retention.insert(key.clone(), debt(None));
         let identity = Identity {
             format: FORMAT,
             db_id: "synthetic-growth-lineage".into(),
@@ -366,5 +367,341 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
         serde_json::to_value(&reopened.v2().growth_retention[&f.key]).unwrap()
             ["last_growth_full_unix"],
         serde_json::json!(NOW)
+    );
+}
+
+/// [regress] v2 CAS resurrected expired absent-file claims on normal and claim saves.
+#[test]
+fn saves_reclaim_expired_orphan_claims_after_merging_maxima() {
+    let now = crate::snapshots::sampled_scan::now_seconds();
+    for route in ["normal", "claim", "subset"] {
+        let expired = "/synthetic/expired.jsonl";
+        let recent = "/synthetic/recent.jsonl";
+        let future = "/synthetic/future.jsonl";
+        let f = Fixture::with_claims(BTreeMap::from([
+            (expired.into(), debt(Some(now - INTERVAL - 1))),
+            (recent.into(), debt(Some(now - 1))),
+            (future.into(), debt(Some(now + INTERVAL))),
+        ]));
+        let previous = f.load();
+        let mut working = previous.clone();
+        working.v2_mut().growth_retention.remove(expired);
+        if route == "subset" {
+            working =
+                working.committable_subset(&previous, &Default::default(), &Default::default());
+        }
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            if route == "claim" {
+                working.save_growth_claim(&f.path).unwrap();
+            } else {
+                working.save(&f.path).unwrap();
+            }
+        });
+        assert!(rows
+            .iter()
+            .any(|row| row["counts"]["growth_claim_reclaimed"] == 1));
+        invalidate_locked(&f.path).unwrap();
+        let reopened = f.load();
+        assert!(!reopened.v2().growth_retention.contains_key(expired), "{route}");
+        for key in [&f.key, recent, future] {
+            assert!(
+                reopened.v2().growth_retention.contains_key(key),
+                "{route}: {key}"
+            );
+        }
+        let mut guard = reopened
+            .v2()
+            .persistence_v2
+            .as_ref()
+            .unwrap()
+            .session
+            .lock()
+            .unwrap();
+        let db = &mut guard.as_mut().unwrap().db;
+        assert!(
+            db.read_control::<u64>("erasure_pending")
+                .unwrap()
+                .unwrap_or(0)
+                > 0
+        );
+    }
+}
+
+/// [regress] claim-only saves undid page halving and page-one oversize retries stormed.
+#[test]
+fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
+    let f = Fixture::new();
+    let mut index = f.load();
+    assert_eq!(collection_page_limit(&index, 250), 250);
+    sqlite::seed_next_save_bytes_for_test(256 * 1024 * 1024);
+    assert!(index.save(&f.path).is_err());
+    let mut index = f.load();
+    assert_eq!(collection_page_limit(&index, 250), 125);
+    index.save_growth_claim(&f.path).unwrap();
+    assert_eq!(collection_page_limit(&index, 250), 125);
+    assert!(crate::snapshots::state_v2_side_effect_guard(&f.path, &index)().is_err());
+
+    // Simulate successive ceiling reductions reaching a page of one.
+    with_state(&f.path, |state| {
+        state.page_limit = 1;
+        Ok(())
+    })
+    .unwrap();
+    assert!(save_read_admitted(&index, &f.key, NOW).unwrap());
+    sqlite::seed_next_save_bytes_for_test(256 * 1024 * 1024);
+    assert!(index.save(&f.path).is_err());
+    let mut index = f.load();
+    assert!(save_oversize_active(&index).unwrap());
+    for now in [NOW - 1, NOW, NOW + INTERVAL - 1] {
+        assert!(!save_read_admitted(&index, &f.key, now).unwrap());
+    }
+    assert!(!save_read_admitted(&index, "/synthetic/other.jsonl", NOW + INTERVAL).unwrap());
+    let candidate = f.candidate(&index);
+    assert!(save_read_admitted(&index, &f.key, NOW + INTERVAL).unwrap());
+    assert!(sampled_audit::growth_read_admitted_at(
+        &mut index,
+        &candidate,
+        ReadMode::Tail,
+        NOW + INTERVAL
+    ));
+    assert_eq!(collection_page_limit(&index, 250), 1);
+    assert!(
+        save_oversize_active(&index).unwrap(),
+        "the claim does not lift the fence"
+    );
+    // A cursor-only save after a skipped read cannot resolve the held file.
+    index.save(&f.path).unwrap();
+    invalidate_locked(&f.path).unwrap();
+    let mut reopened = f.load();
+    assert!(save_oversize_active(&reopened).unwrap());
+    assert!(!save_read_admitted(&reopened, &f.key, NOW + INTERVAL + 1).unwrap());
+    assert!(!sampled_audit::growth_read_admitted_at(
+        &mut reopened,
+        &candidate,
+        ReadMode::Full(FullReason::StateMissing),
+        NOW + INTERVAL + 1
+    ));
+    assert!(crate::snapshots::state_v2_side_effect_guard(&f.path, &reopened)().is_err());
+    // A complete retry may have unACKed bodies: its recovery subset keeps the
+    // old file entry, but a successful local save must allow the next upload.
+    assert!(save_read_admitted(&reopened, &f.key, NOW + 2 * INTERVAL).unwrap());
+    assert!(sampled_audit::growth_read_admitted_at(
+        &mut reopened,
+        &candidate,
+        ReadMode::Tail,
+        NOW + 2 * INTERVAL
+    ));
+    sampled_audit::settle_growth(&mut reopened, &f.key);
+    let previous = f.load();
+    let entry = reopened.files.get_mut(&f.key).unwrap();
+    entry.size_bytes = 999;
+    entry.source_file_fingerprint = "b".repeat(64);
+    entry.last_snapshot_fingerprint = Some("d".repeat(64));
+    let mut subset =
+        reopened.committable_subset(&previous, &Default::default(), &Default::default());
+    assert_eq!(
+        subset.files[&f.key].size_bytes, 4,
+        "unACKed progress stays owed"
+    );
+    subset.save(&f.path).unwrap();
+    assert_eq!(
+        subset.files[&f.key].size_bytes,
+        previous.files[&f.key].size_bytes
+    );
+    crate::snapshots::state_v2_side_effect_guard(&f.path, &subset)().unwrap();
+}
+
+/// [regress] grown and undiscovered keys kept old Exact proof after lossy/failed parses.
+#[test]
+fn growth_never_suppresses_lossy_records_or_failed_validation() {
+    use crate::snapshots::claude_request_census::{
+        self, ClaudeRequestBirth, ClaudeRequestCensusParse, ClaudeRequestCensusRecord,
+        ClaudeRequestCensusShape,
+    };
+    for case in [
+        "lossy",
+        "lossy_at_cap",
+        "incomplete",
+        "no_record",
+        "invalidate",
+        "nongrown_in_range",
+    ] {
+        let f = Fixture::new();
+        let mut index = f.load();
+        let fingerprint = "a".repeat(64);
+        let record = ClaudeRequestCensusRecord::synthetic_for_test(
+            &fingerprint,
+            1,
+            ClaudeRequestCensusShape::Exact,
+            vec![7],
+        )
+        .with_modified_for_test(Some(1))
+        .with_birth_for_test(Some(ClaudeRequestBirth {
+            unix_seconds: 1,
+            device: 1,
+            inode: 1,
+        }));
+        index.claude_request_census.insert_for_test(&f.key, record);
+        if case == "lossy_at_cap" {
+            let cap =
+                crate::snapshots::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64;
+            index.claude_request_census.insert_for_test(
+                "/synthetic/young.jsonl",
+                ClaudeRequestCensusRecord::synthetic_for_test(
+                    &fingerprint,
+                    1,
+                    ClaudeRequestCensusShape::Exact,
+                    (100..cap + 99).collect(),
+                )
+                .with_modified_for_test(Some(u64::MAX)),
+            );
+        }
+        crate::snapshots::ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&f.support),
+            &mut index,
+            "2026-10-07T12:00:00Z",
+            30,
+        );
+        if case == "nongrown_in_range" {
+            index.v2_mut().growth_retention.clear();
+        }
+        if case == "invalidate" {
+            let mut candidate = f.candidate(&index);
+            candidate.physical_identity = Some([2, 2]);
+            assert!(!claude_request_census::retain_held(&mut index, &candidate));
+        } else {
+            claude_request_census::record_claude_request_census(
+                &mut index,
+                ClaudeRequestCensusParse {
+                    path: &f.source,
+                    index_key: &f.key,
+                    source_file_fingerprint: if case == "no_record" {
+                        "invalid"
+                    } else {
+                        &fingerprint
+                    },
+                    census_window_end: "2026-10-07T12:00:00Z",
+                    complete: case != "incomplete",
+                    lossy: case != "no_record",
+                    source_verified: true,
+                    unchanged_source: false,
+                    itemless_request_hashes: vec![8, 9],
+                    opened_birth: None,
+                    modified_unix_seconds: 1,
+                },
+                &[],
+            );
+        }
+        let record = index.claude_request_census.get(&f.key).unwrap();
+        assert!(!record.request_hashes_for_test().contains(&7), "{case}");
+        if matches!(case, "no_record" | "invalidate") {
+            assert!(record.is_birth_stub(), "{case}");
+        } else if case != "lossy_at_cap" {
+            assert_eq!(
+                record.shape_for_test(),
+                ClaudeRequestCensusShape::Lossy,
+                "{case}"
+            );
+        }
+        let holders = index
+            .claude_request_census
+            .family_transcript_holders(
+                &BTreeMap::from([("session", vec![7])]),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap();
+        assert!(
+            holders
+                .get("session")
+                .map_or(true, |family| family.held.is_empty()),
+            "{case}"
+        );
+    }
+}
+
+/// [regress] excluded grown stock evicted overlapping #920 proofs at the soft cap.
+#[test]
+fn excluded_growth_stock_does_not_evict_overlapping_proofs() {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusRecord, ClaudeRequestCensusShape, MAX_CLAUDE_REQUEST_CENSUS_HASHES,
+    };
+    let f = Fixture::new();
+    let mut index = f.load();
+    let cap = MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64;
+    for (key, age, hashes) in [
+        (f.key.clone(), 1, (0..cap / 10).collect()),
+        (
+            "/synthetic/overlap.jsonl".into(),
+            1,
+            (cap / 10..cap / 5).collect(),
+        ),
+        (
+            "/synthetic/copy.jsonl".into(),
+            40 * 86400,
+            (cap / 10..cap * 85 / 100).collect(),
+        ),
+        ("/synthetic/nongrown.jsonl".into(), 1, vec![cap + 1]),
+        ("/synthetic/residue.jsonl".into(), 1, vec![cap + 2]),
+    ] {
+        let entry = index.files[&f.key].clone();
+        index.files.insert(key.clone(), entry);
+        index.claude_request_census.insert_for_test(
+            &key,
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &"a".repeat(64),
+                1,
+                ClaudeRequestCensusShape::Exact,
+                hashes,
+            )
+            .with_modified_for_test(Some(age)),
+        );
+    }
+    crate::snapshots::ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&f.support),
+        &mut index,
+        "2026-10-07T12:00:00Z",
+        30,
+    );
+    let walk = index.traversal.as_mut().unwrap();
+    walk.reconciliation_upper_bound = Some("z".into());
+    walk.reconciliation_after = None;
+    walk.residue
+        .index_keys
+        .insert("/synthetic/residue.jsonl".into());
+    let (aged, kept, _, overflow) = index.retire_claude_transcript_records_for_test(40 * 86400);
+    assert_eq!(
+        aged, 2,
+        "neither an unchecked range nor untracked residue is growth debt"
+    );
+    assert_eq!(kept, 1);
+    assert_eq!(overflow, 0);
+    assert_eq!(
+        index
+            .claude_request_census
+            .get("/synthetic/overlap.jsonl")
+            .unwrap()
+            .retired_for_test(),
+        None
+    );
+    assert_eq!(
+        index
+            .claude_request_census
+            .get(&f.key)
+            .unwrap()
+            .retired_for_test(),
+        None
+    );
+    sampled_audit::settle_growth(&mut index, &f.key);
+    assert_eq!(
+        index
+            .retire_claude_transcript_records_for_test(40 * 86400)
+            .0,
+        1
+    );
+    assert_eq!(
+        index.claude_request_census.totals_for_test(),
+        index.claude_request_census.recounted_for_test()
     );
 }
