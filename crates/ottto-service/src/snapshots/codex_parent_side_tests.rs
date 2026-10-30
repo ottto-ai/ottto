@@ -3,6 +3,31 @@
 //! provider account.
 use super::*;
 
+fn parsed() -> ParsedJsonlFile {
+    ParsedJsonlFile {
+        snapshots: Vec::new(),
+        report: JsonlReadReport::default(),
+        recognized_usage_drop_count: 0,
+        cause: ownership::PARSER,
+        ownership_incomplete_file_count: 0,
+        zero_snapshot_usage_evidence: false,
+        dropped_usage_record_count: 0,
+        terminal_line_loss_count: 0,
+        claude_compaction_unlinked_parent_count: 0,
+        state_only_blocked_session_ids: BTreeSet::new(),
+        codex_parent_session_ref: None,
+        codex_parent_ledger_identity_used: None,
+        codex_parent_resolution_pending: false,
+        codex_parent_ownership_ledger: None,
+        codex_parent_unresolvable: None,
+        codex_parent_ledger_unusable: None,
+        codex_parent_ledger_consulted: false,
+        codex_parent_prefix_decided: None,
+        codex_parent_proof_used: None,
+        codex_parent_proof_refusal: None,
+    }
+}
+
 fn side_request(state: SideRequestState) -> SideRequest {
     SideRequest {
         dev_ino: (16_777_232, 123_456_789),
@@ -17,6 +42,71 @@ fn side_request(state: SideRequestState) -> SideRequest {
         needed_charge: None,
         referenced_epoch: 12,
     }
+}
+
+#[test]
+fn side_verdict_lineage_and_cause_follow_p_own_fork_state() {
+    // P is itself a fork whose parent ref overflowed: a deferral sets the
+    // ownership hold, the cause and no pending flag.
+    let mut deferred = parsed();
+    deferred.codex_parent_session_ref = Some("grandparent".into());
+    deferred.codex_parent_resolution_pending = true;
+    deferred.defer_parent_resolution(CodexParentUnresolvable::DeferredRef);
+    assert_eq!(
+        codex_parent_side_verdict(&deferred),
+        SideVerdict::Held {
+            lineage: true,
+            cause: CodexParentUnresolvable::DeferredRef.index() as u8,
+        }
+    );
+    // The invalid-census keep discounts the hold lineage itself set.
+    assert_eq!(
+        codex_parent_side_verdict_without_lineage(&deferred),
+        SideVerdict::Settled
+    );
+
+    // Still pending: lineage with no evidence.
+    let mut pending = parsed();
+    pending.codex_parent_session_ref = Some("grandparent".into());
+    pending.codex_parent_resolution_pending = true;
+    assert_eq!(
+        codex_parent_side_verdict(&pending),
+        SideVerdict::Held {
+            lineage: true,
+            cause: CAUSE_NO_EVIDENCE,
+        }
+    );
+    assert_eq!(
+        codex_parent_side_verdict_without_lineage(&pending),
+        SideVerdict::Settled
+    );
+
+    // A cause without a parent ref is not lineage; a real ownership hold
+    // with no lineage term survives the keep test.
+    let mut unowned = parsed();
+    unowned.ownership_incomplete_file_count = 1;
+    assert_eq!(
+        codex_parent_side_verdict(&unowned),
+        SideVerdict::Held {
+            lineage: false,
+            cause: CAUSE_NO_EVIDENCE,
+        }
+    );
+    assert_eq!(
+        codex_parent_side_verdict_without_lineage(&unowned),
+        SideVerdict::Held {
+            lineage: false,
+            cause: CAUSE_NO_EVIDENCE,
+        }
+    );
+
+    // Dropped usage records downgrade even a lineage-only hold.
+    let mut lossy = deferred;
+    lossy.dropped_usage_record_count = 1;
+    assert!(matches!(
+        codex_parent_side_verdict_without_lineage(&lossy),
+        SideVerdict::Held { lineage: false, .. }
+    ));
 }
 
 #[test]

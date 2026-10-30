@@ -435,6 +435,23 @@ fn a_ctime_only_change_is_the_same_object_and_a_rewrite_consumes_the_record() {
     assert_eq!(restarted.state_ctime, parent.ctime());
 }
 
+/// R1-M1: one fence reads the record's sealed windows at most once. On the
+/// `SameSizeEdit` path with changed samples, the guard and the `_` arm
+/// share one `samples_match`.
+#[test]
+fn a_same_size_edit_with_changed_samples_reads_them_once() {
+    let mut parent = Parent::new("samples-once", 9_000);
+    let now = now();
+    let len = parent.len();
+    let mut index = with_record(parent.record(SideVerdict::Settled, now));
+    parent.rewrite_head();
+    crate::transcript_acquisition::samples_match_calls();
+    let (fenced, _) = parent.fence(&mut index, len, now);
+    assert_eq!(fenced, SideFence::Unknown, "a rewrite consumes the record");
+    assert!(!index.codex_parent_side.contains_key(KEY));
+    assert_eq!(crate::transcript_acquisition::samples_match_calls(), 1);
+}
+
 /// The request-side object test: a shrink below `state_extent`, or a record
 /// for another object, is a new object (record consumed, request
 /// restarted); a same-size ctime change with matching record samples only

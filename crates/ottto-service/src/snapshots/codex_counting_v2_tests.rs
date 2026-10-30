@@ -1062,6 +1062,37 @@ fn codex_counting_retained_reduction_reuse_requires_the_same_rule() {
     ));
 }
 
+#[test]
+fn codex_v2_staged_turn_charge_stays_within_the_stated_bound() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let rows = codex_usage_occurrence::MAX_PENDING_ROWS as i64;
+    let step = [1_000, 0, 0, 10, 1, 1_010];
+    let mut values = vec![
+        header(&hour(-1)),
+        started(&hour(-1), "turn-1"),
+        context(&hour(-1), "turn-1"),
+    ];
+    let mut total = [0; 6];
+    for index in 0..rows {
+        total = sum(total, step);
+        values.push(ui(&hour(index), step, total));
+    }
+    let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+    codex_counting_version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
+    for value in &values {
+        apply_codex_line(value, &mut accumulator);
+    }
+    let counting = accumulator.codex_counting.as_deref().unwrap();
+    assert_eq!(counting.open_turn_ui_pending().unwrap().0, rows as u64);
+    let fixed = std::mem::size_of::<codex_usage_occurrence::CodexCounting>()
+        + codex_usage_occurrence::max_fixed_heap_bytes();
+    let bound = fixed + codex_usage_occurrence::max_pending_heap_bytes();
+    let charged = crate::heap_layout_bound::bound(counting, usize::MAX).unwrap();
+    assert!(charged <= bound, "charged {charged} > stated bound {bound}");
+}
+
 /// Activation freezes one instant, 2026-10-26T12:00:00Z; it must never move.
 #[test]
 fn codex_counting_v2_compiled_cutover_is_frozen() {
