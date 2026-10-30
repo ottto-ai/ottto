@@ -390,3 +390,152 @@ fn repin_cold_growth_survives_age_filters_and_partial_retry_uses_shared_pace() {
         assert_eq!(f.index.files[&key].size_bytes, 3);
     }
 }
+
+#[test]
+fn repin_repaired_mode_refusal_has_a_funded_held_counter_slot() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let _on = RestartRestoreForTest::enabled();
+    let mut f = Cohort::new(SnapshotSource::Codex, 1);
+    let _lock = test_locks::hold(&f.root);
+    let file = f.grow(0);
+    let key = local_index_key(&f.paths[0]);
+    let digest = store::key_digest(DurableSource::Codex, &key);
+    let name = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let disk = store::store_dir_for_index(&f.index_path).join(format!("{name}.rec"));
+    fs::set_permissions(&disk, fs::Permissions::from_mode(0o640)).unwrap();
+    assert!(f.plan(0, &file) == RepinPlan::Ordinary);
+    let held = f
+        .cache
+        .durable_funded_guard(f.source, &key, |cache| {
+            cache.durable_hold(f.source, &key, &f.index, &mut None)
+        })
+        .unwrap();
+    assert_eq!(held, Some(store::Refusal::Repin));
+    let mut census = ScanCensus::default();
+    let candidate = candidate_from_traversal_path(
+        f.source,
+        ScanTraversalPath {
+            scan_root: f.root.to_path_buf(),
+            path: f.paths[0].clone(),
+            census_member: true,
+            watcher_hint: false,
+        },
+        &mut census,
+        None,
+        183,
+        DiscoveryRecovery::from(&f.index.files),
+    )
+    .unwrap();
+    f.cache.durable_hold_exit(
+        f.source,
+        held.unwrap(),
+        &mut f.index,
+        &candidate,
+        &mut census,
+    );
+    assert_eq!(
+        f.cache.durable().unwrap().counters.durable_held[store::Refusal::Repin as usize],
+        1
+    );
+    assert!(
+        f.plan(0, &file) == RepinPlan::Ready,
+        "the repaired mode has a next-pass recovery exit"
+    );
+}
+
+#[test]
+fn repin_ready_members_pass_the_final_group_guard_off_and_on() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    for on in [false, true] {
+        let _policy = if on {
+            RestartRestoreForTest::enabled()
+        } else {
+            RestartRestoreForTest::disabled()
+        };
+        let f = Cohort::new(SnapshotSource::Codex, 2);
+        for n in 0..2 {
+            let file = f.grow(n);
+            let key = local_index_key(&f.paths[n]);
+            assert_eq!(
+                f.cache
+                    .durable_member_hold(f.source, &key, &f.index, &mut None)
+                    .unwrap(),
+                Some(store::Refusal::Repin)
+            );
+            assert!(f.plan(n, &file) == RepinPlan::Ready);
+            assert!(f.cache.repin_start(f.source, &key, &file));
+            let mut due = None;
+            assert_eq!(
+                f.cache
+                    .durable_member_hold(f.source, &key, &f.index, &mut due)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(due, None);
+        }
+    }
+}
+
+#[test]
+fn repin_codex_singleton_applies_a_valid_trailing_record_only_at_unchanged_eof() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    use std::io::Write;
+    let source = SnapshotSource::Codex;
+    for grow in [false, true] {
+        let root = crate::test_scratch::ScratchDir::new("repin-trailing-codex");
+        let path = root.join("source.jsonl");
+        codex_budget_fixture(&path, "019fa111-2222-7333-8444-555555555555", None);
+        let mut bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&path, &bytes).unwrap();
+        let mut cold = owned_parser(source, &path, File::open(&path).unwrap());
+        while !cold.step().unwrap() {}
+        let expected = codec::encode(
+            &cold.durable_test_reduction_copy(),
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64,
+        )
+        .unwrap();
+        let mut parser = owned_parser(source, &path, File::open(&path).unwrap());
+        parser.reader.set_extent_limit(bytes.len() as u64);
+        while !parser.step().unwrap() {}
+        assert!(parser.reader.sealed_fragment());
+        if grow {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"\n")
+                .unwrap();
+        }
+        parser.apply_repin_eof(bytes.len() as u64);
+        assert_eq!(parser.reader.sealed_fragment(), grow);
+        let actual = codec::encode(
+            &parser.durable_test_reduction_copy(),
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64,
+        )
+        .unwrap();
+        if grow {
+            assert_ne!(
+                actual, expected,
+                "later appended bytes do not authorize applying the frozen fragment"
+            );
+        } else {
+            assert_eq!(
+                actual, expected,
+                "native complete totals include the trailing usage row"
+            );
+        }
+    }
+}

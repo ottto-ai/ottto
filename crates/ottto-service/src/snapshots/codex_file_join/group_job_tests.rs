@@ -3015,7 +3015,7 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
         .iter()
         .any(|item| item.source_session_id == peer_owner));
     let (counts, stats) = cache.durable_counters(source).unwrap();
-    assert_eq!(counts.durable_held, [0; 8]);
+    assert_eq!(counts.durable_held, [0; 9]);
     assert_eq!(counts.not_persisted.get("known_corrupt_held"), Some(&1));
     assert_eq!(stats.t14_rebuild_full_started, 1);
     assert_eq!(fs::read(&record).unwrap(), corrupt);
@@ -3076,7 +3076,7 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
                 "C9: every refused group member counted, not only the first"
             );
         } else {
-            assert_eq!(durable.durable_held, [0; 8]);
+            assert_eq!(durable.durable_held, [0; 9]);
         }
         scanned.push(result.scanned_file_count);
         fs::remove_dir_all(root).unwrap();
@@ -3341,7 +3341,7 @@ fn grouped_missing_carriers_mark_each_member_until_verified(paged: bool) {
         Some(&2)
     );
     assert_eq!(counts.restored, 0);
-    assert_eq!(counts.durable_held, [0; 8]);
+    assert_eq!(counts.durable_held, [0; 9]);
     // Actual save and post-save GC keep both predecessors while debt is owed.
     index.save(&index_path).unwrap();
     crate::snapshots::durable_after_save(&cache, &root, source, &index);

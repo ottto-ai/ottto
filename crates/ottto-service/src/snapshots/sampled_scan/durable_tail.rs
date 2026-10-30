@@ -333,7 +333,7 @@ pub(crate) struct Counters {
     pub(crate) upgrade_state_missing: u64,
     pub(crate) migration: [u64; 4], // held, awaiting save, claimed, durably replaced
     pub(crate) refused_record: u64,
-    pub(crate) durable_held: [u64; 8],
+    pub(crate) durable_held: [u64; 9],
     pub(crate) held_census: [u64; 2],
     pub(crate) ineligible: BTreeMap<&'static str, u64>,
     pub(crate) certificate_refused: BTreeMap<&'static str, u64>,
@@ -2466,6 +2466,7 @@ impl SharedCache {
                 *recovered_audit_due = due.map(|due| due.min(super::now_seconds()));
                 None
             }
+            Err(store::Refusal::Repin) if stores.repin_pending(source, key) => None,
             Err(reason) => Some(reason),
         }
     }

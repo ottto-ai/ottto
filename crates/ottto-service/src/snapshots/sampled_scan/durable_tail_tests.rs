@@ -2122,7 +2122,7 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
         assert!(reads.iter().all(|r| r["completed_native_bytes"] == 0));
         let (counts, _) = cache.durable_counters(source).unwrap();
         assert_eq!(counts.restored, 0);
-        assert_eq!(counts.durable_held, [0; 8]);
+        assert_eq!(counts.durable_held, [0; 9]);
         {
             let mut stores = cache.durable().unwrap();
             let slot = stores.slot(ds).as_mut().unwrap();
@@ -3547,7 +3547,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     );
                     assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
                 } else {
-                    assert_eq!(counts.durable_held, [0; 8]);
+                    assert_eq!(counts.durable_held, [0; 9]);
                 }
                 assert_eq!(counts.restored, 0);
                 let _ = std::fs::remove_dir_all(root);
@@ -3807,7 +3807,7 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
                 ])
             );
             let (counts, stats) = cache.durable_counters(source).unwrap();
-            assert_eq!(counts.durable_held, [0; 8]);
+            assert_eq!(counts.durable_held, [0; 9]);
             assert_eq!(stats.format_hold, [0; 9]);
             assert_eq!(stats.records_written, 0);
             assert_eq!(stats.gc_records_deleted + stats.gc_temps_deleted, 0);
@@ -3931,7 +3931,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
             );
             let (counts, stats) = cache.durable_counters(source).unwrap();
             assert_eq!(stats.t14_rebuild, 1);
-            assert_eq!(counts.durable_held, [0; 8]);
+            assert_eq!(counts.durable_held, [0; 9]);
             assert_eq!(
                 stats.format_hold[store::Refusal::Corrupt as usize],
                 previous_holds + n
@@ -4277,7 +4277,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     let (counts, stats) = cache.durable_counters(source).unwrap();
     assert!(counts.not_persisted["known_corrupt_memory_only"] > 0);
     assert!(counts.not_persisted["known_corrupt_held"] > 0);
-    assert_eq!(counts.durable_held, [0; 8]);
+    assert_eq!(counts.durable_held, [0; 9]);
     assert_eq!(stats.t14_rebuild_full_started, 1);
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
     assert!(alarms
@@ -5022,7 +5022,7 @@ fn restore_reports_each_early_exit_without_changing_old_totals() {
     assert_eq!((old.restore_attempts, old.missing, old.restored), (4, 2, 0));
     assert!(!old.ineligible.contains_key("selection_cleared"));
     assert_eq!(old.ineligible["history_owed"], 1);
-    assert_eq!(old.durable_held, [0; 8]);
+    assert_eq!(old.durable_held, [0; 9]);
     let text = old.summary(source, &disk);
     assert!(!text.contains("restore_attempts="));
     assert!(text.contains("disk_records="));
@@ -5582,7 +5582,7 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
             counts.ineligible.get("audit_carrier"),
             matching_context.then_some(&1)
         );
-        assert_eq!(counts.durable_held, [0; 8]);
+        assert_eq!(counts.durable_held, [0; 9]);
         assert_eq!(counts.restored, 0);
     }
     for reset in [false, true] {
@@ -11356,7 +11356,7 @@ fn absent_upgrade_growth_is_a_counted_miss_and_shares_the_full_pace() {
     assert!(!cache.upgrade_full_allowed("k", &file, &index));
     assert!(!cache.retail_full("k", &file, 3, now));
     assert_eq!(cache.durable().unwrap().counters.upgrade_missing_full, 1);
-    assert_eq!(cache.durable().unwrap().counters.durable_held, [0; 8]);
+    assert_eq!(cache.durable().unwrap().counters.durable_held, [0; 9]);
     let floor = AcceptedFloor::of(&index, "k").unwrap();
     assert!(!cache.stale_full("k", &file, Some(floor), "context"));
     cache.durable().unwrap().retail_full_now =
@@ -11418,7 +11418,7 @@ fn accepted_floor_missing_record_is_neutral_and_freezes_before_mutation() {
     let (counts, _) = cache.durable_counters(source).unwrap();
     assert_eq!(counts.restored, 0);
     assert_eq!(
-        counts.durable_held, [0; 8],
+        counts.durable_held, [0; 9],
         "known floor is not U/UpgradeMissing"
     );
     let mut diagnostics = crate::local_resource_diagnostics::RestoreCounts::default();
@@ -13362,7 +13362,7 @@ fn indexed_debt_carrier_preserves_proven_shrink_before_audit_rearm() {
     let (counts, _) = cache.durable_counters(source).unwrap();
     assert_eq!(counts.certificate_refused.get("shrunk"), Some(&1));
     assert_eq!(counts.ineligible.get("audit_carrier"), None);
-    assert_eq!(counts.durable_held, [0; 8]);
+    assert_eq!(counts.durable_held, [0; 9]);
     assert_eq!(counts.restored, 0);
     assert_eq!(std::fs::read(&record_path).unwrap(), before);
     assert_eq!(

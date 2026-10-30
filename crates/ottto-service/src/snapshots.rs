@@ -29547,6 +29547,18 @@ impl OwnedSourceScan {
                         hook(&active);
                     }
                 });
+                #[cfg(unix)]
+                if active.cursor.is_none() && active.group.is_none() {
+                    if let Some(limit) = durable_guard
+                        .as_ref()
+                        .and_then(std::sync::Weak::upgrade)
+                        .and_then(|cache| {
+                            cache.repin_limit(source, &local_index_key(&active.candidate.path))
+                        })
+                    {
+                        active.parser.apply_repin_eof(limit);
+                    }
+                }
                 // H2c/E1: retain native trailing-line behavior at a genuine
                 // unchanged EOF. A grown read keeps this fragment withheld.
                 if source == SnapshotSource::ClaudeCode
@@ -36397,6 +36409,23 @@ impl OwnedJsonlParser {
             );
         }
         Ok(matches!(step?, JsonlReaderStep::Complete(_)))
+    }
+
+    /// Preserve ordinary trailing-line parsing only at the exact frozen EOF.
+    /// A later append keeps the fragment withheld for the next acquisition.
+    #[cfg(unix)]
+    fn apply_repin_eof(&mut self, limit: u64) {
+        if self.reader.sealed_fragment()
+            && self.reader.consumed_bytes() == limit
+            && self
+                .reader
+                .reader
+                .get_ref()
+                .metadata()
+                .is_ok_and(|m| m.len() == limit)
+        {
+            self.apply_sealed_fragment();
+        }
     }
 
     /// Apply one record another parser's reader produced (a group's legacy
