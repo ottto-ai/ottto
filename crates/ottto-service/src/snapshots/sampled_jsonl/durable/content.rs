@@ -98,12 +98,28 @@ impl Decoded {
             || r.agent_label.is_some()
             || r.session_start.is_some()
         {
+            sampled_scan::durable_tail::record_rederive_refused(
+                self.reduction.accumulator.source,
+                [
+                    r.first_prompt.is_some(),
+                    r.title.is_some(),
+                    r.agent_label.is_some(),
+                    r.session_start.is_some(),
+                    false,
+                ],
+            );
             return Err(RederiveUnfunded);
         }
         if r.workspace.is_none() {
             return Ok(0);
         }
-        let end = self.head_end().map_err(|_| RederiveUnfunded)?;
+        let end = self.head_end().map_err(|_| {
+            sampled_scan::durable_tail::record_rederive_refused(
+                self.reduction.accumulator.source,
+                [false, false, false, false, true],
+            );
+            RederiveUnfunded
+        })?;
         // One exact head buffer; serde_json's string/key scratch grows by
         // reserve/push, at most the next doubling above the entire input.
         // Six cwd captures + kind (all <=4096), one temporary clone, and
@@ -174,10 +190,15 @@ impl Decoded {
                     .or(row.payload.0.cwd.0)
                     .or(row.cwd.0)
             }
-            SnapshotSource::Pi => return Err(Refuse::NotRederivable("workspace_source")),
+            // Native apply_pi_line accepts cwd only on a session header.
+            // Cwd uses string_at's trim/empty semantics; neither projectPath,
+            // workspace nor a message/payload cwd is a Pi workspace source.
+            SnapshotSource::Pi => (row.kind.0.as_deref() == Some("session"))
+                .then_some(row.cwd.0)
+                .flatten(),
         };
         let path = raw.map(PathBuf::from);
-        let got = digest("ottto-dt-rederive:workspace:v1", |e| path.put(e))?;
+        let got = workspace_value_digest(&path)?;
         if got != want {
             return Err(Refuse::NotRederivable("workspace_digest"));
         }

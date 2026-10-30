@@ -125,20 +125,57 @@ const _: () = assert!(RECOVERY_PACE_SECONDS < 24 * 3600);
 /// Existing class-X re-derivation is bounded at `HEAD_BOUND`, on a RAM
 /// miss only, so the census pass line reports it beside the guard's own
 /// counters (SOURCE N1).
-static REDERIVE_HEAD_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static REDERIVE_HEAD_BYTES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+// Diagnostic-only fixed storage: no keys, allocation, admission or new cause.
+// Order matches the summary label, not any persisted/source-admission enum.
+static REDERIVE_REFUSED: [[AtomicU64; 5]; 3] = [const { [const { AtomicU64::new(0) }; 5] }; 3];
+static NATIVE_PHASE_BYTES: [[AtomicU64; 2]; 3] = [const { [const { AtomicU64::new(0) }; 2] }; 3];
+fn diagnostic_source_slot(source: SnapshotSource) -> usize {
+    match source {
+        SnapshotSource::ClaudeCode => 0,
+        SnapshotSource::Codex => 1,
+        SnapshotSource::Pi => 2,
+    }
+}
+
+/// Count every blocking class on an actual content-admission refusal; a row
+/// with multiple obligations contributes to each, not just its first field.
+pub(in crate::snapshots) fn record_rederive_refused(source: SnapshotSource, classes: [bool; 5]) {
+    for (slot, blocked) in REDERIVE_REFUSED[diagnostic_source_slot(source)]
+        .iter()
+        .zip(classes)
+    {
+        if blocked {
+            slot.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Native consumed input, not certificate samples or BufReader readahead.
+/// Call after each step, including partial/error steps, using its actual plan.
+/// Rederive head input has its own pread observer and is never counted twice.
+pub(in crate::snapshots) fn record_native_phase_input(
+    source: SnapshotSource,
+    mode: crate::transcript_acquisition::ReadMode,
+    bytes: u64,
+) {
+    use crate::transcript_acquisition::ReadMode;
+    let phase = match mode {
+        ReadMode::Tail => 0,
+        ReadMode::Full(_) => 1,
+        ReadMode::Unchanged => return,
+    };
+    NATIVE_PHASE_BYTES[diagnostic_source_slot(source)][phase].fetch_add(bytes, Ordering::Relaxed);
+}
 
 pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
-    durable_source(source).map_or(0, |source| {
-        REDERIVE_HEAD_BYTES[source as usize].load(Ordering::Relaxed)
-    })
+    REDERIVE_HEAD_BYTES[diagnostic_source_slot(source)].load(Ordering::Relaxed)
 }
 
 /// Actual physical class-X bytes, including a later capture/hash refusal.
 /// The success receipt is separate; never hide input behind a refusal label.
 pub(in crate::snapshots) fn record_rederive_input(source: SnapshotSource, bytes: u64) {
-    if let Some(ds) = durable_source(source) {
-        REDERIVE_HEAD_BYTES[ds as usize].fetch_add(bytes, Ordering::Relaxed);
-    }
+    REDERIVE_HEAD_BYTES[diagnostic_source_slot(source)].fetch_add(bytes, Ordering::Relaxed);
     crate::local_resource_diagnostics::durable_tail_alarm(
         source.api_slug(),
         &serde_json::json!({"rederive_input_bytes": bytes}),
@@ -229,6 +266,14 @@ impl Counters {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        let diagnostic_slot = diagnostic_source_slot(source);
+        let rederive_refused = REDERIVE_REFUSED[diagnostic_slot]
+            .each_ref()
+            .map(|value| value.load(Ordering::Relaxed));
+        let native_phase = NATIVE_PHASE_BYTES[diagnostic_slot]
+            .each_ref()
+            .map(|value| value.load(Ordering::Relaxed));
+        let input_head = rederive_head_bytes_total(source);
         format!(
             "ottto-service: durable_tail source={} original_v1_mapped={} durable_restore_after_selection_clear={} objects[same,unknown,changed]={:?} s2_skipped_object_changed={} \
              retail_attempts={} retail_keys={} near_cap={} pace_anomaly={} upgrade_missing_full={} migration[held,await_save,claimed,replaced]={:?} retail_exhausted[full,paced,pace_evicted]={:?} tail_read_bytes={} retail_physical_bytes[process,daily]={:?} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} upgrade_state_missing={} \
@@ -242,7 +287,9 @@ impl Counters {
              records_invalidated={} mutation_unproved={} peak_codec_bytes={} t14_rebuild_full_started={} \
              d3_hold[growth_bytes,released_write,released_content,unfunded]={:?} \
              store_write_after_save_failed[files]={} \
-             store_write_failed_restart_full[files,bytes]={:?}",
+             store_write_failed_restart_full[files,bytes]={:?} \
+             rederive_refused[first_prompt,title,agent_label,session_start,workspace]={rederive_refused:?} \
+             native_input_bytes[head,tail,full]=[{input_head},{},{}]",
             source.api_slug(),
             self.original_v1_mapped,
             self.durable_restore_after_selection_clear,
@@ -299,6 +346,8 @@ impl Counters {
             self.d3,
             self.store_write_after_save_failed,
             self.store_write_failed_restart_full,
+            native_phase[0],
+            native_phase[1],
         )
     }
 }

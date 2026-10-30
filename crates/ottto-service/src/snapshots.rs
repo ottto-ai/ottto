@@ -35315,8 +35315,20 @@ impl OwnedJsonlParser {
         on_line: Option<line_delivery::LineTap<'_>>,
     ) -> Result<bool> {
         anyhow::ensure!(self.pending_taken.is_none(), "acquisition return pending");
-        let step = self.with_line_sink(observe, |reader, sink| reader.step_lines(sink, on_line))?;
-        Ok(matches!(step, JsonlReaderStep::Complete(_)))
+        #[cfg(unix)]
+        let before = self.reader.consumed_bytes();
+        #[cfg(unix)]
+        let mode = self.reader.acquisition.as_ref().map(|plan| plan.mode());
+        let step = self.with_line_sink(observe, |reader, sink| reader.step_lines(sink, on_line));
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            sampled_scan::durable_tail::record_native_phase_input(
+                self.source,
+                mode,
+                self.reader.consumed_bytes().saturating_sub(before),
+            );
+        }
+        Ok(matches!(step?, JsonlReaderStep::Complete(_)))
     }
 
     /// Apply one record another parser's reader produced (a group's legacy

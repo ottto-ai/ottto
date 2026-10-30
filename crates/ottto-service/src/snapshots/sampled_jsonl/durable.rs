@@ -61,9 +61,11 @@ fn first_prompt_digest(acc: &SnapshotAccumulator) -> Result<[u8; 32], Refuse> {
 }
 
 fn workspace_digest(acc: &SnapshotAccumulator) -> Result<[u8; 32], Refuse> {
-    digest("ottto-dt-rederive:workspace:v1", |e| {
-        acc.workspace_path.put(e)
-    })
+    workspace_value_digest(&acc.workspace_path)
+}
+
+fn workspace_value_digest(path: &Option<PathBuf>) -> Result<[u8; 32], Refuse> {
+    digest("ottto-dt-rederive:workspace:v1", |e| path.put(e))
 }
 
 fn agent_label_digest(acc: &SnapshotAccumulator) -> Result<[u8; 32], Refuse> {
