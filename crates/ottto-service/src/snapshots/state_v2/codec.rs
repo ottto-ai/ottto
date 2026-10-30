@@ -367,9 +367,11 @@ pub(super) fn check_field<'de, A: serde::de::MapAccess<'de>, T: DeserializeOwned
     if raw.get().len() as u64 > VALUE_BYTES {
         return Err(serde::de::Error::custom("state_v2_value_admission"));
     }
+    // RawValue already proved JSON syntax. A typed-reader failure now means
+    // this writer cannot represent the original class (including future slots).
     strict_json::<T>(raw.get().as_bytes())
         .map(|_| ())
-        .map_err(serde::de::Error::custom)
+        .map_err(|_| serde::de::Error::custom("state_v2_ignored_field"))
 }
 pub(super) fn check_map<'de, A: serde::de::MapAccess<'de>, T: DeserializeOwned + Serialize>(
     map: &mut A,
@@ -390,7 +392,8 @@ pub(super) fn check_map<'de, A: serde::de::MapAccess<'de>, T: DeserializeOwned +
                 if raw.get().len() as u64 > VALUE_BYTES {
                     return Err(serde::de::Error::custom("state_v2_value_admission"));
                 }
-                strict_json::<T>(raw.get().as_bytes()).map_err(serde::de::Error::custom)?;
+                strict_json::<T>(raw.get().as_bytes())
+                    .map_err(|_| serde::de::Error::custom("state_v2_ignored_field"))?;
             }
             Ok(())
         }

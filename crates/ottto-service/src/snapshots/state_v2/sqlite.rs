@@ -1380,8 +1380,7 @@ impl Transaction for Txn<'_> {
         let result = (|| {
             let h = preflight(&row)?;
             if *row.key == RowKey::Meta("minimum_writer_capability".into()) {
-                let mut bytes = Vec::new();
-                row.value.write(&mut ControlBuffer(&mut bytes))?;
+                let bytes = codec::capture(row.value, CONTROL_BYTES)?;
                 let next: u64 = serde_json::from_slice(&bytes)?;
                 let old = self
                     .store
@@ -1412,11 +1411,8 @@ impl Transaction for Txn<'_> {
             self.removed_keys.remove(row.key);
             let conn = self.store.conn()?;
             let inline = if matches!(row.key, RowKey::Meta(_)) {
-                let mut bytes = Vec::with_capacity(h.len as usize);
-                // Preflight already bounds controls, but the replay must be
-                // checked too before allocating for a changing producer.
-                let mut writer = ControlBuffer(&mut bytes);
-                row.value.write(&mut writer)?;
+                // Replay remains bounded before allocating for a changing producer.
+                let bytes = codec::capture(row.value, CONTROL_BYTES)?;
                 let mut hash = value_digest_start(h.value_version);
                 hash.update(&bytes);
                 ensure!(

@@ -380,26 +380,6 @@ fn admit_header(key: &RowKey, fixed: &Fixed) -> Result<()> {
     );
     Ok(())
 }
-struct Preflight {
-    hash: sha2::Sha256,
-    bytes: u64,
-    cap: u64,
-}
-impl Write for Preflight {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        use sha2::Digest;
-        self.bytes = self
-            .bytes
-            .checked_add(bytes.len() as u64)
-            .filter(|n| *n <= self.cap)
-            .ok_or_else(|| std::io::Error::other("state_v2_value_admission"))?;
-        self.hash.update(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
 fn value_version_supported(key: &RowKey, version: u32) -> bool {
     version == 1
         || version == 2
@@ -411,22 +391,13 @@ fn preflight(row: &RowInput<'_>) -> Result<Header> {
         value_version_supported(row.key, row.value_version),
         "scan_index_representation_refused"
     );
-    let mut out = Preflight {
-        hash: value_digest_start(row.value_version),
-        bytes: 0,
-        cap: value_cap(row.key),
-    };
-    row.value.write(&mut out)?;
     let stored = codec::capture(row.value, value_cap(row.key))?;
-    anyhow::ensure!(
-        stored.len() as u64 == out.bytes,
-        "state_v2_value_changed_after_preflight"
-    );
+    let len = stored.len() as u64;
     let logical_digest = codec::stored_digest(row.key, row.value_version, &stored)?;
-    let parts = if matches!(row.key, RowKey::Meta(_)) || out.bytes <= INLINE_BYTES as u64 {
+    let parts = if matches!(row.key, RowKey::Meta(_)) || len <= INLINE_BYTES as u64 {
         0
     } else {
-        out.bytes.div_ceil(PART_BYTES as u64) as u16
+        len.div_ceil(PART_BYTES as u64) as u16
     };
     let mut header = Header {
         key: row.key.clone(),
@@ -434,12 +405,11 @@ fn preflight(row: &RowInput<'_>) -> Result<Header> {
         value_version: row.value_version,
         digest: logical_digest,
         row_checksum: [0; 16],
-        len: out.bytes,
+        len,
         parts,
     };
     header.row_checksum = if let RowKey::Meta(name) = row.key {
-        let mut bytes = Vec::new();
-        row.value.write(&mut ControlBuffer(&mut bytes))?;
+        let bytes = codec::capture(row.value, CONTROL_BYTES)?;
         let mut hash = value_digest_start(row.value_version);
         use sha2::Digest;
         hash.update(&bytes);
@@ -515,24 +485,6 @@ fn row_checksum(h: &Header) -> Result<[u8; 16]> {
 #[cfg(test)]
 mod tests;
 
-struct ControlBuffer<'a>(&'a mut Vec<u8>);
-impl Write for ControlBuffer<'_> {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        if self
-            .0
-            .len()
-            .checked_add(b.len())
-            .map_or(true, |n| n > CONTROL_BYTES as usize)
-        {
-            return Err(std::io::Error::other("state_v2_control_admission"));
-        }
-        self.0.extend_from_slice(b);
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
 struct ControlJson<'a, T: Serialize + ?Sized>(&'a T);
 impl<T: Serialize + ?Sized> Value for ControlJson<'_, T> {
     fn write(&self, out: &mut dyn Write) -> Result<()> {

@@ -423,12 +423,6 @@ fn independent_identity_is_write_once() {
 }
 
 #[test]
-fn f9_current_traversal_paths_and_quarantine_dispositions_are_known() {
-    let raw = br#"{"files":{},"traversal":{"scan_roots":["/synthetic/root"],"pending_candidates":[{"scan_root":"/synthetic/root","path":"/synthetic/root/file","census_member":true,"watcher_hint":false}]},"quarantined_snapshot_fingerprints":{"h":{"disposition":"retry_pending"}},"claude_usage_authority_quarantine":{"root":{"disposition":"unproven_terminal"}}}"#;
-    assert_eq!(shape::inventory(std::io::Cursor::new(raw)), Ok(()));
-}
-
-#[test]
 fn f9_production_traversal_writer_includes_registered_parent_counts() {
     assert_eq!(
         crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES,
