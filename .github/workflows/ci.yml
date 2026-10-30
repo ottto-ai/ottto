@@ -64,8 +64,9 @@ permissions:
 
 jobs:
   rust:
-    # A partial dispatch must never produce the full required-check name.
-    name: ${{ (github.event_name == 'workflow_dispatch' && inputs.rust_test_filter != '' && !(inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin)) && 'Rust contracts (partial pre-check)' || 'Rust contracts' }}
+    # Keep this literal: skipped jobs can expose an unevaluated name expression.
+    # Partial dispatches run in the separate, explicitly named job below.
+    name: Rust contracts
     # macOS runs only in the merge queue, on dispatch and on the daily main
     # cache-refresh schedule: GitHub Free allows five hosted Macs org-wide.
     # Main pushes skip the repeat because the queue already tests the exact
@@ -74,12 +75,12 @@ jobs:
     # the queue. Rollback: revert step 3 (Mac on PRs) FIRST, then the queue
     # rule; never leave the PR skip without the queue. Step 4 (this main-push
     # skip) can be reverted on its own at any time.
-    if: ${{ github.event_name != 'pull_request' && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin)) }}
+    if: ${{ github.event_name != 'pull_request' && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin || inputs.rust_test_filter != '')) }}
     # Main's own queue run takes about 38 min (runs 40321546891, 40331916601,
     # 40348583388); 40 cancelled #791 (run 40378483829). Headroom, not a target.
     timeout-minutes: 55
     runs-on: macos-15
-    env:
+    env: &rust-contract-env
       RUSTUP_TOOLCHAIN: "1.95.0"
       OTTTO_REQUIRE_LAYOUT: "1"
       # Job-level so "Runtime tests" and "Layout coverage receipt" share one build.
@@ -87,7 +88,7 @@ jobs:
       # Dispatch-only; the special-purpose dispatch jobs keep their precedence.
       # Queue/schedule runs always execute the original full commands below.
       OTTTO_CI_TEST_FILTER: ${{ github.event_name == 'workflow_dispatch' && inputs.rust_test_filter || '' }}
-    steps:
+    steps: &rust-contract-steps
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -116,6 +117,8 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          # Same prefix as the existing "rust" job; partial pre-checks restore it.
+          shared-key: rust
           workspaces: |
             . -> target
             crates -> target
@@ -185,6 +188,15 @@ jobs:
       - name: Connector package tests
         if: env.OTTTO_CI_TEST_FILTER == ''
         run: cargo test --manifest-path crates/Cargo.toml --locked -p ottto-connector-testkit --test first_party_sources
+
+  rust-partial:
+    # Separate static names also preserve the full check when either job skips.
+    name: Rust contracts (partial pre-check)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.rust_test_filter != '' && !(inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin) }}
+    timeout-minutes: 55
+    runs-on: macos-15
+    env: *rust-contract-env
+    steps: *rust-contract-steps
 
   public-surface:
     if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin)) }}
