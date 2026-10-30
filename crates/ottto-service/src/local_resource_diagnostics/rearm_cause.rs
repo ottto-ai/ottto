@@ -12,8 +12,9 @@ pub(crate) enum Cause {
     ContextChanged,
     TerminalUnhealthyRetry,
     CarryInvalidation,
+    AuditCapDelay,
 }
-const CAUSES: [(Cause, &str); 4] = [
+const CAUSES: [(Cause, &str); 5] = [
     (
         Cause::NoRetainedTraversal,
         "rearm_cleared{no_retained_traversal}",
@@ -27,6 +28,7 @@ const CAUSES: [(Cause, &str); 4] = [
         Cause::CarryInvalidation,
         "rearm_cleared{carry_invalidation}",
     ),
+    (Cause::AuditCapDelay, "rearm_cleared{audit_cap_delay}"),
 ];
 #[derive(Default)]
 struct Tags(BTreeMap<String, Cause>);
@@ -75,7 +77,7 @@ struct Total {
 }
 /// Fixed page aggregates; the underlying acquisition full_reasons stay intact.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Counts([Total; 4]);
+pub(crate) struct Counts([Total; CAUSES.len()]);
 impl Counts {
     pub(crate) fn is_empty(&self) -> bool {
         self.0

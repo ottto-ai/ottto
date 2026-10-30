@@ -716,7 +716,10 @@ fn fe_claude_sp5_residual_sample_preserving_rewrite_after_read_is_accepted() {
     let ((_, next, audit), diagnostics) = crate::local_resource_diagnostics::capture(|| {
         plain(&base.fixture, CLAUDE, index, &base.cache)
     });
-    assert_eq!(audit.full_reasons[AUDIT_DUE], 1, "FE2: quiet Full audit");
+    assert_eq!(
+        audit.full_reasons[STATE_MISSING], 1,
+        "FE2: prefix has no checkpoint, so Full is StateMissing"
+    );
     assert_eq!(audit.unreadable, 0, "FE2: audit completes");
     assert_eq!(
         content(production_body(CLAUDE, next)),
@@ -796,13 +799,10 @@ fn fe_claude_sp7b_lossy_grown_tail_is_excluded_and_refused() {
     assert!(tail.snapshots.is_empty(), "SP-7b-c: nothing published");
 }
 
-/// SP-8c-c (RED): a grown Claude `Full(AuditDue)` earns no audit credit: FE
-/// publishes the prefix, the due debt stays staged at its deadline, and the
-/// next page is `Full(AuditDue)` again.
-///
-/// Red on main: D1 (one `OpenRead`).
+/// An overdue checkpoint still Tails the append without Full-audit credit.
+/// In-page grown-prefix deadline handling remains a separate full-S1 concern.
 #[test]
-fn fe_claude_sp8c_grown_full_audit_due_keeps_debt_staged() {
+fn fe_claude_sp8c_overdue_checkpoint_tails_and_keeps_debt_staged() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -813,22 +813,17 @@ fn fe_claude_sp8c_grown_full_audit_due_keeps_debt_staged() {
         .get_mut(&base.key)
         .unwrap()
         .set_unverified_deadline(due);
-    let path = base.path.clone();
-    let appended = row_bytes(CLAUDE, 6..9);
     let index = std::mem::take(&mut base.index);
-    let (index, full, seen, read) =
-        page_injecting(&base.fixture, CLAUDE, index, &base.cache, is_full, |_| {
-            append_raw(&path, &appended)
-        });
-    assert_eq!(read.mode, ReadMode::Full(FullReason::AuditDue));
-    assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
-    assert_prefix_published("SP-8c-c", &base, &index, full, &seen, &read, read.frozen);
+    let (index, result, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
+    assert_eq!(seen.modes, (0, 1, 0));
+    assert_eq!(seen.full_reasons[AUDIT_DUE], 0);
+    assert_eq!(seen.unreadable, 0);
+    assert_eq!(index.files[&base.key].unverified_deadline(), Some(due));
     assert_eq!(
-        index.files[&base.key].unverified_deadline(),
-        Some(due),
-        "SP-8c-c: no audit credit; the debt stays staged"
+        content(production_body(CLAUDE, result)),
+        content(full_body(&base.fixture, CLAUDE))
     );
-    next_full("SP-8c-c", &base, index, AUDIT_DUE);
+    assert!(base.cache.retained_checkpoint(&base.key).is_some());
 }
 
 /// SP-11-c, Codex (GREEN): FE is Claude-only. A Codex in-page `Full` with an
@@ -1299,8 +1294,8 @@ fn fe_claude_growth_after_e1_applied_fragment_keeps_strict_identity() {
     );
 }
 
-/// Review F2: exhausted/unsupported audit metadata retains strict Full
-/// behavior, creates no new marker and cannot disable reuse source-wide.
+/// Review F2: exhausted/unsupported legacy prefix slots still refuse a
+/// grown prefix. Ordinary acquisition keeps its frozen extent independently.
 #[test]
 fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1319,8 +1314,9 @@ fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
                 if let Some(opened) = opened(scan) {
                     assert!(is_full(opened.mode));
                     assert_eq!(
-                        opened.extent_limit, None,
-                        "no optional frozen read without capacity"
+                        opened.extent_limit,
+                        Some(opened.frozen - opened.start),
+                        "audit capacity does not disable the acquisition extent"
                     );
                     append_raw(&base.path, &row_bytes(CLAUDE, 6..9));
                     read = Some(opened);
@@ -1333,8 +1329,15 @@ fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
             &base.key,
             &result,
             &seen,
-            OPEN_READ,
+            SCOPE_OBJECT,
             "FE capacity",
+        );
+        // H1c freezes the admitted extent independently of audit capacity.
+        // With no H3c audit marker, completion revalidates the selected object.
+        assert_eq!(
+            seen.causes,
+            [0, 0, 0, 1, 0, 0, 0, 0],
+            "only scope/object refusal"
         );
         assert!(!index
             .files
@@ -1843,12 +1846,12 @@ fn fe_n1_held_tail_save_reload_reaches_due_full_and_reproves() {
         CLAUDE,
         loaded,
         &cache,
-        |mode| mode == ReadMode::Full(FullReason::AuditDue),
+        |mode| mode == ReadMode::Full(FullReason::StateMissing),
         |_| {},
     );
-    assert_eq!(read.mode, ReadMode::Full(FullReason::AuditDue));
+    assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
     assert_eq!(seen.modes, (1, 0, 0));
-    assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
+    assert_eq!(seen.full_reasons[STATE_MISSING], 1);
     assert_eq!(seen.unreadable, 0);
     assert!(!audited.files[&key].has_unverified_source());
     let record = audited.claude_request_census_for_test().get(&key).unwrap();
@@ -1959,7 +1962,8 @@ fn restore_dated(index: &mut ScanIndex, due: u64) -> usize {
 /// Option B (SOURCE rule 3): after a marker-erasing downgrade, nothing reads
 /// the unchanged held file again. A sampled scan re-derives its deadline from
 /// the persisted hold without reading, one interval out and once. The
-/// restored deadline survives save/reload, comes due as Full(AuditDue), and
+/// restored deadline survives save/reload and selects the missing-checkpoint
+/// Full(StateMissing), never a Full caused by audit age, and
 /// the verified source lets the saved witness re-prove.
 #[test]
 fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
@@ -2023,12 +2027,12 @@ fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
         CLAUDE,
         loaded,
         &hold.cache,
-        |mode| mode == ReadMode::Full(FullReason::AuditDue),
+        |mode| mode == ReadMode::Full(FullReason::StateMissing),
         |_| {},
     );
-    assert_eq!(read.mode, ReadMode::Full(FullReason::AuditDue));
+    assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
     assert_eq!(seen.modes, (1, 0, 0));
-    assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
+    assert_eq!(seen.full_reasons[STATE_MISSING], 1);
     assert_eq!(seen.unreadable, 0);
     assert!(!audited.files[&key].has_unverified_source());
     let record = audited.claude_request_census_for_test().get(&key).unwrap();
@@ -2141,10 +2145,10 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
         CLAUDE,
         loaded,
         &hold.cache,
-        |mode| mode == ReadMode::Full(FullReason::AuditDue),
+        |mode| mode == ReadMode::Full(FullReason::StateMissing),
         |_| {},
     );
-    assert_eq!(read.mode, ReadMode::Full(FullReason::AuditDue));
+    assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
     assert_eq!(seen.modes, (1, 0, 0));
     assert_eq!(seen.unreadable, 0);
     assert!(
@@ -2260,7 +2264,7 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
         sampled_scan::set_test_now(Some(due));
         let (mut index, result, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
         assert_eq!(seen.modes, (1, 0, 0));
-        assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
+        assert_eq!(seen.full_reasons[STATE_MISSING], 1);
         assert_eq!(seen.unreadable, 0);
         assert!(!index
             .claude_request_census_for_test()
@@ -2269,6 +2273,146 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
             .unverified_or_twin());
         assert_eq!(index.claude_usage_family_witnesses[SESSION], hold.witness);
         assert!(mints_v1(&mut index, &result, 0..6));
+    }
+}
+
+/// Capture and attachment straddle D in both directions. A pre-due page
+/// cannot spend a virtual turn merely because attachment occurs after D.
+#[test]
+fn fe_n1_option_b_attachment_uses_captured_audit_time_across_due_edge() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    use crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS as INTERVAL;
+    use crate::transcript_cache::CACHE_ENTRIES;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _clock = TestClock;
+    let due = sampled_scan::now_seconds();
+    for saturated in [false, true] {
+        let hold = erased_hold(due);
+        let key = hold.key.clone();
+        File::open(&hold.fixture.file.0)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        let mut index = hold.index;
+        assert!(sampled_audit::awaits_hold_deadline_restoration(
+            &index, &key
+        ));
+        if saturated {
+            for n in 0..CACHE_ENTRIES - 1 {
+                let mut pending = index.files[&key].clone();
+                pending.set_unverified_deadline(due);
+                index
+                    .files
+                    .insert(format!("/attachment-unavailable/{n}"), pending);
+            }
+            index.held_audit_progress = Some(sampled_audit::HeldAuditProgress {
+                key: key.clone(),
+                due,
+                attempted: false,
+            });
+        }
+        for captured in [due - 1, due] {
+            if !saturated && captured == due {
+                break; // The free-slot arm restores a new ordinary deadline.
+            }
+            sampled_scan::set_test_now(Some(captured));
+            let scan = OwnedSourceScan::new(
+                CLAUDE,
+                std::slice::from_ref(&hold.fixture.root),
+                index,
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            );
+            assert_eq!(scan.audit_now, captured);
+            assert!(
+                !scan
+                    .identified_candidates
+                    .iter()
+                    .any(|candidate| local_index_key(&candidate.path) == key),
+                "the old unmarked file needs held-slot rescue"
+            );
+            // Unlike a before_step/setup hook, this is BEFORE attachment.
+            sampled_scan::set_test_now(Some(if captured < due { due + 1 } else { due - 1 }));
+            let scan = scan.with_sampled_acquisition(hold.cache.clone(), Scope(NAMESPACE.into()));
+            let scheduled = captured == due;
+            if saturated {
+                let slot = scan.index.held_audit_progress.as_ref().unwrap();
+                assert_eq!(slot.key, key);
+                assert_eq!(
+                    slot.due, due,
+                    "attachment never postpones the original turn"
+                );
+                if !scheduled {
+                    assert!(
+                        !slot.attempted,
+                        "no spent turn before the captured deadline"
+                    );
+                }
+                assert_eq!(
+                    sampled_audit::progress_debt(&scan.index, &key, scan.audit_now).is_some(),
+                    scheduled
+                );
+                assert_eq!(
+                    scan.identified_candidates
+                        .iter()
+                        .any(|candidate| local_index_key(&candidate.path) == key),
+                    scheduled
+                );
+                assert_eq!(scan.sampling.as_ref().unwrap().audit_slots, 1);
+                assert!(!scan.index.files[&key].has_unverified_source());
+            } else {
+                let restored_due = captured + INTERVAL;
+                assert_eq!(
+                    scan.index.files[&key].unverified_deadline(),
+                    Some(restored_due),
+                    "ordinary restoration is also dated by the captured clock"
+                );
+                assert!(!scan.index.files[&key].audit_requires_full(scan.audit_now));
+                assert!(scan.index.held_audit_progress.is_none());
+            }
+            let (next, raw, _, modes, _) = finish_production_scan_page(scan, CLAUDE);
+            index = next;
+            assert_eq!(modes, (usize::from(scheduled), 0, 0));
+            if scheduled {
+                assert!(
+                    !raw.snapshots.is_empty(),
+                    "the original due turn performs its native read"
+                );
+                assert!(!sampled_audit::awaits_hold_deadline_restoration(
+                    &index, &key
+                ));
+                assert_eq!(index.held_audit_progress.as_ref().unwrap().due, due);
+            } else {
+                assert!(index
+                    .claude_request_census_for_test()
+                    .get(&key)
+                    .unwrap()
+                    .identity_incomplete_hold());
+                if saturated {
+                    let slot = index.held_audit_progress.as_ref().unwrap();
+                    assert_eq!(slot.due, due);
+                    assert!(
+                        !slot.attempted,
+                        "rescue and completion did not spend a future turn"
+                    );
+                }
+            }
+            index.save(&hold.index_path).unwrap();
+            index = ScanIndex::load(&hold.index_path).unwrap();
+            if saturated && !scheduled {
+                let slot = index.held_audit_progress.as_ref().unwrap();
+                assert_eq!(slot.due, due, "D survives save/reload unchanged");
+                assert!(!slot.attempted);
+            }
+        }
     }
 }
 
@@ -2378,7 +2522,7 @@ fn fe_n1_option_b_saturated_non_draining_debts_do_not_starve_many_readable_holds
         });
         index = next;
         assert!(seen.modes.0 <= 1, "one recovery Full per page");
-        assert_eq!(seen.modes.0, seen.full_reasons[AUDIT_DUE]);
+        assert_eq!(seen.modes.0, seen.full_reasons[STATE_MISSING]);
         fulls += seen.modes.0;
         for key in &readable {
             if index
@@ -2466,7 +2610,7 @@ fn fe_n1_option_b_failed_virtual_audits_keep_hold_and_reserved_slot_then_reprove
         sampled_scan::set_test_now(Some(due - 3 * INTERVAL));
         let mut index = if failure != 0 {
             let (index, result, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
-            assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
+            assert_eq!(seen.full_reasons[STATE_MISSING], 1);
             if failure == 1 {
                 assert!(result.over_line_cap_count > 0);
             } else {
@@ -2484,13 +2628,13 @@ fn fe_n1_option_b_failed_virtual_audits_keep_hold_and_reserved_slot_then_reprove
                 CLAUDE,
                 index,
                 &hold.cache,
-                |mode| mode == ReadMode::Full(FullReason::AuditDue),
+                |mode| mode == ReadMode::Full(FullReason::StateMissing),
                 |_| {
                     fs::rename(&path, &parked).unwrap();
                     std::os::unix::fs::symlink("missing-target", &path).unwrap();
                 },
             );
-            assert_eq!(read.mode, ReadMode::Full(FullReason::AuditDue));
+            assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
             assert!(seen.unreadable > 0, "completion re-open must fail");
             fs::remove_file(&path).unwrap();
             fs::rename(&parked, &path).unwrap();
@@ -2526,7 +2670,7 @@ fn fe_n1_option_b_failed_virtual_audits_keep_hold_and_reserved_slot_then_reprove
         let index = ScanIndex::load(&hold.index_path).unwrap();
         sampled_scan::set_test_now(Some(due - INTERVAL));
         let (mut index, result, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
-        assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
+        assert_eq!(seen.full_reasons[STATE_MISSING], 1);
         assert_eq!(seen.unreadable, 0);
         assert!(!index
             .claude_request_census_for_test()
