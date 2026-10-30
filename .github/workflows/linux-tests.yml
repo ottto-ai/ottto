@@ -114,7 +114,8 @@ jobs:
       - name: Runtime tests
         # Print a failing assertion when it happens, not only after the suite.
         # Keep going past a failing test binary so one run lists every failure.
-        run: cargo test --workspace --locked --no-fail-fast -- --nocapture
+        # Same split as the macOS job (scripts/ci_runtime_tests.py).
+        run: python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1 --no-fail-fast
 
       - name: Connector tests
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked
