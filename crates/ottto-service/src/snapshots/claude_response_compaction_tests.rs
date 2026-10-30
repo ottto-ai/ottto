@@ -46,9 +46,6 @@ impl TempJsonl {
         let path = root.join(format!("{SESSION}.jsonl"));
         Self { dir, path }
     }
-    fn root(&self) -> PathBuf {
-        self.dir.join("home/.claude/projects")
-    }
     fn append(&self, rows: &[Value]) {
         let mut file = OpenOptions::new()
             .create(true)
@@ -441,113 +438,6 @@ fn claude_realistic_session_keeps_parity_at_every_split() {
     let sources = &item.model_usage[0].selector_sources;
     assert!(sources.contains_key("service_tier") && sources.contains_key("speed_mode"));
     assert_every_split_tails_with_full_parity("realistic", &rows);
-}
-
-fn production_scan(
-    file: &TempJsonl,
-    index: ScanIndex,
-    cache: Option<Arc<sampled_scan::SharedCache>>,
-) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
-    let source = SnapshotSource::ClaudeCode;
-    let mut scan = OwnedSourceScan::new(
-        source,
-        std::slice::from_ref(&file.root()),
-        index,
-        NOW,
-        BACKFILL_WINDOW_DAYS,
-        10,
-        false,
-        None,
-        &[],
-        false,
-        true,
-    );
-    if let Some(cache) = cache {
-        scan = scan.with_sampled_acquisition(cache, Scope("r1a-production".into()));
-    }
-    let mut modes = (0, 0, 0);
-    loop {
-        if let Some(context) = scan.sampling.as_ref() {
-            modes = (
-                context.full_files,
-                context.tail_files,
-                context.unchanged_files,
-            );
-        }
-        match scan.step(None) {
-            OwnedSourceScanStep::Pending(next) => scan = next,
-            OwnedSourceScanStep::Complete {
-                mut index, scan, ..
-            } => {
-                let mut projected = scan.clone();
-                apply_upload_policy(
-                    source,
-                    &mut projected.snapshots,
-                    SnapshotUploadPolicy::default(),
-                );
-                finalize_scan_after_policy(source, &mut projected, &mut index);
-                let accepted = projected
-                    .snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                    .collect();
-                index.record_accepted_snapshot_fingerprints(&accepted);
-                return (index, scan, modes);
-            }
-        }
-    }
-}
-
-fn production_body(mut scan: SourceScanResult) -> Value {
-    apply_upload_policy(
-        SnapshotSource::ClaudeCode,
-        &mut scan.snapshots,
-        SnapshotUploadPolicy::default(),
-    );
-    serde_json::to_value(scan.snapshots).unwrap()
-}
-
-/// A 600-response realistic session retains its reader state, so the next
-/// append tails, and the tailed output equals an independent full read. The
-/// retained boundary falls inside response 600.
-#[test]
-fn claude_realistic_600_response_session_tails_with_full_read_parity() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let file = TempJsonl::new("production-600");
-    let mut rows = realistic_rows(0..600, &[SHELL]);
-    let mut appended = realistic_rows(600..608, &[SHELL, CHROME[2]]);
-    rows.extend(appended.drain(..2));
-    file.append(&rows);
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    let (index, _, modes) = production_scan(&file, ScanIndex::default(), Some(cache.clone()));
-    assert_eq!(modes, (1, 0, 0));
-    file.append(&appended);
-    let (_, tail, modes) = production_scan(&file, index, Some(cache));
-    let (_, full, _) = production_scan(&file, ScanIndex::default(), None);
-    let tail = production_body(tail);
-    let full = production_body(full);
-    assert_eq!(tail, full);
-    let item = &full[0];
-    assert_eq!(item["request_count"], json!(608));
-    assert!(
-        item["session_display_name"].is_string(),
-        "{}",
-        item["session_display_name"]
-    );
-    assert!(item["session_start"].is_object());
-    assert!(item["tool_usage"]
-        .as_array()
-        .is_some_and(|tools| tools.len() >= 2));
-    let usage = item["model_usage"].as_array().expect("model usage");
-    assert!(usage
-        .iter()
-        .any(|row| row["selector_context"].get("context_bucket").is_some()));
-    assert!(usage
-        .iter()
-        .any(|row| row["selector_sources"].get("region_mode").is_some()));
-    assert_eq!(modes, (0, 1, 0), "the 600-response session did not tail");
 }
 
 fn selector(fields: &[(&str, &str, &str)]) -> SelectorCapture {

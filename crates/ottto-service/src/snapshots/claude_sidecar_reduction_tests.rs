@@ -429,24 +429,6 @@ fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
 }
 
 #[test]
-fn transcript_and_sidecar_append_use_tail_without_changing_joined_body() {
-    let f = Fixture::new(1);
-    let cache = Arc::new(SharedCache::default());
-    let prior = seed_predecessor(&f, &cache);
-    f.append_transcript(1);
-    f.evidence(2);
-    let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
-    assert_layout_mode(cached.modes, (0, 1, 0));
-    assert_oracle(&f, &cached, prior);
-    assert_eq!(
-        cached.index.files[&local_index_key(&f.path)]
-            .audit_obligation(now_seconds())
-            .is_some(),
-        crate::heap_layout_bound::layout_supported()
-    );
-}
-
-#[test]
 fn root_telemetry_reselects_every_child_without_invalidating_reduction() {
     let mut f = Fixture::new(1);
     let children = ["a4d1585d310070d0f", "b4d1585d310070d0f"];

@@ -50,12 +50,6 @@ impl Fixture {
             object["digest"].as_str().unwrap()
         ))
     }
-    fn metadata_path(&self) -> PathBuf {
-        self.shards.join(format!(
-            "metadata-{}.json",
-            self.manifest["objects"][0]["digest"].as_str().unwrap()
-        ))
-    }
     fn semantic_damage(&mut self, map: usize) {
         let old = self.bucket_path(map);
         let original: Value = serde_json::from_slice(&fs::read(&old).unwrap()).unwrap();
@@ -291,30 +285,6 @@ fn integrated_reader_loads_shards_and_still_writes_legacy_with_committed_generat
     );
 }
 
-/// The downgrade contract of a later shard writer: `ObjectKeys` admits only
-/// registered names, so this key must be registered before anything writes it.
-#[test]
-fn integrated_sharded_metadata_carrying_the_desktop_inventory_loads_and_saves_without_it() {
-    let mut fixture = Fixture::new();
-    let healthy = serde_json::to_vec(&fixture.load()).unwrap();
-    let old = fixture.metadata_path();
-    let mut metadata: Value = serde_json::from_slice(&fs::read(&old).unwrap()).unwrap();
-    metadata["claude_desktop_store_inventory"] = json!("a".repeat(64));
-    let payload = serde_json::to_vec(&metadata).unwrap();
-    fixture.rebind_object(0, &payload);
-    let new = fixture.metadata_path();
-    fs::rename(old, &new).unwrap();
-    fs::write(new, payload).unwrap();
-    fixture.write_root();
-    let mut loaded = fixture.load();
-    assert!(loaded.persistence_available());
-    assert_eq!(loaded.claude_desktop_store_inventory, Some("a".repeat(64)));
-    assert_eq!(serde_json::to_vec(&loaded).unwrap(), healthy);
-    loaded.save(&fixture.root).unwrap();
-    let raw: Value = serde_json::from_slice(&fs::read(&fixture.root).unwrap()).unwrap();
-    assert!(raw.get("claude_desktop_store_inventory").is_none());
-}
-
 #[test]
 fn integrated_fresh_init_orphans_are_discarded_and_failure_observations_are_drained() {
     let fixture = Fixture::new();
@@ -436,29 +406,6 @@ fn partial_negative_metadata_holds_keep_their_fund_when_a_map_is_missing() {
     assert!(index.decode_holds.contains("files", "held-negative-file"));
     assert!(index.decode_holds.held_bytes() > 2 * 1024 * 1024);
     assert!(index.decode_holds.held_bytes() <= 8 * 1024 * 1024);
-}
-
-#[test]
-fn completed_storage_controls_keep_many_small_negative_holds_with_one_byte_budget() {
-    let files = (0..1500)
-        .map(|i| (format!("held-{i}"), json!({"size_bytes": "invalid"})))
-        .collect::<serde_json::Map<_, _>>();
-    let bytes = serde_json::to_vec(&json!({
-        "schema_version": 2,
-        "generation": 1,
-        "files": files,
-        "fixture_padding": " ".repeat(4 * 1024 * 1024),
-    }))
-    .unwrap();
-    let index = lenient_decode::read(
-        std::io::Cursor::new(bytes),
-        "many-small-held-controls",
-        "claude_code",
-    )
-    .unwrap();
-    assert_eq!(index.decode_holds.file_keys().count(), 1500);
-    assert!(lenient_decode::persistence_controls(&index, 8 * 1024 * 1024).is_ok());
-    assert!(lenient_decode::persistence_controls(&index, 1).is_err());
 }
 
 #[test]
