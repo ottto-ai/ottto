@@ -3997,11 +3997,11 @@ pub struct ScanIndex {
     /// E2 stored copy removals (copy-family fix): what each Claude file once
     /// removed on an earlier holder's current proof stays removed after that
     /// proof retires. Bounded and local. Appended slot; older daemons ignore
-    /// it, damaged text decodes as empty (copies then decide afresh).
+    /// it; absent/damaged metadata stays uncertain until the current proof decides.
     #[serde(
-        default,
+        default = "claude_request_money::copy_removals::CopyRemovals::missing",
         skip_serializing_if = "claude_request_money::copy_removals::CopyRemovals::is_empty",
-        deserialize_with = "deserialize_lenient_default"
+        deserialize_with = "claude_request_money::copy_removals::CopyRemovals::deserialize_lenient"
     )]
     pub(crate) claude_copy_removals: claude_request_money::copy_removals::CopyRemovals,
 }
@@ -50392,6 +50392,11 @@ impl ScanIndex {
                 }
                 return (CandidateDecision::Skip, None);
             }
+        }
+        // A prefix-only hold must survive settlement of the file's own turns.
+        // Its persisted attempt counter expires on the third decision pass.
+        if self.claude_copy_removals.pending(claude_money_birth_store::location_key(&key)) {
+            return (CandidateDecision::Parse, Some(CandidateParseReason::SourceChanged));
         }
         if entry.audit_requires_full(now) || sampled_audit::progress_debt(self, &key, now).is_some()
         {

@@ -1063,6 +1063,7 @@ fn e2_diagnostic_fields_are_nonzero_only() {
         priced_requests: 2,
         cost_micros: 700,
         reused: 0,
+        ..PrefixTally::default()
     };
     assert_eq!(
         serde_json::to_value(Counts::prefix(&tally)).unwrap(),

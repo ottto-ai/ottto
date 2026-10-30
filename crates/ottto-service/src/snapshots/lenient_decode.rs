@@ -2021,7 +2021,9 @@ impl<R: BufRead + Seek> Decoder<R> {
                             if decoded.is_none() {
                                 self.counts.drops.activity += 1;
                             }
-                            index.claude_copy_removals = decoded.unwrap_or_default();
+                            index.claude_copy_removals = decoded.unwrap_or_else(
+                                claude_request_money::copy_removals::CopyRemovals::missing,
+                            );
                         }
                         "accepted_rebuild_incidence" => {
                             if value.len > CARRIED_ACK_BYTES_MAX as u64 {
@@ -2047,6 +2049,10 @@ impl<R: BufRead + Seek> Decoder<R> {
         }
 
         if pass == Pass::Full {
+            if !seen.contains("claude_copy_removals") {
+                index.claude_copy_removals =
+                    claude_request_money::copy_removals::CopyRemovals::missing();
+            }
             // Migrate the old marker without granting later ACKs blanket retention.
             if index.accepted_incidence_pending_census
                 && index.accepted_rebuild_incidence.is_empty()

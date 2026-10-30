@@ -2947,10 +2947,10 @@ fn e2_pipeline_stored_copy_removal_is_dropped_when_its_holder_no_longer_holds_it
 }
 
 #[test]
-fn e2_pipeline_copy_removal_capacity_preserves_old_decisions_and_holds_new_ones() {
+fn e2_pipeline_copy_removal_capacity_preserves_old_decisions_and_removes_unrecorded() {
     with_e2(|| {
         use crate::snapshots::claude_money_birth_store::location_key;
-        use crate::snapshots::claude_request_money::copy_removals::{CopyRemovals, MAX_BYTES};
+        use crate::snapshots::claude_request_money::copy_removals::MAX_BYTES;
         let mut c = Corpus::new("e2-pipeline-copy-family-capacity");
         c.root(ROOT, &resumed(ROOT, &[A, B]));
         let old = ScanIndex::default();
@@ -2963,7 +2963,6 @@ fn e2_pipeline_copy_removal_capacity_preserves_old_decisions_and_holds_new_ones(
             root,
             (0..((MAX_BYTES - 40 - 32) / 8) as u64).collect::<BTreeSet<_>>(),
         )]);
-        assert_eq!(CopyRemovals::decision_bytes(&groups), MAX_BYTES);
         assert_eq!(prior.claude_copy_removals.store(root, groups).overflow, 0);
         let stored = prior.claude_copy_removals.clone();
         c.write_at(
@@ -2974,15 +2973,20 @@ fn e2_pipeline_copy_removal_capacity_preserves_old_decisions_and_holds_new_ones(
         e2::take_diag();
         let mut page = c.raw(&E2ScanFixture::default(), prior, 100, false, &[]);
         page.enrich(&c);
-        assert_withheld(&page, COPY, "new removals cannot fit durable storage");
+        let copy = body(&page, COPY).expect("own turns emit at capacity");
+        assert!(crate::snapshots::claude_request_money::is_request_owned_literal(copy));
+        assert_eq!(
+            (copy.request_count, copy.removed_request_count),
+            (1, Some(2))
+        );
         assert_eq!(page.index.claude_copy_removals, stored);
         assert_eq!(
             copy_diag(&[
                 "copy_removal_store_overflow",
-                "held_copy_removal_capacity",
+                "copy_removed_unrecorded",
                 "copy_prefix_unproven"
             ]),
-            [2, 1, 0]
+            [2, 2, 0]
         );
     });
 }
@@ -3085,4 +3089,147 @@ fn e2_pipeline_file_without_copied_prefix_stores_and_flags_nothing() {
         assert_eq!(copy_diag(&PREFIX_KEYS), [0; 5]);
         assert!(page.index.claude_copy_removals.is_empty());
     });
+}
+
+#[test]
+fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decisions() {
+    for sampled in [false, true] {
+        with_e2(|| {
+            let mut c = Corpus::new("e2-pipeline-prefix-expiry");
+            c.root(ROOT, &resumed(ROOT, &[A, B]));
+            let mut progress = e2_progress();
+            let scanner = E2ScanFixture::default();
+            let old = ScanIndex::default();
+            let original = ready(&c, &scanner, old.clone(), 100, sampled);
+            let mut prior = settle(&c, &old, original, &mut progress);
+            c.write_at(
+                &file(COPY),
+                &resumed(COPY, &[A, B, C]),
+                "2026-08-02T07:03:00Z",
+            );
+            for pass in 1..=3 {
+                let mut page = c.raw(&scanner, prior.clone(), 100, sampled, &[]);
+                e2::take_diag();
+                crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
+                    page.enrich(&c);
+                });
+                let copy =
+                    body(&page, COPY).expect("held prefix stays discoverable after own-turn ACK");
+                assert!(crate::snapshots::claude_request_money::is_request_owned_literal(copy));
+                assert_eq!(
+                    (copy.request_count, copy.removed_request_count),
+                    (if pass < 3 { 1 } else { 3 }, Some(0))
+                );
+                assert_eq!(
+                    copy_diag(&[
+                        "copy_prefix_held_requests",
+                        "copy_prefix_hold_expired",
+                        "copy_prefix_unproven"
+                    ]),
+                    if pass < 3 { [2, 0, 0] } else { [0, 2, 2] }
+                );
+                prior = settle(&c, &prior, page, &mut progress); // save/reload each pass
+            }
+            let quiet = ready(&c, &scanner, prior, 100, sampled);
+            assert!(
+                body(&quiet, COPY).is_none(),
+                "expired retry debt never selects forever"
+            );
+        });
+    }
+}
+
+#[test]
+fn e2_pipeline_lossy_holder_hits_prove_but_absences_are_flagged() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-lossy-positive");
+        c.root(ROOT, &resumed(ROOT, &[A, B]));
+        let old = ScanIndex::default();
+        let original = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
+        let mut prior = settle(&c, &old, original, &mut e2_progress());
+        e2::pipeline_test_observer::lossy_census(&mut prior, &file(ROOT), &["a"]);
+        c.write_at(
+            &file(COPY),
+            &resumed(COPY, &[A, B, C]),
+            "2026-08-02T07:03:00Z",
+        );
+        e2::take_diag();
+        let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        let copy = body(&page, COPY).unwrap();
+        assert_eq!(
+            (copy.request_count, copy.removed_request_count),
+            (2, Some(1))
+        );
+        assert_eq!(
+            copy_diag(&["copy_prefix_unproven", "copy_removal_stored"]),
+            [1, 1]
+        );
+    });
+}
+
+#[test]
+fn e2_pipeline_lossy_absence_never_invalidates_a_stored_removal() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-lossy-stored");
+        let mut prior = demo_family(&mut c, &mut e2_progress());
+        e2::pipeline_test_observer::lossy_census(&mut prior, &file(ROOT), &["b"]);
+        e2::pipeline_test_observer::retire_census(&mut prior, &file(COPY));
+        append(
+            &c.root.join(file(THIRD)),
+            &line_by(THIRD, "e", "2026-08-02T07:06:20Z", 10, RESUME_WRITER),
+        );
+        e2::take_diag();
+        let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        let third = body(&page, THIRD).unwrap();
+        assert_eq!(
+            (third.request_count, third.removed_request_count),
+            (2, Some(3))
+        );
+        assert_eq!(
+            copy_diag(&["copy_prefix_unproven", "copy_removal_reused"]),
+            [0, 2]
+        );
+    });
+}
+
+#[test]
+fn e2_pipeline_lost_removal_metadata_rederives_or_emits_flagged_without_delaying_own_turns() {
+    for missing in [false, true] {
+        for retired in [false, true] {
+            with_e2(|| {
+                let mut c = Corpus::new("e2-pipeline-removal-metadata-lost");
+                let mut prior = demo_family(&mut c, &mut e2_progress());
+                if retired {
+                    e2::pipeline_test_observer::retire_census(&mut prior, &file(ROOT));
+                    e2::pipeline_test_observer::retire_census(&mut prior, &file(COPY));
+                }
+                let mut encoded = serde_json::to_value(&prior).unwrap();
+                if missing {
+                    encoded
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("claude_copy_removals");
+                } else {
+                    encoded["claude_copy_removals"] = json!("damaged");
+                }
+                prior = serde_json::from_value(encoded).unwrap();
+                prior = c.reload(&mut prior); // both native and streaming decode
+                append(
+                    &c.root.join(file(THIRD)),
+                    &line_by(THIRD, "e", "2026-08-02T07:06:20Z", 10, RESUME_WRITER),
+                );
+                e2::take_diag();
+                let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+                let third = body(&page, THIRD).expect("own turns always publish");
+                assert_eq!(
+                    (third.request_count, third.removed_request_count),
+                    if retired { (5, Some(0)) } else { (2, Some(3)) }
+                );
+                assert_eq!(
+                    copy_diag(&["copy_prefix_unproven", "copy_removal_metadata_lost"]),
+                    if retired { [3, 3] } else { [0, 0] }
+                );
+            });
+        }
+    }
 }

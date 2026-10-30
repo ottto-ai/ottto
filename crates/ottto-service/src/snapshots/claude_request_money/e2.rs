@@ -1015,6 +1015,9 @@ pub(crate) struct PrefixTally {
     priced_requests: u64,
     cost_micros: u64,
     reused: u64,
+    held_requests: u64,
+    hold_expired: u64,
+    metadata_lost: u64,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for PrefixTally {
     const INLINE_ONLY: bool = true;
@@ -2029,7 +2032,8 @@ fn skipped_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> + '_ {
 /// entry's fingerprint. Requests no current revision holds count and are
 /// disclosed. What cannot be decided yet (the proof file not read at its
 /// current revision, a holder not indexed yet, the census walk deadline)
-/// holds the session: delayed to a later page, never counted. All the
+/// defers the unresolved prefix; own turns emit. The third decision pass
+/// emits any still-unproven prefix flagged. All the
 /// page's cross-session checks share ONE census walk. Runs in both gate
 /// modes; dark only counts. Returns the removals to store (gate on only):
 /// the caller applies them to the index (`CopyRemovalUpdates::apply`).
@@ -2063,7 +2067,7 @@ pub(crate) fn decide_page_copies(
     };
     if enabled() {
         for item in items.iter_mut() {
-            tally_unproven_prefix(item);
+            tally_unproven_prefix(item, index.claude_copy_removals.metadata_lost());
         }
     }
     updates
@@ -2072,7 +2076,7 @@ pub(crate) fn decide_page_copies(
 /// The flagged range of a decided fold: its copied-prefix requests that
 /// count because their proof failed (Lead B Addendum 2). A held fold emits
 /// nothing on this page, so it flags nothing.
-fn tally_unproven_prefix(item: &mut SnapshotItem) {
+fn tally_unproven_prefix(item: &mut SnapshotItem, metadata_lost: bool) {
     let SnapshotItem {
         claude_money: Some(fold),
         claude_usage_occurrences,
@@ -2090,38 +2094,35 @@ fn tally_unproven_prefix(item: &mut SnapshotItem) {
         .filter(|occurrence| fold.unproven_copy(occurrence))
         .map(|occurrence| occurrence.usage.request_count)
         .sum();
+    if metadata_lost {
+        fold.prefix.metadata_lost = fold.prefix.unproven_requests + fold.prefix.unproven_idless;
+    }
 }
 
 /// Removal decisions of one page for the index's stored copy removals.
 #[derive(Debug, Default)]
 pub(crate) struct CopyRemovalUpdates {
-    decisions: Vec<(LocationKey, BTreeMap<LocationKey, BTreeSet<u64>>)>,
-    overflow: u64,
+    state: Option<super::copy_removals::CopyRemovals>,
+    added: u64,
+    unrecorded: u64,
 }
 impl CopyRemovalUpdates {
-    /// Store admitted decisions. A refusal holds the newly proven removal
-    /// before emission, rather than removing a copy without durable custody.
-    /// Existing removals are never evicted to make room.
+    /// The bounded replacement carries stored decisions and retry debt in the
+    /// same index save. A refused decision still removes proven copies.
     pub(crate) fn apply(self, index: &mut ScanIndex) {
-        if self.decisions.is_empty() && self.overflow == 0 {
-            return;
+        if let Some(state) = self.state {
+            index.claude_copy_removals = state;
         }
-        // Files no longer indexed (any removal path) leave first; this
-        // page's own files are stored after, whether indexed yet or not.
-        let live = indexed_main_files(index)
-            .into_keys()
-            .collect::<BTreeSet<_>>();
-        let removals = &mut index.claude_copy_removals;
-        removals.retain_files(|file| live.contains(&file));
-        let (mut added, mut overflow) = (0, self.overflow);
-        for (file, groups) in self.decisions {
-            let stored = removals.store(file, groups);
-            added += stored.added;
-            overflow += stored.overflow;
+        diag("copy_removal_stored", self.added);
+        diag("copy_removal_store_overflow", self.unrecorded);
+        diag("copy_removed_unrecorded", self.unrecorded);
+        if self.unrecorded > 0 {
+            eprintln!(
+                "local Claude money: alarm=copy_removal_store_full copy_removed_unrecorded={}",
+                self.unrecorded
+            );
         }
-        diag("copy_removal_stored", added);
-        diag("copy_removal_store_overflow", overflow);
-        record_counts(Counts::removal_store(added, overflow));
+        record_counts(Counts::removal_store(self.added, self.unrecorded));
     }
 }
 
@@ -2148,7 +2149,17 @@ fn stored_holder_answer(index: &ScanIndex, holder: &str, hash: u64) -> Option<bo
         .claude_request_census
         .get(holder)
         .filter(|record| record.proves_scan())
-        .map(|record| record.holds_hash(hash))
+        .and_then(|record| {
+            if record.holds_hash(hash) {
+                Some(true)
+            } else if record.is_lossy() {
+                None
+            }
+            // E7 Addendum 6: absence is unknown.
+            else {
+                Some(false)
+            }
+        })
 }
 
 fn decide_twin(items: &mut [SnapshotItem], at: usize, witness: &str, index: &ScanIndex) {
@@ -2498,9 +2509,12 @@ fn decide_holders(
     let pending = std::cell::OnceCell::<BTreeSet<String>>::new();
     let pending_files = std::cell::OnceCell::new();
     let mut updates = CopyRemovalUpdates::default();
-    // Reserve against the complete store before removing anything. Application
-    // may prune deleted files, which can only increase the available space.
-    let mut available = super::copy_removals::MAX_BYTES - index.claude_copy_removals.bytes();
+    if enabled() {
+        let mut state = index.claude_copy_removals.clone();
+        let live = live.get_or_init(|| indexed_main_files(index));
+        state.retain_files(|file| live.contains_key(&file));
+        updates.state = Some(state);
+    }
     for wanted in wanted {
         let uncovered = wanted
             .hashes
@@ -2508,42 +2522,38 @@ fn decide_holders(
             .copied()
             .filter(|hash| !wanted.covered.contains_key(hash) && !wanted.stored.contains(hash))
             .collect::<Vec<_>>();
-        if enabled() {
-            // Proven now (each hash on a current holder) or stored: keep it.
-            // A proven copy whose decision cannot fit is held, not removed
-            // without a durable record and not mislabeled as unproven.
+        if let Some(state) = updates.state.as_mut() {
             let groups = stored_groups(index, &live, &wanted.covered, wanted.order.1);
-            let old = index.claude_copy_removals.file_bytes(wanted.order.1);
-            let new = super::copy_removals::CopyRemovals::decision_bytes(&groups);
-            if new > available + old {
-                updates.overflow += groups
-                    .values()
-                    .map(|hashes| hashes.len() as u64)
-                    .sum::<u64>();
-                hold_copies(&mut items[wanted.at], "held_copy_removal_capacity");
-                let mut held = Counts::default();
-                held.0[14] = 1;
-                record_counts(held);
-                continue;
-            }
-            available = available + old - new;
-            updates.decisions.push((wanted.order.1, groups));
+            let stored = state.store(wanted.order.1, groups);
+            updates.added += stored.added;
+            updates.unrecorded += stored.overflow;
         }
         let reused = wanted
             .stored
             .iter()
             .filter(|hash| !wanted.covered.contains_key(hash))
             .count() as u64;
-        // Undecidable now (a holder not read at its current revision, or the
-        // walk deadline): the session waits for a later page, resumed or
-        // not. A resumed file emitted now would never be decided again
-        // unless it changes, so its prefix would count twice for good.
+        // Only the unresolved prefix waits. Persisted retry debt reselects
+        // the file after its own-turn ACK, even when it is unchanged; its
+        // third decision emits any remaining unproven requests flagged.
         if walked.is_none() {
-            hold_copies(&mut items[wanted.at], "held_copy_deadline");
+            defer_prefix(
+                &mut items[wanted.at],
+                &uncovered,
+                &mut updates.state,
+                wanted.order.1,
+                "held_copy_deadline",
+            );
             continue;
         }
         if wanted.waiting || uncovered.iter().any(|hash| wanted.stale.contains(hash)) {
-            hold_copies(&mut items[wanted.at], "held_copy_stale_holder");
+            defer_prefix(
+                &mut items[wanted.at],
+                &uncovered,
+                &mut updates.state,
+                wanted.order.1,
+                "held_copy_stale_holder",
+            );
             continue;
         }
         // The pre-existing all-copy /branch lineage rule is not request-id
@@ -2556,6 +2566,9 @@ fn decide_holders(
                 .as_deref()
                 .is_some_and(|parent| parent_proves(index, parent, &wanted.session, wanted.order))
         {
+            if let Some(state) = updates.state.as_mut() {
+                state.clear_hold(wanted.order.1);
+            }
             diag("copy_parent_ref", uncovered.len() as u64);
             restore_uncovered(&mut items[wanted.at], &[]);
             note_reused(&mut items[wanted.at], reused);
@@ -2573,8 +2586,17 @@ fn decide_holders(
                     .any(|root| *root != wanted.session)
             };
         if blocked {
-            hold_copies(&mut items[wanted.at], "held_copy_unscanned");
+            defer_prefix(
+                &mut items[wanted.at],
+                &uncovered,
+                &mut updates.state,
+                wanted.order.1,
+                "held_copy_unscanned",
+            );
             continue;
+        }
+        if let Some(state) = updates.state.as_mut() {
+            state.clear_hold(wanted.order.1);
         }
         // Lead B Addendum 2: what no holder proves now (its id list retired,
         // over budget or missing, no stored removal) counts, flagged.
@@ -2627,6 +2649,76 @@ fn note_reused(item: &mut SnapshotItem, reused: u64) {
         fold.prefix.reused = reused;
         diag("copy_removal_reused", reused);
     }
+}
+
+/// A transient proof wait keeps only the unresolved prefix off this body's
+/// totals. Its own turns emit, and persisted retry debt makes the prefix
+/// discoverable after ACK/semantic no-op/restart. Third decision pass expires.
+fn defer_prefix(
+    item: &mut SnapshotItem,
+    uncovered: &[u64],
+    state: &mut Option<super::copy_removals::CopyRemovals>,
+    file: LocationKey,
+    reason: &'static str,
+) {
+    let ids = skipped_ids(item)
+        .filter(|id| uncovered.binary_search(&claude_request_hash(id)).is_ok())
+        .cloned()
+        .collect::<Vec<_>>();
+    let Some(state) = state.as_mut() else {
+        hold_copies(item, reason);
+        return;
+    };
+    if ids.is_empty() {
+        state.clear_hold(file);
+        restore_uncovered(item, &[]);
+        return;
+    }
+    if !state.advance_hold(file) {
+        restore_uncovered(item, &ids);
+        if let Some(fold) = item.claude_money.as_deref_mut() {
+            fold.prefix.hold_expired = ids
+                .iter()
+                .filter_map(|id| item.claude_usage_occurrences.get(id))
+                .map(|o| o.usage.request_count)
+                .sum();
+        }
+        return;
+    }
+    diag(reason, 1);
+    let Some(fold) = item.claude_money.as_deref_mut() else {
+        return;
+    };
+    // Id-less prefixes have no request-id proof to wait for: emit flagged.
+    fold.restore_idless();
+    for id in &ids {
+        let Some(o) = item.claude_usage_occurrences.get(id) else {
+            continue;
+        };
+        let tokens = ClaudeMoneyTokens::from_usage(&o.usage);
+        if let (Some(tokens), Some(requests)) = (
+            fold.entity.removed.checked_sub(&tokens),
+            fold.entity
+                .removed_requests
+                .checked_sub(o.usage.request_count),
+        ) {
+            fold.entity.removed = tokens;
+            fold.entity.removed_requests = requests;
+            fold.copied = fold.copied.saturating_sub(1);
+            fold.prefix.held_requests += o.usage.request_count;
+        } else {
+            fold.entity.certificate_ok = false;
+        }
+    }
+    if fold.first_own.is_none() {
+        // An all-copy file has no own turns to publish; retain its existing
+        // whole-body hold, now bounded by the same retry debt.
+        fold.entity.held = true;
+        // Whole-body undecided counters are otherwise suppressed at finish;
+        // the held prefix must still be visible in production diagnostics.
+        record_counts(Counts::prefix(&fold.prefix));
+    }
+    fold.proof = None;
 }
 
 /// The proof cannot be decided on this page: the session is withheld.
@@ -3572,6 +3664,13 @@ pub(crate) fn finish_page(
         diag("copy_prefix_unproven", unproven);
         diag("copy_prefix_unproven_files", u64::from(unproven > 0));
         diag("copy_prefix_unproven_cost_micros", fold.prefix.cost_micros);
+        diag("copy_removal_metadata_lost", fold.prefix.metadata_lost);
+        diag("copy_prefix_held_requests", fold.prefix.held_requests);
+        diag(
+            "copy_prefix_held_files",
+            u64::from(fold.prefix.held_requests > 0),
+        );
+        diag("copy_prefix_hold_expired", fold.prefix.hold_expired);
         session.decided.add(&Counts::prefix(&fold.prefix));
         session.decided.add(&Counts::work([
             0,
@@ -3760,7 +3859,7 @@ fn absent_twins(sessions: &[(&str, &[LocationKey])], index: &ScanIndex) -> BTree
 // Existing native_collection_page carrier, nonzero only. These are shared
 // process fold deltas since its previous Claude page line.
 use std::sync::atomic::{AtomicU64, Ordering};
-const COUNT_NAMES: [&str; 15] = [
+const COUNT_NAMES: [&str; 19] = [
     "fold_us",
     "responses",
     "copy_skipped",
@@ -3779,9 +3878,13 @@ const COUNT_NAMES: [&str; 15] = [
     "copy_removal_reused",
     "copy_removal_stored",
     "copy_removal_store_overflow",
-    "held_copy_removal_capacity",
+    "copy_removed_unrecorded",
+    "copy_removal_metadata_lost",
+    "copy_prefix_held_requests",
+    "copy_prefix_held_files",
+    "copy_prefix_hold_expired",
 ];
-static COUNTS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
+static COUNTS: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(
     Instant,
@@ -3813,18 +3916,18 @@ pub(crate) fn take_counts() -> Counts {
     Counts(COUNTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed)))
 }
 #[derive(Debug, Default)]
-pub(crate) struct Counts([u64; 15]);
+pub(crate) struct Counts([u64; 19]);
 impl Counts {
     /// The first seven (work and decision) counters.
     fn work(values: [u64; 7]) -> Self {
-        let mut all = [0; 15];
+        let mut all = [0; 19];
         all[..7].copy_from_slice(&values);
         Self(all)
     }
     /// A decided fold's copied-prefix outcome.
     fn prefix(tally: &PrefixTally) -> Self {
         let unproven = tally.unproven_requests + tally.unproven_idless;
-        let mut all = [0; 15];
+        let mut all = [0; 19];
         all[7..12].copy_from_slice(&[
             unproven,
             u64::from(unproven > 0),
@@ -3832,12 +3935,17 @@ impl Counts {
             tally.cost_micros,
             tally.reused,
         ]);
+        all[15] = tally.metadata_lost;
+        all[16] = tally.held_requests;
+        all[17] = u64::from(tally.held_requests > 0);
+        all[18] = tally.hold_expired;
         Self(all)
     }
     fn removal_store(added: u64, overflow: u64) -> Self {
-        let mut all = [0; 15];
+        let mut all = [0; 19];
         all[12] = added;
         all[13] = overflow;
+        all[14] = overflow;
         Self(all)
     }
     fn add(&mut self, other: &Self) {

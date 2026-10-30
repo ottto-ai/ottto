@@ -10,8 +10,9 @@
 //! group and 8 per hash (about 520k hashes when dense; the encoded index text
 //! is at most 4/3 of the raw bytes, which are smaller than the charge). A
 //! decision past the cap is not stored and is counted
-//! (`copy_removal_store_overflow`); the new removal is held until it can be
-//! recorded. Recorded decisions are never evicted to admit new ones.
+//! (`copy_removed_unrecorded`, alarmed); proof still removes the copy.
+//! Recorded decisions are never evicted. Prefix retry debt shares the cap
+//! (40 bytes/file) and expires on its third decision pass, across restart.
 use crate::snapshots::claude_money_birth_store::LocationKey;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -19,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const MAX_BYTES: usize = 4 * 1024 * 1024;
 const FILE_BYTES: usize = 40;
+pub(crate) const HOLD_PASSES: u64 = 3;
 const GROUP_BYTES: usize = 32;
 const HASH_BYTES: usize = 8;
 
@@ -27,11 +29,12 @@ type Groups = Box<[(LocationKey, Box<[u64]>)]>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CopyRemovals {
-    /// (file, reserved sequence, groups), sorted by file key; never an empty
-    /// group list or an empty group. Recorded decisions are never evicted.
+    /// (file, prefix hold attempts, groups), sorted by key. Empty groups are
+    /// allowed only for retry debt. Recorded decisions are never evicted.
     files: Vec<(LocationKey, u64, Groups)>,
     /// The charged bytes of `files` (see `charge`).
     bytes: usize,
+    metadata_lost: bool,
 }
 
 /// What one `store` did, in hashes.
@@ -40,7 +43,7 @@ pub(crate) struct Stored {
     /// Hashes newly recorded for the file.
     pub(crate) added: u64,
     /// Hashes of the new decision refused by the cap. Existing decisions
-    /// stay recorded; the caller must not publish this new removal.
+    /// stay recorded; current proof still removes the unrecorded copies.
     pub(crate) overflow: u64,
 }
 
@@ -52,9 +55,6 @@ fn charge(groups: &[(LocationKey, Box<[u64]>)]) -> usize {
         bytes + GROUP_BYTES + HASH_BYTES * hashes.len()
     })
 }
-fn hash_count(groups: &[(LocationKey, Box<[u64]>)]) -> u64 {
-    groups.iter().map(|(_, hashes)| hashes.len() as u64).sum()
-}
 
 impl CopyRemovals {
     pub(crate) fn is_empty(&self) -> bool {
@@ -62,24 +62,60 @@ impl CopyRemovals {
     }
 
     /// The charged bytes held now (at most `MAX_BYTES`).
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
 
-    pub(crate) fn file_bytes(&self, file: LocationKey) -> usize {
-        charge(self.get(file))
-    }
-
-    pub(crate) fn decision_bytes(groups: &BTreeMap<LocationKey, BTreeSet<u64>>) -> usize {
-        if groups.values().all(BTreeSet::is_empty) {
-            return 0;
+    /// Absent or damaged metadata is uncertainty, never fresh ownership.
+    pub(crate) fn missing() -> Self {
+        Self {
+            metadata_lost: true,
+            ..Self::default()
         }
-        groups
-            .values()
-            .filter(|hashes| !hashes.is_empty())
-            .fold(FILE_BYTES, |bytes, hashes| {
-                bytes + GROUP_BYTES + HASH_BYTES * hashes.len()
-            })
+    }
+    pub(crate) fn metadata_lost(&self) -> bool {
+        self.metadata_lost
+    }
+    pub(crate) fn deserialize_lenient<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(serde_json::from_value(value).unwrap_or_else(|_| Self::missing()))
+    }
+    pub(crate) fn pending(&self, file: LocationKey) -> bool {
+        self.files
+            .binary_search_by_key(&file, |f| f.0)
+            .is_ok_and(|i| self.files[i].1 > 0)
+    }
+    /// Hold at most two passes; the third emits flagged. A full debt store
+    /// expires immediately. No unbounded or non-discoverable hold is created.
+    pub(crate) fn advance_hold(&mut self, file: LocationKey) -> bool {
+        match self.files.binary_search_by_key(&file, |f| f.0) {
+            Ok(i) => {
+                self.files[i].1 = self.files[i].1.saturating_add(1);
+                if self.files[i].1 < HOLD_PASSES {
+                    return true;
+                }
+                self.clear_hold(file);
+                false
+            }
+            Err(i) if self.bytes + FILE_BYTES <= MAX_BYTES => {
+                self.files.insert(i, (file, 1, Box::new([])));
+                self.bytes += FILE_BYTES;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+    pub(crate) fn clear_hold(&mut self, file: LocationKey) {
+        if let Ok(i) = self.files.binary_search_by_key(&file, |f| f.0) {
+            if self.files[i].2.is_empty() {
+                self.forget(file);
+            } else {
+                self.files[i].1 = 0;
+            }
+        }
     }
 
     /// `file`'s stored (holder, hashes) groups.
@@ -89,9 +125,8 @@ impl CopyRemovals {
             .map_or(&[], |i| &*self.files[i].2)
     }
 
-    /// Replace `file`'s removals with `groups` (empty forgets it). Past the
-    /// cap, refuse the new decision and keep every existing entry. The caller
-    /// must hold a newly proven removal it cannot record durably.
+    /// Refuse new durable decisions past the shared cap; never evict an
+    /// existing decision. A refusal is a counted/alarmed unrecorded removal.
     pub(crate) fn store(
         &mut self,
         file: LocationKey,
@@ -99,31 +134,35 @@ impl CopyRemovals {
     ) -> Stored {
         let groups: Groups = groups
             .into_iter()
-            .filter(|(_, hashes)| !hashes.is_empty())
+            .filter(|(_, h)| !h.is_empty())
             .map(|(holder, hashes)| (holder, hashes.into_iter().collect()))
             .collect();
         let old = self.get(file);
         if *old == *groups {
             return Stored::default();
         }
-        let new_bytes = charge(&groups);
-        if self.bytes - charge(old) + new_bytes > MAX_BYTES {
-            return Stored {
-                added: 0,
-                overflow: hash_count(&groups),
-            };
-        }
         let held = |hash: &u64| old.iter().any(|(_, h)| h.binary_search(hash).is_ok());
         let added = groups
             .iter()
-            .flat_map(|(_, hashes)| hashes.iter())
+            .flat_map(|(_, h)| h.iter())
             .filter(|hash| !held(hash))
             .count() as u64;
+        let attempts = self
+            .files
+            .binary_search_by_key(&file, |f| f.0)
+            .map_or(0, |i| self.files[i].1);
+        let old_bytes = charge(old).max(if attempts > 0 { FILE_BYTES } else { 0 });
+        let new_bytes = charge(&groups).max(if attempts > 0 { FILE_BYTES } else { 0 });
+        if self.bytes - old_bytes + new_bytes > MAX_BYTES {
+            return Stored {
+                added: 0,
+                overflow: added,
+            };
+        }
         self.forget(file);
-        if !groups.is_empty() {
-            let seq = 1; // Reserved in CCR1; no eviction or age-based expiry.
+        if !groups.is_empty() || attempts > 0 {
             let at = self.files.binary_search_by_key(&file, |f| f.0).unwrap_err();
-            self.files.insert(at, (file, seq, groups));
+            self.files.insert(at, (file, attempts, groups));
             self.bytes += new_bytes;
         }
         Stored { added, overflow: 0 }
@@ -132,7 +171,7 @@ impl CopyRemovals {
     /// The file is no longer indexed: its removals go with it.
     pub(crate) fn forget(&mut self, file: LocationKey) {
         if let Ok(i) = self.files.binary_search_by_key(&file, |f| f.0) {
-            self.bytes -= charge(&self.files[i].2);
+            self.bytes -= charge(&self.files[i].2).max(FILE_BYTES);
             self.files.remove(i);
         }
     }
@@ -143,7 +182,7 @@ impl CopyRemovals {
         self.files.retain(|(file, _, groups)| {
             let keep = live(*file);
             if !keep {
-                bytes -= charge(groups);
+                bytes -= charge(groups).max(FILE_BYTES);
             }
             keep
         });
@@ -177,7 +216,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for CopyRemovals {
 impl Serialize for CopyRemovals {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut bytes = Vec::with_capacity(8 + self.bytes);
-        bytes.extend_from_slice(b"CCR1");
+        bytes.extend_from_slice(b"CCR2");
+        bytes.push(u8::from(self.metadata_lost));
         bytes.extend_from_slice(&(self.files.len() as u32).to_le_bytes());
         for (file, seq, groups) in &self.files {
             bytes.extend_from_slice(&file.to_bytes());
@@ -221,21 +261,39 @@ fn decode(encoded: &str) -> Option<CopyRemovals> {
         let n = u32::from_le_bytes(take(input)?) as usize;
         (n > 0 && n <= input.len() / unit).then_some(n)
     };
-    if &take::<4>(&mut input)? != b"CCR1" {
+    let version = take::<4>(&mut input)?;
+    if &version != b"CCR1" && &version != b"CCR2" {
         return None;
     }
+    let metadata_lost = if &version == b"CCR2" {
+        match take::<1>(&mut input)?[0] {
+            0 => false,
+            1 => true,
+            _ => return None,
+        }
+    } else {
+        false
+    };
     let files = u32::from_le_bytes(take(&mut input)?) as usize;
-    if files > input.len() / 56 {
+    if files > input.len() / 28 {
         return None;
     }
     let mut removals = CopyRemovals {
         files: Vec::with_capacity(files),
         bytes: 0,
+        metadata_lost,
     };
     for _ in 0..files {
         let file = LocationKey::from_bytes(take(&mut input)?);
         let seq = u64::from_le_bytes(take(&mut input)?);
-        let group_count = count(&mut input, 28)?;
+        let seq = if &version == b"CCR1" { 0 } else { seq };
+        if seq >= HOLD_PASSES {
+            return None;
+        }
+        let group_count = u32::from_le_bytes(take(&mut input)?) as usize;
+        if group_count > input.len() / 28 || (group_count == 0 && seq == 0) {
+            return None;
+        }
         let mut groups = Vec::with_capacity(group_count);
         for _ in 0..group_count {
             let holder = LocationKey::from_bytes(take(&mut input)?);
@@ -253,7 +311,7 @@ fn decode(encoded: &str) -> Option<CopyRemovals> {
         {
             return None;
         }
-        removals.bytes += charge(&groups);
+        removals.bytes += charge(&groups).max(FILE_BYTES);
         if removals.bytes > MAX_BYTES {
             return None;
         }
@@ -319,7 +377,7 @@ mod tests {
         let huge = (0..(MAX_BYTES / HASH_BYTES) as u64).collect::<Vec<_>>();
         let refused = removals.store(file, groups(&[("h", &huge)]));
         assert_eq!(refused.added, 0);
-        assert_eq!(refused.overflow, huge.len() as u64);
+        assert_eq!(refused.overflow, huge.len() as u64 - 1);
         assert_eq!(removals.get(file)[0].1.as_ref(), &[1]);
     }
 
@@ -363,6 +421,19 @@ mod tests {
         removals.retain_files(|file| file == kept);
         assert!(removals.get(gone).is_empty());
         assert_eq!(removals.bytes(), FILE_BYTES + GROUP_BYTES + HASH_BYTES);
+    }
+
+    #[test]
+    fn prefix_hold_attempts_survive_restart_and_expire_on_third_pass() {
+        let file = location_key("copy");
+        let mut state = CopyRemovals::missing();
+        for pass in 1..=HOLD_PASSES {
+            assert_eq!(state.advance_hold(file), pass < HOLD_PASSES);
+            assert_eq!(state.pending(file), pass < HOLD_PASSES);
+            state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+            assert!(state.metadata_lost());
+        }
+        assert_eq!(state.bytes(), 0);
     }
 
     #[test]
