@@ -2540,6 +2540,74 @@ mod growth_tests {
     }
 
     #[test]
+    fn retained_same_key_rollback_restores_exact_custody_inside_tombstone_reserve() {
+        let _active = Active::on();
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        fixture.grow();
+        revalidate_growth(
+            &mut index,
+            &fixture.key,
+            std::slice::from_ref(&fixture.root),
+        );
+        let whole = super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES
+            - 1024 * 1024;
+        let padding = "x".repeat(3900);
+        let mut n = 0;
+        while index.claude_request_census.serialized_total_for_test() <= whole + 16384 {
+            let record = ClaudeRequestCensusRecord::synthetic_for_test(
+                &"b".repeat(64),
+                40 * 86400,
+                ClaudeRequestCensusShape::OverBudget,
+                vec![],
+            )
+            .with_modified_for_test(Some(40 * 86400));
+            assert_ne!(
+                index
+                    .claude_request_census
+                    .insert_for_test(&format!("reserve-{n:05}-{padding}"), record,),
+                super::super::claude_request_census::ClaudeRequestCensusInsert::Refused
+            );
+            n += 1;
+        }
+        let before = index
+            .claude_request_census
+            .get(&fixture.key)
+            .unwrap()
+            .clone();
+        let hashes = before.request_hashes_for_test().as_ptr();
+        let bytes = serde_json::to_vec(&before).unwrap();
+        let totals = index.claude_request_census.totals_for_test();
+        assert!(totals.1 > whole);
+        assert!(
+            totals.1
+                < super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES
+        );
+        let outcome = index.insert_transcript_record_for_test(
+            &fixture.key,
+            before.clone().with_request_hashes_for_test(vec![7, 8]),
+            40 * 86400,
+        );
+        assert_ne!(
+            outcome,
+            super::super::claude_request_census::ClaudeRequestCensusInsert::Stored
+        );
+        let restored = index.claude_request_census.get(&fixture.key).unwrap();
+        assert_eq!(
+            serde_json::to_vec(restored).unwrap(),
+            bytes,
+            "exact old record"
+        );
+        assert_eq!(
+            restored.request_hashes_for_test().as_ptr(),
+            hashes,
+            "same shared hash buffer"
+        );
+        assert_eq!(index.claude_request_census.totals_for_test(), totals);
+        assert_eq!(index.claude_request_census.recounted_for_test(), totals);
+    }
+
+    #[test]
     fn f3_off_preserves_v1_age_and_bytes() {
         let fixture = Fixture::new();
         let mut index = fixture.index();

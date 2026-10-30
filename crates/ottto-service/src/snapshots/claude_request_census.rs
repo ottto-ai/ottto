@@ -3141,7 +3141,12 @@ fn insert_transcript_record(
     if outcome != ClaudeRequestCensusInsert::Stored {
         if let Some(retained) = retained {
             index.claude_request_census.remove(key);
-            let _ = index.claude_request_census.insert(key.to_owned(), retained);
+            // This custody already passed admission. Tombstones may since have
+            // consumed the reserve; ordinary insert would discard its hashes.
+            // Removal and aged releases only subtract from the prior totals.
+            assert!(index
+                .claude_request_census
+                .storage_insert(key.to_owned(), retained));
         }
     }
     outcome
