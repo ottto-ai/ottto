@@ -3186,9 +3186,9 @@ pub(crate) fn invalidate_claude_request_census(index: &mut ScanIndex, path: &Pat
     }
 
     let key = super::local_index_key(path);
-    if super::sampled_audit::growth_retirement_excluded(index, &key) {
-        return;
-    }
+    // Growth debt prevents retirement, not invalidation after a failed
+    // object/scope check. Keep scheduling debt, but make old proof inert;
+    // unverified alone is insufficient because proves_scan accepts it.
     // A recovery Full has no sampled marker to retain its obligation. Its
     // old unverified IdentityIncomplete record cannot bind a body or grant
     // proof; keep that exclusion/retry obligation after failed validation.
