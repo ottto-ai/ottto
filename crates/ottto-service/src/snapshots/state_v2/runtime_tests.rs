@@ -189,6 +189,7 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     f.published();
     let index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
     let mut stale = index.clone();
+    assert!(fence::sibling(&f.path, ".v2.sqlite.owner").exists());
     for suffix in [
         ".v2.sqlite.migration-backup",
         ".v1-readonly",
@@ -222,6 +223,7 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
         ".v2.sqlite",
         ".v2.sqlite-wal",
         ".v2.sqlite-shm",
+        ".v2.sqlite.owner",
         ".v2.sqlite.import",
         ".v2.sqlite.import-wal",
         ".v2.sqlite.import-shm",

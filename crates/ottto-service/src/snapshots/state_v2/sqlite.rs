@@ -302,8 +302,10 @@ pub(super) struct Sqlite {
     last_purge_attempt: Option<Instant>,
     paths: PathExtractor,
     references: Option<ReferenceExtractor>,
-    // flock ownership outlives the connection; Drop never writes a clean marker.
+    // Keep DB identity separate from ownership: Darwin flock conflicts with
+    // SQLite's fcntl locks on the same inode. Both fds outlive the connection.
     owner: File,
+    _owner_lock: File,
     clean: bool,
     headers: Option<BTreeMap<RowKey, Header>>,
     save_failure: Option<Hold>,
@@ -344,14 +346,37 @@ impl Drop for Txn<'_> {
     }
 }
 
-// A separate flock on the DB inode covers every phase-marker write, migration,
-// and native connection. SQLite's own fcntl locks still serialize transactions.
-fn lock_owner(file: &File) -> Result<()> {
+// Import and published paths share one stable sidecar; never unlink it during
+// retry cleanup or lock SQLite's DB/WAL/SHM inodes. CheckpointLock serializes
+// publication/reopen and explicit erasure outside this connection's lifetime.
+fn lock_owner(path: &Path) -> Result<File> {
+    let db = if path.extension().is_some_and(|ext| ext == "import") {
+        path.with_extension("")
+    } else {
+        path.to_owned()
+    };
+    let path = sidecar(&db, ".owner");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)?;
+    private_file(&path)?;
     ensure!(
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
         "state_v2_exclusive_owner_busy"
     );
-    Ok(())
+    let owned = file.metadata()?;
+    let named = fs::symlink_metadata(&path)?;
+    ensure!(
+        owned.dev() == named.dev() && owned.ino() == named.ino() && owned.nlink() == 1,
+        "state_v2_object_changed"
+    );
+    private_file(&path)?;
+    Ok(file)
 }
 
 fn private_file(path: &Path) -> Result<()> {
@@ -465,6 +490,7 @@ impl Sqlite {
             "state_v2_import_path"
         );
         private_parent(path)?;
+        let owner_lock = lock_owner(path)?;
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -472,7 +498,6 @@ impl Sqlite {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)?;
         file.sync_all()?;
-        lock_owner(&file)?;
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -481,6 +506,12 @@ impl Sqlite {
         settings(&conn, true)?;
         migrations::run(&conn)?;
         private_file(path)?;
+        let owned = file.metadata()?;
+        let named = fs::symlink_metadata(path)?;
+        ensure!(
+            owned.dev() == named.dev() && owned.ino() == named.ino(),
+            "state_v2_object_changed"
+        );
         let mut store = Self {
             conn: Some(conn),
             path: path.into(),
@@ -493,6 +524,7 @@ impl Sqlite {
             paths: missing_path_extractor,
             references: None,
             owner: file,
+            _owner_lock: owner_lock,
             clean: false,
             headers: None,
             save_failure: None,
@@ -633,15 +665,15 @@ impl Sqlite {
                 private_file(&p)?;
             }
         }
+        private_parent(path)?;
+        let owner_lock = lock_owner(path)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)?;
-        lock_owner(&file)?;
         let before = file.metadata()?;
         Self::probe(path, identity)?;
-        private_parent(path)?;
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -687,6 +719,7 @@ impl Sqlite {
             paths: missing_path_extractor,
             references: None,
             owner: file,
+            _owner_lock: owner_lock,
             clean: false,
             headers: None,
             save_failure: None,
