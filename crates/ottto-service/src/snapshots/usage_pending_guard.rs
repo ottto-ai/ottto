@@ -233,13 +233,8 @@ pub(super) struct Runtime {
     // retirement gate). Past the bound it saturates for the process.
     refused: BTreeSet<String>,
     refused_saturated: bool,
-    // Transcript keys whose census record was refused or dropped by the
-    // decoder, until a record is stored or the key vanishes: their prefixes
-    // are missing, so the census-prefix index is Unknown (Lead B
-    // 2026-10-30). Kept here so it outlives the per-cycle index reload.
-    census_lost: claude_request_census::ClaudeCensusLostRecords,
 }
-crate::heap_layout_bound::fields!(Runtime; slots, slot_occurrences, paced, withheld, audited, custody, unread, census_prefix, refused, refused_saturated, census_lost);
+crate::heap_layout_bound::fields!(Runtime; slots, slot_occurrences, paced, withheld, audited, custody, unread, census_prefix, refused, refused_saturated);
 /// Source-wide refused keys kept for the fork-lineage gate.
 pub(super) const FORK_LINEAGE_REFUSED_KEYS: usize = 4096;
 
@@ -828,13 +823,6 @@ impl ScanIndex {
             .unwrap_or_default();
         runtime.withheld.clear();
         runtime.custody = Some(path);
-        // Records this load's decoder dropped are missing from now on, also
-        // after the next save writes the census without them.
-        let lost = self.claude_request_census.take_decode_lost();
-        if !lost.is_empty() {
-            runtime.census_lost.absorb(lost);
-            stash(&runtime);
-        }
         self.usage_guard_holds.runtime = runtime;
     }
     pub(super) fn usage_guard_census_prefix(
@@ -892,26 +880,17 @@ impl ScanIndex {
             .is_some_and(|(_, _, built)| built.unknown())
             || usage_census_prefix::lost_records(self).unknown()
     }
-    pub(super) fn usage_guard_census_lost(
-        &self,
-    ) -> &claude_request_census::ClaudeCensusLostRecords {
-        &self.usage_guard_holds.runtime.census_lost
-    }
     /// The census refused this transcript key's record (not even its
-    /// tombstone fit). The projection is rebuilt against the Unknown index.
+    /// tombstone fit). The mark persists with the census, in the same save
+    /// that drops the record (Lead B r18). The projection is rebuilt against
+    /// the Unknown index.
     pub(super) fn usage_guard_mark_census_lost(&mut self, key: &str) {
-        let runtime = &mut self.usage_guard_holds.runtime;
-        runtime.census_lost.mark(key);
-        stash(runtime);
+        self.claude_request_census.mark_lost(key);
         self.usage_guard_holds.invalidate();
     }
     /// The census stored a record (or its tombstone) for this key again.
     pub(super) fn usage_guard_census_recorded(&mut self, key: &str) {
-        let runtime = &mut self.usage_guard_holds.runtime;
-        if runtime.census_lost.forget(key) {
-            stash(runtime);
-        }
-        self.claude_request_census.forget_decode_lost(key);
+        self.claude_request_census.forget_lost(key);
     }
     pub(super) fn refresh_usage_guard_after_native_completion(&mut self) {
         if self.usage_guard_holds.dirty {
@@ -1154,10 +1133,6 @@ impl ScanIndex {
         let runtime = &mut self.usage_guard_holds.runtime;
         runtime
             .refused
-            .retain(|key| files.contains_key(key) || walked.contains(key));
-        // So is a census-lost key.
-        runtime
-            .census_lost
             .retain(|key| files.contains_key(key) || walked.contains(key));
     }
 

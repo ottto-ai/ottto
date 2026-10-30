@@ -2,9 +2,9 @@
 //! is retired, its request ids survive only as the request census's 8-byte
 //! prefixes. This runtime index of those prefixes, for Claude roots with NO
 //! usage pending, lets a later untagged copy of such a family still meet a
-//! negative scheduling veto. Nothing is persisted: retention is the census
-//! rule (35 idle days, pruned when the file vanishes), inherited by deriving
-//! from it. A prefix collision only over-vetoes. An index past its byte
+//! negative scheduling veto. Nothing is persisted beyond the census (its
+//! records and loss marks): retention is the census rule (35 idle days,
+//! pruned when the file vanishes), inherited by deriving from it. A prefix collision only over-vetoes. An index past its byte
 //! budget, a pending-free record whose hashes the census dropped (over
 //! budget), or a pending-free transcript whose record the census refused or
 //! the decoder dropped (missing, never empty) is Unknown: a B3 hold, never a
@@ -103,13 +103,11 @@ impl LostRecords {
 
 /// Same scope as an OverBudget tombstone: a lost key counts while its root
 /// has no usage pending and the census still holds no record for it (a
-/// birth stub is none). Bounded walk of the runtime and decoder marks.
+/// birth stub is none). Bounded walk of the census's persisted loss marks.
 pub(crate) fn lost_records(index: &ScanIndex) -> LostRecords {
-    let runtime = index.usage_guard_census_lost();
-    let decoded = index.claude_request_census.decode_lost();
-    let records = runtime
+    let lost = index.claude_request_census.lost();
+    let records = lost
         .keys()
-        .chain(decoded.keys().filter(|key| !runtime.contains(key)))
         .filter(|key| {
             index.claude_request_census.get(key).is_none()
                 && claude_index_path_member_ref(Path::new(key.as_str())).is_some_and(|member| {
@@ -119,7 +117,7 @@ pub(crate) fn lost_records(index: &ScanIndex) -> LostRecords {
         .count();
     LostRecords {
         records: u64::try_from(records).unwrap_or(u64::MAX),
-        saturated: runtime.saturated() || decoded.saturated(),
+        saturated: lost.saturated(),
     }
 }
 

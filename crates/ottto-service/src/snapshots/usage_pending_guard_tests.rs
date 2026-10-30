@@ -1454,8 +1454,15 @@ fn census_prefix_refused_insert_is_unknown_never_clear_for_a_copy() {
     assert!(!usage_census_prefix::lost_records(&index).unknown());
     index.claude_usage_family_pending.remove(CARRY_UNWITNESSED);
     assert!(usage_census_prefix::CensusPrefixIndex::build(&index).unknown());
-    // A key neither indexed nor walked has vanished and hides nothing.
-    index.usage_guard_prune_refused(&BTreeSet::new());
+    // A key neither indexed nor walked has vanished and hides nothing: the
+    // complete terminal's prune clears its mark.
+    claude_request_census::settle_claude_request_census_terminal(
+        &mut index,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        CARRY_FAILED,
+    );
+    assert!(index.claude_request_census_for_test().lost().is_empty());
     assert!(!usage_census_prefix::lost_records(&index).unknown());
     let known = usage_census_prefix::CensusPrefixIndex::build(&index);
     assert!(!known.unknown());
@@ -1531,41 +1538,48 @@ fn census_prefix_decoder_dropped_record_is_unknown_across_reloads() {
             "bbbbbbbb",
         ],
     );
-    // The daemon load hands the loss to runtime custody.
+    // The mark lives in the census itself: the daemon load's custody
+    // adoption neither needs nor takes it.
     loaded.usage_guard_adopt_custody(&path);
     assert!(loaded
         .claude_request_census_for_test()
-        .decode_lost()
-        .is_empty());
+        .lost()
+        .keys()
+        .eq([&source_key]));
     assert_eq!(
         usage_census_prefix::census_prefix_verdict(&loaded, CARRY_ROOT, copy),
         usage_census_prefix::CensusPrefixVerdict::Unknown
     );
     assert!(usage_pending_guard::fork_lineage_incomplete(&loaded));
-    // The next save drops the record for good; the next cycle's reload
-    // decodes cleanly, and custody still makes the index Unknown.
-    std::fs::write(&path, serde_json::to_string(&loaded).expect("index json"))
-        .expect("write index");
-    let mut reloaded = ScanIndex::load(&path).expect("load index");
-    assert!(reloaded
-        .claude_request_census_for_test()
-        .decode_lost()
-        .is_empty());
-    reloaded.usage_guard_adopt_custody(&path);
+    // Lead B r18: decoder drop -> save -> restart. The save drops the record
+    // for good and persists the mark with the census; a fresh process (a
+    // plain load: no usage-guard runtime, no custody) is still Unknown.
+    loaded.save(&path).expect("save index");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read index")).expect("index json");
+    assert!(saved["claude_request_census"]
+        .get(source_key.as_str())
+        .is_none());
     assert_eq!(
-        usage_census_prefix::lost_records(&reloaded),
+        saved["claude_request_census"][claude_request_census::CLAUDE_CENSUS_LOST_KEY],
+        json!({"lk": [source_key]})
+    );
+    let restarted = ScanIndex::load(&path).expect("load index");
+    assert_eq!(
+        usage_census_prefix::lost_records(&restarted),
         usage_census_prefix::LostRecords {
             records: 1,
             saturated: false
         }
     );
     assert_eq!(
-        usage_census_prefix::census_prefix_verdict(&reloaded, CARRY_ROOT, copy),
+        usage_census_prefix::census_prefix_verdict(&restarted, CARRY_ROOT, copy),
         usage_census_prefix::CensusPrefixVerdict::Unknown
     );
+    assert!(usage_pending_guard::fork_lineage_incomplete(&restarted));
     // A census the decoder loses whole hides every prefix: saturated.
     let lost = claude_request_census::ClaudeRequestCensus::lost_whole();
-    assert!(lost.decode_lost().saturated());
+    assert!(lost.lost().saturated());
     let mut whole = ScanIndex::default();
     *whole.claude_request_census_mut_for_test() = lost;
     let (built, rows) = crate::local_resource_diagnostics::capture(|| {
@@ -1576,6 +1590,434 @@ fn census_prefix_decoder_dropped_record_is_unknown_across_reloads() {
         row["stage"] == "claude_census_prefix_veto"
             && row["counts"]["census_prefix_unknown_refused_saturated"] == 1
     }));
+}
+
+/// Lead B r18: the census of `index` as persisted JSON.
+fn census_json(index: &ScanIndex) -> serde_json::Value {
+    serde_json::to_value(index).expect("index json")["claude_request_census"].clone()
+}
+
+#[test]
+fn census_prefix_refused_insert_stays_unknown_after_a_restart() {
+    // Lead B r18 (option 3): refused insert -> save -> restart. The mark is
+    // saved with the census in the save that drops the record, so a fresh
+    // process (no usage-guard runtime or custody) is still Unknown.
+    let copy = [claude_request_census::claude_request_hash("req_copy")];
+    let source_key = carry_key(CARRY_UNWITNESSED, None);
+    let scratch = crate::test_scratch::ScratchDir::new("census-prefix-refused-restart");
+    let path = scratch.join("index.json");
+    let mut index = ScanIndex::default();
+    let _ = index.claude_request_census_mut_for_test().insert(
+        carry_key(CARRY_OTHER, None),
+        claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+            &"a".repeat(64),
+            1,
+            claude_request_census::ClaudeRequestCensusShape::Exact,
+            vec![claude_request_census::claude_request_hash("req_other")],
+        ),
+    );
+    index
+        .claude_request_census_mut_for_test()
+        .fill_serialized_budget_for_test();
+    let source = PathBuf::from(&source_key);
+    let (refused_fingerprint, stored_fingerprint) = ("b".repeat(64), "c".repeat(64));
+    let (refused_fingerprint, stored_fingerprint) =
+        (refused_fingerprint.as_str(), stored_fingerprint.as_str());
+    let parse = |fingerprint| claude_request_census::ClaudeRequestCensusParse {
+        path: &source,
+        index_key: &source_key,
+        source_file_fingerprint: fingerprint,
+        census_window_end: CARRY_FAILED,
+        complete: true,
+        lossy: false,
+        source_verified: true,
+        itemless_request_hashes: copy.to_vec(),
+        opened_birth: None,
+        modified_unix_seconds: 1,
+    };
+    claude_request_census::record_claude_request_census(
+        &mut index,
+        parse(refused_fingerprint),
+        &[],
+    );
+    assert!(usage_census_prefix::lost_records(&index).unknown());
+    index.save(&path).expect("save index");
+    assert_eq!(
+        census_json(&ScanIndex::load(&path).expect("load index"))
+            [claude_request_census::CLAUDE_CENSUS_LOST_KEY],
+        json!({"lk": [source_key]})
+    );
+    // Restart: a plain load has a fresh usage-guard runtime and no custody.
+    let mut restarted = ScanIndex::load(&path).expect("load index");
+    assert!(restarted
+        .claude_request_census_for_test()
+        .record_for_test(&source_key)
+        .is_none());
+    assert_eq!(
+        usage_census_prefix::lost_records(&restarted),
+        usage_census_prefix::LostRecords {
+            records: 1,
+            saturated: false
+        }
+    );
+    let (built, rows) = crate::local_resource_diagnostics::capture(|| {
+        usage_census_prefix::CensusPrefixIndex::build(&restarted)
+    });
+    assert!(built.unknown());
+    assert_eq!(
+        built.verdict(CARRY_ROOT, copy),
+        usage_census_prefix::CensusPrefixVerdict::Unknown
+    );
+    assert_eq!(census_prefix_lost_gauge(&rows), (json!(1), json!(0)));
+    assert!(rows.iter().any(
+        |row| row["stage"] == "census_prefix_unknown_overbudget_alarm"
+            && row["counts"]["census_prefix_unknown_refused_records"] == 1
+    ));
+    assert_census_prefix_rows_private(
+        &rows,
+        &[CARRY_ROOT, CARRY_OTHER, CARRY_UNWITNESSED, "req_copy", ".jsonl"],
+    );
+    assert!(usage_pending_guard::fork_lineage_incomplete(&restarted));
+    // Clear rule unchanged: the key's record stored again (the reloaded
+    // census has room) forgets the mark, persistently.
+    claude_request_census::record_claude_request_census(
+        &mut restarted,
+        parse(stored_fingerprint),
+        &[],
+    );
+    assert!(restarted.claude_request_census_for_test().lost().is_empty());
+    assert_eq!(
+        usage_census_prefix::census_prefix_verdict(&restarted, CARRY_ROOT, copy),
+        usage_census_prefix::CensusPrefixVerdict::Held
+    );
+    restarted.save(&path).expect("save index");
+    let saved = census_json(&ScanIndex::load(&path).expect("load index"));
+    assert!(saved
+        .get(claude_request_census::CLAUDE_CENSUS_LOST_KEY)
+        .is_none());
+}
+
+#[test]
+fn census_lost_set_corrupt_on_disk_is_saturated_counted_and_alarmed() {
+    // Lead B r18: an unreadable, oversized, malformed or over-count persisted
+    // mark set reads as saturated (source-wide Unknown), never as empty.
+    let copy = [claude_request_census::claude_request_hash("req_copy")];
+    let scratch = crate::test_scratch::ScratchDir::new("census-lost-corrupt");
+    let path = scratch.join("index.json");
+    let mut index = ScanIndex::default();
+    let _ = index.claude_request_census_mut_for_test().insert(
+        carry_key(CARRY_OTHER, None),
+        claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+            &"a".repeat(64),
+            1,
+            claude_request_census::ClaudeRequestCensusShape::Exact,
+            vec![claude_request_census::claude_request_hash("req_other")],
+        ),
+    );
+    let base = serde_json::to_value(&index).expect("index json");
+    let over_count = (0..=claude_request_census::MAX_CLAUDE_CENSUS_LOST_KEYS)
+        .map(|n| format!("/lost/projects/{n}.jsonl"))
+        .collect::<Vec<_>>();
+    let oversized = "x".repeat(claude_request_census::MAX_CLAUDE_CENSUS_LOST_BYTES);
+    let mut corrupt = [
+        json!("lost"),
+        json!(7),
+        json!(null),
+        json!([]),
+        json!([carry_key(CARRY_UNWITNESSED, None)]),
+        json!({"lk": carry_key(CARRY_UNWITNESSED, None)}),
+        json!({"lk": [7]}),
+        json!({"lk": [{"k": 1}]}),
+        json!({"ls": "yes"}),
+        json!({"ls": 1}),
+        json!({"lk": over_count}),
+        json!({"pad": oversized}),
+    ]
+    .into_iter()
+    .map(|lost| {
+        let mut value = base.clone();
+        value["claude_request_census"][claude_request_census::CLAUDE_CENSUS_LOST_KEY] = lost;
+        value.to_string()
+    })
+    .collect::<Vec<_>>();
+    // A duplicate field inside the set, and a second copy of the set.
+    let lost_key = claude_request_census::CLAUDE_CENSUS_LOST_KEY;
+    let census_key = "\"claude_request_census\":{";
+    let text = base.to_string();
+    assert!(text.contains(census_key));
+    corrupt.push(text.replacen(
+        census_key,
+        &format!("{census_key}\"{lost_key}\":{{\"lk\":[],\"lk\":[]}},"),
+        1,
+    ));
+    corrupt.push(text.replacen(
+        census_key,
+        &format!("{census_key}\"{lost_key}\":{{}},\"{lost_key}\":{{}},"),
+        1,
+    ));
+    for (case, json) in corrupt.iter().enumerate() {
+        std::fs::write(&path, json).expect("write index");
+        let loaded = ScanIndex::load(&path).expect("a corrupt set never refuses the index");
+        // The records themselves are intact.
+        assert!(
+            loaded
+                .claude_request_census_for_test()
+                .get(&carry_key(CARRY_OTHER, None))
+                .is_some(),
+            "case {case}"
+        );
+        assert!(
+            loaded.claude_request_census_for_test().lost().saturated(),
+            "case {case}"
+        );
+        assert_eq!(
+            usage_census_prefix::lost_records(&loaded),
+            usage_census_prefix::LostRecords {
+                records: 0,
+                saturated: true
+            },
+            "case {case}"
+        );
+        let (built, rows) = crate::local_resource_diagnostics::capture(|| {
+            usage_census_prefix::CensusPrefixIndex::build(&loaded)
+        });
+        assert!(built.unknown(), "case {case}");
+        assert_eq!(
+            built.verdict(CARRY_ROOT, copy),
+            usage_census_prefix::CensusPrefixVerdict::Unknown
+        );
+        assert!(
+            rows.iter().any(|row| {
+                row["stage"] == "claude_census_prefix_veto"
+                    && row["counts"]["census_prefix_unknown_refused_saturated"] == 1
+            }),
+            "case {case}"
+        );
+        // The alarm is hourly (per test thread): the first case raises it.
+        if case == 0 {
+            assert!(rows.iter().any(|row| {
+                row["stage"] == "census_prefix_unknown_overbudget_alarm"
+                    && row["counts"]["census_prefix_unknown_refused_saturated"] == 1
+            }));
+        }
+        assert_census_prefix_rows_private(&rows, &[CARRY_OTHER, "req_other", ".jsonl"]);
+        assert!(usage_pending_guard::fork_lineage_incomplete(&loaded));
+        // Saturation persists through the next save.
+        assert_eq!(
+            census_json(&loaded)[lost_key],
+            json!({"ls": true}),
+            "case {case}"
+        );
+    }
+}
+
+#[test]
+fn census_lost_set_wire_round_trip_and_byte_bound() {
+    use claude_request_census::{
+        ClaudeRequestCensus, CLAUDE_CENSUS_LOST_KEY, MAX_CLAUDE_CENSUS_LOST_BYTES,
+        MAX_CLAUDE_CENSUS_LOST_KEYS,
+    };
+    let record = claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+        &"a".repeat(64),
+        1,
+        claude_request_census::ClaudeRequestCensusShape::Exact,
+        vec![claude_request_census::claude_request_hash("req_other")],
+    );
+    let other = carry_key(CARRY_OTHER, None);
+    let mut census = ClaudeRequestCensus::default();
+    let _ = census.insert(other.clone(), record.clone());
+    // No mark: the records-only bytes, unchanged for 0.1.201-0.1.203.
+    let records_only = serde_json::to_string(&census).expect("census json");
+    assert!(!records_only.contains(CLAUDE_CENSUS_LOST_KEY));
+    // Keys round-trip; keys of no transcript member are never marked.
+    let lost = [
+        carry_key(CARRY_UNWITNESSED, None),
+        carry_key(CARRY_ROOT, Some(CARRY_AGENT)),
+    ];
+    for key in &lost {
+        census.mark_lost(key);
+    }
+    census.mark_lost("/lost/projects/not-a-transcript.json");
+    let value = serde_json::to_value(&census).expect("census json");
+    let mut sorted = lost.clone();
+    sorted.sort();
+    assert_eq!(value[CLAUDE_CENSUS_LOST_KEY], json!({"lk": sorted}));
+    // The census decoder buffers raw JSON: decode from text, as a load does.
+    let decode = |value: &serde_json::Value| {
+        serde_json::from_str::<ClaudeRequestCensus>(&value.to_string()).expect("census")
+    };
+    let decoded = decode(&value);
+    assert!(decoded.lost().keys().eq(sorted.iter()));
+    assert!(!decoded.lost().saturated());
+    assert_eq!(decoded.get(&other), Some(&record));
+    assert_eq!(decoded.record_count(), 1);
+    // Forward tolerant: an unknown field inside the set is skipped.
+    let mut value = serde_json::to_value(&census).expect("census json");
+    value[CLAUDE_CENSUS_LOST_KEY]["future"] = json!([1, "x"]);
+    let decoded = decode(&value);
+    assert!(decoded.lost().keys().eq(sorted.iter()));
+    // Saturated round-trips as the flag alone.
+    let saturated = ClaudeRequestCensus::lost_whole();
+    let value = serde_json::to_value(&saturated).expect("census json");
+    let mut expected = serde_json::Map::new();
+    expected.insert(CLAUDE_CENSUS_LOST_KEY.to_owned(), json!({"ls": true}));
+    assert_eq!(value, serde_json::Value::Object(expected));
+    let decoded = decode(&value);
+    assert!(decoded.lost().saturated());
+    assert!(!decoded.is_unwritten());
+
+    // Byte bound (the raw-decode headroom is a const assertion beside
+    // MAX_CLAUDE_CENSUS_LOST_BYTES).
+    let key_of = |n: usize, len: usize| {
+        let tail = format!("/{n:04}.jsonl");
+        let head = "/lost/projects/";
+        format!("{head}{}{tail}", "x".repeat(len - head.len() - tail.len()))
+    };
+    // 256 keys of maximum length (4 KiB): the set holds as many as fit the
+    // wire bound, then saturates; never past either bound.
+    let mut largest = ClaudeRequestCensus::default();
+    let mut kept = 0;
+    for n in 0..MAX_CLAUDE_CENSUS_LOST_KEYS {
+        let key = key_of(n, 4096);
+        assert_eq!(key.len(), 4096);
+        largest.mark_lost(&key);
+        if largest.lost().saturated() {
+            break;
+        }
+        kept += 1;
+    }
+    assert!(largest.lost().saturated());
+    assert!((250..MAX_CLAUDE_CENSUS_LOST_KEYS).contains(&kept), "{kept}");
+    assert_eq!(
+        serde_json::to_value(&largest).unwrap()[CLAUDE_CENSUS_LOST_KEY],
+        json!({"ls": true})
+    );
+    // The fullest set before saturation is within the bound; one more
+    // maximum-length key would not be.
+    let mut fullest = ClaudeRequestCensus::default();
+    for n in 0..kept {
+        fullest.mark_lost(&key_of(n, 4096));
+    }
+    assert!(!fullest.lost().saturated());
+    let wire = serde_json::to_string(&fullest.lost()).unwrap();
+    assert!(wire.len() <= MAX_CLAUDE_CENSUS_LOST_BYTES, "{}", wire.len());
+    assert!(wire.len() + 4096 + 3 > MAX_CLAUDE_CENSUS_LOST_BYTES);
+    assert_eq!(decode(&serde_json::to_value(&fullest).unwrap()).lost().keys().count(), kept);
+    // Short keys: 256 fit, the 257th saturates.
+    let mut short = ClaudeRequestCensus::default();
+    for n in 0..MAX_CLAUDE_CENSUS_LOST_KEYS {
+        short.mark_lost(&key_of(n, 32));
+    }
+    assert!(!short.lost().saturated());
+    assert_eq!(short.lost().keys().count(), MAX_CLAUDE_CENSUS_LOST_KEYS);
+    let decoded = decode(&serde_json::to_value(&short).unwrap());
+    assert_eq!(decoded.lost().keys().count(), MAX_CLAUDE_CENSUS_LOST_KEYS);
+    assert!(!decoded.lost().saturated());
+    short.mark_lost(&key_of(MAX_CLAUDE_CENSUS_LOST_KEYS, 32));
+    assert!(short.lost().saturated());
+    // A key past 4 KiB saturates rather than being kept.
+    let mut long = ClaudeRequestCensus::default();
+    long.mark_lost(&key_of(0, 4097));
+    assert!(long.lost().saturated());
+}
+
+#[test]
+fn census_lost_saturation_clears_only_when_every_transcript_key_has_a_record() {
+    // Lead B r18 proposal: a persisted saturated flag clears at a complete
+    // terminal once every indexed or walked transcript key has a record (or
+    // is idle past the retirement cutoff). One key without either keeps it.
+    let window = rfc3339_unix_seconds(CARRY_FAILED).expect("window");
+    let recent = |entry: &mut ScanIndexEntry| entry.modified_unix_seconds = window - 60;
+    let keys = [
+        carry_key(CARRY_OTHER, None),
+        carry_key(CARRY_ROOT, None),
+        carry_key(CARRY_UNWITNESSED, None),
+    ];
+    let mut index = ScanIndex::default();
+    *index.claude_request_census_mut_for_test() =
+        claude_request_census::ClaudeRequestCensus::lost_whole();
+    for (n, key) in keys.iter().enumerate() {
+        let mut entry = manifest_index_entry(Some("snapshot"));
+        recent(&mut entry);
+        index.files.insert(key.clone(), entry);
+        if n < 2 {
+            let _ = index.claude_request_census_mut_for_test().insert(
+                key.clone(),
+                claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+                    &char::from(b'a' + n as u8).to_string().repeat(64),
+                    1,
+                    claude_request_census::ClaudeRequestCensusShape::Exact,
+                    vec![n as u64],
+                ),
+            );
+        }
+    }
+    let settle = |index: &mut ScanIndex, walked: &BTreeSet<String>| {
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            claude_request_census::settle_claude_request_census_terminal(
+                index,
+                walked,
+                &BTreeSet::new(),
+                CARRY_FAILED,
+            )
+        });
+        let row = rows
+            .iter()
+            .find(|row| row["stage"] == "claude_census_lost_saturated")
+            .expect("saturated settle row")
+            .clone();
+        assert_census_prefix_rows_private(
+            std::slice::from_ref(&row),
+            &[CARRY_ROOT, CARRY_OTHER, CARRY_UNWITNESSED, ".jsonl"],
+        );
+        (
+            row["counts"]["census_lost_saturated_unrecorded_keys"].clone(),
+            row["counts"]["census_lost_saturated_cleared"].clone(),
+        )
+    };
+    // One recent transcript without a record: still saturated.
+    assert_eq!(settle(&mut index, &BTreeSet::new()), (json!(1), json!(0)));
+    assert!(index.claude_request_census_for_test().lost().saturated());
+    // An invalidated record is no record either.
+    let _ = index.claude_request_census_mut_for_test().insert(
+        keys[2].clone(),
+        claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+            &"c".repeat(64),
+            1,
+            claude_request_census::ClaudeRequestCensusShape::Exact,
+            vec![2],
+        ),
+    );
+    index
+        .claude_request_census_mut_for_test()
+        .invalidate_keeping_birth_for_test(&keys[2]);
+    // A walked transcript that is not indexed yet and has no record blocks too.
+    let walked = BTreeSet::from([carry_key(CARRY_ROOT, Some(CARRY_AGENT))]);
+    let (unrecorded, cleared) = settle(&mut index, &walked);
+    assert_eq!(cleared, json!(0));
+    assert!(unrecorded.as_u64().is_some_and(|n| n >= 1));
+    assert!(index.claude_request_census_for_test().lost().saturated());
+    // Idle past the retirement cutoff, a missing record holds no prefix.
+    index
+        .files
+        .get_mut(&keys[2])
+        .expect("entry")
+        .modified_unix_seconds = 2;
+    assert_eq!(settle(&mut index, &BTreeSet::new()), (json!(0), json!(1)));
+    assert!(index.claude_request_census_for_test().lost().is_empty());
+    assert!(!usage_census_prefix::lost_records(&index).unknown());
+    // Not saturated: no settle row.
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        claude_request_census::settle_claude_request_census_terminal(
+            &mut index,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            CARRY_FAILED,
+        )
+    });
+    assert!(!rows
+        .iter()
+        .any(|row| row["stage"] == "claude_census_lost_saturated"));
 }
 
 #[test]

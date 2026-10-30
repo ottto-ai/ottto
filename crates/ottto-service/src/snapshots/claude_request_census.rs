@@ -783,33 +783,60 @@ pub(crate) struct ClaudeRequestCensus {
     hash_total: usize,
     /// Exact serialized bytes of every `"key":record` pair.
     serialized_total: usize,
-    /// Runtime only: transcript keys whose persisted record the decoder
-    /// dropped. The load hands them to the scan's runtime custody.
-    decode_lost: ClaudeCensusLostRecords,
+    /// Transcript keys whose record the census lost (Lead B 2026-10-30):
+    /// persisted with the records, in the same save, under
+    /// [`CLAUDE_CENSUS_LOST_KEY`].
+    lost: ClaudeCensusLostRecords,
 }
-crate::heap_layout_bound::fields!(ClaudeRequestCensus; records, hash_total, serialized_total, decode_lost);
+crate::heap_layout_bound::fields!(ClaudeRequestCensus; records, hash_total, serialized_total, lost);
 
 /// Transcript keys whose record the census lost (an insert `Refused`, a
 /// decoder drop) and that have none since: their request prefixes are
 /// missing, never empty (Lead B 2026-10-30), so the census-prefix index is
-/// Unknown while one of them belongs to a pending-free root. Runtime only:
-/// never serialized, compared or charged to the census budgets. At most
-/// [`MAX_CLAUDE_CENSUS_LOST_KEYS`] keys; past that, or when the lost keys
-/// are themselves unknown (a whole census or an undrained tail lost), it
-/// saturates and stays Unknown for the process.
+/// Unknown while one of them belongs to a pending-free root. Persisted inside
+/// the census (Lead B r18, option 3) and outside its record budgets: at most
+/// [`MAX_CLAUDE_CENSUS_LOST_KEYS`] keys within [`MAX_CLAUDE_CENSUS_LOST_BYTES`]
+/// on the wire. Past either bound, or when the lost keys are themselves
+/// unknown (a whole census, an undrained tail or the set itself lost), it
+/// saturates: source-wide Unknown until a complete pass clears it
+/// (`settle_lost_saturation`).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ClaudeCensusLostRecords {
     keys: BTreeSet<String>,
+    /// Serialized bytes of `keys`, each with its separator.
+    wire: usize,
     saturated: bool,
 }
-crate::heap_layout_bound::fields!(ClaudeCensusLostRecords; keys, saturated);
+crate::heap_layout_bound::fields!(ClaudeCensusLostRecords; keys, wire, saturated);
 
 /// Lost keys kept before the set saturates (each at most
-/// `MAX_CLAUDE_REQUEST_CENSUS_KEY_BYTES`: 1 MiB of keys at worst).
+/// `MAX_CLAUDE_REQUEST_CENSUS_KEY_BYTES`).
 pub(crate) const MAX_CLAUDE_CENSUS_LOST_KEYS: usize = 256;
+/// Census map key of the persisted lost set. Never an index key (those are
+/// absolute paths) or a ledger key. Wire value, each field omitted when
+/// empty or false: `{"lk":["<index key>",...],"ls":true}`. 0.1.201-0.1.203
+/// decode it as a record without `v`/`fp`/`s` and drop it.
+pub(crate) const CLAUDE_CENSUS_LOST_KEY: &str = "~lost";
+/// Wire bound of the lost set's value. It sits in the raw slack above the
+/// serialized record budget (`MAX_RAW_BYTES` minus the 48 MiB budget is
+/// 1 MiB), so a full census plus a full set still decodes whole, also in
+/// 0.1.201-0.1.203. Keys of maximum length saturate the set a few keys short
+/// of 256.
+pub(crate) const MAX_CLAUDE_CENSUS_LOST_BYTES: usize = 1024 * 1024 - 4096;
+/// `{"lk":[]}`: the value's bytes besides its keys and their separators.
+const LOST_WIRE_OVERHEAD: usize = 9;
+// `{` records `,"~lost":` value `}` stays inside the raw decode bound.
+const _: () = assert!(
+    MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES
+        + 1
+        + CLAUDE_CENSUS_LOST_KEY.len()
+        + 4
+        + MAX_CLAUDE_CENSUS_LOST_BYTES
+        <= MAX_RAW_BYTES
+);
 
-// Runtime custody, not census content: two censuses with the same records
-// are equal whatever their loss marks.
+// Equality compares records only: two censuses with the same records are
+// equal whatever their loss marks.
 impl PartialEq for ClaudeCensusLostRecords {
     fn eq(&self, _: &Self) -> bool {
         true
@@ -826,19 +853,32 @@ impl ClaudeCensusLostRecords {
         {
             return;
         }
+        let wire = self
+            .wire
+            .saturating_add(serialized_len(key))
+            .saturating_add(1);
         if self.keys.len() >= MAX_CLAUDE_CENSUS_LOST_KEYS
             || key.len() > MAX_CLAUDE_REQUEST_CENSUS_KEY_BYTES
+            || wire.saturating_add(LOST_WIRE_OVERHEAD) > MAX_CLAUDE_CENSUS_LOST_BYTES
         {
             self.saturate();
         } else {
             self.keys.insert(key.to_owned());
+            self.wire = wire;
         }
     }
 
     /// Records were lost whose keys are unknown.
     pub(crate) fn saturate(&mut self) {
         self.keys = BTreeSet::new();
+        self.wire = 0;
         self.saturated = true;
+    }
+
+    /// A complete pass found a record (or the retirement cutoff) for every
+    /// transcript key: nothing the saturation stood for can still be missing.
+    fn clear_saturated(&mut self) {
+        self.saturated = false;
     }
 
     pub(crate) fn absorb(&mut self, other: Self) {
@@ -852,15 +892,25 @@ impl ClaudeCensusLostRecords {
 
     /// `key` has a record again. True when it was marked.
     pub(crate) fn forget(&mut self, key: &str) -> bool {
-        self.keys.remove(key)
+        let forgotten = self.keys.remove(key);
+        if forgotten {
+            self.wire = self
+                .wire
+                .saturating_sub(serialized_len(key).saturating_add(1));
+        }
+        forgotten
     }
 
     pub(crate) fn retain(&mut self, keep: impl Fn(&str) -> bool) {
-        self.keys.retain(|key| keep(key));
-    }
-
-    pub(crate) fn contains(&self, key: &str) -> bool {
-        self.keys.contains(key)
+        let mut wire = self.wire;
+        self.keys.retain(|key| {
+            let kept = keep(key);
+            if !kept {
+                wire = wire.saturating_sub(serialized_len(key.as_str()).saturating_add(1));
+            }
+            kept
+        });
+        self.wire = wire;
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -873,6 +923,71 @@ impl ClaudeCensusLostRecords {
 
     pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
         self.keys.iter()
+    }
+
+    /// The persisted value: anything unreadable, oversized, malformed or past
+    /// the key count reads as saturated, never as empty.
+    fn decode(raw: &str) -> Self {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default)]
+            lk: Option<LostKeys>,
+            #[serde(default)]
+            ls: bool,
+        }
+        let mut lost = Self::default();
+        // A map only: a derived struct would also accept a sequence.
+        match (raw.len() <= MAX_CLAUDE_CENSUS_LOST_BYTES && raw.trim_start().starts_with('{'))
+            .then(|| serde_json::from_str::<Wire>(raw).ok())
+            .flatten()
+        {
+            Some(wire) => {
+                if wire.ls {
+                    lost.saturate();
+                }
+                if let Some(LostKeys(keys)) = wire.lk {
+                    lost.absorb(keys);
+                }
+            }
+            None => lost.saturate(),
+        }
+        lost
+    }
+}
+
+/// `lk`: marked one by one, so a list past the bounds saturates without
+/// holding more than one key.
+struct LostKeys(ClaudeCensusLostRecords);
+impl<'de> Deserialize<'de> for LostKeys {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KeysVisitor;
+        impl<'de> Visitor<'de> for KeysVisitor {
+            type Value = LostKeys;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a list of census index keys")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<LostKeys, A::Error> {
+                let mut lost = ClaudeCensusLostRecords::default();
+                while let Some(key) = seq.next_element::<String>()? {
+                    lost.mark(&key);
+                }
+                Ok(LostKeys(lost))
+            }
+        }
+        deserializer.deserialize_seq(KeysVisitor)
+    }
+}
+
+impl Serialize for ClaudeCensusLostRecords {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if !self.keys.is_empty() {
+            map.serialize_entry("lk", &self.keys)?;
+        }
+        if self.saturated {
+            map.serialize_entry("ls", &true)?;
+        }
+        map.end()
     }
 }
 
@@ -1004,18 +1119,25 @@ impl ClaudeRequestCensus {
         self.serialized_total
     }
 
-    /// Transcript keys whose persisted record the decoder dropped.
-    pub(crate) fn decode_lost(&self) -> &ClaudeCensusLostRecords {
-        &self.decode_lost
+    /// Transcript keys whose record the census lost and has none since.
+    pub(crate) fn lost(&self) -> &ClaudeCensusLostRecords {
+        &self.lost
     }
 
-    /// Hand the decoder's lost keys to runtime custody.
-    pub(crate) fn take_decode_lost(&mut self) -> ClaudeCensusLostRecords {
-        std::mem::take(&mut self.decode_lost)
+    /// The census refused this transcript key's record.
+    pub(crate) fn mark_lost(&mut self, key: &str) {
+        self.lost.mark(key);
     }
 
-    pub(crate) fn forget_decode_lost(&mut self, key: &str) {
-        self.decode_lost.forget(key);
+    /// A record (or its tombstone) is stored for this key again.
+    pub(crate) fn forget_lost(&mut self, key: &str) {
+        self.lost.forget(key);
+    }
+
+    /// Nothing to persist: no record and no loss mark. A census holding only
+    /// loss marks is written, or a restart would read its losses as empty.
+    pub(crate) fn is_unwritten(&self) -> bool {
+        self.records.is_empty() && self.lost.is_empty()
     }
 
     /// Serialized bytes a full record may still take before the tombstone
@@ -1358,20 +1480,20 @@ impl ClaudeRequestCensus {
             kept
         });
         // A lost key that vanished can hide nothing.
-        self.decode_lost.retain(&keep);
+        self.lost.retain(&keep);
         self.recount();
         dropped
     }
 
     fn recount(&mut self) {
         let records = std::mem::take(&mut self.records);
-        let decode_lost = std::mem::take(&mut self.decode_lost);
+        let lost = std::mem::take(&mut self.lost);
         *self = Self::default();
         for (key, record) in &records {
             self.charge(key, record, true);
         }
         self.records = records;
-        self.decode_lost = decode_lost;
+        self.lost = lost;
     }
 }
 
@@ -1482,9 +1604,19 @@ impl Serialize for ClaudeRequestCensusRecord {
     }
 }
 
+/// The records by index key; a non-empty lost set follows them under
+/// [`CLAUDE_CENSUS_LOST_KEY`], in the same value and so the same save.
 impl Serialize for ClaudeRequestCensus {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.records.serialize(serializer)
+        if self.lost.is_empty() {
+            return self.records.serialize(serializer);
+        }
+        let mut map = serializer.serialize_map(Some(self.records.len() + 1))?;
+        for (key, record) in &self.records {
+            map.serialize_entry(key, record)?;
+        }
+        map.serialize_entry(CLAUDE_CENSUS_LOST_KEY, &self.lost)?;
+        map.end()
     }
 }
 
@@ -1648,7 +1780,7 @@ impl<R: std::io::Read> CensusRead<R> {
 
     fn invalidate_duplicates(&self, index: &mut ScanIndex) {
         if self.duplicate_census {
-            index.claude_request_census = ClaudeRequestCensus::default();
+            index.claude_request_census = ClaudeRequestCensus::lost_whole();
         }
         if self.duplicate_shadow {
             index.claude_request_census_shadow = ClaudeRequestCensusShadowState::default();
@@ -1775,6 +1907,12 @@ impl<R: std::io::Read> CensusRead<R> {
             }
         }
         if overflow {
+            // A request census past the bounds is lost whole: its transcript
+            // prefixes are missing, never empty.
+            if !self.syntax_only && !self.retired_guard && !self.shadow_state {
+                return Ok(serde_json::to_vec(&ClaudeRequestCensus::lost_whole())
+                    .expect("census serialization"));
+            }
             return Ok(b"null".to_vec());
         }
         // Parsing is isolated from the enclosing index, including numeric
@@ -1786,7 +1924,8 @@ impl<R: std::io::Read> CensusRead<R> {
             drop(bytes);
             serde_json::to_vec(&state).expect("shadow serialization")
         } else {
-            let census = serde_json::from_slice::<ClaudeRequestCensus>(&bytes).unwrap_or_default();
+            let census = serde_json::from_slice::<ClaudeRequestCensus>(&bytes)
+                .unwrap_or_else(|_| ClaudeRequestCensus::lost_whole());
             drop(bytes);
             serde_json::to_vec(&census).expect("census serialization")
         })
@@ -1952,7 +2091,7 @@ impl ClaudeRequestCensus {
     /// every transcript prefix it held is missing (saturated loss).
     pub(crate) fn lost_whole() -> Self {
         let mut census = Self::default();
-        census.decode_lost.saturate();
+        census.lost.saturate();
         census
     }
 }
@@ -2038,11 +2177,12 @@ impl<'de> Visitor<'de> for CensusVisitor {
         let mut attempted = 0;
         let mut dropped = 0_u64;
         let mut remaining_work = MAX_RAW_BYTES;
+        let mut lost_seen = false;
         // The index census's records lost here leave their keys' prefixes
         // missing (a ledger shard that loses one is refused whole instead).
         let lost = |census: &mut ClaudeRequestCensus, key: &str| {
             if !self.ledger {
-                census.decode_lost.mark(key);
+                census.lost.mark(key);
             }
         };
         loop {
@@ -2051,7 +2191,7 @@ impl<'de> Visitor<'de> for CensusVisitor {
                     dropped += 1;
                     // Unread keys: which prefixes are missing is unknown.
                     if !self.ledger {
-                        census.decode_lost.saturate();
+                        census.lost.saturate();
                     }
                 }
                 break;
@@ -2060,6 +2200,20 @@ impl<'de> Visitor<'de> for CensusVisitor {
                 break;
             };
             attempted += 1;
+            // The persisted lost set. A second copy is malformed: saturated.
+            if !self.ledger && key == CLAUDE_CENSUS_LOST_KEY {
+                let raw = map.next_value::<Box<serde_json::value::RawValue>>()?;
+                let decoded = if lost_seen {
+                    let mut saturated = ClaudeCensusLostRecords::default();
+                    saturated.saturate();
+                    saturated
+                } else {
+                    ClaudeCensusLostRecords::decode(raw.get())
+                };
+                lost_seen = true;
+                census.lost.absorb(decoded);
+                continue;
+            }
             if key.len() > MAX_CLAUDE_REQUEST_CENSUS_KEY_BYTES
                 || census.records.len() >= MAX_CLAUDE_REQUEST_CENSUS_RECORDS
                 || is_ledger_key(&key) != self.ledger
@@ -2977,6 +3131,7 @@ pub(crate) fn settle_claude_request_census_terminal(
     let window = rfc3339_unix_seconds(census_window_end).unwrap_or_default();
     let aged = retire_claude_transcript_records(index, window);
     note_transcript_retirements(aged, vanished);
+    settle_lost_saturation(index, observed_index_keys, window);
     let join = ClaudeRequestCensusJoin::new(index, window, residue_index_keys);
     let mut counts = join.counts(true);
     let state = &mut index.claude_request_census_shadow;
@@ -3019,6 +3174,55 @@ pub(crate) fn transcript_retirements() -> (u64, u64) {
         TRANSCRIPT_RETIRED[0].load(Ordering::Relaxed),
         TRANSCRIPT_RETIRED[1].load(Ordering::Relaxed),
     )
+}
+
+/// Complete terminal, after the prune and retirement: a saturated loss set
+/// (its lost keys unknown) clears only once nothing it stood for can still be
+/// missing, i.e. every Claude transcript key indexed or walked in this
+/// generation has a census record again (a birth stub is none) or is idle
+/// past the retirement cutoff (its record would hold no prefix either). One
+/// key without either keeps it saturated: source-wide Unknown, counted and
+/// alarmed (Lead B r18 proposal; fails closed).
+fn settle_lost_saturation(
+    index: &mut ScanIndex,
+    observed_index_keys: &BTreeSet<String>,
+    window: u64,
+) {
+    if !index.claude_request_census.lost.saturated() {
+        return;
+    }
+    let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
+    let census = &index.claude_request_census;
+    let files = &index.files;
+    let missing = |key: &String| {
+        super::claude_index_path_member_ref(Path::new(key.as_str())).is_some()
+            && census.get(key).is_none()
+            && !files.get(key.as_str()).is_some_and(|entry| {
+                window > 0
+                    && entry.modified_unix_seconds > 0
+                    && entry.modified_unix_seconds < cutoff
+            })
+    };
+    let unrecorded = files
+        .keys()
+        .chain(
+            observed_index_keys
+                .iter()
+                .filter(|key| !files.contains_key(key.as_str())),
+        )
+        .filter(|key| missing(key))
+        .count();
+    if unrecorded == 0 {
+        index.claude_request_census.lost.clear_saturated();
+    }
+    crate::local_resource_diagnostics::traversal_point(
+        "claude_census_lost_saturated",
+        super::SnapshotSource::ClaudeCode.api_slug(),
+        &serde_json::json!({
+            "census_lost_saturated_unrecorded_keys": unrecorded,
+            "census_lost_saturated_cleared": u64::from(unrecorded == 0),
+        }),
+    );
 }
 
 /// P1 ledger transcript retirement, by the record's own mtime (never the

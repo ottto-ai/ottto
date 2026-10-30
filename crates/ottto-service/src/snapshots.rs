@@ -3554,8 +3554,8 @@ pub struct ScanIndex {
     /// produced it. Local-only and content-free (8-byte SHA-256 prefixes of
     /// provider request ids); never proof, usage or upload input, and no
     /// decision reads it. Decoded per entry: a malformed record is dropped,
-    /// never the index.
-    #[serde(default, skip_serializing_if = "ClaudeRequestCensus::is_empty")]
+    /// never the index. The keys whose record it lost persist with it.
+    #[serde(default, skip_serializing_if = "ClaudeRequestCensus::is_unwritten")]
     claude_request_census: ClaudeRequestCensus,
     /// Slice D1: count-only shadow memory between complete terminals.
     #[serde(

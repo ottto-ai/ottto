@@ -257,7 +257,7 @@ impl Serialize for ScanIndex {
         field!(held claude_account_family_pending);
         field!(held claude_usage_family_witnesses);
         field!(held claude_usage_family_pending);
-        field!(claude_request_census, ClaudeRequestCensus::is_empty);
+        field!(claude_request_census, ClaudeRequestCensus::is_unwritten);
         field!(
             claude_request_census_shadow,
             ClaudeRequestCensusShadowState::is_empty
@@ -1612,7 +1612,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                 }
                 if !seen.insert(name) {
                     if name == "claude_request_census" {
-                        index.claude_request_census = ClaudeRequestCensus::default();
+                        index.claude_request_census = ClaudeRequestCensus::lost_whole();
                     } else if name == "claude_request_census_shadow" {
                         index.claude_request_census_shadow =
                             ClaudeRequestCensusShadowState::default();
@@ -2429,7 +2429,7 @@ pub(super) fn read_bounded(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
     })?;
     let mut index = read(std::io::Cursor::new(normalized), "cas", "unattributed")?;
     if duplicate_census {
-        index.claude_request_census = ClaudeRequestCensus::default();
+        index.claude_request_census = ClaudeRequestCensus::lost_whole();
     }
     if duplicate_shadow {
         index.claude_request_census_shadow = ClaudeRequestCensusShadowState::default();
