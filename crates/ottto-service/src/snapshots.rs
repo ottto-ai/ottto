@@ -19740,16 +19740,7 @@ impl SnapshotAccumulator {
         );
         let request_id =
             string_at(value, &["requestId"]).or_else(|| string_at(value, &["request_id"]));
-        let key = match claude_code_usage_dedup_key(value) {
-            Some(key) => key,
-            None => {
-                // Preserve the historical, conservative one-line/one-response
-                // fallback. Claude accounting proof remains absent for every
-                // snapshot until api_request logs and trace ownership are
-                // reconciled, regardless of transcript identity quality.
-                format!("u\u{1f}{}", self.claude_response_sequence)
-            }
-        };
+        let key = claude_response_key(value, self.claude_response_sequence);
         if self.claude_response_record_count >= MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE {
             crate::local_resource_diagnostics::claude_record_cap_hit();
             if self.claude_responses.contains_key(&key) {
@@ -20859,6 +20850,33 @@ impl SnapshotAccumulator {
                 effort,
             );
         }
+        let (resolved_model, delta) = self.decide_codex_legacy_usage(
+            model,
+            usage,
+            last_usage,
+            usage_event_identity,
+            implicit_request_count,
+        )?;
+        self.add_usage_with_selector(
+            Some(resolved_model),
+            delta.clone(),
+            selector,
+            timestamp,
+            effort,
+        );
+        Some(delta)
+    }
+
+    /// Admission only. The native caller owns publication; bounded replay
+    /// uses the same ordered state transition without constructing money rows.
+    fn decide_codex_legacy_usage(
+        &mut self,
+        model: Option<String>,
+        usage: UsageTotals,
+        last_usage: Option<UsageTotals>,
+        usage_event_identity: Option<String>,
+        implicit_request_count: Option<u64>,
+    ) -> Option<(String, UsageTotals)> {
         let resolved_model = model
             .or_else(|| self.latest_model.clone())
             .unwrap_or_else(|| "unknown".to_string());
@@ -20903,14 +20921,7 @@ impl SnapshotAccumulator {
         if delta.is_zero() {
             return None;
         }
-        self.add_usage_with_selector(
-            Some(resolved_model),
-            delta.clone(),
-            selector,
-            timestamp,
-            effort,
-        );
-        Some(delta)
+        Some((resolved_model, delta))
     }
 
     // Production finishes through `into_items_with_repository_identity`.
@@ -38083,14 +38094,9 @@ fn apply_physical_line(
         buf.shrink_to(max_line_bytes);
         return;
     }
-    // Trim a trailing CR so a CRLF transcript parses identically to LF.
-    let mut bytes = buf.as_slice();
-    if bytes.last() == Some(&b'\r') {
-        bytes = &bytes[..bytes.len() - 1];
-    }
-    let value = match std::str::from_utf8(bytes) {
-        Ok(line) if line.trim().is_empty() => None,
-        Ok(line) => match serde_json::from_str::<Value>(line) {
+    let value = match jsonl_line_text(buf) {
+        JsonlLineText::Blank => None,
+        JsonlLineText::Text(line) => match serde_json::from_str::<Value>(line) {
             Ok(value) => {
                 report.parsed_json_line_count += 1;
                 Some(value)
@@ -38100,7 +38106,7 @@ fn apply_physical_line(
                 None
             }
         },
-        Err(_) => {
+        JsonlLineText::InvalidUtf8 => {
             report.invalid_utf8_line_count += 1;
             None
         }
@@ -39204,6 +39210,102 @@ fn codex_creator_header_evidence(value: &Value, meta: &Value) -> Option<SessionA
     })
 }
 
+
+// Content projection shared with growth-only durable replay. Keep native N/U
+// processing at its existing call sites; these helpers never publish usage.
+enum JsonlLineText<'a> {
+    Blank,
+    InvalidUtf8,
+    Text(&'a str),
+}
+fn jsonl_line_text(mut bytes: &[u8]) -> JsonlLineText<'_> {
+    if bytes.last() == Some(&b'\r') {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(line) if line.trim().is_empty() => JsonlLineText::Blank,
+        Ok(line) => JsonlLineText::Text(line),
+        Err(_) => JsonlLineText::InvalidUtf8,
+    }
+}
+fn claude_response_key(value: &Value, sequence: u64) -> String {
+    match claude_code_usage_dedup_key(value) {
+        Some(key) => key,
+        None => {
+            // Preserve the historical, conservative one-line/one-response
+            // fallback. Claude accounting proof remains absent for every
+            // snapshot until api_request logs and trace ownership are
+            // reconciled, regardless of transcript identity quality.
+            format!("u\u{1f}{}", sequence)
+        }
+    }
+}
+fn claude_title_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.set_title(string_at(value, &["aiTitle"]), "ai_title");
+    accumulator.set_title(
+        string_at(value, &["customTitle"]).and_then(claude_custom_title_display_title),
+        "transcript_title",
+    );
+    accumulator.set_title_if_absent(
+        string_at(value, &["summary"])
+            .or_else(|| string_at(value, &["title"]))
+            .or_else(|| string_at(value, &["metadata", "title"])),
+        "summary",
+    );
+}
+fn claude_prompt_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    claude_title_content(value, accumulator);
+    let real_prompt = claude_first_user_prompt(value);
+    if real_prompt.is_some() {
+        accumulator.session_start.note_user_turn();
+    }
+    accumulator.set_first_prompt_title(real_prompt);
+}
+fn claude_workspace_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.set_workspace_hash(
+        string_at(value, &["cwd"])
+            .or_else(|| string_at(value, &["projectPath"]))
+            .or_else(|| string_at(value, &["workspace"])),
+    );
+}
+fn codex_opening_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator
+        .session_start
+        .observe_codex_line(value, accumulator.workspace_path.as_deref());
+}
+fn codex_user_turn_content(_: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.session_start.note_user_turn();
+}
+fn codex_prompt_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.set_title(codex_transcript_title(value), "transcript_title");
+    accumulator.set_first_prompt_title(codex_first_user_prompt(value));
+}
+fn codex_workspace_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.set_workspace_hash(
+        string_at(value, &["turn_context", "payload", "cwd"])
+            .or_else(|| string_at(value, &["payload", "cwd"]))
+            .or_else(|| string_at(value, &["cwd"])),
+    );
+}
+fn codex_header_workspace_content(meta: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.set_workspace_hash(string_at(meta, &["cwd"]));
+}
+fn codex_agent_content(src: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.codex_agent_label = string_at(src, &["subagent", "thread_spawn", "agent_path"])
+        .and_then(safe_codex_agent_display_label);
+    accumulator
+        .durable_marks
+        .note_end(|marks| &mut marks.agent_label);
+}
+fn pi_workspace_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.set_workspace_hash(string_at(value, &["cwd"]));
+}
+fn pi_prompt_content(value: &Value, role: Option<&str>, accumulator: &mut SnapshotAccumulator) {
+    if role == Some("user") {
+        accumulator.set_first_prompt_title(pi_message_text(value));
+    }
+}
+
 /// First physical header remains the identity/graph owner. Later copied headers
 /// cannot replace it, and contradictory creator evidence permanently clears
 /// only the optional creator witness for this scan.
@@ -39259,18 +39361,13 @@ fn apply_codex_envelope_line(value: &Value, accumulator: &mut SnapshotAccumulato
                 codex_identity_at(src, &["subagent", "thread_spawn", "parent_thread_id"])
                     .or_else(|| codex_identity_at(meta, &["parent_thread_id"])),
             );
-            accumulator.codex_agent_label =
-                string_at(src, &["subagent", "thread_spawn", "agent_path"])
-                    .and_then(safe_codex_agent_display_label);
-            accumulator
-                .durable_marks
-                .note_end(|marks| &mut marks.agent_label);
+            codex_agent_content(src, accumulator);
         }
     }
     accumulator.origin.originator = string_at(meta, &["originator"]);
     accumulator.origin.agent_role =
         string_at(meta, &["agent_role"]).or_else(|| string_at(meta, &["agent_type"]));
-    accumulator.set_workspace_hash(string_at(meta, &["cwd"]));
+    codex_header_workspace_content(meta, accumulator);
     accumulator
         .note_time(string_at(value, &["timestamp"]).or_else(|| string_at(meta, &["timestamp"])));
     accumulator.codex_session_meta_seen = true;
@@ -39691,9 +39788,7 @@ fn apply_codex_ledger_line(value: &Value, accumulator: &mut SnapshotAccumulator)
 }
 
 fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
-    accumulator
-        .session_start
-        .observe_codex_line(value, accumulator.workspace_path.as_deref());
+    codex_opening_content(value, accumulator);
     if string_eq_at(value, &["type"], "turn_context") {
         if let Some(payload) = value.get("payload").and_then(Value::as_object) {
             let metadata = payload
@@ -39722,7 +39817,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         }
     }
     if string_eq_at(value, &["payload", "type"], "task_started") {
-        accumulator.session_start.note_user_turn();
+        codex_user_turn_content(value, accumulator);
         if let Some(turn) = string_at(value, &["payload", "turn_id"]) {
             accumulator.cache_active_turns.insert(turn);
         }
@@ -39792,18 +39887,13 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         .or_else(|| string_at(value, &["time"]))
         .or_else(|| string_at(value, &["created_at"]));
     accumulator.note_time(timestamp.clone());
-    accumulator.set_title(codex_transcript_title(value), "transcript_title");
-    accumulator.set_first_prompt_title(codex_first_user_prompt(value));
+    codex_prompt_content(value, accumulator);
     accumulator.set_model(
         string_at(value, &["turn_context", "payload", "model"])
             .or_else(|| string_at(value, &["payload", "model"]))
             .or_else(|| string_at(value, &["model"])),
     );
-    accumulator.set_workspace_hash(
-        string_at(value, &["turn_context", "payload", "cwd"])
-            .or_else(|| string_at(value, &["payload", "cwd"]))
-            .or_else(|| string_at(value, &["cwd"])),
-    );
+    codex_workspace_content(value, accumulator);
     let selector = codex_selector_from_line(value);
     accumulator.set_selector(selector.clone());
     if let Some(effort) = codex_reasoning_effort(value) {
@@ -40595,32 +40685,13 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             accumulator.claude_last_user_ts = Some(user_ts);
         }
     }
-    accumulator.set_title(string_at(value, &["aiTitle"]), "ai_title");
-    accumulator.set_title(
-        string_at(value, &["customTitle"]).and_then(claude_custom_title_display_title),
-        "transcript_title",
-    );
-    accumulator.set_title_if_absent(
-        string_at(value, &["summary"])
-            .or_else(|| string_at(value, &["title"]))
-            .or_else(|| string_at(value, &["metadata", "title"])),
-        "summary",
-    );
-    let real_prompt = claude_first_user_prompt(value);
-    if real_prompt.is_some() {
-        accumulator.session_start.note_user_turn();
-    }
-    accumulator.set_first_prompt_title(real_prompt);
+    claude_prompt_content(value, accumulator);
     accumulator.set_model(
         string_at(value, &["message", "model"])
             .or_else(|| string_at(value, &["model"]))
             .or_else(|| string_at(value, &["payload", "model"])),
     );
-    accumulator.set_workspace_hash(
-        string_at(value, &["cwd"])
-            .or_else(|| string_at(value, &["projectPath"]))
-            .or_else(|| string_at(value, &["workspace"])),
-    );
+    claude_workspace_content(value, accumulator);
     // Defer the whole response. Sidechain content-block rows progressively
     // increase cumulative output and may add selectors late; neither the first
     // nor an arbitrary line is an authoritative complete response.
@@ -41289,7 +41360,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
                     .or_else(|| string_at(value, &["session_id"]))
                     .or_else(|| string_at(value, &["sessionId"]));
             }
-            accumulator.set_workspace_hash(string_at(value, &["cwd"]));
+            pi_workspace_content(value, accumulator);
             accumulator.note_pi_time(pi_timestamp_field(value));
         }
         Some("message") => {
@@ -41297,9 +41368,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             // nested `message.role`. This is the only chance to capture prompt
             // text for a title fallback.
             let role = pi_message_role(value);
-            if role.as_deref() == Some("user") {
-                accumulator.set_first_prompt_title(pi_message_text(value));
-            }
+            pi_prompt_content(value, role.as_deref(), accumulator);
             let timestamp = pi_message_timestamp(value);
             if role.as_deref() == Some("assistant")
                 && (timestamp.is_some() || !pi_message_timestamp_is_present(value))
