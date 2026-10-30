@@ -404,6 +404,8 @@ impl ClaudeResponseWindow {
 fn read_at(file: &File, source: SnapshotSource, bytes: &mut [u8], at: u64) -> Result<(), Refuse> {
     let mut offset = 0;
     while offset < bytes.len() {
+        #[cfg(test)]
+        sampled_scan::durable_tail::record_rederive_read_call();
         let n = match file.read_at(&mut bytes[offset..], at + offset as u64) {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Ok(0) | Err(_) => return Err(Refuse::NotRederivable("content_read")),

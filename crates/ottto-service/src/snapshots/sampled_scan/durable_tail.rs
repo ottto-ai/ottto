@@ -185,6 +185,29 @@ pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
 
 /// Actual physical class-X bytes, including a later capture/hash refusal.
 /// The success receipt is separate; never hide input behind a refusal label.
+#[cfg(test)]
+thread_local! { static REDERIVE_READ_CALLS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(in crate::snapshots) fn record_rederive_read_call() {
+    REDERIVE_READ_CALLS.with(|count| {
+        if let Some(n) = count.get() {
+            count.set(Some(n + 1));
+        }
+    });
+}
+#[cfg(test)]
+fn capture_rederive_reads<T>(run: impl FnOnce() -> T) -> (T, u64) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REDERIVE_READ_CALLS.set(None);
+        }
+    }
+    assert!(REDERIVE_READ_CALLS.replace(Some(0)).is_none());
+    let _reset = Reset;
+    let result = run();
+    (result, REDERIVE_READ_CALLS.get().unwrap())
+}
 pub(in crate::snapshots) fn record_rederive_input(source: SnapshotSource, bytes: u64) {
     REDERIVE_HEAD_BYTES[diagnostic_source_slot(source)].fetch_add(bytes, Ordering::Relaxed);
     crate::local_resource_diagnostics::durable_tail_alarm(
@@ -3443,6 +3466,15 @@ impl SharedCache {
         let mut stores = self
             .durable()
             .ok_or(Failure::Resource("stores_unavailable"))?;
+        if stores
+            .key_debt
+            .get(&digest)
+            .is_some_and(|debt| debt.retire_source == Some(ds))
+        {
+            return Err(Failure::Certificate(CertificateRefusal::Changed(
+                FullReason::HeadChanged,
+            )));
+        }
         let now = SystemTime::now();
         #[cfg(test)]
         let now = stores.retail_full_now.unwrap_or(now);

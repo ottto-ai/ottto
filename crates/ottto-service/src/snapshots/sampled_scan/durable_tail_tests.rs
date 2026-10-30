@@ -15277,25 +15277,27 @@ fn quiet_restore_has_no_sample_or_content_input_before_decode_on_all_sources() {
             else {
                 panic!("lease");
             };
-            let before = rederive_head_bytes_total(source);
-            let (result, samples) = crate::transcript_acquisition::capture_sample_bytes(|| {
-                cache.durable_restore_record_scoped(
-                    source,
-                    &record,
-                    &expected,
-                    &path,
-                    &scope,
-                    &mut File::open(&path).unwrap(),
-                    &mut lease,
-                    Some(V3RestoreScope {
-                        index: &index,
-                        interpretation: &interpretation,
-                    }),
-                )
-            });
+            let ((result, content_reads), samples) =
+                crate::transcript_acquisition::capture_sample_reads(|| {
+                    capture_rederive_reads(|| {
+                        cache.durable_restore_record_scoped(
+                            source,
+                            &record,
+                            &expected,
+                            &path,
+                            &scope,
+                            &mut File::open(&path).unwrap(),
+                            &mut lease,
+                            Some(V3RestoreScope {
+                                index: &index,
+                                interpretation: &interpretation,
+                            }),
+                        )
+                    })
+                });
             assert!(matches!(result, Err(Failure::Resource("rederive_quiet"))));
-            assert_eq!(samples, 0);
-            assert_eq!(rederive_head_bytes_total(source), before);
+            assert!(samples.is_empty());
+            assert_eq!(content_reads, 0);
             lease.release();
         }
     }
