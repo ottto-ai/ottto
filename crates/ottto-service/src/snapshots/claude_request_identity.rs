@@ -321,6 +321,22 @@ impl Amounts {
         Some(())
     }
 
+    /// Merge already emitted contributions with receiver presence arithmetic.
+    fn merge_wire(&mut self, other: &Amounts) -> Option<()> {
+        let costs = std::array::from_fn::<_, 5, _>(|field| other.wire(field));
+        for (total, value) in self.counts.iter_mut().zip(other.counts) {
+            *total = total.checked_add(value)?;
+        }
+        self.observed = true;
+        self.last_at = self.last_at.max(other.last_at);
+        for (field, cost) in costs.into_iter().enumerate() {
+            if let Some(value) = cost {
+                self.costs[field] = Some(self.costs[field].unwrap_or(0).checked_add(value)?);
+            }
+        }
+        Some(())
+    }
+
     /// The money today's row carries for this field.
     fn wire(&self, index: usize) -> Option<u128> {
         (self.observed && !self.poisoned[index])
@@ -408,6 +424,7 @@ pub(crate) struct Grouping {
     upstream_proof_lost: bool,
     /// Additional cache-reconciliation wire bytes, projected once before tags.
     extra_wire_bytes: usize,
+    accepted_share_changed: BTreeSet<String>,
     failed: Option<Ineligible>,
     /// Requests a `RequestSink` admitted: those the item's transcript holds,
     /// and telemetry-only (auxiliary) ones the reported rebuild added.
@@ -533,6 +550,7 @@ impl Grouping {
             keys_over_cap: false,
             upstream_proof_lost: false,
             extra_wire_bytes: 0,
+            accepted_share_changed: BTreeSet::new(),
             failed: None,
             transcript_requests: 0,
             telemetry_only_requests: 0,
@@ -817,7 +835,7 @@ pub(crate) fn apply_grouped(
 fn apply_grouped_with_accepted(
     item: &mut SnapshotItem,
     mut grouping: Grouping,
-    accepted: Option<&[i64]>,
+    accepted: Option<&accepted::AcceptedSession>,
 ) -> Result<Tagged, Ineligible> {
     if let Some(ineligible) = grouping.failed {
         return Err(ineligible);
@@ -844,7 +862,7 @@ fn apply_grouped_with_accepted(
         top_groups
             .entry(row_key)
             .or_default()
-            .merge(&group.total)
+            .merge_wire(&group.total)
             .ok_or(Ineligible::RowsNotReproduced)?;
     }
     if item.model_usage.len() != top_groups.len() {
@@ -858,7 +876,7 @@ fn apply_grouped_with_accepted(
         )?;
     }
 
-    refuse_unproved_accepted(&mut grouping, accepted);
+    protect_accepted_shares(&mut grouping, accepted);
     let prior_refusals = item.request_identity_refusals;
     let mut refusals = prior_refusals;
     let mut over_cap = BTreeSet::new();
@@ -929,10 +947,16 @@ fn apply_grouped_with_accepted(
         for (row_key, group) in grouping.rows() {
             if *row_key == key {
                 for (authority, amounts) in &group.by_key {
+                    let mut wire_amount = amounts.clone();
+                    for field in 0..5 {
+                        if group.total.wire(field).is_none() {
+                            wire_amount.poisoned[field] = true;
+                        }
+                    }
                     by_key
                         .entry(authority.clone())
                         .or_default()
-                        .merge(amounts)
+                        .merge_wire(&wire_amount)
                         .ok_or(Ineligible::RowsNotReproduced)?;
                 }
             }
@@ -985,18 +1009,18 @@ fn apply_grouped_with_accepted(
         over_cap.insert(OverCap::Bytes);
     }
     if over_cap.is_empty() {
-        budget::record(&cap_counts(item, accepted, None));
+        budget::record(&cap_counts(item, &grouping, accepted, None));
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         item.claude_account_display = display(grouping.unowned_request);
         return Ok(Tagged::Sent { refusals });
     }
     crate::local_resource_diagnostics::claude_identity_over_cap(&over_cap, attempted_bytes);
-    let attempted_counts = cap_counts(item, accepted, None);
+    let attempted_counts = cap_counts(item, &grouping, accepted, None);
     let selected = (!grouping.upstream_proof_lost)
         .then(|| budget::select(item, &grouping, prior_refusals, accepted))
         .flatten();
     if let Some((kept, measurement)) = selected {
-        budget::record(&cap_counts(item, accepted, Some(&measurement)));
+        budget::record(&cap_counts(item, &grouping, accepted, Some(&measurement)));
         let mut visible = grouping;
         for (bucket, keep) in item.usage_buckets.iter().zip(&kept) {
             if !keep {
@@ -1051,30 +1075,52 @@ fn apply_grouped_with_accepted(
     })
 }
 
-fn refuse_unproved_accepted(grouping: &mut Grouping, accepted: Option<&[i64]>) {
+fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::AcceptedSession>) {
+    let Some(accepted) = accepted else {
+        return;
+    };
     for (bucket, rows) in &mut grouping.groups {
-        let remembered = accepted::bucket_key(bucket)
-            .is_some_and(|key| accepted.is_some_and(|known| known.binary_search(&key).is_ok()));
-        // A bucket-level hint cannot turn a legitimately missing sibling row
-        // into a refusal. Refuse restoration only when the whole remembered
-        // bucket has lost its currently provable identity.
-        let proved = rows.values().any(|group| {
-            group
+        let Some(start) = accepted::bucket_key(bucket) else {
+            continue;
+        };
+        if accepted.binary_search(&start).is_err() {
+            continue;
+        }
+        for (row, group) in rows {
+            let prior = accepted.row_shares(start, row);
+            if prior.is_empty() {
+                continue;
+            } // A genuinely always-missing sibling has no prior share.
+            let current = group
                 .by_key
                 .iter()
-                .any(|(key, amounts)| key.is_some() && amounts.counts != [0; 8])
-        });
-        if remembered && !proved {
-            for group in rows.values_mut() {
-                group.refused = true;
+                .filter(|(_, amount)| amount.counts != [0; 8])
+                .map(|(key, _)| key.as_ref().map(accepted::authority_hash))
+                .collect::<BTreeSet<_>>();
+            let changed = current != prior;
+            if !changed {
+                continue;
             }
+            grouping.accepted_share_changed.insert(bucket.clone());
+            let mut kept = BTreeMap::<Option<AuthorityKey>, Amounts>::new();
+            for (key, amount) in std::mem::take(&mut group.by_key) {
+                let key = key.filter(|key| prior.contains(&Some(accepted::authority_hash(key))));
+                // Never reconstruct missing proof from the ledger.
+                kept.entry(key)
+                    .or_default()
+                    .merge_wire(&amount)
+                    .expect("subset of checked row");
+            }
+            group.by_key = kept;
+            group.refused = true;
         }
     }
 }
 
 fn cap_counts(
     item: &SnapshotItem,
-    accepted: Option<&[i64]>,
+    grouping: &Grouping,
+    accepted: Option<&accepted::AcceptedSession>,
     measurement: Option<&CapMeasurement>,
 ) -> budget::Counts {
     let retained = item
@@ -1083,6 +1129,9 @@ fn cap_counts(
         .filter(|bucket| {
             accepted::bucket_key(&bucket.bucket_start)
                 .is_some_and(|key| accepted.is_some_and(|known| known.binary_search(&key).is_ok()))
+                && !grouping
+                    .accepted_share_changed
+                    .contains(&bucket.bucket_start)
                 && bucket.model_usage.iter().any(|row| {
                     row.evidence_ref.is_some()
                         || row.identity_parts.as_ref().is_some_and(|parts| {
@@ -1094,7 +1143,8 @@ fn cap_counts(
     budget::Counts {
         retained_buckets: measurement.map_or(retained, |m| m.accepted_retained),
         refused_new_buckets: measurement.map_or(0, |m| m.refused_recent_buckets),
-        accepted_state_unknown: u64::from(accepted.is_none()),
+        accepted_state_unknown: u64::from(accepted.is_none_or(|known| known.incomplete)),
+        accepted_share_changed: grouping.accepted_share_changed.len() as u64,
         accepted_overflow: measurement
             .map_or_else(Default::default, |m| m.accepted_overflow.clone()),
     }
@@ -1110,7 +1160,7 @@ pub(crate) fn measure_identity_cap(
     let mut grouping = request_owned_grouping(item).or_else(|| wire_grouping(item))?;
     let mut output = item.clone();
     let known = accepted.get(&item.source_session_id);
-    refuse_unproved_accepted(&mut grouping, known);
+    protect_accepted_shares(&mut grouping, known);
     let selected = (!grouping.upstream_proof_lost)
         .then(|| {
             budget::select(
@@ -1468,7 +1518,7 @@ fn row_identity(
                 debug_assert!(evidence_index.contains_key(&key.evidence()));
             }
             for (index, wire) in row_costs(row).into_iter().enumerate() {
-                if wire.is_some() && !amounts.wire(index).is_some_and(micro_exact) {
+                if wire.is_some() && amounts.wire(index).is_some_and(|value| !micro_exact(value)) {
                     return Err(Ineligible::MoneyNotMicroExact);
                 }
             }

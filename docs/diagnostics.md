@@ -1137,7 +1137,11 @@ overwrite; backend authority rules independently govern successor acceptance.
 
 `native_collection_page.counts.identity_cap` contains sparse page observations
 for `retained_buckets`, `refused_new_buckets`, `accepted_state_unknown`, and
-`accepted_overflow.{same_as_parent,differs}`. Overflow classes are append-only.
+`accepted_overflow.{same_as_parent,differs}`, and `accepted_share_changed`. Labels are append-only.
+`accepted_share_changed` counts bucket observations where a previously accepted
+row gains a different authority or loses a tagged share/presence. Unchanged
+shares stay tagged; changed/missing shares become untagged with one refusal
+per affected row. Such a bucket is not counted as retained.
 The default classifier always uses `differs`: a local starting login, creator
 hint or display cannot prove the backend's parent binding. Zero
 `same_as_parent` is explicit when this object is present. Counts describe tagging
@@ -1155,49 +1159,41 @@ accounts still proved by emitted bucket rows.
 
 Accepted overflow removes buckets from the collective set in that drop order,
 using reversible per-share sums and money-presence counts. A bucket need not
-fit alone: multiple buckets can collapse a temporary top-level parts row or
-reconcile missing money only together. Only an unavoidable representation
+fit alone: multiple buckets can collapse a temporary top-level parts row. Only an unavoidable representation
 lower bound can exclude an impossible bucket before the collective check.
 Row byte deltas and reference widths are updated incrementally; allocation
 does not serialize the growing item for each candidate or removal.
 
-Before eviction, a bounded dependency pass excludes money shares that cannot
-reconcile with an unreported top-level cost. A known tagged cost needs a
-currently proved unpriced share of the same row and authority; an untagged
-residual cannot supply that witness. Missing witnesses propagate through the
-candidate set, with each bucket and dependency removed at most once. This
-prevents an independently impossible bucket from discarding other accepted
-buckets that reconcile only together.
-
-Re-admission tries a bucket with its required money witnesses atomically, and
-can complete a shared top row when doing so shrinks the representation. Failed
-row completions are cached until selection changes. The byte budget includes
-the existing semantic envelope, the largest policy flag encoding, and a
-possible cache predecessor when the item carries cache material. The complete
-wire size is checked again after allocation; the 640 KiB wire cap is unchanged.
-Sizing uses fixed-width hash placeholders with the existing envelope serializer,
-avoiding a second semantic-hash computation solely to count bytes. Fixtures
-compare its size with real upload envelopes, including optional components.
-The upload owner projects cache reconciliation against its accepted predecessor
-once per item and reserves any growth before identity selection; the local
-cache patch is left intact. Required money companions try deterministic
-alternative witnesses before refusing the preferred bucket, with at most
-5,000 alternative trials shared by the item and no full-item serialization
-per trial.
+Money follows the receiver's presence arithmetic independently for all five
+cost fields: add present values, ignore absent contributions, and leave the
+sum absent only if none was present. All eight counters sum exactly. There
+is no unpriced-witness rule: an absent contribution cannot erase known money.
+Re-admission can complete a shared top row when this collapses Parts to Single;
+failed row completions are cached until selection changes. The byte budget
+includes the existing semantic envelope, the largest policy flag encoding and
+a possible cache predecessor. The upload owner reserves any cache reconciliation
+growth once before selection, without changing the local cache patch. Full
+wire size is checked again after allocation; 640 KiB is unchanged.
 Individual shared-row completions are tried before their union, so unrelated
 new buckets sharing another row cannot prevent a fitting accepted completion.
 
-The destination-scoped upload progress stores class L priority hints only:
-hashed session keys and sorted bucket-start timestamps, with no identities.
-Only stored-body ACKs update them; an unchanged response that did not store the
-offered body does not. A stripped accepted revision retains earlier bucket keys
-while they remain in the body's bucket set; restoration requires current local
-proof. Keys disappear with their entry. The ledger admits at most 64 sessions
-and 5,000 bucket starts per session, also bounded by each body's bucket count.
-The 64-bit heap accounting bound is 2,621,320 bytes at those limits (under 3 MiB).
-Eviction, migration, downgrade or missing state degrades to keeping currently
-proved buckets that fit and increments `accepted_state_unknown`. Older decoders
-may drop the append-only field without changing billing ACKs.
+The destination-scoped upload progress stores class L hints: hashed session
+keys, sorted bucket starts, and SHA-256 row/authority fingerprints of each
+row's first accepted share set, including whether an untagged share was present.
+It never stores or reconstructs identities. Only stored-body ACKs update it;
+a later stripped/refused ACK cannot bless a new authority or missing presence.
+Restoration still requires current held proof. An always-missing sibling row
+has no accepted tagged fingerprint and is not spuriously refused.
+
+Limits are 16 sessions, 5,000 starts and 1,536 share-presence records per session.
+Each share record occupies 80 inline bytes on the requested 64-bit layout;
+the maximum requested-layout fixture remains below 3 MiB. Whole buckets are
+evicted from the hint ledger at the share limit, never partial share sets;
+`accepted_state_unknown` counts attempts using incomplete or missing state.
+Eviction, timestamp-only migration and older-decoder loss degrade to currently
+proved buckets that fit. The append-only progress field still defaults empty;
+invalid L hints do not invalidate neighbouring billing ACKs. No wire cap or
+backend rule changes.
 
 The pure `measure_identity_cap(item, accepted_state)` hook returns
 `tagged_recent_buckets`, `refused_recent_buckets`, `accepted_retained`,

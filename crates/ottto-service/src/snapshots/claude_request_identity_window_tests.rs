@@ -1,3 +1,87 @@
+// Synthetic fixtures construct receiver-valid totals explicitly. The older
+// emitter's mixed-presence bug is outside this allocator change.
+fn sticky_receiver_totals(item: &mut SnapshotItem) {
+    let mut costs = BTreeMap::<RowKey, [Option<u128>; 5]>::new();
+    let mut counts = [0u64; 8];
+    for bucket in &item.usage_buckets {
+        for row in &bucket.model_usage {
+            let money = costs
+                .entry(row_key_from_model_usage(row))
+                .or_insert([None; 5]);
+            for (slot, value) in money.iter_mut().zip([
+                &row.cost_usd,
+                &row.input_cost_usd,
+                &row.output_cost_usd,
+                &row.cache_read_cost_usd,
+                &row.cache_creation_cost_usd,
+            ]) {
+                if let Some(value) = value {
+                    *slot = Some(slot.unwrap_or(0) + parse_usd_picos(value));
+                }
+            }
+            for (total, value) in counts.iter_mut().zip([
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+                row.cache_creation_5m_tokens,
+                row.cache_creation_1h_tokens,
+                row.reasoning_output_tokens,
+                row.unattributed_total_tokens,
+                row.request_count,
+            ]) {
+                *total += value;
+            }
+        }
+    }
+    let mut totals = [None; 5];
+    for row in &mut item.model_usage {
+        let money = costs.get(&row_key_from_model_usage(row)).unwrap();
+        for (slot, value) in [
+            &mut row.cost_usd,
+            &mut row.input_cost_usd,
+            &mut row.output_cost_usd,
+            &mut row.cache_read_cost_usd,
+            &mut row.cache_creation_cost_usd,
+        ]
+        .into_iter()
+        .zip(money)
+        {
+            *slot = value.map(usd_picos_string);
+        }
+        for (slot, value) in totals.iter_mut().zip(money) {
+            if let Some(value) = value {
+                *slot = Some(slot.unwrap_or(0) + value);
+            }
+        }
+    }
+    [
+        item.input_tokens,
+        item.output_tokens,
+        item.cache_read_tokens,
+        item.cache_creation_5m_tokens,
+        item.cache_creation_1h_tokens,
+        item.reasoning_output_tokens,
+        item.unattributed_total_tokens,
+        item.request_count,
+    ] = counts;
+    item.cost = totals.iter().any(Option::is_some).then(|| SnapshotCost {
+        total_cost_usd: totals[0].map(usd_picos_string),
+        input_cost_usd: totals[1].map(usd_picos_string),
+        output_cost_usd: totals[2].map(usd_picos_string),
+        cache_read_cost_usd: totals[3].map(usd_picos_string),
+        cache_creation_cost_usd: totals[4].map(usd_picos_string),
+        evidence_source: "synthetic".into(),
+    });
+}
+fn sticky_apply(
+    item: &mut SnapshotItem,
+    proof: &[Contribution],
+    accepted: &identity::AcceptedBuckets,
+) -> Result<Tagged, identity::Ineligible> {
+    sticky_receiver_totals(item);
+    identity::apply_with_accepted_for_test(item, proof, accepted)
+}
+
 // Sticky accepted-key budget, using synthetic proof only.
 fn sticky_session(hours: usize) -> (SnapshotItem, Vec<Contribution>) {
     let mut item = one_row_item(&[(2, None)]);
@@ -84,14 +168,14 @@ fn sticky_assert_reconciled(item: &SnapshotItem) {
             });
             let (total, money) = totals
                 .entry((row_key_from_model_usage(row), identity))
-                .or_insert(([0; 8], [Some(0); 5]));
+                .or_insert(([0; 8], [None; 5]));
             for (total, amount) in total.iter_mut().zip(counts) {
                 *total += amount;
             }
             for (total, amount) in money.iter_mut().zip(costs) {
-                *total = total
-                    .zip(amount.map(parse_usd_picos))
-                    .map(|(sum, amount)| sum + amount);
+                if let Some(amount) = amount {
+                    *total = Some(total.unwrap_or(0) + parse_usd_picos(amount));
+                }
             }
         };
         for row in rows {
@@ -192,7 +276,7 @@ fn sticky_assert_reconciled(item: &SnapshotItem) {
 fn sticky_budget_preserves_accepted_old_bucket_and_refuses_new_when_full() {
     let (mut first, proof) = sticky_session(24 * 24);
     let mut accepted = identity::AcceptedBuckets::default();
-    let result = identity::apply_with_accepted_for_test(&mut first, &proof, &accepted).unwrap();
+    let result = sticky_apply(&mut first, &proof, &accepted).unwrap();
     assert!(matches!(result, Tagged::Sent { .. }));
     assert!(
         first.request_identity_refusals > 0,
@@ -201,7 +285,7 @@ fn sticky_budget_preserves_accepted_old_bucket_and_refuses_new_when_full() {
     sticky_assert_reconciled(&first);
     accepted.record(&serde_json::to_value(&first).unwrap());
     let (mut second, proof) = sticky_session(24 * 24 + 1);
-    identity::apply_with_accepted_for_test(&mut second, &proof, &accepted).unwrap();
+    sticky_apply(&mut second, &proof, &accepted).unwrap();
     assert!(
         sticky_tagged(&second.usage_buckets[575].model_usage[0]),
         "previously accepted older hour survives"
@@ -249,7 +333,7 @@ fn sticky_budget_preserves_accepted_old_bucket_and_refuses_new_when_full() {
     );
     sticky_assert_reconciled(&second);
     let (mut again, proof) = sticky_session(24 * 24 + 1);
-    identity::apply_with_accepted_for_test(&mut again, &proof, &accepted).unwrap();
+    sticky_apply(&mut again, &proof, &accepted).unwrap();
     assert_eq!(second.snapshot_fingerprint, again.snapshot_fingerprint);
     assert_eq!(
         serde_json::to_vec(&second).unwrap(),
@@ -268,7 +352,7 @@ fn sticky_budget_preserves_accepted_old_bucket_and_refuses_new_when_full() {
 fn sticky_overflow_protects_open_hour_drops_oldest_as_differs_and_restores_only_held_proof() {
     let (mut first, proof) = sticky_session(576);
     let mut accepted = identity::AcceptedBuckets::default();
-    identity::apply_with_accepted_for_test(&mut first, &proof, &accepted).unwrap();
+    sticky_apply(&mut first, &proof, &accepted).unwrap();
     accepted.record(&serde_json::to_value(&first).unwrap());
     let oldest = first
         .usage_buckets
@@ -292,7 +376,7 @@ fn sticky_overflow_protects_open_hour_drops_oldest_as_differs_and_restores_only_
     grown.usage_buckets[575].model_usage[0].input_tokens += 3;
     grown.usage_buckets[575].model_usage[0].request_count += 3;
     let _ = identity::take_identity_counts();
-    identity::apply_with_accepted_for_test(&mut grown, &proof, &accepted).unwrap();
+    sticky_apply(&mut grown, &proof, &accepted).unwrap();
     let counts = serde_json::to_value(identity::take_identity_counts()).unwrap();
     assert!(
         counts["identity_cap"]["accepted_overflow"]["differs"]
@@ -310,7 +394,7 @@ fn sticky_overflow_protects_open_hour_drops_oldest_as_differs_and_restores_only_
     accepted.record(&serde_json::to_value(&grown).unwrap());
     // The L ledger remembers the stripped bucket, but stores no authority.
     let (mut restored, proof) = sticky_session(576);
-    identity::apply_with_accepted_for_test(&mut restored, &proof, &accepted).unwrap();
+    sticky_apply(&mut restored, &proof, &accepted).unwrap();
     assert!(sticky_tagged(
         &restored.usage_buckets[oldest].model_usage[0]
     ));
@@ -320,7 +404,7 @@ fn sticky_overflow_protects_open_hour_drops_oldest_as_differs_and_restores_only_
             c.identity = RequestIdentity::Missing;
         }
     }
-    identity::apply_with_accepted_for_test(&mut no_proof, &proof, &accepted).unwrap();
+    sticky_apply(&mut no_proof, &proof, &accepted).unwrap();
     assert!(!sticky_tagged(
         &no_proof.usage_buckets[oldest].model_usage[0]
     ));
@@ -332,7 +416,7 @@ fn sticky_missing_state_uses_current_proof_and_counts_unknown() {
     let (mut item, proof) = sticky_session(576);
     let missing = identity::AcceptedBuckets::default();
     let _ = identity::take_identity_counts();
-    identity::apply_with_accepted_for_test(&mut item, &proof, &missing).unwrap();
+    sticky_apply(&mut item, &proof, &missing).unwrap();
     let counts = serde_json::to_value(identity::take_identity_counts()).unwrap();
     assert_eq!(counts["identity_cap"]["accepted_state_unknown"], 1);
     assert!(sticky_tagged(&item.usage_buckets[575].model_usage[0]));
@@ -355,23 +439,13 @@ fn sticky_budget_refolds_exact_money_and_keeps_part_cap_window() {
         bucket.model_usage[0].cost_usd = Some("0.000003".into());
     }
     item.model_usage[0].cost_usd = Some(usd_picos_string(576 * 3 * 1_000_000));
-    identity::apply_with_accepted_for_test(
-        &mut item,
-        &proof,
-        &identity::AcceptedBuckets::default(),
-    )
-    .unwrap();
+    sticky_apply(&mut item, &proof, &identity::AcceptedBuckets::default()).unwrap();
     assert!(item.request_identity_refusals > 0);
     sticky_assert_reconciled(&item);
 
     let (mut item, proof) = sticky_session(1100);
     let (result, rows) = crate::local_resource_diagnostics::capture(|| {
-        identity::apply_with_accepted_for_test(
-            &mut item,
-            &proof,
-            &identity::AcceptedBuckets::default(),
-        )
-        .unwrap()
+        sticky_apply(&mut item, &proof, &identity::AcceptedBuckets::default()).unwrap()
     });
     assert!(matches!(result, Tagged::Sent { .. }));
     assert!(rows
@@ -417,9 +491,9 @@ fn sticky_bucket_hint_does_not_refuse_a_legitimately_missing_sibling_row() {
         .map(|(proof, _)| proof)
         .collect::<Vec<_>>();
     let mut accepted = identity::AcceptedBuckets::default();
-    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    sticky_apply(&mut item, &proof, &accepted).unwrap();
     accepted.record(&serde_json::to_value(&item).unwrap());
-    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    sticky_apply(&mut item, &proof, &accepted).unwrap();
     assert_eq!(item.request_identity_refusals, 0);
     let measured = identity::measure_identity_cap(&item, &accepted).unwrap();
     assert_eq!(measured.item_bytes, identity::item_bytes(&item));
@@ -435,12 +509,7 @@ fn sticky_partial_body_displays_only_the_kept_newest_own_account() {
     item.usage_buckets[575].model_usage[0].request_count -= 2;
     item.input_tokens -= 2;
     item.request_count -= 2;
-    identity::apply_with_accepted_for_test(
-        &mut item,
-        &proof,
-        &identity::AcceptedBuckets::default(),
-    )
-    .unwrap();
+    sticky_apply(&mut item, &proof, &identity::AcceptedBuckets::default()).unwrap();
     assert!(item.request_identity_refusals > 0);
     let display = item.claude_account_display.as_ref().unwrap();
     assert_eq!(display.current.status, identity::CURRENT_KNOWN);
@@ -478,15 +547,10 @@ fn sticky_partial_money_absence_cannot_emit_unreconciled_known_cost_shares() {
         }
     }
     item.model_usage[0].cost_usd = None;
-    let result = identity::apply_with_accepted_for_test(
-        &mut item,
-        &proof,
-        &identity::AcceptedBuckets::default(),
-    )
-    .unwrap();
+    let result = sticky_apply(&mut item, &proof, &identity::AcceptedBuckets::default()).unwrap();
     assert!(matches!(result, Tagged::Sent { .. }));
     assert!(item.request_identity_refusals > 0);
-    assert!(!sticky_tagged(&item.usage_buckets[575].model_usage[0]));
+    assert!(sticky_tagged(&item.usage_buckets[575].model_usage[0]));
     sticky_assert_reconciled(&item);
 }
 
@@ -557,8 +621,10 @@ fn sticky_recovery_cannot_promote_an_upstream_inherited_partition_to_proof() {
 fn sticky_unencodable_open_bucket_does_not_erase_independent_older_accepted_proof() {
     let (mut item, mut proof) = sticky_session(2);
     let mut accepted = identity::AcceptedBuckets::default();
-    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
-    accepted.record(&serde_json::to_value(&item).unwrap());
+    sticky_apply(&mut item, &proof, &accepted).unwrap();
+    let mut accepted_body = serde_json::to_value(&item).unwrap();
+    accepted_body["usage_buckets"].as_array_mut().unwrap().pop();
+    accepted.record(&accepted_body);
     // Seventeen distinct own keys in the current bucket cannot be represented
     // by one row, but the older accepted bucket remains complete and tiny.
     for n in 12..26 {
@@ -574,7 +640,7 @@ fn sticky_unencodable_open_bucket_does_not_erase_independent_older_accepted_proo
         item.usage_buckets[1].model_usage[0].input_tokens += 1;
         item.usage_buckets[1].model_usage[0].request_count += 1;
     }
-    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    sticky_apply(&mut item, &proof, &accepted).unwrap();
     assert!(sticky_tagged(&item.usage_buckets[0].model_usage[0]));
     assert!(!sticky_tagged(&item.usage_buckets[1].model_usage[0]));
     assert_eq!(item.request_identity_refusals, 1);
@@ -598,7 +664,7 @@ fn sticky_complete_accepted_set_is_checked_before_intermediate_money_fit() {
     }
     item.model_usage[0].cost_usd = None;
     let mut accepted = identity::AcceptedBuckets::default();
-    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    sticky_apply(&mut item, &proof, &accepted).unwrap();
     accepted.record(&serde_json::to_value(&item).unwrap());
     sticky_assert_reconciled(&item);
     let measured = identity::measure_identity_cap(&item, &accepted).unwrap();
@@ -653,8 +719,10 @@ fn sticky_assert_joint_pair_survives(large_parts: bool) {
         ..Default::default()
     };
     let mut accepted = identity::AcceptedBuckets::default();
-    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
-    accepted.record(&serde_json::to_value(&item).unwrap());
+    sticky_apply(&mut item, &proof, &accepted).unwrap();
+    let mut accepted_body = serde_json::to_value(&item).unwrap();
+    accepted_body["usage_buckets"].as_array_mut().unwrap().pop();
+    accepted.record(&accepted_body);
     let extras = if large_parts { 15 } else { 16 };
     let prototypes = proof[2..].to_vec();
     for prototype in prototypes {
@@ -680,7 +748,7 @@ fn sticky_assert_joint_pair_survives(large_parts: bool) {
         row.input_tokens += extras;
         row.request_count += extras;
     }
-    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    sticky_apply(&mut item, &proof, &accepted).unwrap();
     assert!(sticky_tagged(&item.usage_buckets[0].model_usage[0]));
     assert!(sticky_tagged(&item.usage_buckets[1].model_usage[0]));
     assert!(item.usage_buckets[2]
@@ -836,7 +904,7 @@ fn sticky_assert_collective_byte_pair(newer_bad: bool, refusal_gap: bool) {
     item.repository_label = Some("x".into());
     let mut proof = timed.into_iter().map(|(c, _)| c).collect::<Vec<_>>();
     let mut accepted = identity::AcceptedBuckets::default();
-    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    sticky_apply(&mut item, &proof, &accepted).unwrap();
     accepted.record(&serde_json::to_value(&item).unwrap());
     let mut clean = stripped(&item);
     clean.provenance.collector = identity::COLLECTOR.into();
@@ -854,7 +922,7 @@ fn sticky_assert_collective_byte_pair(newer_bad: bool, refusal_gap: bool) {
         for share in shares.iter_mut().skip(kept) {
             share.identity = RequestIdentity::Missing;
         }
-        identity::apply_with_accepted_for_test(
+        sticky_apply(
             &mut candidate,
             &shares,
             &identity::AcceptedBuckets::default(),
@@ -875,7 +943,7 @@ fn sticky_assert_collective_byte_pair(newer_bad: bool, refusal_gap: bool) {
         for c in latest.iter_mut().take(2) {
             c.identity = RequestIdentity::Missing;
         }
-        identity::apply_with_accepted_for_test(
+        sticky_apply(
             &mut candidate,
             &latest,
             &identity::AcceptedBuckets::default(),
@@ -896,7 +964,7 @@ fn sticky_assert_collective_byte_pair(newer_bad: bool, refusal_gap: bool) {
     assert!(target + pair_extra <= identity::MAX_ITEM_BYTES);
     assert!(target + single_extra > identity::MAX_ITEM_BYTES);
     proof.extend(filler_proof);
-    identity::apply_with_accepted_for_test(&mut padded, &proof, &accepted).unwrap();
+    sticky_apply(&mut padded, &proof, &accepted).unwrap();
     let bad_index = if newer_bad { 2 } else { 0 };
     for (index, bucket) in padded.usage_buckets.iter().take(3).enumerate() {
         assert!(bucket
@@ -976,7 +1044,7 @@ fn sticky_already_refused_rows_cannot_inflate_the_bound_and_evict_a_fitting_open
     item.repository_label = Some("x".into());
     let mut proof = timed.into_iter().map(|(c, _)| c).collect::<Vec<_>>();
     let mut accepted = identity::AcceptedBuckets::default();
-    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    sticky_apply(&mut item, &proof, &accepted).unwrap();
     accepted.record(&serde_json::to_value(&item).unwrap());
     let mut clean = stripped(&item);
     clean.provenance.collector = identity::COLLECTOR.into();
@@ -987,7 +1055,7 @@ fn sticky_already_refused_rows_cannot_inflate_the_bound_and_evict_a_fitting_open
             c.identity = RequestIdentity::Missing;
         }
     }
-    identity::apply_with_accepted_for_test(
+    sticky_apply(
         &mut open_only,
         &open_proof,
         &identity::AcceptedBuckets::default(),
@@ -997,7 +1065,7 @@ fn sticky_already_refused_rows_cannot_inflate_the_bound_and_evict_a_fitting_open
     let extra = identity::item_bytes(&open_only) - identity::item_bytes(&clean);
     let (mut padded, filler_proof) = sticky_pad_to_bytes(&clean, identity::MAX_ITEM_BYTES - extra);
     proof.extend(filler_proof);
-    identity::apply_with_accepted_for_test(&mut padded, &proof, &accepted).unwrap();
+    sticky_apply(&mut padded, &proof, &accepted).unwrap();
     assert!(sticky_tagged(&padded.usage_buckets[9].model_usage[0]));
     assert!(padded.usage_buckets[..9]
         .iter()
@@ -1046,7 +1114,7 @@ fn sticky_unreconcilable_newer_accepted_money_does_not_erase_an_older_joint_pair
         .unwrap()
         .cost_usd = Some("0.000001".into());
     let mut accepted = identity::AcceptedBuckets::default();
-    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    sticky_apply(&mut item, &proof, &accepted).unwrap();
     sticky_assert_reconciled(&item);
     accepted.record(&serde_json::to_value(&item).unwrap());
     // A new unpriced, untagged pro row cannot poison D64's own known share.
@@ -1083,7 +1151,7 @@ fn sticky_unreconcilable_newer_accepted_money_does_not_erase_an_older_joint_pair
     let mut pair = clean.clone();
     let mut pair_proof = proof.clone();
     pair_proof[2].identity = RequestIdentity::Missing;
-    identity::apply_with_accepted_for_test(
+    sticky_apply(
         &mut pair,
         &pair_proof,
         &identity::AcceptedBuckets::default(),
@@ -1094,7 +1162,7 @@ fn sticky_unreconcilable_newer_accepted_money_does_not_erase_an_older_joint_pair
     let extra = identity::item_bytes(&pair) - identity::item_bytes(&clean);
     let (mut padded, filler_proof) = sticky_pad_to_bytes(&clean, identity::MAX_ITEM_BYTES - extra);
     proof.extend(filler_proof);
-    identity::apply_with_accepted_for_test(&mut padded, &proof, &accepted).unwrap();
+    sticky_apply(&mut padded, &proof, &accepted).unwrap();
     assert!(sticky_tagged(&padded.usage_buckets[0].model_usage[0]));
     assert!(sticky_tagged(&padded.usage_buckets[1].model_usage[0]));
     assert!(!sticky_tagged(&padded.usage_buckets[2].model_usage[0]));
@@ -1135,7 +1203,7 @@ fn sticky_assert_money_companions_survive_eviction(reported_current: bool) {
         };
     }
     let mut accepted = identity::AcceptedBuckets::default();
-    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    sticky_apply(&mut item, &proof, &accepted).unwrap();
     accepted.record(&serde_json::to_value(&item).unwrap());
     let mut clean = stripped(&item);
     clean.provenance.collector = identity::COLLECTOR.into();
@@ -1147,7 +1215,7 @@ fn sticky_assert_money_companions_survive_eviction(reported_current: bool) {
                 share.identity = RequestIdentity::Missing;
             }
         }
-        identity::apply_with_accepted_for_test(
+        sticky_apply(
             &mut candidate,
             &shares,
             &identity::AcceptedBuckets::default(),
@@ -1161,7 +1229,7 @@ fn sticky_assert_money_companions_survive_eviction(reported_current: bool) {
     let (mut padded, filler_proof) =
         sticky_pad_to_bytes(&clean, identity::MAX_ITEM_BYTES - headroom);
     proof.extend(filler_proof);
-    identity::apply_with_accepted_for_test(&mut padded, &proof, &accepted).unwrap();
+    sticky_apply(&mut padded, &proof, &accepted).unwrap();
     assert!(sticky_tagged(&padded.usage_buckets[0].model_usage[0]));
     assert!(!sticky_tagged(&padded.usage_buckets[1].model_usage[0]));
     assert!(sticky_tagged(&padded.usage_buckets[2].model_usage[0]));
@@ -1197,13 +1265,13 @@ fn sticky_cache_retractions_are_budgeted_before_retaining_identity_parts() {
         row
     }).collect::<Vec<_>>()});
     let accepted = identity::AcceptedBuckets::default();
-    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    sticky_apply(&mut item, &proof, &accepted).unwrap();
     let clean = stripped(&item);
     let overhead = identity::item_bytes(&item) - identity::item_bytes(&clean);
     let (mut padded, filler) = sticky_pad_to_bytes(&clean, identity::MAX_ITEM_BYTES - overhead);
     proof.extend(filler);
     let mut unreserved = padded.clone();
-    identity::apply_with_accepted_for_test(&mut unreserved, &proof, &accepted).unwrap();
+    sticky_apply(&mut unreserved, &proof, &accepted).unwrap();
     assert_eq!(identity::item_bytes(&unreserved), identity::MAX_ITEM_BYTES);
     prepare_cache_observations(&mut unreserved, Some(&prior));
     assert_eq!(
@@ -1288,7 +1356,7 @@ fn sticky_current_bucket_tries_a_smaller_alternative_money_witness() {
         ..Default::default()
     };
     let mut accepted = identity::AcceptedBuckets::default();
-    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    sticky_apply(&mut item, &proof, &accepted).unwrap();
     accepted.record(&serde_json::to_value(&item).unwrap());
     let clean = stripped(&item);
     let extra = |small_witness: bool| {
@@ -1301,7 +1369,7 @@ fn sticky_current_bucket_tries_a_smaller_alternative_money_witness() {
                 share.identity = RequestIdentity::Missing;
             }
         }
-        identity::apply_with_accepted_for_test(
+        sticky_apply(
             &mut candidate,
             &shares,
             &identity::AcceptedBuckets::default(),
@@ -1315,7 +1383,7 @@ fn sticky_current_bucket_tries_a_smaller_alternative_money_witness() {
     assert!(extra(false) > headroom);
     let (mut padded, filler) = sticky_pad_to_bytes(&clean, identity::MAX_ITEM_BYTES - headroom);
     proof.extend(filler);
-    identity::apply_with_accepted_for_test(&mut padded, &proof, &accepted).unwrap();
+    sticky_apply(&mut padded, &proof, &accepted).unwrap();
     assert!(
         sticky_tagged(&padded.usage_buckets[1].model_usage[0]),
         "small old witness"
@@ -1350,7 +1418,7 @@ fn sticky_current_bucket_completes_one_shared_row_before_their_union() {
     let (mut first, timed) = display_item(&requests);
     let proof = timed.into_iter().map(|(c, _)| c).collect::<Vec<_>>();
     let mut accepted = identity::AcceptedBuckets::default();
-    identity::apply_with_accepted_for_test(&mut first, &proof, &accepted).unwrap();
+    sticky_apply(&mut first, &proof, &accepted).unwrap();
     accepted.record(&serde_json::to_value(&first).unwrap());
     for at in [
         "2026-09-01T00:00:00Z",
@@ -1392,7 +1460,7 @@ fn sticky_current_bucket_completes_one_shared_row_before_their_union() {
                 refused += 1;
             }
         }
-        identity::apply_with_accepted_for_test(
+        sticky_apply(
             &mut candidate,
             &shares,
             &identity::AcceptedBuckets::default(),
@@ -1407,7 +1475,7 @@ fn sticky_current_bucket_completes_one_shared_row_before_their_union() {
     assert!(extra(2) > headroom, "union unnecessarily adds Y buckets");
     let (mut padded, filler) = sticky_pad_to_bytes(&clean, identity::MAX_ITEM_BYTES - headroom);
     proof.extend(filler);
-    identity::apply_with_accepted_for_test(&mut padded, &proof, &accepted).unwrap();
+    sticky_apply(&mut padded, &proof, &accepted).unwrap();
     assert!(padded.usage_buckets[..8]
         .iter()
         .all(|bucket| !sticky_tagged(&bucket.model_usage[0])));
@@ -1419,4 +1487,220 @@ fn sticky_current_bucket_completes_one_shared_row_before_their_union() {
         .all(sticky_tagged));
     assert_eq!(padded.request_identity_refusals, 9);
     sticky_assert_reconciled(&padded);
+}
+
+#[test]
+fn sticky_accepted_share_retag_and_missing_sibling_are_refused_after_restart() {
+    let (original, proof) = sticky_session(1);
+    let mut first = original.clone();
+    let mut accepted = identity::AcceptedBuckets::default();
+    sticky_apply(&mut first, &proof, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(&first).unwrap());
+    let accepted: identity::AcceptedBuckets =
+        serde_json::from_slice(&serde_json::to_vec(&accepted).unwrap()).unwrap();
+    for retag in [false, true] {
+        let mut next = original.clone();
+        let mut changed = proof.clone();
+        changed[1].identity = if retag {
+            login_key(D64)
+        } else {
+            RequestIdentity::Missing
+        };
+        identity::take_identity_counts();
+        sticky_apply(&mut next, &changed, &accepted).unwrap();
+        assert_eq!(next.request_identity_refusals, 1);
+        let parts = next.usage_buckets[0].model_usage[0]
+            .identity_parts
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|part| part.evidence_ref.is_some())
+                .count(),
+            2
+        );
+        assert_eq!(
+            parts
+                .iter()
+                .find(|part| part.evidence_ref.is_none())
+                .unwrap()
+                .request_count,
+            1
+        );
+        assert!(parts
+            .iter()
+            .all(|part| part.account_identifier_hash.as_deref() != Some(D64)));
+        let counts =
+            serde_json::to_value(identity::take_identity_counts()).unwrap()["identity_cap"].clone();
+        assert_eq!(counts["accepted_share_changed"], 1);
+        assert_eq!(counts["retained_buckets"], 0);
+        sticky_assert_reconciled(&next);
+        let mut repeat = original.clone();
+        sticky_apply(&mut repeat, &changed, &accepted).unwrap();
+        assert_eq!(repeat.snapshot_fingerprint, next.snapshot_fingerprint);
+        assert_eq!(
+            serde_json::to_value(&repeat).unwrap(),
+            serde_json::to_value(&next).unwrap()
+        );
+    }
+    let mut unchanged = original.clone();
+    identity::take_identity_counts();
+    sticky_apply(&mut unchanged, &proof, &accepted).unwrap();
+    assert_eq!(unchanged.request_identity_refusals, 0);
+    let counts =
+        serde_json::to_value(identity::take_identity_counts()).unwrap()["identity_cap"].clone();
+    assert_eq!(counts["accepted_share_changed"], 0);
+    assert_eq!(counts["retained_buckets"], 1);
+}
+
+#[test]
+fn sticky_new_untagged_presence_does_not_bless_a_later_missing_share() {
+    let (original, proof) = sticky_session(1);
+    let mut first = original.clone();
+    let mut accepted = identity::AcceptedBuckets::default();
+    sticky_apply(&mut first, &proof, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(&first).unwrap());
+    let mut changed = proof.clone();
+    changed[1].identity = RequestIdentity::Missing;
+    let mut next = original.clone();
+    sticky_apply(&mut next, &changed, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(&next).unwrap());
+    next.request_identity_refusals = 0;
+    sticky_apply(&mut next, &changed, &accepted).unwrap();
+    assert_eq!(next.request_identity_refusals, 1);
+    sticky_assert_reconciled(&next);
+}
+
+fn sticky_price_fixture(item: &mut SnapshotItem, proof: &mut [Contribution]) {
+    for (hour, bucket) in item.usage_buckets.iter_mut().enumerate() {
+        let row = &mut bucket.model_usage[0];
+        let money = std::array::from_fn::<_, 5, _>(|field| {
+            ((hour + field) % 4 != 0).then_some((field as u128 + 1) * 1_000_000)
+        });
+        for (slot, value) in [
+            &mut row.cost_usd,
+            &mut row.input_cost_usd,
+            &mut row.output_cost_usd,
+            &mut row.cache_read_cost_usd,
+            &mut row.cache_creation_cost_usd,
+        ]
+        .into_iter()
+        .zip(money)
+        {
+            *slot = value.map(|value| usd_picos_string(3 * value));
+        }
+        for c in &mut proof[hour * 3..hour * 3 + 3] {
+            c.usage.costs = UsageCosts {
+                observed: true,
+                reported: true,
+                total: money[0],
+                input: money[1],
+                output: money[2],
+                cache_read: money[3],
+                cache_creation: money[4],
+                ..Default::default()
+            };
+        }
+    }
+    sticky_receiver_totals(item);
+}
+fn sticky_wire(item: SnapshotItem) -> Value {
+    let mut request = valid_v6_batch_request();
+    request.source = "claude_code".into();
+    request.upload_policy = SnapshotUploadPolicy {
+        session_titles_enabled: false,
+        workspace_labels_enabled: false,
+        session_artifacts_enabled: false,
+        session_attribution_enabled: false,
+        session_attribution_labels_enabled: false,
+    };
+    request.snapshots = vec![item];
+    serde_json::to_value(request).unwrap()
+}
+#[test]
+fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
+    use base64::Engine;
+    use std::io::Write;
+    let mut cases = BTreeMap::new();
+    let (mut mixed, mut proof) = sticky_session(3);
+    sticky_price_fixture(&mut mixed, &mut proof);
+    // All eight counters, and independent presence of all five cost fields.
+    for c in &mut proof {
+        c.usage.output_tokens = 2;
+        c.usage.cache_read_tokens = 3;
+        c.usage.cache_creation_5m_tokens = 4;
+        c.usage.cache_creation_1h_tokens = 5;
+        c.usage.reasoning_output_tokens = 6;
+        c.usage.unattributed_total_tokens = 7;
+    }
+    for bucket in &mut mixed.usage_buckets {
+        let row = &mut bucket.model_usage[0];
+        row.output_tokens = 6;
+        row.cache_read_tokens = 9;
+        row.cache_creation_5m_tokens = 12;
+        row.cache_creation_1h_tokens = 15;
+        row.reasoning_output_tokens = 18;
+        row.unattributed_total_tokens = 21;
+    }
+    let row = &mut mixed.model_usage[0];
+    row.output_tokens = 18;
+    row.cache_read_tokens = 27;
+    row.cache_creation_5m_tokens = 36;
+    row.cache_creation_1h_tokens = 45;
+    row.reasoning_output_tokens = 54;
+    row.unattributed_total_tokens = 63;
+    sticky_apply(&mut mixed, &proof, &identity::AcceptedBuckets::default()).unwrap();
+    sticky_assert_reconciled(&mixed);
+    cases.insert("mixed_presence", sticky_wire(mixed));
+
+    let (mut window, mut proof) = sticky_session(576);
+    sticky_price_fixture(&mut window, &mut proof);
+    sticky_apply(&mut window, &proof, &identity::AcceptedBuckets::default()).unwrap();
+    assert!(window.request_identity_refusals > 0);
+    assert!(sticky_tagged(&window.usage_buckets[575].model_usage[0]));
+    sticky_assert_reconciled(&window);
+    cases.insert("window", sticky_wire(window));
+
+    let (mut original, mut original_proof) = sticky_session(24);
+    original.session_display_name = Some("x".into());
+    original.workspace_display_label = Some("x".into());
+    original.repository_label = Some("x".into());
+    sticky_price_fixture(&mut original, &mut original_proof);
+    let mut tagged = original.clone();
+    let mut accepted = identity::AcceptedBuckets::default();
+    sticky_apply(&mut tagged, &original_proof, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(&tagged).unwrap());
+    let clean = stripped(&tagged);
+    let overhead = identity::item_bytes(&tagged) - identity::item_bytes(&clean);
+    let (mut overflow, filler) =
+        sticky_pad_to_bytes(&clean, identity::MAX_ITEM_BYTES - overhead / 2);
+    let mut proof = original_proof.clone();
+    proof.extend(filler);
+    sticky_apply(&mut overflow, &proof, &accepted).unwrap();
+    assert!(overflow.request_identity_refusals > 0);
+    sticky_assert_reconciled(&overflow);
+    accepted.record(&serde_json::to_value(&overflow).unwrap());
+    cases.insert("accepted_overflow", sticky_wire(overflow));
+    let accepted: identity::AcceptedBuckets =
+        serde_json::from_slice(&serde_json::to_vec(&accepted).unwrap()).unwrap();
+    sticky_apply(&mut original, &original_proof, &accepted).unwrap();
+    assert_eq!(original.request_identity_refusals, 0);
+    sticky_assert_reconciled(&original);
+    cases.insert("restore_from_held_proof", sticky_wire(original));
+    let actual = serde_json::to_value(cases).unwrap();
+    let expected: Value =
+        serde_json::from_str(include_str!("fixtures/claude_identity_cap_emitted.json")).unwrap();
+    if actual != expected {
+        // Bootstrap/update on Linux CI only. The compact compressed receipt
+        // is lossless; committing it never requires running tests on the Mac.
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&serde_json::to_vec(&actual).unwrap())
+            .unwrap();
+        eprintln!(
+            "E2_IDENTITY_GOLDEN_GZIP_BASE64={}",
+            base64::engine::general_purpose::STANDARD.encode(gzip.finish().unwrap())
+        );
+        panic!("emitted identity goldens changed; regenerate from the CI receipt");
+    }
 }

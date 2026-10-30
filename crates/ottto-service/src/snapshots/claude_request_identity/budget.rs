@@ -13,6 +13,7 @@ pub(crate) struct Counts {
     pub(crate) retained_buckets: u64,
     pub(crate) refused_new_buckets: u64,
     pub(crate) accepted_state_unknown: u64,
+    pub(crate) accepted_share_changed: u64,
     pub(crate) accepted_overflow: OverflowCounts,
 }
 impl Counts {
@@ -21,10 +22,10 @@ impl Counts {
     }
 }
 #[cfg(not(test))]
-static COUNTERS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static COUNTERS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 #[cfg(test)]
-thread_local! { static COUNTERS: [AtomicU64; 5] = const { [const { AtomicU64::new(0) }; 5] }; }
-fn counters<T>(f: impl FnOnce(&[AtomicU64; 5]) -> T) -> T {
+thread_local! { static COUNTERS: [AtomicU64; 6] = const { [const { AtomicU64::new(0) }; 6] }; }
+fn counters<T>(f: impl FnOnce(&[AtomicU64; 6]) -> T) -> T {
     #[cfg(test)]
     {
         COUNTERS.with(f)
@@ -40,6 +41,7 @@ pub(super) fn record(counts: &Counts) {
             counts.retained_buckets,
             counts.refused_new_buckets,
             counts.accepted_state_unknown,
+            counts.accepted_share_changed,
             counts.accepted_overflow.same_as_parent,
             counts.accepted_overflow.differs,
         ]) {
@@ -48,12 +50,13 @@ pub(super) fn record(counts: &Counts) {
     });
 }
 pub(super) fn take_counts() -> Counts {
-    let [retained_buckets, refused_new_buckets, accepted_state_unknown, same_as_parent, differs] =
+    let [retained_buckets, refused_new_buckets, accepted_state_unknown, accepted_share_changed, same_as_parent, differs] =
         counters(|counters| counters.each_ref().map(|counter| counter.swap(0, Relaxed)));
     Counts {
         retained_buckets,
         refused_new_buckets,
         accepted_state_unknown,
+        accepted_share_changed,
         accepted_overflow: OverflowCounts {
             same_as_parent,
             differs,
@@ -157,8 +160,8 @@ fn evidence_bytes(evidence: &BTreeSet<EvidenceKey>, refusals: u64) -> Option<usi
     let comma = usize::from(!fields.is_empty());
     Some(serde_json::to_vec(&fields).ok()?.len() - 2 + comma)
 }
-// Invertible sums of the actual wire contributions. Presence counts let an
-// overflow removal restore known money after the last missing share leaves.
+// Receiver arithmetic: add present values, ignoring absent contributions.
+// The sum is absent only when no contribution supplied that cost field.
 #[derive(Clone, Default)]
 struct Aggregate {
     amount: Amounts,
@@ -195,7 +198,7 @@ impl Aggregate {
                 total.checked_add(value)?
             };
             self.amount.costs[field] = (self.present[field] > 0).then_some(total);
-            self.amount.poisoned[field] = self.missing[field] > 0;
+            self.amount.poisoned[field] = false;
         }
         Some(())
     }
@@ -318,141 +321,6 @@ fn intrinsically_fits(
             && base
                 .checked_add(minimum.bytes)
                 .is_some_and(|bytes| bytes <= MAX_ITEM_BYTES)
-    })
-}
-
-struct MoneyPlan {
-    possible: Vec<bool>,
-    required: Vec<Vec<usize>>,
-    supplied: Vec<Vec<usize>>,
-    suppliers: Vec<Vec<usize>>,
-}
-impl MoneyPlan {
-    fn closure(
-        &self,
-        seeds: impl IntoIterator<Item = usize>,
-        kept: &[bool],
-        preferred: Option<usize>,
-    ) -> Option<Vec<usize>> {
-        let mut pending = seeds.into_iter().collect::<Vec<_>>();
-        let mut included = BTreeSet::new();
-        let mut supplied = BTreeSet::new();
-        while let Some(bucket) = pending.pop() {
-            if kept[bucket] || !included.insert(bucket) {
-                continue;
-            }
-            if !self.possible[bucket] {
-                return None;
-            }
-            supplied.extend(self.supplied[bucket].iter().copied());
-            for &node in &self.required[bucket] {
-                if supplied.contains(&node) || self.suppliers[node].iter().any(|&index| kept[index])
-                {
-                    continue;
-                }
-                pending.push(
-                    preferred
-                        .filter(|candidate| self.suppliers[node].contains(candidate))
-                        .or_else(|| self.suppliers[node].first().copied())?,
-                );
-            }
-        }
-        Some(included.into_iter().collect())
-    }
-}
-
-// A known tagged cost under an unreported top row needs an unpriced share
-// of that same row and authority to reconcile. Untagged money cannot provide
-// that witness. Remove impossible candidates before ordered cap eviction;
-// otherwise an independent bad bucket can destroy a jointly valid pair.
-fn money_candidates(
-    item: &SnapshotItem,
-    grouping: &Grouping,
-    row_index: &BTreeMap<RowKey, usize>,
-    mut possible: Vec<bool>,
-    rank: &[usize],
-) -> Option<MoneyPlan> {
-    #[derive(Default)]
-    struct Node {
-        witnesses: usize,
-        dependents: Vec<usize>,
-    }
-    let mut indexes = BTreeMap::new();
-    let mut nodes: Vec<Node> = Vec::new();
-    let mut witnesses = vec![Vec::new(); possible.len()];
-    let mut requirements = vec![Vec::new(); possible.len()];
-    let mut suppliers = Vec::<Vec<usize>>::new();
-    for (index, bucket) in item.usage_buckets.iter().enumerate() {
-        if !possible[index] {
-            continue;
-        }
-        let mut required = BTreeSet::new();
-        let mut supplied = BTreeSet::new();
-        for row in &bucket.model_usage {
-            let row_key = row_key_from_model_usage(row);
-            let top = *row_index.get(&row_key)?;
-            let group = grouping.get(&bucket.bucket_start, &row_key)?;
-            for (key, amount) in &group.by_key {
-                let Some(key) = key.as_ref().filter(|_| amount.counts != [0; 8]) else {
-                    continue;
-                };
-                for (field, parent) in row_costs(&item.model_usage[top]).into_iter().enumerate() {
-                    if parent.is_some() {
-                        continue;
-                    }
-                    let node = *indexes.entry((top, key, field)).or_insert_with(|| {
-                        nodes.push(Node::default());
-                        suppliers.push(Vec::new());
-                        nodes.len() - 1
-                    });
-                    if row_costs(row)[field].is_some() && amount.wire(field).is_some() {
-                        required.insert(node);
-                    } else {
-                        supplied.insert(node);
-                    }
-                }
-            }
-        }
-        for node in required {
-            nodes[node].dependents.push(index);
-            requirements[index].push(node);
-        }
-        for node in supplied {
-            nodes[node].witnesses += 1;
-            suppliers[node].push(index);
-            witnesses[index].push(node);
-        }
-    }
-    // Each bucket and dependency is removed at most once. Propagate missing
-    // witnesses so an impossible candidate cannot certify another candidate.
-    let mut missing = nodes
-        .iter()
-        .enumerate()
-        .filter_map(|(index, node)| (node.witnesses == 0).then_some(index))
-        .collect::<std::collections::VecDeque<_>>();
-    while let Some(node) = missing.pop_front() {
-        for bucket in std::mem::take(&mut nodes[node].dependents) {
-            if !possible[bucket] {
-                continue;
-            }
-            possible[bucket] = false;
-            for &witness in &witnesses[bucket] {
-                nodes[witness].witnesses -= 1;
-                if nodes[witness].witnesses == 0 {
-                    missing.push_back(witness);
-                }
-            }
-        }
-    }
-    for suppliers in &mut suppliers {
-        suppliers.retain(|&index| possible[index]);
-        suppliers.sort_by_key(|&index| rank[index]);
-    }
-    Some(MoneyPlan {
-        possible,
-        required: requirements,
-        supplied: witnesses,
-        suppliers,
     })
 }
 
@@ -606,7 +474,7 @@ pub(super) fn select(
     item: &mut SnapshotItem,
     grouping: &Grouping,
     prior_refusals: u64,
-    accepted: Option<&[i64]>,
+    accepted: Option<&accepted::AcceptedSession>,
 ) -> Option<(Vec<bool>, Measurement)> {
     let is_accepted = item
         .usage_buckets
@@ -700,7 +568,7 @@ pub(super) fn select(
         .iter()
         .map(|bucket| vec![RowIdentity::Untagged; bucket.model_usage.len()])
         .collect::<Vec<_>>();
-    // Build accepted proof collectively. Intermediate bytes, parts and money
+    // Build accepted proof collectively. Intermediate bytes and parts
     // can fail even when the complete set fits (a top Parts row may collapse
     // to Single). If it overflows, remove in the prescribed drop order; never
     // use standalone fit as a prerequisite for collectively fitting proof.
@@ -713,27 +581,21 @@ pub(super) fn select(
     for (priority, &index) in order.iter().enumerate() {
         rank[index] = priority;
     }
-    let plan = money_candidates(
-        item,
-        grouping,
-        &row_index,
-        (0..item.usage_buckets.len())
-            .map(|index| {
-                tagged[index]
-                    && intrinsically_fits(
-                        item,
-                        grouping,
-                        index,
-                        base_bytes,
-                        additional_refusal_rows,
-                        mandatory_refusals,
-                    )
-            })
-            .collect(),
-        &rank,
-    )?;
+    let possible = (0..item.usage_buckets.len())
+        .map(|index| {
+            tagged[index]
+                && intrinsically_fits(
+                    item,
+                    grouping,
+                    index,
+                    base_bytes,
+                    additional_refusal_rows,
+                    mandatory_refusals,
+                )
+        })
+        .collect::<Vec<_>>();
     for &index in &accepted_order {
-        if !plan.possible[index] {
+        if !possible[index] {
             continue;
         }
         let Some((next, rows)) =
@@ -759,21 +621,18 @@ pub(super) fn select(
     }
     let mut row_buckets = vec![Vec::new(); item.model_usage.len()];
     for &index in &order {
-        if plan.possible[index] {
+        if possible[index] {
             for row in &item.usage_buckets[index].model_usage {
                 row_buckets[row_index[&row_key_from_model_usage(row)]].push(index);
             }
         }
     }
-    // Re-admit required money companions atomically. A top-row completion can
+    // Re-admit buckets or shared-row completions atomically. A completion can
     // also collapse Parts to Single; cache failed completions until selection
     // changes, so one shared long row is not retried for every bucket.
     let mut failed_completions = BTreeSet::new();
-    // Bound alternative closures over the whole item, not once per bucket.
-    // Trials use row deltas, never whole-item serialization.
-    let mut witness_trials_left = super::accepted::MAX_BUCKETS;
     for &index in &order {
-        if kept[index] || !plan.possible[index] {
+        if kept[index] || !possible[index] {
             continue;
         }
         let mut own_rows = item.usage_buckets[index]
@@ -783,51 +642,26 @@ pub(super) fn select(
             .collect::<Vec<_>>();
         own_rows.sort_unstable();
         own_rows.dedup();
-        let mut choices = vec![vec![index]];
-        if let Some(companions) = plan.closure([index], &kept, None) {
-            if companions.len() > 1 {
-                choices.push(companions);
-            }
-        }
-        let mut completion = None;
-        if !failed_completions.contains(&own_rows) {
-            let seeds = own_rows
-                .iter()
-                .flat_map(|&row| row_buckets[row].iter().copied());
-            completion = plan
-                .closure(seeds, &kept, None)
-                .filter(|members| members.len() > 1);
-        }
-        let mut alternatives = plan.required[index]
-            .iter()
-            .flat_map(|&node| plan.suppliers[node].iter().copied())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .filter(|&supplier| !kept[supplier])
-            .collect::<Vec<_>>();
-        alternatives.sort_by_key(|&supplier| rank[supplier]);
-        let alternatives = alternatives
-            .into_iter()
-            .take(witness_trials_left)
-            .filter_map(|supplier| {
-                witness_trials_left -= 1;
-                plan.closure([index], &kept, Some(supplier))
-            });
-        // Completing just one row can shrink its top-level Parts to Single.
-        // The union may pull unrelated new buckets through another row and
-        // exceed the cap, even when this smaller completion protects the open
-        // accepted bucket. Cache each failed row until selection changes.
+        let choices = vec![vec![index]];
+        let completion_of = |rows: &[usize]| {
+            rows.iter()
+                .flat_map(|&row| row_buckets[row].iter().copied())
+                .filter(|&member| !kept[member])
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        let completion = (!failed_completions.contains(&own_rows))
+            .then(|| completion_of(&own_rows))
+            .filter(|members| members.len() > 1);
         let individual_completions = own_rows
             .iter()
             .filter(|&&row| !failed_completions.contains(&vec![row]))
-            .filter_map(|&row| {
-                plan.closure(row_buckets[row].iter().copied(), &kept, None)
-                    .filter(|members| members.len() > 1)
-            });
+            .map(|&row| completion_of(&[row]))
+            .filter(|members| members.len() > 1);
         let mut admitted = None;
         for mut members in choices
             .into_iter()
-            .chain(alternatives)
             .chain(individual_completions)
             .chain(completion)
         {
@@ -901,7 +735,14 @@ pub(super) fn select(
     }
     for (index, keep) in kept.iter().enumerate() {
         match (is_accepted[index], *keep, tagged[index]) {
-            (true, true, _) => measurement.accepted_retained += 1,
+            (true, true, _)
+                if !grouping
+                    .accepted_share_changed
+                    .contains(&item.usage_buckets[index].bucket_start) =>
+            {
+                measurement.accepted_retained += 1
+            }
+            (true, true, _) => {}
             (true, false, true) => {
                 if same_as_parent(item, index) {
                     measurement.accepted_overflow.same_as_parent += 1;
