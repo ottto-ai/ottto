@@ -151,12 +151,15 @@ pub(crate) fn stats() -> Stats {
     STATS.with(Cell::get)
 }
 pub(crate) fn phase_begin() {
+    if process::caller_phase_begin() {
+        return;
+    }
     assert!(ACTIVE.with(Cell::get));
     PHASE_BASE.with(|b| b.set(stats().requested_live));
     PHASE_PEAK.with(|p| p.set(0));
 }
 pub(crate) fn phase_peak() -> usize {
-    PHASE_PEAK.with(Cell::get)
+    process::caller_phase_peak().unwrap_or_else(|| PHASE_PEAK.with(Cell::get))
 }
 
 // Independent born-in-scope audits. The fixed tables allocate no Rust heap and
@@ -177,16 +180,20 @@ mod process {
         pointer: usize,
         requested: usize,
         usable: usize,
+        in_phase: bool,
     }
     const EMPTY: Entry = Entry {
         pointer: 0,
         requested: 0,
         usable: 0,
+        in_phase: false,
     };
     struct Audit {
         active: bool,
         overflow: bool,
         stats: Stats,
+        phase_live: usize,
+        phase_peak: usize,
         entries: [Entry; SLOTS],
     }
     const IDLE: Audit = Audit {
@@ -202,6 +209,8 @@ mod process {
             requested_peak_with_overlap: 0,
             usable_peak_with_overlap: 0,
         },
+        phase_live: 0,
+        phase_peak: 0,
         entries: [EMPTY; SLOTS],
     };
     struct Table {
@@ -246,6 +255,8 @@ mod process {
                 .requested_peak
                 .max(self.stats.requested_live as usize);
             self.stats.usable_peak = self.stats.usable_peak.max(self.stats.usable_live as usize);
+            self.phase_live += requested;
+            self.phase_peak = self.phase_peak.max(self.phase_live);
             self.stats.allocations += 1;
             self.stats.requested_peak_with_overlap = self.stats.requested_peak;
             self.stats.usable_peak_with_overlap = self.stats.usable_peak;
@@ -257,6 +268,7 @@ mod process {
                         pointer,
                         requested,
                         usable,
+                        in_phase: true,
                     };
                     return;
                 }
@@ -269,6 +281,9 @@ mod process {
                 self.stats.requested_live -= entry.requested as isize;
                 self.stats.usable_live -= entry.usable as isize;
                 self.stats.deallocations += 1;
+                if entry.in_phase {
+                    self.phase_live -= entry.requested;
+                }
                 self.entries[slot].pointer = 1;
             }
         }
@@ -281,6 +296,7 @@ mod process {
                 .stats
                 .usable_peak
                 .max(self.stats.usable_live as usize + usable);
+            self.phase_peak = self.phase_peak.max(self.phase_live + requested);
             self.remove(old);
             self.insert(new, requested, usable);
         }
@@ -307,6 +323,8 @@ mod process {
                 }
                 audit.entries.fill(EMPTY);
                 audit.stats = Stats::default();
+                audit.phase_live = 0;
+                audit.phase_peak = 0;
                 audit.overflow = false;
                 audit.active = true;
                 self.active.store(true, Ordering::Release);
@@ -387,6 +405,32 @@ mod process {
             return None;
         }
         CALLER.active().map(|audit| audit.stats)
+    }
+    // Phase peaks count only pointers born since phase_begin. A free of an
+    // older pointer must not offset a later phase allocation. Realloc charges
+    // the full new side plus any still-live phase allocations conservatively.
+    pub(super) fn caller_phase_begin() -> bool {
+        if !on_caller_thread() {
+            return false;
+        }
+        let mut audit = CALLER.active().expect("active caller-thread audit");
+        for entry in &mut audit.entries {
+            entry.in_phase = false;
+        }
+        audit.phase_live = 0;
+        audit.phase_peak = 0;
+        true
+    }
+    pub(super) fn caller_phase_peak() -> Option<usize> {
+        if !on_caller_thread() {
+            return None;
+        }
+        Some(
+            CALLER
+                .active()
+                .expect("active caller-thread audit")
+                .phase_peak,
+        )
     }
     pub(super) fn measure<T>(f: impl FnOnce() -> T) -> (T, Stats) {
         PROCESS.measure(f)
@@ -548,6 +592,49 @@ mod tests {
         assert_eq!((audit.allocations, audit.deallocations), (2, 1));
         assert!(audit.usable_peak_with_overlap >= audit.requested_peak_with_overlap);
         drop(grown);
+    }
+
+    #[test]
+    fn legacy_measure_keeps_phase_accounting() {
+        let ((), audit) = measure(|| {
+            phase_begin();
+            let value = std::hint::black_box(Box::new([0u8; 128]));
+            assert_eq!(stats().requested_live, 128);
+            assert_eq!(phase_peak(), 128);
+            drop(value);
+        });
+        assert_eq!(audit.requested_live, 0);
+    }
+
+    #[test]
+    fn caller_phases_exclude_old_frees_without_hiding_growth() {
+        let external = Box::new([0u8; 4096]);
+        let mut grown = Vec::<u8>::with_capacity(64);
+        let ((), audit) = measure_caller_thread(|| {
+            let earlier_phase = std::hint::black_box(Box::new([0u8; 512]));
+            phase_begin();
+            drop(external);
+            drop(earlier_phase);
+            assert_eq!(phase_peak(), 0);
+            let born = std::hint::black_box(Box::new([0u8; 256]));
+            grown.reserve_exact(1024); // Only the new side belongs to this audit.
+            assert_eq!(phase_peak(), 256 + 1024);
+            drop(born);
+            assert_eq!(caller_thread_stats().unwrap().requested_live, 1024);
+            phase_begin();
+            drop(grown); // Born in scope, but before this phase: no peak credit.
+            let mut bytes = Vec::<u8>::with_capacity(64);
+            bytes.push(1);
+            bytes.reserve_exact(255);
+            assert_eq!(phase_peak(), 64 + 256); // Conservative realloc overlap.
+            drop(std::hint::black_box(bytes));
+            assert_eq!(caller_thread_stats().unwrap().requested_live, 0);
+        });
+        assert_eq!(audit.requested_peak_with_overlap, 256 + 1024);
+        assert_eq!((audit.requested_live, audit.usable_live), (0, 0));
+        assert_eq!((audit.allocations, audit.deallocations), (5, 5));
+        // A new scope starts with no phase history.
+        measure_caller_thread(|| assert_eq!(phase_peak(), 0));
     }
 
     fn formatless(s: Stats) -> (isize, isize, usize, usize, usize, usize, usize, usize) {
