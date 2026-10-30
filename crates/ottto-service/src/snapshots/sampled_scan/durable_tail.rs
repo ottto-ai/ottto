@@ -1705,19 +1705,6 @@ impl RetailAttempt {
         self.range(file, at)?;
         self.accounted(file).read(bytes)
     }
-    #[cfg(test)]
-    pub(crate) fn read_at(
-        &mut self,
-        file: &File,
-        bytes: &mut [u8],
-        offset: u64,
-    ) -> std::io::Result<usize> {
-        use std::os::unix::fs::FileExt;
-        let limit = self.range(file, offset)?.min(bytes.len());
-        let n = file.read_at(&mut bytes[..limit], offset)?;
-        self.count(offset, n);
-        Ok(n)
-    }
     pub(crate) fn finish(self) {}
 }
 

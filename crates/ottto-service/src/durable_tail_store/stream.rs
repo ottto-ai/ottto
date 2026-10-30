@@ -150,9 +150,6 @@ impl PrepareStoreFailure {
     pub(crate) fn stage(&self) -> &'static str {
         self.stage
     }
-    pub(crate) fn key(&self) -> Digest32 {
-        self.attempt.key
-    }
     pub(crate) fn identity(&self) -> Option<&RecordIdentity> {
         self.attempt.identity.as_ref()
     }

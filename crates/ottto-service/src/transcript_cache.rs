@@ -746,26 +746,6 @@ mod tests {
         }
     }
 
-    fn original(text: &str) -> Box<Taken<String>> {
-        Box::new(Taken {
-            retained: retained(text.into()),
-            durable: Default::default(),
-            modified_hint: (17, 19),
-            finalization_charge: 23,
-            e2_held_new_file: true,
-        })
-    }
-    struct Unfrozen(String);
-    impl HeapLayoutBound for Unfrozen {
-        fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-            self.0.heap_bound(c)
-        }
-    }
-    impl FrozenCacheState for Unfrozen {
-        fn supports_frozen_charge(&self) -> bool {
-            false
-        }
-    }
     /// [money] ordinary admission matches predecessor limits victims clocks and events.
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "validated native cache layout")]

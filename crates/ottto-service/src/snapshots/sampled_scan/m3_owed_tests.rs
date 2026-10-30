@@ -21,7 +21,6 @@ fn physical() -> Vec<(RetailGrant, u64, usize)> {
 
 struct Fixture {
     root: PathBuf,
-    path: PathBuf,
     checkpoint: Checkpoint,
     file: File,
     cache: SharedCache,
@@ -58,7 +57,6 @@ impl Fixture {
         physical();
         Self {
             root,
-            path,
             checkpoint,
             file,
             cache,
