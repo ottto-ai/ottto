@@ -33814,16 +33814,13 @@ impl OwnedSourceScan {
                                 // reuse. A stale cache record cannot hold it idle.
                                 && !debt.is_some_and(|owed| sampled_scan::now_seconds() >= owed.due_unix_seconds) =>
                             {
-                                let pi_namespace = (source == SnapshotSource::Pi)
-                                    .then(|| context.cache.durable_pi_namespace())
-                                    .flatten();
                                 let mut interpretation =
                                     sampled_scan::durable_tail::Interpretation::of(
                                         source,
                                         &key,
                                         index,
                                         claude_request_identity_capture,
-                                        pi_namespace.as_ref().unwrap_or(&context.namespace),
+                                        &context.namespace,
                                     );
                                 interpretation.accepted = restore_floor;
                                 let restore = context.cache.durable_restore(
