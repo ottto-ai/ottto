@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -18,6 +19,7 @@ from unittest import mock
 SCRIPT = Path(__file__).with_name("mac_batch.py").resolve()
 spec = importlib.util.spec_from_file_location("mac_batch", str(SCRIPT))
 mb = importlib.util.module_from_spec(spec)
+sys.modules["mac_batch"] = mb  # dataclasses resolve annotations via sys.modules
 spec.loader.exec_module(mb)
 
 GREEN = [{"name": "Rust tests (Linux)", "conclusion": "SUCCESS"},
