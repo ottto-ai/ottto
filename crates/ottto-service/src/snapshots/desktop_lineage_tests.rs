@@ -4,6 +4,21 @@ use super::*;
 const PARENT: &str = "00000000-0000-4000-8000-000000000091";
 const OTHER: &str = "00000000-0000-4000-8000-000000000092";
 
+fn account_identity_bytes(item: &SnapshotItem) -> Vec<u8> {
+    // Whole usage rows include account_identifier_hash, evidence_ref and every
+    // identity_part. Exclude the deliberately changed lineage/display hashes.
+    serde_json::to_vec(&json!({
+        "source_session_id": item.source_session_id,
+        "session_account_evidence": item.session_account_evidence,
+        "model_usage": item.model_usage,
+        "usage_buckets": item.usage_buckets,
+        "request_evidence": item.request_evidence,
+        "request_identity_refusals": item.request_identity_refusals,
+        "cost": item.cost,
+    }))
+    .unwrap()
+}
+
 struct DesktopFixture {
     home: crate::test_scratch::ScratchDir,
     native: Fixture,
@@ -144,6 +159,7 @@ fn desktop_lineage_coverage_recovery_reoffers_one_parentless_child_then_quiet() 
         .attribution_facts
         .iter()
         .any(|fact| fact.field == "parent_session_ref"));
+    let before_identity = account_identity_bytes(child);
     let index = settle(first);
     let mut proof = index.clone();
     let recovered_metadata = ClaudeTitleMetadata::load_from_roots_with_index(
@@ -158,10 +174,96 @@ fn desktop_lineage_coverage_recovery_reoffers_one_parentless_child_then_quiet() 
     );
     let (recovered, counts) = f.run(index, "2026-08-02T07:12:00Z");
     f.child_only(&recovered, Some(PARENT));
+    assert_eq!(
+        account_identity_bytes(&recovered.result.snapshots[0]),
+        before_identity
+    );
     let bytes = fs::metadata(&f.native.path).unwrap().len();
     assert_eq!(recovered.native_bytes, bytes);
     assert_eq!(counts, (1, bytes));
     f.quiet_three(settle(recovered));
+}
+
+#[test]
+fn desktop_lineage_facts_preserve_account_identity_at_fixed_identity_coverage() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let f = DesktopFixture::new();
+    let account = "a".repeat(64);
+    let original = ClaudeDesktopIdentityEvidence {
+        account_identifier_hash: Some(account.clone()),
+        provider_workspace_hash: Some("b".repeat(64)),
+        source_created_at: Some("2026-08-02T06:00:00Z".into()),
+        imported: false,
+    };
+    let mut carriers = Vec::new();
+    for identity_incomplete in [false, true] {
+        let mut metadata = ClaudeTitleMetadata {
+            account_identifier_hashes: BTreeMap::from([(
+                f.native.session.clone(),
+                BTreeSet::from([account.clone()]),
+            )]),
+            original_identity_evidence: BTreeMap::from([(
+                f.native.session.clone(),
+                BTreeSet::from([original.clone()]),
+            )]),
+            original_identity_census_incomplete: identity_incomplete,
+            sidecar_census_incomplete: true,
+            ..Default::default()
+        };
+        let parse = |metadata: &ClaudeTitleMetadata| {
+            parse_claude_code_jsonl_file_with_title_metadata(
+                &f.native.path,
+                COLLECTED,
+                "f".repeat(64),
+                metadata,
+                false,
+            )
+            .unwrap()
+            .remove(0)
+        };
+        let before = parse(&metadata);
+        assert!(!before
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "parent_session_ref"));
+        metadata.sidecar_census_incomplete = false;
+        metadata.spawn_lineage.insert(
+            f.native.session.clone(),
+            ClaudeDesktopSpawnLineage {
+                parent_session_id: PARENT.into(),
+            },
+        );
+        let after = parse(&metadata);
+        for (field, value) in [
+            ("parent_session_ref", PARENT),
+            ("origin_kind", "agent_spawn"),
+            ("agent_kind", "claude_desktop_session"),
+        ] {
+            assert!(after
+                .attribution_facts
+                .iter()
+                .any(|fact| fact.field == field && fact.value == value));
+        }
+        assert!(!claude_snapshot_belongs_to_family(&after, PARENT));
+        assert_eq!(
+            account_identity_bytes(&before),
+            account_identity_bytes(&after)
+        );
+        assert_eq!(
+            exact_session_account_hash(&after).as_deref(),
+            Some(account.as_str())
+        );
+        carriers.push(after.session_account_evidence.unwrap());
+    }
+    // Identity coverage is a different input: unlike lineage coverage, it
+    // intentionally changes the creator disposition, never the account pair.
+    assert_eq!(carriers[0].identity_disposition, Some("complete"));
+    assert_eq!(carriers[1].identity_disposition, Some("missing"));
+    carriers[1].identity_disposition = Some("complete");
+    assert_eq!(
+        serde_json::to_vec(&carriers[0]).unwrap(),
+        serde_json::to_vec(&carriers[1]).unwrap()
+    );
 }
 
 #[test]
