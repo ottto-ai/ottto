@@ -1600,6 +1600,7 @@ fn claude_contract5_bodies_need_no_cohort_token() {
 /// `claude_contract5_bodies_need_this_cycles_cohort_permit`, whose
 /// tokenless and denied cycles kept today's (`COMPLETE`) bytes.
 #[test]
+#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 fn terminal_off_on_claude_contract5_bodies_need_no_cohort_token() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

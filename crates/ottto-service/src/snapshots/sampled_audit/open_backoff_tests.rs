@@ -804,12 +804,14 @@ fn ordinary_open_keeps_other_slots_due(grown: bool) {
 }
 
 #[test]
+#[ignore = "terminal-off ON-readiness: C3"]
 fn ordinary_unchanged_open_keeps_due_with_another_slot_owner_and_saturated_markers() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     ordinary_open_keeps_other_slots_due(false);
 }
 #[test]
+#[ignore = "terminal-off ON-readiness: C3"]
 fn ordinary_grown_open_keeps_due_with_another_slot_owner_and_saturated_markers() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

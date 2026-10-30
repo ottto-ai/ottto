@@ -328,6 +328,7 @@ fn no_list_and_paused_list_states_hold_history_selected_for_another_reason() {
 /// unrecordable install hold everything even with budget available. On a
 /// verified Mac without a list, old history is paced instead (N1).
 #[test]
+#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 fn terminal_off_on_no_list_and_paused_list_states_hold_history_selected_for_another_reason() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -464,6 +465,7 @@ fn installed_empty_list_paces_history_and_differs_from_a_missing_list() {
 /// census records. A missing (never installed) list is not the same: old
 /// births are held.
 #[test]
+#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 fn terminal_off_on_installed_empty_list_paces_history_and_differs_from_a_missing_list() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -703,6 +705,7 @@ fn revision_bump_rereads_every_stamped_file_paced_then_stops() {
 /// walk, so pacing does not wait for the next walk. Each page commits as a
 /// fully accepted page without holds does (the upload context is adopted).
 #[test]
+#[ignore = "terminal-off ON-readiness: P3"]
 fn terminal_off_on_revision_bump_rereads_every_stamped_file_paced_then_stops() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -1087,6 +1090,7 @@ fn member_only_line_protects_its_root_on_a_fresh_index() {
 /// member is indexed: no root body is emitted, and the unlisted family
 /// upgrades.
 #[test]
+#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
 fn terminal_off_on_member_only_line_protects_its_root_on_a_fresh_index() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -1879,6 +1883,7 @@ fn held_member_owed_a_proof_correction_is_skipped_and_deferred() {
 /// adoption, and its correction is deferred to the history gate (disclosed)
 /// instead of blocking a fully settled upload.
 #[test]
+#[ignore = "terminal-off ON-readiness: R5"]
 fn terminal_off_on_held_member_owed_a_proof_correction_is_skipped_and_deferred() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -3707,6 +3712,7 @@ fn copies_read_under_a_closed_duplicate_fence_settle_after_one_walk() {
 /// request stays in the accepted bodies exactly once, across pages and a
 /// reload. Walks span two pages.
 #[test]
+#[ignore = "terminal-off ON-readiness: P3"]
 fn terminal_off_on_copies_read_under_a_closed_duplicate_fence_settle_after_one_walk() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

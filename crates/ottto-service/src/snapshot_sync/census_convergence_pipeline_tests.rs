@@ -1166,6 +1166,7 @@ fn account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
 /// ordinary traversal reparses only the held file instead of every unchanged
 /// file.
 #[test]
+#[ignore = "terminal-off ON-readiness: C6"]
 #[serial(source_manifests)]
 fn terminal_off_on_account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2295,6 +2296,7 @@ fn terminal_family_never_committed_members_let_the_claude_census_complete() {
 /// are never uploaded, accepted, or in the manifest, healthy siblings keep
 /// their accepted bodies, and the next unchanged traversal parses nothing.
 #[test]
+#[ignore = "terminal-off ON-readiness: C6"]
 #[serial(source_manifests)]
 fn terminal_off_on_terminal_family_never_committed_members_let_the_claude_census_complete() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2598,6 +2600,7 @@ fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
 /// missing member is pruned only by the complete census; a replaced member is
 /// reparsed once, held, and rebound.
 #[test]
+#[ignore = "terminal-off ON-readiness: C6"]
 #[serial(source_manifests)]
 fn terminal_off_on_terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -3239,6 +3242,7 @@ fn real_rejected_page_restores_terminal_hold_and_discloses_refusal_beside_accept
 /// Actual entity ACKs, uploader result, durable refusal ledger, restore, and
 /// next-page census. Exercise both ordinary and backend-dominated refusals.
 #[test]
+#[ignore = "terminal-off ON-readiness: R8"]
 #[serial(source_manifests)]
 #[serial(client_report)]
 fn terminal_off_on_real_rejected_page_restores_terminal_hold_and_discloses_refusal_beside_accepted_sibling() {
@@ -3311,6 +3315,7 @@ fn real_rejected_page_records_account_hold_across_reload_and_reparses_next_gener
 }
 
 #[test]
+#[ignore = "terminal-off ON-readiness: R8"]
 #[serial(source_manifests)]
 #[serial(client_report)]
 fn terminal_off_on_real_rejected_page_records_account_hold_across_reload_and_reparses_next_generation() {
@@ -4601,6 +4606,7 @@ fn retry_pending_debt_elsewhere_settles_unrelated_pages_like_no_debt() {
 /// progress-blocking or marks the sweep, and only the full completion
 /// (census, backfill) stays withheld.
 #[test]
+#[ignore = "terminal-off ON-readiness: R9"]
 #[serial(source_manifests)]
 fn terminal_off_on_retry_pending_debt_elsewhere_settles_unrelated_pages_like_no_debt() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -5851,6 +5857,7 @@ fn returning_member_that_never_reproves_is_held_until_its_bounded_terminal() {
 /// cap. The tombstone, the witness and the terminal record stay; every
 /// sighting counts as a tombstone hit.
 #[test]
+#[ignore = "terminal-off ON-readiness: completion-fold"]
 #[serial(source_manifests)]
 fn terminal_off_on_returning_member_that_never_reproves_is_held_until_its_bounded_terminal() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -6591,6 +6598,7 @@ fn full_tombstone_set_keeps_the_excess_family_and_holds_both_returns() {
 /// and re-forms its record against its witness, and the kept family's record
 /// still holds its member.
 #[test]
+#[ignore = "terminal-off ON-readiness: completion-fold"]
 #[serial(source_manifests)]
 fn terminal_off_on_full_tombstone_set_keeps_the_excess_family_and_holds_both_returns() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();

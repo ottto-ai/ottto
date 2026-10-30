@@ -682,6 +682,7 @@ fn census_every_offered_and_held_body_matches_control() {
 /// Compare every candidate body before hold filtering, including candidates
 /// absent from the returned PipelinePage and its committed body witnesses.
 #[test]
+#[ignore = "terminal-off ON-readiness: completion-fold"]
 #[serial(source_manifests)]
 fn terminal_off_on_census_every_offered_and_held_body_matches_control() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();

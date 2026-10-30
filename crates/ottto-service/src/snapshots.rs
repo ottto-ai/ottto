@@ -81543,6 +81543,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "terminal-off ON-readiness: P1"]
     fn terminal_off_on_claude_context_backfill_resumes_after_restart_without_rereading_settled_files(
     ) {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();

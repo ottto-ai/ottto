@@ -71,6 +71,27 @@ OFF merge still requires R6/R12, the empty-context B1 control, missing-ACK B-P2,
 re-arm-loop B-P5, OFF identity, Linux and branch Mac. B-P2/B-P5 are the next
 separate fix round; this switch does not waive them.
 
+## OFF proof and the ON-readiness manifest
+
+OFF is proven by main's own tests. Every test that exists on main runs with
+main's exact text at the default OFF; shared fixture helpers keep main's body
+and reach the containment version only while a test opts in to ON. The
+containment version of each changed main test runs separately as
+`terminal_off_on_<name>` under the explicit ON guard, with every money, ACK,
+body-equality and zero-read assertion of its original.
+
+ON twins (and new ON tests) that are known red are ignored with the reason
+`terminal-off ON-readiness: <cluster>`. The unit test
+`terminal_off_on_readiness_ignores_equal_the_checked_in_manifest` compares every
+such ignore in the crate's sources with the checked-in list in
+`snapshots/terminal_off/readiness_manifest.rs`, so the count is visible in CI
+and cannot drift.
+
+- Turning ON anywhere, Ron's M4 included, and flipping the default to ON both
+  require that manifest to be **empty** plus Lead B's sign-off.
+- An entry is un-ignored only together with its cluster's fix, never by editing
+  an assertion.
+
 ON is **not ready anywhere**, including the M4. Lead B's pending labels remain:
 
 - **BLOCKS-RELEASE before ON:** R2 (correction settlement against wrong revision),
