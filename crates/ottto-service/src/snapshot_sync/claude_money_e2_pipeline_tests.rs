@@ -5711,7 +5711,8 @@ fn terminal_off_on_deferred_strict_root_never_grants_negative_money() {
                 .retain(|item| item.source_session_id == ROOT);
             assert_eq!(raw.scan.snapshots.len(), 1);
             let prior = raw.index.clone();
-            let accepted = prior.accepted_snapshot_fingerprints.clone();
+            let accepted =
+                serde_json::to_value(&prior).unwrap()["accepted_snapshot_fingerprints"].clone();
             crate::claude_local_otel::reset_evidence_read_counts_for_test();
             assert!(crate::snapshots::claude_terminal_off());
             raw.enrich(&c);
@@ -5755,7 +5756,10 @@ fn terminal_off_on_deferred_strict_root_never_grants_negative_money() {
                 0
             );
             raw.finish();
-            assert_eq!(raw.index.accepted_snapshot_fingerprints, accepted);
+            assert_eq!(
+                serde_json::to_value(&raw.index).unwrap()["accepted_snapshot_fingerprints"],
+                accepted
+            );
             assert!(raw
                 .index
                 .claude_usage_family_pending_retained_for_test(deferred));
@@ -5798,7 +5802,10 @@ fn terminal_off_on_deferred_strict_root_never_grants_negative_money() {
                 canonical(&raw.scan.snapshots),
                 canonical(&cold.scan.snapshots)
             );
-            assert_eq!(cold.index.accepted_snapshot_fingerprints, accepted);
+            assert_eq!(
+                serde_json::to_value(&cold.index).unwrap()["accepted_snapshot_fingerprints"],
+                accepted
+            );
         }
     });
 }

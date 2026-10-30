@@ -1033,8 +1033,8 @@ fn twin_case(name: &str) {
                 let queued = c.raw(&scanner, prior.clone(), 1, true, &[]);
                 assert!(!queued.scan.census_complete);
                 assert_eq!(
-                    queued.index.accepted_snapshot_fingerprints,
-                    prior.accepted_snapshot_fingerprints
+                    serde_json::to_value(&queued.index).unwrap()["accepted_snapshot_fingerprints"],
+                    serde_json::to_value(&prior).unwrap()["accepted_snapshot_fingerprints"]
                 );
             }
             "twin_mixed_accounts" => {
@@ -1066,18 +1066,42 @@ fn twin_case(name: &str) {
             | "twin_stale_or_queued_holder" => (0, 1, 1),
             _ => (0, 0, 2),
         };
-        let accepted = prior.accepted_snapshot_fingerprints.clone();
+        let accepted =
+            serde_json::to_value(&prior).unwrap()["accepted_snapshot_fingerprints"].clone();
         let receipt_body = compare_claude(&c, &scanner, &disk, prior, expected);
         assert!(!receipt_body.items.is_empty());
-        assert!(
+        let changed = matches!(
+            name,
+            "twin_branch_copy"
+                | "twin_resume_copy"
+                | "twin_one_member_grows"
+                | "twin_stale_or_queued_holder"
+        );
+        assert_eq!(
             receipt_body
                 .items
                 .iter()
                 .map(|i| i.request_count)
-                .sum::<u64>()
-                >= 1
+                .sum::<u64>(),
+            if changed { 2 } else { 1 }
         );
-        assert!(accepted.is_empty(), "the warm pass manufactured no ACK");
+        assert_eq!(
+            receipt_body
+                .items
+                .iter()
+                .map(|i| i.input_tokens)
+                .sum::<u64>(),
+            if changed { 30 } else { 10 }
+        );
+        assert_eq!(
+            receipt_body
+                .items
+                .iter()
+                .map(|i| i.output_tokens)
+                .sum::<u64>(),
+            if changed { 30 } else { 10 }
+        );
+        assert!(accepted.is_null(), "the warm pass manufactured no ACK");
         m4_verified(name, &[receipt_body]);
     });
 }
@@ -1143,16 +1167,50 @@ fn pi() {
     assert_eq!(warm.snapshots.len(), 1);
     // Pi intentionally remains Full on change. Reuse the actual owner after
     // a physical source revision change and compare with a new Full owner.
-    append(&path, "\n");
+    let mut next: Value = serde_json::from_str(
+        include_str!("../../../../fixtures/snapshot-audit/pi-session-current.jsonl")
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    next["id"] = json!("m4-second-message");
+    next["parentId"] = json!("fixture-assistant-message");
+    next["timestamp"] = json!("2026-07-22T08:00:02.000Z");
+    next["message"]["responseId"] = json!("m4-second-response");
+    next["message"]["timestamp"] = json!(1784707202000u64);
+    next["message"]["usage"] = json!({"input":8,"output":3,"cacheRead":0,"cacheWrite":0,"totalTokens":11,"cost":{"total":0.0002}});
+    append(&path, &(next.to_string() + "\n"));
     input_clock(&path);
     save_inputs(&c);
     let (tail_index, tail, mode) = other_page(&c, &retained, source, prior.clone());
     let (_, full, cold_mode) = other_page(&c, &E2ScanFixture::default(), source, prior);
-    assert_eq!(mode, (0, 0, 0), "Pi has no sampled reduction");
+    assert_eq!((mode.1, mode.2), (0, 0), "Pi has no retained reduction");
     assert_eq!(cold_mode, mode);
     assert_eq!(tail.scanned_file_count, 1);
     assert_eq!(full.scanned_file_count, 1);
-    assert_eq!(tail_index.accepted_snapshot_fingerprints.len(), 0);
+    assert!(serde_json::to_value(&tail_index).unwrap()["accepted_snapshot_fingerprints"].is_null());
+    assert_eq!(
+        tail.snapshots
+            .iter()
+            .map(|item| item.request_count)
+            .sum::<u64>(),
+        2
+    );
+    assert_eq!(
+        tail.snapshots
+            .iter()
+            .map(|item| item.input_tokens)
+            .sum::<u64>(),
+        20
+    );
+    assert_eq!(
+        tail.snapshots
+            .iter()
+            .map(|item| item.output_tokens)
+            .sum::<u64>(),
+        7
+    );
     let a = other_wire(source, &tail);
     let b = other_wire(source, &full);
     assert_eq!(a, b);
