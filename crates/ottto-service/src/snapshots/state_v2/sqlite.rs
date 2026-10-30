@@ -4,6 +4,7 @@ use anyhow::{bail, ensure, Context};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
 use sha2::Digest;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -514,12 +515,14 @@ pub(super) struct Sqlite {
     purge_policy: PurgePolicy,
     stats: MaintenanceStats,
     last_purge_attempt: Option<Instant>,
+    paths: PathExtractor,
 }
 pub(super) struct Txn<'a> {
     store: &'a mut Sqlite,
     write: bool,
     finished: bool,
-    purge: bool,
+    removed_keys: BTreeSet<RowKey>,
+    original_paths: BTreeMap<RowKey, BTreeSet<String>>,
     failed: bool,
 }
 impl Drop for Txn<'_> {
@@ -551,7 +554,7 @@ fn private_file(path: &Path) -> Result<()> {
     );
     Ok(())
 }
-fn private_parent(path: &Path) -> Result<()> {
+pub(super) fn private_parent(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("state_v2_unsafe_parent"))?;
@@ -658,6 +661,7 @@ impl Sqlite {
             purge_policy: PurgePolicy::default(),
             stats: MaintenanceStats::default(),
             last_purge_attempt: None,
+            paths: missing_path_extractor,
         })
     }
     fn conn(&self) -> Result<&Connection> {
@@ -677,6 +681,20 @@ impl Sqlite {
             Duration::from_millis(250),
         )
     }
+    pub(super) fn probe(path: &Path, identity: &super::Identity) -> Result<()> {
+        private_file(path)?;
+        let probe = Connection::open_with_flags(
+            sqlite_uri(path)?,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        probe.busy_timeout(BUSY)?;
+        let actual: super::Identity = read_json(&probe, &RowKey::Meta("identity".into()))?
+            .ok_or_else(|| anyhow::anyhow!("state_v2_identity_missing"))?;
+        ensure!(actual == *identity, "state_v2_foreign_binding");
+        Ok(())
+    }
     pub(super) fn open_with_policy(
         path: &Path,
         identity: &super::Identity,
@@ -684,7 +702,7 @@ impl Sqlite {
         work: Duration,
     ) -> Result<Self> {
         ensure!(
-            !deadline.is_zero() && !work.is_zero(),
+            !deadline.is_zero() && deadline <= Duration::from_secs(72 * 3600) && !work.is_zero(),
             "state_v2_purge_policy"
         );
         ensure!(
@@ -703,18 +721,7 @@ impl Sqlite {
             }
         }
         let before = fs::symlink_metadata(path)?;
-        {
-            let probe = Connection::open_with_flags(
-                sqlite_uri(path)?,
-                OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | OpenFlags::SQLITE_OPEN_URI
-                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?;
-            probe.busy_timeout(BUSY)?;
-            let actual: super::Identity = read_json(&probe, &RowKey::Meta("identity".into()))?
-                .ok_or_else(|| anyhow::anyhow!("state_v2_identity_missing"))?;
-            ensure!(actual == *identity, "state_v2_foreign_binding");
-        }
+        Self::probe(path, identity)?;
         private_parent(path)?;
         let conn = Connection::open_with_flags(
             path,
@@ -745,6 +752,7 @@ impl Sqlite {
             purge_policy: PurgePolicy::default(),
             stats: MaintenanceStats::default(),
             last_purge_attempt: None,
+            paths: missing_path_extractor,
         };
         store.set_purge_policy(deadline, work)?;
         store.validate_parts()?;
@@ -777,7 +785,8 @@ impl Sqlite {
                 store: self,
                 write: true,
                 finished: false,
-                purge: false,
+                removed_keys: BTreeSet::new(),
+                original_paths: BTreeMap::new(),
                 failed: false,
             };
             tx.put(RowInput {
@@ -852,7 +861,8 @@ impl Store for Sqlite {
             store: self,
             write: mode == TxnMode::Write,
             finished: false,
-            purge: false,
+            removed_keys: BTreeSet::new(),
+            original_paths: BTreeMap::new(),
             failed: false,
         })
     }
@@ -995,7 +1005,7 @@ fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> 
             "state_v2_part_shape"
         );
         let owner = table_number(h.key.table());
-        let key = serde_json::to_vec(&h.key)?;
+        let key = owner_key(&h.key)?;
         let mut stmt = conn
             .prepare("SELECT part,bytes FROM blob_parts WHERE owner=?1 AND key=?2 ORDER BY part")?;
         let mut rows = stmt.query(params![owner, key])?;
@@ -1022,11 +1032,107 @@ fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> 
     );
     Ok(())
 }
+// Shipped owner IDs and key encoding are append-only; Rust names/order are not wire IDs.
 fn table_number(table: Table) -> i64 {
-    Table::ALL
-        .iter()
-        .position(|t| *t == table)
-        .expect("closed table") as i64
+    match table {
+        Table::Meta => 0,
+        Table::Files => 1,
+        Table::FamilyRequests => 2,
+        Table::RequestSets => 3,
+        Table::Census => 4,
+        Table::AccountPending => 5,
+        Table::UsagePending => 6,
+        Table::Witnesses => 7,
+        Table::Accepted => 8,
+        Table::Quarantine => 9,
+        Table::Holds => 10,
+        Table::Traversal => 11,
+        Table::Interned => 12,
+    }
+}
+// Each SQL primary-key component is tagged and length-delimited. Numbers use
+// eight-byte big endian; text is exact UTF-8, blobs are exact bytes.
+fn owner_key(key: &RowKey) -> Result<Vec<u8>> {
+    let mut out = vec![1];
+    out.extend_from_slice(&(table_number(key.table()) as u16).to_be_bytes());
+    for component in key.values()? {
+        let (tag, bytes) = match component {
+            SqlValue::Integer(n) => (0, n.to_be_bytes().to_vec()),
+            SqlValue::Text(s) => (1, s.into_bytes()),
+            SqlValue::Blob(b) => (2, b),
+            _ => bail!("state_v2_owner_key_type"),
+        };
+        out.push(tag);
+        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    Ok(out)
+}
+
+/// The semantic encoder owns path classification, including paths inside raw
+/// holds and packed maps. No table-specific field knowledge belongs here.
+pub(super) type PathExtractor = fn(&RowKey, &dyn Value) -> Result<BTreeSet<String>>;
+fn missing_path_extractor(_: &RowKey, _: &dyn Value) -> Result<BTreeSet<String>> {
+    bail!("state_v2_private_path_extractor_required")
+}
+struct StoredValue<'a> {
+    conn: &'a Connection,
+    header: &'a Header,
+}
+impl Value for StoredValue<'_> {
+    fn write(&self, out: &mut dyn Write) -> Result<()> {
+        read_value(self.conn, self.header, out)
+    }
+}
+impl Sqlite {
+    pub(super) fn path_extractor(&mut self, paths: PathExtractor) {
+        self.paths = paths;
+    }
+}
+impl Txn<'_> {
+    fn remember_paths(&mut self, old: &Header) -> Result<()> {
+        if !pl(&old.key) || self.original_paths.contains_key(&old.key) {
+            return Ok(());
+        }
+        let paths = (self.store.paths)(
+            &old.key,
+            &StoredValue {
+                conn: self.store.conn()?,
+                header: old,
+            },
+        )?;
+        let bytes: usize = self
+            .original_paths
+            .values()
+            .flat_map(|p| p.iter())
+            .chain(paths.iter())
+            .map(|p| p.len())
+            .sum();
+        ensure!(bytes <= 8 * 1024 * 1024, "state_v2_path_diff_admission");
+        self.original_paths.insert(old.key.clone(), paths);
+        Ok(())
+    }
+    fn paths_removed(&self) -> Result<bool> {
+        for (key, old) in &self.original_paths {
+            if old.is_empty() {
+                continue;
+            }
+            let Some(header) = get(self.store.conn()?, key)? else {
+                return Ok(true);
+            };
+            let new = (self.store.paths)(
+                key,
+                &StoredValue {
+                    conn: self.store.conn()?,
+                    header: &header,
+                },
+            )?;
+            if !old.is_subset(&new) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 fn read_json<T: serde::de::DeserializeOwned>(conn: &Connection, key: &RowKey) -> Result<Option<T>> {
     let Some(h) = get(conn, key)? else {
@@ -1131,6 +1237,12 @@ fn pl(key: &RowKey) -> bool {
         _ => true, // Values may contain PL even when the primary key is H/N.
     }
 }
+fn pl_key(key: &RowKey) -> bool {
+    !matches!(
+        key,
+        RowKey::Meta(_) | RowKey::Traversal(_) | RowKey::Interned { .. } | RowKey::RequestSet(_)
+    )
+}
 impl Transaction for Txn<'_> {
     fn get(&mut self, key: &RowKey) -> Result<Option<Header>> {
         get(self.store.conn()?, key)
@@ -1146,7 +1258,7 @@ impl Transaction for Txn<'_> {
             let fixed = fixed_values(table, row.fixed)?;
             // Validate all scalar conversions before deleting the old owner.
             let mut values = row.key.values()?;
-            if let Some(old) = self.get(row.key)? {
+            let existed = if let Some(old) = self.get(row.key)? {
                 if old == h {
                     return Ok(h);
                 }
@@ -1154,13 +1266,23 @@ impl Transaction for Txn<'_> {
                     *row.key != RowKey::Meta("identity".into()),
                     "state_v2_identity_immutable"
                 );
-                self.delete(row.key)?;
-            }
+                if !references::matches(self.store.conn()?, &old, row.value)? {
+                    self.remember_paths(&old)?;
+                }
+                self.store.conn()?.execute(
+                    "DELETE FROM blob_parts WHERE owner=?1 AND key=?2",
+                    params![table_number(table), owner_key(row.key)?],
+                )?;
+                true
+            } else {
+                false
+            };
+            self.removed_keys.remove(row.key);
             let conn = self.store.conn()?;
             let mut writer = PartWriter {
                 conn,
                 owner: table_number(table),
-                key: serde_json::to_vec(row.key)?,
+                key: owner_key(row.key)?,
                 part: 0,
                 bytes: Vec::with_capacity(if h.parts == 0 {
                     INLINE_BYTES
@@ -1203,10 +1325,26 @@ impl Transaction for Txn<'_> {
                 .map(|n| format!("?{n}"))
                 .collect::<Vec<_>>()
                 .join(",");
-            let sql = format!(
-                "INSERT INTO {}({columns}) VALUES({placeholders})",
-                table.name()
-            );
+            let sql = if existed {
+                let assignments = table
+                    .fixed_columns()
+                    .iter()
+                    .chain(table.value_columns())
+                    .enumerate()
+                    .map(|(i, c)| format!("{c}=?{}", table.keys().len() + i + 1))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "UPDATE {} SET {assignments} WHERE {}",
+                    table.name(),
+                    predicate(table)
+                )
+            } else {
+                format!(
+                    "INSERT INTO {}({columns}) VALUES({placeholders})",
+                    table.name()
+                )
+            };
             conn.execute(&sql, params_from_iter(values))?;
             Ok(h)
         })();
@@ -1220,17 +1358,22 @@ impl Transaction for Txn<'_> {
                 *key != RowKey::Meta("identity".into()),
                 "state_v2_identity_immutable"
             );
+            if let Some(old) = self.get(key)? {
+                self.remember_paths(&old)?;
+            }
             let conn = self.store.conn()?;
             conn.execute(
                 "DELETE FROM blob_parts WHERE owner=?1 AND key=?2",
-                params![table_number(key.table()), serde_json::to_vec(key)?],
+                params![table_number(key.table()), owner_key(key)?],
             )?;
             let table = key.table();
             let count = conn.execute(
                 &format!("DELETE FROM {} WHERE {}", table.name(), predicate(table)),
                 params_from_iter(key.values()?),
             )?;
-            self.purge |= count != 0 && pl(key);
+            if count != 0 && pl_key(key) {
+                self.removed_keys.insert(key.clone());
+            }
             Ok(count != 0)
         })();
         self.failed |= result.is_err();
@@ -1274,7 +1417,12 @@ impl Transaction for Txn<'_> {
             );
             let actual = self.store.read_control::<u64>("generation")?.unwrap_or(0);
             ensure!(actual == expected, "state_v2_concurrent_change");
-            if self.purge
+            let purge = !self.removed_keys.is_empty() || self.paths_removed()?;
+            if purge {
+                self.store.stats.erasure_pending_marks =
+                    self.store.stats.erasure_pending_marks.saturating_add(1);
+            }
+            if purge
                 && self
                     .store
                     .read_control::<u64>("erasure_pending")?
@@ -1510,4 +1658,25 @@ pub(super) fn part_count_for_test(db: &Sqlite) -> u64 {
         .unwrap()
         .query_row("SELECT count(*) FROM blob_parts", [], |r| r.get(0))
         .unwrap()
+}
+
+#[cfg(test)]
+#[test]
+fn registered_owner_encoding_is_stable() {
+    assert_eq!(
+        owner_key(&RowKey::File("/a".into())).unwrap(),
+        [1, 0, 1, 1, 0, 0, 0, 2, b'/', b'a']
+    );
+    assert_eq!(
+        owner_key(&RowKey::Interned {
+            kind: 2,
+            ordinal: 3
+        })
+        .unwrap(),
+        [1, 0, 12, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 3]
+    );
+    assert_eq!(
+        Table::ALL.map(table_number),
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    );
 }

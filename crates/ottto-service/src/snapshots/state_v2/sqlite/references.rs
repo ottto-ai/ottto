@@ -92,7 +92,7 @@ pub(super) fn matches(conn: &Connection, header: &Header, value: &dyn Value) -> 
     let mut compare = Compare {
         conn,
         header,
-        key: serde_json::to_vec(&header.key)?,
+        key: owner_key(&header.key)?,
         part_no: None,
         part: Vec::new(),
         compared: 0,

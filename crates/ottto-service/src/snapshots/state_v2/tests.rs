@@ -33,10 +33,15 @@ impl Scratch {
     }
     fn live_store(&self) -> sqlite::Sqlite {
         self.store().finish_import().unwrap();
-        sqlite::Sqlite::open(&self.path(), &self.identity()).unwrap()
+        {
+            let mut db = sqlite::Sqlite::open(&self.path(), &self.identity()).unwrap();
+            db.path_extractor(test_paths);
+            db
+        }
     }
     fn store(&self) -> sqlite::Sqlite {
         let mut db = sqlite::Sqlite::create_import(&self.path()).unwrap();
+        db.path_extractor(test_paths);
         db.control("identity", &self.identity()).unwrap();
         db.control("generation", &0_u64).unwrap();
         db
@@ -393,6 +398,7 @@ fn f6_pl_in_values_requires_purge_even_with_hash_only_keys() {
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
     db.finish_import().unwrap();
     let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
+    db.path_extractor(test_paths);
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, b"replacement");
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
@@ -414,6 +420,7 @@ fn f6_passive_complete_can_leave_allocated_wal_and_allows_next_write() {
     let db = tmp.store();
     db.finish_import().unwrap();
     let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
+    db.path_extractor(test_paths);
     let mut tx = db.begin(TxnMode::Write).unwrap();
     let key = RowKey::RequestSet(1);
     let fixed = Fixed::RequestSet {
@@ -793,6 +800,7 @@ fn f6_deadline_keeps_writes_live_without_resetting_oldest_purge() {
     );
     drop(db);
     let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
+    db.path_extractor(test_paths);
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
     // PASSIVE and idle TRUNCATE alone cannot claim erasure.
     assert_eq!(
@@ -1051,6 +1059,7 @@ fn f8_interned_parts_refs_and_high_water_are_atomic_and_nonreused() {
     db.validate_parts().unwrap();
     drop(db);
     let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
+    db.path_extractor(test_paths);
     let mut tx = db.begin(TxnMode::Write).unwrap();
     assert!(resolve_string(&mut tx, Vocabulary::Model, id).is_err());
     assert_eq!(
@@ -1201,6 +1210,7 @@ fn f6_restart_between_vacuum_and_metadata_clear_keeps_pending_debt() {
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
     drop(db);
     let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
+    db.path_extractor(test_paths);
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
     db.maintenance(true).unwrap();
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
@@ -1317,4 +1327,86 @@ fn growth_retention_follows_runtime_custody_through_clones_subsets_and_baselines
     assert!(state_v2_growth_retention_active(&baseline));
     baseline.retain_persistence_baseline_from(&super::super::ScanIndex::default());
     assert!(!state_v2_growth_retention_active(&baseline));
+}
+
+fn test_paths(_: &RowKey, value: &dyn Value) -> Result<std::collections::BTreeSet<String>> {
+    let mut bytes = Vec::new();
+    value.write(&mut bytes)?;
+    // This fixture encoder labels a JSON string array as paths. Opaque fixture
+    // bytes are one PL string; real encoders must extract their exact paths.
+    if let Ok(paths) = serde_json::from_slice::<Vec<String>>(&bytes) {
+        return Ok(paths.into_iter().collect());
+    }
+    Ok(if bytes.is_empty() {
+        Default::default()
+    } else {
+        [String::from_utf8(bytes)?].into_iter().collect()
+    })
+}
+
+#[test]
+fn c1_same_key_rewrites_and_path_set_diffs() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = RowKey::Traversal("queue".into());
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, br#"["/a","/b"]"#);
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, br#"["/b","/a","/c"]"#);
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), None);
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    tx.delete(&key).unwrap();
+    put(&mut tx, &key, br#"["/c","/b","/a"]"#);
+    assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), None);
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, br#"["/a","/c"]"#);
+    assert_eq!(tx.commit(3, 4), DurableCommitOutcome::Committed(4));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(4));
+}
+
+#[test]
+fn c1_fixed_size_rewrite_and_delete_reinsert_do_not_mark_purge() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = RowKey::File("/private/file".into());
+    let mut fixed = Fixed::File {
+        size: 1,
+        mtime_s: 2,
+        mtime_ns: None,
+        ctime_ns: 0,
+        birth_ns: 0,
+        witness_rev: 0,
+        flags: 0,
+        source_fp: String::new(),
+        last_snapshot_fp: None,
+        body_witness: None,
+        scan_identity: None,
+    };
+    for generation in 0..3 {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        if generation == 2 {
+            tx.delete(&key).unwrap();
+        }
+        if let Fixed::File { size, .. } = &mut fixed {
+            *size += 1;
+        }
+        tx.put(RowInput {
+            key: &key,
+            fixed: &fixed,
+            value: &Bytes(vec![]),
+        })
+        .unwrap();
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+        assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), None);
+    }
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    tx.delete(&key).unwrap();
+    assert_eq!(tx.commit(3, 4), DurableCommitOutcome::Committed(4));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(4));
 }

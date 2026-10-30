@@ -30,6 +30,7 @@ pub(in super::super) struct MaintenanceStats {
     free_space_admitted: Option<bool>,
     erasure_pending_age_s: Option<u64>,
     erasure_overdue: bool,
+    pub(super) erasure_pending_marks: u64,
     vacuum_attempts: u64,
     vacuum_failures: u64,
     vacuum_deferred: u64,
