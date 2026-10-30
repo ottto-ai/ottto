@@ -874,3 +874,179 @@ fn x_out_t1_bounds_the_finished_claude_file() {
         &ClaudeTitleMetadata::default(),
     );
 }
+
+fn parser_for(rows: &[Value]) -> SnapshotAccumulator {
+    let mut parser = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+    for row in rows {
+        apply_claude_code_line(row, &mut parser);
+    }
+    parser
+}
+
+fn progressive_rows(count: usize) -> Vec<Value> {
+    let mut row = realistic_turn(0, &[])[2].clone();
+    row["requestId"] = json!("req_1");
+    row["message"]["id"] = json!("msg_1");
+    row["message"]["usage"]["inference_geo"] = json!("us");
+    vec![row; count]
+}
+
+fn progressive_response(count: usize, tag: &str) -> Vec<Value> {
+    progressive_rows(count)
+        .into_iter()
+        .map(|mut row| {
+            row["requestId"] = json!(format!("req_{tag}"));
+            row["message"]["id"] = json!(format!("msg_{tag}"));
+            row
+        })
+        .collect()
+}
+
+fn t3_limits(peak: usize) -> Vec<usize> {
+    let mut limits = vec![usize::MAX, peak, peak / 2, 1, 0];
+    limits.extend(peak.checked_sub(1));
+    limits.extend(peak.checked_add(1));
+    limits
+}
+
+fn raw_records_80() -> (
+    crate::owned_heap::OwnedVec<CompactClaudeResponseRecord>,
+    ClaudeSelectorTable,
+) {
+    let mut selectors = ClaudeSelectorTable::default();
+    let mut records = crate::owned_heap::OwnedVec::new();
+    for index in 0..80u16 {
+        let model = Some(MODEL.to_string());
+        let effort = Some("high".to_string());
+        let timestamp = Some(at(1, u64::from(index)));
+        let slot = RequestSlot {
+            request_ref: if index % 2 == 0 {
+                "req_bound"
+            } else {
+                "explicit"
+            }
+            .into(),
+            occurred_at: timestamp.clone().unwrap(),
+            model: model.clone(),
+            effort: effort.clone(),
+            prompt_tokens: Some(4),
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            uncached_tokens: None,
+            output_tokens: Some(6),
+        };
+        let selector = selector(&[("region_mode", &format!("region-{index}"), "region")]);
+        let tools = (0..index % 12)
+            .map(|tool| (format!("tool-{tool}"), "Bash".into()))
+            .collect::<BTreeMap<String, String>>();
+        records.push(CompactClaudeResponseRecord::encode(
+            records.first(),
+            index,
+            UsageTotals::default(),
+            model,
+            selectors.intern(selector),
+            effort,
+            Some("req_bound".to_string()),
+            timestamp,
+            None,
+            tools,
+            slot,
+        ));
+    }
+    (records, selectors)
+}
+
+// [behaviour] Deferred: active release branches require the frozen preflight reference.
+#[test]
+fn x_out_t3_decode_peak_and_copy_budget_match_main() {
+    use super::claude_response_records::main_reference;
+    let mut two = parser_for(&progressive_rows(128));
+    for row in progressive_response(128, "2") {
+        apply_claude_code_line(&row, &mut two);
+    }
+    let books = [
+        (
+            "progressive_128",
+            parser_for(&progressive_rows(128)).claude_responses,
+        ),
+        (
+            "progressive_cap",
+            parser_for(&progressive_rows(MAX_CLAUDE_RECORDS_PER_RESPONSE)).claude_responses,
+        ),
+        ("two_progressive_128", two.claude_responses),
+        (
+            "realistic_120",
+            parser_for(&realistic_rows(0..120, &[SHELL, CHROME[0]])).claude_responses,
+        ),
+        ("title_only", parser_for(&title_rows()).claude_responses),
+    ];
+    for (label, book) in &books {
+        let reference = main_reference::decode_peak_bound(book, usize::MAX);
+        if !crate::heap_layout_bound::layout_supported() {
+            assert_eq!(book.decode_peak_bound(usize::MAX), reference, "{label}");
+            assert_eq!(
+                book.completion_bounds(usize::MAX).map(|bounds| bounds.peak),
+                reference,
+                "{label}"
+            );
+            eprintln!("X_OUT_T3 fixture={label} layout_supported=false peak={reference:?}");
+            continue;
+        }
+        let peak = reference.expect("main's peak at usize::MAX");
+        let mut nones = 0usize;
+        let limits = t3_limits(peak);
+        for &limit in &limits {
+            let expected = main_reference::decode_peak_bound(book, limit);
+            nones += usize::from(expected.is_none());
+            assert_eq!(
+                book.decode_peak_bound(limit),
+                expected,
+                "{label} limit={limit}"
+            );
+            assert_eq!(
+                book.completion_bounds(limit).map(|bounds| bounds.peak),
+                expected,
+                "{label} limit={limit}"
+            );
+        }
+        for budget in
+            limits
+                .iter()
+                .copied()
+                .chain([2 * peak, 4 * peak, crate::transcript_cache::ENTRY_BYTES])
+        {
+            assert_eq!(
+                book.finish_copy_budget(budget),
+                main_reference::finish_copy_budget(book, budget),
+                "{label} budget={budget}"
+            );
+        }
+        if let Some(short) = peak.checked_sub(1) {
+            assert_eq!(
+                book.decode_peak_bound(short),
+                None,
+                "{label}: (b) at peak-1"
+            );
+        }
+        let output = book
+            .completion_bounds(usize::MAX)
+            .and_then(|bounds| bounds.output);
+        eprintln!(
+            "X_OUT_T3 fixture={label} layout_supported=true peak={peak} limits={} none_limits={nones} output={output:?} parity=ok",
+            limits.len()
+        );
+    }
+
+    let (records, selectors) = raw_records_80();
+    let reference = main_reference::decoded_response_peak_bound(&records, &selectors, usize::MAX);
+    if let Some(peak) = reference {
+        for limit in t3_limits(peak) {
+            assert_eq!(
+                claude_response_records::decoded_response_peak_bound(&records, &selectors, limit),
+                main_reference::decoded_response_peak_bound(&records, &selectors, limit),
+                "raw_80 limit={limit}"
+            );
+        }
+    }
+    eprintln!("X_OUT_T3 fixture=raw_records_80 peak={reference:?} parity=ok");
+}

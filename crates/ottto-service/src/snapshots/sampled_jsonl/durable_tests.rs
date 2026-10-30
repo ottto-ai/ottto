@@ -1011,8 +1011,31 @@ fn edits_after_the_checkpoint_refuse_restore() {
     );
 }
 
+/// The allowlist digests, pinned: any field, class or type change in a
+/// persisted type moves them. Review the classes with SOURCE, then repin.
+const ALLOWLIST_PINS: [(SnapshotSource, &str); 2] = [
+    (
+        SnapshotSource::ClaudeCode,
+        "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
+    ),
+    (
+        SnapshotSource::Codex,
+        "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+    ),
+];
+
 fn hex(digest: [u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[test]
+fn allowlist_digests_are_pinned() {
+    let actual = ALLOWLIST_PINS.map(|(source, _)| (source, hex(allowlist_digest(source))));
+    assert_eq!(
+        ALLOWLIST_PINS.map(|(source, pin)| (source, pin.to_string())),
+        actual,
+        "allowlist changed: review the field classes with SOURCE, then repin"
+    );
 }
 
 /// The allowlist binds the source, the bounds and every persisted type's
@@ -1253,6 +1276,65 @@ fn fallback_classes_over_the_synthetic_corpus() {
     );
 }
 
+/// Budget receipt (static): the bounds every restore and write is held to.
+#[test]
+fn budget_bounds_hold() {
+    use crate::durable_tail_store::{MAX_BATCH, MAX_RECORDS, RECORD_BYTES, STORE_BYTES};
+    // A restored copy is charged to the 31 MiB state budget like any
+    // retained copy; one record never exceeds one cache entry.
+    assert_eq!(RECORD_BYTES, crate::transcript_cache::ENTRY_BYTES);
+    assert_eq!(MAX_RECORDS, crate::transcript_cache::CACHE_ENTRIES);
+    // Disk: at most 32 MiB per source store.
+    assert_eq!(STORE_BYTES, 32 * 1024 * 1024);
+    // Per restore: one record read, two 4 KiB sample windows, a head
+    // re-parse of at most 1 MiB and at most NAMED_LINES capped lines.
+    assert_eq!(HEAD_BOUND, 1024 * 1024);
+    assert_eq!(NAMED_LINES, 4);
+    // Beside the cache, outside its state budget: both stores' digest maps.
+    assert_eq!(
+        crate::snapshots::sampled_scan::durable_tail::STORES_RESIDENT_BOUND,
+        64 * 1024
+    );
+    // Per write pass: at most MAX_BATCH records of at most RECORD_BYTES.
+    assert_eq!(MAX_BATCH, 32);
+}
+
+/// Budget receipt (measured) on the synthetic transcripts: body and record
+/// bytes, the encode buffer, and one restore's re-derivation I/O.
+#[test]
+fn codec_budget_receipt() {
+    for case in cases() {
+        let scratch = Scratch::new("receipt");
+        let path = scratch.write("t.jsonl", &case.lines);
+        let (reduction, _) = full_read(&path, case.source);
+        let mut e = Enc::bytes(crate::durable_tail_store::RECORD_BYTES);
+        reduction.put(&mut e).unwrap();
+        let encode_buffer = e.into_bytes().capacity();
+        let body = encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        )
+        .unwrap();
+        let (_, receipt) = restore(&path, &body, case.source).unwrap();
+        println!(
+            "dt_codec_budget: source={} file_bytes={} body_bytes={} record_bytes={} \
+             encode_buffer_bytes={} rederive_head_bytes={} rederive_named_lines={} \
+             rederive_line_bytes={}",
+            case.source.api_slug(),
+            fs::metadata(&path).unwrap().len(),
+            body.len(),
+            body.len() + 356,
+            encode_buffer,
+            receipt.head_bytes,
+            receipt.named_lines,
+            receipt.line_bytes,
+        );
+        assert!(body.len() <= crate::durable_tail_store::RECORD_BYTES);
+        assert!(receipt.head_bytes <= HEAD_BOUND);
+    }
+}
+
 /// Decode all stored sections, excluding the caller's independent source
 /// binding check. This is the structural acceptance oracle for `verify`.
 fn structurally_decodes(body: &[u8]) -> bool {
@@ -1391,6 +1473,23 @@ fn structural_verifier_nonempty_selector_capture() {
             .and_then(|()| d.finish())
             .is_err());
     }
+}
+
+#[test]
+fn structural_verifier_large_body_still_allocates_nothing() {
+    let scratch = Scratch::new("large-structural-verifier");
+    let path = scratch.write("large.jsonl", &codex_lines());
+    let (mut reduction, _) = full_read(&path, SnapshotSource::Codex);
+    // Uploaded model/tool strings are stored U fields, so make the body large
+    // without increasing transcript acquisition or test-probe bookkeeping.
+    reduction.accumulator.latest_model = Some("m".repeat(256 * 1024));
+    let body = encode(&reduction, 1 << 20, line_cap()).unwrap();
+    assert!(body.len() > 256 * 1024);
+    assert_eq!(verified_without_allocation(&body), Ok(()));
+    assert_eq!(
+        verified_without_allocation(&body[..body.len() - 1]),
+        Err(Corrupt)
+    );
 }
 
 #[test]

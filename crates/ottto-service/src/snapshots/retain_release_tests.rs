@@ -3,10 +3,11 @@
 //! diagnostic packet's
 //! refusal buckets. Its own block, apart from the shared appends above.
 use super::*;
-use crate::local_resource_diagnostics::cache_lifecycle::{observe, Counts};
+use crate::local_resource_diagnostics::cache_lifecycle::{observe, observed, Counts};
 use crate::session_attribution::SessionAttributionContext;
-use sampled_jsonl::Bucket;
+use sampled_jsonl::{classify_refusal, Bucket, Refusal, RefusalView};
 use sampled_scan::test_hooks::{self, Decision, Point, Probe};
+use sampled_scan::{ReleaseOutcome, RetainBudget};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -96,6 +97,35 @@ fn append_row(fixture: &ScanFixture, source: SnapshotSource) {
         1_000,
         "fixture-model-tail",
     ));
+}
+
+/// A line no parser reads as usage: the parsed snapshots do not change.
+fn append_ignored(fixture: &ScanFixture, _: SnapshotSource) {
+    fixture.file.append(&json!({"type":"ignored"}));
+}
+
+/// T-R0c (Claude): one usage-bearing assistant record with 2,500 browser
+/// `tool_use` blocks, every block with its own id. Since #667 the response
+/// book keeps a per-record summary (`owned_heap`), so many small records no
+/// longer reach the walk's 4,096 visits; one record whose `tool_uses` (two
+/// strings per call) pass them leaves its summary, and so the active,
+/// unmeasured. Usage rows alone do not: the parser's walk is constant in its
+/// row count (pinned by
+/// `sampled_native_large_history_has_constant_step_charge_and_conservative_clones`).
+fn append_many(fixture: &ScanFixture, source: SnapshotSource) {
+    assert_eq!(source, SnapshotSource::ClaudeCode);
+    let blocks = (0..2_500_usize)
+        .map(|block| {
+            json!({"type":"tool_use", "id":format!("toolu_r0_{block:04}"),
+                "name":"mcp__claude-in-chrome__navigate", "input":{}})
+        })
+        .collect::<Vec<_>>();
+    fixture.file.append(
+        &json!({"type":"assistant", "sessionId":"native-tail-fixture",
+        "requestId":"req_r0_many", "timestamp":"2026-10-07T11:00:00Z",
+        "message":{"id":"response-r0-many", "role":"assistant", "model":"fixture-model-tail",
+            "usage":{"input_tokens":1,"output_tokens":1}, "content":blocks}}),
+    );
 }
 
 const OLDER: usize = 3;
@@ -495,6 +525,289 @@ fn r0_tail_with_room_is_granted_and_releases_nothing() {
     }
 }
 
+/// T-D2: the retained lock is never relocked on one thread; a debug build
+/// panics before it would deadlock.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "retained lock taken while this thread holds it")]
+fn r0_retained_relock_panics_in_debug_builds() {
+    let cache = sampled_scan::SharedCache::default();
+    let _held = cache.retained().unwrap();
+    let _ = cache.retained();
+}
+
+/// T-D1: R0's completion measure waits for a held retained lock; every other
+/// walk reads contention as unbounded.
+#[test]
+fn r0_blocking_measure_waits_for_the_retained_lock() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let cache = Arc::clone(&cache);
+        std::thread::spawn(move || {
+            let guard = cache.retained().unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            drop(guard);
+        })
+    };
+    held_rx.recv().unwrap();
+    assert_eq!(
+        crate::heap_layout_bound::bound(&*cache, usize::MAX),
+        None,
+        "an ordinary walk reads contention as unbounded"
+    );
+    release_tx.send(()).unwrap();
+    let blocking = {
+        let _blocking = sampled_scan::BlockingResidentMeasure::enter();
+        crate::heap_layout_bound::bound(&*cache, usize::MAX)
+    };
+    holder.join().unwrap();
+    assert!(blocking.is_some());
+    assert_eq!(
+        blocking,
+        crate::heap_layout_bound::bound(&*cache, usize::MAX),
+        "the same bound as uncontended"
+    );
+}
+
+/// T-D3 (β): an insert keeps its own finalization charge on the entry, apart
+/// from the cursor reservation, and the next take carries it.
+#[test]
+fn r0_insert_carries_its_finalization_charge_to_the_next_take() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let fixture = resident(
+            source,
+            &cache,
+            1,
+            SystemTime::now() - Duration::from_secs(60),
+        );
+        let taken = cache.take(&key(&fixture)).expect("resident");
+        assert!(
+            taken.finalization_charge > 0,
+            "a production insert carries its finalization charge {source:?}"
+        );
+        cache.insert(
+            key(&fixture),
+            sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint: taken.retained.checkpoint,
+                reduction: Some(taken.retained.state),
+                released: None,
+                unsealed: false,
+            },
+            1_234,
+        );
+        assert_eq!(
+            cache
+                .take(&key(&fixture))
+                .expect("reinserted")
+                .finalization_charge,
+            1_234,
+            "{source:?}"
+        );
+    }
+}
+
+/// The packet: one bucket per refused pass, from the budget it was admitted
+/// against and what refused it; excluded and unsealed passes get no budget.
+#[test]
+fn packet_refusal_buckets_and_budget_variants() {
+    let entry = crate::transcript_cache::ENTRY_BYTES;
+    let granted = |budget, resident_measured, active_measured| {
+        RefusalView::of(&RetainBudget::Granted {
+            budget,
+            resident_measured,
+            active_measured,
+        })
+    };
+    let admission = |charge| Refusal::Admission { charge };
+    let cases = [
+        (granted(0, false, true), admission(Some(10)), Bucket::Walk),
+        (granted(9, true, false), admission(Some(10)), Bucket::Walk),
+        (
+            granted(0, true, true),
+            admission(Some(10)),
+            Bucket::BudgetZero,
+        ),
+        (
+            granted(5, true, true),
+            admission(Some(10)),
+            Bucket::OverBudget,
+        ),
+        (granted(5, true, true), admission(None), Bucket::Walk),
+        (
+            granted(2 * entry, true, true),
+            admission(Some(entry + 1)),
+            Bucket::OverEntry,
+        ),
+        (
+            granted(5, false, false),
+            Refusal::Clone { charge: Some(10) },
+            Bucket::OverBudget,
+        ),
+        (
+            RefusalView::deferred(100, 50),
+            Refusal::Release(ReleaseOutcome::Race),
+            Bucket::OverBudget,
+        ),
+        (
+            RefusalView::deferred(100, 50),
+            Refusal::Release(ReleaseOutcome::Unmeasurable),
+            Bucket::Walk,
+        ),
+        (
+            RefusalView::deferred(0, 50),
+            Refusal::Release(ReleaseOutcome::Race),
+            Bucket::BudgetZero,
+        ),
+        (
+            RefusalView::deferred(100, 50),
+            admission(Some(60)),
+            Bucket::OverEntry,
+        ),
+        (
+            RefusalView::deferred(100, 50),
+            admission(Some(120)),
+            Bucket::OverBudget,
+        ),
+        (
+            RefusalView::of(&RetainBudget::TierOrJoinExcluded { raw: 7 }),
+            admission(Some(1)),
+            Bucket::BudgetZero,
+        ),
+    ];
+    for (index, (view, refusal, bucket)) in cases.into_iter().enumerate() {
+        assert_eq!(classify_refusal(view, refusal), bucket, "case {index}");
+    }
+
+    // Only a deferred release carries a released finalization limit
+    // (`released_budget`); reserving #667's peak re-grants a granted budget
+    // at main's peak-reserved figure and leaves excluded and unsealed ones.
+    let granted = RetainBudget::granted_unclassified(7);
+    assert_eq!(
+        (
+            granted.raw(),
+            granted.admission_budget(),
+            granted.released_budget()
+        ),
+        (7, 7, None)
+    );
+    assert!(matches!(
+        RetainBudget::granted_unclassified(7).reserve_peak(5, |_| None),
+        RetainBudget::Granted { budget: 5, .. }
+    ));
+    for budget in [
+        RetainBudget::granted_unclassified(7).excluded(),
+        RetainBudget::granted_unclassified(7).unsealed(),
+    ] {
+        assert_eq!(
+            (
+                budget.raw(),
+                budget.admission_budget(),
+                budget.released_budget()
+            ),
+            (7, 0, None)
+        );
+    }
+    assert!(matches!(
+        RetainBudget::granted_unclassified(7)
+            .excluded()
+            .reserve_peak(5, |_| None),
+        RetainBudget::TierOrJoinExcluded { raw: 7 }
+    ));
+    // H3's no-release conversion leaves a non-deferred budget as it was.
+    assert!(matches!(
+        RetainBudget::granted_unclassified(7).without_release(),
+        RetainBudget::Granted { budget: 7, .. }
+    ));
+    assert!(matches!(
+        RetainBudget::granted_unclassified(7)
+            .unsealed()
+            .without_release(),
+        RetainBudget::Unsealed { raw: 7 }
+    ));
+}
+
+/// Why T-R0b-ins, -ins-band, -node and -node-band set `ins_extra` through
+/// the test seam: each needs `ins_extra` against `A` at a chosen size. On a
+/// minimal Tail (a confirmed-empty file plus one ignored line) the natural
+/// relation moved with #660/#667: CI 39897160806 measured `ins_extra > A`
+/// for both sources (Codex by under 1 KiB). It is recorded, not pinned.
+#[test]
+fn r0_insert_term_against_the_active_charge_on_supported_layouts() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let spec = Spec {
+            older: 1,
+            rows: 0,
+            change: append_ignored,
+            ..SPEC
+        };
+        let mut world = World::build(source, spec);
+        let probe = run(&mut world, Opts::default()).probe;
+        eprintln!(
+            "R0_INSERT_TERM source={source:?} a={} ins_extra={}",
+            probe.a, probe.ins_extra
+        );
+        assert!(probe.ins_extra > 0 && probe.a > 0, "{source:?}: {probe:?}");
+    }
+}
+
+/// T-R0c: a Claude Tail whose active state passes the walk's 4096 visits.
+/// No step-start clear; the completion is granted 0 with the active
+/// unmeasured (bucket `Walk`), and nothing is released.
+#[test]
+fn r0_tail_past_the_visit_limit_is_granted_without_release() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let mut world = World::build(
+        source,
+        Spec {
+            change: append_many,
+            ..SPEC
+        },
+    );
+    let run = run(&mut world, Opts::default());
+    assert_eq!(
+        run.decisions,
+        vec![Decision::Granted {
+            budget: 0,
+            resident_measured: true,
+            active_measured: false,
+        }]
+    );
+    assert_eq!(run.buckets, vec![Bucket::Walk]);
+    let counts = run.counts;
+    assert_eq!(
+        (
+            counts.clear_other_active,
+            counts.clear_no_active,
+            counts.clear_full_resident_bound_unknown,
+            counts.clear_metadata_unsupported,
+            counts.clear_entries_released,
+            counts.insert_entries_evicted,
+            counts.copy_refusal_admission_evicted,
+            counts.copy_refusal_entries_evicted,
+            counts.retention_bound_refused,
+        ),
+        (0, 0, 0, 0, 0, 0, 0, 0, 1)
+    );
+    assert_eq!(victims(&world.cache), run.before);
+}
+
 /// T-R0d: every borrowed-state conjunct keeps a Tail off shape F, so its
 /// step-start refusal keeps `ClearOtherActive`, and its completion never
 /// reaches `tail_completion_budget` (the only source of `Deferred`, called
@@ -578,6 +891,125 @@ fn r0_non_f_shapes_keep_clear_other_active() {
                 .codex_tier_replay = replay;
         }
         assert!(shape_f(&scan), "restored {source:?}");
+    }
+}
+
+/// Runs `release` inside `observe` while another thread holds the retained
+/// lock; that thread lets go once it sees a new
+/// `ClearFullResidentBoundUnknown`, or after 5 s.
+fn contended<T>(
+    cache: &Arc<sampled_scan::SharedCache>,
+    release: impl FnOnce() -> T,
+) -> (T, Counts) {
+    use crate::local_resource_diagnostics::cache_lifecycle::snapshot;
+    let seen = snapshot().clear_full_resident_bound_unknown;
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let holder = {
+        let cache = Arc::clone(cache);
+        std::thread::spawn(move || {
+            let guard = cache.retained().unwrap();
+            held_tx.send(()).unwrap();
+            let start = std::time::Instant::now();
+            while snapshot().clear_full_resident_bound_unknown == seen
+                && start.elapsed() < Duration::from_secs(5)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(guard);
+        })
+    };
+    held_rx.recv().unwrap();
+    let observed = observe(release);
+    holder.join().unwrap();
+    observed
+}
+
+/// T-R0e: branches A (a sampled Full read) and D (an unsampled native read)
+/// release as at base. Measured and uncontended, neither clears; contended
+/// (another thread holds the retained lock), each records
+/// `ClearFullResidentBoundUnknown` and releases every resident once the lock
+/// is free, never `ClearOtherActive`.
+#[test]
+fn r0_branches_a_and_d_release_as_base_under_contention() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clears = |counts: &Counts| {
+        (
+            counts.clear_full_resident_bound_unknown,
+            counts.clear_entries_released,
+            counts.clear_other_active,
+            counts.clear_no_active,
+        )
+    };
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        // A: a new file read Full beside one resident.
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let base = SystemTime::now() - Duration::from_secs(3_600);
+        let other = resident(source, &cache, 1, base);
+        let full = scan_fixture(source, INCUMBENT_ROWS, base + Duration::from_secs(1_000));
+        let scan = step_until(
+            cached_scan(&full, source, ScanIndex::default(), &cache, |_| {}),
+            |scan| scan.active_file.is_some(),
+        );
+        assert!(
+            matches!(
+                scan.active_file
+                    .as_deref()
+                    .and_then(|active| active.sampling.as_ref())
+                    .map(|sampling| sampling.mode),
+                Some(ReadMode::Full(_))
+            ),
+            "precondition: branch A {source:?}"
+        );
+        let release = || {
+            sampled_scan::release_cache_for_copy_refusal(
+                scan.sampling.as_ref(),
+                scan.active_file.as_deref(),
+                None,
+            )
+        };
+        let ((), counts) = observe(release);
+        assert_eq!(clears(&counts), (0, 0, 0, 0), "A {source:?}");
+        assert!(resident_keys(&cache).contains(&key(&other)), "{source:?}");
+        let ((), counts) = contended(&cache, release);
+        assert_eq!(clears(&counts), (1, 1, 0, 0), "contended A {source:?}");
+        assert!(resident_keys(&cache).is_empty(), "{source:?}");
+        drop(scan);
+
+        // D: an unsampled native read beside one resident.
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let other = resident(source, &cache, 1, base);
+        let large = ScanFixture::new(source);
+        append_unretainable_rows(&large, source);
+        let mut scan = step_until(
+            cached_scan(
+                &large,
+                source,
+                ScanIndex::default(),
+                &cache,
+                incomplete_sidecar_census,
+            ),
+            |scan| scan.active_file.is_some(),
+        );
+        assert!(
+            scan.active_file
+                .as_deref()
+                .is_some_and(|active| active.sampling.is_none()),
+            "precondition: branch D {source:?}"
+        );
+        let (measured, counts) = contended(&cache, || {
+            let (_, measured) = scan.sampled_copy_parts();
+            sampled_scan::release_cache_for_copy_refusal(
+                scan.sampling.as_ref(),
+                scan.active_file.as_deref(),
+                measured,
+            );
+            measured
+        });
+        assert_eq!(measured, None, "contention reads unmeasured {source:?}");
+        assert_eq!(clears(&counts), (1, 1, 0, 0), "contended D {source:?}");
+        assert!(!resident_keys(&cache).contains(&key(&other)), "{source:?}");
     }
 }
 
@@ -750,4 +1182,113 @@ fn x_out_coverage_witness_names_every_finished_field() {
             claude_account_display: _, // K (None at finish; set post-scan, contract-5 tagging)
         } = item;
     };
+}
+
+fn u3_identity(tag: &str) -> crate::context_footprint::RepositoryIdentity {
+    crate::context_footprint::RepositoryIdentity {
+        repository_hash: Some(format!("hash-{tag}")),
+        repository_label: Some(format!("label-{tag}")),
+        repository_label_source: Some("git_remote".to_string()),
+        repository_identity_source: Some("git".to_string()),
+        workspace_kind: Some("git_repo".to_string()),
+    }
+}
+
+/// X_out family U3 control (c22 amendment 2): a cold or expired cache entry
+/// is `None` (the proof releases nothing), and peeking neither inserts nor
+/// refreshes. Each workspace path is unique to this test: the cache is global.
+#[test]
+fn u3_repository_identity_peek_is_read_only_and_refuses_a_miss() {
+    let cold = Path::new("/u3-peek-test/cold-workspace");
+    assert_eq!(peek_repository_identity(cold), None);
+    assert_eq!(
+        peek_repository_identity(cold),
+        None,
+        "a miss is not inserted"
+    );
+    assert!(!repository_identity_cache()
+        .lock()
+        .expect("cache")
+        .contains_key(cold));
+
+    let warm = Path::new("/u3-peek-test/warm-workspace");
+    let expired = Path::new("/u3-peek-test/expired-workspace");
+    let stale_at =
+        SystemTime::now() - Duration::from_secs(REPOSITORY_IDENTITY_CACHE_TTL_SECONDS + 60);
+    {
+        let mut cache = repository_identity_cache().lock().expect("cache");
+        cache.insert(warm.to_path_buf(), (SystemTime::now(), u3_identity("warm")));
+        cache.insert(expired.to_path_buf(), (stale_at, u3_identity("expired")));
+    }
+    assert_eq!(peek_repository_identity(warm), Some(u3_identity("warm")));
+    assert_eq!(peek_repository_identity(expired), None);
+    let cache = repository_identity_cache().lock().expect("cache");
+    assert_eq!(
+        cache.get(expired).map(|(at, _)| *at),
+        Some(stale_at),
+        "peek never extends the TTL"
+    );
+}
+
+/// X_out family U3 (c22 amendment 2): the identity the proof measured is the
+/// one the finished item carries; `into_items` resolves nothing (no IO, no
+/// cache insert) when it is supplied.
+#[test]
+fn u3_measured_repository_identity_is_the_finished_value() {
+    let workspace = "/u3-threading-test/workspace";
+    let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+    apply_claude_code_line(
+        &serde_json::json!({"type":"assistant","sessionId":"u3-session","cwd":workspace,"requestId":"req_u3","timestamp":"2026-10-23T10:00:00Z","message":{"id":"msg_u3","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":2}}}),
+        &mut accumulator,
+    );
+    accumulator.finalize_claude_responses();
+    let items = accumulator.into_items_with_repository_identity(
+        Path::new("u3-session.jsonl"),
+        "2026-10-23T10:00:01Z",
+        "f".repeat(64),
+        None,
+        Some(u3_identity("measured")),
+    );
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].repository_hash.as_deref(), Some("hash-measured"));
+    assert_eq!(items[0].repository_label.as_deref(), Some("label-measured"));
+    assert!(!repository_identity_cache()
+        .lock()
+        .expect("cache")
+        .contains_key(Path::new(workspace)));
+}
+
+/// X_out family U1 (c22 amendment 2): a subagent transcript names itself from
+/// agent metadata on disk, so its title bound is `None` (zero victims); a
+/// top-level transcript's bound charges the desktop title it would take.
+#[test]
+fn u1_title_metadata_bound_refuses_subagents_and_charges_the_title() {
+    let accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+    let mut metadata = ClaudeTitleMetadata::default();
+    metadata.titles.insert(
+        "u1-session".to_string(),
+        ClaudeTitleCandidate {
+            title: "  a   desktop  title  ".to_string(),
+            user_set: true,
+        },
+    );
+    assert_eq!(
+        accumulator.claude_title_metadata_bound(
+            Path::new("/p/u1-parent/subagents/agent-u1.jsonl"),
+            &metadata
+        ),
+        None
+    );
+    let bound = accumulator
+        .claude_title_metadata_bound(Path::new("/p/u1-session.jsonl"), &metadata)
+        .expect("top-level bound");
+    assert_eq!(bound.per_usage_row, 0);
+    // r36 `desktop_title_bound(22)`: input and join (2 * 22), 11 one-byte
+    // words in 16 slots plus the 8 beside them (24 * 16), the collect
+    // (3 * 22), `is_safe_display_title`'s copies (2 * 22) and the item's
+    // clone (22).
+    assert_eq!(
+        bound.fixed,
+        2 * 22 + 24 * 16 + 3 * 22 + 2 * 22 + 22 + 2 * "desktop_title".len()
+    );
 }

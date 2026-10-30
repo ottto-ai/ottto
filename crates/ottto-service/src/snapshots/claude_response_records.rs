@@ -1105,6 +1105,141 @@ crate::durable_tail_codec::durable_struct!(CompactClaudeResponseRecord {
     D tool_uses: Vec<ClaudeToolUse>,
 });
 
+/// R1a R8 (T3): main's (`bc77deb9`) decode-peak preflight, verbatim except that
+/// the two book methods take the book as an argument. T3 pins the peak, the
+/// copy budget and their `None` against it.
+#[cfg(test)]
+pub(super) mod main_reference {
+    use super::*;
+
+    pub(in crate::snapshots) fn finish_copy_budget(
+        book: &ClaudeResponseBook,
+        budget: usize,
+    ) -> Option<usize> {
+        budget.checked_sub(decode_peak_bound(book, budget)?)
+    }
+
+    pub(in crate::snapshots) fn decode_peak_bound(
+        book: &ClaudeResponseBook,
+        limit: usize,
+    ) -> Option<usize> {
+        if book.responses.is_empty() {
+            return Some(0);
+        }
+        if !crate::heap_layout_bound::layout_supported() {
+            return None;
+        }
+        let mut peak = 0;
+        for response in book.responses.iter() {
+            if !response.record_limit_exceeded {
+                peak = peak.max(decoded_response_peak_bound(
+                    &response.records,
+                    &book.selectors,
+                    limit,
+                )?);
+            }
+        }
+        // finalize_claude_responses sorts the response vector before decoding;
+        // this scratch never overlaps the per-response decode/sort scratch.
+        let response_sort = book
+            .responses
+            .len()
+            .checked_mul(std::mem::size_of::<ClaudeResponseObservation>())?;
+        let peak = peak.max(response_sort);
+        (peak <= limit).then_some(peak)
+    }
+
+    fn decoded_record_heap_bound(
+        record: &CompactClaudeResponseRecord,
+        first: Option<&CompactClaudeResponseRecord>,
+        selectors: &ClaudeSelectorTable,
+        limit: usize,
+    ) -> Option<usize> {
+        let CompactClaudeResponseRecord {
+            usage: _, // UsageTotals (including costs) is entirely inline.
+            slot,
+            physical_sequence: _,
+            model,
+            reasoning_effort,
+            request_id,
+            timestamp,
+            computed_effective_input_context: _,
+            selector,
+            tool_uses,
+        } = record;
+        let model = model.get(first.map(|first| &first.model))?;
+        let effort = reasoning_effort.get(first.map(|first| &first.reasoning_effort))?;
+        let request_id = request_id.get(first.map(|first| &first.request_id))?;
+        let mut c = Counter::new(limit);
+        model.heap_bound(&mut c)?;
+        effort.heap_bound(&mut c)?;
+        request_id.heap_bound(&mut c)?;
+        timestamp.heap_bound(&mut c)?;
+        selectors.get(selector)?.completed_heap_bound(&mut c)?;
+        match slot {
+            ClaudeSlot::Explicit(slot) => slot.completed_heap_bound(&mut c)?,
+            ClaudeSlot::Derived(_) => {
+                request_id.heap_bound(&mut c)?;
+                timestamp.heap_bound(&mut c)?;
+                model.heap_bound(&mut c)?;
+                effort.heap_bound(&mut c)?;
+            }
+        }
+        crate::heap_layout_bound::tree_nodes::<String, String>(tool_uses.len(), &mut c)?;
+        // Use per-element counters exactly like completed_heap_bound, so the
+        // completion preflight does not inherit a per-line history visit wall.
+        let mut tool_bytes = 0usize;
+        for ClaudeToolUse { id, name } in tool_uses {
+            let mut tool = Counter::new(limit.checked_sub(c.bytes)?.checked_sub(tool_bytes)?);
+            id.heap_bound(&mut tool)?;
+            name.heap_bound(&mut tool)?;
+            tool_bytes = tool_bytes.checked_add(tool.bytes)?;
+        }
+        c.add(tool_bytes)?;
+        // BTreeMap's FromIterator can collect/sort a temporary entry vector while
+        // the original compact list is still alive. Reserve its realloc/scratch.
+        c.add(
+            tool_uses
+                .len()
+                .checked_mul(3 * std::mem::size_of::<(String, String)>())?,
+        )?;
+        Some(c.bytes)
+    }
+
+    pub(in crate::snapshots) fn decoded_response_peak_bound(
+        records: &OwnedVec<CompactClaudeResponseRecord>,
+        selectors: &ClaudeSelectorTable,
+        limit: usize,
+    ) -> Option<usize> {
+        let count = records.len();
+        if count == 0 {
+            return Some(0);
+        }
+        // The decoded vector is allocated exactly once. Stable sorting can ask
+        // for another count slots. Later, canonical_records grows geometrically
+        // while that input vector remains alive; include both old and new buffers
+        // during its largest realloc (also covers sorting). No merge code changes.
+        let canonical_capacity = count.checked_next_power_of_two()?.max(4);
+        let slots = count.checked_add(canonical_capacity.checked_mul(2)?)?;
+        let mut bytes = slots.checked_mul(std::mem::size_of::<ClaudeResponseRecord>())?;
+        let timestamp_copy = records
+            .iter()
+            .filter_map(|record| record.timestamp.as_ref().map(String::capacity))
+            .max()
+            .unwrap_or(0);
+        bytes = bytes.checked_add(timestamp_copy)?; // first_timestamp in the resolver
+        for record in records.iter() {
+            bytes = bytes.checked_add(decoded_record_heap_bound(
+                record,
+                records.first(),
+                selectors,
+                limit.checked_sub(bytes)?,
+            )?)?;
+        }
+        (bytes <= limit).then_some(bytes)
+    }
+}
+
 #[cfg(test)]
 mod output_tests {
     use super::*;
