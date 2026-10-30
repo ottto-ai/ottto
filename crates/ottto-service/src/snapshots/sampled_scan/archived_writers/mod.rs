@@ -348,8 +348,8 @@ fn archived_writer_cannot_reach_production_paths() {
         "archive reaches outside itself",
     );
     assert_text_edit_refused(
-        "use super::{decode_hex,",
-        "use super::super::{decode_hex,",
+        "use super::{\n    decode_hex,",
+        "use super::super::{\n    decode_hex,",
         "archive reaches outside itself",
     );
 }

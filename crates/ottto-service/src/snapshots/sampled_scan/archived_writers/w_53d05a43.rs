@@ -251,8 +251,8 @@ const BODY_GOLDENS: [(u8, &str); 2] = [
 /// same way. A record cannot carry the parser state behind this digest, so the
 /// archive pins its value instead of recomputing it.
 const SESSION_START_GOLDENS: [(u8, &str); 2] = [
-    (1, ""),
-    (2, ""),
+    (1, "8e8a79c3d053350fe28b2ad8a332f05c012d49a2abf13128b7dd57181944f24f"),
+    (2, "a2dd01eb415a98c8558c9ff03d32ce7697c37037a42076fd4bc4284c135fea24"),
 ];
 
 fn goldens() -> Vec<Golden> {

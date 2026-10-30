@@ -1576,7 +1576,6 @@ fn populated_bodies_match_the_archived_v1_writer() {
 
 #[test]
 fn session_start_digest_matches_the_archived_v1_writer() {
-    let mut actual = Vec::new();
     for (source, lines) in [
         (
             SnapshotSource::ClaudeCode,
@@ -1598,10 +1597,9 @@ fn session_start_digest_matches_the_archived_v1_writer() {
         .unwrap();
         let stored = decode(&body, source).unwrap().rederive.session_start;
         let digest = hex(stored.expect("instruction lines set a session start digest"));
-        println!("GOLDEN-SESSION {} {digest}", archived_tag(source));
-        actual.push((archived_tag(source), digest));
-    }
-    for (tag, digest) in actual {
-        assert_eq!(Some(digest.as_str()), W_53d05a43::session_start_golden(tag));
+        assert_eq!(
+            Some(digest.as_str()),
+            W_53d05a43::session_start_golden(archived_tag(source))
+        );
     }
 }
