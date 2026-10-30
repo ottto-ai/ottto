@@ -3,6 +3,8 @@
 //! binding, allowlist, body or trailer. The seed compares it byte for byte with
 //! a hash-pinned `archived_writers` copy of that writer, so current source can
 //! move on while a future writer that drifts refuses instead of being relabeled.
+//! That copy passes stored content digests through, so drift in those digests
+//! refuses in the two `*_archived_v1_writer` tests of `durable_tests.rs` instead.
 //!
 //! The `PINNED_SOURCES` tests below stay as the separate check on CURRENT code.
 //! Serializer regions are extracted by the single companion Python standard-

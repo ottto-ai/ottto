@@ -21,7 +21,9 @@
     clippy::all
 )]
 
-use super::{decode_hex, ArchivedRecord, ArchivedWriter, Golden, Region};
+use super::{
+    decode_hex, ArchivedContent, ArchivedRecord, ArchivedWriter, ContentDigests, Golden, Region,
+};
 use sha2::{Digest, Sha256};
 
 pub(crate) struct W_53d05a43;
@@ -52,6 +54,24 @@ impl ArchivedWriter for W_53d05a43 {
 
     fn frame(record: &ArchivedRecord) -> Result<Vec<u8>, String> {
         durable_tail_store::archived_frame(record)
+    }
+
+    fn content_digests(
+        source_tag: u8,
+        content: &ArchivedContent,
+    ) -> Result<ContentDigests, String> {
+        let body = BODY_GOLDENS
+            .iter()
+            .find(|(tag, _)| *tag == source_tag)
+            .ok_or_else(|| format!("no v1 body source for tag {source_tag}"))?;
+        snapshots::archived_content_digests(&decode_hex(body.1), content)
+    }
+
+    fn session_start_golden(source_tag: u8) -> Option<&'static str> {
+        SESSION_START_GOLDENS
+            .iter()
+            .find(|(tag, _)| *tag == source_tag)
+            .map(|(_, digest)| *digest)
     }
 
     fn goldens() -> Vec<Golden> {
@@ -226,6 +246,13 @@ const FRAME_GOLDENS: [(u8, Option<u64>, [&str; 8]); 4] = [
 const BODY_GOLDENS: [(u8, &str); 2] = [
     (1, "01000000000100000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000010001000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000100000101010000000000000000000000ffffffffffffffffff01ffffffffffffffffff01ffffffffffffffffff01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000107000000000000"),
     (2, "00000000000100000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000010001000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000100000101010000000000000000000000ffffffffffffffffff01ffffffffffffffffff01ffffffffffffffffff01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000107000000000000"),
+];
+/// `session_start` digests of the `*_instruction_lines` transcripts, captured the
+/// same way. A record cannot carry the parser state behind this digest, so the
+/// archive pins its value instead of recomputing it.
+const SESSION_START_GOLDENS: [(u8, &str); 2] = [
+    (1, ""),
+    (2, ""),
 ];
 
 fn goldens() -> Vec<Golden> {
@@ -3898,9 +3925,42 @@ fn durable_content_hash(
         shape.archived_text().to_string()
     }
 
+    /// The digests `rederive_digests` stores for `content`, through the copied
+    /// functions. `session_start` stays empty: its state is not in `content`.
+    pub(super) fn archived_content_digests(
+        base: &[u8],
+        content: &super::ArchivedContent,
+    ) -> Result<super::ContentDigests, String> {
+        let mut d = Dec::new(base);
+        let mut reduction =
+            CachedJsonlReduction::take(&mut d).map_err(|_| "base body refused".to_string())?;
+        let acc = &mut reduction.accumulator;
+        acc.title = content.title.clone();
+        acc.first_prompt_title = content.first_prompt_title.clone();
+        acc.first_prompt_material = content.first_prompt_material.clone();
+        acc.workspace_path = content.workspace_path.clone();
+        acc.codex_agent_label = content.agent_label.clone();
+        // Position marks only gate refusal, and these digests never read them.
+        acc.durable_marks = DurableMarks {
+            first_prompt: Some(0),
+            workspace: Some(0),
+            agent_label: Some(0),
+            title_line: Some((0, 0)),
+            unknown: false,
+        };
+        let rederive = rederive_digests(acc, 0).map_err(|refuse| format!("refused: {refuse:?}"))?;
+        Ok(super::ContentDigests {
+            first_prompt: rederive.first_prompt,
+            workspace: rederive.workspace,
+            agent_label: rederive.agent_label,
+            title: rederive.title,
+        })
+    }
+
     /// Re-emit a body through this writer's own field walk. `encode` is not the
     /// entry point because the content digests need live fields that a record
-    /// never carries, so the stored `Rederive` is written back as it was.
+    /// never carries, so the stored `Rederive` is written back as it was and
+    /// `archived_content_digests` checks those digests separately.
     /// Bytes this writer could not have produced refuse here.
     pub(super) fn archived_rewrite(source: SnapshotSource, body: &[u8]) -> Result<Vec<u8>, String> {
         let mut d = Dec::new(body);

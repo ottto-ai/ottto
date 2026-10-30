@@ -4,6 +4,9 @@
 //! every platform.
 use super::*;
 use crate::durable_tail_codec::take_l_spans;
+use crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::{
+    ArchivedContent, ArchivedWriter, W_53d05a43,
+};
 use crate::transcript_acquisition::{birth_unix_nanos, FullReason, ReadMode, Scope};
 use serde_json::json;
 use std::io::Write;
@@ -1518,13 +1521,18 @@ fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
     });
 }
 
-/// The seed's archive comparison runs only in the native rows; this covers the
-/// same rewrite for populated bodies on every platform.
+fn archived_tag(source: SnapshotSource) -> u8 {
+    match source {
+        SnapshotSource::ClaudeCode => 1,
+        _ => 2,
+    }
+}
+
+/// The seed's archive comparison runs only in the native rows, and it passes
+/// stored digests through. This covers the rewrite for populated bodies on every
+/// platform and refuses digest drift through the archived functions themselves.
 #[test]
 fn populated_bodies_match_the_archived_v1_writer() {
-    use crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::{
-        ArchivedWriter, W_53d05a43,
-    };
     for case in cases() {
         let scratch = Scratch::new("archived-writer");
         let path = scratch.write("t.jsonl", &case.lines);
@@ -1535,10 +1543,65 @@ fn populated_bodies_match_the_archived_v1_writer() {
             line_cap(),
         )
         .unwrap();
-        let source_tag = match case.source {
-            SnapshotSource::ClaudeCode => 1,
-            _ => 2,
+        let tag = archived_tag(case.source);
+        assert_eq!(W_53d05a43::encode_body(tag, &body).as_ref(), Ok(&body));
+        let stored = decode(&body, case.source).unwrap().rederive;
+        let acc = &reduction.accumulator;
+        let content = ArchivedContent {
+            title: acc.title.clone(),
+            first_prompt_title: acc.first_prompt_title.clone(),
+            first_prompt_material: acc.first_prompt_material.clone(),
+            workspace_path: acc.workspace_path.clone(),
+            agent_label: acc.codex_agent_label.clone(),
         };
-        assert_eq!(W_53d05a43::encode_body(source_tag, &body), Ok(body));
+        let archived = W_53d05a43::content_digests(tag, &content).unwrap();
+        assert_eq!(archived.first_prompt, stored.first_prompt);
+        assert_eq!(archived.workspace, stored.workspace);
+        assert_eq!(archived.agent_label, stored.agent_label);
+        assert_eq!(archived.title, stored.title);
+        assert!(
+            [archived.first_prompt, archived.workspace]
+                .iter()
+                .any(Option::is_some),
+            "a populated case must exercise the digests"
+        );
+        let mut renamed = content.clone();
+        renamed.workspace_path = Some(PathBuf::from("/fixture/other-workspace"));
+        renamed.title = Some("other title".to_string());
+        let moved = W_53d05a43::content_digests(tag, &renamed).unwrap();
+        assert_ne!(moved.workspace, stored.workspace);
+        assert_ne!(moved.title, stored.title);
+    }
+}
+
+#[test]
+fn session_start_digest_matches_the_archived_v1_writer() {
+    let mut actual = Vec::new();
+    for (source, lines) in [
+        (
+            SnapshotSource::ClaudeCode,
+            claude_instruction_lines("archived-writer"),
+        ),
+        (
+            SnapshotSource::Codex,
+            codex_instruction_lines("archived-writer"),
+        ),
+    ] {
+        let scratch = Scratch::new("archived-session-start");
+        let path = scratch.write("t.jsonl", &lines);
+        let (reduction, _) = full_read(&path, source);
+        let body = encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        )
+        .unwrap();
+        let stored = decode(&body, source).unwrap().rederive.session_start;
+        let digest = hex(stored.expect("instruction lines set a session start digest"));
+        println!("GOLDEN-SESSION {} {digest}", archived_tag(source));
+        actual.push((archived_tag(source), digest));
+    }
+    for (tag, digest) in actual {
+        assert_eq!(Some(digest.as_str()), W_53d05a43::session_start_golden(tag));
     }
 }

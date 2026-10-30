@@ -53,6 +53,24 @@ pub(crate) struct ArchivedRecord {
     pub(crate) body: Vec<u8>,
 }
 
+/// Live values the content digests cover; a record never stores them.
+#[derive(Clone, Default)]
+pub(crate) struct ArchivedContent {
+    pub(crate) title: Option<String>,
+    pub(crate) first_prompt_title: Option<String>,
+    pub(crate) first_prompt_material: Option<String>,
+    pub(crate) workspace_path: Option<std::path::PathBuf>,
+    pub(crate) agent_label: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContentDigests {
+    pub(crate) first_prompt: Option<[u8; 32]>,
+    pub(crate) workspace: Option<[u8; 32]>,
+    pub(crate) agent_label: Option<[u8; 32]>,
+    pub(crate) title: Option<[u8; 32]>,
+}
+
 pub(crate) enum Golden {
     /// The whole record for an opaque body: framing only.
     Frame {
@@ -72,10 +90,16 @@ pub(crate) trait ArchivedWriter {
     fn regions() -> &'static [Region];
     /// The allowlist digest this writer stamps for a source.
     fn allowlist(source_tag: u8) -> Result<[u8; 32], String>;
-    /// The body bytes this writer emits for a record, or why it never could.
+    /// Re-emit stored body bytes, or say why this writer never could have. Stored
+    /// content digests pass through, so drift in them needs the two checks below.
     fn encode_body(source_tag: u8, body: &[u8]) -> Result<Vec<u8>, String>;
     /// Header, opaque body and trailer.
     fn frame(record: &ArchivedRecord) -> Result<Vec<u8>, String>;
+    /// Digests this writer's own functions compute for live content.
+    fn content_digests(source_tag: u8, content: &ArchivedContent)
+        -> Result<ContentDigests, String>;
+    /// This writer's `session_start` digest of the fixed instruction transcripts.
+    fn session_start_golden(source_tag: u8) -> Option<&'static str>;
     fn goldens() -> Vec<Golden>;
 
     fn encode(record: &ArchivedRecord) -> Result<Vec<u8>, String> {
