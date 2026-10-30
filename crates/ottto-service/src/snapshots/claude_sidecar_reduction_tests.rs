@@ -1400,23 +1400,6 @@ mod durable_restart {
     }
 }
 
-trait RestoreTestOutcome {
-    fn into_test_option(
-        self,
-    ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>;
-}
-impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
-    fn into_test_option(
-        self,
-    ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>> {
-        match self {
-            Self::Restored(taken, _) => Some(*taken),
-            Self::Miss(_) => None,
-            Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
-        }
-    }
-}
-
 fn fixture_in_home(home: &Path) -> Fixture {
     let mut f = Fixture::new(1);
     let old_dir = f.dir.clone();

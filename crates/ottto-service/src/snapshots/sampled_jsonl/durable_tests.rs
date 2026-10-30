@@ -3499,7 +3499,7 @@ fn copied_only_pi_fork_is_complete_emits_zero_and_restores_tail() {
         ReadMode::Tail
     );
     while !tail.step().unwrap() {}
-    let identity = tail.opened_object_identity().unwrap();
+    let identity = opened_object_identity(source, tail.reader.reader.get_mut()).unwrap();
     let parsed = tail
         .finish(&identity, &path, COLLECTED, "fp".into(), None, None, None)
         .unwrap();

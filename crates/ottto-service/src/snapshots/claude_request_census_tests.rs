@@ -463,6 +463,7 @@ fn census_unchanged_preserves_only_matching_verified_records() {
             record_claude_request_census(
                 &mut index,
                 ClaudeRequestCensusParse {
+                    held_index_keys: &Default::default(),
                     path,
                     index_key: &key,
                     source_file_fingerprint: &fingerprint,

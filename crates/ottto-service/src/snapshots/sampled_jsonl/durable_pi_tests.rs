@@ -549,8 +549,8 @@ fn fork_round_trip_keeps_only_local_cutoff_fields_and_funds_the_box() {
     assert!(!bytes
         .windows(PARENT_CANARY.len())
         .any(|w| w == PARENT_CANARY.as_bytes()));
-    assert!(!format!("{:?}", original.accumulator).contains(PARENT_CANARY));
-    assert!(!format!("{:?}", original.accumulator)
+    assert!(!format!("{:?}", original.accumulator.seen_pi_usage_keys).contains(PARENT_CANARY));
+    assert!(!format!("{:?}", original.accumulator.seen_pi_usage_keys)
         .contains(&pi_timestamp_nanos(FORK_TIME).unwrap().to_string()));
     assert_eq!(verify_without_allocation(&bytes), Ok(()));
     let decoded = take_body(&mut Dec::new(&bytes)).unwrap();

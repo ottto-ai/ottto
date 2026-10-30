@@ -831,7 +831,7 @@ pub(crate) const PI_ONLY_E_LABELS: &[(&str, &str)] = &[
     // M-2 (E1, 2026-10-30): the Pi usage ledger plus the Pi fork state. An
     // `E` field: Claude and Codex must leave it empty, and Pi moves it into
     // the Pi section under `A_P`. The shape keeps the pre-M-2 type text, so
-    // `A_C` 8d141d53… and `A_X` 02206079… stay byte-identical.
+    // the Claude and Codex allowlist digests stay byte-identical.
     (
         "SnapshotAccumulator.seen_pi_usage_keys",
         "BTreeMap<String, PiUsageDedupState>",

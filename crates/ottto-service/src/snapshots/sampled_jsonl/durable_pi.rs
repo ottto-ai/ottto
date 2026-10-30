@@ -64,7 +64,7 @@ pub(crate) fn verify_body(d: &mut Dec<'_>) -> Result<(), Corrupt> {
     Rederive::verify(d)?;
     crate::durable_tail_codec::verify_h_map::<String, PiUsageDedupState>(d, PI_LEDGER_MAX_KEYS)?;
     let has_parent = bool::take(d)?;
-    let header_nanos = Option::<i128>::take(d)?;
+    let header_nanos = <Option<i128> as Durable>::take(d)?;
     valid_fork_fields(has_parent, header_nanos)?;
     d.finish()
 }
@@ -88,7 +88,7 @@ pub(crate) fn take_body(d: &mut Dec<'_>) -> Result<Decoded, Corrupt> {
 fn take_ledger(d: &mut Dec<'_>) -> Result<PiLedger, Corrupt> {
     let usage_keys = crate::durable_tail_codec::take_h_map(d, PI_LEDGER_MAX_KEYS)?;
     let has_parent = bool::take(d)?;
-    let header_nanos = Option::<i128>::take(d)?;
+    let header_nanos = <Option<i128> as Durable>::take(d)?;
     valid_fork_fields(has_parent, header_nanos)?;
     if has_parent {
         // Fund the RAM-only wrapper before allocating it.

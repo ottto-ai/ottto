@@ -15212,7 +15212,8 @@ fn pi_live_prepare_ledger_cap_counts_entry_cap_refusal_once() {
         )
         .unwrap();
     for over_cap in [false, true] {
-        accumulator.seen_pi_usage_keys = (0..codec::pi::PI_LEDGER_MAX_KEYS + usize::from(over_cap))
+        *accumulator.seen_pi_usage_keys = (0..codec::pi::PI_LEDGER_MAX_KEYS
+            + usize::from(over_cap))
             .map(|n| (format!("{n:064x}"), PiUsageDedupState::default()))
             .collect();
         let view = LiveFinishView::new(
@@ -16143,6 +16144,7 @@ pub(in crate::snapshots) fn advance_scanner_clock_past_eviction_fillers(cache: &
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn non_pi_fork_live_encode_refusal_is_counted_and_writes_nothing() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let root = crate::test_scratch::ScratchDir::new("m2-non-pi-fork-refused");
         let _lock = test_locks::hold(&root);
@@ -16193,7 +16195,14 @@ fn non_pi_fork_live_encode_refusal_is_counted_and_writes_nothing() {
             _ => panic!("a non-Pi fork must refuse"),
         }
         let counts = &cache.durable().unwrap().counters;
-        assert_eq!(counts.retained_refused_pi_ledger_cap, 0);
+        assert_eq!(
+            counts
+                .not_persisted
+                .get("wa.entry_cap")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
         assert_eq!(
             counts.not_persisted.get("wa.codec").copied().unwrap_or(0),
             1
