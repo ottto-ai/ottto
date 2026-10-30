@@ -625,18 +625,33 @@ fn added_twin_family_member_blocks_apply_at_the_existing_native_file_cap() {
 
 #[test]
 fn closure_growth_refuses_preparation_before_reowing_any_member() {
-    let (home, root, mut index, _, expected) = twin_setup("copy-prefix-twin-closure-growth");
+    let (home, root, mut index, main, expected) = twin_setup("copy-prefix-twin-closure-growth");
     let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
     let support = home.join("support");
     run(&home.join("scope.json"), &support, true).unwrap();
-    let old = expected.iter().next().unwrap();
+    // PathBuf orders components: a root's subagent directory can precede
+    // its main filename. Copy the explicit main, never an arbitrary member.
+    let old = &main;
     let new = root.join("another-copy").join(old.file_name().unwrap());
     fs::create_dir_all(new.parent().unwrap()).unwrap();
     fs::copy(old, &new).unwrap();
-    index.files.insert(
-        local_index_key(&new),
-        index.files[&local_index_key(old)].clone(),
+    assert_eq!(
+        claude_index_path_family_member(&new),
+        claude_index_path_family_member(old),
+        "the new path must be a twin in the requested family"
     );
+    assert!(!expected.contains(&new));
+    assert!(index
+        .files
+        .insert(
+            local_index_key(&new),
+            index.files[&local_index_key(old)].clone(),
+        )
+        .is_none());
+    let request: Request = bounded_json(&support.join("snapshots").join(REQUEST)).unwrap();
+    let (grown, _) = closure(&index, &request).unwrap();
+    assert_eq!(grown.members.len(), expected.len() + 1);
+    assert!(grown.members.iter().any(|m| m.path == new));
     let before = serde_json::to_value(&index).unwrap();
     assert!(prepare(&mut index, &support, &[root]).is_err());
     assert_eq!(serde_json::to_value(&index).unwrap(), before);
