@@ -201,3 +201,8 @@ The healthy control restores and reads only the appended suffix. Both results
 must encode identically to a cold Full. The separate quiet-RAM repair fixture
 requires the failure counter remain one after its successful no-read retry.
 All restored graphs retain their active lease through parsing or disposal.
+
+The header-restore sizing fixture prepares both admission budgets while its
+sizing graph owns the process-wide active lease, then drops that graph and
+releases the lease before trying either restore. A sizing-only graph cannot
+hold the single transfer owner while another restore waits for it.

@@ -14795,7 +14795,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
     // capacities, rather than assuming that 256 KiB covers the native layout.
     let sizing = SharedCache::default();
     sizing.durable_begin_pass(source, &index_path, &namespace, false);
-    let (incoming, _sizing_lease) = match sizing.durable_restore(
+    let (incoming, sizing_lease) = match sizing.durable_restore(
         source,
         &key,
         &path,
@@ -14815,7 +14815,9 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
         incoming.checkpoint.modified_hint(),
         crate::transcript_cache::admission_now(),
     );
-    for fits in [true, false] {
+    // Size both admission arms while this graph still owns its one process
+    // lease, then dispose of it before any subsequent durable restore.
+    let trials = [true, false].map(|fits| {
         let cache = SharedCache::default();
         cache.durable_begin_pass(source, &index_path, &namespace, false);
         READ_CALLS.with(|count| count.set(0));
@@ -14866,6 +14868,11 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
                 })
                 .unwrap();
         }
+        (fits, cache, before)
+    });
+    drop(incoming);
+    sizing_lease.release();
+    for (fits, cache, before) in trials {
         let restored = cache.durable_restore(
             source,
             &key,
