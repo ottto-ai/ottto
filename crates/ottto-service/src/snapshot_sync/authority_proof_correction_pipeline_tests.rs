@@ -1197,43 +1197,34 @@ impl ApcFixture {
     /// (ON). A request-owned body never demotes, so no terminal hold grants a
     /// correction at that gate: in production an owed correction is one an
     /// older build persisted before the flip. Two accepting generations prove
-    /// the family and deliver its bodies. Agent a's next request is then
-    /// refused retryably, so its current body is changed and unaccepted, as
-    /// that build's terminal hold left it. The persisted index then gets that
-    /// build's owed correction under the current proof
+    /// the family and deliver its bodies. A later note on agent a then changes
+    /// its body (last activity) but no request evidence, so the proof stays.
+    /// The persisted index gets that build's owed correction under the proof
     /// (`bind_pre_flip_claude_correction_for_test`) and reloads intact.
     fn pre_flip_grant(&self) -> ApcGrant {
         let family = apc_family_sessions();
         for hour in 8..10 {
             self.generation(hour, |_| ApcUpload::Accept);
         }
-        let delivered = ScanIndex::load(&self.index_path).expect("load the delivered index");
-        for (member, head) in Self::family_heads(&delivered) {
+        let mut index = ScanIndex::load(&self.index_path).expect("load the delivered index");
+        for (member, head) in Self::family_heads(&index) {
             let head = head.unwrap_or_else(|| panic!("{member} has a current head"));
             assert!(
-                delivered.accepted_snapshot_fingerprint_recorded(&head),
+                index.accepted_snapshot_fingerprint_recorded(&head),
                 "{member}'s request-owned head is accepted"
             );
         }
-        let hour = 10;
-        let changed = apc_member_session(Some(APC_AGENTS[0]));
-        self.append_family_request(Some(APC_AGENTS[0]), "req_agent_a_2", 4);
-        let pages = self.generation(hour, |_| ApcUpload::RetryableRejection);
-        let last = pages.last().expect("terminal page");
-        assert!(last.scan.census_complete);
-        assert!(last.record().is_none(), "no record forms at the E2 gate");
-        let head = Self::family_heads(&last.index)[&changed]
-            .clone()
-            .expect("agent a has a current head");
         assert!(
-            pages.iter().any(|page| page.offered.contains(&head)),
-            "agent a's changed body is offered"
+            index.claude_authority_record_for_test(APC_ROOT).is_none(),
+            "no record forms at the E2 gate"
         );
-        assert!(
-            !last.index.accepted_snapshot_fingerprint_recorded(&head),
-            "agent a's changed body is not accepted"
+        let witness = index
+            .claude_usage_family_witness_digest_for_test(APC_ROOT)
+            .expect("the family is proven");
+        Self::append(
+            &self.member_path(Some(APC_AGENTS[0])),
+            &apc_note_line(APC_ROOT, 0),
         );
-        let mut index = last.index.clone();
         index.bind_pre_flip_claude_correction_for_test(APC_ROOT);
         index.save(&self.index_path).expect("save the pre-flip index");
         let seeded = ScanIndex::load(&self.index_path).expect("reload the pre-flip index");
@@ -1244,15 +1235,10 @@ impl ApcFixture {
         let (proof, owed) = record.correction.clone().expect("it owes a correction");
         assert_eq!(record.contract, "claude_usage_authority_quarantine:v2");
         assert!(record.bound_to_retained_witness && record.terminal);
-        assert_eq!(
-            seeded
-                .claude_usage_family_witness_digest_for_test(APC_ROOT)
-                .as_deref(),
-            Some(proof.as_str())
-        );
+        assert_eq!(proof, witness, "the correction is owed under the proof");
         assert_eq!(owed, family, "every family member owes the correction");
         ApcGrant {
-            hour,
+            hour: 9,
             proof,
             record,
             owed,
@@ -3658,8 +3644,8 @@ fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-f1-last", true);
     let grant = fixture.pre_flip_grant();
-    // Agent a's requests after the establishing generation changed its body,
-    // so its correction needs an exact ACK.
+    // Agent a's note after the delivery changed its body, so its correction
+    // needs an exact ACK.
     let held = BTreeSet::from([apc_member_session(Some(APC_AGENTS[0]))]);
     let (pages, release) =
         apc_f1_hold_then_release(&fixture, &grant, &held, &held, ApcUpload::Accept);
