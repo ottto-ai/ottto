@@ -22,8 +22,21 @@ its requests are refused as incomplete evidence. For cap/generation discards,
 E2 places every family share at None for this page: no own account, retained
 start/binding fallback, root-to-child inheritance, or markerless-account
 shortcut can supply a login. Final grouping and identity_parts keep None.
-Durable creator bindings remain untouched and owed history stays held. Account
-attribution is delayed to a later clean pass, never a retained or other account.
+Durable creator bindings remain untouched and owed history stays held.
+
+The page then defers the family's upload. Root and child items are withheld
+through E2's existing withhold (`entity.held`, as for an undecided copy), so
+`finish_page` emits no body and `hold_request_owned` holds them. Nothing of
+the family is posted and no ACK is recorded. Each held key keeps its committed
+revision, so the next page reads it again. Owed history keeps its custody
+through the existing unhealthy-telemetry hold. A bucket the server already
+accepted with a tag is therefore never replaced by an untagged revision. Such
+a revision could let a backend fallback move that hour to another account.
+Attribution and usage for a session whose trace read was discarded are delayed
+one pass. They are never untagged and never another account. A page that
+discards again defers again. Each discard event costs one re-read, the same
+as any other E2 withhold. The None placement and the wire-account clear stay
+as defence in depth: they act only on items the page now withholds.
 Other unhealthy reads retain their existing fallback behavior. Stable
 input keeps the previous rows, dedupe and health counters exactly.
 
@@ -32,18 +45,20 @@ Counters: the trace report carries `rows_discarded` (`cap`, `generation`,
 line as `trace_rows_discarded`. The key is absent while empty, so ordinary
 counts lines and snapshot-audit output are unchanged. The same counts line
 also carries `trace_discard_no_fallback_requests`, the number of requests placed
-at None by this rule, omitted while zero.
+at None by this rule, and `trace_discard_deferred_items`, the number of items
+whose upload the page deferred. Both are omitted while zero.
 
-No persisted field, upload body, ACK, fingerprint or checkpoint changes. The
+No persisted field, upload body format, ACK or checkpoint format changes. The
 pre-paid bounded reader is unchanged.
 
 The real scanner/evidence regressions are
 `e2_pipeline_bound_a_own_b_cap_discard_has_no_fallback_then_recovers` and
 `e2_pipeline_bound_a_own_b_generation_discard_has_no_fallback_then_recovers`
-(Unix-only). Both retain binding A while clean own evidence tags B, discard
-tags None, and the next clean page tags B again. They check root/child shares,
-identity_parts, unchanged per-session request/token/cost totals, history custody
-and the request counter. `e2_pipeline_bound_a_malformed_trace_keeps_main_fallback`
+(Unix-only). Both retain binding A while clean own evidence tags B. The discard
+page defers root and child, so the production upload filter sends nothing of
+the family. The next clean page tags B again with unchanged per-session
+request/token/cost totals. They check root/child shares, identity_parts,
+history custody and both counters. `e2_pipeline_bound_a_malformed_trace_keeps_main_fallback`
 controls main's uniform-login case: an unhealthy, non-discard trace keeps the
 uniform own login B already set on the wire. The split-login family (root B,
 child C, binding A) shows the retained-account hazard:
@@ -51,4 +66,10 @@ child C, binding A) shows the retained-account hazard:
 non-discard fallback to A, while
 `e2_pipeline_bound_a_split_logins_cap_discard_blocks_retained_a` and
 `e2_pipeline_bound_a_split_logins_generation_discard_blocks_retained_a`
-(Unix-only) tag None on discard and B/C again on the next clean page.
+(Unix-only) defer the family on discard and tag B/C again on the next clean
+page. `e2_pipeline_accepted_b_cap_discard_defers_upload_then_recovers` and
+`e2_pipeline_accepted_b_generation_discard_defers_upload_then_recovers`
+(Unix-only) first record the clean B/C bodies in the accepted-identity ledger,
+with the write a stored ACK makes, and read that ledger on every later page.
+The discard page uploads nothing for the family. The next clean page uploads
+B/C with unchanged totals.
