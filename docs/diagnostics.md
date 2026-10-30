@@ -229,18 +229,36 @@ lifetime memory high-water mark, not a collection/cycle peak or current RSS.
 `process_lifetime_max_rss_before_bytes` preserves the start sample when both
 samples are available and non-regressing; otherwise it is `null`. A rise
 correlates only with a process-wide time window, not allocation ownership.
-Unavailable measurements and regressing CPU deltas are `null`. Unix observation
-time and process id support comparison with an independently measured matching
-process. Never subtract or sum overlapping windows or infer per-stage memory
-use: the finish window contains its batch-call windows.
+`source_prepare` wraps synchronous source preparation (including index load
+and baseline construction); it emits an empty counts object on normal return,
+including errors or no-frame returns. Like `source_finish`, it emits no record
+on panic. Both stages, for Claude Code, Codex and Pi, include
+`stage_peak_footprint_bytes`, `stage_start_footprint_bytes`,
+`stage_end_footprint_bytes` and `footprint_samples` when available. One shared
+background thread samples current process footprint every 50 ms while stages
+are open and parks when idle. Start and end reads also contribute to the peak
+and successful sample count. macOS uses `TASK_VM_INFO.phys_footprint`, falling
+back to resident size; Linux uses resident pages from `/proc/self/statm`.
+These are sampled process-wide peaks during a stage, including concurrent work;
+shorter spikes can be missed. They do not establish allocation ownership.
+Up to 16 overlapping stages have independent bounded counters; overflow or
+thread-start failure leaves the measurements absent. `footprint_sample_failures`
+counts unavailable reads (or one refused sampler/slot attempt). Failed endpoints
+and wholly unavailable measurements are absent, as are all footprint fields
+on unsampled stages. Other unavailable measurements and regressing CPU deltas
+are `null`. Unix observation time and process id support comparison with an
+independently measured matching process. Never subtract or sum overlapping
+windows or infer allocation ownership: the finish window contains its batch-call
+windows.
 
 There is one bounded observation per completed page, batch call and normally
-returned finish, with two OS resource samples per observation, no per-row
-sampling, extra transcript reads or new diagnostic store. Version 2 adds one
-record per finish and removes one text line per sampled page; total log writes
-are not unchanged. Output is a synchronous best-effort write on the calling
-thread under std's stderr lock; errors are ignored, with no retry, queue or
-thread. It may block for the duration of a regular-file write, like existing
+returned prepare or finish, with two CPU/lifetime-RSS samples per observation,
+plus the bounded prepare/finish footprint sampler. There is no per-row sampling,
+extra transcript read or new diagnostic store. Version 2 adds one record per
+finish and removes one text line per sampled page; the footprint gauge adds one
+record per prepare. Output is a synchronous best-effort write on the calling
+thread under std's stderr lock; errors are ignored, with no retry or queue for
+log output. It may block for the duration of a regular-file write, like existing
 service stderr lines. Log output uses existing service retention and may be
 unavailable; diagnostic write errors do not fail collection or upload.
 Status/quota refresh, OTLP reception and independent metadata/discovery work are
@@ -369,6 +387,38 @@ These are store bytes, separate from transcript re-derivation bytes. Counters
 on the durable pass summary are process totals; `take_pass` store receipts reset
 their flows while retaining disk levels. Alarm counts retain the delta/total
 contract above.
+
+### Claude Census Retirement Overlap
+
+A complete Claude terminal retires transcript census records whose file was
+last modified more than 35 days before the census window. An aged record that
+shares a request id with another unretired census record is kept instead, so a
+resumed copy keeps its cross-session copy proof while both files stay indexed.
+The terminal then emits `claude_census_retire_kept_overlap` with
+`census_retire_kept_overlap_records`, `census_retire_kept_overlap_hashes`,
+`census_retire_kept_overflow` and its two reasons,
+`census_retire_kept_overflow_occupancy` and
+`census_retire_kept_overflow_admission`, each with a `_total` process total,
+and `census_missing_over_budget`: the same terminal's census-full tombstone
+count (the shadow's `missing_over_budget`), so both read together.
+Kept records stay while the census, after the other aged records retire, is
+at most 90% full by both its hash budget and its serialized budget. Above
+that, the oldest kept records (equal ages in path order) retire until it is
+back at 90%, counted as occupancy overflow, so one index always yields one
+kept set. Kept records never cost another record its admission: a transcript
+record that does not fit whole first retires, oldest first, the records the
+age rule would retire at that window but that still hold their hashes, only
+as many as it needs; if retiring all of them would still not admit it, none
+retires and the record is tombstoned as before. Each such insert emits a row with zero kept counts, no
+`census_missing_over_budget`, and the records it retired as admission
+overflow. The census holds at most 65,536 records, live as on load: a new
+transcript key past that gets no record (read as missing) and emits a row
+with `census_record_limit_refused` = 1 and no `census_missing_over_budget`.
+Every row carries `census_record_limit_refused` and its `_total`. A positive
+overflow, by either reason, or a positive refusal also emits
+`claude_census_retire_kept_overlap_alarm` with the same counts. Each terminal
+decides again, so a kept record retires once its partner is pruned or
+retired. Counts only; no path, id or wire event.
 
 ## Credential File Cap Refusals
 
@@ -731,6 +781,78 @@ OTLP sources can serve again. A busy approved port can then produce the mismatch
 finding above. Without an approved candidate, the fallback chain applies immediately.
 Startup retains its existing behavior of falling back if the approved port is
 busy.
+
+## Claude Stale Exporter Port
+
+Claude Code keeps its telemetry endpoint for the life of a session. Ottto can
+serve up to two older approved candidate ports on loopback, accepting only
+`POST /v1/logs`, `/v1/metrics` and `/v1/traces` through the same local export
+handler. Control and health routes return 404 on these listeners. A private,
+versioned port record retains the newest two previous approvals. On first
+approval it seeds once from retained Ottto-owned Claude settings backups,
+reading at most the newest ten JSON backups with the existing size and
+no-symlink checks. Ports must be in the current user's relay candidate list;
+seed discovery does not guess ports or connect to them. Busy ports are skipped
+and retried every 60 seconds. Legacy binds first probe IPv4 and dual-stack
+IPv6 wildcard addresses, then bind IPv4 loopback. Successful wildcard probes
+stay bound through the loopback bind and listen, closing that acquisition gap.
+All three binds use `SO_REUSEADDR`: live wildcard or IPv4 loopback listeners veto
+the port, while our connected sockets and TIME_WAIT allow immediate replacement.
+IPv4 remains available when the probe reports that IPv6 is unavailable.
+A port observed as the current approval is removed from legacy ingress; primary
+recovery releases that legacy socket before attempting its bind.
+
+Every legacy export rechecks Claude endpoint approval and the listener's live
+approval generation immediately before capture. Refused exports return 403 and
+store no evidence or successful-request activity. Claude telemetry disable,
+default-approval removal and setup opt-out operations invalidate that generation
+synchronously and wait up to two seconds for the supervisor to persist
+retirement and close sockets. Secondary-account removal
+and browser-login cleanup preserve legacy listeners and default approval;
+acknowledgement waits never hold the Claude settings lock. Each tick captures
+its generation before reading approval, so a concurrent revoke also fences
+sockets created later in that tick. A pending revoke also blocks exports and
+new/refreshed listener activity until retirement is persisted and sockets close.
+Periodic checks retire ports only after two consecutive definite non-approval
+reads. I/O errors, missing
+settings and truncated or unparsable JSON are unknown: that export is refused,
+but listeners/history are preserved and the consecutive-revocation streak resets.
+Idle expiry also retires a port. Retirement survives restarts and prevents
+re-seeding or reopening until that port is explicitly approved again and then
+superseded. The primary listener continues its existing behavior for all sources.
+The optional record is separate from existing daemon formats: older daemons
+ignore it, and missing fields or unknown extra fields decode without error.
+Retirement is persisted before socket closure, with a separate owner-only
+`legacy-relay-retired.json` tombstone protecting against replay of a stale main
+record after a failed write. A write failure closes legacy listeners and attempts
+to remove the stale main record. If both state and tombstone writes fail,
+compatibility supervision stops and logs the failure; retirement may be unknown
+after restart. Existing atomic-file durability guarantees apply.
+
+A legacy entry retires after 24 hours without a successful OTLP request, starting
+when it enters the persisted record even if a busy port never binds. Entry time
+and request activity persist across daemon restarts; activity writes are
+limited to once per 10 minutes, so a crash can lose up to that much recent
+activity and shorten retention. No request content or identity is in the port
+record. The primary relay's `/healthz` response includes process-local counts
+under `legacy_relay`: `otlp_legacy_listener_bound` (current gauge),
+`otlp_legacy_listener_requests`, `otlp_legacy_listener_busy` and
+`otlp_legacy_listener_closed` (cumulative counts since process start). Busy means
+bind attempts skipped. Closed counts only actually open sockets released,
+including on supervisor exit; retiring a never-bound entry adds no close.
+With no open sockets the supervisor waits until its next tick or a command.
+Live sockets drain up to 16 pending connections per turn. Resource-related
+accept failures back off; unusable sockets release for later tick rebind, keeping
+recent request activity. Release checks descriptor ownership before closing. Accept
+error logs are limited to one line per minute per socket.
+
+Canonical health reports `claude_stale_exporter_port` as a `Warning` owned by
+`source`, with runtime authority, while a legacy listener has accepted OTLP
+within the last hour in this process. Restart those Claude Code sessions to
+reload the current telemetry endpoint. The uploaded warning contains no port
+number. It follows blocking account and source findings in the blocker list.
+This restores future local evidence; it cannot recover dropped batches
+and does not change consent, account attribution or money calculations.
 
 ## Common Diagnostics Flow
 
@@ -1278,13 +1400,92 @@ the same cause with a `near_cap` annotation. Source caps predate this path:
 512 MiB Claude, 256 MiB Pi, 2 GiB Codex. Above the cap the existing oversized-file
 rejection/disclosure still applies; near-cap admission does not expand it.
 
-Workspace re-derivation captures at most 4096 bytes per selected field and
-requires the original digest. Unsupported first-prompt, title, agent-label
-and session-start obligations remain `rederive_unfunded`. Capture/hash/read
-refusals are counted as `not_rederived`; no altered value is published.
-`rederive_input_bytes` counts each actual physical read, including bytes read
-before a later capture/hash refusal. Success receipts count successful restores
-separately; do not add the two byte counters together.
+With restart restore enabled, content re-derivation runs only after growth
+past the committed extent. Quiet files return Pending before certificate samples
+or content input. Grown files validate the existing certificate samples before
+any decode, support, pacing or allocation refusal, so those refusals cannot hide
+prefix edits. The native M1 route remains active when the switch is OFF.
+
+The replay reads at most a 1 MiB head and one title line of at most 1 MiB.
+An enforced seeded JSON builder admits at most 8,388,608 bytes of Value-owned
+requested allocations per line, prepaid on the existing active lease. Decoded
+raw-value magic keys refuse to the counted growth Full; no partial parse is
+adopted. Shared native content helpers rebuild the projection, and all recorded
+content digests must match before any fields move. `rederive_fence_mismatch`
+is an alarm: any nonzero value needs investigation. No content enters diagnostics.
+
+`rederive_head_reads` and `rederive_head_bytes` are process totals; the latter
+includes title input and partial reads. Use daily byte deltas for replay cost.
+`rederive_line_peak_bytes` records exact metered line high-water, alongside the
+active-lease high-water (which survives refunds) and stage footprint samples.
+`rederive_refused` counts failures after input by content class.
+`rederive_unsupported` names fixed boundary/mark/title refusal classes.
+`resource_full.decode` keeps decode refusals separate from certificate edits.
+Success receipts count successful restores separately from physical input;
+do not add the two byte counters together.
+
+A replay attempt is remembered by predecessor extent, not exact generation.
+A new extent resets only the head attempt; the cross-cause Full spend remains.
+Re-derive failures take at most one growth Full per key per six hours, plus at
+most one extra near the source cap, counted `rederive_failure_full.near_cap`.
+This exception avoids losing discovery when a held file grows beyond its source
+cap. Budget contention waits without a Full; after six hours its counted
+`rederive_budget_aged` fallback uses the same Full pacing. The paid pace map's
+overflow permits at most one extra head per evicted extent and alarms
+`pace_evicted`. Discovery custody survives pace eviction independently.
+
+Fence and certificate-edit retirement is bound to a verified predecessor.
+`rederive_retire.{retired,superseded,retry}` describes writer outcomes; missing
+binding authority is counted as `rederive_retire_unproven` or
+`rederive_retire_unfunded` and never grants deletion. Unlink's directory-sync
+obligation survives an absent path and is retried at saves. Pending receipts
+and unknown survivors remain protected. Retirement never creates an ACK.
+Missing retirement authority also emits `retire_exact_held{edge}`, where `edge`
+is `metadata`, `accepted_object`, `independent_edit` or `scoped_certificate`.
+The predecessor and discovery hold remain. `retire_exact_held_exit` names an
+existing exit: `revalidated_retire_exact` means a later eligible verified read
+can reacquire the witness for the post-save writer; `native_replacement_receipt`
+means a later native acquisition must commit its exact replacement receipt
+(`receipt_acquisition`/`discharge_owed`, which release restore-pending discovery).
+Conflicting retained predecessors also require their existing writer/receipt
+settlement before another witness can be installed. A failed stat/read is never
+proven absence; unlink's pending directory sync stays in key custody.
+
+`retire_exact_held_first_attempt{source}` is a **process proxy**, emitted with
+`process_id` on the same per-source pass carrier. It counts keys whose first
+retirement attempt in this process lacked authority; a first success followed
+by a later hold does not count. It resets on restart and stores no restart
+streak. Alarm on the server/log side when this proxy is non-zero across more
+than three consecutive starts. It cannot identify a repeated key. If a first
+observation cannot be funded or is reclaimed, the process latches
+`retire_exact_first_attempt_tracking_closed` and stops enrolling first attempts;
+the cumulative total is then a lower bound and a returning key cannot count
+twice. These observations use the existing bounded key custody and do not
+change any persisted format.
+Claude's accepted-floor hold reports `restored_behind_accepted.held` at its
+actual decision edges. The discovery dependency continues to hard-gate the
+production switch; RAM pacing does not establish restart-persistent bounds.
+Codex and Pi report `restored_behind_accepted.published` only when a complete
+restored Tail body below the frozen accepted extent reaches publication.
+
+`rederive_failed_first_attempt{source}` and `restore_pending_quiet{source}` are
+**proxies**, emitted once per source pass as cumulative process totals on the
+existing `durable_tail_alarm` carrier with `process_id`. The first counts keys
+whose first eligible non-quiet (b) restore attempt in this process failed, including
+a fence drop; later failures of the same key do not increment it, and a first
+success followed by failure does not count. Its diagnostic marker shares the
+bounded key custody. Under capacity pressure, idle diagnostic observations and
+expired pacing can be reclaimed; live receipt, discovery and retirement custody
+remain protected. If any first-result marker is forgotten or cannot be funded,
+`rederive_first_attempt_tracking_closed` latches true and no more first results
+are enrolled for this process. The first-failure total is then a lower bound;
+returning keys cannot be counted twice, and diagnostics cannot pin write capacity. The quiet proxy
+counts metadata-only restores returning Pending with zero transcript input.
+It does not decode obligations and cannot establish `pending_no_obligation`.
+Neither proxy measures a per-key restart streak. Compare process totals using
+`process_id`; they reset on restart and carry no key identity. Full-spend time
+and near-cap use for funded keys also live in key custody, so evicting the paid
+pace node cannot renew either allowance.
 
 ## Codex state-only identity coverage
 

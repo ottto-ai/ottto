@@ -372,6 +372,14 @@ pub(crate) struct DurableRecord {
     pub(crate) wire: Option<WireIdentity>,
 }
 
+/// Writer-owned retirement distinguishes absence/verified replacement from
+/// unknown survivors and I/O. No outcome is an ACK or a receipt.
+pub(crate) enum RetireOutcome {
+    Retired,
+    Superseded,
+    Retry,
+}
+
 /// Exact verified predecessor; no caller can manufacture or clone its authority.
 pub(crate) struct MutationWitness {
     key: Digest32,
@@ -665,6 +673,8 @@ pub(crate) struct DurableTailStore {
     disabled: Option<&'static str>,
     /// This pass: directory checked and [records loaded, T14 rebuilds].
     checked: bool,
+    /// M1's reader ceiling, selected by the source owner before a pass.
+    read_v1_only: bool,
     pass: [u64; 2],
     /// Process-lifetime attempts, removed only after a successful replacement.
     rebuilt: BTreeMap<Digest32, Rebuild>,
@@ -703,6 +713,13 @@ const RECEIPT_RECONCILE_FAILURES: u8 = 3;
 // A memo entry stays within the 128 bytes per record `STORES_RESIDENT_BOUND` charges.
 const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp, bool))>() <= 128);
 
+/// Counts erasures and unadjudicated records in one privacy pass. No receipt
+/// or per-key state escapes the store; partial progress is always reported.
+pub(crate) struct PrivateLabelPurge {
+    pub(crate) erased: u64,
+    pub(crate) refused: u64,
+}
+
 impl DurableTailStore {
     pub(crate) fn new(dir: PathBuf, source: DurableSource) -> Self {
         Self {
@@ -713,6 +730,7 @@ impl DurableTailStore {
             cleanup: Arc::new(TempCleanupCounts::default()),
             disabled: None,
             checked: false,
+            read_v1_only: false,
             pass: [0; 2],
             rebuilt: BTreeMap::new(),
             startup_synced: false,
@@ -726,6 +744,12 @@ impl DurableTailStore {
             resource_checked: false,
             resource_granted: false,
         }
+    }
+
+    /// Preserve main's envelope admission while restart restore is OFF.
+    /// Only explicit consent erasure may inspect newer known records.
+    pub(crate) fn restrict_reads_to_v1(&mut self) {
+        self.read_v1_only = true;
     }
 
     /// A new pass: the directory is checked again and the T14 breaker resets.
@@ -866,6 +890,7 @@ impl DurableTailStore {
         work: &str,
         writer: Option<&dyn SingleWriter>,
     ) -> Result<Option<Header>, Refusal> {
+        let restoring = matches!(work, "restore" | "privacy_restore");
         let writable = writer
             .or_else(|| {
                 crate::locked_state_dir::held_for(&self.dir).map(|w| w as &dyn SingleWriter)
@@ -931,6 +956,14 @@ impl DurableTailStore {
                 self.counters.guard_header_bytes += n as u64;
             }
             first.map_err(|e| self.read_failure(e, Refusal::Undecodable))?;
+            if self.read_v1_only
+                && work != "privacy_restore"
+                && header.len() >= 10
+                && header[..8] == MAGIC
+                && u16::from_le_bytes([header[8], header[9]]) > FORMAT_V1
+            {
+                return Err(Refusal::NewerFormat);
+            }
             let (_, _, _, size) = dispatch(&header)?;
             let rest = Read::by_ref(&mut file)
                 .take((size - n) as u64)
@@ -954,8 +987,7 @@ impl DurableTailStore {
                 return Err(Refusal::Corrupt);
             }
             if let Some((content, old, _)) = self.durable.get(key) {
-                if work != "restore" && *old == stamp && (work != "overwrite" || content.is_some())
-                {
+                if !restoring && *old == stamp && (work != "overwrite" || content.is_some()) {
                     binding.content = *content;
                     return Ok(Some(binding));
                 }
@@ -976,7 +1008,7 @@ impl DurableTailStore {
             }
             self.note_codec(bytes.capacity());
             verify(&bytes, self.source)?;
-            if work == "overwrite" || work == "restore" {
+            if work == "overwrite" || restoring {
                 binding.content = Some(stored_digest(&bytes));
             }
             let content = stored_digest(&bytes);
@@ -984,7 +1016,7 @@ impl DurableTailStore {
                 *allowed && *saved == stamp && *old == Some(content)
             });
             self.memoize(*key, (Some(content), stamp, allowed));
-            if work == "restore" {
+            if restoring {
                 binding.verified = Some(bytes);
             }
             Ok(Some(binding))
@@ -1085,7 +1117,11 @@ impl DurableTailStore {
         live_context: &Digest32,
     ) -> Result<Option<u64>, Refusal> {
         let held = self.guard_with_carrier(key, has_index, live_context);
+        // The OFF/M1 reader has no successor writer. Its optional corrupt
+        // cache may recover in RAM, but cannot consume an attempt whose only
+        // discharge would be a new durable record.
         if start
+            && !self.read_v1_only
             && held.is_ok()
             && self.disabled.is_none()
             && self.rebuilt.get(key) == Some(&Rebuild::Authorized)
@@ -1113,7 +1149,7 @@ impl DurableTailStore {
         if self.receipt_pending(key) {
             return ReadOutcome::Refused(Refusal::ReceiptPending);
         }
-        match self.read_known(key, None) {
+        match self.read_known(key, None, false) {
             Ok(Some(verified)) => ReadOutcome::Found(verified.record),
             Ok(None) => ReadOutcome::Missing,
             Err(reason) => ReadOutcome::Refused(reason),
@@ -1123,8 +1159,14 @@ impl DurableTailStore {
         &mut self,
         key: &Digest32,
         writer: Option<&dyn SingleWriter>,
+        privacy_erasure: bool,
     ) -> Result<Option<VerifiedRecord>, Refusal> {
-        let mut header = match self.classify(key, "restore", writer)? {
+        let work = if privacy_erasure {
+            "privacy_restore"
+        } else {
+            "restore"
+        };
+        let mut header = match self.classify(key, work, writer)? {
             Some(header) => header,
             None => {
                 self.counters.missing += 1;
@@ -1272,7 +1314,7 @@ impl DurableTailStore {
             };
         }
         self.durable.remove(key); // Reconcile fully verifies, even a memo hit.
-        let receipted = match self.read_known(key, Some(writer)) {
+        let receipted = match self.read_known(key, Some(writer), false) {
             Ok(Some(verified)) if before == stamp_at(&path)? => {
                 if verified.identity == candidate {
                     let file = OpenOptions::new()
@@ -2120,6 +2162,180 @@ impl DurableTailStore {
         Ok(keys)
     }
 
+    /// Explicit privacy erasure after the owning cycle's index save. Only
+    /// fully verified records of the current representation are inspected;
+    /// unknown/future records retain their existing protection. This is not
+    /// overwrite authority, a receipt, or settlement of acquisition debt.
+    /// Compact pending receipt metadata stays owed if its record is erased.
+    pub(crate) fn purge_private_labels<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        mut contains: impl FnMut(&[u8]) -> bool,
+    ) -> io::Result<PrivateLabelPurge> {
+        self.check_writer(writer)?;
+        if !self.usable(Some(writer)) {
+            return Err(io::Error::other("privacy erasure store unavailable"));
+        }
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok(PrivateLabelPurge {
+                    erased: 0,
+                    refused: 0,
+                })
+            }
+            Err(e) => return Err(e),
+        };
+        let mut report = PrivateLabelPurge {
+            erased: 0,
+            refused: 0,
+        };
+        // Stream names, holding at most one existing bounded record body.
+        // Consent erasure covers every known record, even after a bad entry.
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    report.refused += 1;
+                    continue;
+                }
+            };
+            let name = entry.file_name();
+            let Some(key) = name
+                .to_str()
+                .and_then(|s| s.strip_suffix(RECORD_SUFFIX))
+                .and_then(parse_hex_digest)
+            else {
+                continue;
+            };
+            let path = self.record_path(&key);
+            let before = match stamp_at(&path) {
+                Ok(stamp) => stamp,
+                Err(_) => {
+                    report.refused += 1;
+                    continue;
+                }
+            };
+            let verified = match self.read_known(&key, Some(writer), true) {
+                Ok(Some(verified)) => verified,
+                Ok(None) => continue,
+                Err(Refusal::Unknown | Refusal::NewerFormat) => continue,
+                Err(_) => {
+                    report.refused += 1;
+                    continue;
+                }
+            };
+            if !contains(&verified.record.record.body) {
+                continue;
+            }
+            if before.is_none() || stamp_at(&path).ok() != Some(before) {
+                report.refused += 1;
+                continue;
+            }
+            if remove_if_present(&path).is_err() {
+                report.refused += 1;
+                continue;
+            }
+            // Erasure revokes an undelivered retained completion, not the
+            // candidate's owed work. Reconciliation must subsequently prove
+            // synced absence and return Retired, never deliver that receipt.
+            if let Some(pending) = self.pending.get_mut(&key) {
+                pending.completed = None;
+            }
+            self.durable.remove(&key);
+            report.erased += 1;
+        }
+        // Also sync an empty retry after an earlier failed erasure sync.
+        if self.sync_store().is_err() {
+            report.refused += 1;
+        }
+        Ok(report)
+    }
+
+    /// Retire exactly the verified predecessor. `sync_due` belongs to writer
+    /// custody: once unlink succeeds, absence never cancels the sync barrier.
+    pub(crate) fn retire_exact<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        proof: &MutationWitness,
+        sync_due: &mut bool,
+    ) -> RetireOutcome {
+        let result = (|| -> io::Result<RetireOutcome> {
+            self.check_writer(writer)?;
+            if !self.usable(Some(writer))
+                || self.pending.contains_key(&proof.key)
+                || self.receipt_pending(&proof.key)
+            {
+                return Ok(RetireOutcome::Retry);
+            }
+            let path = self.record_path(&proof.key);
+            let before = stamp_at(&path)?;
+            match before {
+                None => {
+                    // Also covers a prior unlink whose sync returned an error.
+                    #[cfg(test)]
+                    test_hooks::transition_edge(CrashPoint::BeforeRetireSync, &self.dir)?;
+                    self.sync_store()?;
+                    #[cfg(test)]
+                    test_hooks::transition_edge(CrashPoint::RetiredSynced, &self.dir)?;
+                    if stamp_at(&path)?.is_some() {
+                        return Ok(RetireOutcome::Retry);
+                    }
+                    self.durable.remove(&proof.key);
+                    *sync_due = false;
+                    self.counters.records_invalidated += 1;
+                    return Ok(RetireOutcome::Retired);
+                }
+                Some(stamp) if stamp != proof.stamp => {
+                    if *sync_due {
+                        self.sync_store()?;
+                    }
+                    // A boolean witness miss is NOT supersession. Force a full
+                    // survivor verification, preserving newer/unknown formats.
+                    self.durable.remove(&proof.key);
+                    let verified = self.read_known(&proof.key, Some(writer), false);
+                    return Ok(
+                        if matches!(verified, Ok(Some(_))) && stamp_at(&path)? == before {
+                            *sync_due = false;
+                            RetireOutcome::Superseded
+                        } else {
+                            RetireOutcome::Retry
+                        },
+                    );
+                }
+                Some(_) => {}
+            }
+            let _header = self
+                .classify(&proof.key, "delete", Some(writer))
+                .map_err(|_| io::Error::other("retirement classification"))?
+                .ok_or_else(|| io::Error::other("retirement unknown survivor"))?;
+            // The retained witness is the eligible original-binding authority;
+            // begin_pass and memo turnover cannot revoke that exact predecessor.
+            if stamp_at(&path)? != Some(proof.stamp) {
+                return Ok(RetireOutcome::Retry);
+            }
+            #[cfg(test)]
+            test_hooks::transition_edge(CrashPoint::BeforeRetireUnlink, &path)?;
+            remove_if_present(&path)?;
+            *sync_due = true;
+            #[cfg(test)]
+            test_hooks::transition_edge(CrashPoint::RetiredUnlink, &path)?;
+            #[cfg(test)]
+            test_hooks::transition_edge(CrashPoint::BeforeRetireSync, &self.dir)?;
+            self.sync_store()?;
+            #[cfg(test)]
+            test_hooks::transition_edge(CrashPoint::RetiredSynced, &self.dir)?;
+            if stamp_at(&path)?.is_some() {
+                return Ok(RetireOutcome::Retry);
+            }
+            self.durable.remove(&proof.key);
+            *sync_due = false;
+            self.counters.records_invalidated += 1;
+            Ok(RetireOutcome::Retired)
+        })();
+        result.unwrap_or(RetireOutcome::Retry)
+    }
+
     /// Deletes the records of `keys` (held or reverted selections): a stale
     /// record for them must never restore.
     pub(crate) fn remove_keys<W: SingleWriter>(
@@ -2221,6 +2437,10 @@ impl DurableTailStore {
 }
 
 impl MutationWitness {
+    pub(crate) fn same_predecessor(&self, other: &Self) -> bool {
+        self.key == other.key && self.content == other.content && self.stamp == other.stamp
+    }
+
     pub(crate) fn migration_floor(&self) -> Option<u64> {
         self.migration_floor.map(|floor| floor.get())
     }

@@ -376,7 +376,12 @@ fn scan_index_save_in_progress_is_never_disturbed() {
     let generation = save.join().expect("saver thread").expect("save completes");
     assert_eq!(generation, 2);
     assert_eq!(ScanIndex::load(&path).expect("load").generation, 2);
-    assert!(!in_flight.exists(), "the save renamed its temp");
+    // Namespaced saves now own random storage temporaries. A planted legacy
+    // PID temp belongs to neither this saver nor the sweep and remains intact.
+    assert!(
+        in_flight.exists(),
+        "save keeps an unrelated legacy PID temp"
+    );
 
     let report = apply(&f.support, &later());
     assert_eq!(report.removed, 1);

@@ -11,6 +11,12 @@
 //! - `L` a provider-minted opaque id (request, response, message, tool-use,
 //!   call or MCP call id). Persisted only in the local 0600 durable-tail store;
 //!   never logged, never in diagnostics or counters, never uploaded from it;
+//! - `PL` private local literal: exactly the uploaded wire value, or the
+//!   explicitly approved bounded native state from which that upload is derived
+//!   (PL-retained). Consent-gated; never stored while consent is off and purged
+//!   at the next save on revocation. Dropped on identity failure and erased with
+//!   its record. Never exposed in logs, diagnostics, status, support bundles or
+//!   error text; single use, restoring only the same approved upload/state.
 //! - `X` content (text, paths). Never encoded. Restored by re-derivation from
 //!   the file itself and verified by hash, else the entry reads in Full;
 //! - `E` must be empty in the retained copy. A non-empty value refuses the
@@ -33,6 +39,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write;
 
 use sha2::{Digest, Sha256};
+
+#[cfg(unix)]
+#[allow(unused_imports)] // Shared API; field activation follows separately.
+pub(crate) use crate::snapshots::PlText;
 
 /// Why a value was not encoded. Carries field paths only, never values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +96,8 @@ pub(crate) struct Enc<'a> {
     sink: Sink<'a>,
     moved_field: Option<&'static str>,
     written: usize,
+    #[cfg(test)]
+    include_content_bytes: bool,
 }
 
 impl<'a> Enc<'a> {
@@ -93,11 +105,21 @@ impl<'a> Enc<'a> {
         Self {
             moved_field: None,
             written: 0,
+            #[cfg(test)]
+            include_content_bytes: false,
             sink: Sink::Bytes {
                 out: Vec::with_capacity(limit),
                 limit,
             },
         }
+    }
+    /// Differential fixtures need actual X bytes as well as persisted classes.
+    /// This never participates in a production encoder or a shape/hash pin.
+    #[cfg(test)]
+    pub(crate) fn full_bytes(limit: usize) -> Self {
+        let mut out = Self::bytes(limit);
+        out.include_content_bytes = true;
+        out
     }
     /// Count and emit through the same field walk. The body allocation is
     /// exact and only happens after every admission/size check succeeds.
@@ -119,6 +141,8 @@ impl<'a> Enc<'a> {
         Self {
             moved_field: None,
             written: 0,
+            #[cfg(test)]
+            include_content_bytes: false,
             sink: Sink::Write {
                 out,
                 len: 0,
@@ -137,6 +161,8 @@ impl<'a> Enc<'a> {
         Self {
             moved_field: None,
             written: 0,
+            #[cfg(test)]
+            include_content_bytes: false,
             sink: Sink::Count { len: 0, limit },
         }
     }
@@ -153,6 +179,8 @@ impl<'a> Enc<'a> {
         Self {
             moved_field: None,
             written: 0,
+            #[cfg(test)]
+            include_content_bytes: false,
             sink: Sink::Hash(Box::new(hasher)),
         }
     }
@@ -194,7 +222,10 @@ impl<'a> Enc<'a> {
             .ok_or(Refuse::TooLarge)
     }
     pub(crate) fn hashing(&self) -> bool {
-        matches!(self.sink, Sink::Hash(_))
+        let hashing = matches!(self.sink, Sink::Hash(_));
+        #[cfg(test)]
+        let hashing = hashing || self.include_content_bytes;
+        hashing
     }
     /// Byte-output position; counting and hashing never record `L` spans.
     #[cfg(test)]
@@ -280,6 +311,7 @@ pub(crate) struct Dec<'a> {
     allowance: Option<&'a mut dyn FnMut(u64) -> bool>,
     refused: bool,
     required_section: Option<bool>,
+    pl_labels_nonempty: bool,
 }
 
 impl<'a> Dec<'a> {
@@ -290,6 +322,7 @@ impl<'a> Dec<'a> {
             allowance: None,
             refused: false,
             required_section: None,
+            pl_labels_nonempty: false,
         }
     }
     pub(crate) fn bounded(bytes: &'a [u8], allowance: &'a mut dyn FnMut(u64) -> bool) -> Self {
@@ -299,6 +332,7 @@ impl<'a> Dec<'a> {
             allowance: Some(allowance),
             refused: false,
             required_section: None,
+            pl_labels_nonempty: false,
         }
     }
     fn reserve(&mut self, bytes: Option<usize>) -> Result<(), Corrupt> {
@@ -314,7 +348,7 @@ impl<'a> Dec<'a> {
     fn slots<T>(&mut self, len: usize) -> Result<(), Corrupt> {
         self.reserve(len.checked_mul(std::mem::size_of::<T>()))
     }
-    fn tree<K, V>(&mut self, len: usize) -> Result<(), Corrupt> {
+    pub(crate) fn tree<K, V>(&mut self, len: usize) -> Result<(), Corrupt> {
         self.reserve(
             len.checked_add(1)
                 .and_then(|n| n.checked_mul(crate::heap_layout_bound::tree_node_bytes::<K, V>()?)),
@@ -364,6 +398,25 @@ impl<'a> Dec<'a> {
     pub(crate) fn len_prefixed(&mut self) -> Result<&'a [u8], Corrupt> {
         let len = self.take_len()?;
         self.raw(len)
+    }
+    /// Check the field bound and UTF-8 before requesting allocation credit.
+    pub(crate) fn bounded_text(&mut self, cap: usize) -> Result<String, Corrupt> {
+        let bytes = self.bounded_text_bytes(cap)?;
+        self.slots::<u8>(bytes.len())?;
+        Ok(bytes.to_owned())
+    }
+    pub(crate) fn bounded_text_bytes(&mut self, cap: usize) -> Result<&'a str, Corrupt> {
+        let len = self.take_len()?;
+        if len > cap {
+            return Err(Corrupt);
+        }
+        std::str::from_utf8(self.raw(len)?).map_err(|_| Corrupt)
+    }
+    pub(crate) fn note_pl_labels(&mut self, len: usize) {
+        self.pl_labels_nonempty |= len != 0;
+    }
+    pub(crate) fn has_pl_labels(&self) -> bool {
+        self.pl_labels_nonempty
     }
     pub(crate) fn remaining(&self) -> usize {
         self.bytes.len() - self.at
@@ -456,6 +509,24 @@ pub(crate) trait Durable: Sized {
     /// Walk the stored fields without constructing the value or allocating.
     fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt>;
     fn shape(s: &mut Shape);
+}
+
+/// Only private literal wrappers implement this class. In particular, ordinary
+/// String and arbitrary Durable values cannot be labelled PL by the macro.
+/// Each use still needs its field-specific consent, lifetime and single-use rule.
+pub(crate) trait PlLiteral: Durable {
+    fn put_pl(&self, e: &mut Enc, _path: &'static str) -> Result<(), Refuse> {
+        self.put(e)
+    }
+    fn take_pl(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        Self::take(d)
+    }
+    fn verify_pl(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        Self::verify(d)
+    }
+    fn shape_pl(s: &mut Shape) {
+        Self::shape(s);
+    }
 }
 
 /// `H` is a type, not a label: only fixed 32-byte values (a raw
@@ -1378,6 +1449,10 @@ macro_rules! durable_field {
     (put U, $e:ident, $f:ident, $ty:ty, $path:expr) => {
         $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
     };
+    (put PL, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
+        let value: &$ty = $f;
+        $crate::durable_tail_codec::PlLiteral::put_pl(value, $e, $path)?;
+    }};
     (put L, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
         let value: &$ty = $f;
         #[cfg(test)]
@@ -1416,6 +1491,9 @@ macro_rules! durable_field {
     (take U, $d:ident, $ty:ty) => {
         <$ty as $crate::durable_tail_codec::Durable>::take($d)?
     };
+    (take PL, $d:ident, $ty:ty) => {
+        <$ty as $crate::durable_tail_codec::PlLiteral>::take_pl($d)?
+    };
     (take L, $d:ident, $ty:ty) => {
         <$ty as $crate::durable_tail_codec::Durable>::take($d)?
     };
@@ -1428,6 +1506,7 @@ macro_rules! durable_field {
     (take $other:ident, $d:ident, $ty:ty) => {
         <$ty as ::std::default::Default>::default()
     };
+    (verify PL, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::PlLiteral>::verify_pl($d)? };
     (verify H, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::HDigest>::verify_h($d)? };
     (verify X, $d:ident, $ty:ty) => {};
     (verify E, $d:ident, $ty:ty) => {};
@@ -1438,6 +1517,8 @@ macro_rules! durable_field {
     (verify D, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
     (verify P, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
     (verify $other:ident, $d:ident, $ty:ty) => { compile_error!("unknown durable field class in verify") };
+    (key_type PL, $ty:ty, $lt:lifetime) => { compile_error!("PL fields cannot appear in durable keys") };
+    (key PL, $d:ident, $ty:ty) => { compile_error!("PL fields cannot appear in durable keys") };
     (key_type X, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
     (key_type E, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
     (key_type I, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
@@ -1448,6 +1529,10 @@ macro_rules! durable_field {
     (key_type $c:ident, $ty:ty, $lt:lifetime) => { <$ty as $crate::durable_tail_codec::DurableKey>::View<$lt> };
     (key H, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::HDigestKey>::key_h($d)? };
     (key $c:ident, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::DurableKey>::key($d)? };
+    (shape PL, $s:ident, $f:ident, $ty:ty) => {{
+        $s.push(concat!("PL ", stringify!($f)));
+        <$ty as $crate::durable_tail_codec::PlLiteral>::shape_pl($s);
+    }};
     (shape X, $s:ident, $f:ident, $ty:ty) => {{
         $s.push(concat!("X ", stringify!($f)));
         <$ty as $crate::durable_tail_codec::Durable>::shape($s);
@@ -1787,6 +1872,7 @@ mod tests {
             let mut e = Enc {
                 moved_field: None,
                 written: 0,
+                include_content_bytes: false,
                 sink: Sink::Write {
                     out: &mut out,
                     len: 0,
@@ -1802,6 +1888,7 @@ mod tests {
         let mut e = Enc {
             moved_field: None,
             written: 0,
+            include_content_bytes: false,
             sink: Sink::Write {
                 out: &mut empty,
                 len: 0,

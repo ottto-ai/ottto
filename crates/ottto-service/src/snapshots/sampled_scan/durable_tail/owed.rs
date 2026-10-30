@@ -29,17 +29,50 @@ pub(super) enum OwedMark {
 #[derive(Default)]
 pub(super) struct KeyDebt {
     owed: OwedMark,
+    pub(super) rederive_hold: Option<DurableSource>,
+    pub(super) head_extent: Option<u32>,
+    pub(super) extra_head: bool,
+    /// Cross-cause Full allowance survives turnover of the paid pace map.
+    pub(super) full_spend: Option<FullSpend>,
+    /// Diagnostic only: the first non-quiet scoped replay result this process.
+    pub(super) first_rederive_failed: Option<bool>,
+    pub(super) first_retire_held: Option<bool>,
+    pub(super) retire_source: Option<DurableSource>,
+    pub(super) retire_sync: bool,
     /// D3: this Claude key's stale predecessor survived a failed write.
     hold: Option<ClaudeHold>,
 }
+#[derive(Clone, Copy)]
+pub(super) struct FullSpend {
+    pub(super) at: std::time::SystemTime,
+    pub(super) near_extra: bool,
+}
 impl KeyDebt {
+    /// Only idle observations or expired pacing may be reclaimed. Receipt,
+    /// discovery, retirement and directory-sync custody are never victims.
+    fn reclaimable(&self, now: std::time::SystemTime) -> bool {
+        self.owed == OwedMark::None
+            && self.hold.is_none()
+            && self.rederive_hold.is_none()
+            && self.retire_source.is_none()
+            && !self.retire_sync
+            && !self
+                .full_spend
+                .is_some_and(|spend| super::full_pace_delayed(spend.at, now))
+    }
     pub(super) fn is_empty(&self) -> bool {
-        self.owed == OwedMark::None && self.hold.is_none()
+        self.owed == OwedMark::None
+            && self.hold.is_none()
+            && self.rederive_hold.is_none()
+            && self.retire_source.is_none()
+            && self.full_spend.is_none()
+            && self.first_rederive_failed.is_none()
+            && self.first_retire_held.is_none()
     }
 }
 /// Funded nodes per map: owed/hold keys need no more than the RAM cache's
 /// key count. Native writes reserve a node before any fault can create a
-/// D3 hold. A full map defers an unstarted write as counted NotPersisted;
+/// D3 hold. A map full of live custody defers an unstarted write as NotPersisted;
 /// existing receipt/debt overflow retains the conservative discovery bit.
 const KEY_DEBT_KEYS: usize = store::MAX_RECORDS;
 pub(super) fn key_debt_node_bytes() -> Option<usize> {
@@ -125,8 +158,27 @@ pub(in crate::snapshots) enum OwedCompletionAdmission {
 }
 
 impl Stores {
-    /// Funds `digest`'s debt node; never evicts another key's debt or hold.
+    /// Funds `digest`'s debt node; never evicts another key's live custody.
+    /// Idle diagnostic observations and expired pacing cannot deny capacity.
     pub(super) fn fund_debt(&mut self, digest: store::Digest32) -> Option<&mut KeyDebt> {
+        if !self.key_debt.contains_key(&digest) && self.key_debt.len() >= KEY_DEBT_KEYS {
+            let now = std::time::SystemTime::now();
+            #[cfg(test)]
+            let now = self.retail_full_now.unwrap_or(now);
+            if let Some(idle) = self
+                .key_debt
+                .iter()
+                .find_map(|(key, debt)| debt.reclaimable(now).then_some(*key))
+            {
+                let forgotten = self.key_debt.remove(&idle).expect("idle observation");
+                if forgotten.first_retire_held.is_some() {
+                    self.counters.retire_exact_first_attempt_tracking_closed = true;
+                }
+                if forgotten.first_rederive_failed.is_some() {
+                    self.close_first_rederive_tracking();
+                }
+            }
+        }
         if key_debt_node_bytes().map_or(true, |n| n > 1024)
             || (!self.key_debt.contains_key(&digest) && self.key_debt.len() >= KEY_DEBT_KEYS)
         {
@@ -134,6 +186,23 @@ impl Stores {
             return None;
         }
         Some(self.key_debt.entry(digest).or_default().as_mut())
+    }
+    /// After forgetting any first-result marker, stop enrolling observations:
+    /// a later visit cannot be mistaken for a key's first process attempt.
+    pub(super) fn close_first_rederive_tracking(&mut self) {
+        if !self.counters.rederive_first_attempt_tracking_closed {
+            self.counters.rederive_first_attempt_tracking_closed = true;
+            super::Counters::bump(
+                &mut self.counters.ineligible,
+                "rederive_first_attempt_tracking_closed",
+            );
+        }
+    }
+    pub(super) fn clear_rederive_hold(&mut self, digest: &store::Digest32) {
+        if let Some(debt) = self.key_debt.get_mut(digest) {
+            debt.rederive_hold = None;
+        }
+        self.release_idle_debt(digest);
     }
     /// Frees an empty debt node, so a discharged key never pins a slot.
     fn release_idle_debt(&mut self, digest: &store::Digest32) {
@@ -173,6 +242,11 @@ impl Stores {
         for debt in self.key_debt.values_mut() {
             if matches!(debt.owed, OwedMark::Owed(s) | OwedMark::Hold(s) if s == source) {
                 debt.owed = OwedMark::None;
+            }
+        }
+        for debt in self.key_debt.values_mut() {
+            if debt.rederive_hold == Some(source) {
+                debt.rederive_hold = None;
             }
         }
         self.key_debt.retain(|_, debt| !debt.is_empty());
@@ -237,6 +311,9 @@ fn checkpoint_bytes(checkpoint: &Checkpoint) -> Option<u64> {
 impl SharedCache {
     /// Queried before selector Skip/comparison/family/scoped retry logic.
     pub(crate) fn owed_before_skip(&self, source: SnapshotSource, key: &str) -> OwedQuery {
+        if !crate::snapshots::restart_restore::enabled() {
+            return OwedQuery::None;
+        }
         let Some(ds) = durable_source(source) else {
             return OwedQuery::None;
         };
@@ -539,6 +616,19 @@ impl SharedCache {
     /// Age-independent: debt, a pending receipt, a D3 hold or the source-wide
     /// conservative bit keeps the key discoverable.
     pub(in crate::snapshots) fn owes_discovery(&self, source: SnapshotSource, key: &str) -> bool {
+        if !crate::snapshots::restart_restore::enabled() {
+            return false;
+        }
+        if durable_source(source).is_some_and(|ds| {
+            self.durable().is_some_and(|stores| {
+                stores
+                    .key_debt
+                    .get(&store::key_digest(ds, key))
+                    .is_some_and(|d| d.rederive_hold == Some(ds))
+            })
+        }) {
+            return true;
+        }
         let overflow = durable_source(source).is_some_and(|ds| {
             self.durable()
                 .is_some_and(|stores| stores.owed_overflow[ds.slot()])

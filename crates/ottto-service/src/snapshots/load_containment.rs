@@ -639,10 +639,15 @@ fn quarantine_invalid_scan_index(
     // structural damage must not permanently block collection, but never
     // overwrite the unreadable witness in place.
     let quarantine_path = unique_checkpoint_sibling(path, "corrupt");
+    let persistence_recovery =
+        scan_index_integration::prepare_legacy_recovery(path, &quarantine_path)?;
     fs::rename(path, &quarantine_path).context("quarantine invalid local snapshot scan index")?;
     sync_checkpoint_parent(path)?;
     note_scan_index_quarantine_rebuild(cause, discarded_file_entries, source);
-    Ok(ScanIndex::default())
+    Ok(ScanIndex {
+        persistence_legacy_recovery: persistence_recovery,
+        ..ScanIndex::default()
+    })
 }
 
 fn note_scan_index_quarantine_rebuild(

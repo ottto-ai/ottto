@@ -1608,7 +1608,8 @@ fn census_records_are_charged_with_the_scan_index_and_leave_entries_alone() {
     // re-read rule rebuilds the scan fingerprint from the ctime so a
     // ctime-only change never re-reads, and only for the same object
     // generation, bound by its exact birth (owner-approved 464 -> 472 -> 480).
-    const SCAN_INDEX_ENTRY_BYTES: usize = 480;
+    // Optional context receipt adds 80 inline bytes; its three H digests are heap-charged.
+    const SCAN_INDEX_ENTRY_BYTES: usize = 560;
     assert_eq!(
         std::mem::size_of::<ScanIndexEntry>(),
         SCAN_INDEX_ENTRY_BYTES
@@ -2442,6 +2443,7 @@ fn held_original_keeps_dependent_copy_proof_only_while_committed_entry_unchanged
 #[cfg(unix)]
 #[test]
 fn held_original_production_exit_conserves_copy_money_while_committed_entry_unchanged() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let scratch = crate::test_scratch::ScratchDir::new("held-census-production");
     let root = scratch.join("projects");

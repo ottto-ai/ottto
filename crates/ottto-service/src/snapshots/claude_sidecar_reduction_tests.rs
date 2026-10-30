@@ -364,7 +364,7 @@ fn seed_predecessor(fixture: &Fixture, cache: &Arc<SharedCache>) -> ScanIndex {
     ));
     let bound = cache.inner.lock().unwrap().resident_bound();
     if crate::heap_layout_bound::layout_supported() {
-        assert!(bound.unwrap() <= STATE_BYTES);
+        assert!(bound.unwrap() <= state_bytes());
     } else {
         assert!(
             bound.is_none(),
@@ -1033,6 +1033,7 @@ mod durable_restart {
     /// key's older record is invalidated, and a restart reads Full.
     #[test]
     fn a_held_reverted_selection_is_never_written_and_invalidates_the_old_record() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1066,6 +1067,7 @@ mod durable_restart {
     /// reads Full.
     #[test]
     fn a_cleared_fingerprint_never_restores_or_writes() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1125,6 +1127,7 @@ mod durable_restart {
     /// invalidated and a restart reads Full.
     #[test]
     fn a_reduction_ahead_of_the_saved_selection_is_never_written() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1159,6 +1162,7 @@ mod durable_restart {
     /// mismatch, and the tailed body keeps the prefix's marker.
     #[test]
     fn a_constant_capture_restart_reads_no_full() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         capture_marked(&f);
         let state = State::new(&f);
@@ -1180,6 +1184,7 @@ mod durable_restart {
 
     #[test]
     fn restart_restores_then_tails_and_matches_cold_full() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1238,6 +1243,7 @@ mod durable_restart {
 
     #[test]
     fn e2_restart_tail_and_quiet_late_sidecar_match_cold_full_emitted_body() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let _gate = claude_request_money::e2::GateForTest::set(true);
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
             for append_native in [true, false] {
@@ -1329,6 +1335,7 @@ mod durable_restart {
 
     #[test]
     fn restart_after_a_metadata_only_touch_restores_unchanged() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(2);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1352,6 +1359,7 @@ mod durable_restart {
 
     #[test]
     fn an_index_from_another_context_never_restores() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1737,6 +1745,7 @@ fn desktop_completed_census_counts_existing_held_retry_reads() {
 
 #[test]
 fn desktop_inventory_backoff_keeps_growing_native_prefix_and_cold_body_parity() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let home = crate::test_scratch::ScratchDir::new("desktop-growing-backoff");
     let mut f = Fixture::new(1);

@@ -36,6 +36,7 @@ struct Owner {
 pub(crate) struct ActiveLease {
     source: &'static str,
     bytes: u64,
+    peak: u64,
     released: bool,
 }
 impl ActiveLease {
@@ -66,6 +67,7 @@ impl ActiveLease {
         Some(Self {
             source,
             bytes: 0,
+            peak: 0,
             released: false,
         })
     }
@@ -110,7 +112,15 @@ impl ActiveLease {
                 ActiveOverBudget
             })?;
         self.bytes = total;
+        self.peak = self.peak.max(total);
         event(self.source, "active_current_bytes", total);
+        Ok(())
+    }
+    /// Refund only after the associated allocations are dropped or moved to
+    /// separately retained credit. An invalid refund cannot increase credit.
+    pub(crate) fn refund(&mut self, bytes: u64) -> Result<(), ActiveOverBudget> {
+        self.bytes = self.bytes.checked_sub(bytes).ok_or(ActiveOverBudget)?;
+        event(self.source, "active_current_bytes", self.bytes);
         Ok(())
     }
     #[cfg(test)]
@@ -122,7 +132,7 @@ impl ActiveLease {
     }
     fn finish(&mut self, leaked: bool) {
         if !self.released {
-            event(self.source, "active_peak_bytes", self.bytes);
+            event(self.source, "active_peak_bytes", self.peak);
             event(self.source, "active_current_bytes", 0);
             event(self.source, "active_drop_release", u64::from(leaked));
             self.bytes = 0;
@@ -139,6 +149,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ActiveLease {
         let Self {
             source: _,
             bytes: _,
+            peak: _,
             released: _,
         } = self;
         c.add(0) // Fixed fields only; the process owner is static, never walked.
@@ -297,6 +308,22 @@ mod tests {
                 .count()
                 >= 3
         );
+    }
+
+    #[test]
+    fn refund_preserves_peak_and_rejects_underflow() {
+        let (_, events) = capture(|| {
+            let mut lease = granted();
+            lease.charge(1024).unwrap();
+            lease.refund(1000).unwrap();
+            assert!(lease.refund(25).is_err());
+            assert_eq!(lease.bytes, 24);
+            lease.charge(1).unwrap();
+            drop(lease); // includes a later Tail failure/drop
+        });
+        assert!(events
+            .iter()
+            .any(|e| e["counts"]["active_peak_bytes"] == 1024));
     }
 
     #[test]

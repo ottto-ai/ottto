@@ -1327,7 +1327,7 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
             restart.insert(
                 key.clone(),
                 sampled_jsonl::CompletedNativeAcquisition {
-                    durable: Default::default(),
+                    durable: copy.durable,
                     checkpoint: copy.retained.checkpoint,
                     reduction: Some(copy.retained.state),
                     released: None,
@@ -1510,6 +1510,7 @@ fn cap_pace_overflow_is_counted_and_alarms_on_the_production_full() {
 
 #[test]
 fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store as store;
     if !crate::heap_layout_bound::layout_supported() {
         return;

@@ -45,6 +45,7 @@ fn entry() -> ScanIndexEntry {
 
 #[test]
 fn r7_every_key_map_node_fits_its_prepaid_charge() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     // r6 put the D3 hold in the A0-h node and pushed it past 1024 bytes,
     // which would refuse every Q11 grant and strict check as unfunded.
     assert!(custody_node_bytes().unwrap() <= 1024, "A0-h custody node");
@@ -88,6 +89,7 @@ fn r7_every_key_map_node_fits_its_prepaid_charge() {
 
 #[test]
 fn p1_1_zero_old_byte_restore_spends_pending_never_custody() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let (root, checkpoint, file) = grown("r7-p1-1-pending");
     let sealed = checkpoint.sealed_offset();
     let end = file.metadata().unwrap().len();
@@ -136,6 +138,7 @@ fn p1_1_zero_old_byte_restore_spends_pending_never_custody() {
 
 #[test]
 fn p1_1_pending_overflow_reads_through_the_paced_full_and_never_evicts() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let (root, checkpoint, file) = grown("r7-p1-1-overflow");
     let sealed = checkpoint.sealed_offset();
     let cache = SharedCache::default();
@@ -187,6 +190,7 @@ fn p1_1_pending_overflow_reads_through_the_paced_full_and_never_evicts() {
 
 #[test]
 fn authorityless_custody_is_freed_and_authority_is_kept() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("r7-custody-free");
     let cache = SharedCache::default();
     let now = Instant::now();
@@ -217,6 +221,7 @@ fn authorityless_custody_is_freed_and_authority_is_kept() {
 
 #[test]
 fn debt_and_holds_live_outside_custody_and_overflow_stays_conservative() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use super::owed::OwedMark;
     let claude = DurableSource::ClaudeCode;
     let cache = SharedCache::default();
@@ -242,6 +247,7 @@ fn debt_and_holds_live_outside_custody_and_overflow_stays_conservative() {
 
 #[test]
 fn pass_maps_follow_the_committed_index_and_count_overflow() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("r7-pass-maps");
     let cache = SharedCache::default();
     cache.durable_begin_pass(
@@ -332,6 +338,7 @@ fn native_reduction(path: &Path, scope: &Scope) -> CachedJsonlReduction {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
 fn p2_restored_head_reread_is_bounded_per_pass_and_counted() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -421,6 +428,7 @@ fn p2_restored_head_reread_is_bounded_per_pass_and_counted() {
 /// counts a stale refusal and takes one paced Full under its own cause.
 #[test]
 fn codex_cleared_selection_over_a_surviving_record_is_refused_and_paced() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("r7-codex-stale-selection");
     let path = root.join("fixture.jsonl");
     std::fs::write(&path, b"{}\n").unwrap();
@@ -493,6 +501,7 @@ fn codex_cleared_selection_over_a_surviving_record_is_refused_and_paced() {
 
 #[test]
 fn native_debt_reservation_refuses_before_io_and_preserves_every_funded_hold() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use super::owed::OwedMark;
     let cache = SharedCache::default();
     let mut stores = cache.durable().unwrap();
@@ -521,6 +530,7 @@ fn native_debt_reservation_refuses_before_io_and_preserves_every_funded_hold() {
 
 #[test]
 fn overflow_preserves_discovery_without_forcing_quiet_keys_to_parse() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use super::owed::{OwedMark, OwedQuery};
     let cache = SharedCache::default();
     {
@@ -544,6 +554,7 @@ fn overflow_preserves_discovery_without_forcing_quiet_keys_to_parse() {
 
 #[test]
 fn native_full_debt_map_declines_before_write_and_keeps_the_emitted_body() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use super::owed::{OwedMark, OwedQuery};
     use crate::snapshots::{OwnedSourceScan, OwnedSourceScanStep};
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -635,6 +646,7 @@ fn native_full_debt_map_declines_before_write_and_keeps_the_emitted_body() {
 /// encoding. These are the existing canonical protected-history carriers.
 #[test]
 fn protected_history_refuses_singleton_restore_across_passes_before_record_io() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for field in [
         "codex_protected_owner",
         "codex_joined_member_set",
@@ -720,6 +732,7 @@ fn protected_history_refuses_singleton_restore_across_passes_before_record_io() 
 
 #[test]
 fn layout_unavailability_preserves_future_audit_and_state_missing_selection_cause() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let (root, _, mut file) = grown("m3-layout-future-audit");
     let now = 1_800_000_000;
     let future = now + 3600;

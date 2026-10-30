@@ -442,11 +442,12 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
         .attribution_context
         .as_ref()
         .map(SessionAttributionContext::checkpoint_namespace);
-    index.activate_upload_context(cycle_upload_context(
-        minted.upload_policy,
-        checkpoint.as_deref(),
-        false,
-    ));
+    activate_source_upload_context(
+        source,
+        cycle_upload_context(minted.upload_policy, checkpoint.as_deref(), false),
+        &mut index,
+        &mut progress,
+    );
     let generation = cycle_replay_generation(source, false, &index, CONTINUATION_NAMESPACE);
     assert_eq!(prepared.replay_generation, generation);
     let now = reason_reoffer::now_unix_seconds();
@@ -826,6 +827,7 @@ fn ordinary_durable_continuation_to_eof(
         &ScanIndex,
     ),
 ) {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(crate::heap_layout_bound::layout_supported());
     use crate::snapshots::{OwnedSourceScan, OwnedSourceScanStep};
     let fixture = ContinuationFixture::quiescent(name);
@@ -879,6 +881,7 @@ fn ordinary_durable_continuation_to_eof(
         false,
         &namespace,
         false,
+        true,
     );
     crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
         let mut ordinary = OwnedSourceScan::new(

@@ -698,7 +698,6 @@ impl SessionStartState {
     }
 
     /// Moves the re-derived opening content from a head re-parse.
-    #[cfg(test)]
     pub(super) fn adopt_durable_content(&mut self, from: &mut Self) {
         self.instructions = from.instructions.take();
         self.codex_prelude = from.codex_prelude.take();
@@ -715,6 +714,10 @@ impl SessionStartState {
     /// Where the opening content is final (`content_end`), when known.
     pub(super) fn durable_content_end(&self) -> Option<u64> {
         self.content_end
+    }
+
+    pub(super) fn content_window_open(&self) -> bool {
+        !self.frozen
     }
 
     fn charge(&mut self, bytes: usize) -> bool {

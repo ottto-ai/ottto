@@ -1615,6 +1615,11 @@ fn ack_huge_file_real_finish_body() {
         "every file ACK transferred to the index"
     );
     assert_eq!(
+        upload_context_resend::last_counts(),
+        (0, 0),
+        "same-context retry is not a context resend"
+    );
+    assert_eq!(
         progress.accepted_fingerprints, debt_set,
         "only the unrelated debt remains"
     );

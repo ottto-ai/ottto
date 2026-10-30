@@ -1,7 +1,11 @@
 //! One dispatch table for admitted durable sources. Each source admits exact v1/v3 representations.
-use super::sampled_jsonl::{durable, CachedJsonlReduction};
+use super::sampled_jsonl::durable;
+#[cfg(test)]
+use super::sampled_jsonl::CachedJsonlReduction;
 use super::*;
-use crate::durable_tail_codec::{Corrupt, Refuse};
+use crate::durable_tail_codec::Corrupt;
+#[cfg(test)]
+use crate::durable_tail_codec::Refuse;
 use crate::durable_tail_store::{Digest32, DurableSource};
 
 pub(crate) struct Representation {
@@ -31,8 +35,8 @@ pub(crate) struct Properties {
     pub(crate) tag: u8,
     pub(crate) write_format: u16,
     pub(crate) representations: &'static [Representation],
-    pub(super) encode: fn(&CachedJsonlReduction, usize, u64) -> Result<Vec<u8>, Refuse>,
     #[cfg(test)]
+    pub(super) encode: fn(&CachedJsonlReduction, usize, u64) -> Result<Vec<u8>, Refuse>,
     pub(super) decode: fn(&[u8], SnapshotSource) -> Result<durable::Decoded, Corrupt>,
     #[cfg(unix)]
     pub(super) decode_bounded:
@@ -42,11 +46,11 @@ pub(crate) struct Properties {
             &mut crate::durable_tail_store::ActiveLease,
         ) -> Result<durable::Decoded, crate::durable_tail_codec::DecodeFailure>,
     pub(super) verify: fn(&[u8]) -> Result<(), Corrupt>,
-    #[cfg(test)]
     pub(super) apply_line: fn(&Value, &mut SnapshotAccumulator),
 }
 
-// Pins from both historical v1 writers (72205c6c and ffc6c846).
+// Current PL-retained schema only. Historical pins refuse at dispatch; there is
+// no reader-first dual-pin path. Both admitted envelope versions use this body.
 // Enum ordinals index this table and Stores' slots; tags remain independent wire IDs.
 pub(crate) const SOURCES: &[Properties] = &[
     Properties {
@@ -56,15 +60,14 @@ pub(crate) const SOURCES: &[Properties] = &[
         // Advance only with the atomic native write-ahead activation.
         write_format: 1,
         representations: &representations(
-            "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
+            "95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2",
         ),
-        encode: durable::encode_body,
         #[cfg(test)]
+        encode: durable::encode_body,
         decode: durable::decode_body,
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
         verify: durable::verify,
-        #[cfg(test)]
         apply_line: apply_claude_code_line,
     },
     Properties {
@@ -74,15 +77,14 @@ pub(crate) const SOURCES: &[Properties] = &[
         // Advance only with the atomic native write-ahead activation.
         write_format: 1,
         representations: &representations(
-            "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+            "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0",
         ),
-        encode: durable::encode_body,
         #[cfg(test)]
+        encode: durable::encode_body,
         decode: durable::decode_body,
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
         verify: durable::verify,
-        #[cfg(test)]
         apply_line: apply_codex_line,
     },
     Properties {
@@ -95,13 +97,12 @@ pub(crate) const SOURCES: &[Properties] = &[
             allowlist_pin: "bd43c3d6197e6a6dfe339a486b0bbf4aaa121fc40022fcc8418f9d900baac4f7",
             header_bytes: crate::durable_tail_store::HEADER_V3_BYTES,
         }],
-        encode: durable::encode_body,
         #[cfg(test)]
+        encode: durable::encode_body,
         decode: durable::decode_body,
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
         verify: durable::pi::verify,
-        #[cfg(test)]
         apply_line: apply_pi_line,
     },
 ];

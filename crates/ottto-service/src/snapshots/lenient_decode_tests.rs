@@ -829,6 +829,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     .unwrap();
     scan.snapshots = vec![snapshot];
     scan.pending_finalization.push(PendingIndexFinalization {
+        restored_behind_accepted: false,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: key.clone(),
@@ -4909,6 +4910,7 @@ fn pi_restored_behind_accepted_counts_an_offer_or_an_index_regression() {
             parsed_snapshot_count: 1,
             effective_upload_body_witness_revision: 0,
             pi_restored_behind_accepted: extent,
+            restored_behind_accepted: false,
         });
         let (_, counts) =
             observe(|| finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut index));

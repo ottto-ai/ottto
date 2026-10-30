@@ -1721,15 +1721,22 @@ fn lock_managed_claude_settings() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-pub(crate) fn approved_managed_claude_relay_endpoint() -> Result<Option<String>, LocalApiError> {
+pub(crate) enum ManagedClaudeRelaySettings {
+    Revoked,
+    Missing,
+    Body(String),
+}
+
+pub(crate) fn read_managed_claude_relay_settings(
+) -> Result<ManagedClaudeRelaySettings, LocalApiError> {
     if source_patch_disabled(&SourceKind::ClaudeCode) {
-        return Ok(None);
+        return Ok(ManagedClaudeRelaySettings::Revoked);
     }
     let device = FileDeviceStore::default().load().map_err(|_| {
         LocalApiError::LocalOperationFailed("read managed Claude source approval".into())
     })?;
     if !device.is_some_and(|device| device.sources.iter().any(|source| source == "claude_code")) {
-        return Ok(None);
+        return Ok(ManagedClaudeRelaySettings::Revoked);
     }
     let Some(body) = crate::agent_configs::claude_managed_settings::read_settings(&home_path(
         ".claude/settings.json",
@@ -1738,7 +1745,17 @@ pub(crate) fn approved_managed_claude_relay_endpoint() -> Result<Option<String>,
         LocalApiError::LocalOperationFailed("read approved Claude relay settings".into())
     })?
     else {
-        return Ok(None);
+        return Ok(ManagedClaudeRelaySettings::Missing);
+    };
+    Ok(ManagedClaudeRelaySettings::Body(body))
+}
+
+pub(crate) fn approved_managed_claude_relay_endpoint() -> Result<Option<String>, LocalApiError> {
+    let body = match read_managed_claude_relay_settings()? {
+        ManagedClaudeRelaySettings::Body(body) => body,
+        ManagedClaudeRelaySettings::Revoked | ManagedClaudeRelaySettings::Missing => {
+            return Ok(None)
+        }
     };
     if crate::agent_configs::claude_managed_settings::approved_relay_port(&body).is_none() {
         return Ok(None);
@@ -1821,6 +1838,7 @@ fn validate_managed_claude_settings_root(config_dir: &str) -> Result<(), LocalAp
 }
 
 fn disable_managed_claude_relay_settings() -> Result<bool, LocalApiError> {
+    crate::otlp_relay::legacy::revoke_now();
     let _settings_guard = lock_managed_claude_settings();
     use crate::agent_configs::claude_managed_settings::{disable_settings, Outcome};
     let default_root = home_path(".claude");
@@ -9559,6 +9577,9 @@ fn setup_answer(
         }
     };
     let detail = save_setup_answer(&api_base_url, &mut credentials, &source, &answer_type)?;
+    if source == SourceKind::ClaudeCode {
+        crate::otlp_relay::legacy::revoke_now();
+    }
     setup_result_from_detail(&credentials.connection, detail, false, Vec::new())
 }
 
@@ -27402,8 +27423,52 @@ for line in sys.stdin:
         );
     }
 
+    /// Seed the private record directory with codec bytes, so both diagnostic
+    /// paths must exclude stored literals rather than merely redact a Debug.
+    fn seed_private_literal_canary(support: &Path) -> &'static str {
+        use crate::durable_tail_codec::{Durable, Enc, PlText};
+        const CANARY: &str = "PRIVATE_LITERAL_DIAGNOSTICS_CANARY_20261030";
+        let literal = PlText::<96>::new(CANARY.into()).unwrap();
+        let body = Enc::count_write(1024, |e| literal.put(e)).unwrap();
+        assert!(body
+            .windows(CANARY.len())
+            .any(|bytes| bytes == CANARY.as_bytes()));
+        let dir =
+            crate::durable_tail_store::store_dir_for_index(&support.join("claude-scan-index.json"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let record = dir.join(format!("{}.rec", "0".repeat(64)));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(record)
+            .unwrap();
+        file.write_all(&body).unwrap();
+        // F8: the support collector must also omit transient replay input,
+        // including raw-value magic keys and malformed-selector material.
+        std::fs::write(support.join("bounded-replay-private.jsonl"), format!(
+            "{{\"$serde_json::private::RawValue\":\"{CANARY}\"}}\n{{\"selector\":{{\"model\":[\"{CANARY}\"]}},\"content\":\"{CANARY}\"}}\n"
+        )).unwrap();
+        let canaries =
+            crate::snapshots::test_replay_privacy_artifacts(&support.join("bounded-replay-input"));
+        assert_eq!(canaries[0], CANARY);
+        CANARY
+    }
+
     #[test]
+    #[serial]
     fn diagnostics_collect_is_local_only_without_upload() {
+        let _env_lock = lock_backend_test_env();
+        let support = crate::test_scratch::ScratchDir::new("pl-diagnostics-export");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let _secrets =
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &support.join("secrets"));
+        let _keys = EnvVarGuard::set_path(
+            TELEMETRY_KEY_FILE_STORE_ENV,
+            &support.join("telemetry-keys"),
+        );
+        let canary = seed_private_literal_canary(&support);
         let response = handle_request(
             &daemon(),
             LocalControlRequest {
@@ -27422,6 +27487,14 @@ for line in sys.stdin:
 
         assert!(response.ok, "{response:?}");
         let payload = response.payload.expect("payload");
+        assert!(!serde_json::to_string(&payload).unwrap().contains(canary));
+        for private in [
+            "PRIVATE_REPLAY_HEAD_CANARY_20261030",
+            "PRIVATE_REPLAY_PROMPT_CANARY_20261030",
+            "PRIVATE_REPLAY_LABEL_CANARY_20261030",
+        ] {
+            assert!(!serde_json::to_string(&payload).unwrap().contains(private));
+        }
         assert!(payload
             .get("bundle_id")
             .and_then(|value| value.as_str())
@@ -27518,7 +27591,18 @@ for line in sys.stdin:
     }
 
     #[test]
+    #[serial]
     fn diagnostics_upload_with_support_claim_posts_redacted_bundle() {
+        let _env_lock = lock_backend_test_env();
+        let support = crate::test_scratch::ScratchDir::new("pl-support-bundle");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let _secrets =
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &support.join("secrets"));
+        let _keys = EnvVarGuard::set_path(
+            TELEMETRY_KEY_FILE_STORE_ENV,
+            &support.join("telemetry-keys"),
+        );
+        let canary = seed_private_literal_canary(&support);
         let captured = Arc::new(Mutex::new(None));
         let api_base_url = diagnostics_upload_server(captured.clone());
         let response = handle_request(
@@ -27581,6 +27665,16 @@ for line in sys.stdin:
         assert!(body.contains("\"retention_disclosure_accepted\":true"));
         assert!(body.contains("\"support_claim_provided\":true"));
         assert!(!body.contains("support_123"));
+        assert!(!body.contains(canary));
+        for private in [
+            "PRIVATE_REPLAY_HEAD_CANARY_20261030",
+            "PRIVATE_REPLAY_PROMPT_CANARY_20261030",
+            "PRIVATE_REPLAY_LABEL_CANARY_20261030",
+        ] {
+            assert!(!body.contains(private));
+            assert!(!payload_json.contains(private));
+        }
+        assert!(!payload_json.contains(canary));
     }
 
     #[test]
@@ -32649,6 +32743,38 @@ X-API-Key = "otel_redacted"
         assert_eq!(provisional["env"], json!({}));
         assert!(!provision_managed_claude_relay_settings(&roots[0]).unwrap());
         crate::claude_browser_auth::release_ceremony(operation_id);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn secondary_claude_removal_preserves_legacy_listeners_but_disable_retires_them() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let prepared = store
+            .prepare_managed_account_target(
+                1,
+                "claude_setup_99999999999999999999999999999999".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let slot = &prepared.managed_slots[0];
+        provision_managed_claude_relay_settings(slot.config_dir.as_ref().unwrap()).unwrap();
+        let default_settings = root.join(".claude/settings.json");
+        let approval = fs::read(&default_settings).unwrap();
+        let (open, retired) = crate::otlp_relay::legacy::with_running_listener_for_test(|| {
+            remove_claude_registration_with_relay_cleanup(1, &slot.slot_id).unwrap();
+        });
+        assert_eq!((open, retired), (1, 0));
+        assert_eq!(fs::read(&default_settings).unwrap(), approval);
+        let (open, retired) = crate::otlp_relay::legacy::with_running_listener_for_test(|| {
+            assert!(disable_managed_claude_relay_settings().unwrap());
+        });
+        assert_eq!((open, retired), (0, 1));
+        assert_ne!(fs::read(&default_settings).unwrap(), approval);
         fs::remove_dir_all(root).unwrap();
     }
 

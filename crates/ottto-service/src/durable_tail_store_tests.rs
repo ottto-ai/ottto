@@ -10,7 +10,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 /// Real compiled v1 body/allowlist; arbitrary test-only representations are U.
 pub(super) fn placeholder_allowlist() -> Digest32 {
-    parse_hex_digest("8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c").unwrap()
+    parse_hex_digest("95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2").unwrap()
 }
 pub(super) fn placeholder_body(count: u64, sum: u64) -> Vec<u8> {
     crate::snapshots::durable_store_fixture_body(
@@ -2726,10 +2726,7 @@ fn pinned_v1_scope_replay_and_header_goldens() {
         assert_eq!(&encode(&DurableRecord {
         wire: None,
         envelope_audit_debt: None,record: pending.clone(), index_generation: 9, format: 1})[..HEADER_BYTES], golden);
-        let decoded = decode_header(&golden, &[1; 32], source).unwrap();
-        assert_eq!(decoded.record.binding, pending.binding);
-        assert_eq!(decoded.generation, 9);
-        assert_eq!(decoded.record.certificate.audit_debt_unix_seconds, None);
+        assert!(matches!(decode_header(&golden, &[1; 32], source), Err(Refusal::Unknown)), "the single PL switch-over refuses the historical allowlist");
     }
 }
 
@@ -3520,8 +3517,15 @@ fn full_v1_writer_goldens_preserve_zero_and_nonzero_debt() {
         let scratch = Scratch::new();
         let lock = LockedStateDir::acquire(&scratch.root).unwrap();
         let mut store = DurableTailStore::new(store_dir_for_index(&scratch.index_path()), source);
-        assert_eq!(store.write_after_save(&lock, 9, 0, vec![pending]).unwrap().written, 1);
-        assert_eq!(fs::read(record_file(&store, &[1; 32])).unwrap(), golden, "complete current writer output");
+        assert_eq!(store.write_after_save(&lock, 9, 0, vec![pending]).unwrap().written, 0);
+        assert_eq!(store.counters().store_write_skipped[0], 1);
+        assert!(!record_file(&store, &[1; 32]).exists(), "historical records are refused, never written under the new codec");
+        let file = record_file(&store, &[1; 32]);
+        ensure_private_dir(store.dir()).unwrap();
+        put_record(&file, &golden);
+        assert!(matches!(store.read(&[1;32]), ReadOutcome::Refused(Refusal::Unknown)));
+        assert_eq!(store.counters().format_hold[Refusal::Unknown as usize],1);
+        assert_eq!(fs::read(&file).unwrap(),golden,"refusal never misreads or rewrites historical bytes");
     }
 }
 
@@ -4381,7 +4385,7 @@ fn delayed_t14_receipt_allows_clean_then_changed_offer_without_second_rebuild() 
             let mut record = pending(b.clone(), certificate(&transcript), n);
             // Existing source-tag2 v1 pin; no private codec module access.
             record.allowlist = parse_hex_digest(
-                "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+                "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0",
             )
             .unwrap();
             record.body = crate::snapshots::durable_store_fixture_body(
@@ -4786,4 +4790,517 @@ fn atomic_write_reports_double_failure_only_after_both_cleanup_boundaries_fail()
             }
         }
     }
+}
+
+#[test]
+fn private_label_purge_erases_known_labelled_records_without_receipt_or_money_credit() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("policy-on", "scope", ("fp", None));
+    let mut store = scratch.store();
+    let mut item = pending(b.clone(), certificate(&path), 1);
+    item.body = crate::snapshots::durable_store_fixture_body_with_skill();
+    store.write_after_save(&lock, 1, 0, vec![item]).unwrap();
+    let before = store.counters();
+    // The source-specific caller supplies the no-allocation record predicate.
+    let purged = store
+        .purge_private_labels(&lock, |body| {
+            body.windows("syntheticpurgelabel".len())
+                .any(|s| s == b"syntheticpurgelabel")
+        })
+        .unwrap();
+    assert_eq!(purged.erased, 1);
+    assert_eq!(purged.refused, 0);
+    assert!(matches!(store.read(&b.key), ReadOutcome::Missing));
+    assert_eq!(
+        store.counters().durable_write_failed_published,
+        before.durable_write_failed_published
+    );
+    assert!(
+        matches!(
+            store.reconcile_pending(&lock, &b.key).unwrap(),
+            ReconcileOutcome::NoPending
+        ),
+        "privacy erasure never manufactures a receipt"
+    );
+    let empty = binding("policy-off", "scope", ("fp-empty", None));
+    store
+        .write_after_save(
+            &lock,
+            2,
+            0,
+            vec![pending(empty.clone(), certificate(&path), 1)],
+        )
+        .unwrap();
+    assert_eq!(
+        store.purge_private_labels(&lock, |_| false).unwrap().erased,
+        0
+    );
+    assert!(matches!(store.read(&empty.key), ReadOutcome::Found(_)));
+}
+
+#[test]
+fn private_label_purge_continues_past_corruption_and_reports_partial_progress() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let bad = binding("bad", "scope", ("bad", None));
+    let mut good = binding("good", "scope", ("good", None));
+    good.key = key_digest(DurableSource::ClaudeCode, "synthetic-good.jsonl");
+    let make = |binding| {
+        let mut item = pending(binding, certificate(&path), 1);
+        item.body = crate::snapshots::durable_store_fixture_body_with_skill();
+        item
+    };
+    assert_eq!(
+        store
+            .write_after_save(&lock, 1, 0, vec![make(bad.clone()), make(good.clone())])
+            .unwrap()
+            .written,
+        2
+    );
+    let file = record_file(&store, &bad.key);
+    let mut corrupt = fs::read(&file).unwrap();
+    *corrupt.last_mut().unwrap() ^= 1;
+    put_record(&file, &corrupt);
+    let report = store.purge_private_labels(&lock, |_| true).unwrap();
+    assert_eq!(report.erased, 1);
+    assert_eq!(report.refused, 1);
+    assert!(!record_file(&store, &good.key).exists());
+    assert_eq!(
+        fs::read(&file).unwrap(),
+        corrupt,
+        "corruption never licenses erasing unknown bytes"
+    );
+}
+
+#[test]
+fn private_label_purge_revokes_retained_completion_but_keeps_candidate_owed() {
+    let _reset = ResetFaults;
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let b = binding("pending", "scope", ("fp", None));
+    let mut item = pending(b.clone(), certificate(&path), 1);
+    item.body = crate::snapshots::durable_store_fixture_body_with_skill();
+    // First establish/repair the store before faulting the canonical sync.
+    store
+        .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 0)])
+        .unwrap();
+    test_hooks::set_before_dir_sync(Some(Box::new(|_| Err(io::Error::other("late sync")))));
+    let _ = store.write_after_save(&lock, 2, 0, vec![item]);
+    test_hooks::set_before_dir_sync(None);
+    let ReconcileOutcome::Receipted(proof) = store.reconcile_pending(&lock, &b.key).unwrap() else {
+        panic!("exact completion")
+    };
+    store.retain_receipt(proof).unwrap();
+    let candidate = store.pending[&b.key].candidate;
+    let before = store.counters().receipt_reconciled;
+    assert!(store.pending[&b.key].completed.is_some());
+    assert_eq!(
+        store.purge_private_labels(&lock, |_| true).unwrap().erased,
+        1
+    );
+    assert!(
+        store.pending.contains_key(&b.key),
+        "privacy erasure cannot settle owed work"
+    );
+    assert!(store.pending[&b.key].completed.is_none());
+    let ReconcileOutcome::Retired(retired) = store.reconcile_pending(&lock, &b.key).unwrap() else {
+        panic!("synced absence, never a receipt")
+    };
+    assert_eq!(retired.candidate, candidate);
+    assert_eq!(store.counters().receipt_reconciled, before);
+    assert!(store.disabled().is_none());
+}
+
+#[test]
+fn m1_reader_ceiling_refuses_newer_envelopes_before_any_body_read() {
+    for format in [2u16, FORMAT_V3, FORMAT_V3 + 1] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("source.jsonl", b"{}\n");
+        let b = binding("account", "scope", ("fp-a", None));
+        let mut writer = scratch.store();
+        assert_eq!(
+            writer
+                .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+                .unwrap()
+                .written,
+            1
+        );
+        let record_path = writer.record_path(&b.key);
+        let mut bytes = fs::read(&record_path).unwrap();
+        bytes[8..10].copy_from_slice(&format.to_le_bytes());
+        fs::write(&record_path, &bytes).unwrap();
+        let mut reader = scratch.store();
+        reader.restrict_reads_to_v1();
+        assert!(matches!(
+            reader.read(&b.key),
+            ReadOutcome::Refused(Refusal::NewerFormat)
+        ));
+        assert_eq!(reader.counters().guard_header_bytes, DISPATCH_BYTES as u64);
+        assert_eq!(reader.counters().guard_verify_bytes, 0);
+        assert_eq!(reader.counters().bytes_read, 0);
+        assert_eq!(fs::read(&record_path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn m1_reader_ceiling_keeps_consent_erasure_for_known_v3_private_labels() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let mut b = binding("account", "scope", ("fp-a", None));
+    // V3 acquisition records use the replay binding's zero entry digest.
+    // A legacy entry digest makes write_after_save skip the record.
+    b.entry = [0; 32];
+    let mut record = pending(b.clone(), certificate(&path), 1);
+    record.acquisition = Some(AcquisitionFields {
+        acquired_revision: 3,
+        protocol: crate::snapshots::AcquisitionProtocol::WriteAhead,
+    });
+    record.body = crate::snapshots::durable_store_fixture_body_with_skill();
+    let mut writer = scratch.store();
+    assert_eq!(
+        writer
+            .write_after_save(&lock, 1, 0, vec![record])
+            .unwrap()
+            .written,
+        1
+    );
+    let record_path = writer.record_path(&b.key);
+    assert_eq!(found(writer.read(&b.key)).format, FORMAT_V3);
+    drop(writer);
+    let mut reader = scratch.store();
+    reader.restrict_reads_to_v1();
+    assert!(matches!(
+        reader.read(&b.key),
+        ReadOutcome::Refused(Refusal::NewerFormat)
+    ));
+    assert_eq!(reader.counters().guard_verify_bytes, 0);
+    let report = reader
+        .purge_private_labels(&lock, |body| {
+            body == crate::snapshots::durable_store_fixture_body_with_skill()
+        })
+        .unwrap();
+    assert_eq!((report.erased, report.refused), (1, 0));
+    assert!(!record_path.exists());
+    assert_eq!(reader.counters().records_written, 0);
+}
+
+#[test]
+fn m1_without_a_successor_writer_never_strands_corruption_recovery() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp-a", None));
+    let mut writer = scratch.store();
+    assert_eq!(
+        writer
+            .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+            .unwrap()
+            .written,
+        1
+    );
+    let record_path = writer.record_path(&b.key);
+    let mut bytes = fs::read(&record_path).unwrap();
+    let tail = bytes.len() - 1;
+    bytes[tail] ^= 1;
+    fs::write(&record_path, &bytes).unwrap();
+    let mut reader = scratch.store();
+    reader.restrict_reads_to_v1();
+    // Model a native Full, successful memory-only completion, then RAM loss
+    // and more growth across several passes. The record cannot be repaired
+    // while OFF; its corruption must never become a permanent acquisition hold.
+    for _ in 0..3 {
+        reader.begin_pass();
+        assert_eq!(reader.full_guard(&b.key, false, true, &[0; 32]), Ok(None));
+        assert_eq!(reader.full_guard(&b.key, true, true, &[0; 32]), Ok(None));
+        assert_eq!(reader.rebuilt[&b.key], Rebuild::Authorized);
+    }
+    assert_eq!(reader.counters().t14_rebuild_full_started, 0);
+    assert_eq!(reader.counters().records_written, 0);
+    assert_eq!(fs::read(&record_path).unwrap(), bytes);
+}
+
+#[test]
+fn m1_blocked_group_leaves_earlier_corrupt_member_recoverable() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let a = binding("account", "scope", ("fp-a", None));
+    let mut b = a.clone();
+    b.key = key_digest(DurableSource::ClaudeCode, "later-member");
+    let mut writer = scratch.store();
+    assert_eq!(
+        writer
+            .write_after_save(
+                &lock,
+                1,
+                0,
+                vec![
+                    pending(a.clone(), certificate(&path), 1),
+                    pending(b.clone(), certificate(&path), 1)
+                ]
+            )
+            .unwrap()
+            .written,
+        2
+    );
+    let corrupt = writer.record_path(&a.key);
+    let later = writer.record_path(&b.key);
+    let mut bytes = fs::read(&corrupt).unwrap();
+    let tail = bytes.len() - 1;
+    bytes[tail] ^= 1;
+    fs::write(&corrupt, &bytes).unwrap();
+    let mut unknown = fs::read(&later).unwrap();
+    unknown[8..10].copy_from_slice(&FORMAT_V3.to_le_bytes());
+    fs::write(&later, unknown).unwrap();
+    let mut reader = scratch.store();
+    reader.restrict_reads_to_v1();
+    // Admission checks every needed member before committing any start.
+    assert_eq!(reader.full_guard(&a.key, false, true, &[0; 32]), Ok(None));
+    assert_eq!(
+        reader.full_guard(&b.key, false, true, &[0; 32]),
+        Err(Refusal::NewerFormat)
+    );
+    assert_eq!(reader.rebuilt[&a.key], Rebuild::Authorized);
+    fs::remove_file(&later).unwrap();
+    reader.begin_pass();
+    assert_eq!(reader.full_guard(&a.key, false, true, &[0; 32]), Ok(None));
+    assert_eq!(reader.full_guard(&b.key, false, true, &[0; 32]), Ok(None));
+    assert_eq!(reader.full_guard(&a.key, true, true, &[0; 32]), Ok(None));
+    assert_eq!(reader.counters().t14_rebuild_full_started, 0);
+}
+
+#[test]
+fn exact_retirement_retries_unlink_and_absent_path_directory_barrier() {
+    use crate::snapshots::sampled_scan::transition_fixture::{fail_store_at, CrashPoint};
+    for point in [CrashPoint::BeforeRetireUnlink, CrashPoint::BeforeRetireSync] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("retire.jsonl", b"{}\n");
+        let b = binding("account", "scope", ("fp", None));
+        let mut store = scratch.store();
+        assert_eq!(
+            store
+                .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+                .unwrap()
+                .written,
+            1
+        );
+        // Cold process: failure-side authorization cannot rely on restore success.
+        drop(store);
+        let mut store = scratch.store();
+        let record = found(store.read(&b.key));
+        let expected = Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        };
+        store.authorize(&record, &expected);
+        let proof = store.mutation_witness(&record, &expected).unwrap();
+        store.begin_pass();
+        store.durable.clear(); // writer custody outlives memo/permission turnover
+        let mut sync_due = false;
+        let fault = fail_store_at(point, 1);
+        assert!(matches!(
+            store.retire_exact(&lock, &proof, &mut sync_due),
+            RetireOutcome::Retry
+        ));
+        assert_eq!(fault.hits(), 1);
+        assert_eq!(store.counters.records_invalidated, 0);
+        assert_eq!(sync_due, point == CrashPoint::BeforeRetireSync);
+        drop(fault);
+        if sync_due {
+            assert!(!record_file(&store, &b.key).exists());
+            // The second attempt must still run the actual barrier even though
+            // the canonical path is absent; another barrier error retains it.
+            let fault = fail_store_at(CrashPoint::BeforeRetireSync, 1);
+            assert!(matches!(
+                store.retire_exact(&lock, &proof, &mut sync_due),
+                RetireOutcome::Retry
+            ));
+            assert_eq!(fault.hits(), 1);
+            assert!(sync_due);
+            drop(fault);
+        }
+        assert!(matches!(
+            store.retire_exact(&lock, &proof, &mut sync_due),
+            RetireOutcome::Retired
+        ));
+        assert!(!sync_due);
+        assert!(!record_file(&store, &b.key).exists());
+        assert_eq!(store.counters.records_invalidated, 1);
+    }
+}
+
+#[test]
+fn exact_retirement_verifies_changed_survivor_and_never_deletes_unknown_bytes() {
+    for unknown in [false, true] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("retire.jsonl", b"{}\n");
+        let b = binding("account", "scope", ("fp", None));
+        let mut store = scratch.store();
+        assert_eq!(
+            store
+                .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+                .unwrap()
+                .written,
+            1
+        );
+        let record = found(store.read(&b.key));
+        let expected = Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        };
+        store.authorize(&record, &expected);
+        let proof = store.mutation_witness(&record, &expected).unwrap();
+        let disk = record_file(&store, &b.key);
+        if unknown {
+            fs::write(&disk, b"unknown survivor").unwrap();
+        } else {
+            assert_eq!(
+                store
+                    .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
+                    .unwrap()
+                    .written,
+                1
+            );
+        }
+        let before = fs::read(&disk).unwrap();
+        let outcome = store.retire_exact(&lock, &proof, &mut false);
+        assert!(if unknown {
+            matches!(outcome, RetireOutcome::Retry)
+        } else {
+            matches!(outcome, RetireOutcome::Superseded)
+        });
+        assert_eq!(fs::read(&disk).unwrap(), before);
+    }
+}
+
+// F11: an exact retirement witness never converts a pending successor or a
+// retained exact completion into absence/ACK credit for its predecessor.
+#[test]
+fn exact_retirement_preserves_pending_and_retained_receipt_successors() {
+    let _reset = ResetFaults;
+    for retained_receipt in [false, true] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("pending-retire.jsonl", b"{}\n");
+        let b = binding("pending-retire", "scope", ("fp", None));
+        let mut store = scratch.store();
+        store
+            .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+            .unwrap();
+        let record = found(store.read(&b.key));
+        let expected = Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        };
+        store.authorize(&record, &expected);
+        let proof = store.mutation_witness(&record, &expected).unwrap();
+        let dir = store.dir().to_owned();
+        test_hooks::set_before_dir_sync(Some(Box::new(move |path| {
+            if path == dir {
+                Err(io::Error::other("synthetic pending successor sync"))
+            } else {
+                Ok(())
+            }
+        })));
+        let failed = store
+            .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
+            .unwrap();
+        test_hooks::set_before_dir_sync(None);
+        assert_eq!(failed.written, 0);
+        assert!(store.pending.contains_key(&b.key));
+        if retained_receipt {
+            let ReconcileOutcome::Receipted(receipt) =
+                store.reconcile_pending(&lock, &b.key).unwrap()
+            else {
+                panic!("exact successor receipt");
+            };
+            let completed_stamp = receipt.stamp;
+            store.retain_receipt(receipt).unwrap();
+            assert_eq!(store.pending[&b.key].completed, Some(completed_stamp));
+            assert!(
+                !store.receipt_pending(&b.key),
+                "matching completed stamp has no unresolved I/O"
+            );
+        }
+        let before = fs::read(record_file(&store, &b.key)).unwrap();
+        let invalidated = store.counters().records_invalidated;
+        assert!(matches!(
+            store.retire_exact(&lock, &proof, &mut false),
+            RetireOutcome::Retry
+        ));
+        assert_eq!(fs::read(record_file(&store, &b.key)).unwrap(), before);
+        assert_eq!(store.counters().records_invalidated, invalidated);
+        assert!(store.pending.contains_key(&b.key));
+        // A cold reader sees the published successor; the old witness cannot
+        // delete it even when process-local pending custody is gone.
+        drop(store);
+        let mut cold = scratch.store();
+        assert!(matches!(
+            cold.retire_exact(&lock, &proof, &mut false),
+            RetireOutcome::Superseded
+        ));
+        assert_eq!(fs::read(record_file(&cold, &b.key)).unwrap(), before);
+    }
+}
+
+#[test]
+fn exact_retirement_stat_io_error_is_retry_and_never_proven_absence() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let transcript = scratch.transcript("retire-stat.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp", None));
+    let mut store = scratch.store();
+    assert_eq!(
+        store
+            .write_after_save(
+                &lock,
+                1,
+                0,
+                vec![pending(b.clone(), certificate(&transcript), 1)]
+            )
+            .unwrap()
+            .written,
+        1
+    );
+    let record = found(store.read(&b.key));
+    let expected = Expected {
+        binding: b.clone(),
+        committed_generation: 1,
+    };
+    let proof = store.mutation_witness(&record, &expected).unwrap();
+    let path = record_file(&store, &b.key);
+    let saved_dir = scratch.root.join("saved-record-dir");
+    fs::rename(store.dir(), &saved_dir).unwrap();
+    // A regular file as the parent returns ENOTDIR at stamp_at, not ENOENT.
+    fs::write(store.dir(), b"blocked parent").unwrap();
+    assert!(stamp_at(&path).is_err());
+    let mut sync_due = true;
+    assert!(matches!(
+        store.retire_exact(&lock, &proof, &mut sync_due),
+        RetireOutcome::Retry
+    ));
+    assert!(
+        sync_due,
+        "a stat error cannot discharge directory-sync custody"
+    );
+    assert_eq!(store.counters.records_invalidated, 0);
+    fs::remove_file(store.dir()).unwrap();
+    fs::rename(&saved_dir, store.dir()).unwrap();
+    assert!(path.exists());
+    assert!(matches!(
+        store.retire_exact(&lock, &proof, &mut sync_due),
+        RetireOutcome::Retired
+    ));
+    assert!(!sync_due);
+    assert_eq!(store.counters.records_invalidated, 1);
 }

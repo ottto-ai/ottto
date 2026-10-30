@@ -312,6 +312,7 @@ impl OwnedJsonlParser {
         (preserve, planned): (bool, Option<ReadPlan>),
         mut reuse: impl FnMut(&Checkpoint, &File) -> Result<bool>,
     ) -> std::result::Result<ReadMode, PrepareRejected> {
+        let preserve = preserve && restart_restore::enabled();
         let checked = (|| -> Result<()> {
             // Checkpoints, samples and resume offsets are physical-file bytes. A
             // compressed stream has none, so it is never sampled or resumed.

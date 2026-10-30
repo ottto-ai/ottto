@@ -255,6 +255,7 @@ impl Drop for Hooks {
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_old_writer_tail_receipt_gc_and_two_restarts() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_transition") {
         return;
     }
@@ -305,6 +306,7 @@ fn shared_old_writer_tail_receipt_gc_and_two_restarts() {
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_quiet_restart_discloses_m1_io_gap_instead_of_claiming_zero() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_quiet") {
         return;
     }
@@ -335,6 +337,7 @@ fn shared_quiet_restart_discloses_m1_io_gap_instead_of_claiming_zero() {
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_selection_cleared_is_an_explicit_m1_gap_for_859() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_selection_clear") {
         return;
     }
@@ -377,6 +380,7 @@ fn shared_selection_cleared_is_an_explicit_m1_gap_for_859() {
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_unknown_record_holds_last_accepted_body_and_survives_gc() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_unknown_hold") {
         return;
     }
@@ -478,6 +482,7 @@ fn shared_unknown_record_holds_last_accepted_body_and_survives_gc() {
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_failed_rename_preserves_predecessor_and_retry_money() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_rename_retry") {
         return;
     }
@@ -593,6 +598,7 @@ fn shared_failed_rename_preserves_predecessor_and_retry_money() {
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(supported("shared_unacked_rename_retry"));
     with_e2(|| {
         let mut f = M1::old_writer("transition-unacked-rename", WRITERS[0]);
@@ -816,6 +822,7 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
 /// Runs ONLY as a new test process. Every edge is checked by the parent.
 #[test]
 fn shared_transition_crash_child() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if std::env::var_os("OTTTO_TRANSITION_CRASH").is_none() {
         return;
     }
@@ -845,6 +852,7 @@ fn shared_transition_crash_child() {
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_transition_crash_edges_reach_sigkill_and_keep_a_valid_survivor() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_crash") {
         return;
     }
@@ -923,6 +931,7 @@ fn shared_transition_crash_edges_reach_sigkill_and_keep_a_valid_survivor() {
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_codex_dated_legacy_and_v2_receipts_survive_two_restarts() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_codex") {
         return;
     }
@@ -1020,6 +1029,7 @@ fn shared_codex_dated_legacy_and_v2_receipts_survive_two_restarts() {
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_money_oracle_reports_each_field_and_rejects_false_holds() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_oracle_controls") {
         return;
     }
@@ -1355,6 +1365,7 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_24b_old_writer_restored_version_tail_and_unchanged_restart_twice() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(supported("shared_24b"));
     codex_24b_old_writer_row(false);
 }
@@ -1363,6 +1374,7 @@ fn shared_24b_old_writer_restored_version_tail_and_unchanged_restart_twice() {
 #[cfg(target_os = "macos")]
 #[ignore = "needs card-F retirement: main v1 restore re-derives SessionStartState prelude (DoD 6)"]
 fn shared_24b_old_writer_zero_old_bytes_target() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     codex_24b_old_writer_row(true);
 }
 
@@ -1459,6 +1471,7 @@ impl TransitionDriver for M3 {
     ignore = "M3 native retained transitions require qualified heap layout"
 )]
 fn shared_m3_native_receipt_precedes_ack_and_five_routes_match_money() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_m3_native") {
         return;
     }

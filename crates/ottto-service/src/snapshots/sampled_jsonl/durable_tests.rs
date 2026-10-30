@@ -86,7 +86,7 @@ fn full_read(path: &Path, source: SnapshotSource) -> (CachedJsonlReduction, Chec
 /// finishes with the money context the scan passes (the E2 fold's read
 /// context over an index holding the file), so the money fold is compared
 /// too.
-fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value {
+pub(super) fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value {
     items_at(parser, path, source, None)
 }
 
@@ -184,6 +184,16 @@ fn restore(
     let decoded = decode(body, source).expect("decode");
     let parser = rederive_parser(File::open(path).unwrap(), path, &decoded).unwrap();
     decoded.rederive(parser, &mut File::open(path).unwrap(), line_cap())
+}
+
+/// A later skill reference must not also create an unsupported opening-call
+/// obligation: close the native opening window with three ordinary user turns.
+fn skill_fixture_lines() -> Vec<String> {
+    let mut lines = claude_lines(1, 1);
+    for n in 4..7 {
+        lines.push(json!({"type":"user","sessionId":CLAUDE_SESSION,"uuid":format!("skill-window-{n}"),"timestamp":format!("2026-10-20T10:00:0{n}Z"),"message":{"role":"user","content":"synthetic later turn"}}).to_string());
+    }
+    lines
 }
 
 /// `pad` filler lines of about `width` bytes each.
@@ -413,8 +423,8 @@ const CODEX_IDS: [&str; 3] = ["call_CANARYL1cx", "call_CANARYL2cx", "call_CANARY
 
 /// The canary matrix: plain sessions, private instruction text on both
 /// sources (its reversible `ConfigDigest` included), and an email context
-/// with an org marker. Artifacts and skill names are `E` (Full, never
-/// stored): `e_class_canaries_never_persist`.
+/// with an org marker. Artifacts remain E; approved skill labels use PL-retained.
+/// `e_content_refuses_and_approved_mid_file_skills_persist` covers both.
 fn cases() -> Vec<Case> {
     const CODEX_CONTENT: &[&str] = &[
         "CANARY_PROMPT_cx",
@@ -663,10 +673,9 @@ fn org_marker_email_is_stored_only_as_a_domain_separated_digest() {
     assert_eq!(occurrences(&body, &separated).len(), 1);
 }
 
-/// F4 matrix, `E` classes: an artifact or a skill name refuses the record
-/// (the entry reads Full), so neither is ever stored.
+/// Other E content still refuses; the approved mid-file skill label now persists.
 #[test]
-fn e_class_canaries_never_persist() {
+fn e_content_refuses_and_approved_mid_file_skills_persist() {
     let scratch = Scratch::new("artifact");
     let path = scratch.write("t.jsonl", &claude_lines(1, 1));
     let (mut reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
@@ -683,7 +692,7 @@ fn e_class_canaries_never_persist() {
         .err(),
         Some(Refuse::NonEmpty("SnapshotAccumulator.artifacts"))
     );
-    let mut skill = claude_lines(1, 1);
+    let mut skill = skill_fixture_lines();
     skill.push(
         json!({"type":"assistant","sessionId":CLAUDE_SESSION,"uuid":"u-9","parentUuid":"u-3",
             "timestamp":"2026-10-20T10:00:09Z","requestId":"req_skill",
@@ -698,14 +707,14 @@ fn e_class_canaries_never_persist() {
     let scratch = Scratch::new("skill");
     let path = scratch.write("t.jsonl", &skill);
     let (reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
-    assert_eq!(
+    assert!(
         encode(
             &reduction,
             crate::durable_tail_store::RECORD_BYTES,
             line_cap()
         )
-        .err(),
-        Some(Refuse::NonEmpty("SnapshotAccumulator.activity_skills"))
+        .is_ok(),
+        "a native mid-file SKILL.md label is now PL-retained"
     );
 }
 
@@ -1119,7 +1128,18 @@ fn pi_tail_title_follows_its_update_and_the_first_prompt_fields_stay() {
 /// finishes to the same upload items as a cold Full of the grown file.
 #[test]
 fn restore_then_tail_matches_cold_full() {
-    for case in cases() {
+    let mut corpus = cases();
+    let mut skill = skill_fixture_lines();
+    skill.push(serde_json::json!({"type":"assistant","sessionId":CLAUDE_SESSION,"uuid":"skill-mid","timestamp":"2026-10-20T10:00:09Z","attributionSkill":"Review","message":{"id":"skill-mid","role":"assistant","model":"claude-opus-4-1","content":[{"type":"tool_use","id":"toolu-mid","name":"Read","input":{"file_path":"/synthetic/skills/Review/SKILL.md"}}],"usage":{"input_tokens":1,"output_tokens":1}}}).to_string());
+    corpus.push(Case {
+        source: SnapshotSource::ClaudeCode,
+        lines: skill,
+        appended: claude_lines(2, 2),
+        content: &[],
+        provider_ids: &[],
+        survivors: &[],
+    });
+    for case in corpus {
         let scratch = Scratch::new("tail");
         let path = scratch.write("t.jsonl", &case.lines);
         let (reduction, checkpoint) = full_read(&path, case.source);
@@ -1138,7 +1158,12 @@ fn restore_then_tail_matches_cold_full() {
         drop(file);
         let mut held = File::open(&path).unwrap();
         let (checkpoint, _) = certificate.restore(&mut held, scope()).unwrap();
-        let (restored, _) = restore(&path, &body, case.source).unwrap();
+        let (oracle, _) = restore(&path, &body, case.source).unwrap();
+        let (restored, _) = decode(&body, case.source)
+            .unwrap()
+            .rederive_content(&File::open(&path).unwrap())
+            .unwrap();
+        assert_eq!(full_digest(&restored), full_digest(&oracle));
         let mut continued = parser(&path, case.source);
         let mode = continued
             .prepare_acquisition(
@@ -1153,6 +1178,44 @@ fn restore_then_tail_matches_cold_full() {
             .unwrap();
         assert_eq!(mode, ReadMode::Tail, "{:?}", case.source);
         while !continued.step().unwrap() {}
+        let (cold_reduction, _) = full_read(&path, case.source);
+        assert_eq!(
+            serde_json::to_vec(&continued.accumulator.activity_summary()).unwrap(),
+            serde_json::to_vec(&cold_reduction.accumulator.activity_summary()).unwrap()
+        );
+        if case.source == SnapshotSource::ClaudeCode {
+            let attribution =
+                crate::session_attribution::SessionAttributionContext::from_activity_hint(
+                    case.source,
+                    &scratch.0,
+                    true,
+                    Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                    Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+                )
+                .unwrap();
+            let grouping = |acc: &SnapshotAccumulator| {
+                serde_json::to_vec(&attribution.grouping_facts(
+                    crate::session_attribution::SessionAttributionGroupingInput {
+                        source: case.source,
+                        origin: Some(&acc.origin),
+                        source_session_id: CLAUDE_SESSION,
+                        observed_at: COLLECTED,
+                        source_version: case.source.parser_version(),
+                        first_prompt: acc.first_prompt_material.as_deref(),
+                        provider_skills: &acc.provider_skills,
+                        activity_skills: &acc.activity_skills,
+                        repository_hash: None,
+                        source_started_at: acc.started_at.as_deref(),
+                        transcript_path: &path,
+                    },
+                ))
+                .unwrap()
+            };
+            assert_eq!(
+                grouping(&continued.accumulator),
+                grouping(&cold_reduction.accumulator)
+            );
+        }
         assert_eq!(
             items(continued, &path, case.source),
             cold_items(&path, case.source),
@@ -1234,7 +1297,10 @@ fn edits_after_the_checkpoint_refuse_restore() {
         .sum::<u64>();
     let record = |scratch: &Scratch| {
         let path = scratch.write("t.jsonl", &lines);
-        let (reduction, checkpoint) = full_read(&path, source);
+        let (mut reduction, checkpoint) = full_read(&path, source);
+        reduction
+            .accumulator
+            .note_activity_skills("/synthetic/skills/HeadLabel/SKILL.md");
         let body = encode(
             &reduction,
             crate::durable_tail_store::RECORD_BYTES,
@@ -1311,11 +1377,11 @@ fn edits_after_the_checkpoint_refuse_restore() {
 const ALLOWLIST_PINS: [(SnapshotSource, &str); 3] = [
     (
         SnapshotSource::ClaudeCode,
-        "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
+        "95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2",
     ),
     (
         SnapshotSource::Codex,
-        "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+        "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0",
     ),
     (
         SnapshotSource::Pi,
@@ -1351,8 +1417,8 @@ fn allowlist_digest_binds_source_and_field_classes() {
         "X title",
         "X first_prompt_material",
         "X workspace_path",
-        "E provider_skills",
-        "E activity_skills",
+        "PL provider_skills",
+        "PL activity_skills",
         "I codex_turn_traces",
         "D activity_call_tools",
         "L activity_mcp_call_ids",
@@ -1538,11 +1604,11 @@ fn h_fields_are_audited() {
 }
 
 /// Full-fallback classes on a synthetic corpus, by the refusing field: a
-/// skill reference (E) and a first prompt past the 1 MiB head bound (not
-/// re-derivable) each read Full; plain sessions persist.
+/// approved skill references persist alongside plain sessions; a first prompt
+/// past the 1 MiB head bound still refuses toward native Full.
 #[test]
 fn fallback_classes_over_the_synthetic_corpus() {
-    let mut skill = claude_lines(1, 1);
+    let mut skill = skill_fixture_lines();
     skill.push(
         json!({"type":"assistant","sessionId":CLAUDE_SESSION,"uuid":"u-9","parentUuid":"u-3",
             "timestamp":"2026-10-20T10:00:09Z","requestId":"req_skill",
@@ -1585,8 +1651,7 @@ fn fallback_classes_over_the_synthetic_corpus() {
     assert_eq!(
         tally,
         BTreeMap::from([
-            ("persisted", 2),
-            ("SnapshotAccumulator.activity_skills", 1),
+            ("persisted", 3),
             ("SnapshotAccumulator.first_prompt_material", 1),
         ])
     );
@@ -2023,7 +2088,7 @@ fn no_input_completion_requires_every_rederive_digest_absent() {
 /// codec corpus. Other digest obligations are deliberately left unsupported;
 /// this projection is NOT a claim that the complete rich records restore.
 #[test]
-fn bounded_workspace_matches_native_corpus_and_refuses_other_classes() {
+fn bounded_content_matches_native_corpus_and_fences_every_class() {
     let scratch = Scratch::new("bounded-workspace");
     let cases = [
         (SnapshotSource::ClaudeCode, claude_lines(3, 3)),
@@ -2044,11 +2109,12 @@ fn bounded_workspace_matches_native_corpus_and_refuses_other_classes() {
         let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
         let decoded = decode(&body, source).unwrap();
         assert!(decoded.rederive.workspace.is_some());
-        assert!(
-            decoded.content_charge().is_err(),
-            "rich record remains unsupported"
-        );
+        assert!(decoded.content_charge().is_ok());
+        let (bounded, _) = decoded
+            .rederive_content(&File::open(&path).unwrap())
+            .unwrap();
         let oracle = restore(&path, &body, source).unwrap().0;
+        assert_eq!(full_digest(&bounded), full_digest(&oracle));
         let mut workspace = decode(&body, source).unwrap();
         workspace.rederive = Rederive {
             workspace: workspace.rederive.workspace,
@@ -2064,7 +2130,7 @@ fn bounded_workspace_matches_native_corpus_and_refuses_other_classes() {
         wrong.content_charge().unwrap();
         assert!(matches!(
             wrong.rederive_content(&File::open(&path).unwrap()),
-            Err(Refuse::NotRederivable("workspace_digest"))
+            Err(Refuse::NotRederivable("content_fence"))
         ));
         let (bounded, receipt) = workspace
             .rederive_content(&File::open(&path).unwrap())
@@ -2093,7 +2159,9 @@ fn bounded_workspace_matches_native_corpus_and_refuses_other_classes() {
                 2 => excluded.rederive.agent_label = Some([1; 32]),
                 _ => excluded.rederive.session_start = Some([1; 32]),
             }
-            assert!(excluded.content_charge().is_err());
+            assert!(excluded
+                .rederive_content(&File::open(&path).unwrap())
+                .is_err());
         }
     }
 }
@@ -2123,17 +2191,10 @@ fn bounded_workspace_cap_and_escaped_text_keep_native_values_or_refuse() {
             };
             decoded.content_charge().unwrap();
             let actual = decoded.rederive_content(&File::open(&path).unwrap());
-            if length > 4096 {
-                assert!(matches!(
-                    actual,
-                    Err(Refuse::NotRederivable("workspace_capture"))
-                ));
-            } else {
-                assert_eq!(
-                    actual.unwrap().0.accumulator.workspace_path,
-                    native.accumulator.workspace_path
-                );
-            }
+            assert_eq!(
+                actual.unwrap().0.accumulator.workspace_path,
+                native.accumulator.workspace_path
+            );
         }
     }
     let path = scratch.write("escaped", &[r#"{"type":"progress","cwd":"  /tmp/a\u0062\u0063  ","ignored":[{"key":"not captured"}]}"#.into()]);
@@ -2157,7 +2218,7 @@ fn bounded_workspace_cap_and_escaped_text_keep_native_values_or_refuse() {
 }
 
 #[test]
-fn workspace_wrong_object_shapes_refuse_without_formatting_the_input() {
+fn workspace_unknown_object_shapes_match_native_without_formatting_the_input() {
     let scratch = Scratch::new("workspace-shape-error");
     for field in ["payload", "session_meta", "turn_context"] {
         let path = scratch.write(
@@ -2175,10 +2236,15 @@ fn workspace_wrong_object_shapes_refuse_without_formatting_the_input() {
         };
         assert!(decoded.rederive.workspace.is_some());
         decoded.content_charge().unwrap();
-        assert!(matches!(
-            decoded.rederive_content(&File::open(&path).unwrap()),
-            Err(Refuse::NotRederivable("workspace_capture"))
-        ));
+        assert_eq!(
+            decoded
+                .rederive_content(&File::open(&path).unwrap())
+                .unwrap()
+                .0
+                .accumulator
+                .workspace_path,
+            native.accumulator.workspace_path
+        );
     }
 }
 
@@ -2369,13 +2435,13 @@ fn bounded_pi_workspace_matches_native_header_only_precedence() {
         prompt.rederive.first_prompt = Some([1; 32]);
         assert!(
             prompt.content_charge().is_err(),
-            "Pi first prompt is still unfunded"
+            "a fabricated prompt without a physical mark refuses"
         );
         let mut wrong = make();
         wrong.rederive.workspace = Some([0; 32]);
         assert!(matches!(
             wrong.rederive_content(&File::open(&path).unwrap()),
-            Err(Refuse::NotRederivable("workspace_digest"))
+            Err(Refuse::NotRederivable("content_fence"))
         ));
     }
 }
@@ -2408,17 +2474,10 @@ fn bounded_pi_workspace_enforces_cap_and_refuses_nonheader_cwd() {
         };
         decoded.content_charge().unwrap();
         let result = decoded.rederive_content(&File::open(&path).unwrap());
-        if size == 4096 {
-            assert_eq!(
-                result.unwrap().0.accumulator.workspace_path,
-                Some(PathBuf::from("x".repeat(size)))
-            );
-        } else {
-            assert!(matches!(
-                result,
-                Err(Refuse::NotRederivable("workspace_capture"))
-            ));
-        }
+        assert_eq!(
+            result.unwrap().0.accumulator.workspace_path,
+            Some(PathBuf::from("x".repeat(size)))
+        );
     }
     let row = json!({"type":"message","cwd":"/synthetic/wrong-row"}).to_string();
     let path = scratch.write("not-header", std::slice::from_ref(&row));
@@ -2442,6 +2501,751 @@ fn bounded_pi_workspace_enforces_cap_and_refuses_nonheader_cwd() {
     };
     assert!(matches!(
         decoded.rederive_content(&File::open(&path).unwrap()),
-        Err(Refuse::NotRederivable("workspace_digest"))
+        Err(Refuse::NotRederivable("content_fence"))
     ));
+}
+
+#[test]
+fn skill_label_bounds_and_consent_preserve_the_whole_native_state() {
+    let scratch = Scratch::new("label-bounds");
+    let path = scratch.write("t.jsonl", &claude_lines(1, 1));
+    let (base, _) = full_read(&path, SnapshotSource::ClaudeCode);
+    for label in [
+        "x".repeat(97),
+        "é".into(),
+        "a/b".into(),
+        "a\\b".into(),
+        "a\0b".into(),
+    ] {
+        let mut record = base.clone();
+        record.accumulator.note_provider_skill(Some(label));
+        let native = record.accumulator.provider_skills.clone();
+        assert_eq!(
+            encode_permitted(&record, usize::MAX, line_cap(), true).err(),
+            Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=provider}"))
+        );
+        assert_eq!(
+            record.accumulator.provider_skills, native,
+            "no filtering, truncation or recasing at persistence"
+        );
+    }
+    let mut record = base.clone();
+    record
+        .accumulator
+        .note_provider_skill(Some(format!("  {}  ", "A".repeat(96))));
+    record.accumulator.note_activity_skills(
+        "/synthetic/skills/FirstSpelling/SKILL.md /synthetic/skills/firstspelling/SKILL.md",
+    );
+    assert_eq!(
+        record.accumulator.provider_skills,
+        BTreeSet::from(["a".repeat(96)])
+    );
+    assert_eq!(
+        record.accumulator.activity_skills,
+        BTreeSet::from(["FirstSpelling".into()])
+    );
+    let body = encode_permitted(&record, usize::MAX, line_cap(), true).unwrap();
+    assert!(body_has_skill_labels(&body).unwrap());
+    let decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
+    assert!(
+        !decoded.permits_skill_labels(false),
+        "consent off never resurrects old labels"
+    );
+    assert!(decoded.permits_skill_labels(true));
+    assert_eq!(
+        encode_permitted(&record, usize::MAX, line_cap(), false).err(),
+        Some(Refuse::NonEmpty("skill_label_consent_off"))
+    );
+    assert!(
+        encode_permitted(&base, usize::MAX, line_cap(), false).is_ok(),
+        "empty sets need no label permission"
+    );
+    assert!(
+        encode_permitted(&record, usize::MAX, line_cap(), true).is_ok(),
+        "turn-on permits the next native save without a forced read"
+    );
+    record.accumulator.activity_skills.insert("bad/path".into());
+    assert_eq!(
+        encode_permitted(&record, usize::MAX, line_cap(), true).err(),
+        Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=activity}"))
+    );
+}
+
+#[test]
+fn skill_labels_preserve_native_provider_and_activity_caps() {
+    let scratch = Scratch::new("label-cap");
+    let path = scratch.write("t.jsonl", &claude_lines(1, 1));
+    let (mut record, _) = full_read(&path, SnapshotSource::ClaudeCode);
+    for n in 0..33 {
+        record
+            .accumulator
+            .note_provider_skill(Some(format!("Provider{n:02}")));
+        record
+            .accumulator
+            .note_activity_skills(&format!("/synthetic/skills/Activity{n:02}/SKILL.md"));
+    }
+    record
+        .accumulator
+        .note_provider_skill(Some("Aardvark".into()));
+    record
+        .accumulator
+        .note_activity_skills("/synthetic/skills/Aardvark/SKILL.md");
+    assert!(!record.accumulator.provider_skills.contains("aardvark"));
+    assert!(!record.accumulator.activity_skills.contains("Aardvark"));
+    assert_eq!(
+        record.accumulator.provider_skills.len(),
+        crate::session_attribution::MAX_SKILL_FACTS + 1
+    );
+    assert_eq!(record.accumulator.activity_skills.len(), 33);
+    assert!(record.accumulator.provider_skills.contains("provider08"));
+    assert!(!record.accumulator.provider_skills.contains("provider09"));
+    assert!(record.accumulator.activity_skills.contains("Activity32"));
+    assert!(!record.accumulator.provider_skills.contains("provider33"));
+    assert!(!record.accumulator.activity_skills.contains("Activity33"));
+    let body = encode_permitted(&record, usize::MAX, line_cap(), true).unwrap();
+    let decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
+    assert_eq!(
+        decoded.reduction.accumulator.provider_skills,
+        record.accumulator.provider_skills
+    );
+    assert_eq!(
+        decoded.reduction.accumulator.activity_skills,
+        record.accumulator.activity_skills
+    );
+    record.accumulator.activity_skills.insert("extra".into());
+    assert_eq!(
+        encode_permitted(&record, usize::MAX, line_cap(), true).err(),
+        Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=activity}"))
+    );
+    record.accumulator.activity_skills.remove("extra");
+    // Native provider insertion stops at nine. Also pin the record codec's
+    // approved <=33 bound independently of that narrower native cap.
+    record.accumulator.provider_skills = (0..34).map(|n| format!("provider{n:02}")).collect();
+    assert_eq!(
+        encode_permitted(&record, usize::MAX, line_cap(), true).err(),
+        Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=provider}"))
+    );
+}
+
+#[test]
+fn pl_scope_is_closed_and_every_other_e_field_stays_refusing() {
+    let shape = shape_text();
+    let paths = |class: &str| {
+        h_paths(&shape.replace("H ", "digest ").replace(class, "H "))
+            .into_iter()
+            .map(|path| path.split(':').next().unwrap().to_owned())
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        paths("PL "),
+        BTreeSet::from([
+            "SnapshotAccumulator.activity_skills".into(),
+            "SnapshotAccumulator.provider_skills".into()
+        ])
+    );
+    assert_eq!(
+        paths("E "),
+        [
+            "CodexPrelude.skills_body",
+            "OpeningCall.files",
+            "OrgMarkers.home",
+            "SelectorCapture.context.attribution",
+            "SnapshotAccumulator.codex_tier_replay",
+            "SnapshotAccumulator.claude_desktop_identity",
+            "SnapshotAccumulator.claude_desktop_spawn_lineage",
+            "SnapshotAccumulator.codex_parent_signatures",
+            "SnapshotAccumulator.codex_parent_prefix_proof",
+            "SnapshotAccumulator.codex_parent_proof_used",
+            "SnapshotAccumulator.codex_parent_proof_refusal",
+            "SnapshotAccumulator.codex_legacy_bootstrap_buffer",
+            "SnapshotAccumulator.artifacts",
+            "SnapshotAccumulator.claude_usage_request_ids",
+            "SnapshotAccumulator.claude_usage_occurrences",
+            "SnapshotAccumulator.cache_observations",
+            "SnapshotAccumulator.claude_fork_parent",
+            "SnapshotAccumulator.claude_money",
+            "SnapshotAccumulator.seen_pi_usage_keys",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+    );
+}
+
+/// Pi is not registered by this slice. Exercise the same decoded production
+/// content interface without granting Pi store/write authority (E5 owns that).
+#[test]
+fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
+    let root = Scratch::new("pi-bounded-head-tail");
+    let source = SnapshotSource::Pi;
+    for cwd in [None, Some("/synthetic/pi-workspace")] {
+        let lines = vec![
+            json!({"type":"session","id":"synthetic-pi","cwd":cwd}).to_string(),
+            json!({"type":"message","role":"user","content":"Synthetic first prompt"}).to_string(),
+            json!({"type":"message","message":{"role":"assistant","model":"claude-sonnet-4-5","usage":{"input":20,"output":3},"timestamp":"2026-10-20T10:00:00Z"}}).to_string(),
+        ];
+        let path = root.write(if cwd.is_some() { "cwd" } else { "no-cwd" }, &lines);
+        for cycle in 0..2 {
+            let (native, checkpoint) = full_read(&path, source);
+            let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
+            assert!(digests.first_prompt.is_some());
+            assert!(digests.session_start.is_none());
+            assert!(digests.agent_label.is_none());
+            let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
+                native.put(e)?;
+                digests.put(e)
+            })
+            .unwrap();
+            let certificate = checkpoint
+                .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
+                .unwrap();
+            let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(append, "{}", json!({"type":"message","message":{"role":"user","content":format!("later prompt {cycle}")}})).unwrap();
+            drop(append);
+            let (checkpoint, _) = certificate
+                .restore(&mut File::open(&path).unwrap(), scope())
+                .unwrap();
+            let decoded = decode_body(&body, source).unwrap();
+            let (restored, receipt) = decoded
+                .rederive_content(&File::open(&path).unwrap())
+                .unwrap();
+            assert!(receipt.head_bytes <= HEAD_BOUND);
+            assert_eq!(
+                restored.accumulator.first_prompt_material,
+                native.accumulator.first_prompt_material
+            );
+            assert_eq!(
+                restored.accumulator.first_prompt_title,
+                native.accumulator.first_prompt_title
+            );
+            assert_eq!(restored.accumulator.workspace_path, cwd.map(PathBuf::from));
+            let mut tail = parser(&path, source);
+            assert_eq!(
+                tail.prepare_acquisition(
+                    Some(Retained {
+                        checkpoint,
+                        state: restored
+                    }),
+                    &scope(),
+                    None,
+                    NOW
+                )
+                .unwrap(),
+                ReadMode::Tail
+            );
+            while !tail.step().unwrap() {}
+            let actual = items(tail, &path, source);
+            assert_eq!(actual, cold_items(&path, source));
+            assert!(actual.to_string().contains("Synthetic first prompt"));
+        }
+    }
+}
+
+#[test]
+fn bounded_plan_refuses_unsupported_codex_boundaries_and_oversized_marks_without_reads() {
+    let root = Scratch::new("unsupported-bounded");
+    let path = root.write("t", &codex_lines());
+    let (native, _) = full_read(&path, SnapshotSource::Codex);
+    let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
+    for boundary in [
+        CodexOwnershipBoundary::AwaitingLegacyTrigger,
+        CodexOwnershipBoundary::AwaitingParentPrefix,
+        CodexOwnershipBoundary::AmbiguousFork,
+        CodexOwnershipBoundary::Undetermined,
+    ] {
+        let mut decoded = decode(&body, SnapshotSource::Codex).unwrap();
+        decoded.reduction.accumulator.codex_ownership_boundary = boundary;
+        assert!(decoded.rederive_plan().is_err());
+    }
+    let mut decoded = decode(&body, SnapshotSource::Codex).unwrap();
+    decoded.rederive.first_prompt = Some([0; 32]);
+    decoded.reduction.accumulator.durable_marks.first_prompt = Some(HEAD_BOUND + 1);
+    assert_eq!(decoded.rederive_plan().err(), Some("mark"));
+    let mut decoded = decode(&body, SnapshotSource::Codex).unwrap();
+    decoded.rederive.title = Some([0; 32]);
+    decoded.reduction.accumulator.durable_marks.title_line =
+        Some((HEAD_BOUND + 1, TITLE_LINE_BOUND + 1));
+    assert_eq!(decoded.rederive_plan().err(), Some("title"));
+}
+
+// F4: each H class fails atomically, and diagnostics identify only the class.
+#[test]
+fn bounded_fence_refuses_each_content_class_before_adoption() {
+    let root = Scratch::new("all-content-fences");
+    let source = SnapshotSource::Codex;
+    let mut lines = codex_lines();
+    let mut header: Value = serde_json::from_str(&lines[0]).unwrap();
+    header["payload"]["source"] =
+        json!({"subagent":{"thread_spawn":{"agent_path":"/agents/PRIVATE-AGENT-FENCE"}}});
+    lines[0] = header.to_string();
+    let path = root.write("source.jsonl", &lines);
+    let (native, _) = full_read(&path, source);
+    let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
+    // Retain the ordinary corpus's supported plan; each injected digest is
+    // deliberately impossible, including absent-class versus present mismatch.
+    for class in 0..5 {
+        let mut decoded = decode(&body, source).unwrap();
+        let digest = match class {
+            0 => &mut decoded.rederive.first_prompt,
+            1 => &mut decoded.rederive.title,
+            2 => &mut decoded.rederive.agent_label,
+            3 => &mut decoded.rederive.session_start,
+            4 => &mut decoded.rederive.workspace,
+            _ => unreachable!(),
+        };
+        *digest = Some([0; 32]);
+        let (result, rows) = crate::local_resource_diagnostics::capture(|| {
+            decoded.rederive_content(&File::open(&path).unwrap())
+        });
+        assert!(matches!(
+            result,
+            Err(Refuse::NotRederivable("content_fence"))
+        ));
+        let counts = rows
+            .iter()
+            .find_map(|row| row["counts"].get("rederive_fence_mismatch"))
+            .expect("fence alarm");
+        assert_eq!(counts[class], 1);
+        assert!(!serde_json::to_string(&rows)
+            .unwrap()
+            .contains("PRIVATE-AGENT-FENCE"));
+    }
+}
+
+// F7: concurrent appends at the physical sample/head/title read boundaries
+// preserve bounded replay and leave the appended suffix to ordinary Tail.
+#[test]
+fn bounded_restore_append_injection_at_samples_head_and_title_matches_cold_body() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for edge in [
+            "before_samples",
+            "between_samples",
+            "after_samples",
+            "head",
+            "title",
+        ] {
+            let root = Scratch::new("bounded-append-stages");
+            let lines = if source == SnapshotSource::ClaudeCode {
+                claude_lines(20, 20)
+            } else {
+                let mut lines = codex_lines();
+                let title = lines
+                    .iter()
+                    .position(|line| line.contains("thread_name_updated"))
+                    .unwrap();
+                let title = lines.remove(title);
+                for n in 2..=3 {
+                    let mut total = codex_usage(100 * n);
+                    total["output_tokens"] = json!(3 * n);
+                    total["total_tokens"] = json!(103 * n);
+                    lines.push(json!({"type":"turn_context","payload":{"turn_id":format!("extra-{n}"),"model":"gpt-5.2"}}).to_string());
+                    lines.push(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":format!("extra-{n}")}}).to_string());
+                    lines.push(json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":codex_usage(100),"total_token_usage":total}}}).to_string());
+                    lines.push(json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":format!("extra-{n}")}}).to_string());
+                }
+                lines.push(title);
+                lines
+            };
+            let path = root.write("source.jsonl", &lines);
+            let (native, checkpoint) = full_read(&path, source);
+            let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
+            let certificate = checkpoint
+                .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
+                .unwrap();
+            let append = |path: &Path| {
+                writeln!(
+                    fs::OpenOptions::new().append(true).open(path).unwrap(),
+                    "{{\"type\":\"progress\",\"data\":\"append-injection\"}}"
+                )
+                .unwrap();
+            };
+            append(&path); // scoped restore is growth-only
+            if edge == "before_samples" {
+                append(&path);
+            }
+            let hook_path = path.clone();
+            let mut samples = 0;
+            let target_sample = match edge {
+                "between_samples" => 1,
+                "after_samples" => 2,
+                _ => 0,
+            };
+            let (checkpoint, _) = crate::transcript_acquisition::with_sample_read_hook(
+                move || {
+                    samples += 1;
+                    if samples == target_sample {
+                        append(&hook_path);
+                    }
+                },
+                || certificate.restore_grown(&mut File::open(&path).unwrap(), scope()),
+            )
+            .unwrap();
+            let decoded = decode(&body, source).unwrap();
+            let plan = decoded.rederive_plan().unwrap();
+            let title_offset = plan.title.map(|(offset, _)| offset);
+            if edge == "title" {
+                assert!(title_offset.is_some(), "fixture must read a named title");
+            }
+            let hook_path = path.clone();
+            let mut fired = false;
+            let (restored, receipt, _) = content::with_read_hook(
+                move |offset| {
+                    let target = (edge == "head" && offset == 0)
+                        || (edge == "title" && Some(offset) == title_offset);
+                    if target && !fired {
+                        fired = true;
+                        append(&hook_path);
+                    }
+                },
+                || decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan),
+            )
+            .unwrap();
+            assert_eq!(receipt.head_bytes + receipt.line_bytes, plan.input_bytes());
+            let mut tail = parser(&path, source);
+            assert_eq!(
+                tail.prepare_acquisition(
+                    Some(Retained {
+                        checkpoint,
+                        state: restored
+                    }),
+                    &scope(),
+                    None,
+                    NOW
+                )
+                .unwrap(),
+                ReadMode::Tail
+            );
+            while !tail.step().unwrap() {}
+            assert_eq!(
+                items(tail, &path, source),
+                cold_items(&path, source),
+                "{source:?}/{edge}"
+            );
+        }
+    }
+}
+
+const PRIVACY_CANARIES: [&str; 4] = [
+    "PRIVATE_LITERAL_DIAGNOSTICS_CANARY_20261030",
+    "PRIVATE_REPLAY_HEAD_CANARY_20261030",
+    "PRIVATE_REPLAY_PROMPT_CANARY_20261030",
+    "PRIVATE_REPLAY_LABEL_CANARY_20261030",
+];
+
+/// The support tests consume the actual replay errors and diagnostic lines,
+/// alongside the private input that must never be collected into a bundle.
+pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
+    fs::create_dir_all(root).unwrap();
+    let mut safe_log = String::new();
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let mut lines = match source {
+            SnapshotSource::ClaudeCode => claude_lines(2, 2),
+            SnapshotSource::Codex => codex_lines(),
+            SnapshotSource::Pi => vec![
+                json!({"type":"session","id":"synthetic-pi","cwd":"/synthetic/privacy"})
+                    .to_string(),
+                json!({"type":"message","role":"user","content":"Synthetic Pi prompt"}).to_string(),
+            ],
+        };
+        // Insert canaries in content, a head-only ignored field and an agent
+        // label. A malformed selector and raw-value key are native inputs too.
+        for line in &mut lines {
+            let mut v: Value = serde_json::from_str(line).unwrap();
+            v["private_head"] = json!(PRIVACY_CANARIES[1]);
+            if let Some(content) = v.pointer_mut("/message/content") {
+                if content.is_string() {
+                    *content = json!(PRIVACY_CANARIES[2]);
+                }
+            }
+            if source == SnapshotSource::Pi && v.get("role") == Some(&json!("user")) {
+                v["content"] = json!(PRIVACY_CANARIES[2]);
+            }
+            if v.pointer("/payload/type") == Some(&json!("user_message")) {
+                v["payload"]["message"] = json!(PRIVACY_CANARIES[2]);
+            }
+            if v.get("type") == Some(&json!("session_meta")) {
+                v["payload"]["source"] = json!({"subagent":{"thread_spawn":{"agent_path":format!("/agents/{}", PRIVACY_CANARIES[3])}}});
+            }
+            *line = v.to_string();
+        }
+        lines.insert(
+            0,
+            json!({"selector":{"model":[PRIVACY_CANARIES[0]]}, "private_head":PRIVACY_CANARIES[1]})
+                .to_string(),
+        );
+        let path = root.join(format!("{}-private.jsonl", source.api_slug()));
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let (native, _) = full_read(&path, source);
+        let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
+        let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
+            native.put(e)?;
+            digests.put(e)
+        })
+        .unwrap();
+        for class in 0..5 {
+            let bad = decode_body(&body, source).unwrap().test_fence_body(class);
+            // A real caught panic is a failed test, with a content-free failure
+            // assertion. The subprocess test also inspects the panic hook sink.
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::local_resource_diagnostics::capture(|| {
+                    decode_body(&bad, source)
+                        .unwrap()
+                        .rederive_content(&File::open(&path).unwrap())
+                })
+            }));
+            assert!(
+                caught.is_ok(),
+                "replay must return a typed refusal without panicking"
+            );
+            let (result, rows) = caught.unwrap();
+            let error = result.err().expect("inconsistent H refuses atomically");
+            let text = format!("{error:?}\n{}\n", serde_json::to_string(&rows).unwrap());
+            for canary in PRIVACY_CANARIES {
+                assert!(!text.contains(canary));
+            }
+            safe_log.push_str(&text);
+        }
+        // Native raw-value handling accepts/reparses this physical input;
+        // bounded replay must explicitly refuse the special key, without
+        // reflecting either the input or serde's error payload.
+        // Value's raw-value map consumes exactly one field. A second outer
+        // field makes the native JSONL read lossy, so the certified full_read
+        // premise would fail before bounded replay. Keep the canary inside the
+        // raw JSON string; native parses it and bounded replay refuses the key.
+        let raw = json!({
+            "$serde_json::private::RawValue": json!({"ignored":PRIVACY_CANARIES[0]}).to_string()
+        })
+        .to_string()
+            + "\n";
+        fs::write(&path, raw + &lines.join("\n") + "\n").unwrap();
+        let (native, _) = full_read(&path, source);
+        let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
+        let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
+            native.put(e)?;
+            digests.put(e)
+        })
+        .unwrap();
+        let result = decode_body(&body, source)
+            .unwrap()
+            .rederive_content(&File::open(&path).unwrap());
+        assert!(matches!(
+            result,
+            Err(Refuse::NotRederivable("raw_value_key"))
+        ));
+        safe_log.push_str(&format!("{:?}\n", result.err().unwrap()));
+        // Corrupt persisted bytes and a descriptor error exercise both error
+        // carriers without formatting a Value, prompt, title or label.
+        assert!(decode_body(&body[..body.len() - 1], source).is_err());
+        let fd = File::options().write(true).open(&path).unwrap();
+        let err = decode_body(&body, source)
+            .unwrap()
+            .rederive_content(&fd)
+            .err()
+            .unwrap();
+        safe_log.push_str(&format!("{err:?}\n"));
+    }
+    for canary in PRIVACY_CANARIES {
+        assert!(!safe_log.contains(canary));
+    }
+    fs::write(root.join("replay-errors.log"), &safe_log).unwrap();
+    eprintln!("{safe_log}");
+    PRIVACY_CANARIES
+}
+
+#[test]
+fn bounded_replay_errors_logs_and_panics_are_content_free() {
+    const CHILD: &str = "OTTTO_BOUNDED_REPLAY_PRIVACY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let root = Scratch::new("privacy-child");
+        replay_privacy_artifacts(&root.0);
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "snapshots::sampled_jsonl::durable::tests::bounded_replay_errors_logs_and_panics_are_content_free", "--nocapture"])
+        .env(CHILD, "1").output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for canary in PRIVACY_CANARIES {
+        assert!(
+            !stdout.contains(canary),
+            "content in stdout or panic payload"
+        );
+        assert!(!stderr.contains(canary), "content in log or panic payload");
+    }
+    assert!(
+        stdout.contains("1 passed"),
+        "child fixture must actually run"
+    );
+    assert!(
+        output.status.success(),
+        "privacy child must return typed errors without panic"
+    );
+}
+
+/// Pi remains unregistered here. This is the production codec/acquisition/
+/// native-finish/finalizer interface E5 will route after registration, with
+/// actual A < C < B extents and a real complete native body (no hand-built item).
+#[test]
+fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
+    let _on = RestartRestoreForTest::enabled();
+    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
+        let root = Scratch::new("pi-publication-race");
+        let pi_lines = vec![
+        json!({"type":"session","id":"synthetic-pi","cwd":"/synthetic/pi"}).to_string(),
+        json!({"type":"message","role":"user","content":"Synthetic first Pi prompt"}).to_string(),
+        json!({"type":"message","message":{"role":"assistant","model":"claude-sonnet-4-5","usage":{"input":20,"output":3},"timestamp":"2026-10-20T10:00:00Z"}}).to_string(),
+    ];
+        let lines = if source == SnapshotSource::Codex {
+            codex_lines()
+        } else {
+            pi_lines
+        };
+        let path = root.write("source.jsonl", &lines);
+        let (native, checkpoint) = full_read(&path, source);
+        let a = fs::metadata(&path).unwrap().len();
+        let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
+        let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
+            native.put(e)?;
+            digests.put(e)
+        })
+        .unwrap();
+        let certificate = checkpoint
+            .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
+            .unwrap();
+        let total_input = std::cell::Cell::new(100);
+        let total_output = std::cell::Cell::new(3);
+        let append = |n| {
+            let lines = if source == SnapshotSource::Codex {
+                total_input.set(total_input.get() + n);
+                total_output.set(total_output.get() + 3);
+                let mut total = codex_usage(total_input.get());
+                total["output_tokens"] = json!(total_output.get());
+                total["total_tokens"] = json!(total_input.get() + total_output.get());
+                vec![
+                    json!({"type":"turn_context","timestamp":COLLECTED,"payload":{"turn_id":format!("race-{n}"),"model":"gpt-5.2"}}),
+                    json!({"type":"event_msg","timestamp":COLLECTED,"payload":{"type":"task_started","turn_id":format!("race-{n}")}}),
+                    json!({"type":"event_msg","timestamp":COLLECTED,"payload":{"type":"token_count","info":{"last_token_usage":codex_usage(n),"total_token_usage":total}}}),
+                    json!({"type":"event_msg","timestamp":COLLECTED,"payload":{"type":"task_complete","turn_id":format!("race-{n}")}}),
+                ]
+            } else {
+                vec![
+                    json!({"type":"message","message":{"role":"assistant","model":"claude-sonnet-4-5","usage":{"input":n,"output":3},"timestamp":"2026-10-20T10:01:00Z"}}),
+                ]
+            };
+            let mut fd = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            for line in lines {
+                writeln!(fd, "{line}").unwrap();
+            }
+        };
+        append(30);
+        let c = fs::metadata(&path).unwrap().len();
+        append(40);
+        let b = fs::metadata(&path).unwrap().len();
+        let finish = |parser: OwnedJsonlParser| {
+            let identity = opened_object_identity(source, &mut File::open(&path).unwrap()).unwrap();
+            parser
+                .finish_with_repository_identity(
+                    &identity,
+                    &path,
+                    COLLECTED,
+                    "race-source".into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+        };
+        let mut accepted = parser(&path, source);
+        while !accepted.step().unwrap() {}
+        let accepted = finish(accepted);
+        assert!(accepted.report.complete());
+        assert!(!accepted.snapshots.is_empty());
+        let previous_entities: BTreeSet<String> = accepted
+            .snapshots
+            .iter()
+            .map(|i| snapshot_fingerprint(source, i))
+            .collect();
+        let previous_bodies: BTreeSet<String> = accepted
+            .snapshots
+            .iter()
+            .map(snapshot_upload_body_witness)
+            .collect();
+        let (checkpoint, _) = certificate
+            .restore_grown(&mut File::open(&path).unwrap(), scope())
+            .unwrap();
+        let (restored, _) = decode_body(&body, source)
+            .unwrap()
+            .rederive_content(&File::open(&path).unwrap())
+            .unwrap();
+        // The accepted extent remains B while the actual plan freezes C.
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(c)
+            .unwrap();
+        assert!(a < c && c < b);
+        let mut tail = parser(&path, source);
+        let mode = tail
+            .prepare_acquisition(
+                Some(Retained {
+                    checkpoint,
+                    state: restored,
+                }),
+                &scope(),
+                None,
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(mode, ReadMode::Tail);
+        let frozen = tail.reader.acquisition.as_ref().unwrap().frozen_length();
+        while !tail.step().unwrap() {}
+        let parsed = finish(tail);
+        assert!(parsed.report.complete());
+        let mut cold = parser(&path, source);
+        while !cold.step().unwrap() {}
+        assert_eq!(
+            serde_json::to_value(&parsed.snapshots).unwrap(),
+            serde_json::to_value(finish(cold).snapshots).unwrap()
+        );
+        let mut scan = SourceScanResult::empty(source);
+        scan.snapshots = parsed.snapshots;
+        scan.pending_finalization.push(PendingIndexFinalization {
+            restored_behind_accepted: sampled_scan::durable_tail::restored_tail_below_accepted(
+                source,
+                true,
+                mode,
+                Some(frozen),
+                Some(b),
+            ),
+            sampled_audit_verified: false,
+            codex_pending_recovery: false,
+            index_key: local_index_key(&path),
+            source_file_fingerprint: "race-source".into(),
+            previous_snapshot_fingerprint: Some(snapshot_file_entity_set_hex(&previous_entities)),
+            previous_upload_body_witness: Some(snapshot_file_upload_body_set_hex(&previous_bodies)),
+            parse_complete: parsed.report.complete(),
+            diagnostic_reason: FileReason::Complete,
+            parsed_snapshot_count: scan.snapshots.len(),
+            effective_upload_body_witness_revision:
+                crate::snapshot_sync::effective_upload_body_witness_revision(source),
+        });
+        let mut index = ScanIndex::default();
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            finalize_scan_after_policy(source, &mut scan, &mut index)
+        });
+        assert!(!scan.snapshots.is_empty());
+        assert_eq!(
+            rows.iter()
+                .filter_map(|r| r["counts"]["restored_behind_accepted"]["published"].as_u64())
+                .sum::<u64>(),
+            1
+        );
+    }
 }

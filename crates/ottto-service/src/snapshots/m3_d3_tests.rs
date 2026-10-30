@@ -356,6 +356,202 @@ impl Rig {
     }
 }
 
+/// Keep readable native A while main's real terminal-loss settlement records B.
+/// Repair only the terminal row, adding healthy usage on the same object: A < C < B.
+fn lossy_shrink_rig() -> (Rig, Vec<u8>) {
+    let mut rig = Rig::new(SnapshotSource::ClaudeCode, "m3-due-lossy-shrink");
+    rig.create(SESSION_A, 2);
+    assert_eq!(rig.pass().published(SESSION_A), 1);
+    rig.assert_native_record(SESSION_A);
+    let record = fs::read(rig.record(SESSION_A)).unwrap();
+    let path = rig.path(SESSION_A);
+    let clean = fs::read_to_string(&path).unwrap();
+    File::options()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&("x".repeat(jsonl_line_cap() + 1) + "\n").into_bytes())
+        .unwrap();
+    // No store slot here: an actual Full records the lossy extent without
+    // replacing A or inventing a checkpoint, scope, receipt or accepted body.
+    let (index, _) = scan(
+        rig.source,
+        &rig.sessions,
+        std::mem::take(&mut rig.index),
+        Arc::new(SharedCache::default()),
+        &rig.namespace,
+    );
+    rig.index = index;
+    let key = rig.key(SESSION_A);
+    assert!(rig.index.files[&key].has_unverified_source());
+    let b = rig.index.files[&key].size_bytes;
+    assert_eq!(b, fs::metadata(&path).unwrap().len());
+    rig.index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .set_unverified_deadline(now_unix().saturating_sub(1));
+    rig.index.save(&rig.index_path).unwrap();
+    fs::write(&path, clean + &claude_line(SESSION_A, 3)).unwrap();
+    assert!(fs::metadata(&path).unwrap().len() < b);
+    assert_eq!(fs::read(rig.record(SESSION_A)).unwrap(), record);
+    rig.restart();
+    (rig, record)
+}
+
+fn owed_shrink_fulls(pass: &Pass) -> u64 {
+    pass.events
+        .iter()
+        .filter_map(|e| e["counts"]["full_causes"]["owed_full_after_lossy_shrink"].as_u64())
+        .sum()
+}
+
+fn assert_cold_body(rig: &Rig, pass: &Pass) {
+    let (_, mut cold) = scan(
+        rig.source,
+        &rig.sessions,
+        ScanIndex::default(),
+        Arc::new(SharedCache::default()),
+        &rig.namespace,
+    );
+    let mut actual = pass.snapshots.clone();
+    apply_upload_policy(rig.source, &mut actual, SnapshotUploadPolicy::default());
+    apply_upload_policy(rig.source, &mut cold, SnapshotUploadPolicy::default());
+    assert_eq!(
+        serde_json::to_value(actual).unwrap(),
+        serde_json::to_value(cold).unwrap(),
+        "entire emitted body, including usage and money, equals cold Full"
+    );
+}
+
+#[test]
+fn m3_due_matching_record_lossy_shrink_full_verifies_once_across_restart() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    with_test_line_cap(64 * 1024, || {
+        let (mut rig, record) = lossy_shrink_rig();
+        let key = rig.key(SESSION_A);
+        let corrected = rig.pass();
+        assert_eq!(corrected.full(), 1);
+        assert_eq!(corrected.tail(), 0);
+        assert_eq!(
+            owed_shrink_fulls(&corrected),
+            1,
+            "must reach matching A's Held arm, not Stale"
+        );
+        assert_eq!(corrected.published(SESSION_A), 1);
+        assert_eq!(corrected.snapshots[0].input_tokens, 600);
+        assert_cold_body(&rig, &corrected);
+        assert_eq!(
+            rig.counters().0.ineligible.get("behind_accepted.legacy"),
+            Some(&1)
+        );
+        assert_eq!(rig.index.files[&key].unverified_deadline(), None);
+        assert!(!rig.index.files[&key].has_unverified_source());
+        assert_ne!(fs::read(rig.record(SESSION_A)).unwrap(), record);
+        rig.restart();
+        assert_eq!(rig.index.files[&key].unverified_deadline(), None);
+        let quiet = rig.pass();
+        assert_eq!(quiet.full(), 0, "verified publication does not repeat Full");
+        assert_eq!(quiet.published(SESSION_A), 0);
+        assert_eq!(owed_shrink_fulls(&quiet), 0);
+    });
+}
+
+#[test]
+fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    with_test_line_cap(64 * 1024, || {
+        for control in ["verified_extent", "future_revision", "not_due"] {
+            let (mut rig, record) = lossy_shrink_rig();
+            let key = rig.key(SESSION_A);
+            let revision = rig.index.files[&key].effective_upload_body_witness_revision;
+            let entry = rig.index.files.get_mut(&key).unwrap();
+            match control {
+                "verified_extent" => {
+                    entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into())
+                }
+                "future_revision" => entry.effective_upload_body_witness_revision = revision + 1,
+                "not_due" => entry.set_unverified_deadline(
+                    now_unix() + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS / 2,
+                ),
+                _ => unreachable!(),
+            }
+            rig.index.save(&rig.index_path).unwrap();
+            rig.restart();
+            let accepted = rig.accepted(SESSION_A);
+            let held = rig.pass();
+            assert_eq!(held.full(), 0, "{control}");
+            assert_eq!(held.published(SESSION_A), 0, "{control}");
+            assert_eq!(owed_shrink_fulls(&held), 0, "{control}");
+            assert_eq!(rig.accepted(SESSION_A), accepted, "{control}");
+            assert_eq!(
+                fs::read(rig.record(SESSION_A)).unwrap(),
+                record,
+                "{control}"
+            );
+            let counters = rig.counters().0;
+            assert!(
+                counters
+                    .ineligible
+                    .get(if control == "not_due" {
+                        "behind_accepted.legacy"
+                    } else {
+                        "accepted_body_floor"
+                    })
+                    .is_some_and(|n| *n > 0),
+                "{control}: exercise the actual held outcome"
+            );
+            if control != "future_revision" {
+                continue;
+            }
+            // A correctness hold may delay this append, never lose it after
+            // the transcript stops growing and leaves the discovery window.
+            rig.append(SESSION_A, 1);
+            assert_eq!(rig.pass().published(SESSION_A), 0);
+            File::options()
+                .write(true)
+                .open(rig.path(SESSION_A))
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(400 * 86_400))
+                .unwrap();
+            let aged = rig.pass();
+            assert_eq!(aged.full(), 0);
+            assert_eq!(aged.published(SESSION_A), 0);
+            assert!(rig.index.files[&key].unverified_deadline().is_some());
+            rig.restart();
+            let still_held = rig.pass();
+            assert_eq!(still_held.full(), 0);
+            assert_eq!(still_held.published(SESSION_A), 0);
+            assert_eq!(rig.accepted(SESSION_A), accepted);
+            assert!(rig.index.files[&key].unverified_deadline().is_some());
+            rig.index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .effective_upload_body_witness_revision = revision;
+            rig.index.save(&rig.index_path).unwrap();
+            rig.restart();
+            let caught_up = rig.pass();
+            assert_eq!(caught_up.full(), 1);
+            assert_eq!(owed_shrink_fulls(&caught_up), 1);
+            assert_eq!(caught_up.published(SESSION_A), 1);
+            assert_eq!(caught_up.snapshots[0].input_tokens, 1000);
+            assert_cold_body(&rig, &caught_up);
+            assert_eq!(rig.index.files[&key].unverified_deadline(), None);
+            rig.restart();
+            assert_eq!(rig.pass().full(), 0);
+        }
+    });
+}
+
 struct ClearFaults;
 impl Drop for ClearFaults {
     fn drop(&mut self) {
@@ -435,6 +631,7 @@ fn count_unlinks(record: PathBuf) -> Rc<Cell<u64>> {
 /// successful write releases it with a Tail catch-up equal to a cold Full.
 #[test]
 fn m3_d3_claude_double_fault_holds_only_that_key_until_its_next_write() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -546,6 +743,7 @@ fn m3_d3_claude_double_fault_holds_only_that_key_until_its_next_write() {
 /// the completion publishes degraded with no record and no hold.
 #[test]
 fn m3_d3_claude_cleanup_proving_a_absent_publishes_degraded() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -589,6 +787,7 @@ fn m3_d3_claude_cleanup_proving_a_absent_publishes_degraded() {
 /// and the key's next write releases it with a Tail equal to a cold Full.
 #[test]
 fn m3_d3_enospc_pauses_the_store_preserves_a_and_resumes_when_space_frees() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -672,6 +871,7 @@ fn m3_d3_enospc_pauses_the_store_preserves_a_and_resumes_when_space_frees() {
 /// is ever emitted for it.
 #[test]
 fn m3_d3_held_key_keeps_865_debt_membership_and_record_never_absent() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -752,6 +952,7 @@ impl Change {
 /// file afterwards, including after a restart.
 #[test]
 fn m3_d3_content_change_releases_a_held_key_while_writes_still_fail() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -806,6 +1007,7 @@ fn m3_d3_content_change_releases_a_held_key_while_writes_still_fail() {
 /// is the file:line proof on `codex_strict_rebind`.
 #[test]
 fn m3_d3_codex_strict_rebind_survives_save_and_load_and_refuses_a_with_one_full() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -939,9 +1141,16 @@ fn kill_child(root: PathBuf, point: OrderPoint) {
     let _gate = claude_request_money::e2::GateForTest::set(true);
     let mut rig = Rig::open(SnapshotSource::ClaudeCode, root.clone());
     rig.create(SESSION_A, 2);
+    // F11: the killed acquisition must restore real content through (b),
+    // rather than exercising only an obligation-free or RAM Tail.
+    let path = rig.path(SESSION_A);
+    let usage = fs::read_to_string(&path).unwrap();
+    let prompt = json!({"type":"user","sessionId":SESSION_A,"uuid":"crash-content-prompt","message":{"role":"user","content":"Synthetic bounded crash prompt"}}).to_string() + "\n";
+    fs::write(&path, prompt + &usage).unwrap();
     assert_eq!(rig.pass().published(SESSION_A), 1);
     rig.assert_native_record(SESSION_A);
     fs::copy(rig.record(SESSION_A), root.join("a-after-first-pass")).unwrap();
+    rig.restart();
     rig.append(SESSION_A, 1);
     let marker = root.join("point-reached");
     match point {
@@ -967,6 +1176,7 @@ fn kill_child(root: PathBuf, point: OrderPoint) {
 /// read, and leaves no orphan temp.
 #[test]
 fn m3_d3_sigkill_at_native_order_points_recovers_exactly_once() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if let Some(root) = std::env::var_os(KILL_ROOT) {
         let point = OrderPoint::parse(&std::env::var(KILL_POINT).unwrap());
         return kill_child(PathBuf::from(root), point);
@@ -1039,17 +1249,25 @@ fn m3_d3_sigkill_at_native_order_points_recovers_exactly_once() {
 /// The real Codex native fault reaches the PRE barrier before any upload is
 /// authorized. The barrier saves retained facts, never the newly parsed end.
 #[test]
-fn m3_codex_native_double_fault_commits_only_pre_binding_before_publish() {
+fn m3_codex_native_double_fault_bound_barrier_then_working_save_preserves_both_publications() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
     let _clear = ClearFaults;
     let mut rig = Rig::new(SnapshotSource::Codex, "m3-codex-pre-ack");
+    use std::os::unix::fs::PermissionsExt;
+    let namespace = rig.root.join("b".repeat(64));
+    fs::create_dir(&namespace).unwrap();
+    fs::set_permissions(&namespace, fs::Permissions::from_mode(0o700)).unwrap();
+    rig.index_path = namespace.join("codex-scan-index-v3.json");
     rig.create(CODEX_SESSION, 3);
     assert_eq!(rig.pass().published(CODEX_SESSION), 1);
+    assert!(rig.index.persistence_root.is_some(), "bound root premise");
     rig.assert_native_record(CODEX_SESSION);
     let key = rig.key(CODEX_SESSION);
     let mut committed = rig.index.clone();
+    let pre_generation = committed.generation;
     let pre = serde_json::to_value(&committed.files[&key]).unwrap();
     let membership = committed.file_snapshot_fingerprints[&key].clone();
     let a = fs::read(rig.record(CODEX_SESSION)).unwrap();
@@ -1075,6 +1293,11 @@ fn m3_codex_native_double_fault_commits_only_pre_binding_before_publish() {
         pre,
         "no post-upload save is being counted as this barrier"
     );
+    let mut expected_pre = committed.files[&key].clone();
+    expected_pre.carry_sampled_audit(&working.files[&key]);
+    expected_pre.source_file_fingerprint.clear();
+    let advanced = serde_json::to_value(&working.files[&key]).unwrap();
+    assert!(working.files[&key].size_bytes > committed.files[&key].size_bytes);
     assert!(commit_store_fault_barrier(
         &rig.cache,
         rig.source,
@@ -1084,17 +1307,40 @@ fn m3_codex_native_double_fault_commits_only_pre_binding_before_publish() {
     )
     .unwrap());
     let disk = ScanIndex::load(&rig.index_path).unwrap();
+    assert!(disk.persistence_root.is_some());
+    assert_eq!(disk.generation, pre_generation + 1);
     assert!(disk.files[&key].source_file_fingerprint.is_empty());
-    let mut rebound = serde_json::to_value(&disk.files[&key]).unwrap();
-    rebound["source_file_fingerprint"] = pre["source_file_fingerprint"].clone();
     assert_eq!(
-        rebound, pre,
-        "real PRE revision, extent, witness and debt are retained"
+        serde_json::to_value(&disk.files[&key]).unwrap(),
+        serde_json::to_value(expected_pre).unwrap(),
+        "only PRE selection and carried audit debt may change"
     );
     assert_eq!(disk.file_snapshot_fingerprints[&key], membership);
     assert_eq!(
         working.generation, disk.generation,
         "subsequent saves CAS against the barrier"
+    );
+    let mut concurrent = working.clone();
+    working
+        .save(&rig.index_path)
+        .expect("working publication adopts the barrier's exact bound root");
+    let disk = ScanIndex::load(&rig.index_path).unwrap();
+    assert_eq!(disk.generation, pre_generation + 2);
+    assert_eq!(serde_json::to_value(&disk.files[&key]).unwrap(), advanced);
+    assert_eq!(
+        disk.file_snapshot_fingerprints,
+        working.file_snapshot_fingerprints
+    );
+    assert_eq!(
+        concurrent.save(&rig.index_path).unwrap_err().to_string(),
+        "local snapshot scan index changed concurrently",
+        "adoption does not authorize saving over a later root"
+    );
+    let surviving = ScanIndex::load(&rig.index_path).unwrap();
+    assert_eq!(surviving.generation, pre_generation + 2);
+    assert_eq!(
+        serde_json::to_value(&surviving.files[&key]).unwrap(),
+        advanced
     );
     assert!(
         !rig.cache.owes_discovery(rig.source, &key),
@@ -1107,6 +1353,7 @@ fn m3_codex_native_double_fault_commits_only_pre_binding_before_publish() {
 /// refuses A. Kill an actual native double-fault process on both sides.
 #[test]
 fn m3_d3_sigkill_at_pre_ack_fault_barrier_preserves_pre_facts() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if let Some(root) = std::env::var_os(KILL_ROOT) {
         let after = std::env::var(KILL_POINT).unwrap() == "after_fault_barrier";
         let mut rig = Rig::open(SnapshotSource::Codex, PathBuf::from(root));
@@ -1232,6 +1479,7 @@ fn m3_d3_sigkill_at_pre_ack_fault_barrier_preserves_pre_facts() {
 
 #[test]
 fn m3_codex_native_pass_budget_is_counted_not_persisted_without_hold_or_debt() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -1267,6 +1515,7 @@ fn m3_codex_native_pass_budget_is_counted_not_persisted_without_hold_or_debt() {
 /// file to a grouped pair; old native bytes cannot enter the joined reduction.
 #[test]
 fn m3_codex_singleton_to_group_refuses_native_restore_and_retires_record() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let mut rig = Rig::new(SnapshotSource::Codex, "m3-singleton-group");
     rig.create(CODEX_SESSION, 2);
     assert_eq!(rig.pass().published(CODEX_SESSION), 1);
@@ -1325,6 +1574,7 @@ fn m3_codex_singleton_to_group_refuses_native_restore_and_retires_record() {
 /// receipt must refuse A across restart even when the first GC unlink fails.
 #[test]
 fn m3_codex_post_read_tier_transition_refuses_a_across_failed_gc_and_restart() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -1429,4 +1679,318 @@ fn m3_codex_post_read_tier_transition_refuses_a_across_failed_gc_and_restart() {
         !record.exists(),
         "the excluded owner never stages another singleton A"
     );
+}
+
+/// F9's input is a body produced by the native store restore, bounded replay
+/// and ordinary Tail, rather than a hand-built item. Qualified macOS only.
+#[cfg(target_os = "macos")]
+pub(super) fn bounded_restore_tail_items(source: SnapshotSource) -> Vec<SnapshotItem> {
+    let _restart_restore = RestartRestoreForTest::enabled();
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let mut rig = Rig::new(source, "bounded-settlement-body");
+    let session = if source == SnapshotSource::Codex {
+        CODEX_SESSION
+    } else {
+        SESSION_A
+    };
+    let prompt = if source == SnapshotSource::Codex {
+        codex_head(session) + &json!({"type":"event_msg","payload":{"type":"user_message","message":"Synthetic bounded settlement prompt"}}).to_string() + "\n"
+    } else {
+        json!({"type":"user","sessionId":session,"uuid":"bounded-prompt","cwd":"/synthetic/bounded","message":{"role":"user","content":"Synthetic bounded settlement prompt"}}).to_string() + "\n"
+    };
+    fs::write(rig.path(session), prompt).unwrap();
+    rig.append(session, 2);
+    assert_eq!(rig.pass().published(session), 1);
+    rig.assert_native_record(session);
+    rig.restart();
+    rig.append(session, 1);
+    let restored = rig.pass();
+    assert_eq!(restored.published(session), 1);
+    assert_eq!(restored.full(), 0);
+    assert!(rig.counters().0.rederive_head_bytes > 0);
+    assert_eq!(restored.witness(session), Some(rig.cold(session)));
+    restored.snapshots
+}
+
+/// F10: A is a real native v3 checkpoint; B is a later complete accepted
+/// extent while A's replacement is deferred. Truncate only after A has been
+/// restored, before native preparation freezes C with A < C < B.
+#[test]
+fn codex_real_restore_then_shrink_preserves_the_native_identity_guard() {
+    let _on = RestartRestoreForTest::enabled();
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            sampled_jsonl::preparation_tests::set(None);
+        }
+    }
+    let _clear = Clear;
+    let mut rig = Rig::new(SnapshotSource::Codex, "restored-floor-race");
+    let session = CODEX_SESSION;
+    fs::write(rig.path(session), codex_head(session) + &json!({"type":"event_msg","payload":{"type":"user_message","message":"Synthetic restored race prompt"}}).to_string() + "\n").unwrap();
+    rig.append(session, 3);
+    assert_eq!(rig.pass().published(session), 1);
+    rig.assert_native_record(session);
+    let a = fs::read(rig.record(session)).unwrap();
+    rig.append(session, 1);
+    let c = fs::metadata(rig.path(session)).unwrap().len();
+    rig.append(session, 1);
+    // Accept B through the real cold Full/finalizer without a store writer.
+    let (index, items) = scan(
+        rig.source,
+        &rig.sessions,
+        rig.index.clone(),
+        Arc::new(SharedCache::default()),
+        &rig.namespace,
+    );
+    assert_eq!(items.len(), 1);
+    rig.index = index;
+    rig.index.save(&rig.index_path).unwrap();
+    let b = rig.index.files[&rig.key(session)].size_bytes;
+    assert!(c < b);
+    assert_eq!(fs::read(rig.record(session)).unwrap(), a);
+    rig.append(session, 1);
+    rig.restart();
+    let path = rig.path(session);
+    let fired = Rc::new(Cell::new(false));
+    let seen = fired.clone();
+    sampled_jsonl::preparation_tests::set(Some(Box::new(move |_| {
+        if !seen.replace(true) {
+            File::options().write(true).open(&path)?.set_len(c)?;
+        }
+        Ok(())
+    })));
+    let publication = rig.pass();
+    sampled_jsonl::preparation_tests::set(None);
+    assert!(
+        fired.get(),
+        "race reached native preparation with the restored owner"
+    );
+    assert_eq!(rig.counters().0.restored, 1);
+    assert_eq!((publication.full(), publication.tail()), (0, 1));
+    // The discovery identity was frozen before this physical truncation.
+    // A real scanner must retain that TOCTOU guard; parser finish alone may
+    // not mint a published diagnostic or lower the accepted extent.
+    assert_eq!(publication.published(session), 0);
+    assert!(!publication
+        .events
+        .iter()
+        .any(|r| r["counts"]["restored_behind_accepted"]["published"].is_number()));
+    assert_eq!(rig.index.files[&rig.key(session)].size_bytes, b);
+    assert_eq!(fs::read(rig.record(session)).unwrap(), a);
+    assert!(
+        c < b,
+        "the rejected read actually froze below the accepted floor"
+    );
+}
+
+/// F7's source scheduler row. Twenty first heads and twenty permitted
+/// post-eviction heads precede a maximal waiter; all measured scan passes
+/// select zero Fulls. The initial state has already spent each failed key's
+/// ordinary growth-Full allowance, as a preceding recovery would.
+#[test]
+fn full_source_scan_failed_heads_and_evictions_release_maximal_waiter_without_fulls() {
+    use super::sampled_jsonl::durable as codec;
+    use super::sampled_scan::durable_tail::{capture_rederive_reads, tests as fixtures};
+    let _on = RestartRestoreForTest::enabled();
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let mut rig = Rig::new(SnapshotSource::Codex, "rederive-full-scanner-fairness");
+    let failing: Vec<_> = (0..20)
+        .map(|i| format!("11111111-1111-4111-8111-{i:012}"))
+        .collect();
+    let waiter = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    for session in failing
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(waiter))
+    {
+        let mut text = codex_head(session);
+        for i in 1..=3 {
+            text.push_str(&codex_line(i));
+        }
+        if session != waiter {
+            text.push_str("{\"$serde_json::private::RawValue\":\"{}\"}\n");
+        }
+        let prompt=json!({"type":"event_msg","payload":{"type":"user_message","message":"Synthetic fairness prompt"}}).to_string()+"\n";
+        let end = if session == waiter {
+            codec::HEAD_BOUND as usize
+        } else {
+            90_000
+        };
+        assert!(text.len() + prompt.len() + 3 < end);
+        text.push_str(&" ".repeat(end - text.len() - prompt.len() - 3));
+        text.push_str("{}\n");
+        text.push_str(&prompt);
+        if session == waiter {
+            text.push_str("{}\n");
+            let mut title = json!({"type":"event_msg","payload":{"type":"thread_name_updated","thread_name":"Synthetic fairness title"},"padding":""});
+            title["padding"] =
+                json!("x".repeat(codec::TITLE_LINE_BOUND as usize - title.to_string().len() - 1));
+            assert_eq!(
+                title.to_string().len() + 1,
+                codec::TITLE_LINE_BOUND as usize
+            );
+            text.push_str(&(title.to_string() + "\n"));
+        }
+        fs::write(rig.path(session), text).unwrap();
+    }
+    let seed = rig.pass();
+    assert_eq!(seed.full(), 21);
+    for session in failing
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(waiter))
+    {
+        rig.assert_native_record(session);
+    }
+    // Prove the maximum replay plan from the actual native record, not a
+    // hand-built job size or a synthetic accumulator.
+    let mut disk = store::DurableTailStore::new(rig.store_dir(), store::DurableSource::Codex);
+    let store::ReadOutcome::Found(record) = disk.read(&rig.digest(waiter)) else {
+        panic!("waiter record");
+    };
+    let plan = codec::decode(&record.record.body, rig.source)
+        .unwrap()
+        .rederive_plan()
+        .unwrap();
+    assert_eq!(plan.end, codec::HEAD_BOUND);
+    assert_eq!(plan.title.unwrap().1, codec::TITLE_LINE_BOUND);
+    assert_eq!(plan.input_bytes(), 2 * 1024 * 1024);
+    let predecessor = fs::read(rig.record(waiter)).unwrap();
+    rig.restart();
+    rig.cache
+        .durable_begin_pass(rig.source, &rig.index_path, &rig.namespace, true);
+    for session in failing
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(waiter))
+    {
+        use std::io::Write;
+        let append = if session == waiter {
+            // A real usage delta makes publication observable; an ignored
+            // progress row could correctly be suppressed as an equal body.
+            codex_line(4)
+        } else {
+            "{\"type\":\"progress\"}\n".into()
+        };
+        File::options()
+            .append(true)
+            .open(rig.path(session))
+            .unwrap()
+            .write_all(append.as_bytes())
+            .unwrap();
+        if session != waiter {
+            fixtures::spend_rederive_full_for_scanner_fixture(
+                &rig.cache,
+                rig.source,
+                &rig.key(session),
+                &File::open(rig.path(session)).unwrap(),
+                rig.index.files[&rig.key(session)].size_bytes,
+            );
+        }
+    }
+    let accepted = rig.accepted(waiter);
+    for pass in 0..3 {
+        if pass == 1 {
+            for session in &failing {
+                fixtures::evict_failed_replay_pace(&rig.cache, rig.source, &rig.key(session));
+            }
+            fixtures::advance_scanner_clock_past_eviction_fillers(&rig.cache);
+        }
+        let (result, reads) = capture_rederive_reads(|| rig.pass());
+        assert_eq!(result.full(), 0, "source pass {pass}: no Full selection");
+        let input: u64 = result
+            .events
+            .iter()
+            .filter_map(|r| r["counts"]["rederive_input_bytes"].as_u64())
+            .sum();
+        assert!(
+            input <= 2 * 1024 * 1024,
+            "source pass respects aggregate input budget"
+        );
+        if pass < 2 {
+            assert_eq!(reads, 20, "twenty actual failed heads, source pass {pass}");
+            assert_eq!(result.published(waiter), 0);
+            assert_eq!(rig.accepted(waiter), accepted);
+            assert_eq!(fs::read(rig.record(waiter)).unwrap(), predecessor);
+            assert!(rig.cache.owes_discovery(rig.source, &rig.key(waiter)));
+        } else {
+            assert_eq!(
+                reads, 2,
+                "maximal head plus independent title admitted after head-once bounds churn"
+            );
+            assert_eq!(result.tail(), 1);
+            assert_eq!(result.witness(waiter), Some(rig.cold(waiter)));
+            assert_eq!(rig.counters().0.restored, 1);
+        }
+    }
+    let idle = rig.pass();
+    assert_eq!(idle.full(), 0);
+    assert_eq!(idle.published(waiter), 0);
+}
+
+/// F10 positive: C is stable before discovery freezes its identity. Codex's
+/// floor policy permits this complete native body below B; a shrink AFTER
+/// discovery is separately refused by the adjacent native identity fixture.
+#[test]
+fn codex_stable_below_accepted_restore_publishes_full_scanner_native_tail() {
+    let _on = RestartRestoreForTest::enabled();
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let mut rig = Rig::new(SnapshotSource::Codex, "stable-restored-below-accepted");
+    let session = CODEX_SESSION;
+    fs::write(rig.path(session), codex_head(session) + &json!({"type":"event_msg","payload":{"type":"user_message","message":"Synthetic stable restored prompt"}}).to_string() + "\n").unwrap();
+    rig.append(session, 3);
+    assert_eq!(rig.pass().published(session), 1);
+    rig.assert_native_record(session);
+    let a = fs::metadata(rig.path(session)).unwrap().len();
+    let predecessor = fs::read(rig.record(session)).unwrap();
+    rig.append(session, 1);
+    let c = fs::metadata(rig.path(session)).unwrap().len();
+    rig.append(session, 1);
+    // B is a real accepted cold Full; no post-save writer replaces A.
+    let (index, items) = scan(
+        rig.source,
+        &rig.sessions,
+        rig.index.clone(),
+        Arc::new(SharedCache::default()),
+        &rig.namespace,
+    );
+    assert_eq!(items.len(), 1);
+    rig.index = index;
+    rig.index.save(&rig.index_path).unwrap();
+    let b = rig.index.files[&rig.key(session)].size_bytes;
+    assert!(a < c && c < b);
+    assert_eq!(fs::read(rig.record(session)).unwrap(), predecessor);
+    // The selected identity and native preparation both see the SAME C.
+    File::options()
+        .write(true)
+        .open(rig.path(session))
+        .unwrap()
+        .set_len(c)
+        .unwrap();
+    rig.restart();
+    let result = rig.pass();
+    assert_eq!(rig.counters().0.restored, 1, "real durable restore");
+    assert!(rig.counters().0.rederive_head_bytes > 0);
+    assert_eq!((result.full(), result.tail()), (0, 1));
+    assert_eq!(result.published(session), 1);
+    assert_eq!(result.witness(session), Some(rig.cold(session)));
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .filter_map(|r| r["counts"]["restored_behind_accepted"]["published"].as_u64())
+            .sum::<u64>(),
+        1
+    );
+    let idle = rig.pass();
+    assert_eq!(idle.full(), 0);
+    assert_eq!(idle.published(session), 0, "no repeat publication");
 }

@@ -1,214 +1,489 @@
-//! Bounded content-only extraction. Never invokes native usage/selector folds.
+//! Growth-only replay of native content projection. The caller owns the active
+//! lease, certificate, pacing and input admission; scratch never publishes money.
+use super::bounded_value::{BoundedValue, LineMeter, LINE_VALUE_CREDIT};
 use super::*;
-use serde::Deserialize;
-use std::fmt;
-use std::fs::File;
+use serde::de::DeserializeSeed;
 use std::os::unix::fs::FileExt;
 
-const CWD_CAP: usize = 4096;
-
-/// The visitor checks BEFORE making an owned capture. Unknown fields use
-/// serde's IgnoredAny; no Value or collection of unknown content is built.
-#[derive(Default)]
-struct Cwd(Option<String>);
-impl<'de> Deserialize<'de> for Cwd {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct Capture;
-        impl<'de> serde::de::Visitor<'de> for Capture {
-            type Value = Cwd;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("bounded workspace text")
-            }
-            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Cwd, E> {
-                if s.len() > CWD_CAP {
-                    return Err(E::custom("workspace capture cap"));
-                }
-                Ok(Cwd((!s.trim().is_empty()).then(|| s.trim().to_owned())))
-            }
-            fn visit_unit<E: serde::de::Error>(self) -> Result<Cwd, E> {
-                Ok(Cwd::default())
-            }
-        }
-        d.deserialize_str(Capture)
+pub(crate) struct RederivePlan {
+    pub(crate) end: u64,
+    pub(crate) title: Option<(u64, u64)>,
+    pub(crate) charge: u64,
+}
+impl RederivePlan {
+    pub(crate) fn input_bytes(&self) -> u64 {
+        self.end + self.title.map_or(0, |(_, n)| n)
     }
 }
 
-/// serde's default struct type error can format the entire rejected string.
-/// Intercept strings at every object boundary; errors stay fixed-size as well
-/// as captures. Unknown map members still use the derived IgnoredAny path.
-#[derive(Default)]
-struct Object<T>(T);
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct MapOnly<T>(std::marker::PhantomData<T>);
-        impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for MapOnly<T> {
-            type Value = Object<T>;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("content object")
-            }
-            fn visit_map<M: serde::de::MapAccess<'de>>(
-                self,
-                map: M,
-            ) -> Result<Self::Value, M::Error> {
-                T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(Object)
-            }
-            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
-                Err(E::custom("content object shape"))
-            }
-        }
-        d.deserialize_any(MapOnly(std::marker::PhantomData))
-    }
-}
-
-#[derive(Default, Deserialize)]
-struct Fields {
-    #[serde(default)]
-    cwd: Cwd,
-}
-#[derive(Default, Deserialize)]
-struct Nested {
-    #[serde(default)]
-    payload: Object<Fields>,
-}
-#[derive(Deserialize)]
-struct Row {
-    #[serde(default)]
-    cwd: Cwd,
-    #[serde(default, rename = "projectPath")]
-    project_path: Cwd,
-    #[serde(default)]
-    workspace: Cwd,
-    #[serde(default)]
-    payload: Object<Fields>,
-    #[serde(default)]
-    session_meta: Object<Nested>,
-    #[serde(default)]
-    turn_context: Object<Nested>,
-    #[serde(default, rename = "type")]
-    kind: Cwd,
+// Isolate construction's debug temporary from the recursive JSON visitor frame.
+#[inline(never)]
+fn scratch(source: SnapshotSource) -> Box<SnapshotAccumulator> {
+    Box::new(SnapshotAccumulator::new(source))
 }
 
 impl Decoded {
-    /// Enabled obligation class: workspace only. Other classes refuse before
-    /// I/O, retaining the existing resource-growth fallback and all hash fences.
+    #[cfg(test)]
     pub(crate) fn content_charge(&self) -> Result<u64, RederiveUnfunded> {
-        let r = &self.rederive;
-        if r.first_prompt.is_some()
-            || r.title.is_some()
-            || r.agent_label.is_some()
-            || r.session_start.is_some()
-        {
-            sampled_scan::durable_tail::record_rederive_refused(
-                self.reduction.accumulator.source,
-                [
-                    r.first_prompt.is_some(),
-                    r.title.is_some(),
-                    r.agent_label.is_some(),
-                    r.session_start.is_some(),
-                    false,
-                ],
-            );
-            return Err(RederiveUnfunded);
-        }
-        if r.workspace.is_none() {
-            return Ok(0);
-        }
-        let end = self.head_end().map_err(|_| {
-            sampled_scan::durable_tail::record_rederive_refused(
-                self.reduction.accumulator.source,
-                [false, false, false, false, true],
-            );
-            RederiveUnfunded
-        })?;
-        // One exact head buffer; serde_json's string/key scratch grows by
-        // reserve/push, at most the next doubling above the entire input.
-        // Six cwd captures + kind (all <=4096), one temporary clone, and
-        // fixed typed/deserializer/error frames. Captures are dropped before
-        // the output is moved; count both anyway. No native accumulator.
-        let scratch = end.checked_next_power_of_two().ok_or(RederiveUnfunded)?;
-        end.checked_add(scratch.checked_mul(2).ok_or(RederiveUnfunded)?)
-            .and_then(|n| {
-                n.checked_add(
-                    (8 * CWD_CAP
-                        + size_of::<Row>()
-                        + size_of::<serde_json::Deserializer<serde_json::de::SliceRead<'_>>>()
-                        + size_of::<RederiveReceipt>()
-                        + size_of::<serde_json::Error>()
-                        + 256) as u64,
-                )
-            })
-            .ok_or(RederiveUnfunded)
+        self.rederive_plan()
+            .map(|p| p.charge)
+            .map_err(|_| RederiveUnfunded)
     }
-
-    /// Caller already charged content_charge, before certificate/read/allocation.
+    #[cfg(test)]
     pub(crate) fn rederive_content(
-        mut self,
+        self,
         file: &File,
     ) -> Result<(CachedJsonlReduction, RederiveReceipt), Refuse> {
-        let Some(want) = self.rederive.workspace else {
-            return Ok((self.reduction, RederiveReceipt::default()));
-        };
-        let end = self.head_end()?;
-        let mut head = vec![0; end as usize];
-        let mut offset = 0;
-        while offset < head.len() {
-            let n = match file.read_at(&mut head[offset..], offset as u64) {
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Ok(0) | Err(_) => return Err(Refuse::NotRederivable("workspace_read")),
-                Ok(n) => n,
-            };
-            sampled_scan::durable_tail::record_rederive_input(
-                self.reduction.accumulator.source,
-                n as u64,
-            );
-            offset += n;
+        let plan = self.rederive_plan().map_err(Refuse::NotRederivable)?;
+        self.rederive_content_planned(file, &plan)
+            .map(|(r, receipt, _)| (r, receipt))
+    }
+    pub(crate) fn content_classes(&self) -> [bool; 5] {
+        let r = &self.rederive;
+        [
+            r.first_prompt.is_some(),
+            r.title.is_some(),
+            r.agent_label.is_some(),
+            r.session_start.is_some(),
+            r.workspace.is_some(),
+        ]
+    }
+    pub(crate) fn has_content(&self) -> bool {
+        self.rederive != Rederive::default()
+    }
+
+    pub(crate) fn rederive_plan(&self) -> Result<RederivePlan, &'static str> {
+        if !self.has_content() {
+            return Ok(RederivePlan {
+                end: 0,
+                title: None,
+                charge: 0,
+            });
         }
-        if head.last() != Some(&b'\n') {
-            return Err(Refuse::NotRederivable("workspace_line"));
-        }
-        // The native first-assignment mark names this exact row. Earlier rows
-        // need no parsing or accumulation; the stored digest is mandatory.
-        let start = head[..head.len() - 1]
-            .iter()
-            .rposition(|b| *b == b'\n')
-            .map_or(0, |at| at + 1);
-        let row: Object<Row> = serde_json::from_slice(&head[start..])
-            .map_err(|_| Refuse::NotRederivable("workspace_capture"))?;
-        let row = row.0;
-        let raw = match self.reduction.accumulator.source {
-            SnapshotSource::ClaudeCode => row.cwd.0.or(row.project_path.0).or(row.workspace.0),
-            SnapshotSource::Codex => {
-                // Same precedence as apply_codex_envelope_line followed by
-                // apply_codex_owned_line. Hash equality also excludes wrong
-                // ownership/compaction candidates without granting authority.
-                let meta = if row.kind.0.as_deref() == Some("session_meta") {
-                    row.payload.0.cwd.0.clone()
-                } else {
-                    row.session_meta.0.payload.0.cwd.0
-                };
-                meta.or(row.turn_context.0.payload.0.cwd.0)
-                    .or(row.payload.0.cwd.0)
-                    .or(row.cwd.0)
+        let acc = &self.reduction.accumulator;
+        if acc.source == SnapshotSource::Codex {
+            match acc.codex_ownership_boundary {
+                CodexOwnershipBoundary::AllLocal => {
+                    if acc.codex_legacy_trigger_seen {
+                        return Err("legacy");
+                    }
+                    if acc.codex_parent_ledger_consulted
+                        || acc.codex_parent_signature_index != 0
+                        || acc.codex_parent_prefix_decided.is_some()
+                    {
+                        return Err("parent");
+                    }
+                }
+                CodexOwnershipBoundary::Ordinal { .. }
+                | CodexOwnershipBoundary::NativeCreatedThread => {}
+                CodexOwnershipBoundary::AwaitingLegacyTrigger => return Err("legacy"),
+                CodexOwnershipBoundary::AwaitingParentPrefix => return Err("parent"),
+                CodexOwnershipBoundary::AmbiguousFork => return Err("ambiguous"),
+                CodexOwnershipBoundary::Undetermined => return Err("undetermined"),
             }
-            // Native apply_pi_line accepts cwd only on a session header.
-            // Cwd uses string_at's trim/empty semantics; neither projectPath,
-            // workspace nor a message/payload cwd is a Pi workspace source.
-            SnapshotSource::Pi => (row.kind.0.as_deref() == Some("session"))
-                .then_some(row.cwd.0)
-                .flatten(),
-        };
-        let path = raw.map(PathBuf::from);
-        let got = workspace_value_digest(&path)?;
-        if got != want {
-            return Err(Refuse::NotRederivable("workspace_digest"));
+            if acc.codex_proof_decision_only {
+                return Err("parent");
+            }
         }
-        self.reduction.accumulator.workspace_path = path;
+        let end = self.head_end().map_err(|_| "mark")?;
+        let title = self.title_line(end).map_err(|_| "title")?;
+        let t = title.map_or(0, |(_, n)| n);
+        if title.is_some_and(|(offset, n)| {
+            n == 0 || n > TITLE_LINE_BOUND || offset.checked_add(n).is_none()
+        }) {
+            return Err("title");
+        }
+        let input = end.checked_add(t).ok_or("charge")?;
+        let line = end.max(t);
+        // Requested-allocation ledger, simultaneous replay phase:
+        // input + serde scratch (2L) + Value (8 MiB) + fold string temporaries
+        // (4L) + retained X (2 input) + response keys (end+64) + SS (512 KiB).
+        // An independent 8 MiB covers reference-vector old/new backing while
+        // Value arrays are live; it is never double-spent as Value credit.
+        // Reducer includes closed filter/ring and capped native ids. Copying
+        // source_session_id has its own term. Fixed errors/frames: 64 KiB.
+        let charge = input
+            .checked_mul(3)
+            .and_then(|n| n.checked_add(line.checked_mul(6)?))
+            .and_then(|n| n.checked_add(2 * LINE_VALUE_CREDIT))
+            .and_then(|n| n.checked_add(end.checked_add(64)?))
+            .and_then(|n| n.checked_add(524_288 + 65_536))
+            .and_then(|n| n.checked_add(codex_usage_occurrence::max_fixed_heap_bytes() as u64))
+            .and_then(|n| {
+                n.checked_add(acc.source_session_id.as_ref().map_or(0, |s| s.len() as u64))
+            })
+            .ok_or("charge")?;
+        const _: () =
+            assert!(size_of::<SnapshotAccumulator>() + size_of::<RederiveReceipt>() < 65_536);
+        Ok(RederivePlan { end, title, charge })
+    }
+
+    /// All fences precede every X move. Errors carry fixed class names only.
+    pub(crate) fn rederive_content_planned(
+        mut self,
+        file: &File,
+        plan: &RederivePlan,
+    ) -> Result<(CachedJsonlReduction, RederiveReceipt, u64), Refuse> {
+        if !self.has_content() {
+            return Ok((self.reduction, RederiveReceipt::default(), 0));
+        }
+        let source = self.reduction.accumulator.source;
+        let mut fresh = scratch(source);
+        let stored = &self.reduction.accumulator;
+        fresh.source_session_id = stored.source_session_id.clone();
+        fresh.codex_counting = stored
+            .codex_counting
+            .as_ref()
+            .map(|c| Box::new(c.content_scratch()));
+        let boundary = stored.codex_ownership_boundary;
+        let session_end = stored.session_start.durable_content_end().unwrap_or(0);
+        let mut head = vec![0; plan.end as usize];
+        read_at(file, source, &mut head, 0)?;
+        let mut window = ClaudeResponseWindow::default();
+        let mut offset = 0;
+        let mut peak = 0;
+        for line in head.split_inclusive(|b| *b == b'\n') {
+            if line.last() != Some(&b'\n') {
+                return Err(Refuse::NotRederivable("head_line"));
+            }
+            offset += line.len() as u64;
+            replay_line(
+                source,
+                &line[..line.len() - 1],
+                &mut peak,
+                |value, meter| {
+                    let opening = self.rederive.session_start.is_some() && offset <= session_end;
+                    let shell_line = match source {
+                        SnapshotSource::ClaudeCode => value
+                            .pointer("/message/content")
+                            .and_then(Value::as_array)
+                            .is_some_and(|items| {
+                                items.iter().any(|item| {
+                                    string_eq_at(item, &["type"], "tool_use")
+                                        && string_eq_at(item, &["name"], "Bash")
+                                })
+                            }),
+                        SnapshotSource::Codex => string_at(value, &["payload", "type"])
+                            .or_else(|| string_at(value, &["type"]))
+                            .is_some_and(|kind| {
+                                matches!(kind.as_str(), "exec_command_end" | "item_completed")
+                            }),
+                        SnapshotSource::Pi => false,
+                    };
+                    if opening && fresh.session_start.content_window_open() && shell_line {
+                        // Shell token fan-out is derived from a string, not from a
+                        // charged Value array. Pay it separately before the fold.
+                        let separators = line
+                            .iter()
+                            .filter(|b| {
+                                b.is_ascii_whitespace()
+                                    || matches!(
+                                        **b,
+                                        b'\\'
+                                            | b'\''
+                                            | b'"'
+                                            | b';'
+                                            | b'|'
+                                            | b'&'
+                                            | b'('
+                                            | b')'
+                                            | b'<'
+                                            | b'>'
+                                            | b'`'
+                                    )
+                                    || **b >= 128
+                            })
+                            .count() as u64;
+                        meter.charge::<serde_json::Error>(separators.checked_mul(48))?;
+                    }
+                    match source {
+                        SnapshotSource::ClaudeCode => {
+                            match claude_fork_line_provenance(value) {
+                                ClaudeForkLineProvenance::Inherited => {
+                                    fresh.session_start.note_inherited_prefix();
+                                    return Ok(());
+                                }
+                                ClaudeForkLineProvenance::Invalid => return Ok(()),
+                                ClaudeForkLineProvenance::None => {}
+                            }
+                            claude_prompt_content(value, &mut fresh);
+                            claude_workspace_content(value, &mut fresh);
+                            window.observe(value);
+                            if opening {
+                                fresh.session_start.observe_claude_line(
+                                    value,
+                                    window.sequence,
+                                    fresh.workspace_path.as_deref(),
+                                );
+                            }
+                        }
+                        SnapshotSource::Codex => {
+                            if let Some(meta) = codex_session_meta_payload(value) {
+                                if !fresh.codex_session_meta_seen {
+                                    if let Some(src) = meta.get("source").filter(|v| v.is_object())
+                                    {
+                                        codex_agent_content(src, &mut fresh);
+                                    }
+                                    codex_header_workspace_content(meta, &mut fresh);
+                                    fresh.codex_session_meta_seen = true;
+                                    fresh.codex_ownership_boundary = boundary;
+                                }
+                            }
+                            if opening && string_eq_at(value, &["type"], "session_meta") {
+                                fresh.session_start.note_codex_session_meta(value);
+                            }
+                            if !fresh.codex_record_is_owned(value) {
+                                return Ok(());
+                            }
+                            if opening {
+                                codex_opening_content(value, &mut fresh);
+                            }
+                            if string_eq_at(value, &["payload", "type"], "task_started") {
+                                codex_user_turn_content(value, &mut fresh);
+                            }
+                            codex_prompt_content(value, &mut fresh);
+                            codex_workspace_content(value, &mut fresh);
+                            fresh.observe_codex_content_counting(value);
+                            if let Some(usage) = codex_total_usage(value) {
+                                let last = codex_last_usage(value);
+                                let identity = codex_usage_event_identity(value);
+                                let count =
+                                    (!codex_total_usage_has_request_count(value)).then_some(1);
+                                let admitted = if fresh.codex_counting_v2() {
+                                    fresh
+                                        .decide_codex_usage(
+                                            None,
+                                            usage,
+                                            last.clone(),
+                                            identity,
+                                            count,
+                                        )
+                                        .is_some()
+                                } else {
+                                    fresh
+                                        .decide_codex_legacy_usage(
+                                            None,
+                                            usage,
+                                            last.clone(),
+                                            identity,
+                                            count,
+                                        )
+                                        .is_some()
+                                };
+                                if opening && admitted {
+                                    if let Some(last) = last {
+                                        fresh.session_start.note_codex_request(&last);
+                                    }
+                                }
+                            }
+                        }
+                        SnapshotSource::Pi => {
+                            if string_eq_at(value, &["type"], "session") {
+                                pi_workspace_content(value, &mut fresh);
+                            }
+                            if string_eq_at(value, &["type"], "message") {
+                                pi_prompt_content(
+                                    value,
+                                    pi_message_role(value).as_deref(),
+                                    &mut fresh,
+                                );
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        if let Some((offset, len)) = plan.title {
+            let mut line = vec![0; len as usize];
+            read_at(file, source, &mut line, offset)?;
+            replay_line(
+                source,
+                line.strip_suffix(b"\n").unwrap_or(&line),
+                &mut peak,
+                |value, _| {
+                    match source {
+                        SnapshotSource::ClaudeCode
+                            if matches!(
+                                claude_fork_line_provenance(value),
+                                ClaudeForkLineProvenance::None
+                            ) =>
+                        {
+                            claude_title_content(value, &mut fresh)
+                        }
+                        SnapshotSource::Codex => {
+                            fresh.set_title(codex_transcript_title(value), "transcript_title")
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        sampled_scan::durable_tail::record_rederive_line_peak(source, peak);
+        let r = &self.rederive;
+        let matches = [
+            r.first_prompt
+                .map(|h| first_prompt_digest(&fresh).map(|got| got == h))
+                .transpose()?,
+            r.title
+                .map(|h| title_digest(&fresh).map(|got| got == h))
+                .transpose()?,
+            r.agent_label
+                .map(|h| agent_label_digest(&fresh).map(|got| got == h))
+                .transpose()?,
+            r.session_start
+                .map(|h| {
+                    fresh
+                        .session_start
+                        .durable_content_hash()
+                        .map(|got| got == h)
+                })
+                .transpose()?,
+            r.workspace
+                .map(|h| workspace_digest(&fresh).map(|got| got == h))
+                .transpose()?,
+        ];
+        if matches.contains(&Some(false)) {
+            sampled_scan::durable_tail::record_rederive_fence(
+                source,
+                matches.map(|m| m == Some(false)),
+            );
+            return Err(Refuse::NotRederivable("content_fence"));
+        }
+        let acc = &mut self.reduction.accumulator;
+        if r.first_prompt.is_some() {
+            acc.first_prompt_material = fresh.first_prompt_material.take();
+            acc.first_prompt_title = fresh.first_prompt_title.take();
+        }
+        if r.title.is_some() {
+            acc.title = fresh.title.take();
+        }
+        if r.workspace.is_some() {
+            acc.workspace_path = fresh.workspace_path.take();
+        }
+        if r.agent_label.is_some() {
+            acc.codex_agent_label = fresh.codex_agent_label.take();
+        }
+        if r.session_start.is_some() {
+            acc.session_start
+                .adopt_durable_content(&mut fresh.session_start);
+        }
+        // Keep a conservative retained-X charge; everything else drops before
+        // the caller refunds. Includes copied SS graph and string ownership.
+        let retained = 2 * plan.input_bytes() + 524_288;
         Ok((
             self.reduction,
             RederiveReceipt {
-                head_bytes: end,
-                ..Default::default()
+                head_bytes: plan.end,
+                named_lines: u64::from(plan.title.is_some()),
+                line_bytes: plan.title.map_or(0, |(_, n)| n),
             },
+            retained,
         ))
     }
+}
+
+#[derive(Default)]
+struct ClaudeResponseWindow {
+    keys: Vec<String>,
+    sequence: u64,
+}
+impl ClaudeResponseWindow {
+    fn observe(&mut self, value: &Value) {
+        if self.sequence >= 3 || claude_code_delta_usage(value).is_none() {
+            return;
+        }
+        let key = claude_response_key(value, self.sequence);
+        if !self.keys.contains(&key) {
+            self.keys.push(key);
+            self.sequence += 1;
+        }
+    }
+}
+#[cfg(test)]
+type ContentReadHook = Option<Box<dyn FnMut(u64)>>;
+#[cfg(test)]
+thread_local! {
+    static AFTER_CONTENT_READ: std::cell::RefCell<ContentReadHook> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn with_read_hook<T>(hook: impl FnMut(u64) + 'static, run: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            AFTER_CONTENT_READ.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    AFTER_CONTENT_READ.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+    let _reset = Reset;
+    run()
+}
+
+fn read_at(file: &File, source: SnapshotSource, bytes: &mut [u8], at: u64) -> Result<(), Refuse> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        #[cfg(test)]
+        sampled_scan::durable_tail::record_rederive_read_call();
+        let n = match file.read_at(&mut bytes[offset..], at + offset as u64) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(0) | Err(_) => return Err(Refuse::NotRederivable("content_read")),
+            Ok(n) => n,
+        };
+        sampled_scan::durable_tail::record_rederive_input(source, n as u64);
+        #[cfg(test)]
+        AFTER_CONTENT_READ.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(at + offset as u64);
+            }
+        });
+        offset += n;
+    }
+    Ok(())
+}
+fn replay_line(
+    source: SnapshotSource,
+    bytes: &[u8],
+    peak: &mut u64,
+    fold: impl FnOnce(&Value, &mut LineMeter) -> Result<(), serde_json::Error>,
+) -> Result<(), Refuse> {
+    let JsonlLineText::Text(text) = jsonl_line_text(bytes) else {
+        return Ok(());
+    };
+    let mut meter = LineMeter::new();
+    let mut d = serde_json::Deserializer::from_str(text);
+    let folded = if let Ok(value) = BoundedValue(&mut meter)
+        .deserialize(&mut d)
+        .and_then(|value| {
+            d.end()?;
+            Ok(value)
+        }) {
+        fold(&value, &mut meter).map_err(|_| Refuse::NotRederivable("content_credit"))
+    } else {
+        Ok(())
+    };
+    *peak = (*peak).max(meter.used());
+    sampled_scan::durable_tail::record_rederive_line_peak(source, *peak);
+    folded?;
+    if let Some(reason) = meter.stop {
+        return Err(Refuse::NotRederivable(reason));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(in crate::snapshots) fn test_codex_content_scratch(
+    stored: &SnapshotAccumulator,
+) -> Box<SnapshotAccumulator> {
+    let mut fresh = scratch(SnapshotSource::Codex);
+    fresh.source_session_id = stored.source_session_id.clone();
+    fresh.codex_counting = stored
+        .codex_counting
+        .as_ref()
+        .map(|c| Box::new(c.content_scratch()));
+    fresh
 }

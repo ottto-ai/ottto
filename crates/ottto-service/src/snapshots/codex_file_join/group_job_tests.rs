@@ -1620,6 +1620,7 @@ fn group_with_legacy_tee_is_byte_charged() {
     )
     .unwrap();
     let sampling = active.sampling.replace(sampled_scan::Active {
+        restored_behind_accepted: false,
         no_record: false,
         key: String::new(),
         scope: Scope("group-fixture".into()),
@@ -2892,6 +2893,7 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
 #[cfg(unix)]
 #[test]
 fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store::{self as store, SingleWriter};
     use std::io::Read;
     let (root, _) = fixture();
@@ -3023,6 +3025,7 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
 #[cfg(unix)]
 #[test]
 fn durable_hold_on_one_member_holds_the_joined_group() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store as store;
     let mut scanned = Vec::new();
     for refused_members in 0..=2 {
@@ -3083,6 +3086,7 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
 
 #[test]
 fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use codex_zst_refusal_tests::assert_refused;
     let (root, inventory) = fixture();
     let index = ScanIndex::default();
@@ -3422,6 +3426,7 @@ fn grouped_missing_carriers_mark_each_paged_member_until_verified() {
 #[cfg(unix)]
 #[test]
 fn grouped_missing_carrier_requires_live_context_and_clamps_future_debt() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let source = SnapshotSource::Codex;
     let (root, _) = fixture();
     let lock = crate::locked_state_dir::test_locks::hold(&root);
@@ -3499,6 +3504,7 @@ fn grouped_missing_carrier_requires_live_context_and_clamps_future_debt() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn parked_group_across_fresh_index_reprobes_member_debt_on_resume() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(crate::heap_layout_bound::layout_supported());
     let source = SnapshotSource::Codex;
     let root = paged_corpus("missing-carrier-r1");
@@ -3573,6 +3579,7 @@ fn parked_group_across_fresh_index_reprobes_member_debt_on_resume() {
 #[cfg(unix)]
 #[test]
 fn protected_group_peer_does_not_spend_corruption_rebuild_before_input() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let (root, _) = fixture();
     let writer = crate::locked_state_dir::test_locks::hold(&root);
     let records = seed_member_debts(&root, writer, &[("a", 1, None), ("b", 1, None)]);
