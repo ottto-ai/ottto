@@ -1004,6 +1004,29 @@ fn the_sync_lock_is_free_while_the_loop_waits() {
 
 // Option W (W1–W12): the worker, its join and the parent's mapping.
 
+/// W10: test hooks are thread-locals the worker does not inherit; a test
+/// must install them inside the worker.
+#[test]
+fn parent_test_hooks_are_not_seen_on_the_worker() {
+    use crate::snapshots::{cursor_limit_for_test, with_test_limits_for_test};
+    let production = cursor_limit_for_test();
+    assert_ne!(production, 2048);
+    with_test_limits_for_test(2048, 1024, 64, || {
+        assert_eq!(cursor_limit_for_test(), 2048, "installed on the parent");
+        assert_eq!(
+            on_worker(cursor_limit_for_test),
+            Ok(production),
+            "not inherited by the worker"
+        );
+        assert_eq!(
+            on_worker(|| with_test_limits_for_test(4096, 1024, 64, cursor_limit_for_test)),
+            Ok(4096),
+            "installed inside the worker"
+        );
+        assert_eq!(cursor_limit_for_test(), 2048, "the parent's own is kept");
+    });
+}
+
 fn test_latch() -> &'static AtomicBool {
     Box::leak(Box::new(AtomicBool::new(false)))
 }

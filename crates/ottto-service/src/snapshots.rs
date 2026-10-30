@@ -188,7 +188,7 @@ use claude_response_records::{
 use codex_compressed_input::{refuse_compressed_codex, OpenedInput};
 pub(crate) use pi_retry_inputs::PiRetryInputs;
 #[cfg(test)]
-pub(crate) use sampled_scan::codex_cursor::with_test_limits_for_test;
+pub(crate) use sampled_scan::codex_cursor::{cursor_limit_for_test, with_test_limits_for_test};
 #[allow(unused_imports)]
 pub(crate) use sampled_scan::codex_cursor::{CodexCursorPort, CodexCursorTicket};
 
