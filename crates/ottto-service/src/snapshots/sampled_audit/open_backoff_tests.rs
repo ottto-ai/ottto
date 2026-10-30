@@ -684,3 +684,39 @@ fn blocked_due_debt_does_not_resample_neighbours_and_stat_change_wakes_recovery(
         );
     }
 }
+
+#[test]
+fn restoring_held_marker_preserves_same_stat_park_and_original_due() {
+    reset_open_backoff_for_test();
+    let root = Root::new("marker-restoration-park");
+    let path = root.0.join("parked.jsonl");
+    fs::write(&path, b"{}\n").unwrap();
+    let key = local_index_key(&path);
+    let mut index = held_index(&root, &[&key]);
+    index.held_audit_progress = Some(HeldAuditProgress {
+        key: key.clone(),
+        due: D,
+        attempted: false,
+    });
+    for _ in 0..OPEN_PARK_FAILURES {
+        record_open_failure(&key, D, D);
+    }
+    assert!(candidate_open_blocked(&key, D));
+    assert_eq!(held_audit_open_failed(D), (1, 0));
+    assert_eq!(restore_held_audit_deadlines(&mut index, D), 1);
+    assert!(!awaits_hold_deadline_restoration(&index, &key));
+    assert!(index.files[&key].has_unverified_source());
+    for now in [D, D + CAP, D + 2 * CAP] {
+        assert_eq!(schedule_held_audit_progress(&mut index, now), None);
+        assert!(candidate_open_blocked(&key, now));
+        assert_eq!(failed_open_debt(&key, now), Some(D));
+        assert_eq!(debt_for_key(&index, &key, now).unwrap().due_unix_seconds, D);
+        assert_eq!(held_audit_open_failed(now), (1, now - D));
+        assert!(index.accepted_snapshot_fingerprints.is_empty());
+    }
+    // A real stat change clears the throttle, retaining the original debt.
+    fs::write(&path, b"{}\n{}\n").unwrap();
+    assert!(!candidate_open_blocked(&key, D + 3 * CAP));
+    assert_eq!(failed_open_debt(&key, D + 3 * CAP), Some(D));
+    assert!(index.files[&key].has_unverified_source());
+}

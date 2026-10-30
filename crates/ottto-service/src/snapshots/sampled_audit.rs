@@ -710,9 +710,16 @@ pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
 fn schedule_held_audit_progress(index: &mut ScanIndex, now: u64) -> Option<String> {
     with_open_backoff(|backoff| {
         backoff.page = backoff.page.saturating_add(1);
-        backoff
-            .keys
-            .retain(|key, _| awaits_hold_deadline_restoration(index, key));
+        // Restoring a plain-v2 hold changes its representation, not its
+        // failed-open obligation. Keep the same-stat park and original D
+        // until source verification discharges them (or the entry is gone).
+        backoff.keys.retain(|key, _| {
+            awaits_hold_deadline_restoration(index, key)
+                || index
+                    .files
+                    .get(key)
+                    .is_some_and(ScanIndexEntry::has_unverified_source)
+        });
     });
     let previous = index.held_audit_progress.clone();
     let keep = previous.as_ref().is_some_and(|slot| {
