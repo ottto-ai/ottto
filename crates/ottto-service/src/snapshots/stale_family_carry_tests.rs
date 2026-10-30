@@ -8714,6 +8714,12 @@ fn terminal_off_red_retries_rearm_once_per_generation(context: Option<&str>, lat
         !claude_redundant_stale_clear_suppressed(&index),
         "this generation owes the semantic clear"
     );
+    // AutoReview: a start whose working index is discarded (cancelled page,
+    // failed checkpoint save) serves nothing to the reloaded index.
+    let mut discarded = index.clone();
+    let lost = terminal_off_red_retry_start(&mut discarded, CARRY_RETRY);
+    assert_eq!(lost["rearmed_index_files"], 3);
+    drop(discarded);
     let first = terminal_off_red_retry_start(&mut index, CARRY_RETRY);
     assert_eq!(first["stale_pending_families"], 2);
     assert_eq!(first["rearmed_index_files"], 3, "one semantic re-read per member");

@@ -220,10 +220,13 @@ fn claude_unacked_head_members(index: &ScanIndex, roots: &BTreeSet<String>) -> B
 // source-wide context adoption discharges, so an unsuppressed semantic stale
 // clear would re-arm every stale pending family at every red-retry or floor
 // start. This bounded process memo serves it once per family and generation
-// (traversal context, upload context pair, contract and latch). A cleared
-// member keeps its empty fingerprint persisted until it is actually read, so
-// the debt stays owed. Eviction or restart fails toward one more re-read,
-// never toward proof, ACK or settlement.
+// (traversal context, upload context pair, contract and latch). Each key also
+// names the traversal its start created, and a later start counts the clear
+// as served only when the traversal it replaces is that one. A working index
+// discarded after a cancelled page or a failed checkpoint save leaves the
+// reloaded traversal unmatched, so its families are cleared again. Eviction or
+// restart likewise fails toward one more re-read, never toward proof, ACK or
+// settlement.
 const TERMINAL_OFF_STALE_CLEAR_KEYS: usize = 16_384;
 #[derive(Default)]
 struct TerminalOffStaleClears {
@@ -263,7 +266,12 @@ fn with_terminal_off_stale_clears<T>(f: impl FnOnce(&mut TerminalOffStaleClears)
     #[cfg(test)]
     TERMINAL_OFF_STALE_CLEARS.with(|memo| f(&mut memo.borrow_mut()))
 }
-fn terminal_off_stale_clear_key(index: &ScanIndex, context: &str, root: &str) -> [u8; 32] {
+fn terminal_off_stale_clear_key(
+    index: &ScanIndex,
+    context: &str,
+    traversal_window: &str,
+    root: &str,
+) -> [u8; 32] {
     let mut digest = Sha256::new();
     for value in [
         "terminal-off-stale-clear:v1",
@@ -282,33 +290,49 @@ fn terminal_off_stale_clear_key(index: &ScanIndex, context: &str, root: &str) ->
         } else {
             "settled"
         },
+        traversal_window,
         root,
     ] {
         update_length_prefixed(&mut digest, value.as_bytes());
     }
     digest.finalize().into()
 }
-/// The stale roots whose semantic clear this generation already served.
+/// The stale roots whose semantic clear this generation already served to
+/// the traversal this start replaces.
 fn terminal_off_stale_clear_served(
     index: &ScanIndex,
     context: &str,
     roots: &BTreeSet<String>,
 ) -> BTreeSet<String> {
+    let Some(prior) = index.traversal.as_ref() else {
+        return BTreeSet::new();
+    };
     with_terminal_off_stale_clears(|memo| {
         roots
             .iter()
             .filter(|root| {
-                memo.keys
-                    .contains(&terminal_off_stale_clear_key(index, context, root))
+                memo.keys.contains(&terminal_off_stale_clear_key(
+                    index,
+                    context,
+                    &prior.census_window_end,
+                    root,
+                ))
             })
             .cloned()
             .collect()
     })
 }
-fn note_terminal_off_stale_clears(index: &ScanIndex, context: &str, roots: &BTreeSet<String>) {
+/// Records that the traversal starting at `window` carries this generation's
+/// semantic clear of `roots`, whether served earlier or by this start.
+fn note_terminal_off_stale_clears(
+    index: &ScanIndex,
+    context: &str,
+    window: &str,
+    roots: &BTreeSet<String>,
+) {
     let keys: Vec<_> = roots
         .iter()
-        .map(|root| terminal_off_stale_clear_key(index, context, root))
+        .map(|root| terminal_off_stale_clear_key(index, context, window, root))
         .collect();
     with_terminal_off_stale_clears(|memo| keys.into_iter().for_each(|key| memo.remember(key)));
 }

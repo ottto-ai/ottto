@@ -2202,11 +2202,19 @@ fn terminal_off_unacked_head_stays_parse_and_is_reoffered_beside_an_acked_contro
 fn terminal_off_stale_clear_memo_is_bounded_and_eviction_fails_toward_another_clear() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    let index = off_index();
+    let mut index = off_index();
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[],
+        &mut index,
+        W1,
+        BACKFILL_WINDOW_DAYS,
+    );
     let roots: BTreeSet<String> = (0..TERMINAL_OFF_STALE_CLEAR_KEYS + 2)
         .map(|n| format!("root-{n:05}"))
         .collect();
-    note_terminal_off_stale_clears(&index, "context", &roots);
+    assert!(terminal_off_stale_clear_served(&index, "context", &roots).is_empty());
+    note_terminal_off_stale_clears(&index, "context", W1, &roots);
     assert_eq!(
         terminal_off_stale_clear_memo_len_for_test(),
         (TERMINAL_OFF_STALE_CLEAR_KEYS, 2)
@@ -2222,4 +2230,12 @@ fn terminal_off_stale_clear_memo_is_bounded_and_eviction_fails_toward_another_cl
         terminal_off_stale_clear_served(&toggled, "context", &roots).is_empty(),
         "another generation is never served by this one"
     );
+    let mut reloaded = index.clone();
+    reloaded.traversal.as_mut().unwrap().census_window_end = W2.into();
+    assert!(
+        terminal_off_stale_clear_served(&reloaded, "context", &roots).is_empty(),
+        "a traversal its start did not create is never served"
+    );
+    reloaded.traversal = None;
+    assert!(terminal_off_stale_clear_served(&reloaded, "context", &roots).is_empty());
 }

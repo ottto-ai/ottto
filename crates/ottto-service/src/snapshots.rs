@@ -42226,8 +42226,10 @@ fn ensure_bounded_traversal(
                 }
             }
         }
+        if !suppressed {
+            note_terminal_off_stale_clears(index, &context_fingerprint, collected_at, &stale);
+        }
         if !semantic.is_empty() {
-            note_terminal_off_stale_clears(index, &context_fingerprint, &semantic);
             eprintln!(
                 "claude_terminal_off semantic_context_reselection files={}",
                 index.files.len()
