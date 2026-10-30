@@ -52084,19 +52084,12 @@ mod tests {
     }
 
     fn temp_file(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        std::env::temp_dir().join(format!("ottto-{name}-{unique}.jsonl"))
+        let unique = crate::test_scratch::unique_name(&format!("ottto-{name}"));
+        std::env::temp_dir().join(format!("{unique}.jsonl"))
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("ottto-{name}-{unique}"));
+        let path = crate::test_scratch::unique_path(&format!("ottto-{name}"));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }

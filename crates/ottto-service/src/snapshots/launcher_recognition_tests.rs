@@ -8,14 +8,7 @@ const NOW: &str = "2026-10-07T12:00:00Z";
 struct Home(PathBuf);
 impl Home {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "ottto-launch-native-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_scratch::unique_path("ottto-launch-native");
         fs::create_dir_all(&path).unwrap();
         Self(path)
     }
