@@ -5065,3 +5065,107 @@ fn m1_blocked_group_leaves_earlier_corrupt_member_recoverable() {
     assert_eq!(reader.full_guard(&a.key, true, true, &[0; 32]), Ok(None));
     assert_eq!(reader.counters().t14_rebuild_full_started, 0);
 }
+
+#[test]
+fn exact_retirement_retries_unlink_and_absent_path_directory_barrier() {
+    use crate::snapshots::sampled_scan::transition_fixture::{fail_store_at, CrashPoint};
+    for point in [CrashPoint::BeforeRetireUnlink, CrashPoint::BeforeRetireSync] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("retire.jsonl", b"{}\n");
+        let b = binding("account", "scope", ("fp", None));
+        let mut store = scratch.store();
+        assert_eq!(
+            store
+                .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+                .unwrap()
+                .written,
+            1
+        );
+        // Cold process: failure-side authorization cannot rely on restore success.
+        drop(store);
+        let mut store = scratch.store();
+        let record = found(store.read(&b.key));
+        let expected = Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        };
+        store.authorize(&record, &expected);
+        let proof = store.mutation_witness(&record, &expected).unwrap();
+        let mut sync_due = false;
+        let fault = fail_store_at(point, 1);
+        assert!(matches!(
+            store.retire_exact(&lock, &proof, &mut sync_due),
+            RetireOutcome::Retry
+        ));
+        assert_eq!(fault.hits(), 1);
+        assert_eq!(store.counters.records_invalidated, 0);
+        assert_eq!(sync_due, point == CrashPoint::BeforeRetireSync);
+        drop(fault);
+        if sync_due {
+            assert!(!record_file(&store, &b.key).exists());
+            // The second attempt must still run the actual barrier even though
+            // the canonical path is absent; another barrier error retains it.
+            let fault = fail_store_at(CrashPoint::BeforeRetireSync, 1);
+            assert!(matches!(
+                store.retire_exact(&lock, &proof, &mut sync_due),
+                RetireOutcome::Retry
+            ));
+            assert_eq!(fault.hits(), 1);
+            assert!(sync_due);
+            drop(fault);
+        }
+        assert!(matches!(
+            store.retire_exact(&lock, &proof, &mut sync_due),
+            RetireOutcome::Retired
+        ));
+        assert!(!sync_due);
+        assert!(!record_file(&store, &b.key).exists());
+        assert_eq!(store.counters.records_invalidated, 1);
+    }
+}
+
+#[test]
+fn exact_retirement_verifies_changed_survivor_and_never_deletes_unknown_bytes() {
+    for unknown in [false, true] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("retire.jsonl", b"{}\n");
+        let b = binding("account", "scope", ("fp", None));
+        let mut store = scratch.store();
+        assert_eq!(
+            store
+                .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+                .unwrap()
+                .written,
+            1
+        );
+        let record = found(store.read(&b.key));
+        let expected = Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        };
+        store.authorize(&record, &expected);
+        let proof = store.mutation_witness(&record, &expected).unwrap();
+        let disk = record_file(&store, &b.key);
+        if unknown {
+            fs::write(&disk, b"unknown survivor").unwrap();
+        } else {
+            assert_eq!(
+                store
+                    .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
+                    .unwrap()
+                    .written,
+                1
+            );
+        }
+        let before = fs::read(&disk).unwrap();
+        let outcome = store.retire_exact(&lock, &proof, &mut false);
+        assert!(if unknown {
+            matches!(outcome, RetireOutcome::Retry)
+        } else {
+            matches!(outcome, RetireOutcome::Superseded)
+        });
+        assert_eq!(fs::read(&disk).unwrap(), before);
+    }
+}

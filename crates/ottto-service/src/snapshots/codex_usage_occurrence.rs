@@ -1300,3 +1300,54 @@ crate::durable_tail_codec::durable_struct!(OccurrenceCounters {
     N closed_filter_hit_unconfirmed_native_usage: T6,
     N pending_overflow_flushes: u64,
 });
+
+#[cfg(test)]
+mod content_decision_tests {
+    use super::*;
+    #[test]
+    fn unbound_equal_totals_precede_bound_repeat_filter_and_physical_duplicates() {
+        for bound in [false, true] {
+            let mut acc = SnapshotAccumulator::new(SnapshotSource::Codex);
+            let mut counting = CodexCounting::new(AckEvidence::None, None);
+            counting.version = Some(CountingVersion::V2);
+            counting.reducer = Some(Box::default());
+            acc.codex_counting = Some(Box::new(counting));
+            if bound {
+                acc.observe_codex_content_counting(
+                    &serde_json::json!({"payload":{"type":"task_started","turn_id":"t"}}),
+                );
+            }
+            let usage = UsageTotals {
+                input_tokens: 10,
+                output_tokens: 2,
+                request_count: 1,
+                ..Default::default()
+            };
+            for (identity, admitted) in [("a", true), ("b", !bound), ("b", false)] {
+                acc.codex_occurrence().unwrap().line_ui =
+                    Some(([10, 0, 0, 2, 0, 12], [10, 0, 0, 2, 0, 12]));
+                assert_eq!(
+                    acc.decide_codex_usage(
+                        None,
+                        usage.clone(),
+                        Some(usage.clone()),
+                        Some(identity.into()),
+                        Some(1)
+                    )
+                    .is_some(),
+                    admitted
+                );
+            }
+            assert!(
+                acc.usage_buckets.is_empty(),
+                "scratch decisions cannot publish or stage money"
+            );
+            assert!(acc
+                .codex_occurrence()
+                .unwrap()
+                .turn
+                .as_ref()
+                .is_none_or(|turn| turn.pending.is_empty()));
+        }
+    }
+}

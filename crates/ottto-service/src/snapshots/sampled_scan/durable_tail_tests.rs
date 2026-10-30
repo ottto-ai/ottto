@@ -9650,6 +9650,8 @@ fn a0h_pace_evicted_alone_emits_one_alarm_without_a_full_delta() {
                 FullPace {
                     at: now,
                     structural: false,
+                    flags: FULL_SPENT,
+                    head_extent: 0,
                 },
             );
         }
@@ -11489,6 +11491,8 @@ fn shared_recovery_pace_uses_wall_clock_and_overflow_fails_toward_reading() {
             FullPace {
                 at: at + std::time::Duration::from_secs(u64::from(n != 0)),
                 structural: false,
+                flags: FULL_SPENT,
+                head_extent: 0,
             },
         );
     }
@@ -12410,6 +12414,8 @@ fn o3_same_owner_shorter_growth_expires_pace_without_lowering_original_floor() {
             FullPace {
                 at: now,
                 structural: false,
+                flags: FULL_SPENT,
+                head_extent: 0,
             },
         );
     }
@@ -12815,6 +12821,8 @@ fn o3_generation_ahead_survivor_reads_growth_without_mutation_authority() {
                     FullPace {
                         at: now,
                         structural: false,
+                        flags: FULL_SPENT,
+                        head_extent: 0,
                     },
                 );
             }
@@ -12896,6 +12904,8 @@ fn o3_paced_growth_survives_idle_past_window_until_real_native_catchup() {
             FullPace {
                 at: now,
                 structural: false,
+                flags: FULL_SPENT,
+                head_extent: 0,
             },
         );
         stores.retail_full_now = Some(now);
@@ -13230,6 +13240,8 @@ fn pace_clock_anomaly_is_separate_from_overflow_and_never_refunds_q11() {
             FullPace {
                 at: stamp,
                 structural: false,
+                flags: FULL_SPENT,
+                head_extent: 0,
             },
         );
         assert!(
@@ -15132,4 +15144,159 @@ fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write
         !cache.skill_labels_enabled(source),
         "a new cycle defaults fail-closed until its owner supplies policy"
     );
+}
+
+#[test]
+fn rederive_extent_pacing_preserves_full_spend_and_overflow_discovery_custody() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    let cache = SharedCache::default();
+    let source = SnapshotSource::ClaudeCode;
+    let ds = DurableSource::ClaudeCode;
+    let key = "bounded-head-pacing";
+    let digest = store::key_digest(ds, key);
+    let now = SystemTime::now();
+    assert!(cache.paced_admission(source, key, now, false, false, true));
+    cache
+        .rederive_gate(source, digest, 100, true, false)
+        .unwrap();
+    for _ in 0..5 {
+        assert!(matches!(
+            cache.rederive_gate(source, digest, 100, false, false),
+            Err(Failure::Resource("rederive_paced"))
+        ));
+    }
+    // Only new predecessor extent resets HEAD_USED. A Full already spent by
+    // any cause continues to pace across that reset.
+    cache
+        .rederive_gate(source, digest, 101, true, false)
+        .unwrap();
+    assert!(!cache.paced_admission(source, key, now, false, false, false));
+    assert!(cache.owes_discovery(source, key));
+    {
+        let mut stores = cache.durable().unwrap();
+        stores.retail_full_at.remove(&digest); // exact effect of overflow eviction
+    }
+    // Exactly one extra head for this evicted extent, then no repeated input.
+    cache
+        .rederive_gate(source, digest, 101, true, false)
+        .unwrap();
+    cache.durable().unwrap().retail_full_at.remove(&digest);
+    assert!(matches!(
+        cache.rederive_gate(source, digest, 101, true, false),
+        Err(Failure::Resource("rederive_paced"))
+    ));
+    assert!(
+        cache.owes_discovery(source, key),
+        "custody survives repeated pace eviction"
+    );
+    // Fill/overflow the actual paid map. A repeatedly evicted waiter remains
+    // held even when its budget age must restart under rule 7.
+    for n in 0..2 * store::MAX_RECORDS + 2 {
+        let other = store::key_digest(ds, &format!("waiter-{n}"));
+        let _ = cache.rederive_gate(source, other, 1, false, true);
+    }
+    let stores = cache.durable().unwrap();
+    assert!(stores.retail_full_at.len() <= 2 * store::MAX_RECORDS);
+    assert!(stores.counters.pace_evicted[0] > 0);
+    drop(stores);
+    assert!(cache.owes_discovery(source, key));
+}
+
+#[test]
+fn rederive_budget_deferral_ages_without_spending_a_full_or_head() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    let cache = SharedCache::default();
+    let source = SnapshotSource::ClaudeCode;
+    let key = store::key_digest(DurableSource::ClaudeCode, "aged-waiter");
+    let now = SystemTime::now();
+    cache.durable().unwrap().retail_full_now = Some(now);
+    cache.reserve_rederive(source, REDERIVE_PASS_BYTES).unwrap();
+    assert!(matches!(
+        cache.reserve_rederive(source, 1),
+        Err(Failure::Resource("rederive_budget"))
+    ));
+    cache.rederive_gate(source, key, 100, false, true).unwrap();
+    assert_eq!(
+        cache.durable().unwrap().retail_full_at[&key].flags & (HEAD_USED | FULL_SPENT),
+        0
+    );
+    cache.durable().unwrap().retail_full_now =
+        Some(now + std::time::Duration::from_secs(PACE_SECS));
+    assert!(matches!(
+        cache.rederive_gate(source, key, 100, false, false),
+        Err(Failure::Resource("rederive_budget_aged"))
+    ));
+}
+
+#[test]
+fn quiet_restore_has_no_sample_or_content_input_before_decode_on_all_sources() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    let root = crate::test_scratch::ScratchDir::new("bounded-quiet");
+    let path = root.join("source.jsonl");
+    let scope = Scope("quiet-content".into());
+    // Pi's durable registration is E5's responsibility; its metadata gate is
+    // exercised with the same scoped restore entry before source decode.
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        for bytes in [
+            b"{}\n".as_slice(),
+            b"{\"cwd\":\"/synthetic\"}\n".as_slice(),
+            b"{\"type\":\"user\",\"message\":{\"content\":\"synthetic prompt\"}}\n".as_slice(),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            let b = store::tests::binding("account", "scope", ("fp", None));
+            let expected = Expected {
+                binding: b.clone(),
+                committed_generation: 1,
+            };
+            let record = store::DurableRecord {
+                wire: None,
+                envelope_audit_debt: None,
+                format: store::FORMAT_V1,
+                index_generation: 1,
+                record: PendingRecord {
+                    acquisition: None,
+                    binding: b,
+                    certificate: certificate(&path, &scope),
+                    body: Vec::new(),
+                    allowlist: codec::allowlist_digest(source),
+                },
+            };
+            let index = ScanIndex::default();
+            let interpretation = Interpretation {
+                accepted: None,
+                identity_contract: String::new(),
+                counting_view: String::new(),
+                namespace: &scope,
+            };
+            let cache = SharedCache::default();
+            let store::LeaseWait::Granted(mut lease) = cache.acquire_prepared_transfer(source)
+            else {
+                panic!("lease");
+            };
+            let before = rederive_head_bytes_total(source);
+            let (result, samples) = crate::transcript_acquisition::capture_sample_bytes(|| {
+                cache.durable_restore_record_scoped(
+                    source,
+                    &record,
+                    &expected,
+                    &path,
+                    &scope,
+                    &mut File::open(&path).unwrap(),
+                    &mut lease,
+                    Some(V3RestoreScope {
+                        index: &index,
+                        interpretation: &interpretation,
+                    }),
+                )
+            });
+            assert!(matches!(result, Err(Failure::Resource("rederive_quiet"))));
+            assert_eq!(samples, 0);
+            assert_eq!(rederive_head_bytes_total(source), before);
+            lease.release();
+        }
+    }
 }

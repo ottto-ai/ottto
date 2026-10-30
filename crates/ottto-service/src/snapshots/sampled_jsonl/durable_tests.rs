@@ -889,7 +889,12 @@ fn restore_then_tail_matches_cold_full() {
         drop(file);
         let mut held = File::open(&path).unwrap();
         let (checkpoint, _) = certificate.restore(&mut held, scope()).unwrap();
-        let (restored, _) = restore(&path, &body, case.source).unwrap();
+        let (oracle, _) = restore(&path, &body, case.source).unwrap();
+        let (restored, _) = decode(&body, case.source)
+            .unwrap()
+            .rederive_content(&File::open(&path).unwrap())
+            .unwrap();
+        assert_eq!(full_digest(&restored), full_digest(&oracle));
         let mut continued = parser(&path, case.source);
         let mode = continued
             .prepare_acquisition(
@@ -1793,7 +1798,7 @@ fn no_input_completion_requires_every_rederive_digest_absent() {
 /// codec corpus. Other digest obligations are deliberately left unsupported;
 /// this projection is NOT a claim that the complete rich records restore.
 #[test]
-fn bounded_workspace_matches_native_corpus_and_refuses_other_classes() {
+fn bounded_content_matches_native_corpus_and_fences_every_class() {
     let scratch = Scratch::new("bounded-workspace");
     let cases = [
         (SnapshotSource::ClaudeCode, claude_lines(3, 3)),
@@ -1814,11 +1819,12 @@ fn bounded_workspace_matches_native_corpus_and_refuses_other_classes() {
         let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
         let decoded = decode(&body, source).unwrap();
         assert!(decoded.rederive.workspace.is_some());
-        assert!(
-            decoded.content_charge().is_err(),
-            "rich record remains unsupported"
-        );
+        assert!(decoded.content_charge().is_ok());
+        let (bounded, _) = decoded
+            .rederive_content(&File::open(&path).unwrap())
+            .unwrap();
         let oracle = restore(&path, &body, source).unwrap().0;
+        assert_eq!(full_digest(&bounded), full_digest(&oracle));
         let mut workspace = decode(&body, source).unwrap();
         workspace.rederive = Rederive {
             workspace: workspace.rederive.workspace,
@@ -1834,7 +1840,7 @@ fn bounded_workspace_matches_native_corpus_and_refuses_other_classes() {
         wrong.content_charge().unwrap();
         assert!(matches!(
             wrong.rederive_content(&File::open(&path).unwrap()),
-            Err(Refuse::NotRederivable("workspace_digest"))
+            Err(Refuse::NotRederivable("content_fence"))
         ));
         let (bounded, receipt) = workspace
             .rederive_content(&File::open(&path).unwrap())
@@ -1863,7 +1869,9 @@ fn bounded_workspace_matches_native_corpus_and_refuses_other_classes() {
                 2 => excluded.rederive.agent_label = Some([1; 32]),
                 _ => excluded.rederive.session_start = Some([1; 32]),
             }
-            assert!(excluded.content_charge().is_err());
+            assert!(excluded
+                .rederive_content(&File::open(&path).unwrap())
+                .is_err());
         }
     }
 }
@@ -1893,17 +1901,10 @@ fn bounded_workspace_cap_and_escaped_text_keep_native_values_or_refuse() {
             };
             decoded.content_charge().unwrap();
             let actual = decoded.rederive_content(&File::open(&path).unwrap());
-            if length > 4096 {
-                assert!(matches!(
-                    actual,
-                    Err(Refuse::NotRederivable("workspace_capture"))
-                ));
-            } else {
-                assert_eq!(
-                    actual.unwrap().0.accumulator.workspace_path,
-                    native.accumulator.workspace_path
-                );
-            }
+            assert_eq!(
+                actual.unwrap().0.accumulator.workspace_path,
+                native.accumulator.workspace_path
+            );
         }
     }
     let path = scratch.write("escaped", &[r#"{"type":"progress","cwd":"  /tmp/a\u0062\u0063  ","ignored":[{"key":"not captured"}]}"#.into()]);
@@ -1927,7 +1928,7 @@ fn bounded_workspace_cap_and_escaped_text_keep_native_values_or_refuse() {
 }
 
 #[test]
-fn workspace_wrong_object_shapes_refuse_without_formatting_the_input() {
+fn workspace_unknown_object_shapes_match_native_without_formatting_the_input() {
     let scratch = Scratch::new("workspace-shape-error");
     for field in ["payload", "session_meta", "turn_context"] {
         let path = scratch.write(
@@ -1945,10 +1946,15 @@ fn workspace_wrong_object_shapes_refuse_without_formatting_the_input() {
         };
         assert!(decoded.rederive.workspace.is_some());
         decoded.content_charge().unwrap();
-        assert!(matches!(
-            decoded.rederive_content(&File::open(&path).unwrap()),
-            Err(Refuse::NotRederivable("workspace_capture"))
-        ));
+        assert_eq!(
+            decoded
+                .rederive_content(&File::open(&path).unwrap())
+                .unwrap()
+                .0
+                .accumulator
+                .workspace_path,
+            native.accumulator.workspace_path
+        );
     }
 }
 
@@ -2139,13 +2145,13 @@ fn bounded_pi_workspace_matches_native_header_only_precedence() {
         prompt.rederive.first_prompt = Some([1; 32]);
         assert!(
             prompt.content_charge().is_err(),
-            "Pi first prompt is still unfunded"
+            "a fabricated prompt without a physical mark refuses"
         );
         let mut wrong = make();
         wrong.rederive.workspace = Some([0; 32]);
         assert!(matches!(
             wrong.rederive_content(&File::open(&path).unwrap()),
-            Err(Refuse::NotRederivable("workspace_digest"))
+            Err(Refuse::NotRederivable("content_fence"))
         ));
     }
 }
@@ -2178,17 +2184,10 @@ fn bounded_pi_workspace_enforces_cap_and_refuses_nonheader_cwd() {
         };
         decoded.content_charge().unwrap();
         let result = decoded.rederive_content(&File::open(&path).unwrap());
-        if size == 4096 {
-            assert_eq!(
-                result.unwrap().0.accumulator.workspace_path,
-                Some(PathBuf::from("x".repeat(size)))
-            );
-        } else {
-            assert!(matches!(
-                result,
-                Err(Refuse::NotRederivable("workspace_capture"))
-            ));
-        }
+        assert_eq!(
+            result.unwrap().0.accumulator.workspace_path,
+            Some(PathBuf::from("x".repeat(size)))
+        );
     }
     let row = json!({"type":"message","cwd":"/synthetic/wrong-row"}).to_string();
     let path = scratch.write("not-header", std::slice::from_ref(&row));
@@ -2212,7 +2211,7 @@ fn bounded_pi_workspace_enforces_cap_and_refuses_nonheader_cwd() {
     };
     assert!(matches!(
         decoded.rederive_content(&File::open(&path).unwrap()),
-        Err(Refuse::NotRederivable("workspace_digest"))
+        Err(Refuse::NotRederivable("content_fence"))
     ));
 }
 
@@ -2381,4 +2380,100 @@ fn pl_scope_is_closed_and_every_other_e_field_stays_refusing() {
         .map(str::to_owned)
         .collect::<BTreeSet<_>>()
     );
+}
+
+/// Pi is not registered by this slice. Exercise the same decoded production
+/// content interface without granting Pi store/write authority (E5 owns that).
+#[test]
+fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
+    let root = Scratch::new("pi-bounded-head-tail");
+    let source = SnapshotSource::Pi;
+    for cwd in [None, Some("/synthetic/pi-workspace")] {
+        let lines = vec![
+            json!({"type":"session","id":"synthetic-pi","cwd":cwd}).to_string(),
+            json!({"type":"message","role":"user","content":"Synthetic first prompt"}).to_string(),
+            json!({"type":"message","message":{"role":"assistant","model":"claude-sonnet-4-5","usage":{"input":20,"output":3},"timestamp":"2026-10-20T10:00:00Z"}}).to_string(),
+        ];
+        let path = root.write(if cwd.is_some() { "cwd" } else { "no-cwd" }, &lines);
+        for cycle in 0..2 {
+            let (native, checkpoint) = full_read(&path, source);
+            let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
+            assert!(digests.first_prompt.is_some());
+            assert!(digests.session_start.is_none());
+            assert!(digests.agent_label.is_none());
+            let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
+                native.put(e)?;
+                digests.put(e)
+            })
+            .unwrap();
+            let certificate = checkpoint
+                .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
+                .unwrap();
+            let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(append, "{}", json!({"type":"message","message":{"role":"user","content":format!("later prompt {cycle}")}})).unwrap();
+            drop(append);
+            let (checkpoint, _) = certificate
+                .restore(&mut File::open(&path).unwrap(), scope())
+                .unwrap();
+            let decoded = decode_body(&body, source).unwrap();
+            let (restored, receipt) = decoded
+                .rederive_content(&File::open(&path).unwrap())
+                .unwrap();
+            assert!(receipt.head_bytes <= HEAD_BOUND);
+            assert_eq!(
+                restored.accumulator.first_prompt_material,
+                native.accumulator.first_prompt_material
+            );
+            assert_eq!(
+                restored.accumulator.first_prompt_title,
+                native.accumulator.first_prompt_title
+            );
+            assert_eq!(restored.accumulator.workspace_path, cwd.map(PathBuf::from));
+            let mut tail = parser(&path, source);
+            assert_eq!(
+                tail.prepare_acquisition(
+                    Some(Retained {
+                        checkpoint,
+                        state: restored
+                    }),
+                    &scope(),
+                    None,
+                    NOW
+                )
+                .unwrap(),
+                ReadMode::Tail
+            );
+            while !tail.step().unwrap() {}
+            let actual = items(tail, &path, source);
+            assert_eq!(actual, cold_items(&path, source));
+            assert!(actual.to_string().contains("Synthetic first prompt"));
+        }
+    }
+}
+
+#[test]
+fn bounded_plan_refuses_unsupported_codex_boundaries_and_oversized_marks_without_reads() {
+    let root = Scratch::new("unsupported-bounded");
+    let path = root.write("t", &codex_lines());
+    let (native, _) = full_read(&path, SnapshotSource::Codex);
+    let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
+    for boundary in [
+        CodexOwnershipBoundary::AwaitingLegacyTrigger,
+        CodexOwnershipBoundary::AwaitingParentPrefix,
+        CodexOwnershipBoundary::AmbiguousFork,
+        CodexOwnershipBoundary::Undetermined,
+    ] {
+        let mut decoded = decode(&body, SnapshotSource::Codex).unwrap();
+        decoded.reduction.accumulator.codex_ownership_boundary = boundary;
+        assert!(decoded.rederive_plan().is_err());
+    }
+    let mut decoded = decode(&body, SnapshotSource::Codex).unwrap();
+    decoded.rederive.first_prompt = Some([0; 32]);
+    decoded.reduction.accumulator.durable_marks.first_prompt = Some(HEAD_BOUND + 1);
+    assert_eq!(decoded.rederive_plan().err(), Some("mark"));
+    let mut decoded = decode(&body, SnapshotSource::Codex).unwrap();
+    decoded.rederive.title = Some([0; 32]);
+    decoded.reduction.accumulator.durable_marks.title_line =
+        Some((HEAD_BOUND + 1, TITLE_LINE_BOUND + 1));
+    assert_eq!(decoded.rederive_plan().err(), Some("title"));
 }

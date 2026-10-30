@@ -1356,13 +1356,49 @@ the same cause with a `near_cap` annotation. Source caps predate this path:
 512 MiB Claude, 256 MiB Pi, 2 GiB Codex. Above the cap the existing oversized-file
 rejection/disclosure still applies; near-cap admission does not expand it.
 
-Workspace re-derivation captures at most 4096 bytes per selected field and
-requires the original digest. Unsupported first-prompt, title, agent-label
-and session-start obligations remain `rederive_unfunded`. Capture/hash/read
-refusals are counted as `not_rederived`; no altered value is published.
-`rederive_input_bytes` counts each actual physical read, including bytes read
-before a later capture/hash refusal. Success receipts count successful restores
-separately; do not add the two byte counters together.
+With restart restore enabled, content re-derivation runs only after growth
+past the committed extent. Quiet files return Pending before certificate samples
+or content input. Grown files validate the existing certificate samples before
+any decode, support, pacing or allocation refusal, so those refusals cannot hide
+prefix edits. The native M1 route remains active when the switch is OFF.
+
+The replay reads at most a 1 MiB head and one title line of at most 1 MiB.
+An enforced seeded JSON builder admits at most 8,388,608 bytes of Value-owned
+requested allocations per line, prepaid on the existing active lease. Decoded
+raw-value magic keys refuse to the counted growth Full; no partial parse is
+adopted. Shared native content helpers rebuild the projection, and all recorded
+content digests must match before any fields move. `rederive_fence_mismatch`
+is an alarm: any nonzero value needs investigation. No content enters diagnostics.
+
+`rederive_head_reads` and `rederive_head_bytes` are process totals; the latter
+includes title input and partial reads. Use daily byte deltas for replay cost.
+`rederive_line_peak_bytes` records exact metered line high-water, alongside the
+active-lease high-water (which survives refunds) and stage footprint samples.
+`rederive_refused` counts failures after input by content class.
+`rederive_unsupported` names fixed boundary/mark/title refusal classes.
+`resource_full.decode` keeps decode refusals separate from certificate edits.
+Success receipts count successful restores separately from physical input;
+do not add the two byte counters together.
+
+A replay attempt is remembered by predecessor extent, not exact generation.
+A new extent resets only the head attempt; the cross-cause Full spend remains.
+Re-derive failures take at most one growth Full per key per six hours, plus at
+most one extra near the source cap, counted `rederive_failure_full.near_cap`.
+This exception avoids losing discovery when a held file grows beyond its source
+cap. Budget contention waits without a Full; after six hours its counted
+`rederive_budget_aged` fallback uses the same Full pacing. The paid pace map's
+overflow permits at most one extra head per evicted extent and alarms
+`pace_evicted`. Discovery custody survives pace eviction independently.
+
+Fence and certificate-edit retirement is bound to a verified predecessor.
+`rederive_retire.{retired,superseded,retry}` describes writer outcomes; missing
+binding authority is counted as `rederive_retire_unproven` or
+`rederive_retire_unfunded` and never grants deletion. Unlink's directory-sync
+obligation survives an absent path and is retried at saves. Pending receipts
+and unknown survivors remain protected. Retirement never creates an ACK.
+Claude's accepted-floor hold reports `restored_behind_accepted.held` at its
+actual decision edges. The discovery dependency continues to hard-gate the
+production switch; RAM pacing does not establish restart-persistent bounds.
 
 ## Codex state-only identity coverage
 
