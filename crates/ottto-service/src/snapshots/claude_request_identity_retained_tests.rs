@@ -510,15 +510,38 @@ fn retained_golden_cases() -> Value {
     let mut unpriced_first = unpriced.clone();
     sticky_apply(&mut unpriced_first, &unpriced_proof, &unpriced_state).unwrap();
     retained_ack(&mut unpriced_state, &unpriced_first, &[]);
+    identity::take_identity_counts();
     sticky_apply(&mut unpriced, &unpriced_proof, &unpriced_state).unwrap();
     assert_eq!(retained_marked(&unpriced), vec![false; 4]);
-    assert!(unpriced.request_identity_refusals > 0);
+    assert!(unpriced.usage_buckets.iter().all(|b| !sticky_tagged(&b.model_usage[0])));
+    assert_eq!(retained_count(&retained_counts(), "unpriced_part_untagged"), 1);
+    assert_eq!(unpriced.request_identity_refusals, 4);
     cases.insert("unpriced_strip_after_proof_proving", sticky_wire(unpriced_first));
     cases.insert("unpriced_strip_after_proof", sticky_wire(unpriced));
     for case in cases.values() {
-        assert!(
-            serde_json::to_vec(&case["snapshots"][0]).unwrap().len() <= identity::MAX_ITEM_BYTES
-        );
+        let item = &case["snapshots"][0];
+        assert!(serde_json::to_vec(item).unwrap().len() <= identity::MAX_ITEM_BYTES);
+        // Receiver presence rule at both levels: a part carries exactly the
+        // costs its row carries.
+        let bucket_rows = item["usage_buckets"].as_array().unwrap().iter();
+        let rows = item["model_usage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(bucket_rows.flat_map(|bucket| bucket["model_usage"].as_array().unwrap()));
+        for row in rows {
+            for part in row["identity_parts"].as_array().into_iter().flatten() {
+                for cost in [
+                    "cost_usd",
+                    "input_cost_usd",
+                    "output_cost_usd",
+                    "cache_read_cost_usd",
+                    "cache_creation_cost_usd",
+                ] {
+                    assert_eq!(part[cost].is_null(), row[cost].is_null(), "{cost}");
+                }
+            }
+        }
     }
     serde_json::to_value(cases).unwrap()
 }
