@@ -442,11 +442,12 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
         .attribution_context
         .as_ref()
         .map(SessionAttributionContext::checkpoint_namespace);
-    index.activate_upload_context(cycle_upload_context(
-        minted.upload_policy,
-        checkpoint.as_deref(),
-        false,
-    ));
+    activate_source_upload_context(
+        source,
+        cycle_upload_context(minted.upload_policy, checkpoint.as_deref(), false),
+        &mut index,
+        &mut progress,
+    );
     let generation = cycle_replay_generation(source, false, &index, CONTINUATION_NAMESPACE);
     assert_eq!(prepared.replay_generation, generation);
     let now = reason_reoffer::now_unix_seconds();

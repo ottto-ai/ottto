@@ -213,7 +213,7 @@ impl OwnedSourceScan {
             committed.o3_replay = previous;
             return Err(error);
         }
-        self.index.generation = committed.generation;
+        self.index.adopt_committed_save(committed);
         self.index.o3_replay.saved();
         committed.o3_replay.saved();
         Ok(())
@@ -248,6 +248,50 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(root);
     }
+    /// A production-shaped path has a storage root, unlike `index.json`: a
+    /// reservation saved on the committed copy moves it, and the same cycle's
+    /// working save must still commit.
+    #[cfg(unix)]
+    #[test]
+    fn reservation_save_moves_the_working_baseline_on_a_bound_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_scratch::private_dir("o3-bound-baseline");
+        let namespace = root.join("a".repeat(64));
+        std::fs::create_dir(&namespace).unwrap();
+        std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = namespace.join("claude_code-scan-index-v3.json");
+        let mut committed = ScanIndex::default();
+        committed.save(&path).unwrap();
+        assert!(committed.persistence_root.is_some(), "bound path premise");
+        let mut scan = OwnedSourceScan::new_with_identity_capture(
+            SnapshotSource::ClaudeCode,
+            &[],
+            committed.clone(),
+            "2026-10-29T12:00:00Z",
+            365,
+            100,
+            false,
+            None,
+            &[],
+            false,
+            true,
+            true,
+        );
+        assert!(!scan.index.o3_replay.upgrade_missing("file", true));
+        scan.persist_upgrade_reservations(&mut committed, &path)
+            .unwrap();
+        assert_eq!(scan.index.generation, committed.generation);
+        scan.index
+            .save(&path)
+            .expect("the working save follows the reservation's publication");
+        assert_eq!(scan.index.generation, committed.generation + 1);
+        assert_eq!(
+            ScanIndex::load(&path).unwrap().generation,
+            scan.index.generation
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn partial_checkpoint_unions_negative_spends_without_live_permissions() {
         let mut committed = ScanIndex::default();

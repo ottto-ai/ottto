@@ -3181,7 +3181,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
             for bypass in [
                 "ordinary",
                 "sampling_none",
-                "allow_sample_false",
+                "audit_metadata_unsupported",
                 "state_false",
                 "sidecar_false",
                 "owning_header_false",
@@ -3357,7 +3357,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 if bypass == "sampling_none" || bypass == "compressed" {
                     scan.sampling = None;
                 }
-                if bypass == "allow_sample_false" {
+                if bypass == "audit_metadata_unsupported" {
                     if let Some(context) = scan.sampling.as_mut() {
                         context.audit_metadata_supported = false;
                     }
@@ -5476,11 +5476,17 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
         index.save(&index_path).unwrap();
         let debt = sampled_audit::debt_for_key(&index, &key, due).unwrap();
         assert_eq!(debt.due_unix_seconds, due, "later offers cannot renew debt");
+        let overdue =
+            ReadPlan::prepare(&mut held, Some(&checkpoint), &scope, Some(debt), due).unwrap();
+        assert_eq!(overdue.mode(), ReadMode::Unchanged);
+        let overdue = overdue
+            .commit_after_native_completion(&held, &scope, due)
+            .unwrap();
+        assert_eq!(overdue.audit_debt().unwrap().due_unix_seconds, due);
         assert_eq!(
-            ReadPlan::prepare(&mut held, Some(&checkpoint), &scope, Some(debt), due)
-                .unwrap()
-                .mode(),
-            ReadMode::Full(FullReason::AuditDue)
+            overdue.last_full_verified(),
+            checkpoint.last_full_verified(),
+            "no Full credit"
         );
     }
     // Third case: absent entries miss without inventing membership. Reset
@@ -5574,12 +5580,12 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
                 sampled_audit::debt_for_key(&missing, &key, now),
                 Some(rearmed)
             );
-            assert_eq!(
-                ReadPlan::prepare(&mut held, None, &scope, Some(rearmed), now)
-                    .unwrap()
-                    .mode(),
-                ReadMode::Full(FullReason::AuditDue)
-            );
+            // Carrier custody re-arms scheduling debt, independently of the
+            // read cause: without a checkpoint the reader is StateMissing.
+            let plan = ReadPlan::prepare(&mut held, None, &scope, Some(rearmed), now).unwrap();
+            assert_eq!(plan.mode(), ReadMode::Full(FullReason::StateMissing));
+            assert_eq!(rearmed.due_unix_seconds, now);
+            assert_eq!(plan.metrics().audit_due, Some(rearmed.due_unix_seconds));
             missing.save(&index_path).unwrap();
             let loaded = ScanIndex::load(&index_path).unwrap();
             let mut disk = DurableTailStore::new(dir.clone(), source);
@@ -6474,6 +6480,7 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         for reason in [
             "eligibility",
+            "audit_cap",
             "prepare_scope",
             "prepare_incompatible",
             "dependency",
@@ -6544,6 +6551,11 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                 if refusal == "eligibility" {
                     if let Some(context) = scan.sampling.as_mut() {
                         context.audit_metadata_supported = false;
+                    }
+                }
+                if refusal == "audit_cap" {
+                    if let Some(context) = scan.sampling.as_mut() {
+                        context.audit_slots = 0;
                     }
                 }
                 if refusal == "census" {
