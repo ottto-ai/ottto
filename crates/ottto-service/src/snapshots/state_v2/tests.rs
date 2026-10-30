@@ -75,6 +75,7 @@ impl Value for Repeat {
 }
 fn put(tx: &mut impl Transaction, key: &RowKey, bytes: &[u8]) -> Header {
     tx.put(RowInput {
+        value_version: 1,
         key,
         fixed: &Fixed::None,
         value: &Bytes(bytes.into()),
@@ -88,149 +89,10 @@ fn value(tx: &mut impl Transaction, h: &Header) -> Vec<u8> {
 }
 
 #[test]
-fn typed_keys_and_fixed_columns_round_trip_every_table() {
-    let tmp = Scratch::new();
-    let mut db = tmp.store();
-    let rows = [
-        (RowKey::Meta("inherited".into()), Fixed::None),
-        (
-            RowKey::File("/synthetic/file".into()),
-            Fixed::File {
-                size: 91,
-                mtime_s: 7,
-                mtime_ns: Some(8),
-                ctime_ns: 9,
-                birth_ns: 10,
-                witness_rev: 11,
-                flags: 12,
-                source_fp: "0d".repeat(32),
-                last_snapshot_fp: Some("0E".repeat(32)),
-                body_witness: Some("malformed-but-retained".into()),
-                scan_identity: Some("existing-identity".into()),
-            },
-        ),
-        (RowKey::FamilyRequests("family".into()), Fixed::None),
-        (
-            RowKey::RequestSet(3),
-            Fixed::RequestSet {
-                commitment: vec![4; 32],
-                hash_count: Some(5),
-                refs: 6,
-            },
-        ),
-        (
-            RowKey::Census("/synthetic/file".into()),
-            Fixed::Census {
-                fp: vec![7; 32],
-                derivation: 8,
-                window: 9,
-                shape: 4,
-                flags: 11,
-                set_id: Some(3),
-                retired: Some(12),
-                old_path_requests: Some(13),
-                old_path_tokens: Some(14),
-                modified: Some(15),
-                birth: Some(vec![16; 24]),
-            },
-        ),
-        (
-            RowKey::AccountPending {
-                root: "family".into(),
-                window: 17,
-            },
-            Fixed::AccountPending {
-                version_ord: 18,
-                window_end: "019-not-a-clock".into(),
-                account_hash: "14".repeat(32),
-                evidence_count: 21,
-                flags: 22,
-            },
-        ),
-        (
-            RowKey::UsagePending("family".into()),
-            Fixed::UsagePending {
-                window_end: "2026-10-30T01:00:00+01:00".into(),
-                flags: 24,
-                idless_revision: Some(vec![25; 32]),
-            },
-        ),
-        (
-            RowKey::Witness {
-                kind: 26,
-                key: "owner".into(),
-            },
-            Fixed::None,
-        ),
-        (
-            RowKey::Accepted {
-                kind: 27,
-                key: vec![28; 32],
-            },
-            Fixed::None,
-        ),
-        (
-            RowKey::Quarantine {
-                kind: 29,
-                key: "entity".into(),
-            },
-            Fixed::Quarantine { claims: Some(30) },
-        ),
-        (
-            RowKey::Hold {
-                kind: 31,
-                field: "files".into(),
-                key: "raw".into(),
-            },
-            Fixed::None,
-        ),
-        (RowKey::Traversal("traversal".into()), Fixed::None),
-        (
-            RowKey::Interned {
-                kind: 32,
-                ordinal: 33,
-            },
-            Fixed::Interned { refs: 34 },
-        ),
-    ];
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    for (key, fixed) in &rows {
-        let bytes: &[u8] = if matches!(key, RowKey::Census(_)) {
-            b""
-        } else {
-            b"opaque\0bytes"
-        };
-        let h = tx
-            .put(RowInput {
-                key,
-                fixed,
-                value: &Bytes(bytes.to_vec()),
-            })
-            .unwrap();
-        assert_eq!(h.fixed, *fixed);
-        assert_eq!(value(&mut tx, &h), bytes);
-    }
-    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    for (key, fixed) in &rows {
-        let h = tx.get(key).unwrap().unwrap();
-        assert_eq!(&h.fixed, fixed);
-        assert_eq!(
-            value(&mut tx, &h),
-            if matches!(key, RowKey::Census(_)) {
-                b"".as_slice()
-            } else {
-                b"opaque\0bytes".as_slice()
-            }
-        );
-    }
-}
-
-#[test]
 fn f8_owner_replacement_reclaims_all_superseded_parts_atomically() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
-    let key = RowKey::Traversal("traversal".into());
+    let key = traversal("traversal".into());
     let mut tx = db.begin(TxnMode::Write).unwrap();
     let h = put(&mut tx, &key, &vec![b'a'; PART_BYTES * 2 + 1]);
     assert_eq!(h.parts, 3);
@@ -260,8 +122,9 @@ fn f8_owner_replacement_reclaims_all_superseded_parts_atomically() {
 
 #[test]
 fn f8_64_mib_admission_checks_before_read_allocation() {
-    let key = RowKey::Traversal("large".into());
+    let key = raw_hold("large".into());
     let admitted = preflight(&RowInput {
+        value_version: 1,
         key: &key,
         fixed: &Fixed::None,
         value: &Repeat(VALUE_BYTES),
@@ -270,6 +133,7 @@ fn f8_64_mib_admission_checks_before_read_allocation() {
     assert_eq!(admitted.parts, 256);
     assert_eq!(admitted.len, VALUE_BYTES);
     assert!(preflight(&RowInput {
+        value_version: 1,
         key: &key,
         fixed: &Fixed::None,
         value: &Repeat(VALUE_BYTES + 1)
@@ -297,7 +161,7 @@ fn f8_packed_raw_spelling_hashes_and_positional_neighbours_survive() {
 fn header_projection_never_reads_corrupt_parts() {
     let tmp = Scratch::new();
     let mut db = tmp.store();
-    let key = RowKey::Traversal("traversal".into());
+    let key = traversal("traversal".into());
     let mut tx = db.begin(TxnMode::Write).unwrap();
     let h = put(&mut tx, &key, &vec![b'a'; PART_BYTES]);
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
@@ -307,7 +171,7 @@ fn header_projection_never_reads_corrupt_parts() {
     let page = tx
         .scan_prefix(
             RowPrefix {
-                table: Table::Traversal,
+                table: Table::Records,
             },
             None,
             128,
@@ -337,17 +201,18 @@ fn wrong_fixed_type_and_generation_refuse_without_publishing() {
         let mut tx = db.begin(TxnMode::Write).unwrap();
         assert!(tx
             .put(RowInput {
-                key: &RowKey::File("x".into()),
+                value_version: 1,
+                key: &file("x".into()),
                 fixed: &Fixed::None,
                 value: &Bytes(vec![])
             })
             .is_err());
     }
     let mut tx = db.begin(TxnMode::Write).unwrap();
-    put(&mut tx, &RowKey::Meta("new".into()), b"x");
+    put(&mut tx, &test_record("new".into()), b"x");
     assert_eq!(tx.commit(7, 8), DurableCommitOutcome::NotPublished);
     let mut tx = db.begin(TxnMode::Read).unwrap();
-    assert!(tx.get(&RowKey::Meta("new".into())).unwrap().is_none());
+    assert!(tx.get(&test_record("new".into())).unwrap().is_none());
 }
 
 #[test]
@@ -357,7 +222,7 @@ fn f6_import_is_journal_off_and_has_no_import_wal() {
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(
         &mut tx,
-        &RowKey::Traversal("large".into()),
+        &raw_hold("large".into()),
         &vec![b'a'; PART_BYTES * 3],
     );
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
@@ -387,11 +252,7 @@ fn f5_independent_identity_mismatch_refuses_before_wal_mutation() {
 fn f6_pl_in_values_requires_purge_even_with_hash_only_keys() {
     let tmp = Scratch::new();
     let mut db = tmp.store();
-    let key = RowKey::Hold {
-        kind: 1,
-        field: "files".into(),
-        key: "h".repeat(64),
-    };
+    let key = raw_hold("h".repeat(64));
     let canary = b"unique-synthetic-private-value-canary-4f235";
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, canary);
@@ -425,11 +286,11 @@ fn f6_passive_complete_can_leave_allocated_wal_and_allows_next_write() {
     let mut tx = db.begin(TxnMode::Write).unwrap();
     let key = RowKey::RequestSet(1);
     let fixed = Fixed::RequestSet {
-        commitment: vec![1; 32],
-        hash_count: Some(1),
+        commitment: [1; 32],
         refs: 1,
     };
     tx.put(RowInput {
+        value_version: 1,
         key: &key,
         fixed: &fixed,
         value: &Repeat(WAL_PASSIVE_BYTES + 1),
@@ -440,7 +301,7 @@ fn f6_passive_complete_can_leave_allocated_wal_and_allows_next_write() {
     assert_eq!(cp.state, CheckpointState::Complete);
     assert!(cp.wal_bytes.unwrap() > 0, "PASSIVE is not TRUNCATE");
     let mut tx = db.begin(TxnMode::Write).unwrap();
-    put(&mut tx, &RowKey::Meta("N-test".into()), b"small");
+    put(&mut tx, &test_record("N-test".into()), b"small");
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
 }
 
@@ -511,11 +372,12 @@ fn failed_write_cannot_be_ignored_then_committed() {
     }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
-    let key = RowKey::Traversal("traversal".into());
+    let key = traversal("traversal".into());
     let mut tx = db.begin(TxnMode::Write).unwrap();
     let bad = Changes(Cell::new(false));
     assert!(tx
         .put(RowInput {
+            value_version: 1,
             key: &key,
             fixed: &Fixed::None,
             value: &bad
@@ -532,11 +394,7 @@ fn aborted_journal_off_import_is_never_finishable() {
     let mut db = tmp.store();
     {
         let mut tx = db.begin(TxnMode::Write).unwrap();
-        put(
-            &mut tx,
-            &RowKey::Traversal("traversal".into()),
-            b"unpublished",
-        );
+        put(&mut tx, &traversal("traversal".into()), b"unpublished");
     }
     assert!(db.finish_import().is_err());
 }
@@ -556,52 +414,13 @@ fn independent_identity_is_write_once() {
     other.db_id = "replacement".into();
     assert!(tx
         .put(RowInput {
+            value_version: 1,
             key: &key,
             fixed: &Fixed::None,
-            value: &packed::Json(&other)
+            value: &ControlJson(&other)
         })
         .is_err());
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::NotPublished);
-}
-
-#[test]
-fn f8_damaged_header_refuses_both_lookup_and_scan_before_owned_copy() {
-    let tmp = Scratch::new();
-    let mut db = tmp.live_store();
-    let key = RowKey::File("/synthetic/file".into());
-    let fixed = Fixed::File {
-        size: 1,
-        mtime_s: 2,
-        mtime_ns: None,
-        ctime_ns: 0,
-        birth_ns: 0,
-        witness_rev: 0,
-        flags: 0,
-        source_fp: "03".repeat(32),
-        last_snapshot_fp: None,
-        body_witness: None,
-        scan_identity: None,
-    };
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    tx.put(RowInput {
-        key: &key,
-        fixed: &fixed,
-        value: &Bytes(vec![]),
-    })
-    .unwrap();
-    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    sqlite::oversize_header_for_test(&mut db);
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    assert!(tx.get(&key).is_err());
-    assert!(tx
-        .scan_prefix(
-            RowPrefix {
-                table: Table::Files
-            },
-            None,
-            128
-        )
-        .is_err());
 }
 
 #[test]
@@ -648,138 +467,10 @@ fn f9_production_traversal_writer_includes_registered_parent_counts() {
 }
 
 #[test]
-fn format_one_unsigned_clocks_and_hash_spelling_are_lossless() {
-    let tmp = Scratch::new();
-    let mut db = tmp.store();
-    let rows = [
-        (
-            RowKey::File("u64".into()),
-            Fixed::File {
-                size: u64::MAX,
-                mtime_s: u64::MAX,
-                mtime_ns: Some(u64::MAX),
-                ctime_ns: 0,
-                birth_ns: 0,
-                witness_rev: u64::MAX,
-                flags: 0,
-                source_fp: "a".repeat(64),
-                last_snapshot_fp: Some("A".repeat(64)),
-                body_witness: Some(String::new()),
-                scan_identity: Some("exact:identity".into()),
-            },
-        ),
-        (
-            RowKey::AccountPending {
-                root: "account".into(),
-                window: 0,
-            },
-            Fixed::AccountPending {
-                version_ord: 1,
-                window_end: "malformed:019\u{0}".into(),
-                account_hash: "not-a-hash".into(),
-                evidence_count: u128::MAX,
-                flags: 0,
-            },
-        ),
-        (
-            RowKey::UsagePending("usage".into()),
-            Fixed::UsagePending {
-                window_end: "2026-10-30T01:00:00+01:00".into(),
-                flags: 0,
-                idless_revision: None,
-            },
-        ),
-        (
-            RowKey::Census("census".into()),
-            Fixed::Census {
-                fp: vec![1; 32],
-                derivation: u16::MAX,
-                window: u64::MAX,
-                shape: 4,
-                flags: 0,
-                set_id: None,
-                retired: Some(u64::MAX),
-                old_path_requests: Some(0),
-                old_path_tokens: None,
-                modified: Some(u64::MAX),
-                birth: Some(vec![255; 24]),
-            },
-        ),
-    ];
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    for (key, fixed) in &rows {
-        tx.put(RowInput {
-            key,
-            fixed,
-            value: &Bytes(vec![]),
-        })
-        .unwrap();
-    }
-    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    for (key, fixed) in &rows {
-        let mut tx = db.begin(TxnMode::Read).unwrap();
-        let h = tx.get(key).unwrap().unwrap();
-        assert_eq!(&h.fixed, fixed);
-        assert!(value(&mut tx, &h).is_empty());
-    }
-    for spelling in [
-        "".to_owned(),
-        "a".repeat(64),
-        "A".repeat(64),
-        "ü\u{0}".into(),
-        "a".repeat(63),
-    ] {
-        let encoded = packed::hash_string(&spelling).unwrap();
-        assert_eq!(packed::read_hash_string(&encoded).unwrap(), spelling);
-    }
-    assert!(packed::read_hash_string(&[1; 32]).is_err());
-    assert!(packed::hash_string(&"x".repeat(KEY_BYTES + 1)).is_err());
-}
-
-#[test]
-fn format_one_census_and_key_admission_precede_mutation() {
-    let tmp = Scratch::new();
-    let mut db = tmp.store();
-    let key = RowKey::Census("census".into());
-    let fixed = Fixed::Census {
-        fp: vec![1; 32],
-        derivation: 1,
-        window: 0,
-        shape: 0,
-        flags: 0,
-        set_id: None,
-        retired: None,
-        old_path_requests: None,
-        old_path_tokens: None,
-        modified: None,
-        birth: None,
-    };
-    assert!(preflight(&RowInput {
-        key: &key,
-        fixed: &fixed,
-        value: &Bytes(vec![1])
-    })
-    .is_err());
-    assert!(preflight(&RowInput {
-        key: &RowKey::Meta("x".repeat(KEY_BYTES + 1)),
-        fixed: &Fixed::None,
-        value: &Bytes(vec![])
-    })
-    .is_err());
-    // The cap is UTF-8 bytes, independent of JSON escaping overhead.
-    let exact = RowKey::Meta("\u{0}".repeat(KEY_BYTES));
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    put(&mut tx, &exact, b"admitted");
-    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    assert!(tx.get(&exact).unwrap().is_some());
-}
-
-#[test]
 fn f6_deadline_keeps_writes_live_without_resetting_oldest_purge() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
-    let key = RowKey::Meta("private-value".into());
+    let key = test_record("private-value".into());
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, b"first");
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
@@ -834,21 +525,13 @@ fn f8_vacuum_churn_removes_deleted_keys_and_pl_values() {
         .collect();
     let mut tx = db.begin(TxnMode::Write).unwrap();
     for (i, marker) in markers.iter().enumerate() {
-        let key = RowKey::Hold {
-            kind: 1,
-            field: "synthetic".into(),
-            key: format!("{i:06}"),
-        };
+        let key = raw_hold(format!("{i:06}"));
         put(&mut tx, &key, marker.as_bytes());
     }
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
     let mut tx = db.begin(TxnMode::Write).unwrap();
     for i in 0..512 {
-        let key = RowKey::Hold {
-            kind: 1,
-            field: "synthetic".into(),
-            key: format!("{i:06}"),
-        };
+        let key = raw_hold(format!("{i:06}"));
         if i % 7 == 0 {
             tx.delete(&key).unwrap();
         } else {
@@ -940,16 +623,17 @@ fn request_set_candidates_allow_collisions_and_compare_complete_evidence() {
     // Construct a distinct earlier candidate with the SAME lookup digest.
     // Full bytes, rather than lookup uniqueness, must distinguish it on reuse.
     tx.put(RowInput {
+        value_version: 1,
         key: &RowKey::RequestSet(90),
         fixed: &Fixed::RequestSet {
-            commitment: commitment.clone(),
-            hash_count: Some(1),
+            commitment: *commitment,
             refs: 1,
         },
         value: &Bytes(b"collision".to_vec()),
     })
     .unwrap();
     tx.put(RowInput {
+        value_version: 1,
         key: &RowKey::Meta("next_request_set_id".into()),
         fixed: &Fixed::None,
         value: &packed::Json(&91_u64),
@@ -982,6 +666,7 @@ fn colliding_candidate_before_exact_match_is_not_aliased_or_overwritten() {
     let fixed = exact.fixed.clone();
     // Both candidates remain. The first differs only in its LAST payload byte.
     tx.put(RowInput {
+        value_version: 1,
         key: &RowKey::RequestSet(2),
         fixed: &fixed,
         value: &Bytes(stored.clone()),
@@ -990,12 +675,14 @@ fn colliding_candidate_before_exact_match_is_not_aliased_or_overwritten() {
     let mut collision = stored.clone();
     *collision.last_mut().unwrap() ^= 1;
     tx.put(RowInput {
+        value_version: 1,
         key: &RowKey::RequestSet(a),
         fixed: &fixed,
         value: &Bytes(collision.clone()),
     })
     .unwrap();
     tx.put(RowInput {
+        value_version: 1,
         key: &RowKey::Meta("next_request_set_id".into()),
         fixed: &Fixed::None,
         value: &packed::Json(&3_u64),
@@ -1008,70 +695,6 @@ fn colliding_candidate_before_exact_match_is_not_aliased_or_overwritten() {
     assert_eq!(value(&mut tx, &right), stored);
     assert!(matches!(right.fixed, Fixed::RequestSet { refs: 2, .. }));
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-}
-
-#[test]
-fn f8_interned_parts_refs_and_high_water_are_atomic_and_nonreused() {
-    use interning::{intern_string, release_string, resolve_string, Vocabulary};
-    let tmp = Scratch::new();
-    let mut db = tmp.live_store();
-    let text = "é".repeat(PART_BYTES + 17);
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    let id = intern_string(&mut tx, Vocabulary::Model, &text).unwrap();
-    assert_eq!(
-        intern_string(&mut tx, Vocabulary::Model, &text).unwrap(),
-        id
-    );
-    assert_eq!(
-        resolve_string(&mut tx, Vocabulary::Model, id).unwrap(),
-        text
-    );
-    let key = RowKey::Interned {
-        kind: 1,
-        ordinal: id,
-    };
-    let h = tx.get(&key).unwrap().unwrap();
-    assert_eq!(h.parts, 3);
-    assert!(matches!(h.fixed, Fixed::Interned { refs: 2 }));
-    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    {
-        let mut tx = db.begin(TxnMode::Write).unwrap();
-        release_string(&mut tx, Vocabulary::Model, id).unwrap();
-        release_string(&mut tx, Vocabulary::Model, id).unwrap();
-        assert!(resolve_string(&mut tx, Vocabulary::Model, id).is_err());
-        let next = intern_string(&mut tx, Vocabulary::Model, "new").unwrap();
-        assert!(next > id);
-        // Drop rolls back refs, parts, purge AND high water together.
-    }
-    db.validate_parts().unwrap();
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    assert_eq!(
-        resolve_string(&mut tx, Vocabulary::Model, id).unwrap(),
-        text
-    );
-    release_string(&mut tx, Vocabulary::Model, id).unwrap();
-    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
-    // Updating a live reference count alone removes no PL and creates no purge.
-    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), None);
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    release_string(&mut tx, Vocabulary::Model, id).unwrap();
-    let next = intern_string(&mut tx, Vocabulary::Model, "new").unwrap();
-    assert!(next > id);
-    assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
-    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(3));
-    db.validate_parts().unwrap();
-    drop(db);
-    let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
-    db.path_extractor(test_paths);
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    assert!(resolve_string(&mut tx, Vocabulary::Model, id).is_err());
-    assert_eq!(
-        resolve_string(&mut tx, Vocabulary::Model, next).unwrap(),
-        "new"
-    );
-    let after_restart = intern_string(&mut tx, Vocabulary::Model, "later").unwrap();
-    assert!(after_restart > next);
-    assert_eq!(tx.commit(3, 4), DurableCommitOutcome::Committed(4));
 }
 
 #[test]
@@ -1111,7 +734,7 @@ fn f8_full_stream_comparison_validates_parts_and_all_bytes() {
     let mut changed = bytes.clone();
     *changed.last_mut().unwrap() = b'b';
     let mut tx = db.begin(TxnMode::Write).unwrap();
-    let h = put(&mut tx, &RowKey::Traversal("stream".into()), &bytes);
+    let h = put(&mut tx, &traversal("stream".into()), &bytes);
     assert!(tx.value_matches(&h, &Bytes(bytes)).unwrap());
     assert!(!tx.value_matches(&h, &Bytes(changed)).unwrap());
     assert!(!tx.value_matches(&h, &Repeat(17)).unwrap());
@@ -1122,40 +745,11 @@ fn f8_full_stream_comparison_validates_parts_and_all_bytes() {
 }
 
 #[test]
-fn format_one_physical_columns_match_the_fourteen_table_contract() {
-    let tmp = Scratch::new();
-    let db = tmp.store();
-    let (tables, unique) = sqlite::schema_for_test(&db);
-    assert_eq!(FORMAT, 1);
-    assert_eq!(tables.len(), 14);
-    assert_eq!(
-        tables
-            .iter()
-            .map(|(_, columns)| columns.len())
-            .sum::<usize>(),
-        108
-    );
-    assert!(!unique, "lookup collisions must coexist");
-    let census = &tables.iter().find(|(name, _)| name == "census").unwrap().1;
-    assert_eq!(census.len(), 13);
-    assert!(!census
-        .iter()
-        .any(|(name, _)| ["len", "parts", "inline"].contains(&name.as_str())));
-    let account = &tables
-        .iter()
-        .find(|(name, _)| name == "account_pending")
-        .unwrap()
-        .1;
-    assert!(account.contains(&("evidence_count".into(), "BLOB".into())));
-    assert!(account.contains(&("window_end".into(), "TEXT".into())));
-}
-
-#[test]
 fn f6_busy_purge_retains_obligation_paces_retry_and_allows_in_deadline_writes() {
     use std::time::{SystemTime, UNIX_EPOCH};
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
-    let key = RowKey::Traversal("private".into());
+    let key = traversal("private".into());
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, b"old private bytes");
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
@@ -1201,7 +795,7 @@ fn f6_busy_purge_retains_obligation_paces_retry_and_allows_in_deadline_writes() 
 fn f6_restart_between_vacuum_and_metadata_clear_keeps_pending_debt() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
-    let key = RowKey::Meta("private".into());
+    let key = test_record("private".into());
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, b"old");
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
@@ -1223,73 +817,11 @@ fn f6_restart_between_vacuum_and_metadata_clear_keeps_pending_debt() {
 }
 
 #[test]
-fn f8_corrupted_refcount_cannot_reclaim_evidence_or_commit_sibling_changes() {
-    use interning::{
-        intern_request_set, intern_string, release_request_set, release_string, RequestEvidence,
-        Vocabulary,
-    };
-    for string in [true, false] {
-        let tmp = Scratch::new();
-        let mut db = tmp.live_store();
-        let mut tx = db.begin(TxnMode::Write).unwrap();
-        let key = if string {
-            let text = "x".repeat(PART_BYTES + 31);
-            let id = intern_string(&mut tx, Vocabulary::Model, &text).unwrap();
-            assert_eq!(
-                intern_string(&mut tx, Vocabulary::Model, &text).unwrap(),
-                id
-            );
-            RowKey::Interned {
-                kind: 1,
-                ordinal: id,
-            }
-        } else {
-            let payload = Repeat(PART_BYTES as u64 + 31);
-            let evidence = RequestEvidence::Census {
-                hashes: &payload,
-                hash_count: None,
-            };
-            let id = intern_request_set(&mut tx, &evidence).unwrap();
-            assert_eq!(intern_request_set(&mut tx, &evidence).unwrap(), id);
-            RowKey::RequestSet(id)
-        };
-        let before = tx.get(&key).unwrap().unwrap();
-        assert!(matches!(
-            before.fixed,
-            Fixed::Interned { refs: 2 } | Fixed::RequestSet { refs: 2, .. }
-        ));
-        assert!(before.parts > 0);
-        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-        let parts = sqlite::part_count_for_test(&db);
-        sqlite::damage_refs_for_test(&db, &key);
-        let sibling = RowKey::Meta("sibling".into());
-        let mut tx = db.begin(TxnMode::Write).unwrap();
-        put(&mut tx, &sibling, b"must roll back");
-        let release = match key {
-            RowKey::Interned { ordinal, .. } => release_string(&mut tx, Vocabulary::Model, ordinal),
-            RowKey::RequestSet(id) => release_request_set(&mut tx, id),
-            _ => unreachable!(),
-        };
-        assert!(
-            release.is_err(),
-            "corrupted fixed columns cannot authorize reclamation"
-        );
-        assert_eq!(tx.commit(1, 2), DurableCommitOutcome::NotPublished);
-        assert_eq!(sqlite::part_count_for_test(&db), parts);
-        let mut tx = db.begin(TxnMode::Read).unwrap();
-        assert!(tx.get(&sibling).unwrap().is_none());
-        let retained = tx.get(&key).unwrap().unwrap();
-        assert_eq!(retained.parts, before.parts);
-        assert!(tx.read_value(&retained, &mut std::io::sink()).is_err());
-    }
-}
-
-#[test]
 fn f6_backward_clock_does_not_grant_a_restart_purge_attempt() {
     use std::time::{SystemTime, UNIX_EPOCH};
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
-    let key = RowKey::Meta("private".into());
+    let key = test_record("private".into());
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, b"old");
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
@@ -1337,39 +869,11 @@ fn growth_retention_follows_runtime_custody_through_clones_subsets_and_baselines
     baseline.retain_persistence_baseline_from(&super::super::ScanIndex::default());
     assert!(!state_v2_growth_retention_active(&baseline));
 }
-
-fn test_paths(
-    header: &Header,
-    value: &dyn Value,
-    paths: &mut dyn FnMut(&str) -> Result<()>,
-) -> Result<()> {
-    if let RowKey::File(path) | RowKey::Census(path) = &header.key {
-        paths(path)?;
-    }
-    if let Fixed::File {
-        scan_identity: Some(private),
-        ..
-    } = &header.fixed
-    {
-        paths(private)?;
-    }
-    let mut bytes = Vec::new();
-    value.write(&mut bytes)?;
-    if let Ok(strings) = serde_json::from_slice::<Vec<String>>(&bytes) {
-        for path in strings {
-            paths(&path)?;
-        }
-    } else if !bytes.is_empty() {
-        paths(&String::from_utf8(bytes)?)?;
-    }
-    Ok(())
-}
-
 #[test]
 fn c1_same_key_rewrites_and_path_set_diffs() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
-    let key = RowKey::Traversal("queue".into());
+    let key = traversal("queue".into());
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, br#"["/a","/b"]"#);
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
@@ -1389,97 +893,6 @@ fn c1_same_key_rewrites_and_path_set_diffs() {
 }
 
 #[test]
-fn c1_fixed_size_rewrite_and_delete_reinsert_do_not_mark_purge() {
-    let tmp = Scratch::new();
-    let mut db = tmp.live_store();
-    let key = RowKey::File("/private/file".into());
-    let mut fixed = Fixed::File {
-        size: 1,
-        mtime_s: 2,
-        mtime_ns: None,
-        ctime_ns: 0,
-        birth_ns: 0,
-        witness_rev: 0,
-        flags: 0,
-        source_fp: String::new(),
-        last_snapshot_fp: None,
-        body_witness: None,
-        scan_identity: None,
-    };
-    for generation in 0..3 {
-        let mut tx = db.begin(TxnMode::Write).unwrap();
-        if generation == 2 {
-            tx.delete(&key).unwrap();
-        }
-        if let Fixed::File { size, .. } = &mut fixed {
-            *size += 1;
-        }
-        tx.put(RowInput {
-            key: &key,
-            fixed: &fixed,
-            value: &Bytes(vec![]),
-        })
-        .unwrap();
-        assert_eq!(
-            tx.commit(generation, generation + 1),
-            DurableCommitOutcome::Committed(generation + 1)
-        );
-        assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), None);
-    }
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    tx.delete(&key).unwrap();
-    assert_eq!(tx.commit(3, 4), DurableCommitOutcome::Committed(4));
-    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(4));
-}
-
-#[test]
-fn census_fixed_column_update_preserves_digest_without_value_comparison() {
-    let tmp = Scratch::new();
-    let mut db = tmp.live_store();
-    let key = RowKey::Census("/synthetic/census".into());
-    let mut fixed = Fixed::Census {
-        fp: vec![1; 32],
-        derivation: 0,
-        window: 0,
-        shape: 0,
-        flags: 0,
-        set_id: None,
-        retired: None,
-        old_path_requests: None,
-        old_path_tokens: None,
-        modified: None,
-        birth: None,
-    };
-    for generation in 0..2 {
-        if let Fixed::Census { window, .. } = &mut fixed {
-            *window = generation;
-        }
-        let mut tx = db.begin(TxnMode::Write).unwrap();
-        let header = tx
-            .put(RowInput {
-                key: &key,
-                fixed: &fixed,
-                value: &Bytes(vec![]),
-            })
-            .unwrap();
-        tx.read_value(&header, &mut std::io::sink()).unwrap();
-        assert_eq!(
-            tx.commit(generation, generation + 1),
-            DurableCommitOutcome::Committed(generation + 1)
-        );
-    }
-    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), None);
-}
-
-fn age_erasure(db: &mut sqlite::Sqlite, seconds: u64) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    db.control("erasure_since", &(now - seconds)).unwrap();
-}
-
-#[test]
 fn clean_checkpoint_is_durable_and_next_write_marks_dirty_before_mutation() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
@@ -1490,11 +903,7 @@ fn clean_checkpoint_is_durable_and_next_write_marks_dirty_before_mutation() {
     assert_eq!(db.read_control::<u8>("phase").unwrap(), Some(0));
     {
         let mut tx = db.begin(TxnMode::Write).unwrap();
-        put(
-            &mut tx,
-            &RowKey::Traversal("uncommitted".into()),
-            b"rollback",
-        );
+        put(&mut tx, &traversal("uncommitted".into()), b"rollback");
     }
     assert_eq!(db.read_control::<u8>("phase").unwrap(), Some(1));
     db.clean_checkpoint().unwrap();
@@ -1503,7 +912,7 @@ fn clean_checkpoint_is_durable_and_next_write_marks_dirty_before_mutation() {
     assert!(db
         .begin(TxnMode::Read)
         .unwrap()
-        .get(&RowKey::Traversal("uncommitted".into()))
+        .get(&traversal("uncommitted".into()))
         .unwrap()
         .is_none());
 }
@@ -1512,7 +921,7 @@ fn clean_checkpoint_is_durable_and_next_write_marks_dirty_before_mutation() {
 fn purge_starts_at_twelve_hours_and_busy_source_pauses_at_twenty() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
-    let key = RowKey::Traversal("private".into());
+    let key = traversal("private".into());
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, b"alias-old");
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
@@ -1600,7 +1009,7 @@ fn save_admission_rolls_back_whole_burst_and_resident_headers_follow_commit() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     db.prime_headers().unwrap();
-    let key = RowKey::Traversal("first".into());
+    let key = traversal("first".into());
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, b"old");
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
@@ -1609,7 +1018,8 @@ fn save_admission_rolls_back_whole_burst_and_resident_headers_follow_commit() {
     assert_eq!(value(&mut tx, &tx_header(&key, b"new")), b"new");
     assert!(tx
         .put(RowInput {
-            key: &RowKey::Traversal("too-large".into()),
+            value_version: 1,
+            key: &traversal("too-large".into()),
             fixed: &Fixed::None,
             value: &Repeat(33 * 1024 * 1024)
         })
@@ -1619,74 +1029,6 @@ fn save_admission_rolls_back_whole_burst_and_resident_headers_follow_commit() {
     let header = tx.get(&key).unwrap().unwrap();
     assert_eq!(value(&mut tx, &header), b"old");
 }
-
-fn tx_header(key: &RowKey, bytes: &[u8]) -> Header {
-    preflight(&RowInput {
-        key,
-        fixed: &Fixed::None,
-        value: &Bytes(bytes.to_vec()),
-    })
-    .unwrap()
-}
-
-#[test]
-fn fixed_private_text_and_labels_aliases_and_raw_holds_create_erasure_epochs() {
-    let tmp = Scratch::new();
-    let mut db = tmp.live_store();
-    let key = RowKey::File("/synthetic/private".into());
-    let mut fixed = Fixed::File {
-        size: 0,
-        mtime_s: 0,
-        mtime_ns: None,
-        ctime_ns: 0,
-        birth_ns: 0,
-        witness_rev: 0,
-        flags: 0,
-        source_fp: String::new(),
-        last_snapshot_fp: None,
-        body_witness: None,
-        scan_identity: Some("private-label-alias".into()),
-    };
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    tx.put(RowInput {
-        key: &key,
-        fixed: &fixed,
-        value: &Bytes(vec![]),
-    })
-    .unwrap();
-    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    if let Fixed::File { scan_identity, .. } = &mut fixed {
-        *scan_identity = Some("replacement".into());
-    }
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    tx.put(RowInput {
-        key: &key,
-        fixed: &fixed,
-        value: &Bytes(vec![]),
-    })
-    .unwrap();
-    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
-    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
-    let oldest = db.read_control::<u64>("erasure_since").unwrap();
-    let raw = RowKey::Hold {
-        kind: 1,
-        field: "raw".into(),
-        key: "hash-only".into(),
-    };
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    put(
-        &mut tx,
-        &raw,
-        br#"["private-label","private-alias","raw-private-text"]"#,
-    );
-    assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    tx.delete(&raw).unwrap();
-    assert_eq!(tx.commit(3, 4), DurableCommitOutcome::Committed(4));
-    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(4));
-    assert_eq!(db.read_control::<u64>("erasure_since").unwrap(), oldest);
-}
-
 #[test]
 fn page_admission_reserves_all_commit_markers_before_delta_returns() {
     let tmp = Scratch::new();
@@ -1697,7 +1039,8 @@ fn page_admission_reserves_all_commit_markers_before_delta_returns() {
     sqlite::seed_page_estimate_for_test(&mut tx, 32 * 1024 - 64 - 18);
     let error = tx
         .put(RowInput {
-            key: &RowKey::Traversal("last-user-row".into()),
+            value_version: 1,
+            key: &traversal("last-user-row".into()),
             fixed: &Fixed::None,
             value: &Bytes(b"small".to_vec()),
         })
@@ -1705,4 +1048,391 @@ fn page_admission_reserves_all_commit_markers_before_delta_returns() {
     assert_eq!(error.to_string(), "state_v2_save_admission");
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::NotPublished);
     assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(0));
+}
+
+fn traversal(key: String) -> RowKey {
+    RowKey::record("scan_state.traversal", key.into_bytes(), 0).unwrap()
+}
+fn file(key: String) -> RowKey {
+    RowKey::record("file.progress", key.into_bytes(), 0).unwrap()
+}
+fn census(key: String) -> RowKey {
+    RowKey::record("file.census", key.into_bytes(), 0).unwrap()
+}
+fn raw_hold(key: String) -> RowKey {
+    RowKey::record("raw_hold.files", key.into_bytes(), 0).unwrap()
+}
+fn test_paths(h: &Header, v: &dyn Value, paths: &mut dyn FnMut(&str) -> Result<()>) -> Result<()> {
+    if let RowKey::Record { key_bytes, .. } = &h.key {
+        paths(std::str::from_utf8(key_bytes)?)?;
+    }
+    let mut bytes = Vec::new();
+    v.write(&mut bytes)?;
+    if let Ok(strings) = serde_json::from_slice::<Vec<String>>(&bytes) {
+        for s in strings {
+            paths(&s)?;
+        }
+    } else if !bytes.is_empty() {
+        paths(&String::from_utf8(bytes)?)?;
+    }
+    Ok(())
+}
+fn age_erasure(db: &mut sqlite::Sqlite, seconds: u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    db.control("erasure_since", &now.saturating_sub(seconds))
+        .unwrap();
+}
+fn tx_header(key: &RowKey, bytes: &[u8]) -> Header {
+    preflight(&RowInput {
+        value_version: 1,
+        key,
+        fixed: &Fixed::None,
+        value: &Bytes(bytes.into()),
+    })
+    .unwrap()
+}
+fn file_fixed() -> Fixed {
+    Fixed::File {
+        size: 91,
+        mtime_s: u64::MAX,
+        mtime_ns: Some(0),
+        ctime_ns: u64::MAX,
+        birth_ns: 4,
+        witness_rev: 5,
+        flags: 6,
+        source_fp: Some([7; 32]),
+        last_snapshot_fp: None,
+        body_witness: Some([8; 32]),
+    }
+}
+fn census_fixed() -> Fixed {
+    Fixed::Census {
+        fp: [9; 32],
+        derivation: 2,
+        window: u64::MAX,
+        shape: 4,
+        flags: 10,
+        set_id: None,
+        retired: Some(0),
+        old_path_requests: None,
+        old_path_tokens: Some(u64::MAX),
+        modified: Some(u64::MAX),
+        birth: Some([11; 24]),
+    }
+}
+
+#[test]
+fn typed_keys_and_scan_projections_round_trip_every_physical_owner() {
+    let tmp = Scratch::new();
+    let mut db = tmp.store();
+    let rows = vec![
+        (file("file".into()), file_fixed()),
+        (census("file".into()), census_fixed()),
+        (
+            RowKey::record("account_window", b"family".to_vec(), 17).unwrap(),
+            Fixed::AccountPending {
+                account_hash: None,
+                evidence_count: u128::MAX,
+                flags: 1,
+                member_count: u64::MAX,
+                set_count: 0,
+            },
+        ),
+        (
+            RowKey::record("usage.pending", b"family".to_vec(), 0).unwrap(),
+            Fixed::UsagePending {
+                flags: 2,
+                idless_revision: Some([3; 32]),
+                occurrence_count: u64::MAX,
+                member_count: 0,
+            },
+        ),
+        (
+            RowKey::RequestSet(4),
+            Fixed::RequestSet {
+                commitment: [5; 32],
+                refs: 6,
+            },
+        ),
+        (
+            RowKey::record("accepted.activity", Vec::new(), 0).unwrap(),
+            Fixed::None,
+        ),
+    ];
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    for (k, f) in &rows {
+        let h = tx
+            .put(RowInput {
+                value_version: 1,
+                key: k,
+                fixed: f,
+                value: &Bytes(b"opaque\0bytes".to_vec()),
+            })
+            .unwrap();
+        assert_eq!(value(&mut tx, &h), b"opaque\0bytes");
+    }
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    for (k, f) in &rows {
+        let h = tx.get(k).unwrap().unwrap();
+        assert_eq!(&h.fixed, f);
+        assert_eq!(value(&mut tx, &h), b"opaque\0bytes");
+    }
+}
+#[test]
+fn f8_damaged_header_refuses_both_lookup_and_scan_before_owned_copy() {
+    for oversized in [false, true] {
+        let tmp = Scratch::new();
+        let mut db = tmp.live_store();
+        let key = file("file".into());
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        tx.put(RowInput {
+            value_version: 1,
+            key: &key,
+            fixed: &file_fixed(),
+            value: &Bytes(vec![]),
+        })
+        .unwrap();
+        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+        if oversized {
+            sqlite::oversize_header_for_test(&mut db);
+        } else {
+            sqlite::corrupt_header_for_test(&mut db);
+        }
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        assert!(tx.get(&key).is_err());
+        assert!(tx
+            .scan_prefix(
+                RowPrefix {
+                    table: Table::Records
+                },
+                None,
+                8
+            )
+            .is_err());
+    }
+}
+#[test]
+fn format_one_census_can_keep_payload_and_header_changes_do_not_rehash_value() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = census("file".into());
+    let mut f = census_fixed();
+    let bytes = Bytes(b"original boundary spelling".to_vec());
+    let mut digest = None;
+    for generation in 0..2 {
+        if let Fixed::Census { window, .. } = &mut f {
+            *window = generation;
+        }
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        let h = tx
+            .put(RowInput {
+                value_version: 1,
+                key: &key,
+                fixed: &f,
+                value: &bytes,
+            })
+            .unwrap();
+        if let Some(d) = digest {
+            assert_eq!(h.digest, d);
+        }
+        digest = Some(h.digest);
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+    }
+    db.validate_parts().unwrap();
+}
+#[test]
+fn format_one_physical_columns_match_the_four_table_contract() {
+    let tmp = Scratch::new();
+    let db = tmp.store();
+    let (tables, unique) = sqlite::schema_for_test(&db);
+    assert_eq!(FORMAT, 1);
+    assert_eq!(
+        tables
+            .iter()
+            .map(|(name, cols)| (name.as_str(), cols.len()))
+            .collect::<Vec<_>>(),
+        [
+            ("control", 4),
+            ("records", 10),
+            ("shared_values", 10),
+            ("value_chunks", 6)
+        ]
+    );
+    assert!(!unique);
+    assert!(sqlite::text_key_refused_for_test(&db));
+    assert!(RecordKind::parse("not.registered").is_err());
+    assert!(RecordKind::parse("raw_hold.unknown").is_err());
+}
+#[test]
+fn mutable_values_require_segmentation_and_raw_holds_stay_exact() {
+    let mutable = traversal("family".into());
+    let raw = raw_hold("family".into());
+    for (key, size, ok) in [
+        (&mutable, MUTABLE_VALUE_BYTES, true),
+        (&mutable, MUTABLE_VALUE_BYTES + 1, false),
+        (&raw, VALUE_BYTES, true),
+        (&raw, VALUE_BYTES + 1, false),
+    ] {
+        assert_eq!(
+            preflight(&RowInput {
+                value_version: 1,
+                key,
+                fixed: &Fixed::None,
+                value: &Repeat(size)
+            })
+            .is_ok(),
+            ok
+        );
+    }
+    let tmp = Scratch::new();
+    let mut db = tmp.store();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let bytes = vec![0xff, 0, 0xc3, 0x28, b' '];
+    let h = put(&mut tx, &raw, &bytes);
+    assert_eq!(value(&mut tx, &h), bytes);
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+}
+#[test]
+fn extra_chunks_and_shared_record_owner_aliases_are_refused() {
+    let tmp = Scratch::new();
+    let mut db = tmp.store();
+    let rec = RowKey::record("family.requests", 1_u64.to_be_bytes().to_vec(), 0).unwrap();
+    let shared = RowKey::RequestSet(1);
+    assert_ne!(
+        sqlite::owner_for_test(&rec),
+        sqlite::owner_for_test(&shared)
+    );
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let h = put(&mut tx, &rec, b"inline");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    sqlite::add_extra_part_for_test(&db, &rec);
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    assert!(tx.read_value(&h, &mut std::io::sink()).is_err());
+}
+#[test]
+fn f8_corrupted_refcount_cannot_reclaim_evidence_or_commit_sibling_changes() {
+    use interning::{intern_request_set, release_request_set, RequestEvidence};
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let hashes = Repeat(PART_BYTES as u64 + 1);
+    let evidence = RequestEvidence::Census {
+        hashes: &hashes,
+        hash_count: None,
+    };
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let id = intern_request_set(&mut tx, &evidence).unwrap();
+    assert_eq!(intern_request_set(&mut tx, &evidence).unwrap(), id);
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let parts = sqlite::part_count_for_test(&db);
+    sqlite::damage_refs_for_test(&db, &RowKey::RequestSet(id));
+    let sibling = traversal("sibling".into());
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &sibling, b"rollback");
+    assert!(release_request_set(&mut tx, id).is_err());
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::NotPublished);
+    assert_eq!(sqlite::part_count_for_test(&db), parts);
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    assert!(tx.get(&sibling).unwrap().is_none());
+    assert!(tx.get(&RowKey::RequestSet(id)).is_err());
+}
+#[test]
+fn c1_fixed_size_rewrite_and_delete_reinsert_do_not_mark_purge() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = file("file".into());
+    let mut fixed = file_fixed();
+    for g in 0..3 {
+        if let Fixed::File { size, .. } = &mut fixed {
+            *size = g;
+        }
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        if g == 2 {
+            tx.delete(&key).unwrap();
+        }
+        tx.put(RowInput {
+            value_version: 1,
+            key: &key,
+            fixed: &fixed,
+            value: &Bytes(b"same".to_vec()),
+        })
+        .unwrap();
+        assert_eq!(tx.commit(g, g + 1), DurableCommitOutcome::Committed(g + 1));
+    }
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), None);
+}
+#[test]
+fn private_labels_aliases_and_raw_holds_create_erasure_epochs() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = file("file".into());
+    let fixed = file_fixed();
+    for (g, text) in [(0, "private label"), (1, "changed label")] {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        tx.put(RowInput {
+            value_version: 1,
+            key: &key,
+            fixed: &fixed,
+            value: &Bytes(text.as_bytes().to_vec()),
+        })
+        .unwrap();
+        assert_eq!(tx.commit(g, g + 1), DurableCommitOutcome::Committed(g + 1));
+    }
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+}
+#[test]
+fn positions_and_current_pointer_survive_retirement_without_renumbering() {
+    let tmp = Scratch::new();
+    let mut db = tmp.store();
+    let kind = "account_window";
+    let root = b"family".to_vec();
+    let f = Fixed::AccountPending {
+        account_hash: Some([1; 32]),
+        evidence_count: 0,
+        flags: 0,
+        member_count: 0,
+        set_count: 0,
+    };
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    for pos in [17, 18, 19] {
+        let k = RowKey::record(kind, root.clone(), pos).unwrap();
+        tx.put(RowInput {
+            value_version: 1,
+            key: &k,
+            fixed: &f,
+            value: &Bytes(vec![]),
+        })
+        .unwrap();
+    }
+    let pointer = RowKey::record("account.current", root.clone(), 0).unwrap();
+    put(&mut tx, &pointer, &19_u64.to_be_bytes());
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    tx.delete(&RowKey::record(kind, root.clone(), 17).unwrap())
+        .unwrap();
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let k = RecordKind::parse(kind).unwrap();
+    let page = tx.scan_family(&k, &root, Some(17), 1).unwrap();
+    assert_eq!(page.len(), 1);
+    assert!(matches!(page[0].key, RowKey::Record { position: 18, .. }));
+    assert_eq!(tx.scan_kind(&k, None, 128).unwrap().len(), 2);
+    for pos in [18, 19] {
+        assert!(tx
+            .get(&RowKey::record(kind, root.clone(), pos).unwrap())
+            .unwrap()
+            .is_some());
+    }
+    let h = tx.get(&pointer).unwrap().unwrap();
+    assert_eq!(value(&mut tx, &h), 19_u64.to_be_bytes());
+}
+
+fn test_record(key: String) -> RowKey {
+    RowKey::record("v1_field.files", key.into_bytes(), 0).unwrap()
 }

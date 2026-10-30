@@ -1,15 +1,52 @@
--- Revision 1: immutable after shipment. Append a migration; never edit this file.
-CREATE TABLE meta(name TEXT NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=16),len INTEGER NOT NULL CHECK(len BETWEEN 0 AND 67108864),parts INTEGER NOT NULL CHECK(parts BETWEEN 0 AND 256),inline BLOB,CHECK((parts=0 AND len<=512 AND inline IS NOT NULL AND length(inline)=len) OR (parts>0 AND len>512 AND inline IS NULL AND parts=(len+262143)/262144)),PRIMARY KEY(name)) WITHOUT ROWID;
-CREATE TABLE files(key TEXT NOT NULL,size BLOB NOT NULL CHECK(length(size)=8),mtime_s BLOB NOT NULL CHECK(length(mtime_s)=8),mtime_ns BLOB CHECK(mtime_ns IS NULL OR length(mtime_ns)=8),ctime_ns BLOB NOT NULL CHECK(length(ctime_ns)=8),birth_ns BLOB NOT NULL CHECK(length(birth_ns)=8),witness_rev BLOB NOT NULL CHECK(length(witness_rev)=8),flags INTEGER NOT NULL,source_fp BLOB NOT NULL,last_snapshot_fp BLOB,body_witness BLOB,scan_identity TEXT,digest BLOB NOT NULL CHECK(length(digest)=16),len INTEGER NOT NULL CHECK(len BETWEEN 0 AND 67108864),parts INTEGER NOT NULL CHECK(parts BETWEEN 0 AND 256),inline BLOB,CHECK((parts=0 AND len<=512 AND inline IS NOT NULL AND length(inline)=len) OR (parts>0 AND len>512 AND inline IS NULL AND parts=(len+262143)/262144)),PRIMARY KEY(key)) WITHOUT ROWID;
-CREATE TABLE family_requests(root TEXT NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=16),len INTEGER NOT NULL CHECK(len BETWEEN 0 AND 67108864),parts INTEGER NOT NULL CHECK(parts BETWEEN 0 AND 256),inline BLOB,CHECK((parts=0 AND len<=512 AND inline IS NOT NULL AND length(inline)=len) OR (parts>0 AND len>512 AND inline IS NULL AND parts=(len+262143)/262144)),PRIMARY KEY(root)) WITHOUT ROWID;
-CREATE TABLE request_sets(set_id INTEGER NOT NULL,commitment BLOB NOT NULL,hash_count INTEGER,refs INTEGER NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=16),len INTEGER NOT NULL CHECK(len BETWEEN 0 AND 67108864),parts INTEGER NOT NULL CHECK(parts BETWEEN 0 AND 256),inline BLOB,CHECK((parts=0 AND len<=512 AND inline IS NOT NULL AND length(inline)=len) OR (parts>0 AND len>512 AND inline IS NULL AND parts=(len+262143)/262144)),PRIMARY KEY(set_id)) WITHOUT ROWID;
-CREATE TABLE census(key TEXT NOT NULL,fp BLOB NOT NULL,derivation INTEGER NOT NULL,window BLOB NOT NULL CHECK(length(window)=8),shape INTEGER NOT NULL,flags INTEGER NOT NULL,set_id INTEGER,retired BLOB CHECK(retired IS NULL OR length(retired)=8),old_path_requests BLOB CHECK(old_path_requests IS NULL OR length(old_path_requests)=8),old_path_tokens BLOB CHECK(old_path_tokens IS NULL OR length(old_path_tokens)=8),modified BLOB CHECK(modified IS NULL OR length(modified)=8),birth BLOB CHECK(birth IS NULL OR length(birth)=24),digest BLOB NOT NULL CHECK(length(digest)=16),PRIMARY KEY(key)) WITHOUT ROWID;
-CREATE TABLE account_pending(root TEXT NOT NULL,window_no INTEGER NOT NULL,version_ord INTEGER NOT NULL,window_end TEXT NOT NULL,account_hash BLOB NOT NULL,evidence_count BLOB NOT NULL CHECK(length(evidence_count)=16),flags INTEGER NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=16),len INTEGER NOT NULL CHECK(len BETWEEN 0 AND 67108864),parts INTEGER NOT NULL CHECK(parts BETWEEN 0 AND 256),inline BLOB,CHECK((parts=0 AND len<=512 AND inline IS NOT NULL AND length(inline)=len) OR (parts>0 AND len>512 AND inline IS NULL AND parts=(len+262143)/262144)),PRIMARY KEY(root,window_no)) WITHOUT ROWID;
-CREATE TABLE usage_pending(root TEXT NOT NULL,window_end TEXT NOT NULL,flags INTEGER NOT NULL,idless_revision BLOB,digest BLOB NOT NULL CHECK(length(digest)=16),len INTEGER NOT NULL CHECK(len BETWEEN 0 AND 67108864),parts INTEGER NOT NULL CHECK(parts BETWEEN 0 AND 256),inline BLOB,CHECK((parts=0 AND len<=512 AND inline IS NOT NULL AND length(inline)=len) OR (parts>0 AND len>512 AND inline IS NULL AND parts=(len+262143)/262144)),PRIMARY KEY(root)) WITHOUT ROWID;
-CREATE TABLE witnesses(kind INTEGER NOT NULL,key TEXT NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=16),len INTEGER NOT NULL CHECK(len BETWEEN 0 AND 67108864),parts INTEGER NOT NULL CHECK(parts BETWEEN 0 AND 256),inline BLOB,CHECK((parts=0 AND len<=512 AND inline IS NOT NULL AND length(inline)=len) OR (parts>0 AND len>512 AND inline IS NULL AND parts=(len+262143)/262144)),PRIMARY KEY(kind,key)) WITHOUT ROWID;
-CREATE TABLE accepted(kind INTEGER NOT NULL,key BLOB NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=16),len INTEGER NOT NULL CHECK(len BETWEEN 0 AND 67108864),parts INTEGER NOT NULL CHECK(parts BETWEEN 0 AND 256),inline BLOB,CHECK((parts=0 AND len<=512 AND inline IS NOT NULL AND length(inline)=len) OR (parts>0 AND len>512 AND inline IS NULL AND parts=(len+262143)/262144)),PRIMARY KEY(kind,key)) WITHOUT ROWID;
-CREATE TABLE quarantine(kind INTEGER NOT NULL,key TEXT NOT NULL,claims INTEGER,digest BLOB NOT NULL CHECK(length(digest)=16),len INTEGER NOT NULL CHECK(len BETWEEN 0 AND 67108864),parts INTEGER NOT NULL CHECK(parts BETWEEN 0 AND 256),inline BLOB,CHECK((parts=0 AND len<=512 AND inline IS NOT NULL AND length(inline)=len) OR (parts>0 AND len>512 AND inline IS NULL AND parts=(len+262143)/262144)),PRIMARY KEY(kind,key)) WITHOUT ROWID;
-CREATE TABLE holds(kind INTEGER NOT NULL,field TEXT NOT NULL,key TEXT NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=16),len INTEGER NOT NULL CHECK(len BETWEEN 0 AND 67108864),parts INTEGER NOT NULL CHECK(parts BETWEEN 0 AND 256),inline BLOB,CHECK((parts=0 AND len<=512 AND inline IS NOT NULL AND length(inline)=len) OR (parts>0 AND len>512 AND inline IS NULL AND parts=(len+262143)/262144)),PRIMARY KEY(kind,field,key)) WITHOUT ROWID;
-CREATE TABLE traversal(name TEXT NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=16),len INTEGER NOT NULL CHECK(len BETWEEN 0 AND 67108864),parts INTEGER NOT NULL CHECK(parts BETWEEN 0 AND 256),inline BLOB,CHECK((parts=0 AND len<=512 AND inline IS NOT NULL AND length(inline)=len) OR (parts>0 AND len>512 AND inline IS NULL AND parts=(len+262143)/262144)),PRIMARY KEY(name)) WITHOUT ROWID;
-CREATE TABLE interned(kind INTEGER NOT NULL,ordinal INTEGER NOT NULL,refs INTEGER NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=16),len INTEGER NOT NULL CHECK(len BETWEEN 0 AND 67108864),parts INTEGER NOT NULL CHECK(parts BETWEEN 0 AND 256),inline BLOB,CHECK((parts=0 AND len<=512 AND inline IS NOT NULL AND length(inline)=len) OR (parts>0 AND len>512 AND inline IS NULL AND parts=(len+262143)/262144)),PRIMARY KEY(kind,ordinal)) WITHOUT ROWID;
-CREATE INDEX request_sets_commitment ON request_sets(commitment); CREATE TABLE blob_parts(owner INTEGER NOT NULL,key BLOB NOT NULL,part INTEGER NOT NULL CHECK(part BETWEEN 0 AND 255),bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 262144),UNIQUE(owner,key,part));
+-- Revision 1 has not shipped. After shipment this file is immutable.
+-- Q-control: directly readable, bounded bootstrap values with their own checksum.
+CREATE TABLE control (
+ name TEXT NOT NULL CHECK(length(CAST(name AS BLOB))<=4096),
+ value_version INTEGER NOT NULL CHECK(value_version BETWEEN 1 AND 4294967295),
+ value BLOB NOT NULL CHECK(length(value)<=16384),
+ row_checksum BLOB NOT NULL CHECK(length(row_checksum)=16),
+ PRIMARY KEY(name)
+) STRICT, WITHOUT ROWID;
+-- Q-record/Q-kind/Q-family. All key bytes are exact; position is monotonic.
+CREATE TABLE records (
+ kind TEXT NOT NULL CHECK(length(kind) BETWEEN 1 AND 255),
+ key_bytes BLOB NOT NULL CHECK(length(key_bytes)<=4096),
+ position INTEGER NOT NULL CHECK(position>=0),
+ value_version INTEGER NOT NULL CHECK(value_version BETWEEN 1 AND 4294967295),
+ header BLOB CHECK(header IS NULL OR length(header)<=512),
+ value_digest BLOB NOT NULL CHECK(length(value_digest)=16),
+ row_checksum BLOB NOT NULL CHECK(length(row_checksum)=16),
+ value_bytes INTEGER NOT NULL CHECK(value_bytes BETWEEN 0 AND 67108864),
+ chunk_count INTEGER NOT NULL CHECK(chunk_count BETWEEN 0 AND 256),
+ inline_value BLOB,
+ CHECK((chunk_count=0 AND value_bytes<=512 AND inline_value IS NOT NULL AND length(inline_value)=value_bytes)
+    OR (chunk_count>0 AND value_bytes>512 AND inline_value IS NULL AND chunk_count=(value_bytes+262143)/262144)),
+ PRIMARY KEY(kind,key_bytes,position)
+) STRICT, WITHOUT ROWID;
+-- Q-shared and Q-reuse. Hash collisions coexist; reuse compares full evidence.
+CREATE TABLE shared_values (
+ class TEXT NOT NULL CHECK(class='request_hash_set'),
+ id INTEGER NOT NULL CHECK(id>0),
+ lookup_hash BLOB NOT NULL CHECK(length(lookup_hash)=32),
+ ref_count INTEGER NOT NULL CHECK(ref_count>0),
+ value_version INTEGER NOT NULL CHECK(value_version BETWEEN 1 AND 4294967295),
+ value_digest BLOB NOT NULL CHECK(length(value_digest)=16),
+ row_checksum BLOB NOT NULL CHECK(length(row_checksum)=16),
+ value_bytes INTEGER NOT NULL CHECK(value_bytes BETWEEN 0 AND 67108864),
+ chunk_count INTEGER NOT NULL CHECK(chunk_count BETWEEN 0 AND 256),
+ inline_value BLOB,
+ CHECK((chunk_count=0 AND value_bytes<=512 AND inline_value IS NOT NULL AND length(inline_value)=value_bytes)
+    OR (chunk_count>0 AND value_bytes>512 AND inline_value IS NULL AND chunk_count=(value_bytes+262143)/262144)),
+ PRIMARY KEY(class,id)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX shared_values_lookup ON shared_values(class,lookup_hash);
+-- Q-chunks: disjoint table namespace and complete parent primary key.
+CREATE TABLE value_chunks (
+ owner_table TEXT NOT NULL CHECK(owner_table IN ('records','shared_values')),
+ owner_kind TEXT NOT NULL CHECK(length(owner_kind) BETWEEN 1 AND 255),
+ owner_key BLOB NOT NULL CHECK(length(owner_key)<=4096),
+ position INTEGER NOT NULL CHECK(position>=0),
+ chunk_no INTEGER NOT NULL CHECK(chunk_no BETWEEN 0 AND 255),
+ chunk BLOB NOT NULL CHECK(length(chunk) BETWEEN 1 AND 262144),
+ PRIMARY KEY(owner_table,owner_kind,owner_key,position,chunk_no)
+) STRICT, WITHOUT ROWID;

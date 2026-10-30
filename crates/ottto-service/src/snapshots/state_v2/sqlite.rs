@@ -23,448 +23,154 @@ const PAGE_HEADERS: usize = 128;
 impl Table {
     fn name(self) -> &'static str {
         match self {
-            Self::Meta => "meta",
-            Self::Files => "files",
-            Self::FamilyRequests => "family_requests",
-            Self::RequestSets => "request_sets",
-            Self::Census => "census",
-            Self::AccountPending => "account_pending",
-            Self::UsagePending => "usage_pending",
-            Self::Witnesses => "witnesses",
-            Self::Accepted => "accepted",
-            Self::Quarantine => "quarantine",
-            Self::Holds => "holds",
-            Self::Traversal => "traversal",
-            Self::Interned => "interned",
+            Self::Meta => "control",
+            Self::Records => "records",
+            Self::RequestSets => "shared_values",
         }
     }
     fn keys(self) -> &'static [&'static str] {
         match self {
             Self::Meta => &["name"],
-            Self::Files => &["key"],
-            Self::FamilyRequests => &["root"],
-            Self::RequestSets => &["set_id"],
-            Self::Census => &["key"],
-            Self::AccountPending => &["root", "window_no"],
-            Self::UsagePending => &["root"],
-            Self::Witnesses => &["kind", "key"],
-            Self::Accepted => &["kind", "key"],
-            Self::Quarantine => &["kind", "key"],
-            Self::Holds => &["kind", "field", "key"],
-            Self::Traversal => &["name"],
-            Self::Interned => &["kind", "ordinal"],
-        }
-    }
-    fn value_columns(self) -> &'static [&'static str] {
-        if self == Self::Census {
-            &["digest"]
-        } else {
-            &["digest", "len", "parts", "inline"]
-        }
-    }
-    fn fixed_columns(self) -> &'static [&'static str] {
-        match self {
-            Self::Meta => &[],
-            Self::Files => &[
-                "size",
-                "mtime_s",
-                "mtime_ns",
-                "ctime_ns",
-                "birth_ns",
-                "witness_rev",
-                "flags",
-                "source_fp",
-                "last_snapshot_fp",
-                "body_witness",
-                "scan_identity",
-            ],
-            Self::FamilyRequests => &[],
-            Self::RequestSets => &["commitment", "hash_count", "refs"],
-            Self::Census => &[
-                "fp",
-                "derivation",
-                "window",
-                "shape",
-                "flags",
-                "set_id",
-                "retired",
-                "old_path_requests",
-                "old_path_tokens",
-                "modified",
-                "birth",
-            ],
-            Self::AccountPending => &[
-                "version_ord",
-                "window_end",
-                "account_hash",
-                "evidence_count",
-                "flags",
-            ],
-            Self::UsagePending => &["window_end", "flags", "idless_revision"],
-            Self::Witnesses => &[],
-            Self::Accepted => &[],
-            Self::Quarantine => &["claims"],
-            Self::Holds => &[],
-            Self::Traversal => &[],
-            Self::Interned => &["refs"],
+            Self::Records => &["kind", "key_bytes", "position"],
+            Self::RequestSets => &["class", "id"],
         }
     }
 }
-
 fn schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(include_str!("sqlite/migrations/revision_1.sql"))?;
     Ok(())
 }
-
-fn fixed_values(table: Table, fixed: &Fixed) -> Result<Vec<SqlValue>> {
-    use rusqlite::types::ToSqlOutput;
-    fn sql<T: rusqlite::ToSql>(v: &T) -> Result<SqlValue> {
-        Ok(match v.to_sql()? {
-            ToSqlOutput::Owned(v) => v,
-            ToSqlOutput::Borrowed(v) => SqlValue::try_from(v)?,
-            _ => bail!("state_v2_sql_type"),
-        })
-    }
-    Ok(match (table, fixed) {
-        (Table::Meta, Fixed::None) => vec![],
-        (
-            Table::Files,
-            Fixed::File {
-                size,
-                mtime_s,
-                mtime_ns,
-                ctime_ns,
-                birth_ns,
-                witness_rev,
-                flags,
-                source_fp,
-                last_snapshot_fp,
-                body_witness,
-                scan_identity,
-            },
-        ) => vec![
-            unsigned(*size),
-            unsigned(*mtime_s),
-            optional_unsigned(*mtime_ns),
-            unsigned(*ctime_ns),
-            unsigned(*birth_ns),
-            unsigned(*witness_rev),
-            sql(flags)?,
-            SqlValue::Blob(packed::hash_string(source_fp)?),
-            optional_hash(last_snapshot_fp)?,
-            optional_hash(body_witness)?,
-            sql(scan_identity)?,
-        ],
-        (Table::FamilyRequests, Fixed::None) => vec![],
-        (
-            Table::RequestSets,
-            Fixed::RequestSet {
-                commitment,
-                hash_count,
-                refs,
-            },
-        ) => vec![sql(commitment)?, sql(hash_count)?, sql(refs)?],
-        (
-            Table::Census,
-            Fixed::Census {
-                fp,
-                derivation,
-                window,
-                shape,
-                flags,
-                set_id,
-                retired,
-                old_path_requests,
-                old_path_tokens,
-                modified,
-                birth,
-            },
-        ) => vec![
-            sql(fp)?,
-            sql(derivation)?,
-            unsigned(*window),
-            sql(shape)?,
-            sql(flags)?,
-            sql(set_id)?,
-            optional_unsigned(*retired),
-            optional_unsigned(*old_path_requests),
-            optional_unsigned(*old_path_tokens),
-            optional_unsigned(*modified),
-            sql(birth)?,
-        ],
-        (
-            Table::AccountPending,
-            Fixed::AccountPending {
-                version_ord,
-                window_end,
-                account_hash,
-                evidence_count,
-                flags,
-            },
-        ) => vec![
-            sql(version_ord)?,
-            sql(window_end)?,
-            SqlValue::Blob(packed::hash_string(account_hash)?),
-            SqlValue::Blob(evidence_count.to_be_bytes().to_vec()),
-            sql(flags)?,
-        ],
-        (
-            Table::UsagePending,
-            Fixed::UsagePending {
-                window_end,
-                flags,
-                idless_revision,
-            },
-        ) => vec![sql(window_end)?, sql(flags)?, sql(idless_revision)?],
-        (Table::Witnesses, Fixed::None) => vec![],
-        (Table::Accepted, Fixed::None) => vec![],
-        (Table::Quarantine, Fixed::Quarantine { claims }) => vec![sql(claims)?],
-        (Table::Holds, Fixed::None) => vec![],
-        (Table::Traversal, Fixed::None) => vec![],
-        (Table::Interned, Fixed::Interned { refs }) => vec![sql(refs)?],
-        _ => bail!("state_v2_fixed_type"),
-    })
-}
-fn unsigned(n: u64) -> SqlValue {
-    SqlValue::Blob(n.to_be_bytes().to_vec())
-}
-fn optional_unsigned(n: Option<u64>) -> SqlValue {
-    n.map_or(SqlValue::Null, unsigned)
-}
-fn optional_hash(s: &Option<String>) -> Result<SqlValue> {
-    Ok(s.as_deref()
-        .map(packed::hash_string)
-        .transpose()?
-        .map_or(SqlValue::Null, SqlValue::Blob))
-}
-fn unsigned_cell<const N: usize>(row: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<[u8; N]> {
-    row.get_ref(i)?
-        .as_blob()?
-        .try_into()
-        .map_err(|_| rusqlite::Error::InvalidQuery)
-}
-fn read_unsigned(row: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<u64> {
-    Ok(u64::from_be_bytes(unsigned_cell(row, i)?))
-}
-fn read_optional_unsigned(row: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<Option<u64>> {
-    if row.get_ref(i)?.data_type() == rusqlite::types::Type::Null {
-        Ok(None)
-    } else {
-        Ok(Some(read_unsigned(row, i)?))
-    }
-}
-fn read_hash(row: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<String> {
-    packed::read_hash_string(row.get_ref(i)?.as_blob()?).map_err(|_| rusqlite::Error::InvalidQuery)
-}
-fn read_optional_hash(row: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<Option<String>> {
-    if row.get_ref(i)?.data_type() == rusqlite::types::Type::Null {
-        Ok(None)
-    } else {
-        Ok(Some(read_hash(row, i)?))
-    }
-}
-fn read_fixed(table: Table, row: &rusqlite::Row<'_>, start: usize) -> rusqlite::Result<Fixed> {
-    Ok(match table {
-        Table::Meta => Fixed::None,
-        Table::Files => Fixed::File {
-            size: read_unsigned(row, start)?,
-            mtime_s: read_unsigned(row, start + 1)?,
-            mtime_ns: read_optional_unsigned(row, start + 2)?,
-            ctime_ns: read_unsigned(row, start + 3)?,
-            birth_ns: read_unsigned(row, start + 4)?,
-            witness_rev: read_unsigned(row, start + 5)?,
-            flags: row.get(start + 6)?,
-            source_fp: read_hash(row, start + 7)?,
-            last_snapshot_fp: read_optional_hash(row, start + 8)?,
-            body_witness: read_optional_hash(row, start + 9)?,
-            scan_identity: row.get(start + 10)?,
-        },
-        Table::FamilyRequests => Fixed::None,
-        Table::RequestSets => Fixed::RequestSet {
-            commitment: row.get(start)?,
-            hash_count: row.get(start + 1)?,
-            refs: row.get(start + 2)?,
-        },
-        Table::Census => Fixed::Census {
-            fp: row.get(start)?,
-            derivation: row.get(start + 1)?,
-            window: read_unsigned(row, start + 2)?,
-            shape: row.get(start + 3)?,
-            flags: row.get(start + 4)?,
-            set_id: row.get(start + 5)?,
-            retired: read_optional_unsigned(row, start + 6)?,
-            old_path_requests: read_optional_unsigned(row, start + 7)?,
-            old_path_tokens: read_optional_unsigned(row, start + 8)?,
-            modified: read_optional_unsigned(row, start + 9)?,
-            birth: row.get(start + 10)?,
-        },
-        Table::AccountPending => Fixed::AccountPending {
-            version_ord: row.get(start)?,
-            window_end: row.get(start + 1)?,
-            account_hash: read_hash(row, start + 2)?,
-            evidence_count: u128::from_be_bytes(unsigned_cell(row, start + 3)?),
-            flags: row.get(start + 4)?,
-        },
-        Table::UsagePending => Fixed::UsagePending {
-            window_end: row.get(start)?,
-            flags: row.get(start + 1)?,
-            idless_revision: row.get(start + 2)?,
-        },
-        Table::Witnesses => Fixed::None,
-        Table::Accepted => Fixed::None,
-        Table::Quarantine => Fixed::Quarantine {
-            claims: row.get(start)?,
-        },
-        Table::Holds => Fixed::None,
-        Table::Traversal => Fixed::None,
-        Table::Interned => Fixed::Interned {
-            refs: row.get(start)?,
-        },
-    })
-}
-
 impl RowKey {
     fn table(&self) -> Table {
         match self {
             Self::Meta(_) => Table::Meta,
-            Self::File(_) => Table::Files,
-            Self::FamilyRequests(_) => Table::FamilyRequests,
+            Self::Record { .. } => Table::Records,
             Self::RequestSet(_) => Table::RequestSets,
-            Self::Census(_) => Table::Census,
-            Self::AccountPending { .. } => Table::AccountPending,
-            Self::UsagePending(_) => Table::UsagePending,
-            Self::Witness { .. } => Table::Witnesses,
-            Self::Accepted { .. } => Table::Accepted,
-            Self::Quarantine { .. } => Table::Quarantine,
-            Self::Hold { .. } => Table::Holds,
-            Self::Traversal(_) => Table::Traversal,
-            Self::Interned { .. } => Table::Interned,
         }
     }
     fn values(&self) -> Result<Vec<SqlValue>> {
-        let text = |s: &String| SqlValue::Text(s.clone());
-        let number = |n: u64| -> Result<SqlValue> {
+        let number = |n| -> Result<SqlValue> {
             Ok(SqlValue::Integer(
                 i64::try_from(n).context("state_v2_number_admission")?,
             ))
         };
         Ok(match self {
-            Self::Meta(s)
-            | Self::File(s)
-            | Self::FamilyRequests(s)
-            | Self::Census(s)
-            | Self::UsagePending(s)
-            | Self::Traversal(s) => vec![text(s)],
-            Self::RequestSet(n) => vec![number(*n)?],
-            Self::AccountPending { root, window } => vec![text(root), number(*window)?],
-            Self::Witness { kind, key } | Self::Quarantine { kind, key } => {
-                vec![number(*kind as u64)?, text(key)]
-            }
-            Self::Accepted { kind, key } => {
-                vec![number(*kind as u64)?, SqlValue::Blob(key.clone())]
-            }
-            Self::Hold { kind, field, key } => vec![number(*kind as u64)?, text(field), text(key)],
-            Self::Interned { kind, ordinal } => vec![number(*kind as u64)?, number(*ordinal)?],
+            Self::Meta(name) => vec![SqlValue::Text(name.clone())],
+            Self::Record {
+                kind,
+                key_bytes,
+                position,
+            } => vec![
+                SqlValue::Text(kind.name().into()),
+                SqlValue::Blob(key_bytes.clone()),
+                number(*position)?,
+            ],
+            Self::RequestSet(id) => vec![SqlValue::Text("request_hash_set".into()), number(*id)?],
         })
     }
 }
-fn read_key(table: Table, row: &rusqlite::Row<'_>) -> rusqlite::Result<RowKey> {
-    Ok(match table {
-        Table::Meta => RowKey::Meta(row.get(0)?),
-        Table::Files => RowKey::File(row.get(0)?),
-        Table::FamilyRequests => RowKey::FamilyRequests(row.get(0)?),
-        Table::RequestSets => RowKey::RequestSet(row.get(0)?),
-        Table::Census => RowKey::Census(row.get(0)?),
-        Table::AccountPending => RowKey::AccountPending {
-            root: row.get(0)?,
-            window: row.get(1)?,
-        },
-        Table::UsagePending => RowKey::UsagePending(row.get(0)?),
-        Table::Witnesses => RowKey::Witness {
-            kind: row.get(0)?,
-            key: row.get(1)?,
-        },
-        Table::Accepted => RowKey::Accepted {
-            kind: row.get(0)?,
-            key: row.get(1)?,
-        },
-        Table::Quarantine => RowKey::Quarantine {
-            kind: row.get(0)?,
-            key: row.get(1)?,
-        },
-        Table::Holds => RowKey::Hold {
-            kind: row.get(0)?,
-            field: row.get(1)?,
-            key: row.get(2)?,
-        },
-        Table::Traversal => RowKey::Traversal(row.get(0)?),
-        Table::Interned => RowKey::Interned {
-            kind: row.get(0)?,
-            ordinal: row.get(1)?,
-        },
-    })
+fn projection(table: Table) -> &'static str {
+    match table {
+        Table::Meta=>"name,value_version,value,row_checksum",
+        Table::Records=>"kind,key_bytes,position,value_version,header,value_digest,row_checksum,value_bytes,chunk_count",
+        Table::RequestSets=>"class,id,lookup_hash,ref_count,value_version,value_digest,row_checksum,value_bytes,chunk_count",
+    }
 }
-fn projection(table: Table) -> String {
-    table
-        .keys()
-        .iter()
-        .chain(table.fixed_columns())
-        .copied()
-        .chain(
-            table
-                .value_columns()
-                .iter()
-                .copied()
-                .filter(|c| *c != "inline"),
-        )
-        .collect::<Vec<_>>()
-        .join(",")
+fn control_header(name: String, version: u32, value: &[u8], checksum: [u8; 16]) -> Result<Header> {
+    ensure!(
+        name.len() <= KEY_BYTES
+            && value.len() as u64 <= CONTROL_BYTES
+            && control_checksum(&name, version, value) == checksum,
+        "state_v2_control_checksum"
+    );
+    ensure!(
+        version == 1 && control_name(&name),
+        "scan_index_representation_refused"
+    );
+    let mut digest = value_digest_start(version);
+    digest.update(value);
+    Ok(Header {
+        key: RowKey::Meta(name),
+        fixed: Fixed::None,
+        value_version: version,
+        digest: integrity(digest),
+        row_checksum: checksum,
+        len: value.len() as u64,
+        parts: 0,
+    })
 }
 fn header(table: Table, row: &rusqlite::Row<'_>) -> rusqlite::Result<Header> {
-    // Inspect SQLite's borrowed cells BEFORE any Vec/String conversion. The
-    // encoded header admission below then applies the same write-side limit.
-    let start = table.keys().len();
-    let at = start + table.fixed_columns().len();
-    let mut key_bytes = 0_usize;
-    let mut fixed_bytes = 0_usize;
-    for i in 0..at {
-        let len = match row.get_ref(i)? {
-            rusqlite::types::ValueRef::Blob(b) | rusqlite::types::ValueRef::Text(b) => b.len(),
-            _ => 8,
-        };
-        let (total, cap) = if i < start {
-            (&mut key_bytes, 16 * 1024)
-        } else {
-            (&mut fixed_bytes, 32 * 1024)
-        };
-        if len > KEY_BYTES + 1 {
-            return Err(rusqlite::Error::InvalidQuery);
+    fn convert(table: Table, row: &rusqlite::Row<'_>) -> Result<Header> {
+        fn bounded<'a>(row: &'a rusqlite::Row<'_>, at: usize, cap: usize) -> Result<&'a [u8]> {
+            let b = row.get_ref(at)?.as_blob()?;
+            ensure!(b.len() <= cap, "state_v2_header_admission");
+            Ok(b)
         }
-        *total = total
-            .checked_add(len)
-            .filter(|n| *n <= cap)
-            .ok_or(rusqlite::Error::InvalidQuery)?;
+        fn text(row: &rusqlite::Row<'_>, at: usize, cap: usize) -> Result<String> {
+            let b = row.get_ref(at)?.as_str()?;
+            ensure!(b.len() <= cap, "state_v2_key_admission");
+            Ok(b.to_owned())
+        }
+        if table == Table::Meta {
+            let name = text(row, 0, KEY_BYTES)?;
+            let v = row.get(1)?;
+            let bytes = bounded(row, 2, CONTROL_BYTES as usize)?;
+            return control_header(name, v, bytes, row.get(3)?);
+        }
+        let key = if table == Table::Records {
+            RowKey::record(
+                &text(row, 0, 255)?,
+                bounded(row, 1, KEY_BYTES)?.to_vec(),
+                row.get(2)?,
+            )?
+        } else {
+            ensure!(
+                text(row, 0, 255)? == "request_hash_set",
+                "scan_index_representation_refused"
+            );
+            RowKey::RequestSet(row.get(1)?)
+        };
+        let version: u32 = row.get(if table == Table::Records { 3 } else { 4 })?;
+        ensure!(version == 1, "scan_index_representation_refused");
+        let shared = if table == Table::RequestSets {
+            Some((row.get(2)?, row.get(3)?))
+        } else {
+            None
+        };
+        let bytes = if table == Table::Records
+            && row.get_ref(4)?.data_type() != rusqlite::types::Type::Null
+        {
+            Some(bounded(row, 4, HEADER_BYTES)?)
+        } else {
+            None
+        };
+        let h = Header {
+            key: key.clone(),
+            fixed: decode_projection(&key, bytes, shared)?,
+            value_version: version,
+            digest: row.get(5)?,
+            row_checksum: row.get(6)?,
+            len: row.get(7)?,
+            parts: row.get(8)?,
+        };
+        // Nothing may consume the decoded projection until this succeeds.
+        ensure!(row_checksum(&h)? == h.row_checksum, "state_v2_row_checksum");
+        admit_header(&h.key, &h.fixed)?;
+        ensure!(
+            h.len <= value_cap(&h.key)
+                && h.parts <= 256
+                && (h.parts == 0 && h.len <= INLINE_BYTES as u64
+                    || h.parts > 0
+                        && h.len > INLINE_BYTES as u64
+                        && u64::from(h.parts) == h.len.div_ceil(PART_BYTES as u64)),
+            "state_v2_value_shape"
+        );
+        Ok(h)
     }
-    let key = read_key(table, row)?;
-    let fixed = read_fixed(table, row, start)?;
-    admit_header(&key, &fixed).map_err(|_| rusqlite::Error::InvalidQuery)?;
-    Ok(Header {
-        key,
-        fixed,
-        digest: row.get(at)?,
-        len: if table == Table::Census {
-            0
-        } else {
-            row.get(at + 1)?
-        },
-        parts: if table == Table::Census {
-            0
-        } else {
-            row.get(at + 2)?
-        },
+    convert(table, row).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, error.into())
     })
 }
-
 fn predicate(table: Table) -> String {
     table
         .keys()
@@ -486,6 +192,97 @@ fn get(conn: &Connection, key: &RowKey) -> Result<Option<Header>> {
         .prepare_cached(&sql)?
         .query_row(params_from_iter(key.values()?), |r| header(table, r))
         .optional()?)
+}
+#[derive(Clone)]
+struct ChunkOwner {
+    table: &'static str,
+    kind: String,
+    key: Vec<u8>,
+    position: u64,
+}
+fn chunk_owner(key: &RowKey) -> Result<ChunkOwner> {
+    Ok(match key {
+        RowKey::Record {
+            kind,
+            key_bytes,
+            position,
+        } => ChunkOwner {
+            table: "records",
+            kind: kind.name().into(),
+            key: key_bytes.clone(),
+            position: *position,
+        },
+        RowKey::RequestSet(id) => ChunkOwner {
+            table: "shared_values",
+            kind: "request_hash_set".into(),
+            key: id.to_be_bytes().to_vec(),
+            position: 0,
+        },
+        RowKey::Meta(_) => bail!("state_v2_control_has_no_chunks"),
+    })
+}
+fn owner_key_bytes(key: &RowKey) -> Result<Vec<u8>> {
+    let mut b = Vec::new();
+    for v in key.values()? {
+        match v {
+            SqlValue::Text(s) => {
+                b.push(1);
+                b.extend_from_slice(&(s.len() as u64).to_be_bytes());
+                b.extend_from_slice(s.as_bytes());
+            }
+            SqlValue::Blob(v) => {
+                b.push(2);
+                b.extend_from_slice(&(v.len() as u64).to_be_bytes());
+                b.extend_from_slice(&v);
+            }
+            SqlValue::Integer(n) => {
+                b.push(3);
+                b.extend_from_slice(&n.to_be_bytes());
+            }
+            _ => bail!("state_v2_key_shape"),
+        }
+    }
+    Ok(b)
+}
+fn delete_chunks(conn: &Connection, key: &RowKey) -> Result<()> {
+    if !matches!(key, RowKey::Meta(_)) {
+        let o = chunk_owner(key)?;
+        conn.execute("DELETE FROM value_chunks WHERE owner_table=?1 AND owner_kind=?2 AND owner_key=?3 AND position=?4",params![o.table,o.kind,o.key,o.position])?;
+    }
+    Ok(())
+}
+fn read_piece(conn: &Connection, h: &Header, part: u64) -> Result<Vec<u8>> {
+    if h.parts == 0 {
+        let table = h.key.table();
+        let col = if table == Table::Meta {
+            "value"
+        } else {
+            "inline_value"
+        };
+        Ok(conn
+            .prepare_cached(&format!(
+                "SELECT {col} FROM {} WHERE {}",
+                table.name(),
+                predicate(table)
+            ))?
+            .query_row(params_from_iter(h.key.values()?), |r| {
+                let b = r.get_ref(0)?.as_blob()?;
+                if b.len()
+                    > if table == Table::Meta {
+                        CONTROL_BYTES as usize
+                    } else {
+                        INLINE_BYTES
+                    }
+                {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                Ok(b.to_vec())
+            })?)
+    } else {
+        let o = chunk_owner(&h.key)?;
+        Ok(conn.prepare_cached("SELECT chunk FROM value_chunks WHERE owner_table=?1 AND owner_kind=?2 AND owner_key=?3 AND position=?4 AND chunk_no=?5")?
+        .query_row(params![o.table,o.kind,o.key,o.position,part],|r|{let b=r.get_ref(0)?.as_blob()?;if b.len()>PART_BYTES{return Err(rusqlite::Error::InvalidQuery);}Ok(b.to_vec())})?)
+    }
 }
 
 pub(super) struct Sqlite {
@@ -597,7 +394,10 @@ fn sqlite_uri(path: &Path) -> Result<String> {
 fn settings(conn: &Connection, import: bool) -> Result<()> {
     // SQL exposes sqlite3_libversion/sourceid from the linked engine, not the
     // OS installation. Refuse an accidental older link before using the store.
-    ensure!(rusqlite::version_number() >= 3_051_003, "state_v2_sqlite_version");
+    ensure!(
+        rusqlite::version_number() >= 3_051_003,
+        "state_v2_sqlite_version"
+    );
     let engine: (String, String) =
         conn.query_row("SELECT sqlite_version(), sqlite_source_id()", [], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -667,7 +467,7 @@ impl Sqlite {
         settings(&conn, true)?;
         migrations::run(&conn)?;
         private_file(path)?;
-        Ok(Self {
+        let mut store = Self {
             conn: Some(conn),
             path: path.into(),
             import: true,
@@ -681,7 +481,10 @@ impl Sqlite {
             owner: file,
             clean: false,
             headers: None,
-        })
+        };
+        store.control("limits", &StorageLimits::current())?;
+        super::telemetry::event("schema_layout", &"four_tables");
+        Ok(store)
     }
     fn mark_dirty(&mut self) -> Result<()> {
         if self.clean {
@@ -738,16 +541,10 @@ impl Sqlite {
                     total_parts = total_parts
                         .checked_add(u64::from(header.parts))
                         .context("state_v2_part_count")?;
-                    // Fixed-only rows still authenticate the complete header.
-                    if table == Table::Census {
-                        read_value(self.conn()?, &header, &mut io::sink())?;
-                    }
-                    rows += u64::from(
-                        table != Table::Meta
-                            && table != Table::Interned
-                            && table != Table::RequestSets,
+                    rows += u64::from(table == Table::Records);
+                    files += u64::from(
+                        matches!(&header.key,RowKey::Record{kind,..} if kind.name()=="file.progress"),
                     );
-                    files += u64::from(table == Table::Files);
                     self.stats.max_value_bytes = self.stats.max_value_bytes.max(header.len);
                     headers.insert(header.key.clone(), header);
                 }
@@ -755,7 +552,7 @@ impl Sqlite {
         }
         let actual: u64 = self
             .conn()?
-            .query_row("SELECT count(*) FROM blob_parts", [], |r| r.get(0))?;
+            .query_row("SELECT count(*) FROM value_chunks", [], |r| r.get(0))?;
         ensure!(actual == total_parts, "state_v2_orphan_parts");
         self.stats.record_rows = rows;
         self.stats.file_rows = files;
@@ -814,10 +611,6 @@ impl Sqlite {
             identity.format == FORMAT,
             "scan_index_representation_refused"
         );
-        ensure!(
-            identity.binding.source == super::super::scan_index_persistence::Source::Claude,
-            "state_v2_non_claude_binding"
-        );
         private_file(path)?;
         for suffix in ["-wal", "-shm"] {
             let p = sidecar(path, suffix);
@@ -848,6 +641,12 @@ impl Sqlite {
         migrations::run(&conn)?;
         validate_schema(&conn)?;
         migrations::writer_supported(&conn)?;
+        ensure!(
+            read_json::<StorageLimits>(&conn, &RowKey::Meta("limits".into()))?
+                == Some(StorageLimits::current()),
+            "state_v2_limits"
+        );
+        super::telemetry::event("schema_layout", &"four_tables");
         let generation: u64 = read_json(&conn, &RowKey::Meta("generation".into()))?
             .ok_or_else(|| anyhow::anyhow!("state_v2_generation_missing"))?;
         ensure!(
@@ -919,9 +718,10 @@ impl Sqlite {
                 estimated_pages: 0,
             };
             tx.put(RowInput {
+                value_version: 1,
                 key: &RowKey::Meta(name.into()),
                 fixed: &Fixed::None,
-                value: &packed::Json(value),
+                value: &ControlJson(value),
             })?;
             tx.store.conn()?.execute_batch("COMMIT")?;
             tx.finished = true;
@@ -963,7 +763,7 @@ impl Sqlite {
                     break;
                 }
                 for h in &page {
-                    if let Fixed::RequestSet { refs, .. } | Fixed::Interned { refs } = &h.fixed {
+                    if let Fixed::RequestSet { refs, .. } = &h.fixed {
                         ensure!(
                             *refs > 0 && *refs <= i64::MAX as u64,
                             "state_v2_reference_count"
@@ -977,7 +777,7 @@ impl Sqlite {
                 after = page.last().map(|h| h.key.clone());
             }
         }
-        let actual: u64 = conn.query_row("SELECT count(*) FROM blob_parts", [], |r| r.get(0))?;
+        let actual: u64 = conn.query_row("SELECT count(*) FROM value_chunks", [], |r| r.get(0))?;
         ensure!(actual == total_parts, "state_v2_orphan_parts");
         Ok(())
     }
@@ -1116,52 +916,89 @@ fn scan(
     Ok(page)
 }
 
+fn scan_record_range(
+    conn: &Connection,
+    kind: &RecordKind,
+    key: Option<&[u8]>,
+    after: Option<&RowKey>,
+    limit: usize,
+) -> Result<Vec<Header>> {
+    ensure!(limit <= PAGE_HEADERS, "state_v2_header_page_admission");
+    let mut values = vec![SqlValue::Text(kind.name().into())];
+    let mut filter = String::from("kind=?1");
+    if let Some(key) = key {
+        ensure!(key.len() <= KEY_BYTES, "state_v2_key_admission");
+        values.push(SqlValue::Blob(key.to_vec()));
+        filter.push_str(" AND key_bytes=?2");
+    }
+    if let Some(after) = after {
+        let RowKey::Record {
+            kind: k,
+            key_bytes,
+            position,
+        } = after
+        else {
+            bail!("state_v2_prefix_key")
+        };
+        ensure!(
+            k == kind && key.map_or(true, |key| key == key_bytes) && key_bytes.len() <= KEY_BYTES,
+            "state_v2_prefix_key"
+        );
+        let n = values.len() + 1;
+        values.push(SqlValue::Blob(key_bytes.clone()));
+        values.push(SqlValue::Integer(i64::try_from(*position)?));
+        filter.push_str(&format!(" AND (key_bytes,position)>(?{n},?{})", n + 1));
+    }
+    values.push(SqlValue::Integer(limit as i64));
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM records WHERE {filter} ORDER BY key_bytes,position LIMIT ?{}",
+        projection(Table::Records),
+        values.len()
+    ))?;
+    let rows = stmt.query_map(params_from_iter(values), |r| header(Table::Records, r))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
 fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> {
-    ensure!(
-        h.len <= VALUE_BYTES && h.parts <= 256,
-        "state_v2_value_shape"
-    );
-    let mut hash = digest_start(&h.key, &h.fixed)?;
+    ensure!(h.len <= value_cap(&h.key), "state_v2_value_shape");
+    if let RowKey::Meta(name) = &h.key {
+        let bytes = read_piece(conn, h, 0)?;
+        ensure!(
+            control_checksum(name, h.value_version, &bytes) == h.row_checksum,
+            "state_v2_control_checksum"
+        );
+        out.write_all(&bytes)?;
+        return Ok(());
+    }
+    ensure!(row_checksum(h)? == h.row_checksum, "state_v2_row_checksum");
+    let mut hash = value_digest_start(h.value_version);
     let mut len = 0_u64;
     let mut consume = |bytes: &[u8]| -> Result<()> {
         len = len
             .checked_add(bytes.len() as u64)
             .filter(|n| *n <= h.len)
-            .ok_or_else(|| anyhow::anyhow!("state_v2_part_length"))?;
+            .context("state_v2_part_length")?;
         hash.update(bytes);
         out.write_all(bytes)?;
         Ok(())
     };
-    if h.key.table() == Table::Census {
-        ensure!(h.len == 0 && h.parts == 0, "state_v2_census_has_no_value");
-    } else if h.parts == 0 {
-        ensure!(h.len <= INLINE_BYTES as u64, "state_v2_inline_length");
-        let table = h.key.table();
-        let sql = format!(
-            "SELECT inline FROM {} WHERE {}",
-            table.name(),
-            predicate(table)
+    let o = chunk_owner(&h.key)?;
+    // Even inline owners must have zero external pieces. Count is bounded by
+    // the owner PK prefix; no whole-history integrity sweep is needed.
+    let mut stmt=conn.prepare_cached("SELECT chunk_no,chunk FROM value_chunks WHERE owner_table=?1 AND owner_kind=?2 AND owner_key=?3 AND position=?4 ORDER BY chunk_no")?;
+    let mut rows = stmt.query(params![o.table, o.kind, o.key, o.position])?;
+    if h.parts == 0 {
+        ensure!(
+            h.len <= INLINE_BYTES as u64 && rows.next()?.is_none(),
+            "state_v2_extra_parts"
         );
-        conn.query_row(&sql, params_from_iter(h.key.values()?), |r| {
-            let bytes = r.get_ref(0)?.as_blob()?;
-            if bytes.len() > INLINE_BYTES {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
-            Ok(bytes.to_vec())
-        })
-        .map_err(anyhow::Error::from)
-        .and_then(|bytes| consume(&bytes))?;
+        consume(&read_piece(conn, h, 0)?)?;
     } else {
         ensure!(
-            h.len > INLINE_BYTES as u64 && h.parts as u64 == h.len.div_ceil(PART_BYTES as u64),
+            h.parts <= 256
+                && h.len > INLINE_BYTES as u64
+                && u64::from(h.parts) == h.len.div_ceil(PART_BYTES as u64),
             "state_v2_part_shape"
         );
-        let owner = table_number(h.key.table());
-        let key_bytes = owner_key_bytes(&h.key)?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT part,bytes FROM blob_parts WHERE owner=?1 AND key=?2 ORDER BY part",
-        )?;
-        let mut rows = stmt.query(params![owner, key_bytes])?;
         let mut part = 0_u16;
         while let Some(row) = rows.next()? {
             let ordinal: u16 = row.get(0)?;
@@ -1181,45 +1018,9 @@ fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> 
     }
     ensure!(
         len == h.len && integrity(hash) == h.digest,
-        "state_v2_row_digest"
+        "state_v2_value_digest"
     );
     Ok(())
-}
-// Shipped owner IDs and key encoding are append-only; Rust names/order are not wire IDs.
-fn table_number(table: Table) -> i64 {
-    match table {
-        Table::Meta => 0,
-        Table::Files => 1,
-        Table::FamilyRequests => 2,
-        Table::RequestSets => 3,
-        Table::Census => 4,
-        Table::AccountPending => 5,
-        Table::UsagePending => 6,
-        Table::Witnesses => 7,
-        Table::Accepted => 8,
-        Table::Quarantine => 9,
-        Table::Holds => 10,
-        Table::Traversal => 11,
-        Table::Interned => 12,
-    }
-}
-// Each SQL primary-key component is tagged and length-delimited. Numbers use
-// eight-byte big endian; text is exact UTF-8, blobs are exact bytes.
-fn owner_key_bytes(key: &RowKey) -> Result<Vec<u8>> {
-    let mut out = vec![1];
-    out.extend_from_slice(&(table_number(key.table()) as u16).to_be_bytes());
-    for component in key.values()? {
-        let (tag, bytes) = match component {
-            SqlValue::Integer(n) => (0, n.to_be_bytes().to_vec()),
-            SqlValue::Text(s) => (1, s.into_bytes()),
-            SqlValue::Blob(b) => (2, b),
-            _ => bail!("state_v2_owner_key_type"),
-        };
-        out.push(tag);
-        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-        out.extend_from_slice(&bytes);
-    }
-    Ok(out)
 }
 
 /// The semantic encoder owns path classification, including paths inside raw
@@ -1369,37 +1170,17 @@ fn read_json<T: serde::de::DeserializeOwned>(conn: &Connection, key: &RowKey) ->
     ensure!(h.len <= 16 * 1024, "state_v2_control_admission");
     let mut encoded = Vec::with_capacity(h.len as usize);
     read_value(conn, &h, &mut encoded)?;
-    struct Bounded(Vec<u8>);
-    impl Write for Bounded {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if self
-                .0
-                .len()
-                .checked_add(bytes.len())
-                .map_or(true, |n| n > 32 * 1024)
-            {
-                return Err(io::Error::other("state_v2_control_admission"));
-            }
-            self.0.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut json = Bounded(Vec::new());
-    packed::decode(encoded.as_slice(), &mut json)?;
-    Ok(Some(serde_json::from_slice(&json.0)?))
+    Ok(Some(serde_json::from_slice(&encoded)?))
 }
 
 struct PartWriter<'a> {
     conn: &'a Connection,
-    owner: i64,
-    key_bytes: Vec<u8>,
+    owner: ChunkOwner,
     part: u16,
     bytes: Vec<u8>,
     len: u64,
     hash: sha2::Sha256,
+    cap: u64,
 }
 impl PartWriter<'_> {
     fn part(&mut self) -> io::Result<()> {
@@ -1408,8 +1189,8 @@ impl PartWriter<'_> {
         }
         self.conn
             .execute(
-                "INSERT INTO blob_parts(owner,key,part,bytes) VALUES(?1,?2,?3,?4)",
-                params![self.owner, self.key_bytes, self.part, self.bytes],
+                "INSERT INTO value_chunks(owner_table,owner_kind,owner_key,position,chunk_no,chunk) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![self.owner.table,self.owner.kind,self.owner.key,self.owner.position,self.part,self.bytes],
             )
             .map_err(|_| io::Error::other("state_v2_part_write"))?;
         self.part += 1;
@@ -1422,7 +1203,7 @@ impl Write for PartWriter<'_> {
         self.len = self
             .len
             .checked_add(bytes.len() as u64)
-            .filter(|n| *n <= VALUE_BYTES)
+            .filter(|n| *n <= self.cap)
             .ok_or_else(|| io::Error::other("state_v2_value_admission"))?;
         self.hash.update(bytes);
         let mut rest = bytes;
@@ -1442,32 +1223,9 @@ impl Write for PartWriter<'_> {
 }
 fn pl(key: &RowKey) -> bool {
     match key {
-        RowKey::Meta(name) => !matches!(
-            name.as_str(),
-            "identity"
-                | "generation"
-                | "phase"
-                | "erasure_success"
-                | "erasure_failures"
-                | "erasure_purged_epoch"
-                | "reference_check_success"
-                | "reference_check_attempt"
-                | "reference_drift"
-                | "minimum_writer_capability"
-                | "erasure_pending"
-                | "erasure_since"
-                | "erasure_attempt"
-                | "next_request_set_id"
-                | "next_version_ordinal"
-                | "next_model_ordinal"
-                | "next_speed_ordinal"
-                | "next_effort_ordinal"
-                | "baseline_bytes"
-                | "baseline_digest"
-                | "repair_commitment"
-        ),
+        RowKey::Meta(name) => !control_name(name),
         RowKey::RequestSet(_) => false,
-        _ => true, // Values may contain PL even when the primary key is H/N.
+        RowKey::Record { .. } => true,
     }
 }
 impl Transaction for Txn<'_> {
@@ -1489,12 +1247,9 @@ impl Transaction for Txn<'_> {
         let result = (|| {
             let h = preflight(&row)?;
             if *row.key == RowKey::Meta("minimum_writer_capability".into()) {
-                ensure!(h.len <= 16 * 1024, "state_v2_control_admission");
-                let mut encoded = Vec::new();
-                row.value.write(&mut encoded)?;
-                let mut json = Vec::new();
-                packed::decode(encoded.as_slice(), &mut json)?;
-                let next: u64 = serde_json::from_slice(&json)?;
+                let mut bytes = Vec::new();
+                row.value.write(&mut bytes)?;
+                let next: u64 = serde_json::from_slice(&bytes)?;
                 let old = self
                     .store
                     .read_control::<u64>("minimum_writer_capability")?
@@ -1504,104 +1259,107 @@ impl Transaction for Txn<'_> {
                     "state_v2_writer_capability_order"
                 );
             }
-            let table = row.key.table();
-            let fixed = fixed_values(table, row.fixed)?;
-            // Validate all scalar conversions before deleting the old owner.
-            let mut values = row.key.values()?;
-            let existed = if let Some(old) = self.get(row.key)? {
+            if let Some(old) = self.get(row.key)? {
                 if old == h {
                     return Ok(h);
                 }
                 ensure!(
-                    *row.key != RowKey::Meta("identity".into()),
+                    !matches!(row.key,RowKey::Meta(name) if matches!(name.as_str(),"identity"|"limits")),
                     "state_v2_identity_immutable"
                 );
-                if table == Table::Census
-                    || old.fixed != h.fixed
-                    || !references::matches(self.store.conn()?, &old, row.value)?
-                {
-                    read_value(self.store.conn()?, &old, &mut io::sink())?;
-                    self.remember_paths(&old)?;
-                }
-                self.admit_change(row.key, h.len + serde_json::to_vec(&h.fixed)?.len() as u64)?;
-                self.store.conn()?.execute(
-                    "DELETE FROM blob_parts WHERE owner=?1 AND key=?2",
-                    params![table_number(table), owner_key_bytes(row.key)?],
-                )?;
-                true
-            } else {
-                self.admit_change(row.key, h.len + serde_json::to_vec(&h.fixed)?.len() as u64)?;
-                false
-            };
+                // Integrity and privacy extraction use the original value even
+                // for a header-only change. Both run before replacing chunks.
+                read_value(self.store.conn()?, &old, &mut io::sink())?;
+                self.remember_paths(&old)?;
+            }
+            self.admit_change(
+                row.key,
+                h.len + projection_bytes(&h.fixed)?.map_or(0, |b| b.len()) as u64,
+            )?;
+            delete_chunks(self.store.conn()?, row.key)?;
             self.removed_keys.remove(row.key);
             let conn = self.store.conn()?;
-            let mut writer = PartWriter {
-                conn,
-                owner: table_number(table),
-                key_bytes: owner_key_bytes(row.key)?,
-                part: 0,
-                bytes: Vec::with_capacity(if h.parts == 0 {
-                    INLINE_BYTES
+            let inline = if matches!(row.key, RowKey::Meta(_)) {
+                let mut bytes = Vec::with_capacity(h.len as usize);
+                // Preflight already bounds controls, but the replay must be
+                // checked too before allocating for a changing producer.
+                let mut writer = ControlBuffer(&mut bytes);
+                row.value.write(&mut writer)?;
+                let mut hash = value_digest_start(h.value_version);
+                hash.update(&bytes);
+                ensure!(
+                    bytes.len() as u64 == h.len && integrity(hash) == h.digest,
+                    "state_v2_value_changed_after_preflight"
+                );
+                Some(bytes)
+            } else {
+                let mut writer = PartWriter {
+                    conn,
+                    owner: chunk_owner(row.key)?,
+                    part: 0,
+                    bytes: Vec::with_capacity(if h.parts == 0 {
+                        INLINE_BYTES
+                    } else {
+                        PART_BYTES
+                    }),
+                    len: 0,
+                    hash: value_digest_start(h.value_version),
+                    cap: value_cap(row.key),
+                };
+                row.value.write(&mut writer)?;
+                ensure!(
+                    writer.len == h.len && integrity(writer.hash.clone()) == h.digest,
+                    "state_v2_value_changed_after_preflight"
+                );
+                if h.parts == 0 {
+                    Some(writer.bytes)
                 } else {
-                    PART_BYTES
-                }),
-                len: 0,
-                hash: digest_start(row.key, row.fixed)?,
+                    writer.part()?;
+                    ensure!(writer.part == h.parts, "state_v2_part_shape");
+                    None
+                }
             };
-            row.value.write(&mut writer)?;
-            ensure!(
-                writer.len == h.len && integrity(writer.hash.clone()) == h.digest,
-                "state_v2_value_changed_after_preflight"
-            );
-            let inline = if h.parts == 0 {
-                Some(writer.bytes.clone())
-            } else {
-                writer.part()?;
-                ensure!(writer.part == h.parts, "state_v2_part_shape");
-                None
+            let mut values = row.key.values()?;
+            let table = row.key.table();
+            let sql = match table {
+                Table::Meta => {
+                    values.extend([
+                        SqlValue::Integer(h.value_version.into()),
+                        SqlValue::Blob(inline.context("state_v2_control_shape")?),
+                        SqlValue::Blob(h.row_checksum.to_vec()),
+                    ]);
+                    "INSERT INTO control(name,value_version,value,row_checksum) VALUES(?1,?2,?3,?4) ON CONFLICT(name) DO UPDATE SET value_version=excluded.value_version,value=excluded.value,row_checksum=excluded.row_checksum"
+                }
+                Table::Records => {
+                    values.extend([
+                        SqlValue::Integer(h.value_version.into()),
+                        projection_bytes(&h.fixed)?.map_or(SqlValue::Null, SqlValue::Blob),
+                        SqlValue::Blob(h.digest.to_vec()),
+                        SqlValue::Blob(h.row_checksum.to_vec()),
+                        SqlValue::Integer(h.len as i64),
+                        SqlValue::Integer(h.parts.into()),
+                        inline.map_or(SqlValue::Null, SqlValue::Blob),
+                    ]);
+                    "INSERT INTO records(kind,key_bytes,position,value_version,header,value_digest,row_checksum,value_bytes,chunk_count,inline_value) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(kind,key_bytes,position) DO UPDATE SET value_version=excluded.value_version,header=excluded.header,value_digest=excluded.value_digest,row_checksum=excluded.row_checksum,value_bytes=excluded.value_bytes,chunk_count=excluded.chunk_count,inline_value=excluded.inline_value"
+                }
+                Table::RequestSets => {
+                    let Fixed::RequestSet { commitment, refs } = &h.fixed else {
+                        bail!("state_v2_fixed_type")
+                    };
+                    values.extend([
+                        SqlValue::Blob(commitment.to_vec()),
+                        SqlValue::Integer(*refs as i64),
+                        SqlValue::Integer(h.value_version.into()),
+                        SqlValue::Blob(h.digest.to_vec()),
+                        SqlValue::Blob(h.row_checksum.to_vec()),
+                        SqlValue::Integer(h.len as i64),
+                        SqlValue::Integer(h.parts.into()),
+                        inline.map_or(SqlValue::Null, SqlValue::Blob),
+                    ]);
+                    "INSERT INTO shared_values(class,id,lookup_hash,ref_count,value_version,value_digest,row_checksum,value_bytes,chunk_count,inline_value) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(class,id) DO UPDATE SET lookup_hash=excluded.lookup_hash,ref_count=excluded.ref_count,value_version=excluded.value_version,value_digest=excluded.value_digest,row_checksum=excluded.row_checksum,value_bytes=excluded.value_bytes,chunk_count=excluded.chunk_count,inline_value=excluded.inline_value"
+                }
             };
-            values.extend(fixed);
-            values.push(SqlValue::Blob(h.digest.to_vec()));
-            if table != Table::Census {
-                values.extend([
-                    SqlValue::Integer(h.len as i64),
-                    SqlValue::Integer(h.parts as i64),
-                    inline.map_or(SqlValue::Null, SqlValue::Blob),
-                ]);
-            }
-            let columns = table
-                .keys()
-                .iter()
-                .chain(table.fixed_columns())
-                .copied()
-                .chain(table.value_columns().iter().copied())
-                .collect::<Vec<_>>()
-                .join(",");
-            let placeholders = (1..=values.len())
-                .map(|n| format!("?{n}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = if existed {
-                let assignments = table
-                    .fixed_columns()
-                    .iter()
-                    .chain(table.value_columns())
-                    .enumerate()
-                    .map(|(i, c)| format!("{c}=?{}", table.keys().len() + i + 1))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!(
-                    "UPDATE {} SET {assignments} WHERE {}",
-                    table.name(),
-                    predicate(table)
-                )
-            } else {
-                format!(
-                    "INSERT INTO {}({columns}) VALUES({placeholders})",
-                    table.name()
-                )
-            };
-            conn.prepare_cached(&sql)?
+            conn.prepare_cached(sql)?
                 .execute(params_from_iter(values))?;
             self.changed.insert(row.key.clone(), Some(h.clone()));
             self.store.stats.max_value_bytes = self.store.stats.max_value_bytes.max(h.len);
@@ -1617,7 +1375,7 @@ impl Transaction for Txn<'_> {
             self.store.stats.row_delete_attempts.saturating_add(1);
         let result = (|| {
             ensure!(
-                *key != RowKey::Meta("identity".into()),
+                !matches!(key,RowKey::Meta(name) if matches!(name.as_str(),"identity"|"limits")),
                 "state_v2_identity_immutable"
             );
             if let Some(old) = self.get(key)? {
@@ -1625,10 +1383,7 @@ impl Transaction for Txn<'_> {
                 self.remember_paths(&old)?;
             }
             let conn = self.store.conn()?;
-            conn.execute(
-                "DELETE FROM blob_parts WHERE owner=?1 AND key=?2",
-                params![table_number(key.table()), owner_key_bytes(key)?],
-            )?;
+            delete_chunks(conn, key)?;
             let table = key.table();
             let count = conn.execute(
                 &format!("DELETE FROM {} WHERE {}", table.name(), predicate(table)),
@@ -1655,9 +1410,6 @@ impl Transaction for Txn<'_> {
         limit: usize,
     ) -> Result<Vec<Header>> {
         references::candidates(self.store.conn()?, commitment, after, limit)
-    }
-    fn interned_candidates(&mut self, kind: u16, after: u64, limit: usize) -> Result<Vec<Header>> {
-        references::interned_candidates(self.store.conn()?, kind, after, limit)
     }
     fn adjust_refs(&mut self, key: &RowKey, delta: i64) -> Result<u64> {
         references::adjust(self, key, delta)
@@ -1693,6 +1445,35 @@ impl Transaction for Txn<'_> {
         }
         scan(self.store.conn()?, prefix, after, limit)
     }
+    fn scan_kind(
+        &mut self,
+        kind: &RecordKind,
+        after: Option<&RowKey>,
+        limit: usize,
+    ) -> Result<Vec<Header>> {
+        scan_record_range(self.store.conn()?, kind, None, after, limit)
+    }
+    fn scan_family(
+        &mut self,
+        kind: &RecordKind,
+        key_bytes: &[u8],
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<Header>> {
+        ensure!(key_bytes.len() <= KEY_BYTES, "state_v2_key_admission");
+        let after = after.map(|position| RowKey::Record {
+            kind: kind.clone(),
+            key_bytes: key_bytes.to_vec(),
+            position,
+        });
+        scan_record_range(
+            self.store.conn()?,
+            kind,
+            Some(key_bytes),
+            after.as_ref(),
+            limit,
+        )
+    }
     fn commit(mut self, expected: u64, next: u64) -> DurableCommitOutcome {
         let result = (|| -> Result<()> {
             ensure!(
@@ -1719,9 +1500,10 @@ impl Transaction for Txn<'_> {
                     == 0
                 {
                     self.put(RowInput {
+                        value_version: 1,
                         key: &RowKey::Meta("erasure_since".into()),
                         fixed: &Fixed::None,
-                        value: &packed::Json(
+                        value: &ControlJson(
                             &SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
                         ),
                     })?;
@@ -1729,20 +1511,23 @@ impl Transaction for Txn<'_> {
                 // Every deleting transaction gets its own epoch. Keep the
                 // oldest timestamp until all captured deletions are purged.
                 self.put(RowInput {
+                    value_version: 1,
                     key: &RowKey::Meta("erasure_pending".into()),
                     fixed: &Fixed::None,
-                    value: &packed::Json(&next),
+                    value: &ControlJson(&next),
                 })?;
             }
             self.put(RowInput {
+                value_version: 1,
                 key: &RowKey::Meta("minimum_writer_capability".into()),
                 fixed: &Fixed::None,
-                value: &packed::Json(&migrations::WRITER_CAPABILITY),
+                value: &ControlJson(&migrations::WRITER_CAPABILITY),
             })?;
             self.put(RowInput {
+                value_version: 1,
                 key: &RowKey::Meta("generation".into()),
                 fixed: &Fixed::None,
-                value: &packed::Json(&next),
+                value: &ControlJson(&next),
             })?;
             Ok(())
         })();
@@ -1768,14 +1553,11 @@ impl Transaction for Txn<'_> {
             if let Some(headers) = &mut self.store.headers {
                 for (key, header) in std::mem::take(&mut self.changed) {
                     let delta = i64::from(header.is_some()) - i64::from(headers.contains_key(&key));
-                    if key.table() != Table::Meta
-                        && key.table() != Table::Interned
-                        && key.table() != Table::RequestSets
-                    {
+                    if key.table() == Table::Records {
                         self.store.stats.record_rows =
                             self.store.stats.record_rows.saturating_add_signed(delta);
                     }
-                    if key.table() == Table::Files {
+                    if matches!(&key,RowKey::Record{kind,..} if kind.name()=="file.progress") {
                         self.store.stats.file_rows =
                             self.store.stats.file_rows.saturating_add_signed(delta);
                     }
@@ -1887,140 +1669,7 @@ fn quick_check(conn: &Connection, budget: Duration) -> Result<()> {
 }
 
 #[cfg(test)]
-pub(super) fn damage_part_for_test(db: &mut Sqlite) {
-    db.conn()
-        .unwrap()
-        .execute("UPDATE blob_parts SET bytes=zeroblob(length(bytes))", [])
-        .unwrap();
-}
+#[path = "sqlite/fixtures.rs"]
+mod fixtures;
 #[cfg(test)]
-pub(super) fn orphan_part_for_test(db: &mut Sqlite) {
-    db.conn()
-        .unwrap()
-        .execute(
-            "INSERT INTO blob_parts(owner,key,part,bytes) VALUES(0,X'00',0,X'01')",
-            [],
-        )
-        .unwrap();
-}
-#[cfg(test)]
-pub(super) fn wal_bytes_for_test(db: &Sqlite) -> Option<u64> {
-    db.wal_bytes()
-}
-
-#[cfg(test)]
-pub(super) fn oversize_header_for_test(db: &mut Sqlite) {
-    db.conn()
-        .unwrap()
-        .execute("UPDATE files SET source_fp=zeroblob(1048576)", [])
-        .unwrap();
-}
-
-#[cfg(test)]
-pub(super) struct ReaderForTest {
-    _conn: Connection,
-}
-#[cfg(test)]
-pub(super) fn reader_for_test(db: &Sqlite) -> ReaderForTest {
-    let conn = Connection::open_with_flags(&db.path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-    conn.busy_timeout(BUSY).unwrap();
-    conn.execute_batch("BEGIN").unwrap();
-    let _: Vec<u8> = conn
-        .query_row("SELECT inline FROM meta WHERE name='phase'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    ReaderForTest { _conn: conn }
-}
-
-#[cfg(test)]
-type SchemaFacts = Vec<(String, Vec<(String, String)>)>;
-#[cfg(test)]
-pub(super) fn schema_for_test(db: &Sqlite) -> (SchemaFacts, bool) {
-    let conn = db.conn().unwrap();
-    let mut facts = Vec::new();
-    for table in Table::ALL.iter().map(|t| t.name()).chain(["blob_parts"]) {
-        let mut stmt = conn
-            .prepare_cached(&format!("PRAGMA table_info({table})"))
-            .unwrap();
-        let columns = stmt
-            .query_map([], |r| Ok((r.get(1)?, r.get(2)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<(String, String)>>>()
-            .unwrap();
-        facts.push((table.to_owned(), columns));
-    }
-    let unique: bool = conn.query_row("SELECT \"unique\" FROM pragma_index_list('request_sets') WHERE name='request_sets_commitment'", [], |r| r.get(0)).unwrap();
-    (facts, unique)
-}
-
-#[cfg(test)]
-pub(super) fn damage_refs_for_test(db: &Sqlite, key: &RowKey) {
-    assert!(matches!(
-        key,
-        RowKey::RequestSet(_) | RowKey::Interned { .. }
-    ));
-    let table = key.table();
-    db.conn()
-        .unwrap()
-        .execute(
-            &format!(
-                "UPDATE {} SET refs=1 WHERE {}",
-                table.name(),
-                predicate(table)
-            ),
-            params_from_iter(key.values().unwrap()),
-        )
-        .unwrap();
-}
-#[cfg(test)]
-pub(super) fn part_count_for_test(db: &Sqlite) -> u64 {
-    db.conn()
-        .unwrap()
-        .query_row("SELECT count(*) FROM blob_parts", [], |r| r.get(0))
-        .unwrap()
-}
-
-#[cfg(test)]
-#[test]
-fn registered_owner_encoding_is_stable() {
-    assert_eq!(
-        owner_key_bytes(&RowKey::File("/a".into())).unwrap(),
-        [1, 0, 1, 1, 0, 0, 0, 2, b'/', b'a']
-    );
-    assert_eq!(
-        owner_key_bytes(&RowKey::Interned {
-            kind: 2,
-            ordinal: 3
-        })
-        .unwrap(),
-        [1, 0, 12, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 3]
-    );
-    assert_eq!(
-        Table::ALL.map(table_number),
-        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-    );
-}
-
-#[cfg(test)]
-pub(super) fn future_writer_for_test(db: &mut Sqlite) {
-    let key = RowKey::Meta("minimum_writer_capability".into());
-    let value = packed::Json(&(migrations::WRITER_CAPABILITY + 1));
-    let h = preflight(&RowInput {
-        key: &key,
-        fixed: &Fixed::None,
-        value: &value,
-    })
-    .unwrap();
-    let mut bytes = Vec::new();
-    value.write(&mut bytes).unwrap();
-    db.conn().unwrap().execute(
-        "INSERT INTO meta(name,digest,len,parts,inline) VALUES(?1,?2,?3,0,?4) ON CONFLICT(name) DO UPDATE SET digest=excluded.digest,len=excluded.len,parts=0,inline=excluded.inline",
-        params!["minimum_writer_capability", h.digest.as_slice(), h.len, bytes],
-    ).unwrap();
-}
-
-#[cfg(test)]
-pub(super) fn seed_page_estimate_for_test(tx: &mut Txn<'_>, pages: u64) {
-    tx.estimated_pages = pages;
-}
+pub(super) use fixtures::*;

@@ -81,8 +81,7 @@ impl Mapper for EmptyMapper {
         let h = tx.get(&RowKey::Meta("generation".into()))?.unwrap();
         let mut packed = Vec::new();
         tx.read_value(&h, &mut packed)?;
-        let mut json = Vec::new();
-        super::super::packed::decode(packed.as_slice(), &mut json)?;
+        let json = packed;
         Ok(ScanIndex {
             generation: serde_json::from_slice(&json)?,
             ..ScanIndex::default()

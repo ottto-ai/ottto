@@ -365,3 +365,31 @@ fn destructive_backup_is_private_verified_and_never_overwritten() {
     drop(owned);
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[cfg(test)]
+#[test]
+fn revision_one_four_table_ddl_golden() {
+    assert_eq!(
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(include_bytes!("migrations/revision_1.sql"))
+        ),
+        "5ea34633109a7ef0319c619d1393c744a834e52a07f2bdd86ec422fa8afa3e01"
+    );
+}
+#[cfg(test)]
+#[test]
+fn superseded_unshipped_layout_is_refused_intact() {
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch("CREATE TABLE meta(name TEXT PRIMARY KEY,value BLOB); PRAGMA user_version=1;")
+        .unwrap();
+    assert!(run(&c).is_err());
+    assert_eq!(revision(&c).unwrap(), 1);
+    assert!(c
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='meta')",
+            [],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap());
+}

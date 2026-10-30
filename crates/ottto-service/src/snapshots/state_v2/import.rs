@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Pause {
-    TableReview,
+    MapperPending,
     UnknownClass,
     Malformed,
     Partial,
@@ -97,7 +97,7 @@ pub(super) trait Mapper {
     // remain transient. The framework never guesses from provider text.
     fn verify<S: Store>(&self, store: &mut S, index: &ScanIndex) -> Result<()>;
     /// Read every semantic row through Transaction::read_value, including
-    /// fixed-only rows: it verifies their checksum while decoding. Never return
+    /// projection-bearing rows: it verifies value digests while decoding. Never return
     /// a partially hydrated graph or normalize unknown raw holds away.
     fn hydrate<S: Store>(&self, store: &mut S) -> Result<ScanIndex>;
     /// Uses the SAME claim maxima/hold and repair comparisons as v1; the
@@ -128,10 +128,10 @@ impl Mapper for PendingMapper {
         bail!(Hold::DbUnavailable)
     }
     fn inventory(&self, _: &Path) -> std::result::Result<(), Pause> {
-        Err(Pause::TableReview)
+        Err(Pause::MapperPending)
     }
     fn preflight(&self, _: &ScanIndex) -> std::result::Result<(), Pause> {
-        Err(Pause::TableReview)
+        Err(Pause::MapperPending)
     }
     fn populate<S: Store>(&self, _: &mut S, _: &ScanIndex) -> Result<()> {
         bail!(Hold::DbUnavailable)

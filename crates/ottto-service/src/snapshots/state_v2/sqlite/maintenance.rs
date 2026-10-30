@@ -293,9 +293,10 @@ impl Sqlite {
             ),
         ] {
             tx.put(RowInput {
+                value_version: 1,
                 key: &RowKey::Meta(name.into()),
                 fixed: &Fixed::None,
-                value: &packed::Json(&value),
+                value: &ControlJson(&value),
             })?;
         }
         if tx.store.conn()?.execute_batch("COMMIT").is_err() {

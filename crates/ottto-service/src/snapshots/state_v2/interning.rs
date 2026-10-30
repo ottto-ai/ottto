@@ -144,9 +144,7 @@ fn allocate(
         ensure!(h.len <= 128, "state_v2_high_water_admission");
         let mut encoded = Vec::with_capacity(h.len as usize);
         tx.read_value(&h, &mut encoded)?;
-        let mut raw = Vec::new();
-        packed::decode(encoded.as_slice(), &mut raw)?;
-        serde_json::from_slice::<u64>(&raw)?
+        serde_json::from_slice::<u64>(&encoded)?
     } else {
         ensure!(!existing, "state_v2_high_water_missing");
         1
@@ -158,9 +156,10 @@ fn allocate(
     ensure!(tx.get(&owner(id))?.is_none(), "state_v2_high_water_reused");
     let next = id.checked_add(1).context("state_v2_ordinal_exhausted")?;
     tx.put(RowInput {
+        value_version: 1,
         key: &key,
         fixed: &Fixed::None,
-        value: &packed::Json(&next),
+        value: &ControlJson(&next),
     })?;
     Ok(id)
 }
@@ -184,15 +183,11 @@ pub(super) fn intern_request_set(
             let RowKey::RequestSet(id) = h.key else {
                 anyhow::bail!("state_v2_set_key");
             };
-            let Fixed::RequestSet {
-                hash_count, refs, ..
-            } = h.fixed
-            else {
+            let Fixed::RequestSet { refs, .. } = h.fixed else {
                 anyhow::bail!("state_v2_set_columns");
             };
             ensure!(id > after && refs > 0, "state_v2_reference_count");
             if tx.value_matches(h, &value)? {
-                ensure!(hash_count == evidence.count(), "state_v2_set_count");
                 tx.adjust_refs(&h.key, 1)?;
                 return Ok(id);
             }
@@ -212,10 +207,10 @@ pub(super) fn intern_request_set(
     let key = RowKey::RequestSet(id);
     ensure!(tx.get(&key)?.is_none(), "state_v2_high_water_reused");
     tx.put(RowInput {
+        value_version: 1,
         key: &key,
         fixed: &Fixed::RequestSet {
-            commitment: digest.to_vec(),
-            hash_count: evidence.count(),
+            commitment: digest,
             refs: 1,
         },
         value: &value,
@@ -223,128 +218,7 @@ pub(super) fn intern_request_set(
     Ok(id)
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum Vocabulary {
-    Version,
-    Model,
-    Speed,
-    Effort,
-}
-impl Vocabulary {
-    fn kind(self) -> u16 {
-        match self {
-            Self::Version => 0,
-            Self::Model => 1,
-            Self::Speed => 2,
-            Self::Effort => 3,
-        }
-    }
-    fn high_water(self) -> &'static str {
-        match self {
-            Self::Version => "next_version_ordinal",
-            Self::Model => "next_model_ordinal",
-            Self::Speed => "next_speed_ordinal",
-            Self::Effort => "next_effort_ordinal",
-        }
-    }
-}
-struct Text<'a>(&'a str);
-impl Value for Text<'_> {
-    fn write(&self, out: &mut dyn Write) -> Result<()> {
-        ensure!(
-            self.0.len() as u64 <= VALUE_BYTES,
-            "state_v2_value_admission"
-        );
-        out.write_all(self.0.as_bytes())?;
-        Ok(())
-    }
-}
-
-pub(super) fn intern_string(
-    tx: &mut impl Transaction,
-    kind: Vocabulary,
-    text: &str,
-) -> Result<u64> {
-    ensure!(text.len() as u64 <= VALUE_BYTES, "state_v2_value_admission");
-    let value = Text(text);
-    let mut after = 0;
-    let mut existing = false;
-    loop {
-        let page = tx.interned_candidates(kind.kind(), after, PAGE)?;
-        if page.is_empty() {
-            break;
-        }
-        existing = true;
-        for h in &page {
-            let RowKey::Interned { ordinal, .. } = h.key else {
-                anyhow::bail!("state_v2_ordinal_key");
-            };
-            ensure!(ordinal > after, "state_v2_ordinal_order");
-            if tx.value_matches(h, &value)? {
-                tx.adjust_refs(&h.key, 1)?;
-                return Ok(ordinal);
-            }
-            after = ordinal;
-        }
-    }
-    let ordinal = allocate(tx, kind.high_water(), existing, |ordinal| {
-        RowKey::Interned {
-            kind: kind.kind(),
-            ordinal,
-        }
-    })?;
-    let key = RowKey::Interned {
-        kind: kind.kind(),
-        ordinal,
-    };
-    ensure!(tx.get(&key)?.is_none(), "state_v2_high_water_reused");
-    tx.put(RowInput {
-        key: &key,
-        fixed: &Fixed::Interned { refs: 1 },
-        value: &value,
-    })?;
-    Ok(ordinal)
-}
-
 pub(super) fn release_request_set(tx: &mut impl Transaction, id: u64) -> Result<()> {
     tx.adjust_refs(&RowKey::RequestSet(id), -1)?;
     Ok(())
-}
-pub(super) fn release_string(
-    tx: &mut impl Transaction,
-    kind: Vocabulary,
-    ordinal: u64,
-) -> Result<()> {
-    tx.adjust_refs(
-        &RowKey::Interned {
-            kind: kind.kind(),
-            ordinal,
-        },
-        -1,
-    )?;
-    Ok(())
-}
-
-/// Resolve directly into the final owned graph string, without a dictionary
-/// graph or a second text copy. No memo is required for correctness.
-pub(super) fn resolve_string(
-    tx: &mut impl Transaction,
-    kind: Vocabulary,
-    ordinal: u64,
-) -> Result<String> {
-    let h = tx
-        .get(&RowKey::Interned {
-            kind: kind.kind(),
-            ordinal,
-        })?
-        .context("state_v2_ordinal_missing")?;
-    ensure!(
-        matches!(h.fixed, Fixed::Interned { refs } if refs > 0),
-        "state_v2_reference_count"
-    );
-    ensure!(h.len <= VALUE_BYTES, "state_v2_value_admission");
-    let mut value = Vec::new();
-    value.try_reserve_exact(usize::try_from(h.len)?)?;
-    tx.read_value(&h, &mut value)?;
-    Ok(String::from_utf8(value)?)
 }
