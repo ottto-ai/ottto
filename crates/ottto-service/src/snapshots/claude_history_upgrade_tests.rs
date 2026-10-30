@@ -4007,6 +4007,11 @@ fn terminal_off_r11_current_exact_ack_skips_semantic_clear_and_base_keeps_it() {
     assert!(claude_terminal_off());
     let (home, _, mut index) = families("r11-accepted", 1);
     index.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-1".into());
+    index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
+    assert!(index
+        .files
+        .iter()
+        .all(|(key, entry)| terminal_off_stale_member_can_skip_clear(&index, key, entry)));
     for (key, entry) in &index.files {
         assert!(terminal_off_stale_member_can_skip_clear(&index, key, entry));
         let _base = KeepStaleClaudeFamilyRearmForTest::new();
@@ -4030,6 +4035,11 @@ fn terminal_off_r11_ackless_member_keeps_semantic_clear() {
     assert!(claude_terminal_off());
     let (home, _, mut index) = families("r11-ackless", 1);
     index.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-1".into());
+    index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
+    assert!(index
+        .files
+        .iter()
+        .all(|(key, entry)| terminal_off_stale_member_can_skip_clear(&index, key, entry)));
     index.accepted_snapshot_fingerprints.clear();
     for (key, entry) in &index.files {
         assert!(!terminal_off_stale_member_can_skip_clear(
@@ -4045,6 +4055,11 @@ fn terminal_off_r11_held_member_keeps_semantic_clear() {
     assert!(claude_terminal_off());
     let (home, _, mut index) = families("r11-held", 1);
     index.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-1".into());
+    index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
+    assert!(index
+        .files
+        .iter()
+        .all(|(key, entry)| terminal_off_stale_member_can_skip_clear(&index, key, entry)));
     index.claude_reemission_exclusions = ReemissionExclusions::with_state(ListState::Unreadable);
     for (key, entry) in &index.files {
         assert!(!terminal_off_stale_member_can_skip_clear(
@@ -4060,6 +4075,11 @@ fn terminal_off_r11_listed_member_keeps_semantic_clear() {
     assert!(claude_terminal_off());
     let (home, _, mut index) = families("r11-listed", 1);
     index.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-1".into());
+    index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
+    assert!(index
+        .files
+        .iter()
+        .all(|(key, entry)| terminal_off_stale_member_can_skip_clear(&index, key, entry)));
     index.claude_reemission_exclusions =
         ReemissionExclusions::parse(format!("{}\n", digest(&session(0))).as_bytes());
     for (key, entry) in &index.files {
@@ -4076,6 +4096,11 @@ fn terminal_off_r11_no_list_held_member_keeps_semantic_clear() {
     assert!(claude_terminal_off());
     let (home, _, mut index) = families("r11-no-list-held", 1);
     index.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-1".into());
+    index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
+    assert!(index
+        .files
+        .iter()
+        .all(|(key, entry)| terminal_off_stale_member_can_skip_clear(&index, key, entry)));
     index.claude_reemission_exclusions = ReemissionExclusions::with_state(ListState::NotInstalled);
     for (key, entry) in &index.files {
         assert!(!terminal_off_stale_member_can_skip_clear(
