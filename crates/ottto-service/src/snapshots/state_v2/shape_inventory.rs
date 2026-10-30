@@ -448,6 +448,13 @@ pub(super) fn named(name: &str) -> Option<Rule> {
                 "claude_money_birth_store::BirthStore",
             ),
             ("claude_desktop_store_inventory", "Option<String>"),
+            ("growth_retention", "BTreeMap<String,GrowthRetention>"),
+        ]),
+        "GrowthRetention" => Rule::Struct(&[
+            ("predecessor_size", "Option<u64>"),
+            ("uncertain_passes", "u32"),
+            ("checked_generation", "Option<u64>"),
+            ("last_growth_full_unix", "Option<u64>"),
         ]),
         "ScanIndexEntry" => Rule::Struct(&[
             ("size_bytes", "u64"),

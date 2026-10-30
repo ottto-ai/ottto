@@ -334,6 +334,7 @@ impl Serialize for ScanIndex {
             claude_money_birth_store::BirthStore::is_empty
         );
         field!(claude_desktop_store_inventory, Option::is_none);
+        field!(held growth_retention);
         map.end()
     }
 }
@@ -426,6 +427,7 @@ pub(super) const FIELDS: &[&str] = &[
     "held_audit_progress",
     "claude_money_birth_store",
     "claude_desktop_store_inventory",
+    "growth_retention",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1420,7 +1422,11 @@ impl<R: BufRead + Seek> Decoder<R> {
             let value = self.span()?;
             // Decode the value first: only actual opaque debt spends hold
             // admission. Its full charge is checked before allocating the key.
-            let decoded = if field == "claude_usage_family_pending" {
+            let decoded = if field == "growth_retention" && value.len > 4096 {
+                // Four numeric fields: bound malformed strings before Serde
+                // scratch allocation. Preserve opaque pacing debt as a hold.
+                Err(Error::Refused("growth retention record size"))
+            } else if field == "claude_usage_family_pending" {
                 self.pending_typed(value)
             } else {
                 self.typed(value)
@@ -1641,6 +1647,10 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.upload_context_fingerprint = self.typed(value)?
                         }
                         "files" => index.files = self.records("files", value, true)?,
+                        "growth_retention" => {
+                            index.growth_retention =
+                                self.records("growth_retention", value, true)?
+                        }
                         "session_account_bindings" => {
                             index.session_account_bindings = self.typed(value)?
                         }

@@ -2039,6 +2039,10 @@ fn every_persisted_field_fixture() -> ScanIndex {
                 serde_json::json!({"completed_at_unix_seconds":1,"process_id":1,"inventory":"inventory"})
             }
             "claude_desktop_store_inventory" => serde_json::json!("a".repeat(64)),
+            "growth_retention" => serde_json::json!({"/synthetic/0.jsonl": {
+                "predecessor_size": 11, "uncertain_passes": 2,
+                "checked_generation": 3, "last_growth_full_unix": 4
+            }}),
             "accepted_rebuild_incidence" => {
                 serde_json::json!({"/synthetic/carried.jsonl":["a".repeat(64)]})
             }
@@ -2132,16 +2136,18 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
     let current = serde_json::to_value(&seed).unwrap();
     let fields = lenient_decode::FIELDS;
     assert_eq!(
-        &fields[fields.len() - 4..],
+        &fields[fields.len() - 5..],
         &[
             "upload_ack_retirement_handoff",
             "held_audit_progress",
             "claude_money_birth_store",
             "claude_desktop_store_inventory",
+            "growth_retention",
         ]
     );
     for earlier_e2 in [false, true] {
         let mut legacy = current.clone();
+        legacy.as_object_mut().unwrap().remove("growth_retention");
         legacy
             .as_object_mut()
             .unwrap()
@@ -2156,7 +2162,7 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
             // The main positional schema ends at audit progress; appending E2
             // must leave every already-shipped position intact.
             forms.push(Value::Array(
-                fields[..fields.len() - 2]
+                fields[..85] // historical main schema ends at audit progress
                     .iter()
                     .map(|name| legacy[*name].clone())
                     .collect(),
@@ -2183,15 +2189,38 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
 
 #[test]
 fn desktop_inventory_keeps_existing_positional_index_slots() {
-    let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
+    let mut current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
+    current.as_object_mut().unwrap().remove("growth_retention");
     let mut legacy = current.clone();
     legacy
         .as_object_mut()
         .unwrap()
         .remove("claude_desktop_store_inventory");
     let fields = lenient_decode::FIELDS;
-    assert_eq!(fields.last(), Some(&"claude_desktop_store_inventory"));
-    for (expected, slots) in [(&legacy, &fields[..fields.len() - 1]), (&current, fields)] {
+    assert_eq!(fields[86], "claude_desktop_store_inventory");
+    for (expected, slots) in [(&legacy, &fields[..86]), (&current, &fields[..87])] {
+        let array = Value::Array(slots.iter().map(|name| expected[*name].clone()).collect());
+        let bytes = serde_json::to_vec(&array).unwrap();
+        let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+        let streaming =
+            lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+        let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+        for decoded in [native, streaming, bounded] {
+            assert_eq!(serde_json::to_value(decoded).unwrap(), *expected);
+        }
+    }
+}
+
+#[test]
+fn growth_retention_keeps_existing_positional_index_slots() {
+    let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
+    let mut legacy = current.clone();
+    legacy.as_object_mut().unwrap().remove("growth_retention");
+    let fields = lenient_decode::FIELDS;
+    assert_eq!(fields[86], "claude_desktop_store_inventory");
+    assert_eq!(fields[87], "growth_retention");
+    assert_eq!(fields.len(), 88);
+    for (expected, slots) in [(&legacy, &fields[..87]), (&current, fields)] {
         let array = Value::Array(slots.iter().map(|name| expected[*name].clone()).collect());
         let bytes = serde_json::to_vec(&array).unwrap();
         let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
