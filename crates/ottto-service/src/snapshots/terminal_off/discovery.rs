@@ -38,6 +38,7 @@ struct Observation {
     first_seen: u64,
     targeted: Option<[u8; 32]>,
     served: Option<(Option<Stat>, [u8; 32])>,
+    served_root: Option<[u8; 32]>,
 }
 #[derive(Clone, Default)]
 struct Walk {
@@ -46,6 +47,7 @@ struct Walk {
     coalesced_since: Option<u64>,
     round: u64,
     suppressing: bool,
+    target_cursor: Option<String>,
     floor_due: bool,
     held_roots: BTreeSet<String>,
     oversized: BTreeSet<String>,
@@ -125,7 +127,7 @@ fn blocked(walk: &Walk, key: &str, stat: Option<Stat>, token: Option<[u8; 32]>) 
             .oversized
             .contains(&oversized_discovery::path_hash(Path::new(key))))
         && walk.observations.get(&digest(key)).is_some_and(|o| {
-            stat.is_some()
+            stat.is_some_and(|s| s.identity.is_some() && s.modified.is_some() && s.birth > 0)
                 && o.served.is_some_and(|(old, revision)| {
                     old == stat && token.map_or(true, |t| t == revision)
                 })
@@ -427,6 +429,7 @@ pub(super) fn served(index: &ScanIndex, candidate: &CandidateFile, now: u64) {
             o.stat = stat;
             o.round = round;
             o.served = Some((stat, token));
+            o.served_root = Some(digest(&local_index_key(&candidate.scan_root)));
             o.targeted = Some(service_token(token, debt, stat, cause));
         }
     });
@@ -444,11 +447,27 @@ pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
         .iter()
         .map(|p| local_index_key(&p.path))
         .collect::<BTreeSet<_>>();
+    if limit == 0 {
+        return;
+    }
+    // Bound inspections (and thus stats), not merely successful admissions.
+    // A RAM cursor gives blocked/served cohorts fair turns without an O(N)
+    // metadata sweep on each page. Losing it only restarts scheduling.
+    let cursor = with_walks(|m| m.get(&scope).and_then(|w| w.target_cursor.clone()));
+    let keys = if let Some(cursor) = cursor.as_ref() {
+        index.files.range((std::ops::Bound::Excluded(cursor.clone()), std::ops::Bound::Unbounded))
+            .chain(index.files.range(..=cursor.clone()))
+            .take(limit).map(|(k, _)| k.clone()).collect::<Vec<_>>()
+    } else {
+        index.files.keys().take(limit).cloned().collect::<Vec<_>>()
+    };
+    let inspected = keys.len();
+    let mut stats = 0;
+    if let Some(last) = keys.last() {
+        with_walks(|m| { if let Some(w) = m.get_mut(&scope) { w.target_cursor = Some(last.clone()); } });
+    }
     let mut selected = Vec::new();
-    for key in index.files.keys() {
-        if selected.len() >= limit {
-            break;
-        }
+    for key in &keys {
         if pending.contains(key)
             || sampled_audit::candidate_open_blocked(key, now)
             || index.file_upload_context_waits_for_retry(key)
@@ -463,6 +482,7 @@ pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
             continue;
         };
         let token = revision(index, key);
+        stats += 1;
         let stat = fs::symlink_metadata(key)
             .ok()
             .and_then(|m| Stat::capture(&m));
@@ -485,13 +505,19 @@ pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
         if !admitted {
             continue;
         }
-        let Some(root) = index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .owning_scan_root(Path::new(key))
-            .cloned()
-        else {
+        let traversal = index.traversal.as_ref().unwrap();
+        let served_root = with_walks(|m| m.get(&scope)
+            .and_then(|w| w.observations.get(&digest(key)))
+            .and_then(|o| o.served_root));
+        // Preserve actual native acquisition custody. Only cold keys without
+        // an admitted/served owner use the traversal's existing inference.
+        let root = served_root.and_then(|owner| traversal.scan_roots.iter()
+            .find(|root| digest(&local_index_key(root)) == owner).cloned())
+            .or_else(|| index.claude_full_rearm_progress.terminal_off_admitted.iter()
+                .find(|p| local_index_key(&p.path) == *key && traversal.scan_roots.contains(&p.scan_root))
+                .map(|p| p.scan_root.clone()))
+            .or_else(|| traversal.owning_scan_root(Path::new(key)).cloned());
+        let Some(root) = root else {
             continue;
         };
         selected.push(ScanTraversalPath {
@@ -513,8 +539,12 @@ pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
         .unwrap()
         .pending_candidates
         .extend(selected);
+    crate::local_resource_diagnostics::traversal_point(
+        "terminal_off_target_inspections", "claude_code",
+        &json!({"keys":inspected,"stat_operations":stats,"allowance":limit,"bytes":0}),
+    );
 }
 
 crate::heap_layout_bound::fields!(Stat; length, modified, identity, birth);
-crate::heap_layout_bound::fields!(Observation; stat, round, first_seen, targeted, served);
-crate::heap_layout_bound::fields!(Walk; now, last_walk, coalesced_since, round, suppressing, floor_due, held_roots, oversized, observations);
+crate::heap_layout_bound::fields!(Observation; stat, round, first_seen, targeted, served, served_root);
+crate::heap_layout_bound::fields!(Walk; now, last_walk, coalesced_since, round, suppressing, target_cursor, floor_due, held_roots, oversized, observations);
