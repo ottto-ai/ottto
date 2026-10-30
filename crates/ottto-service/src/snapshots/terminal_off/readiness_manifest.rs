@@ -19,10 +19,13 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/p12_pipeline_original_tests.rs", "terminal_off_on_native_comparison_original_novel_import_oracle", "historical-strict-fence"),
     ("snapshot_sync/p12_pipeline_original_tests.rs", "terminal_off_on_novel_import_recovers_after_owner_coverage_then_stops_reading", "P12-driver"),
     ("snapshots/claude_history_upgrade_tests.rs", "terminal_off_on_held_member_owed_a_proof_correction_is_skipped_and_deferred", "R5"),
+    ("snapshots/p12_usage_original_tests.rs", "terminal_off_on_member_change_after_unchanged_proof_fails_closed_until_family_reparse", "P12-driver"),
     ("snapshots/retry_admission_tests.rs", "terminal_off_on_oversized_complete_accepted_singleton_defers_without_healthy_full_reads", "R13"),
     ("snapshots/retry_admission_tests.rs", "terminal_off_on_oversized_singleton_keeps_runnable_debt_and_later_siblings_after_reload", "R13"),
     ("snapshots/sampled_audit/open_backoff_tests.rs", "ordinary_grown_open_keeps_due_with_another_slot_owner_and_saturated_markers", "C3"),
     ("snapshots/sampled_audit/open_backoff_tests.rs", "ordinary_unchanged_open_keeps_due_with_another_slot_owner_and_saturated_markers", "C3"),
+    ("snapshots/transcript_acquisition_tests.rs", "terminal_off_on_sampled_production_allocation_baseline_and_tail", "native-allocation-probe"),
+    ("snapshots/transcript_acquisition_tests.rs", "terminal_off_on_sampled_production_performance_32mib", "native-performance-probe"),
 ];
 
 fn ignored_for_readiness() -> Vec<(String, String, String)> {
@@ -71,7 +74,7 @@ fn terminal_off_on_readiness_ignores_equal_the_checked_in_manifest() {
     assert_eq!(expected, sorted, "keep the manifest sorted");
     assert_eq!(ignored_for_readiness(), expected);
     // The count is the ON gate: it must reach 0 before ON anywhere.
-    assert_eq!(READINESS_MANIFEST.len(), 17);
+    assert_eq!(READINESS_MANIFEST.len(), 20);
 }
 
 #[test]

@@ -6561,7 +6561,7 @@ fn sampled_production_performance_32mib() {
 /// Explicit synthetic performance probe; excluded from routine unit runs.
 /// No timing threshold: filesystem caches and host load affect wall time.
 #[test]
-#[ignore = "run explicitly for native synthetic throughput measurements"]
+#[ignore = "terminal-off ON-readiness: native-performance-probe"]
 fn terminal_off_on_sampled_production_performance_32mib() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -6703,7 +6703,7 @@ fn sampled_production_allocation_baseline_and_tail() {
 }
 
 #[test]
-#[ignore = "explicit native allocation probe; process scope requires serial isolation"]
+#[ignore = "terminal-off ON-readiness: native-allocation-probe"]
 fn terminal_off_on_sampled_production_allocation_baseline_and_tail() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

@@ -788,7 +788,7 @@ fn member_change_after_unchanged_proof_fails_closed_until_family_reparse() {
 }
 
 #[test]
-#[ignore = "P12: needs full qualified two-phase driver; original expectations preserved"]
+#[ignore = "terminal-off ON-readiness: P12-driver"]
 fn terminal_off_on_member_change_after_unchanged_proof_fails_closed_until_family_reparse() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
