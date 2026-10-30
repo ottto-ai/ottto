@@ -23849,22 +23849,23 @@ mod tests {
                     test_quarantine_witness(),
                 )
                 .unwrap();
-                attempt_snapshot_page(
+                // The page attempt assumes already-selected pending indices;
+                // saved-ACK suppression belongs to the canonical selector.
+                let resumed = upload_resumable_batches_with_body_witness(
                     &items,
-                    &slots,
                     &scope,
                     &mut loaded,
                     &mut accepted,
-                    &|i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
-                    &snapshot_upload_body_witness,
-                    &|i: &SnapshotItem| Some(i.source_session_id.as_str()),
-                    &mut |_| {
+                    |i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
+                    snapshot_upload_body_witness,
+                    |_| {
                         posts += 1;
                         Err(anyhow!("exact saved ACK must skip POST"))
                     },
-                    &mut |_| Ok(()),
+                    |_| Ok(()),
                 )
                 .unwrap();
+                assert_eq!(resumed, ResumableUploadResult::Completed);
                 assert_eq!(posts, 1);
                 // An ordinary entity ACK for a different body cannot credit this
                 // revision. Keep fingerprint fixed to exercise body equality.
@@ -23874,6 +23875,59 @@ mod tests {
                     &changed[0].snapshot_fingerprint,
                     &snapshot_upload_body_witness(&changed[0])
                 ));
+                // The same generated complete bodies receive no stored-body
+                // credit from not_stored, refusal or a rejected partial ACK.
+                for disposition in ["not_stored", "refused", "partial"] {
+                    let mut negative = test_upload_progress();
+                    let result = attempt_snapshot_page(
+                        &items,
+                        &slots,
+                        &unique_poison_scope(),
+                        &mut negative,
+                        &mut 0,
+                        &|i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
+                        &snapshot_upload_body_witness,
+                        &|i: &SnapshotItem| Some(i.source_session_id.as_str()),
+                        &mut |body| {
+                            if disposition == "partial" {
+                                return Err(anyhow!("synthetic partial exact-ACK rejection"));
+                            }
+                            let mut ack = same_source_fixture_ack(body)?;
+                            if disposition == "not_stored" {
+                                ack.unchanged_entities = std::mem::take(&mut ack.accepted_entities);
+                                for entity in &mut ack.unchanged_entities {
+                                    entity.unchanged_basis = Some("usage_identical".into());
+                                }
+                            } else {
+                                ack.rejected_entities = std::mem::take(&mut ack.accepted_entities)
+                                    .into_iter()
+                                    .map(|entity| crate::snapshot_client::SnapshotEntityRejection {
+                                        source_session_id: entity.source_session_id,
+                                        snapshot_fingerprint: entity.snapshot_fingerprint,
+                                        occurrence_count: entity.occurrence_count,
+                                        reason: "usage_accounting_authority_downgrade".into(),
+                                        detail: "synthetic refusal".into(),
+                                        permanent: true,
+                                    })
+                                    .collect();
+                                ack.accepted = 0;
+                                ack.sessions_reconciled = 0;
+                            }
+                            Ok(ack)
+                        },
+                        &mut |_| Ok(()),
+                    );
+                    assert_eq!(result.is_err(), disposition == "partial");
+                    for item in &items {
+                        assert!(
+                            !negative.contains_body(
+                                &item.snapshot_fingerprint,
+                                &snapshot_upload_body_witness(item)
+                            ),
+                            "{source:?}/{disposition}"
+                        );
+                    }
+                }
                 std::fs::remove_dir_all(root).unwrap();
             }
         });
