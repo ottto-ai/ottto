@@ -314,6 +314,7 @@ pub(super) struct Txn<'a> {
     changed: BTreeMap<RowKey, Option<Header>>,
     dirty_bytes: u64,
     estimated_pages: u64,
+    admission: Option<units::Admission>,
 }
 impl Drop for Txn<'_> {
     fn drop(&mut self) {
@@ -719,6 +720,7 @@ impl Sqlite {
                 changed: BTreeMap::new(),
                 dirty_bytes: 0,
                 estimated_pages: 0,
+                admission: None,
             };
             tx.put(RowInput {
                 value_version: 1,
@@ -813,6 +815,7 @@ impl Store for Sqlite {
             changed: BTreeMap::new(),
             dirty_bytes: 0,
             estimated_pages: 0,
+            admission: None,
         })
     }
     fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
@@ -1059,9 +1062,59 @@ impl Sqlite {
         self.references = Some(refs);
     }
 }
+impl Sqlite {
+    /// The caller holds source ownership, has selected the complete committable
+    /// subset, and has durably staged its R1 files BEFORE entering this method.
+    /// Ordinary callers keep their existing conservative transaction limits.
+    #[allow(dead_code)] // Complete mapper plans are required before enabling publication.
+    pub(super) fn begin_selected(&mut self, selection: units::Selection) -> Result<Txn<'_>> {
+        let mut tx = self.begin(TxnMode::Write)?;
+        ensure!(
+            tx.store.read_control::<Identity>("identity")?.as_ref() == Some(&selection.identity)
+                && tx.store.read_control::<u64>("generation")?.unwrap_or(0) == selection.generation,
+            "state_v2_unit_stale_plan"
+        );
+        ensure!(
+            units::Schedule::read(&mut tx)? == selection.prior_schedule,
+            "state_v2_unit_stale_schedule"
+        );
+        telemetry::event("unit_selected", &selection.selected_units);
+        telemetry::event("unit_deferred", &selection.deferred());
+        telemetry::event(
+            "unit_charge_rows_bytes_pages",
+            &selection.diagnostic_charge(),
+        );
+        if selection.held != 0 {
+            telemetry::event("unit_oversize_alarm", &selection.held);
+        }
+        if selection.windows_alarm != 0 {
+            telemetry::event("account_windows_alarm", &selection.windows_alarm);
+        }
+        tx.admission = Some(selection.admission());
+        Ok(tx)
+    }
+}
 impl Txn<'_> {
+    fn admit_selected(
+        &mut self,
+        before: Option<&Header>,
+        after: Option<&Header>,
+        refs_only: bool,
+    ) -> Result<()> {
+        if let Some(admission) = &mut self.admission {
+            admission.record(before, after, refs_only)?;
+        }
+        Ok(())
+    }
     fn admit_change(&mut self, key: &RowKey, bytes: u64) -> Result<()> {
         if self.store.import {
+            return Ok(());
+        }
+        if self.admission.is_some() {
+            self.dirty_bytes = self
+                .dirty_bytes
+                .checked_add(bytes)
+                .context("state_v2_save_admission")?;
             return Ok(());
         }
         let rows = self.changed.len() + usize::from(!self.changed.contains_key(key));
@@ -1275,8 +1328,9 @@ impl Transaction for Txn<'_> {
                     "state_v2_writer_capability_order"
                 );
             }
-            if let Some(old) = self.get(row.key)? {
-                if old == h {
+            let previous = self.get(row.key)?;
+            if let Some(old) = &previous {
+                if *old == h {
                     return Ok(h);
                 }
                 ensure!(
@@ -1285,9 +1339,10 @@ impl Transaction for Txn<'_> {
                 );
                 // Integrity and privacy extraction use the original value even
                 // for a header-only change. Both run before replacing chunks.
-                read_value(self.store.conn()?, &old, &mut io::sink())?;
-                self.remember_paths(&old)?;
+                read_value(self.store.conn()?, old, &mut io::sink())?;
+                self.remember_paths(old)?;
             }
+            self.admit_selected(previous.as_ref(), Some(&h), false)?;
             self.admit_change(
                 row.key,
                 h.len + projection_bytes(&h.fixed)?.map_or(0, |b| b.len()) as u64,
@@ -1395,6 +1450,7 @@ impl Transaction for Txn<'_> {
                 "state_v2_identity_immutable"
             );
             if let Some(old) = self.get(key)? {
+                self.admit_selected(Some(&old), None, false)?;
                 self.admit_change(key, 0)?;
                 self.remember_paths(&old)?;
             }
@@ -1501,6 +1557,21 @@ impl Transaction for Txn<'_> {
                             .ok_or_else(|| anyhow::anyhow!("state_v2_generation_overflow"))?,
                 "state_v2_generation_order"
             );
+            if let Some(admission) = self.admission.take() {
+                ensure!(
+                    expected == admission.generation(),
+                    "state_v2_unit_stale_plan"
+                );
+                admission.complete(&mut self)?;
+                let schedule = admission.schedule().clone();
+                self.admission = Some(admission);
+                self.put(RowInput {
+                    value_version: 1,
+                    key: &RowKey::Meta("unit_schedule".into()),
+                    fixed: &Fixed::None,
+                    value: &ControlJson(&schedule),
+                })?;
+            }
             let actual = self.store.read_control::<u64>("generation")?.unwrap_or(0);
             ensure!(actual == expected, "state_v2_concurrent_change");
             let purge = self.paths_removed()?;

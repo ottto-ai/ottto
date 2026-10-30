@@ -30,6 +30,7 @@ mod kinds_misc;
 mod packed;
 mod shape;
 mod sqlite;
+mod units;
 use kinds::KindCx;
 
 /// Runtime-only custody carrier. Only the verified v2 load route may install it.
@@ -782,6 +783,7 @@ fn control_name(name: &str) -> bool {
             | "baseline_bytes"
             | "baseline_digest"
             | "repair_commitment"
+            | "unit_schedule"
             | "limits"
     )
 }
