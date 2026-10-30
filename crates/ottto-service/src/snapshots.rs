@@ -15234,6 +15234,7 @@ struct UsageTotals {
 }
 
 const USD_PICO_SCALE: u128 = 1_000_000_000_000;
+const PI_COST_FIELD_CEILING_PICOS: u128 = 100_000 * USD_PICO_SCALE;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct UsageCosts {
@@ -38704,6 +38705,17 @@ fn codex_total_usage_has_request_count(value: &Value) -> bool {
 }
 
 fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    // Count per observed usage line, before response deduplication and timestamp
+    // drops; rereads count again. Usage-shape probes remain side-effect-free.
+    if pi_usage_event(value) {
+        if let Some(usage) = pi_usage_value(value) {
+            let (_, observations) = pi_usage_costs_with_observations(usage);
+            crate::local_resource_diagnostics::pi_cost_observations(
+                observations.refused,
+                observations.rounded,
+            );
+        }
+    }
     let event_type = string_at(value, &["type"]);
     match event_type.as_deref() {
         Some("custom") => {
@@ -39133,49 +39145,160 @@ fn pi_cache_creation_split(usage: &Value) -> (u64, u64) {
     (flat.saturating_sub(cache_1h), cache_1h)
 }
 
+#[derive(Default)]
+struct PiCostObservations {
+    refused: u64,
+    rounded: u64,
+}
+
 fn pi_usage_costs(usage: &Value) -> UsageCosts {
+    pi_usage_costs_with_observations(usage).0
+}
+
+fn pi_usage_costs_with_observations(usage: &Value) -> (UsageCosts, PiCostObservations) {
+    let mut observations = PiCostObservations::default();
     let Some(cost) = usage.get("cost") else {
-        return UsageCosts {
-            observed: true,
-            ..UsageCosts::default()
-        };
+        return (
+            UsageCosts {
+                observed: true,
+                ..UsageCosts::default()
+            },
+            observations,
+        );
     };
-    let total = usd_picos_at(cost, &["total"]);
-    let input = usd_picos_at(cost, &["input"]);
-    let output = usd_picos_at(cost, &["output"]);
-    let cache_read = usd_picos_at(cost, &["cacheRead", "cache_read"]);
-    let cache_creation = usd_picos_at(cost, &["cacheWrite", "cache_write"]);
+    let mut parse = |keys: &[&str]| match usd_picos_at(cost, keys) {
+        Ok((picos, rounded)) => {
+            observations.rounded += u64::from(rounded);
+            Some(picos)
+        }
+        Err(PiCostParseError::Overflow) => {
+            observations.refused += 1;
+            None
+        }
+        Err(PiCostParseError::Invalid) => None,
+    };
+    let total = parse(&["total"]);
+    let input = parse(&["input"]);
+    let output = parse(&["output"]);
+    let cache_read = parse(&["cacheRead", "cache_read"]);
+    let cache_creation = parse(&["cacheWrite", "cache_write"]);
     let reported = [total, input, output, cache_read, cache_creation]
         .iter()
         .any(Option::is_some);
-    if !reported {
-        return UsageCosts {
+    (
+        UsageCosts {
             observed: true,
-            ..UsageCosts::default()
-        };
-    }
-    UsageCosts {
-        observed: true,
-        reported: true,
-        total,
-        input,
-        output,
-        cache_read,
-        cache_creation,
+            reported,
+            total,
+            input,
+            output,
+            cache_read,
+            cache_creation,
+        },
+        observations,
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PiCostParseError {
+    Invalid,
+    Overflow,
+}
+
+fn usd_picos_at(value: &Value, keys: &[&str]) -> Result<(u128, bool), PiCostParseError> {
+    let raw = keys.iter().find_map(|key| value.get(*key));
+    match raw {
+        // serde_json has no arbitrary_precision feature here; integers remain exact.
+        // The number form is exact only to f64's shortest round-trip representation; the string form is exact to its lexeme.
+        Some(Value::Number(number)) => parse_pi_usd_picos(&number.to_string()),
+        Some(Value::String(text)) => parse_pi_usd_picos(text),
+        _ => Err(PiCostParseError::Invalid),
     }
 }
 
-fn usd_picos_at(value: &Value, keys: &[&str]) -> Option<u128> {
-    let raw = keys.iter().find_map(|key| value.get(*key))?;
-    let parsed = match raw {
-        Value::Number(number) => number.as_f64(),
-        Value::String(text) => text.parse::<f64>().ok(),
-        _ => None,
-    }?;
-    if !parsed.is_finite() || parsed < 0.0 {
-        return None;
+/// Checked decimal dollars to picos; the bool records sub-pico precision.
+fn parse_pi_usd_picos(text: &str) -> Result<(u128, bool), PiCostParseError> {
+    use PiCostParseError::{Invalid, Overflow};
+    let (mantissa, exponent) = text.split_once(['e', 'E']).unwrap_or((text, "0"));
+    let mantissa = mantissa.strip_prefix('+').unwrap_or(mantissa);
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (whole.is_empty() && fraction.is_empty())
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return Err(Invalid);
     }
-    Some((parsed * USD_PICO_SCALE as f64).round() as u128)
+    let (negative_exponent, exponent_digits) = if let Some(digits) = exponent.strip_prefix('-') {
+        (true, digits)
+    } else {
+        (false, exponent.strip_prefix('+').unwrap_or(exponent))
+    };
+    if exponent_digits.is_empty() || !exponent_digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Invalid);
+    }
+    let coefficient = whole
+        .bytes()
+        .chain(fraction.bytes())
+        .try_fold(0u128, |n, b| {
+            n.checked_mul(10)?.checked_add(u128::from(b - b'0'))
+        })
+        .ok_or(Overflow)?;
+    let exponent = exponent_digits
+        .bytes()
+        .try_fold(0i128, |n, b| {
+            n.checked_mul(10)?.checked_add(i128::from(b - b'0'))
+        })
+        .ok_or(Overflow)?;
+    let exponent = if negative_exponent {
+        -exponent
+    } else {
+        exponent
+    };
+    let shift = exponent
+        .checked_sub(i128::try_from(fraction.len()).map_err(|_| Overflow)?)
+        .and_then(|n| n.checked_add(12))
+        .ok_or(Overflow)?;
+    let (picos, rounded) = if shift >= 0 {
+        let picos = if coefficient == 0 {
+            0
+        } else {
+            let power = u32::try_from(shift).map_err(|_| Overflow)?;
+            coefficient
+                .checked_mul(10u128.checked_pow(power).ok_or(Overflow)?)
+                .ok_or(Overflow)?
+        };
+        (picos, false)
+    } else {
+        // 10^39 exceeds u128::MAX, so every representable coefficient is
+        // strictly below its halfway point (and rounds to zero).
+        let Some(power) = shift
+            .checked_neg()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n <= 38)
+        else {
+            return Ok((0, true));
+        };
+        let divisor = 10u128.checked_pow(power).ok_or(Overflow)?;
+        let floor = coefficient / divisor;
+        let remainder = coefficient % divisor;
+        // Refuse even a sub-pico excess above the dollar ceiling, before rounding.
+        if floor > PI_COST_FIELD_CEILING_PICOS
+            || (floor == PI_COST_FIELD_CEILING_PICOS && remainder != 0)
+        {
+            return Err(Overflow);
+        }
+        let round_up = remainder > divisor / 2 || (remainder == divisor / 2 && floor % 2 != 0);
+        (
+            floor.checked_add(u128::from(round_up)).ok_or(Overflow)?,
+            true,
+        )
+    };
+    if picos > PI_COST_FIELD_CEILING_PICOS {
+        return Err(Overflow);
+    }
+    Ok((picos, rounded))
 }
 
 fn usd_picos_string(value: u128) -> String {
@@ -80022,6 +80145,168 @@ mod tests {
         aggregate.add(&invalid);
         assert!(!aggregate.reported);
         assert_eq!(aggregate.snapshot_cost(), None);
+    }
+
+    #[test]
+    fn pi_cost_decimal_lexemes_are_exact_and_match_realistic_numbers() {
+        for (text, expected) in [
+            ("0.000123456789", 123_456_789),
+            ("0.1", 100_000_000_000),
+            ("3", 3_000_000_000_000),
+            ("+3.", 3_000_000_000_000),
+            (".1", 100_000_000_000),
+            ("1e-3", 1_000_000_000),
+            ("2.5E2", 250_000_000_000_000),
+            ("0.0042", 4_200_000_000),
+            ("0.0011", 1_100_000_000),
+            ("0.0006", 600_000_000),
+            ("100000", PI_COST_FIELD_CEILING_PICOS),
+            ("99999.999999999999", PI_COST_FIELD_CEILING_PICOS - 1),
+        ] {
+            assert_eq!(parse_pi_usd_picos(text), Ok((expected, false)), "{text}");
+        }
+        for text in ["0.000123456789", "0.1", "3", "1e-3", "2.5E2", "0.0042"] {
+            let number: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                usd_picos_at(&serde_json::json!({"total": number}), &["total"]),
+                usd_picos_at(&serde_json::json!({"total": text}), &["total"]),
+                "{text}",
+            );
+        }
+        for text in [
+            "", "-1", "-0", "NaN", "inf", "1e", "1e+", "1e2e3", "1..2", " 1", ".",
+        ] {
+            assert_eq!(
+                parse_pi_usd_picos(text),
+                Err(PiCostParseError::Invalid),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn pi_cost_number_display_matches_realistic_decimal_strings() {
+        // Every pair has at most 15 significant digits. Include precision
+        // rounding and half-even ties as well as ordinary multi-dollar costs.
+        for (text, picos, rounded) in [
+            ("0.000123456789012", 123_456_789, true),
+            ("12.3456789", 12_345_678_900_000, false),
+            ("99999.999999", 99_999_999_999_000_000, false),
+            ("0.0000000000015", 2, true),
+            ("0.0000000000025", 2, true),
+            ("0.0000000000035", 4, true),
+        ] {
+            for raw in [serde_json::from_str::<Value>(text).unwrap(), json!(text)] {
+                let (costs, observations) = pi_usage_costs_with_observations(&json!({
+                    "cost": {"total": raw}
+                }));
+                assert_eq!(costs.total, Some(picos), "{raw}");
+                assert_eq!(observations.rounded, u64::from(rounded), "{raw}");
+                assert_eq!(observations.refused, 0, "{raw}");
+            }
+        }
+    }
+
+    #[test]
+    fn pi_cost_refuses_overflow_and_ceiling_excess_in_every_field() {
+        use crate::local_resource_diagnostics::cache_lifecycle;
+        for field in [
+            "total",
+            "input",
+            "output",
+            "cacheRead",
+            "cacheWrite",
+            "cache_read",
+            "cache_write",
+        ] {
+            for raw in [
+                serde_json::json!(1e30),
+                serde_json::json!("1e400"),
+                serde_json::json!("340282366920938463463374607431768211456e-40"),
+                serde_json::json!("100000.000000000001"),
+                serde_json::json!("100000.0000000000001"),
+            ] {
+                let event = serde_json::json!({"type": "message_end", "message": {
+                    "usage": {"input": 1, "cost": {field: raw}}
+                }});
+                let (costs, observations) =
+                    pi_usage_costs_with_observations(&event["message"]["usage"]);
+                assert!(!costs.reported, "{field}: {raw}");
+                assert_eq!(costs.snapshot_cost(), None);
+                assert_eq!(observations.refused, 1);
+                assert_eq!(observations.rounded, 0);
+                let (_, counts) = cache_lifecycle::observe(|| {
+                    // Repeated probes must not record extra observations.
+                    assert!(recognized_positive_usage_shape(SnapshotSource::Pi, &event));
+                    assert!(!recognized_usage_shape_was_dropped(
+                        SnapshotSource::Pi,
+                        &event
+                    ));
+                    apply_pi_line(&event, &mut SnapshotAccumulator::new(SnapshotSource::Pi));
+                });
+                assert_eq!(counts.pi_cost_refused_overflow, 1);
+                assert_eq!(counts.pi_cost_precision_rounded, 0);
+            }
+            let (costs, observations) = pi_usage_costs_with_observations(&serde_json::json!({
+                "cost": {field: 100_000}
+            }));
+            assert!(costs.reported);
+            assert_eq!(observations.refused, 0);
+        }
+        let (partial, observations) = pi_usage_costs_with_observations(&serde_json::json!({
+            "cost": {"total": "1e400", "input": "0.1"}
+        }));
+        assert_eq!(partial.total, None);
+        assert_eq!(partial.input, Some(100_000_000_000));
+        assert!(partial.reported);
+        assert_eq!(observations.refused, 1);
+    }
+
+    #[test]
+    fn pi_cost_sub_pico_precision_rounds_half_to_even_and_counts_each_field() {
+        use crate::local_resource_diagnostics::cache_lifecycle;
+        for (text, expected) in [
+            ("0.0000000000015", 2),
+            ("0.0000000000025", 2),
+            ("0.0000000000035", 4),
+            ("15e-13", 2),
+            ("25e-13", 2),
+            ("0.0000000000014", 1),
+            ("0.0000000000026", 3),
+            ("0.0000000000020", 2),
+            ("1e-400", 0),
+        ] {
+            assert_eq!(parse_pi_usd_picos(text), Ok((expected, true)), "{text}");
+            let usage = serde_json::json!({"input": 1, "cost": {
+                "total": text, "input": text, "output": text,
+                "cacheRead": text, "cacheWrite": text
+            }});
+            let (costs, observations) = pi_usage_costs_with_observations(&usage);
+            assert_eq!(
+                [
+                    costs.total,
+                    costs.input,
+                    costs.output,
+                    costs.cache_read,
+                    costs.cache_creation
+                ],
+                [Some(expected); 5]
+            );
+            assert_eq!(observations.rounded, 5);
+            let (_, counts) = cache_lifecycle::observe(|| {
+                for event in [
+                    serde_json::json!({"type": "message_end", "message": {"usage": usage}}),
+                    serde_json::json!({"type": "message", "message": {"role": "assistant", "usage": usage}}),
+                    serde_json::json!({"type": "usage", "usage": usage}),
+                    serde_json::json!({"type": "compaction", "usage": usage}),
+                    serde_json::json!({"type": "branch_summary", "usage": usage}),
+                ] {
+                    apply_pi_line(&event, &mut SnapshotAccumulator::new(SnapshotSource::Pi));
+                }
+            });
+            assert_eq!(counts.pi_cost_precision_rounded, 25);
+            assert_eq!(counts.pi_cost_refused_overflow, 0);
+        }
     }
 
     #[test]
