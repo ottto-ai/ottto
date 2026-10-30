@@ -3277,14 +3277,16 @@ fn corrected_family_counter_excludes_history_vetoed_literals() {
         let path = c.root.join(file(THIRD));
         assert!(prior.re_owe_effective_upload_body_witness_revision(
             path.to_string_lossy().as_ref(), 2));
-        // Unlisted ordinary context debt still parses locally when history
-        // is held. This is intentionally not a scoped REOWED acquisition:
-        // it exercises a successfully rebuilt literal that is later vetoed.
-        let mut page = crate::snapshots::e2_pipeline_scan_fixture::with_history_byte_limit(1, || {
-            c.raw(&E2ScanFixture::default(), prior, 100, false, &[])
-        });
+        // Read the owed member through the normal scanner, then use the
+        // production late telemetry hold. This isolates the counter's final
+        // emission decision from candidate-admission and page-budget rules.
+        let scanner = E2ScanFixture::default();
+        let mut page = c.raw(&scanner, prior, 100, false, &[]);
+        assert!(scanner.paths().contains(&path), "the owed member was actually read");
         page.scan.snapshots.retain(|item| item.source_session_id == THIRD);
         assert_eq!(page.scan.snapshots.len(), 1, "actual native read of the held member");
+        assert_eq!(page.index.hold_claude_history_for_unread_telemetry(), 1,
+            "one permitted owed member is now held by the production emission seam");
         e2::take_diag();
         page.enrich(&c);
         assert_eq!(page.released.removed_requests, 3, "the literal actually removed its proven prefix");
