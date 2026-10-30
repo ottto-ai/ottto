@@ -161,15 +161,29 @@ impl Stores {
     /// Funds `digest`'s debt node; never evicts another key's live custody.
     /// Idle diagnostic observations and expired pacing cannot deny capacity.
     pub(super) fn fund_debt(&mut self, digest: store::Digest32) -> Option<&mut KeyDebt> {
+        self.fund_debt_except(digest, &[])
+    }
+
+    /// Group preflight cannot reclaim another member's idle reservation.
+    /// Failure may leave idle nodes, but spends no Full allowance.
+    pub(super) fn fund_debts(&mut self, digests: &[store::Digest32]) -> bool {
+        digests
+            .iter()
+            .all(|digest| self.fund_debt_except(*digest, digests).is_some())
+    }
+
+    fn fund_debt_except(
+        &mut self,
+        digest: store::Digest32,
+        reserved: &[store::Digest32],
+    ) -> Option<&mut KeyDebt> {
         if !self.key_debt.contains_key(&digest) && self.key_debt.len() >= KEY_DEBT_KEYS {
             let now = std::time::SystemTime::now();
             #[cfg(test)]
             let now = self.retail_full_now.unwrap_or(now);
-            if let Some(idle) = self
-                .key_debt
-                .iter()
-                .find_map(|(key, debt)| debt.reclaimable(now).then_some(*key))
-            {
+            if let Some(idle) = self.key_debt.iter().find_map(|(key, debt)| {
+                (debt.reclaimable(now) && !reserved.contains(key)).then_some(*key)
+            }) {
                 let forgotten = self.key_debt.remove(&idle).expect("idle observation");
                 if forgotten.first_retire_held.is_some() {
                     self.counters.retire_exact_first_attempt_tracking_closed = true;

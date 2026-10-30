@@ -12916,6 +12916,24 @@ fn retired_missing_uses_shared_history_page_and_growth_pace() {
         let mut group_page = HistoryPage::default();
         assert!(group_page.reserve("ordinary-history", 1024 * 1024 * 1024 - 6));
         assert!(!cache.upgrade_group_full_allowed(source, &members, &index, &mut group_page));
+        // Live custody can leave room for one member but not the whole group.
+        // That refusal also preserves the first member's ordinary allowance.
+        if source == SnapshotSource::Codex {
+            let mut stores = cache.durable().unwrap();
+            for n in 0..store::MAX_RECORDS - 1 {
+                stores.set_owed(
+                    full_pace_key(source, &format!("live-custody-{n}")),
+                    owed::OwedMark::Owed(ds),
+                );
+            }
+            drop(stores);
+            assert!(!cache.upgrade_group_full_allowed(
+                source,
+                &members,
+                &index,
+                &mut HistoryPage::default()
+            ));
+        }
         let mut page = HistoryPage::default();
         assert!(cache.upgrade_full_allowed(source, &key, &file, &index, &mut page));
         assert!(!cache.upgrade_full_allowed(

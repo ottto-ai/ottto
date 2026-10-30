@@ -2701,36 +2701,69 @@ impl SharedCache {
         index: &ScanIndex,
         page: &mut HistoryPage,
     ) -> bool {
-        let files: Option<Vec<_>> = members
-            .iter()
-            .filter(|member| {
-                index
-                    .files
-                    .get(&local_index_key(&member.path))
-                    .is_some_and(|entry| member.size_bytes > entry.size_bytes)
-            })
-            .map(|member| {
-                Some((
-                    local_index_key(&member.path),
-                    File::open(&member.path).ok()?,
-                ))
-            })
-            .collect();
-        let Some(files) = files else {
-            return false;
-        };
         let mut reserved = page.clone();
-        if !files.iter().all(|(key, file)| {
-            self.upgrade_full_admission(source, key, file, index, &mut reserved, false)
+        let mut retired = Vec::new();
+        for member in members.iter().filter(|member| {
+            index
+                .files
+                .get(&local_index_key(&member.path))
+                .is_some_and(|entry| member.size_bytes > entry.size_bytes)
         }) {
+            let key = local_index_key(&member.path);
+            let Ok(file) = File::open(&member.path) else {
+                return false;
+            };
+            if !self.upgrade_full_admission(source, &key, &file, index, &mut reserved, false) {
+                return false;
+            }
+            if self
+                .missing_reduction_cause(source, &key)
+                .is_ok_and(|cause| cause == Some("repin"))
+            {
+                retired.push(key);
+            }
+        }
+        let digests: Vec<_> = retired
+            .iter()
+            .map(|key| full_pace_key(source, key))
+            .collect();
+        if !digests.is_empty()
+            && !self
+                .durable()
+                .is_some_and(|mut stores| stores.fund_debts(&digests))
+        {
             return false;
         }
-        if !files.iter().all(|(key, file)| {
-            self.upgrade_full_admission(source, key, file, index, &mut reserved, true)
-        }) {
+        // No input, file opens or other fallible admission remains between
+        // the all-member reservation and these ordinary paid-pace spends.
+        if !retired
+            .iter()
+            .all(|key| self.start_missing_full(source, key))
+        {
             return false;
         }
         *page = reserved;
+        true
+    }
+
+    fn start_missing_full(&self, source: SnapshotSource, key: &str) -> bool {
+        if !self
+            .durable()
+            .is_some_and(|mut stores| stores.fund_debt(full_pace_key(source, key)).is_some())
+            || !self.paced_with_cause(
+                source,
+                key,
+                SystemTime::now(),
+                (false, false, true),
+                Some(4),
+            )
+        {
+            return false;
+        }
+        if let Some(mut stores) = self.durable() {
+            stores.counters.upgrade_missing_full += 1;
+            Counters::bump(&mut stores.counters.resource_full, "repin");
+        }
         true
     }
 
@@ -2781,29 +2814,17 @@ impl SharedCache {
             {
                 return false;
             }
-            if !self
-                .durable()
-                .is_some_and(|mut stores| stores.fund_debt(full_pace_key(source, key)).is_some())
-            {
-                return false;
-            }
-            if !self.paced_with_cause(
-                source,
-                key,
-                SystemTime::now(),
-                (false, false, start),
-                Some(4),
-            ) {
-                return false;
-            }
-            if !start {
-                return true;
-            }
-            if let Some(mut stores) = self.durable() {
-                stores.counters.upgrade_missing_full += 1;
-                Counters::bump(&mut stores.counters.resource_full, "repin");
-            }
-            return true;
+            return if start {
+                self.start_missing_full(source, key)
+            } else {
+                self.paced_with_cause(
+                    source,
+                    key,
+                    SystemTime::now(),
+                    (false, false, false),
+                    Some(4),
+                )
+            };
         }
         if !start {
             return self.paced_with_cause(

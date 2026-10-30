@@ -1235,13 +1235,6 @@ fn receipted_locked(stores: &mut Stores, source: DurableSource, key: &str, recei
     let digest = store::key_digest(source, key);
     stores.release_hold(digest, HoldRelease::Write);
     stores.release_restore_pending(&digest, receipt.identity().certificate().length);
-    if stores
-        .key_debt
-        .get(&digest)
-        .is_some_and(|d| d.repin.is_some())
-    {
-        return;
-    }
     if source != DurableSource::ClaudeCode {
         return;
     }
