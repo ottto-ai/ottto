@@ -3894,6 +3894,12 @@ fn org_shares(item: &SnapshotItem) -> BTreeMap<String, u64> {
     shares
 }
 
+/// One `identity_cap` counter; the group and zero option-(ii) counters are
+/// omitted from the serialized counts.
+fn identity_count(counts: &serde_json::Value, key: &str) -> u64 {
+    counts["identity_cap"][key].as_u64().unwrap_or(0)
+}
+
 /// [money] SOURCE 2026-10-31 (#944 xPR F5) fixtures 1-3 and 5, in #909 and
 /// option (ii) modes. Switch OFF froze an own turn's org a copied prefix
 /// marker lent (X). Switch ON tombstones that row once, counted, and sends it
@@ -3902,29 +3908,7 @@ fn org_shares(item: &SnapshotItem) -> BTreeMap<String, u64> {
 /// marker in the invalidated row tags it fresh. Money never changes.
 #[test]
 fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
-    copy_lent_fixture(&[false, true], 6);
-}
-// DIAGNOSTIC (temporary): CI reports failing test names only. Stages 1-5
-// and the retained mode pass (run 41133168382); these probes read the #909
-// late phase's values, then fold back into the single test above.
-#[test]
-fn diag_copy_lent_late_909_body_present() { copy_lent_fixture(&[false], 10); }
-#[test]
-fn diag_copy_lent_late_909_share_changed_1() { copy_lent_fixture(&[false], 11); }
-#[test]
-fn diag_copy_lent_late_909_share_changed_0() { copy_lent_fixture(&[false], 12); }
-#[test]
-fn diag_copy_lent_late_909_share_changed_2() { copy_lent_fixture(&[false], 13); }
-#[test]
-fn diag_copy_lent_late_909_invalidated_null() { copy_lent_fixture(&[false], 14); }
-#[test]
-fn diag_copy_lent_late_909_refusals_1() { copy_lent_fixture(&[false], 15); }
-#[test]
-fn diag_copy_lent_late_909_refusals_0() { copy_lent_fixture(&[false], 16); }
-#[test]
-fn diag_copy_lent_late_909_refusals_2() { copy_lent_fixture(&[false], 17); }
-fn copy_lent_fixture(modes: &[bool], upto: u8) {
-    for &retained in modes {
+    for retained in [false, true] {
         with_e2(|| {
             use crate::snapshots::claude_request_identity::{take_identity_counts, AcceptedBuckets};
             let mut c = Corpus::new("e2-pipeline-copy-derived-identity");
@@ -3936,9 +3920,11 @@ fn copy_lent_fixture(modes: &[bool], upto: u8) {
             let [org_x, org_b] = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"];
             let marker = |org: &str| json!({"type":"attachment", "sessionId":COPY,
                 "attachment":{"type":"credential_org","organizationUuid":org}}).to_string() + "\n";
-            let switched = |org: &str| json!({"type":"attachment", "sessionId":COPY,
-                "attachment":{"type":"session_context", "context":{}}}).to_string() + "\n" + &marker(org);
-            let mut text = marker(org_x) + &resumed(COPY, &[A, C]) + &switched(org_b)
+            // A trusted org change needs a changed session_context digest.
+            let switched = |org: &str, email: &str| json!({"type":"attachment", "sessionId":COPY,
+                "attachment":{"type":"session_context", "context":{"userEmail":email}}}).to_string()
+                + "\n" + &marker(org);
+            let mut text = marker(org_x) + &resumed(COPY, &[A, C]) + &switched(org_b, "")
                 + &line_by(COPY, "own", "2026-08-02T08:10:00Z", 10, RESUME_WRITER);
             c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
             let [x, b] = [org_x, org_b].map(|org| ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap());
@@ -3958,7 +3944,6 @@ fn copy_lent_fixture(modes: &[bool], upto: u8) {
                 }
             };
             ack(&mut ledger, stored);
-            if upto == 1 { return; }
             // The 07:00 row X lent, the 08:00 row B proves, and money per row.
             let rows = |item: &SnapshotItem| item.usage_buckets.iter()
                 .map(|bucket| {
@@ -3974,7 +3959,6 @@ fn copy_lent_fixture(modes: &[bool], upto: u8) {
                 rows(body(&page, COPY).unwrap())
             };
             assert_eq!(today.iter().map(|row| row.4).collect::<Vec<_>>(), [false, true]);
-            if upto == 2 { return; }
             let pass = |c: &Corpus, ledger: &mut AcceptedBuckets| {
                 let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
                 take_identity_counts();
@@ -3982,10 +3966,8 @@ fn copy_lent_fixture(modes: &[bool], upto: u8) {
                 let copy = body(&page, COPY).expect("the own turns publish").clone();
                 let counts = serde_json::to_value(take_identity_counts()).unwrap();
                 assert_eq!(copy.request_identity_refusals, 0, "never a refusal");
-                // `identity_cap` and zero option-(ii) counters are omitted.
-                let count = |key: &str| counts["identity_cap"][key].as_u64().unwrap_or(0);
-                assert_eq!(count("accepted_share_changed"), 0);
-                (copy, count("copy_derived_proof_invalidated"))
+                assert_eq!(identity_count(&counts, "accepted_share_changed"), 0);
+                (copy, identity_count(&counts, "copy_derived_proof_invalidated"))
             };
             for once in [1, 0] {
                 let (copy, invalidated) = pass(&c, &mut ledger);
@@ -3996,12 +3978,11 @@ fn copy_lent_fixture(modes: &[bool], upto: u8) {
                     (&today[1].0, today[1].1, today[1].2, &today[1].3));
                 assert!(got[1].4 || got[1].5, "the row B proves keeps its accepted identity");
                 assert_eq!(org_shares(&copy).get(&x), None);
-                if upto == 3 || (upto == 4 && once == 0) { return; }
             }
             // The invalidated row reads as never accepted: own evidence tags it fresh.
             let (copy, _) = pass(&c, &mut ledger);
             ack(&mut ledger, &copy);
-            text += &switched(org_b);
+            text += &switched(org_b, "");
             text += &line_by(COPY, "own-early", "2026-08-02T07:05:00Z", 10, RESUME_WRITER);
             c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
             let (copy, invalidated) = pass(&c, &mut ledger);
@@ -4009,33 +3990,17 @@ fn copy_lent_fixture(modes: &[bool], upto: u8) {
             let row = &copy.usage_buckets[0].model_usage[0];
             assert!(!row.identity_retained && row.identity_parts.is_some(), "fresh own tags");
             assert_eq!(org_shares(&copy).get(&x), None);
-            if upto == 5 { return; }
             // A copied marker never lent B's row: its own later change is #909's.
-            text += &switched("33333333-3333-4333-8333-333333333333");
+            text += &switched("33333333-3333-4333-8333-333333333333", "late@example.invalid");
             text += &line_by(COPY, "own-late", "2026-08-02T08:20:00Z", 10, RESUME_WRITER);
             c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
             let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
             take_identity_counts();
             page.enrich_with(&c, Some(&mut ledger));
             let counts = serde_json::to_value(take_identity_counts()).unwrap();
-            let changed = counts["identity_cap"]["accepted_share_changed"].as_u64().unwrap_or(0);
-            let invalidated = counts["identity_cap"]["copy_derived_proof_invalidated"].is_null();
-            let refusals = body(&page, COPY).map(|copy| copy.request_identity_refusals);
-            match upto {
-                10 => assert!(refusals.is_some()),
-                11 => assert_eq!(changed, 1),
-                12 => assert_eq!(changed, 0),
-                13 => assert_eq!(changed, 2),
-                14 => assert!(invalidated),
-                15 => assert_eq!(refusals, Some(1)),
-                16 => assert_eq!(refusals, Some(0)),
-                17 => assert_eq!(refusals, Some(2)),
-                _ => {
-                    assert_eq!(changed, 1);
-                    assert!(invalidated);
-                    assert_eq!(refusals, Some(u64::from(!retained)));
-                }
-            }
+            assert_eq!(identity_count(&counts, "accepted_share_changed"), 1);
+            assert_eq!(identity_count(&counts, "copy_derived_proof_invalidated"), 0);
+            assert_eq!(body(&page, COPY).unwrap().request_identity_refusals, u64::from(!retained));
         });
     }
 }
