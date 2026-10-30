@@ -90,32 +90,93 @@ fn record_filters_ineligible_ports_seed_and_last_approved_and_deduplicates() {
     );
 }
 
+// Keep a real listener reserved across the busy -> primary -> retry steps.
+// Releasing an ephemeral port before reconcile lets another parallel test (or
+// an outbound connection) claim it before the native wildcard probes run.
+struct BindPlan {
+    port: u16,
+    results: std::collections::VecDeque<io::Result<TcpListener>>,
+}
+
+thread_local! {
+    static BIND_PLAN: std::cell::RefCell<Option<BindPlan>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn planned_bind(port: u16) -> Option<io::Result<TcpListener>> {
+    BIND_PLAN.with(|plan| {
+        let mut plan = plan.borrow_mut();
+        let plan = plan.as_mut()?;
+        assert_eq!(port, plan.port, "bind only the historical candidate");
+        Some(plan.results.pop_front().expect("unexpected bind attempt"))
+    })
+}
+
+fn with_bind_plan(plan: BindPlan, run: impl FnOnce()) {
+    struct Reset(Option<BindPlan>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BIND_PLAN.with(|plan| *plan.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(BIND_PLAN.with(|slot| slot.replace(Some(plan))));
+    run();
+    BIND_PLAN.with(|plan| {
+        assert!(
+            plan.borrow().as_ref().unwrap().results.is_empty(),
+            "every planned bind must be attempted"
+        );
+    });
+}
+
 #[test]
 fn busy_port_is_counted_untouched_and_retried_and_primary_is_excluded() {
     let (_dir, mut supervisor) = scratch();
     let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = busy.local_addr().unwrap().port();
-    supervisor
-        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
-        .unwrap();
-    assert!(supervisor.open.is_empty());
-    assert_eq!(supervisor.counters.bind_skipped.load(Ordering::Relaxed), 1);
-    assert_eq!(supervisor.record.ports[0].idle_since, Some(100));
-    drop(busy);
-    supervisor
-        .reconcile_current(160, Some(APPROVED), port, &[APPROVED, port], &[port])
-        .unwrap();
-    assert!(supervisor.open.is_empty(), "primary port is never opened");
-    supervisor
-        .reconcile_current(220, Some(APPROVED), 0, &[APPROVED, port], &[port])
-        .unwrap();
-    assert_eq!(supervisor.open.len(), 1);
-    assert_eq!(supervisor.counters.open.load(Ordering::Relaxed), 1);
-    assert_eq!(supervisor.record.ports[0].idle_since, Some(100));
-    let counters = supervisor.counters.clone();
-    drop(supervisor);
-    assert_eq!(counters.open.load(Ordering::Relaxed), 0);
-    assert_eq!(counters.closed.load(Ordering::Relaxed), 1);
+    busy.set_nonblocking(true).unwrap();
+    // Obtain the real native busy error while the owner is still listening.
+    // Bypass the test plan when exercising the wildcard/loopback probes.
+    let busy_error = socket::bind_with_probe(port, socket::bind_ipv6_wildcard).unwrap_err();
+    assert_eq!(busy_error.kind(), io::ErrorKind::AddrInUse);
+    let plan = BindPlan {
+        port,
+        results: [Err(busy_error), Ok(busy)].into(),
+    };
+    // Transfer the held listener on retry instead of releasing its port and
+    // racing other ephemeral allocations. The primary step must not bind.
+    with_bind_plan(plan, || {
+        supervisor
+            .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+            .unwrap();
+        assert!(supervisor.open.is_empty());
+        assert_eq!(supervisor.counters.bind_skipped.load(Ordering::Relaxed), 1);
+        assert_eq!(supervisor.record.ports[0].idle_since, Some(100));
+        supervisor
+            .reconcile_current(160, Some(APPROVED), port, &[APPROVED, port], &[port])
+            .unwrap();
+        assert!(supervisor.open.is_empty(), "primary port is never opened");
+        supervisor
+            .reconcile_current(220, Some(APPROVED), 0, &[APPROVED, port], &[port])
+            .unwrap();
+        assert_eq!(supervisor.open.len(), 1);
+        assert_eq!(supervisor.counters.open.load(Ordering::Relaxed), 1);
+        assert_eq!(supervisor.record.ports[0].idle_since, Some(100));
+        assert_eq!(
+            supervisor.open[&port]
+                .listener
+                .as_ref()
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port(),
+            port
+        );
+        assert_eq!(supervisor.counters.bind_skipped.load(Ordering::Relaxed), 1);
+        let counters = supervisor.counters.clone();
+        drop(supervisor);
+        assert_eq!(counters.open.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.closed.load(Ordering::Relaxed), 1);
+    });
 }
 
 #[test]
@@ -1014,14 +1075,23 @@ fn empty_supervisor_waits_until_tick_and_live_socket_drains_sixteen_at_once() {
         supervisor.wait_duration(100, 160),
         Duration::from_millis(100)
     );
-    let clients: Vec<_> = (0..18)
+    // A handshake can finish after `connect` returns and one pass takes only
+    // what is queued, so the clients outnumber the pass bound by a margin and
+    // the rest are drained within a bounded moment.
+    let clients: Vec<_> = (0..32)
         .map(|_| TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap())
         .collect();
     let mut accepted = 0;
     supervisor.accept_ready(Instant::now(), |_, _| accepted += 1);
     assert_eq!(accepted, 16);
-    supervisor.accept_ready(Instant::now(), |_, _| accepted += 1);
-    assert_eq!(accepted, 18);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while accepted < clients.len() && Instant::now() < deadline {
+        let before = accepted;
+        supervisor.accept_ready(Instant::now(), |_, _| accepted += 1);
+        assert!(accepted - before <= 16);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(accepted, clients.len());
     drop(clients);
     supervisor.close_all();
     assert_eq!(supervisor.wait_duration(110, 160), Duration::from_secs(50));

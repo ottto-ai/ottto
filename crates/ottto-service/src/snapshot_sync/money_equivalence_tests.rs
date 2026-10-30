@@ -1664,22 +1664,36 @@ fn pi_divergent_pair_quarantine() {
     }
 }
 
-#[test]
-fn pi_no_response_id() {
+fn pi_usage_case(name: &str) {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_no_response_id") {
+    if !supported(name) {
         return;
     }
-    let mut turn = pi_turn("message", None, 20, "2026-10-27T06:01:00Z");
-    turn["message"]["provider"] = json!("google");
-    turn["message"]["model"] = json!("gemini-2.5-flash");
-    let scan = pi_splits(
-        "pi_no_response_id",
-        &(pi_seed() + &pi_json(turn.clone())),
-        vec![turn.clone(), turn],
-        4,
-    );
-    assert_eq!(scan.snapshots[0].input_tokens, 70);
+    let (response, input, repeats, requests, tokens) = match name {
+        "pi_no_response_id" => (None, 20, 2, 4, 70),
+        "pi_error_zero_requests" => (Some("synthetic-error"), 0, 1, 1, 10),
+        _ => panic!("unknown Pi usage row: {name}"),
+    };
+    let mut prefix = pi_seed();
+    let mut turn = pi_turn("message", response, input, "2026-10-27T06:01:00Z");
+    if response.is_none() {
+        turn["message"]["provider"] = json!("google");
+        turn["message"]["model"] = json!("gemini-2.5-flash");
+        prefix += &pi_json(turn.clone());
+    } else {
+        turn["message"]["stopReason"] = json!("error");
+        turn["message"]["errorMessage"] = json!("Synthetic provider error.");
+        turn["message"]["usage"] = json!({"input":0,"output":0,"cacheRead":0,"cacheWrite":0,
+            "totalTokens":0,"cost":{"total":0}});
+    }
+    let scan = pi_splits(name, &prefix, vec![turn; repeats], requests);
+    assert_eq!(scan.snapshots[0].input_tokens, tokens, "{name}");
+}
+
+/// [money] Missing response IDs must retain every billable occurrence.
+#[test]
+fn pi_no_response_id() {
+    pi_usage_case("pi_no_response_id");
 }
 
 #[test]
@@ -1764,24 +1778,10 @@ fn pi_time_and_invalid_evidence() {
     assert_eq!(scan.dropped_usage_record_count, 1);
 }
 
+/// [money] A zero-usage error must not add a billable request.
 #[test]
 fn pi_error_zero_requests() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_error_zero_requests") {
-        return;
-    }
-    let mut error = pi_turn(
-        "message",
-        Some("synthetic-error"),
-        0,
-        "2026-10-27T06:01:00Z",
-    );
-    error["message"]["stopReason"] = json!("error");
-    error["message"]["errorMessage"] = json!("Synthetic provider error.");
-    error["message"]["usage"] = json!({"input":0,"output":0,"cacheRead":0,"cacheWrite":0,
-        "totalTokens":0,"cost":{"total":0}});
-    let scan = pi_splits("pi_error_zero_requests", &pi_seed(), vec![error], 1);
-    assert_eq!(scan.snapshots[0].input_tokens, 10);
+    pi_usage_case("pi_error_zero_requests");
 }
 
 #[test]
@@ -1835,68 +1835,129 @@ fn pi_cli_fork_preserves_double_count() {
     proof.finish(&c, &disk);
 }
 
-#[test]
-fn pi_version_rewrite_after_tail() {
+fn pi_lifecycle_case(name: &str) {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_version_rewrite_after_tail") {
+    if !supported(name) {
         return;
     }
-    let initial = pi_seed().replacen("\"version\":3", "\"version\":1", 1);
-    let (c, disk, path, scanner, prior, mut proof) =
-        pi_disk_corpus("pi_version_rewrite_after_tail", &initial);
-    pi_grow(
-        &path,
-        pi_turn(
-            "message",
-            Some("before-migration"),
-            20,
-            "2026-10-27T06:01:00Z",
+    let (rewrite, downgrade, turns): (bool, bool, &[(&str, u64, &str)]) = match name {
+        "pi_upgrade_without_semantic_revision" => (
+            false,
+            false,
+            &[("upgrade-growth", 20, "2026-10-27T06:01:00Z")],
         ),
-    );
-    let restart = disk.owner(SnapshotSource::Pi);
-    let ([tail, full, mut restored], _) = pi_pages(
-        &mut proof,
-        &c,
-        &scanner,
-        &restart,
-        [prior.clone(), prior.clone(), prior],
-        (0, 1, 0),
-        (0, 1, 0),
-        1,
-    );
-    let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
-    let mut migrated =
-        std::fs::read_to_string(&path)
-            .unwrap()
-            .replacen("\"version\":1", "\"version\":3", 1);
-    migrated += &pi_json(pi_turn(
-        "message",
-        Some("after-migration"),
-        30,
-        "2026-10-27T06:02:00Z",
-    ));
-    let before = std::fs::metadata(&path).unwrap();
-    std::fs::write(&path, migrated).unwrap();
-    input_clock(&path);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        assert_eq!(before.ino(), std::fs::metadata(&path).unwrap().ino());
+        "pi_downgrade_then_reupgrade" => (
+            false,
+            true,
+            &[
+                ("reupgrade-growth", 30, "2026-10-27T06:02:00Z"),
+                ("next-restart", 40, "2026-10-27T06:03:00Z"),
+            ],
+        ),
+        "pi_version_rewrite_after_tail" => (
+            true,
+            false,
+            &[
+                ("before-migration", 20, "2026-10-27T06:01:00Z"),
+                ("after-migration", 30, "2026-10-27T06:02:00Z"),
+            ],
+        ),
+        _ => panic!("unknown Pi lifecycle row: {name}"),
+    };
+    let initial = if rewrite {
+        pi_seed().replacen("\"version\":3", "\"version\":1", 1)
+    } else {
+        pi_seed()
+    };
+    let (c, disk, path, mut scanner, prior, mut proof) = pi_disk_corpus(name, &initial);
+    let mut priors = if downgrade {
+        drop(scanner);
+        scanner = E2ScanFixture::default();
+        pi_grow(
+            &path,
+            pi_turn(
+                "message",
+                Some("downgrade-growth"),
+                20,
+                "2026-10-27T06:01:00Z",
+            ),
+        );
+        let (mut down, scan, mode) = other_page(&c, &scanner, SnapshotSource::Pi, prior);
+        assert_eq!(
+            mode,
+            if proof.sampled { (1, 0, 0) } else { (0, 0, 0) },
+            "{name}"
+        );
+        proof.capture(&scan);
+        down.save(&disk.index).unwrap();
+        let committed = ScanIndex::load(&disk.index).unwrap();
+        assert_eq!(disk.records(), usize::from(proof.durable), "{name}");
+        [committed.clone(), committed.clone(), committed]
+    } else if rewrite {
+        [prior.clone(), prior.clone(), prior]
+    } else {
+        disk.begin(&scanner, SnapshotSource::Pi);
+        let (mut quiet, _, mode) = other_page(&c, &scanner, SnapshotSource::Pi, prior.clone());
+        assert_eq!(mode.0 + mode.1, 0, "{name}");
+        let committed = disk.commit(&scanner.cache, SnapshotSource::Pi, &mut quiet);
+        assert!(committed.generation > prior.generation, "{name}");
+        [committed.clone(), committed.clone(), committed]
+    };
+    for (step, &(response, input, at)) in turns.iter().enumerate() {
+        let turn = pi_turn("message", Some(response), input, at);
+        let migrating = rewrite && step == 1;
+        if migrating {
+            let mut migrated = std::fs::read_to_string(&path).unwrap().replacen(
+                "\"version\":1",
+                "\"version\":3",
+                1,
+            );
+            migrated += &pi_json(turn);
+            let before = std::fs::metadata(&path).unwrap();
+            std::fs::write(&path, migrated).unwrap();
+            input_clock(&path);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(
+                    before.ino(),
+                    std::fs::metadata(&path).unwrap().ino(),
+                    "{name}"
+                );
+            }
+            assert!(
+                std::fs::metadata(&path).unwrap().len() > before.len(),
+                "{name}"
+            );
+        } else {
+            pi_grow(&path, turn);
+        }
+        let restart = disk.owner(SnapshotSource::Pi);
+        let ram_mode = if migrating { (1, 0, 0) } else { (0, 1, 0) };
+        let (disk_mode, restores) = if migrating {
+            ((1, 0, 0), 0)
+        } else {
+            ((0, 1, 0), 1)
+        };
+        let ([tail, full, mut restored], scan) = pi_pages(
+            &mut proof, &c, &scanner, &restart, priors, ram_mode, disk_mode, restores,
+        );
+        if migrating {
+            assert_eq!(scan.snapshots[0].request_count, 3, "{name}");
+        }
+        if step + 1 == turns.len() {
+            break;
+        }
+        let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
+        priors = [tail, full, next];
     }
-    assert!(std::fs::metadata(&path).unwrap().len() > before.len());
-    let restart = disk.owner(SnapshotSource::Pi);
-    let (_, scan) = pi_pages(
-        &mut proof,
-        &c,
-        &scanner,
-        &restart,
-        [tail, full, next],
-        (1, 0, 0),
-        (1, 0, 0),
-        0,
-    );
-    assert_eq!(scan.snapshots[0].request_count, 3);
     proof.finish(&c, &disk);
+}
+
+/// [money] A version rewrite after Tail must reacquire Full without double billing.
+#[test]
+fn pi_version_rewrite_after_tail() {
+    pi_lifecycle_case("pi_version_rewrite_after_tail");
 }
 
 #[test]
@@ -1916,105 +1977,16 @@ fn pi_restart_between_pages() {
     );
 }
 
+/// [money] An index-only upgrade must preserve emitted usage across restart.
 #[test]
 fn pi_upgrade_without_semantic_revision() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_upgrade_without_semantic_revision") {
-        return;
-    }
-    let (c, disk, path, scanner, prior, mut proof) =
-        pi_disk_corpus("pi_upgrade_without_semantic_revision", &pi_seed());
-    disk.begin(&scanner, SnapshotSource::Pi);
-    let (mut quiet, _, mode) = other_page(&c, &scanner, SnapshotSource::Pi, prior.clone());
-    assert_eq!(mode.0 + mode.1, 0);
-    let committed = disk.commit(&scanner.cache, SnapshotSource::Pi, &mut quiet);
-    assert!(committed.generation > prior.generation);
-    pi_grow(
-        &path,
-        pi_turn(
-            "message",
-            Some("upgrade-growth"),
-            20,
-            "2026-10-27T06:01:00Z",
-        ),
-    );
-    let upgraded = disk.owner(SnapshotSource::Pi);
-    pi_pages(
-        &mut proof,
-        &c,
-        &scanner,
-        &upgraded,
-        [committed.clone(), committed.clone(), committed],
-        (0, 1, 0),
-        (0, 1, 0),
-        1,
-    );
-    proof.finish(&c, &disk);
+    pi_lifecycle_case("pi_upgrade_without_semantic_revision");
 }
 
+/// [money] Downgrade and reupgrade must preserve each arm's committed usage.
 #[test]
 fn pi_downgrade_then_reupgrade() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_downgrade_then_reupgrade") {
-        return;
-    }
-    let (c, disk, path, _, prior, mut proof) =
-        pi_disk_corpus("pi_downgrade_then_reupgrade", &pi_seed());
-    let downgraded = E2ScanFixture::default();
-    pi_grow(
-        &path,
-        pi_turn(
-            "message",
-            Some("downgrade-growth"),
-            20,
-            "2026-10-27T06:01:00Z",
-        ),
-    );
-    let (mut down, scan, mode) = other_page(&c, &downgraded, SnapshotSource::Pi, prior);
-    assert_eq!(mode, if proof.sampled { (1, 0, 0) } else { (0, 0, 0) });
-    proof.capture(&scan);
-    down.save(&disk.index).unwrap();
-    let committed = ScanIndex::load(&disk.index).unwrap();
-    assert_eq!(disk.records(), usize::from(proof.durable));
-    pi_grow(
-        &path,
-        pi_turn(
-            "message",
-            Some("reupgrade-growth"),
-            30,
-            "2026-10-27T06:02:00Z",
-        ),
-    );
-    // Format 3 preserves this valid prefix across the index-only downgrade.
-    // The appended suffix catches up with the accepted extent by Tail.
-    let reupgraded = disk.owner(SnapshotSource::Pi);
-    let ([tail, full, mut restored], _) = pi_pages(
-        &mut proof,
-        &c,
-        &downgraded,
-        &reupgraded,
-        [committed.clone(), committed.clone(), committed],
-        (0, 1, 0),
-        (0, 1, 0),
-        1,
-    );
-    let next = disk.commit(&reupgraded.cache, SnapshotSource::Pi, &mut restored);
-    pi_grow(
-        &path,
-        pi_turn("message", Some("next-restart"), 40, "2026-10-27T06:03:00Z"),
-    );
-    let restart = disk.owner(SnapshotSource::Pi);
-    pi_pages(
-        &mut proof,
-        &c,
-        &downgraded,
-        &restart,
-        [tail, full, next],
-        (0, 1, 0),
-        (0, 1, 0),
-        1,
-    );
-    proof.finish(&c, &disk);
+    pi_lifecycle_case("pi_downgrade_then_reupgrade");
 }
 
 #[cfg(unix)]

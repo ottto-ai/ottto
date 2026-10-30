@@ -102,7 +102,10 @@ pub(crate) fn layout_supported() -> bool {
     if FORCE_UNSUPPORTED_LAYOUT.with(std::cell::Cell::get) {
         return false;
     }
-    cfg!(target_os = "macos")
+    // Linux unit-test builds use the same std container layouts on the same
+    // 64-bit toolchain, so PR checks run the shipped macOS path. Non-test
+    // Linux builds keep refusing.
+    (cfg!(target_os = "macos") || cfg!(all(test, target_os = "linux")))
         && cfg!(target_pointer_width = "64")
         && compiler_layout_supported(env!("OTTTO_SCAN_LAYOUT_RUSTC"))
 }

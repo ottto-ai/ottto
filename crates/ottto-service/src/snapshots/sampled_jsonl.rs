@@ -558,20 +558,6 @@ impl OwnedJsonlParser {
         record(Event::RetentionBoundRefused);
         if self.source == SnapshotSource::Pi {
             record(Event::RetentionBoundRefusedPi);
-            let bytes = crate::heap_layout_bound::completed_bound(&self.accumulator, usize::MAX)
-                .and_then(|n| {
-                    n.checked_add(
-                        std::mem::size_of::<CachedJsonlReduction>()
-                            - std::mem::size_of::<SnapshotAccumulator>(),
-                    )
-                });
-            if bytes.is_none() {
-                record(Event::RetentionBoundRefusedPiBytesUnavailable);
-            }
-            crate::local_resource_diagnostics::cache_lifecycle::add(
-                Event::RetentionBoundRefusedPiBytes,
-                bytes.unwrap_or(0) as u64,
-            );
         }
     }
 

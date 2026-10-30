@@ -296,7 +296,10 @@ fn restart_full_alarm_fires_on_the_first_file_once_per_process() {
 /// A failed rename preserves A; without the quiet-RAM repair, restart must
 /// refuse A and count the actual Full. The healthy control restores a Tail.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS retained layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS retained layout"
+)]
 fn failed_write_after_save_costs_one_counted_full_after_restart() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for fail in [true, false] {

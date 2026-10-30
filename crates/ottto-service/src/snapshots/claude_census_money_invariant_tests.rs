@@ -325,12 +325,17 @@ fn money_transcript_records_retire_after_35_days() {
         assert_eq!(record.retired_for_test(), Some(3), "{name}");
         assert!(record.request_hashes_for_test().is_empty(), "{name}");
     }
-    for name in ["young", "dirty", "legacy_young"] {
+    // Kept records retain exactly their own ids (the record seeds above).
+    for (name, record_seed) in [("young", 'b'), ("dirty", 'd'), ("legacy_young", 'f')] {
         let record = census
             .record_for_test(&format!("/money/projects/{name}.jsonl"))
             .unwrap();
         assert_eq!(record.retired_for_test(), None, "{name}");
-        assert_eq!(record.request_hashes_for_test().len(), 3, "{name}");
+        assert_eq!(
+            record.request_hashes_for_test(),
+            distinct_hashes(record_seed).as_slice(),
+            "{name}"
+        );
     }
     assert_eq!(census.hash_total_for_test(), 9);
 }

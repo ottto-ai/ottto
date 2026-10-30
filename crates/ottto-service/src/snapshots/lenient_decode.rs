@@ -336,7 +336,6 @@ impl Serialize for ScanIndex {
             claude_money_birth_store,
             claude_money_birth_store::BirthStore::is_empty
         );
-        field!(claude_desktop_store_inventory, Option::is_none);
         map.end()
     }
 }
@@ -428,7 +427,7 @@ pub(super) const FIELDS: &[&str] = &[
     "upload_ack_retirement_handoff",
     "held_audit_progress",
     "claude_money_birth_store",
-    "claude_desktop_store_inventory",
+    "claude_desktop_store_inventory", // Decoded and ignored; never serialized.
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1614,6 +1613,12 @@ impl<R: BufRead + Seek> Decoder<R> {
                     self.family_spans.insert(name, value);
                 }
                 if !seen.insert(name) {
+                    if name == "claude_desktop_store_inventory" && pass == Pass::Full {
+                        with_claude_absence_counters(|counts| {
+                            counts.tombstone_decode_drops =
+                                counts.tombstone_decode_drops.saturating_add(1);
+                        });
+                    }
                     if name == "claude_request_census" {
                         index.claude_request_census = ClaudeRequestCensus::default();
                     } else if name == "claude_request_census_shadow" {
@@ -1621,7 +1626,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                             ClaudeRequestCensusShadowState::default();
                     } else if name == "reread_guard" {
                         index.o3_replay = upgrade_replay::State::refused();
-                    } else {
+                    } else if name != "claude_desktop_store_inventory" {
                         return Err(Error::Refused("duplicate index field"));
                     }
                 } else {
@@ -1642,6 +1647,24 @@ impl<R: BufRead + Seek> Decoder<R> {
                                 } else {
                                     self.history_scalar(value, upgrade_replay::State::refused())?
                                 };
+                        }
+                        "claude_desktop_store_inventory" => {
+                            // No new refusal: this key was unknown to the last
+                            // release. A digest is 64 bytes plus its quotes, so
+                            // nothing wider is buffered; a bad value is dropped.
+                            let inventory: Option<String> = if value.len > 66 {
+                                Some(String::new())
+                            } else {
+                                self.history_scalar(value, Some(String::new()))?
+                            };
+                            if inventory.as_ref().is_some_and(|digest| digest.len() != 64) {
+                                with_claude_absence_counters(|counts| {
+                                    counts.tombstone_decode_drops =
+                                        counts.tombstone_decode_drops.saturating_add(1);
+                                });
+                            } else {
+                                index.claude_desktop_store_inventory = inventory;
+                            }
                         }
                         "upload_ack_retirement_handoff" => {
                             // Damaged cleanup authority delays retirement; it must
@@ -1837,9 +1860,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "claude_desktop_store_cursor" => {
                             index.claude_desktop_store_cursor = self.typed(value)?
-                        }
-                        "claude_desktop_store_inventory" => {
-                            index.claude_desktop_store_inventory = self.typed(value)?
                         }
                         "claude_desktop_store_upper_bound" => {
                             index.claude_desktop_store_upper_bound = self.typed(value)?

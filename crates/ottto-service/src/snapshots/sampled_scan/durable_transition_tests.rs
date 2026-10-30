@@ -641,28 +641,36 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
         assert!(
             !fixture::accepted_fingerprints(&attempt.index).contains(&root.snapshot_fingerprint)
         );
+        let sibling_item = attempt
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == SIBLING)
+            .unwrap();
         let mut progress = e2_progress();
         let mut initial_posts = 0;
-        let (status, batches, _) = upload(&attempt.scan.snapshots, &mut progress, |items| {
-            initial_posts += 1;
-            let mut response = ack(items)?;
-            let at = response
-                .accepted_entities
-                .iter()
-                .position(|entity| entity.source_session_id == ROOT)
-                .unwrap();
-            let mut unacked = response.accepted_entities.remove(at);
-            response.accepted -= 1;
-            unacked.head_etag = None;
-            response.conflict_entities.push(unacked);
-            Ok(response)
-        });
+        // ACK the sibling through the native uploader, then fail the root's
+        // POST before any response/ACK. A conflict would instead checkpoint
+        // retryable quarantine and legitimately defer the identical body.
+        let (status, mut batches, _) =
+            upload(std::slice::from_ref(sibling_item), &mut progress, |items| {
+                initial_posts += 1;
+                ack(items)
+            });
+        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+        let (status, failed_batches, _) =
+            upload(std::slice::from_ref(&root), &mut progress, |_| {
+                initial_posts += 1;
+                Err(anyhow::anyhow!("synthetic unACKed transport failure"))
+            });
         assert_eq!(
-            status.unwrap(),
-            ResumableUploadResult::Deferred { count: 1 }
+            status.unwrap_err().to_string(),
+            "synthetic unACKed transport failure"
         );
-        assert_eq!(initial_posts, 1);
+        batches.extend(failed_batches);
+        assert_eq!(initial_posts, 2);
         assert_eq!(progress.accepted_fingerprints.len(), 1);
+        assert!(progress.quarantined_fingerprints.is_empty());
         assert!(!progress
             .accepted_fingerprints
             .contains(&root.snapshot_fingerprint));
@@ -677,13 +685,26 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
             &progress.accepted_fingerprints,
             &progress.quarantined_fingerprints,
         );
-        partial.mark_bounded_sweep_unsettled_by(
-            crate::snapshots::UnsettledUploadCause::DeferredConflict,
-        );
+        partial
+            .mark_bounded_sweep_unsettled_by(crate::snapshots::UnsettledUploadCause::UploadError);
+        // Native rollback retains every committed entry field except the
+        // carried source-audit debt; that debt grants no delivery acceptance.
+        let retained = serde_json::to_value(&partial.files[&key]).unwrap();
+        let previous = serde_json::to_value(&attempt.committed.files[&key]).unwrap();
         assert_eq!(
-            serde_json::to_value(&partial.files[&key]).unwrap(),
-            serde_json::to_value(&attempt.committed.files[&key]).unwrap()
+            retained.as_object().unwrap().len(),
+            previous.as_object().unwrap().len()
         );
+        for (field, value) in previous.as_object().unwrap() {
+            if field != "scan_identity_version" {
+                assert_eq!(&retained[field], value, "unACKed root/{field}");
+            }
+        }
+        assert_eq!(
+            retained["scan_identity_version"],
+            serde_json::to_value(&attempt.index.files[&key]).unwrap()["scan_identity_version"]
+        );
+        assert_eq!(partial.file_snapshot_fingerprints[&key], prior_root_acks);
         assert_eq!(
             serde_json::to_value(&partial.files[&sibling_key]).unwrap(),
             serde_json::to_value(&attempt.index.files[&sibling_key]).unwrap()
@@ -711,8 +732,12 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
         cold_page.finish();
         assert_eq!(cold_page.scan.snapshots.len(), 1);
         assert_eq!(cold_page.scan.snapshots[0].source_session_id, ROOT);
-        let (status, batches, _) = upload(&cold_page.scan.snapshots, &mut e2_progress(), ack);
+        let mut cold_progress = e2_progress();
+        let (status, batches, _) = upload(&cold_page.scan.snapshots, &mut cold_progress, ack);
         assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+        cold_page
+            .index
+            .record_accepted_snapshot_fingerprints(&cold_progress.accepted_fingerprints);
         let cold = RouteResult::emitted(Mode::ColdFull, SOURCE, batches, &cold_page.scan.snapshots);
 
         // Native RAM re-scan starts at the actual saved partial generation;
@@ -750,6 +775,24 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
             .disk
             .commit(&retry_page.cache, SOURCE, &mut retry_page.index);
         assert!(fixture::accepted_fingerprints(&f.prior).contains(&root.snapshot_fingerprint));
+
+        // A newly ACKed retry advances the native group to the resent body.
+        // Its complete accepted ledger/group/witness, exact file membership
+        // and revision must equal an independent cold ACK of that same body.
+        for key in [&key, &sibling_key] {
+            assert_eq!(
+                NativeAcceptedState::of(&f.prior, key),
+                NativeAcceptedState::of(&cold_page.index, key)
+            );
+            assert_eq!(
+                f.prior.file_snapshot_fingerprints[key],
+                cold_page.index.file_snapshot_fingerprints[key]
+            );
+            assert_eq!(
+                f.prior.files[key].effective_upload_body_witness_revision,
+                cold_page.index.files[key].effective_upload_body_witness_revision
+            );
+        }
 
         let committed = [&key, &sibling_key].map(|key| NativeAcceptedState::of(&f.prior, key));
         let mut quiet_prior = f.prior.clone();

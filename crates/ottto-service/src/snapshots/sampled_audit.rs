@@ -1612,14 +1612,7 @@ mod absence_tests {
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "ottto-audit-absence-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
+            let root = crate::test_scratch::unique_path("ottto-audit-absence");
             fs::create_dir(&root).unwrap();
             Self(root)
         }

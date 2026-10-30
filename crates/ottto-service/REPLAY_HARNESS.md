@@ -95,7 +95,7 @@ The CI-speed owner approved the separate `.github/workflows/replay-harness.yml`
 workflow. It runs on path-filtered PRs, nightly on main at 03:30 UTC, and manual
 dispatch. It has no push/merge-group trigger and is advisory, non-required and
 Linux-only. Its own `replay-harness-linux` cache restores on PRs and saves only
-on main; concurrency is per ref with cancellation for PRs. Default Linux tests
+on main, also when a replay test fails once both test binaries built; concurrency is per ref with cancellation for PRs. Default Linux tests
 and release/default features are unchanged. Both feature commands run even if
 one fails, and either failure fails the workflow:
 

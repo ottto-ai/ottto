@@ -79,8 +79,6 @@ counters! {
     retention_incompatible: RetentionIncompatible,
     retention_bound_refused: RetentionBoundRefused,
     retention_bound_refused_pi: RetentionBoundRefusedPi,
-    retention_bound_refused_pi_bytes: RetentionBoundRefusedPiBytes,
-    retention_bound_refused_pi_bytes_unavailable: RetentionBoundRefusedPiBytesUnavailable,
     retention_no_plan: RetentionNoPlan,
     retention_unsealed_eof: RetentionUnsealedEof,
     retention_clone_bound_refused: RetentionCloneBoundRefused,
@@ -89,6 +87,9 @@ counters! {
     // SOURCE (B): fixed content-free totals, never per-file history.
     prefix_excluded_bodies: PrefixExcludedBody,
     prefix_tag_clears: PrefixTagCleared,
+    // Pi source-field parsing observations, independent of retention decisions.
+    pi_cost_refused_overflow: PiCostRefusedOverflow,
+    pi_cost_precision_rounded: PiCostPrecisionRounded,
 }
 
 pub(crate) fn add(event: Event, amount: u64) {

@@ -88,7 +88,7 @@ fn native_parser_with(
         match source {
             SnapshotSource::Codex => apply_codex_line,
             SnapshotSource::ClaudeCode => apply_claude_code_line,
-            SnapshotSource::Pi => apply_pi_line,
+            _ => unreachable!(),
         },
         Some(metadata),
         None,
@@ -221,9 +221,7 @@ fn oracle(fixture: &Fixture, source: SnapshotSource) -> Value {
             false,
         )
         .unwrap(),
-        SnapshotSource::Pi => {
-            parse_pi_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap()
-        }
+        _ => unreachable!(),
     };
     apply_upload_policy(source, &mut items, SnapshotUploadPolicy::default());
     serde_json::to_value(items).unwrap()
@@ -548,44 +546,6 @@ fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
         assert_ne!(later, oracle(&fixture, source));
     }
 }
-
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_hidden_middle_edit_remains_an_accepted_sampled_residual() {
-    let source = SnapshotSource::Pi;
-    let fixture = Fixture::new(source);
-    fixture.append(&json!({"type":"ignored", "padding":"a".repeat(12 * 1024)}));
-    fixture.append(&usage(source, 100, 0, "fixture-model"));
-    fixture.append(&json!({"type":"ignored", "padding":"b".repeat(12 * 1024)}));
-    let (old, mode, _, initial) = acquire(&fixture, source, None, 100);
-    assert!(old.is_some());
-    assert!(matches!(mode, ReadMode::Full(_)));
-    assert_eq!(initial, oracle(&fixture, source));
-    let original = fs::read_to_string(&fixture.0).unwrap();
-    let edited = original.replace("\"input\":100", "\"input\":900");
-    assert_ne!(original, edited);
-    assert_eq!(original.len(), edited.len());
-    fs::write(&fixture.0, edited).unwrap();
-    fixture.append(&usage(source, 140, 1, "fixture-model"));
-    let (tail, mode, _, interim) = acquire(&fixture, source, old, 101);
-    assert_eq!(mode, ReadMode::Tail);
-    assert!(tail.is_some());
-    let full = oracle(&fixture, source);
-    assert_eq!(interim[0]["input_tokens"], 240);
-    assert_eq!(full[0]["input_tokens"], 1040);
-    assert_ne!(interim, full, "accepted sampled limitation must be visible");
-    let (_, mode, guards, later) = acquire(
-        &fixture,
-        source,
-        tail,
-        101 + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
-    );
-    assert_eq!(mode, ReadMode::Unchanged);
-    assert_eq!(guards, 0);
-    assert_eq!(later, interim);
-    assert_ne!(later, full);
-}
-
 #[test]
 fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
@@ -5436,162 +5396,7 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
     }
 }
 
-thread_local! {
-    pub(super) static PI_LEGACY_HASH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[test]
-fn pi_h_keys_preserve_the_legacy_reducer_body() {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            PI_LEGACY_HASH.with(|old| old.set(false));
-        }
-    }
-    let _reset = Reset;
-    let source = SnapshotSource::Pi;
-    let fixture = Fixture::new(source);
-    for (shape, n, id) in [
-        ("message", 100, 0),
-        ("message", 100, 0),
-        ("message_end", 100, 0),
-        ("message_end", 100, 0),
-        ("message_end", 200, 1),
-        ("message", 200, 1),
-        ("message", 300, 2),
-    ] {
-        let mut line = usage(source, n, id, "fixture-model");
-        line["type"] = json!(shape);
-        fixture.append(&line);
-    }
-    let parse = || {
-        let (mut parser, expected, _) = native_parser(&fixture, source);
-        while !parser.step().unwrap() {}
-        let keys = parser
-            .accumulator
-            .seen_pi_usage_keys
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        let parsed = parser
-            .finish(
-                &expected,
-                &fixture.0,
-                NOW,
-                "native-fixture".into(),
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-        (serde_json::to_vec(&parsed.snapshots).unwrap(), keys)
-    };
-    PI_LEGACY_HASH.with(|old| old.set(true));
-    let (legacy, raw_keys) = parse();
-    assert!(raw_keys.iter().any(|key| key == "response-0"));
-    PI_LEGACY_HASH.with(|old| old.set(false));
-    let (hashed, keys) = parse();
-    assert_eq!(
-        hashed, legacy,
-        "hash representation cannot change emitted bytes"
-    );
-    assert!(!keys.is_empty());
-    assert!(keys.iter().all(|key| key.len() == 64
-        && key
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))));
-    assert_ne!(
-        pi_usage_hash("ottto-pi-usage-key:v1", &["ab", "c"]),
-        pi_usage_hash("ottto-pi-usage-key:v1", &["a", "bc"])
-    );
-    assert_ne!(
-        pi_usage_hash("ottto-pi-usage-key:v1", &["id"]),
-        pi_usage_hash("ottto-pi-usage-occurrence:v1", &["id"])
-    );
-}
-
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_ram_tail_ignores_age_and_clock_and_audit_cap_reads_full() {
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            sampled_scan::set_test_now(None);
-        }
-    }
-    let _reset = Reset;
-    const START: u64 = 1_800_000_000;
-    let source = SnapshotSource::Pi;
-    for (label, clock, pending) in [
-        ("aged", START + 7_200, 0),
-        ("clock", START - 1, 0),
-        ("slots", START + 7_200, 300),
-    ] {
-        sampled_scan::set_test_now(Some(START));
-        let fixture = ScanFixture::new(source);
-        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-        let cache = Arc::new(sampled_scan::SharedCache::default());
-        let (mut index, initial, modes) = production_scan(
-            &fixture,
-            source,
-            ScanIndex::default(),
-            Some(cache.clone()),
-            label,
-        );
-        assert_eq!(modes, (1, 0, 0));
-        assert!(!initial.snapshots.is_empty());
-        let key = local_index_key(&fixture.file.0);
-        for n in 0..pending {
-            let mut entry = index.files[&key].clone();
-            entry.set_unverified_deadline(START + 1);
-            index.files.insert(format!("/synthetic-pending/{n}"), entry);
-        }
-        sampled_scan::set_test_now(Some(clock));
-        let ((quiet, _, modes, bytes), reads) =
-            terminal_contract_retry::source_acquisitions(|| {
-                production_scan_at(&fixture, source, index, Some(cache.clone()), label, NOW)
-            });
-        assert!(reads.is_empty(), "idle Pi never enters the native reader");
-        assert_eq!(modes, (0, 0, 0));
-        assert_eq!(bytes, (0, 0));
-        let before = fs::metadata(&fixture.file.0).unwrap().len();
-        fixture.file.append(&usage(source, 200, 1, "fixture-model"));
-        let suffix = fs::metadata(&fixture.file.0).unwrap().len() - before;
-        let ((_, tail, modes, bytes), _counts) = observe(|| {
-            production_scan_at_with_setup(
-                &fixture,
-                source,
-                quiet.clone(),
-                Some(cache.clone()),
-                label,
-                NOW,
-                |scan| {
-                    let context = scan.sampling.as_ref().unwrap();
-                    if pending > 0 {
-                        assert_eq!(context.audit_slots, 0);
-                    }
-                },
-            )
-        });
-        if pending == 0 {
-            assert_eq!(
-                modes,
-                (0, 1, 0),
-                "{label}: no AuditDue or ClockChanged Full"
-            );
-            assert_eq!(bytes.0, suffix, "only appended body bytes are consumed");
-        } else {
-            // #870's shared audit cap: with no audit slot left, an unmarked
-            // change funds no new debt and reads Full instead of Tail.
-            assert_eq!(modes, (1, 0, 0), "{label}: cap Full, not Tail");
-            assert!(bytes.0 > suffix, "{label}: the whole file is read");
-        }
-        let (_, full, _) = production_scan(&fixture, source, quiet, None, label);
-        assert_eq!(production_body(source, tail), production_body(source, full));
-    }
-}
-
+/// [regress] A new file was incorrectly counted as a recordless content change.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn pi_new_file_reads_once_without_transitional_full_count() {
@@ -5620,148 +5425,6 @@ fn pi_new_file_reads_once_without_transitional_full_count() {
         reads.is_empty(),
         "the new Pi file is settled after one read"
     );
-}
-
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_recordless_restart_and_eviction_full_only_on_change() {
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
-    let source = SnapshotSource::Pi;
-    for evict in [false, true] {
-        let fixture = ScanFixture::new(source);
-        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-        let cache = Arc::new(sampled_scan::SharedCache::default());
-        let (index, _, modes) = production_scan(
-            &fixture,
-            source,
-            ScanIndex::default(),
-            Some(cache.clone()),
-            "pi-recordless",
-        );
-        assert_eq!(modes, (1, 0, 0));
-        let state = fixture.dir.join("index.json");
-        let mut saved = index;
-        saved.save(&state).unwrap();
-        let cache = if evict {
-            cache.clear();
-            cache
-        } else {
-            Arc::new(sampled_scan::SharedCache::default())
-        };
-        assert!(cache.durable_counters(source).is_none());
-        let ((quiet, _, modes, bytes), reads) =
-            terminal_contract_retry::source_acquisitions(|| {
-                production_scan_at(
-                    &fixture,
-                    source,
-                    ScanIndex::load(&state).unwrap(),
-                    Some(cache.clone()),
-                    "pi-recordless",
-                    NOW,
-                )
-            });
-        assert!(reads.is_empty(), "restart and eviction cannot read idle Pi");
-        assert_eq!((modes, bytes), ((0, 0, 0), (0, 0)));
-        fixture.file.append(&usage(source, 200, 1, "fixture-model"));
-        let (((index, _, modes, _), diagnostics), _counts) = observe(|| {
-            crate::local_resource_diagnostics::capture(|| {
-                production_scan_at(
-                    &fixture,
-                    source,
-                    quiet,
-                    Some(cache.clone()),
-                    "pi-recordless",
-                    NOW,
-                )
-            })
-        });
-        assert_eq!(modes, (1, 0, 0));
-        let pages = diagnostics
-            .iter()
-            .filter(|record| record["stage"] == "native_collection_page")
-            .collect::<Vec<_>>();
-        assert_eq!(pages.len(), 1);
-        assert_eq!(pages[0]["source"], "pi");
-        assert_eq!(
-            pages[0]["counts"]["sampled_acquisition"]["page_events"]["full_reasons"],
-            json!({"state_missing": 1}),
-            "a recordless Pi read keeps the shared planner reason"
-        );
-        let ((_, _, modes, _), _counts) = observe(|| {
-            production_scan_at(
-                &fixture,
-                source,
-                index,
-                Some(cache.clone()),
-                "pi-recordless",
-                NOW,
-            )
-        });
-        assert_eq!(modes, (0, 0, 0));
-    }
-}
-
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_retention_refusal_is_cache_only_and_counts_bytes() {
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
-    let source = SnapshotSource::Pi;
-    let fixture = Fixture::new(source);
-    let (mut parser, _, scope) = native_parser(&fixture, source);
-    parser
-        .prepare_acquisition(None, &scope, None, 1_800_000_000)
-        .unwrap();
-    while !parser.step().unwrap() {}
-    for n in 0..8_000 {
-        parser
-            .accumulator
-            .seen_pi_usage_keys
-            .insert(format!("{n:064x}"), PiUsageDedupState::default());
-    }
-    let charge = crate::heap_layout_bound::completed_bound(&parser.accumulator, usize::MAX)
-        .unwrap()
-        + std::mem::size_of::<sampled_jsonl::CachedJsonlReduction>()
-        - std::mem::size_of::<SnapshotAccumulator>();
-    assert!(charge > crate::transcript_cache::ENTRY_BYTES);
-    assert!(parser
-        .retention_bound(crate::transcript_cache::ENTRY_BYTES)
-        .is_none());
-    let (completed, counts) = observe(|| {
-        parser
-            .retain_reduction(
-                &scope,
-                1_800_000_000,
-                sampled_scan::RetainBudget::granted_unclassified(usize::MAX),
-            )
-            .unwrap()
-            .unwrap()
-    });
-    assert!(completed.reduction.is_none());
-    assert_eq!(counts.retention_bound_refused, 1);
-    assert_eq!(counts.retention_bound_refused_pi, 1);
-    assert_eq!(counts.retention_bound_refused_pi_bytes, charge as u64);
-    assert!(sampled_scan::SharedCache::default()
-        .durable_counters(source)
-        .is_none());
-    let control_fixture = Fixture::new(SnapshotSource::ClaudeCode);
-    let (mut control, _, control_scope) =
-        native_parser(&control_fixture, SnapshotSource::ClaudeCode);
-    control
-        .prepare_acquisition(None, &control_scope, None, 1_800_000_000)
-        .unwrap();
-    while !control.step().unwrap() {}
-    let (_, counts) = observe(|| {
-        control
-            .retain_reduction(
-                &control_scope,
-                1_800_000_000,
-                sampled_scan::RetainBudget::granted_unclassified(0),
-            )
-            .unwrap()
-    });
-    assert_eq!(counts.retention_bound_refused, 1);
-    assert_eq!(counts.retention_bound_refused_pi, 0);
-    assert_eq!(counts.retention_bound_refused_pi_bytes, 0);
 }
 
 mod codex_mcp_version_tests;

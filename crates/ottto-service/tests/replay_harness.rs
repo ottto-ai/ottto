@@ -330,18 +330,9 @@ const LIFECYCLE_COUNTERS: &[(&str, CounterClass)] = &[
     // snapshots/sampled_jsonl.rs::retain_reduction/retain_after_release:
     // retention_bound failed; qualified only with real unsupported layout flag.
     ("retention_bound_refused", CounterClass::LayoutWitness),
-    // snapshots/sampled_jsonl.rs::record_retention_bound_refusal: Pi count and
-    // byte annotations, always beside retention_bound_refused; never a layout
-    // witness on their own.
+    // snapshots/sampled_jsonl.rs::record_retention_bound_refusal: Pi subset
+    // of retention_bound_refused; never a layout witness on its own.
     ("retention_bound_refused_pi", CounterClass::Observation),
-    (
-        "retention_bound_refused_pi_bytes",
-        CounterClass::Observation,
-    ),
-    (
-        "retention_bound_refused_pi_bytes_unavailable",
-        CounterClass::Observation,
-    ),
     // snapshots/sampled_jsonl.rs::retain_reduction/retain_after_release: no plan.
     ("retention_no_plan", CounterClass::NonLayoutFailure),
     // snapshots/sampled_jsonl.rs::retain_reduction/retain_after_release:
@@ -366,6 +357,9 @@ const LIFECYCLE_COUNTERS: &[(&str, CounterClass)] = &[
     ("prefix_excluded_bodies", CounterClass::Observation),
     // snapshots/sampled_audit.rs::complete_native_recomposition: prefix tag cleared.
     ("prefix_tag_clears", CounterClass::Observation),
+    // snapshots.rs::apply_pi_line: cost parsing, never a retention decision.
+    ("pi_cost_refused_overflow", CounterClass::Observation),
+    ("pi_cost_precision_rounded", CounterClass::Observation),
 ];
 
 // CachePage flattens the registry above and adds these sparse scalars.
