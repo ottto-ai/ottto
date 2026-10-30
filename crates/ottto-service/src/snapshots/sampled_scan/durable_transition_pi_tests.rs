@@ -8,7 +8,7 @@
 // (C2) and E1's follow-up is unmerged, so these rows ALSO assert whole-body
 // equality (`whole_body`) and the index's own body fingerprint/witness
 // (`stored_bodies`); the populated Pi body's byte identity is E1-2's codec
-// fixture (`count_pass_section_is_byte_identical_and_round_trips`).
+// fixture (`plain_trailing_pi_body_counts_and_round_trips`).
 //
 // P-PREACT (a binary without Pi support meeting Pi files and a Pi store) is a
 // cross-build property: it belongs to the money_equivalence base-vs-candidate
@@ -948,7 +948,7 @@ fn pi_version_rewrite_after_restart_reads_one_real_edit_full() {
 // rebuild, never a U hold), then replaced by a record the next restart
 // restores. Both arms break the trailer, so store framing refuses them. The
 // Pi-section framing arms (stripped/duplicated/trailing/over-cap/short H)
-// are the codec's own refusals (`corrupt_truncated_or_misframed_sections_are_refused`).
+// are the codec's own refusals (`corrupt_or_truncated_trailing_fields_are_refused`).
 /// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
