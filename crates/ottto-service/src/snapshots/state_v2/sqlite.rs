@@ -8,11 +8,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod maintenance;
+use maintenance::{MaintenanceStats, PurgePolicy};
 
 const BUSY: Duration = Duration::from_millis(100);
 const PAGE_HEADERS: usize = 128;
-const VAL: &str = "digest BLOB NOT NULL CHECK(length(digest)=32),len INTEGER NOT NULL CHECK(len BETWEEN 0 AND 67108864),parts INTEGER NOT NULL CHECK(parts BETWEEN 0 AND 256),inline BLOB,CHECK((parts=0 AND len<=512 AND length(inline)=len) OR (parts>0 AND len>512 AND inline IS NULL AND parts=(len+262143)/262144))";
+const VAL: &str = "digest BLOB NOT NULL CHECK(length(digest)=16),len INTEGER NOT NULL CHECK(len BETWEEN 0 AND 67108864),parts INTEGER NOT NULL CHECK(parts BETWEEN 0 AND 256),inline BLOB,CHECK((parts=0 AND len<=512 AND inline IS NOT NULL AND length(inline)=len) OR (parts>0 AND len>512 AND inline IS NULL AND parts=(len+262143)/262144))";
 
 impl Table {
     fn name(self) -> &'static str {
@@ -47,6 +50,13 @@ impl Table {
             Self::Holds => &["kind", "field", "key"],
             Self::Traversal => &["name"],
             Self::Interned => &["kind", "ordinal"],
+        }
+    }
+    fn value_columns(self) -> &'static [&'static str] {
+        if self == Self::Census {
+            &["digest"]
+        } else {
+            &["digest", "len", "parts", "inline"]
         }
     }
     fn fixed_columns(self) -> &'static [&'static str] {
@@ -102,14 +112,14 @@ fn schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(&format!(
         "CREATE TABLE meta(name TEXT NOT NULL,{VAL},PRIMARY KEY(name)) WITHOUT ROWID;"
     ))?;
-    conn.execute_batch(&format!("CREATE TABLE files(key TEXT NOT NULL,size INTEGER NOT NULL,mtime_s INTEGER NOT NULL,mtime_ns INTEGER,ctime_ns INTEGER,birth_ns INTEGER,witness_rev INTEGER NOT NULL,flags INTEGER NOT NULL,source_fp BLOB NOT NULL,last_snapshot_fp BLOB,body_witness BLOB,scan_identity TEXT,{VAL},PRIMARY KEY(key)) WITHOUT ROWID;"))?;
+    conn.execute_batch(&format!("CREATE TABLE files(key TEXT NOT NULL,size BLOB NOT NULL CHECK(length(size)=8),mtime_s BLOB NOT NULL CHECK(length(mtime_s)=8),mtime_ns BLOB CHECK(mtime_ns IS NULL OR length(mtime_ns)=8),ctime_ns BLOB CHECK(ctime_ns IS NULL OR length(ctime_ns)=8),birth_ns BLOB CHECK(birth_ns IS NULL OR length(birth_ns)=8),witness_rev BLOB NOT NULL CHECK(length(witness_rev)=8),flags INTEGER NOT NULL,source_fp BLOB NOT NULL,last_snapshot_fp BLOB,body_witness BLOB,scan_identity TEXT,{VAL},PRIMARY KEY(key)) WITHOUT ROWID;"))?;
     conn.execute_batch(&format!(
         "CREATE TABLE family_requests(root TEXT NOT NULL,{VAL},PRIMARY KEY(root)) WITHOUT ROWID;"
     ))?;
-    conn.execute_batch(&format!("CREATE TABLE request_sets(set_id INTEGER NOT NULL,commitment BLOB NOT NULL,hash_count INTEGER NOT NULL,refs INTEGER NOT NULL,{VAL},PRIMARY KEY(set_id)) WITHOUT ROWID;"))?;
-    conn.execute_batch(&format!("CREATE TABLE census(key TEXT NOT NULL,fp BLOB NOT NULL,derivation INTEGER NOT NULL,window INTEGER NOT NULL,shape INTEGER NOT NULL,flags INTEGER NOT NULL,set_id INTEGER,retired INTEGER,old_path_requests INTEGER,old_path_tokens INTEGER,modified INTEGER,birth BLOB,{VAL},PRIMARY KEY(key)) WITHOUT ROWID;"))?;
-    conn.execute_batch(&format!("CREATE TABLE account_pending(root TEXT NOT NULL,window_no INTEGER NOT NULL,version_ord INTEGER,window_end INTEGER NOT NULL,account_hash BLOB,evidence_count INTEGER NOT NULL,flags INTEGER NOT NULL,{VAL},PRIMARY KEY(root,window_no)) WITHOUT ROWID;"))?;
-    conn.execute_batch(&format!("CREATE TABLE usage_pending(root TEXT NOT NULL,window_end INTEGER NOT NULL,flags INTEGER NOT NULL,idless_revision BLOB,{VAL},PRIMARY KEY(root)) WITHOUT ROWID;"))?;
+    conn.execute_batch(&format!("CREATE TABLE request_sets(set_id INTEGER NOT NULL,commitment BLOB NOT NULL,hash_count INTEGER,refs INTEGER NOT NULL,{VAL},PRIMARY KEY(set_id)) WITHOUT ROWID;"))?;
+    conn.execute_batch("CREATE TABLE census(key TEXT NOT NULL,fp BLOB NOT NULL,derivation INTEGER NOT NULL,window BLOB NOT NULL CHECK(length(window)=8),shape INTEGER NOT NULL CHECK(shape BETWEEN 0 AND 4),flags INTEGER NOT NULL,set_id INTEGER,retired BLOB CHECK(retired IS NULL OR length(retired)=8),old_path_requests BLOB CHECK(old_path_requests IS NULL OR length(old_path_requests)=8),old_path_tokens BLOB CHECK(old_path_tokens IS NULL OR length(old_path_tokens)=8),modified BLOB CHECK(modified IS NULL OR length(modified)=8),birth BLOB CHECK(birth IS NULL OR length(birth)=24),digest BLOB NOT NULL CHECK(length(digest)=16),PRIMARY KEY(key)) WITHOUT ROWID;")?;
+    conn.execute_batch(&format!("CREATE TABLE account_pending(root TEXT NOT NULL,window_no INTEGER NOT NULL,version_ord INTEGER NOT NULL,window_end TEXT NOT NULL,account_hash BLOB NOT NULL,evidence_count BLOB NOT NULL CHECK(length(evidence_count)=16),flags INTEGER NOT NULL,{VAL},PRIMARY KEY(root,window_no)) WITHOUT ROWID;"))?;
+    conn.execute_batch(&format!("CREATE TABLE usage_pending(root TEXT NOT NULL,window_end TEXT NOT NULL,flags INTEGER NOT NULL,idless_revision BLOB,{VAL},PRIMARY KEY(root)) WITHOUT ROWID;"))?;
     conn.execute_batch(&format!("CREATE TABLE witnesses(kind INTEGER NOT NULL,key TEXT NOT NULL,{VAL},PRIMARY KEY(kind,key)) WITHOUT ROWID;"))?;
     conn.execute_batch(&format!("CREATE TABLE accepted(kind INTEGER NOT NULL,key BLOB NOT NULL,{VAL},PRIMARY KEY(kind,key)) WITHOUT ROWID;"))?;
     conn.execute_batch(&format!("CREATE TABLE quarantine(kind INTEGER NOT NULL,key TEXT NOT NULL,claims INTEGER,{VAL},PRIMARY KEY(kind,key)) WITHOUT ROWID;"))?;
@@ -118,8 +128,8 @@ fn schema(conn: &Connection) -> Result<()> {
         "CREATE TABLE traversal(name TEXT NOT NULL,{VAL},PRIMARY KEY(name)) WITHOUT ROWID;"
     ))?;
     conn.execute_batch(&format!("CREATE TABLE interned(kind INTEGER NOT NULL,ordinal INTEGER NOT NULL,refs INTEGER NOT NULL,{VAL},PRIMARY KEY(kind,ordinal)) WITHOUT ROWID;"))?;
-    // Named queries: immutable set identity and bounded ordered part reads.
-    conn.execute_batch("CREATE UNIQUE INDEX request_set_commitment ON request_sets(commitment); CREATE TABLE blob_parts(owner INTEGER NOT NULL CHECK(owner BETWEEN 0 AND 12),key BLOB NOT NULL,part INTEGER NOT NULL CHECK(part BETWEEN 0 AND 255),bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 262144),UNIQUE(owner,key,part));")?;
+    // Named queries: full-evidence set candidates and bounded ordered part reads.
+    conn.execute_batch("CREATE INDEX request_sets_commitment ON request_sets(commitment); CREATE TABLE blob_parts(owner INTEGER NOT NULL CHECK(owner BETWEEN 0 AND 12),key BLOB NOT NULL,part INTEGER NOT NULL CHECK(part BETWEEN 0 AND 255),bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 262144),UNIQUE(owner,key,part));")?;
     Ok(())
 }
 
@@ -150,16 +160,16 @@ fn fixed_values(table: Table, fixed: &Fixed) -> Result<Vec<SqlValue>> {
                 scan_identity,
             },
         ) => vec![
-            sql(size)?,
-            sql(mtime_s)?,
-            sql(mtime_ns)?,
-            sql(ctime_ns)?,
-            sql(birth_ns)?,
-            sql(witness_rev)?,
+            unsigned(*size),
+            unsigned(*mtime_s),
+            optional_unsigned(*mtime_ns),
+            optional_unsigned(*ctime_ns),
+            optional_unsigned(*birth_ns),
+            unsigned(*witness_rev),
             sql(flags)?,
-            sql(source_fp)?,
-            sql(last_snapshot_fp)?,
-            sql(body_witness)?,
+            SqlValue::Blob(packed::hash_string(source_fp)?),
+            optional_hash(last_snapshot_fp)?,
+            optional_hash(body_witness)?,
             sql(scan_identity)?,
         ],
         (Table::FamilyRequests, Fixed::None) => vec![],
@@ -189,14 +199,14 @@ fn fixed_values(table: Table, fixed: &Fixed) -> Result<Vec<SqlValue>> {
         ) => vec![
             sql(fp)?,
             sql(derivation)?,
-            sql(window)?,
+            unsigned(*window),
             sql(shape)?,
             sql(flags)?,
             sql(set_id)?,
-            sql(retired)?,
-            sql(old_path_requests)?,
-            sql(old_path_tokens)?,
-            sql(modified)?,
+            optional_unsigned(*retired),
+            optional_unsigned(*old_path_requests),
+            optional_unsigned(*old_path_tokens),
+            optional_unsigned(*modified),
             sql(birth)?,
         ],
         (
@@ -211,8 +221,8 @@ fn fixed_values(table: Table, fixed: &Fixed) -> Result<Vec<SqlValue>> {
         ) => vec![
             sql(version_ord)?,
             sql(window_end)?,
-            sql(account_hash)?,
-            sql(evidence_count)?,
+            SqlValue::Blob(packed::hash_string(account_hash)?),
+            SqlValue::Blob(evidence_count.to_be_bytes().to_vec()),
             sql(flags)?,
         ],
         (
@@ -232,20 +242,58 @@ fn fixed_values(table: Table, fixed: &Fixed) -> Result<Vec<SqlValue>> {
         _ => bail!("state_v2_fixed_type"),
     })
 }
+fn unsigned(n: u64) -> SqlValue {
+    SqlValue::Blob(n.to_be_bytes().to_vec())
+}
+fn optional_unsigned(n: Option<u64>) -> SqlValue {
+    n.map_or(SqlValue::Null, unsigned)
+}
+fn optional_hash(s: &Option<String>) -> Result<SqlValue> {
+    Ok(s.as_deref()
+        .map(packed::hash_string)
+        .transpose()?
+        .map_or(SqlValue::Null, SqlValue::Blob))
+}
+fn unsigned_cell<const N: usize>(row: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<[u8; N]> {
+    row.get_ref(i)?
+        .as_blob()?
+        .try_into()
+        .map_err(|_| rusqlite::Error::InvalidQuery)
+}
+fn read_unsigned(row: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<u64> {
+    Ok(u64::from_be_bytes(unsigned_cell(row, i)?))
+}
+fn read_optional_unsigned(row: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<Option<u64>> {
+    if row.get_ref(i)?.data_type() == rusqlite::types::Type::Null {
+        Ok(None)
+    } else {
+        Ok(Some(read_unsigned(row, i)?))
+    }
+}
+fn read_hash(row: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<String> {
+    packed::read_hash_string(row.get_ref(i)?.as_blob()?).map_err(|_| rusqlite::Error::InvalidQuery)
+}
+fn read_optional_hash(row: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<Option<String>> {
+    if row.get_ref(i)?.data_type() == rusqlite::types::Type::Null {
+        Ok(None)
+    } else {
+        Ok(Some(read_hash(row, i)?))
+    }
+}
 fn read_fixed(table: Table, row: &rusqlite::Row<'_>, start: usize) -> rusqlite::Result<Fixed> {
     Ok(match table {
         Table::Meta => Fixed::None,
         Table::Files => Fixed::File {
-            size: row.get(start)?,
-            mtime_s: row.get(start + 1)?,
-            mtime_ns: row.get(start + 2)?,
-            ctime_ns: row.get(start + 3)?,
-            birth_ns: row.get(start + 4)?,
-            witness_rev: row.get(start + 5)?,
+            size: read_unsigned(row, start)?,
+            mtime_s: read_unsigned(row, start + 1)?,
+            mtime_ns: read_optional_unsigned(row, start + 2)?,
+            ctime_ns: read_optional_unsigned(row, start + 3)?,
+            birth_ns: read_optional_unsigned(row, start + 4)?,
+            witness_rev: read_unsigned(row, start + 5)?,
             flags: row.get(start + 6)?,
-            source_fp: row.get(start + 7)?,
-            last_snapshot_fp: row.get(start + 8)?,
-            body_witness: row.get(start + 9)?,
+            source_fp: read_hash(row, start + 7)?,
+            last_snapshot_fp: read_optional_hash(row, start + 8)?,
+            body_witness: read_optional_hash(row, start + 9)?,
             scan_identity: row.get(start + 10)?,
         },
         Table::FamilyRequests => Fixed::None,
@@ -257,21 +305,21 @@ fn read_fixed(table: Table, row: &rusqlite::Row<'_>, start: usize) -> rusqlite::
         Table::Census => Fixed::Census {
             fp: row.get(start)?,
             derivation: row.get(start + 1)?,
-            window: row.get(start + 2)?,
+            window: read_unsigned(row, start + 2)?,
             shape: row.get(start + 3)?,
             flags: row.get(start + 4)?,
             set_id: row.get(start + 5)?,
-            retired: row.get(start + 6)?,
-            old_path_requests: row.get(start + 7)?,
-            old_path_tokens: row.get(start + 8)?,
-            modified: row.get(start + 9)?,
+            retired: read_optional_unsigned(row, start + 6)?,
+            old_path_requests: read_optional_unsigned(row, start + 7)?,
+            old_path_tokens: read_optional_unsigned(row, start + 8)?,
+            modified: read_optional_unsigned(row, start + 9)?,
             birth: row.get(start + 10)?,
         },
         Table::AccountPending => Fixed::AccountPending {
             version_ord: row.get(start)?,
             window_end: row.get(start + 1)?,
-            account_hash: row.get(start + 2)?,
-            evidence_count: row.get(start + 3)?,
+            account_hash: read_hash(row, start + 2)?,
+            evidence_count: u128::from_be_bytes(unsigned_cell(row, start + 3)?),
             flags: row.get(start + 4)?,
         },
         Table::UsagePending => Fixed::UsagePending {
@@ -379,7 +427,13 @@ fn projection(table: Table) -> String {
         .iter()
         .chain(table.fixed_columns())
         .copied()
-        .chain(["digest", "len", "parts"])
+        .chain(
+            table
+                .value_columns()
+                .iter()
+                .copied()
+                .filter(|c| *c != "inline"),
+        )
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -400,6 +454,9 @@ fn header(table: Table, row: &rusqlite::Row<'_>) -> rusqlite::Result<Header> {
         } else {
             (&mut fixed_bytes, 32 * 1024)
         };
+        if len > KEY_BYTES + 1 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
         *total = total
             .checked_add(len)
             .filter(|n| *n <= cap)
@@ -412,8 +469,16 @@ fn header(table: Table, row: &rusqlite::Row<'_>) -> rusqlite::Result<Header> {
         key,
         fixed,
         digest: row.get(at)?,
-        len: row.get(at + 1)?,
-        parts: row.get(at + 2)?,
+        len: if table == Table::Census {
+            0
+        } else {
+            row.get(at + 1)?
+        },
+        parts: if table == Table::Census {
+            0
+        } else {
+            row.get(at + 2)?
+        },
     })
 }
 
@@ -445,6 +510,9 @@ pub(super) struct Sqlite {
     import: bool,
     debt: bool,
     reload: bool,
+    purge_policy: PurgePolicy,
+    stats: MaintenanceStats,
+    last_purge_attempt: Option<Instant>,
 }
 pub(super) struct Txn<'a> {
     store: &'a mut Sqlite,
@@ -586,6 +654,9 @@ impl Sqlite {
             import: true,
             debt: false,
             reload: false,
+            purge_policy: PurgePolicy::default(),
+            stats: MaintenanceStats::default(),
+            last_purge_attempt: None,
         })
     }
     fn conn(&self) -> Result<&Connection> {
@@ -598,6 +669,23 @@ impl Sqlite {
     /// settings changes, and SHM creation. The expected identity comes from the
     /// independently read fence, never from the candidate database.
     pub(super) fn open(path: &Path, identity: &super::Identity) -> Result<Self> {
+        Self::open_with_policy(
+            path,
+            identity,
+            Duration::from_secs(86400),
+            Duration::from_millis(250),
+        )
+    }
+    pub(super) fn open_with_policy(
+        path: &Path,
+        identity: &super::Identity,
+        deadline: Duration,
+        work: Duration,
+    ) -> Result<Self> {
+        ensure!(
+            !deadline.is_zero() && !work.is_zero(),
+            "state_v2_purge_policy"
+        );
         ensure!(
             identity.format == FORMAT,
             "scan_index_representation_refused"
@@ -653,7 +741,11 @@ impl Sqlite {
             import: false,
             debt: false,
             reload: false,
+            purge_policy: PurgePolicy::default(),
+            stats: MaintenanceStats::default(),
+            last_purge_attempt: None,
         };
+        store.set_purge_policy(deadline, work)?;
         store.validate_parts()?;
         // Reconstruct required maintenance from durable purge metadata/size;
         // a nonzero allocated WAL by itself is not a checkpoint debt.
@@ -703,40 +795,6 @@ impl Sqlite {
         name: &str,
     ) -> Result<Option<T>> {
         read_json(self.conn()?, &RowKey::Meta(name.into()))
-    }
-    pub(super) fn maintenance(&mut self, idle: bool) -> Result<()> {
-        if self.import {
-            return Ok(());
-        }
-        let purge = self.read_control::<u64>("erasure_pending")?.unwrap_or(0) != 0;
-        let bytes = self.wal_bytes();
-        let required = purge || self.debt || bytes.map_or(true, |n| n >= WAL_PASSIVE_BYTES);
-        if !required && !idle {
-            return Ok(());
-        }
-        let mode = if purge {
-            CheckpointMode::Purge
-        } else if required {
-            CheckpointMode::Passive
-        } else {
-            CheckpointMode::IdleReclaim
-        };
-        let result = self.checkpoint(mode);
-        if result.state != CheckpointState::Complete {
-            self.debt = required;
-            ensure!(!required, "state_v2_wal_debt");
-            return Ok(());
-        }
-        if purge {
-            // Only a verified TRUNCATE can discharge the durable obligation.
-            // This N-only transaction can leave metadata WAL frames safely.
-            if self.control("erasure_pending", &0_u64).is_err() {
-                self.reload = true;
-                bail!("current_index_requires_reload");
-            }
-        }
-        self.debt = false;
-        Ok(())
     }
     fn wal_bytes(&self) -> Option<u64> {
         match fs::symlink_metadata(sidecar(&self.path, "-wal")) {
@@ -792,6 +850,14 @@ impl Store for Sqlite {
         })
     }
     fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
+        if mode == CheckpointMode::Purge && self.vacuum().is_err() {
+            return CheckpointResult {
+                state: CheckpointState::Failed,
+                log_frames: None,
+                checkpointed_frames: None,
+                wal_bytes: self.wal_bytes(),
+            };
+        }
         let command = match mode {
             CheckpointMode::Passive => "PRAGMA wal_checkpoint(PASSIVE)",
             CheckpointMode::Purge | CheckpointMode::IdleReclaim => {
@@ -808,6 +874,7 @@ impl Store for Sqlite {
             })?)
         });
         let bytes = self.wal_bytes();
+        self.stats.observe_wal(bytes);
         let (state, log, done) = match tuple {
             Ok((busy, log, done)) => {
                 let empty = log == -1 && done == -1;
@@ -829,6 +896,7 @@ impl Store for Sqlite {
             }
             Err(_) => (CheckpointState::Failed, None, None),
         };
+        self.stats.checkpoint(mode, state);
         CheckpointResult {
             state,
             log_frames: log,
@@ -873,10 +941,6 @@ fn scan(
     let mut page = Vec::with_capacity(limit);
     while let Some(row) = rows.next()? {
         let h = header(table, row)?;
-        ensure!(
-            serde_json::to_vec(&h.key)?.len() <= 16 * 1024,
-            "state_v2_key_admission"
-        );
         page.push(h);
     }
     Ok(page)
@@ -898,7 +962,9 @@ fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> 
         out.write_all(bytes)?;
         Ok(())
     };
-    if h.parts == 0 {
+    if h.key.table() == Table::Census {
+        ensure!(h.len == 0 && h.parts == 0, "state_v2_census_has_no_value");
+    } else if h.parts == 0 {
         ensure!(h.len <= INLINE_BYTES as u64, "state_v2_inline_length");
         let table = h.key.table();
         let sql = format!(
@@ -943,7 +1009,7 @@ fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> 
         ensure!(part == h.parts, "state_v2_missing_parts");
     }
     ensure!(
-        len == h.len && <[u8; 32]>::from(hash.finalize()) == h.digest,
+        len == h.len && integrity(hash) == h.digest,
         "state_v2_row_digest"
     );
     Ok(())
@@ -1042,6 +1108,8 @@ fn pl(key: &RowKey) -> bool {
                 | "generation"
                 | "phase"
                 | "erasure_pending"
+                | "erasure_since"
+                | "erasure_attempt"
                 | "baseline_bytes"
                 | "baseline_digest"
                 | "repair_commitment"
@@ -1091,7 +1159,7 @@ impl Transaction for Txn<'_> {
             };
             row.value.write(&mut writer)?;
             ensure!(
-                writer.len == h.len && <[u8; 32]>::from(writer.hash.clone().finalize()) == h.digest,
+                writer.len == h.len && integrity(writer.hash.clone()) == h.digest,
                 "state_v2_value_changed_after_preflight"
             );
             let inline = if h.parts == 0 {
@@ -1102,18 +1170,20 @@ impl Transaction for Txn<'_> {
                 None
             };
             values.extend(fixed);
-            values.extend([
-                SqlValue::Blob(h.digest.to_vec()),
-                SqlValue::Integer(h.len as i64),
-                SqlValue::Integer(h.parts as i64),
-                inline.map_or(SqlValue::Null, SqlValue::Blob),
-            ]);
+            values.push(SqlValue::Blob(h.digest.to_vec()));
+            if table != Table::Census {
+                values.extend([
+                    SqlValue::Integer(h.len as i64),
+                    SqlValue::Integer(h.parts as i64),
+                    inline.map_or(SqlValue::Null, SqlValue::Blob),
+                ]);
+            }
             let columns = table
                 .keys()
                 .iter()
                 .chain(table.fixed_columns())
                 .copied()
-                .chain(["digest", "len", "parts", "inline"])
+                .chain(table.value_columns().iter().copied())
                 .collect::<Vec<_>>()
                 .join(",");
             let placeholders = (1..=values.len())
@@ -1174,7 +1244,18 @@ impl Transaction for Txn<'_> {
             );
             let actual = self.store.read_control::<u64>("generation")?.unwrap_or(0);
             ensure!(actual == expected, "state_v2_concurrent_change");
-            if self.purge {
+            if self.purge
+                && self
+                    .store
+                    .read_control::<u64>("erasure_pending")?
+                    .unwrap_or(0)
+                    == 0
+            {
+                self.put(RowInput {
+                    key: &RowKey::Meta("erasure_since".into()),
+                    fixed: &Fixed::None,
+                    value: &packed::Json(&SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()),
+                })?;
                 self.put(RowInput {
                     key: &RowKey::Meta("erasure_pending".into()),
                     fixed: &Fixed::None,
@@ -1241,7 +1322,7 @@ fn validate_schema(conn: &Connection) -> Result<()> {
             .iter()
             .chain(table.fixed_columns())
             .copied()
-            .chain(["digest", "len", "parts", "inline"])
+            .chain(table.value_columns().iter().copied())
             .collect::<Vec<_>>();
         let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table.name()))?;
         let actual = stmt
@@ -1259,7 +1340,7 @@ fn validate_schema(conn: &Connection) -> Result<()> {
         ensure!(
             (kind == "table"
                 && (name == "blob_parts" || Table::ALL.iter().any(|t| t.name() == name)))
-                || kind == "index" && name == "request_set_commitment",
+                || kind == "index" && name == "request_sets_commitment",
             "scan_index_representation_refused"
         );
         count += 1;

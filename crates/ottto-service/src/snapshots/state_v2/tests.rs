@@ -98,9 +98,9 @@ fn typed_keys_and_fixed_columns_round_trip_every_table() {
                 birth_ns: Some(10),
                 witness_rev: 11,
                 flags: 12,
-                source_fp: vec![13; 32],
-                last_snapshot_fp: Some(vec![14; 32]),
-                body_witness: Some(vec![15; 32]),
+                source_fp: "0d".repeat(32),
+                last_snapshot_fp: Some("0E".repeat(32)),
+                body_witness: Some("malformed-but-retained".into()),
                 scan_identity: Some("existing-identity".into()),
             },
         ),
@@ -109,7 +109,7 @@ fn typed_keys_and_fixed_columns_round_trip_every_table() {
             RowKey::RequestSet(3),
             Fixed::RequestSet {
                 commitment: vec![4; 32],
-                hash_count: 5,
+                hash_count: Some(5),
                 refs: 6,
             },
         ),
@@ -119,7 +119,7 @@ fn typed_keys_and_fixed_columns_round_trip_every_table() {
                 fp: vec![7; 32],
                 derivation: 8,
                 window: 9,
-                shape: 10,
+                shape: 4,
                 flags: 11,
                 set_id: Some(3),
                 retired: Some(12),
@@ -135,9 +135,9 @@ fn typed_keys_and_fixed_columns_round_trip_every_table() {
                 window: 17,
             },
             Fixed::AccountPending {
-                version_ord: Some(18),
-                window_end: 19,
-                account_hash: Some(vec![20; 32]),
+                version_ord: 18,
+                window_end: "019-not-a-clock".into(),
+                account_hash: "14".repeat(32),
                 evidence_count: 21,
                 flags: 22,
             },
@@ -145,7 +145,7 @@ fn typed_keys_and_fixed_columns_round_trip_every_table() {
         (
             RowKey::UsagePending("family".into()),
             Fixed::UsagePending {
-                window_end: 23,
+                window_end: "2026-10-30T01:00:00+01:00".into(),
                 flags: 24,
                 idless_revision: Some(vec![25; 32]),
             },
@@ -190,22 +190,34 @@ fn typed_keys_and_fixed_columns_round_trip_every_table() {
     ];
     let mut tx = db.begin(TxnMode::Write).unwrap();
     for (key, fixed) in &rows {
+        let bytes: &[u8] = if matches!(key, RowKey::Census(_)) {
+            b""
+        } else {
+            b"opaque\0bytes"
+        };
         let h = tx
             .put(RowInput {
                 key,
                 fixed,
-                value: &Bytes(b"opaque\0bytes".to_vec()),
+                value: &Bytes(bytes.to_vec()),
             })
             .unwrap();
         assert_eq!(h.fixed, *fixed);
-        assert_eq!(value(&mut tx, &h), b"opaque\0bytes");
+        assert_eq!(value(&mut tx, &h), bytes);
     }
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
     let mut tx = db.begin(TxnMode::Read).unwrap();
     for (key, fixed) in &rows {
         let h = tx.get(key).unwrap().unwrap();
         assert_eq!(&h.fixed, fixed);
-        assert_eq!(value(&mut tx, &h), b"opaque\0bytes");
+        assert_eq!(
+            value(&mut tx, &h),
+            if matches!(key, RowKey::Census(_)) {
+                b"".as_slice()
+            } else {
+                b"opaque\0bytes".as_slice()
+            }
+        );
     }
 }
 
@@ -384,6 +396,8 @@ fn f6_pl_in_values_requires_purge_even_with_hash_only_keys() {
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, b"replacement");
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    db.maintenance(true).unwrap();
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
     for suffix in ["", "-wal", "-shm"] {
         let p = tmp.0.join(format!("index.v2.sqlite.import{suffix}"));
@@ -404,7 +418,7 @@ fn f6_passive_complete_can_leave_allocated_wal_and_allows_next_write() {
     let key = RowKey::RequestSet(1);
     let fixed = Fixed::RequestSet {
         commitment: vec![1; 32],
-        hash_count: 1,
+        hash_count: Some(1),
         refs: 1,
     };
     tx.put(RowInput {
@@ -555,7 +569,7 @@ fn f8_damaged_header_refuses_both_lookup_and_scan_before_owned_copy() {
         birth_ns: None,
         witness_rev: 0,
         flags: 0,
-        source_fp: vec![3; 32],
+        source_fp: "03".repeat(32),
         last_snapshot_fp: None,
         body_witness: None,
         scan_identity: None,
@@ -609,8 +623,10 @@ fn f9_production_traversal_writer_includes_registered_parent_counts() {
             "counts": {}
         }))
         .unwrap();
-    let mut index = super::super::ScanIndex::default();
-    index.traversal = Some(checkpoint);
+    let index = super::super::ScanIndex {
+        traversal: Some(checkpoint),
+        ..Default::default()
+    };
     let raw = serde_json::to_vec(&index).unwrap();
     let actual: serde_json::Value = serde_json::from_slice(&raw).unwrap();
     assert_eq!(
@@ -621,4 +637,228 @@ fn f9_production_traversal_writer_includes_registered_parent_counts() {
         12
     );
     assert_eq!(shape::inventory(std::io::Cursor::new(raw)), Ok(()));
+}
+
+#[test]
+fn format_one_unsigned_clocks_and_hash_spelling_are_lossless() {
+    let tmp = Scratch::new();
+    let mut db = tmp.store();
+    let rows = [
+        (
+            RowKey::File("u64".into()),
+            Fixed::File {
+                size: u64::MAX,
+                mtime_s: u64::MAX,
+                mtime_ns: Some(u64::MAX),
+                ctime_ns: None,
+                birth_ns: Some(0),
+                witness_rev: u64::MAX,
+                flags: 0,
+                source_fp: "a".repeat(64),
+                last_snapshot_fp: Some("A".repeat(64)),
+                body_witness: Some(String::new()),
+                scan_identity: Some("exact:identity".into()),
+            },
+        ),
+        (
+            RowKey::AccountPending {
+                root: "account".into(),
+                window: 0,
+            },
+            Fixed::AccountPending {
+                version_ord: 1,
+                window_end: "malformed:019\u{0}".into(),
+                account_hash: "not-a-hash".into(),
+                evidence_count: u128::MAX,
+                flags: 0,
+            },
+        ),
+        (
+            RowKey::UsagePending("usage".into()),
+            Fixed::UsagePending {
+                window_end: "2026-10-30T01:00:00+01:00".into(),
+                flags: 0,
+                idless_revision: None,
+            },
+        ),
+        (
+            RowKey::Census("census".into()),
+            Fixed::Census {
+                fp: vec![1; 32],
+                derivation: u16::MAX,
+                window: u64::MAX,
+                shape: 4,
+                flags: 0,
+                set_id: None,
+                retired: Some(u64::MAX),
+                old_path_requests: Some(0),
+                old_path_tokens: None,
+                modified: Some(u64::MAX),
+                birth: Some(vec![255; 24]),
+            },
+        ),
+    ];
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    for (key, fixed) in &rows {
+        tx.put(RowInput {
+            key,
+            fixed,
+            value: &Bytes(vec![]),
+        })
+        .unwrap();
+    }
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    for (key, fixed) in &rows {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let h = tx.get(key).unwrap().unwrap();
+        assert_eq!(&h.fixed, fixed);
+        assert!(value(&mut tx, &h).is_empty());
+    }
+    for spelling in [
+        "".to_owned(),
+        "a".repeat(64),
+        "A".repeat(64),
+        "ü\u{0}".into(),
+        "a".repeat(63),
+    ] {
+        let encoded = packed::hash_string(&spelling).unwrap();
+        assert_eq!(packed::read_hash_string(&encoded).unwrap(), spelling);
+    }
+    assert!(packed::read_hash_string(&[1; 32]).is_err());
+    assert!(packed::hash_string(&"x".repeat(KEY_BYTES + 1)).is_err());
+}
+
+#[test]
+fn format_one_census_and_key_admission_precede_mutation() {
+    let tmp = Scratch::new();
+    let mut db = tmp.store();
+    let key = RowKey::Census("census".into());
+    let fixed = Fixed::Census {
+        fp: vec![1; 32],
+        derivation: 1,
+        window: 0,
+        shape: 0,
+        flags: 0,
+        set_id: None,
+        retired: None,
+        old_path_requests: None,
+        old_path_tokens: None,
+        modified: None,
+        birth: None,
+    };
+    assert!(preflight(&RowInput {
+        key: &key,
+        fixed: &fixed,
+        value: &Bytes(vec![1])
+    })
+    .is_err());
+    assert!(preflight(&RowInput {
+        key: &RowKey::Meta("x".repeat(KEY_BYTES + 1)),
+        fixed: &Fixed::None,
+        value: &Bytes(vec![])
+    })
+    .is_err());
+    // The cap is UTF-8 bytes, independent of JSON escaping overhead.
+    let exact = RowKey::Meta("\u{0}".repeat(KEY_BYTES));
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &exact, b"admitted");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    assert!(tx.get(&exact).unwrap().is_some());
+}
+
+#[test]
+fn f6_deadline_keeps_writes_live_without_resetting_oldest_purge() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = RowKey::Meta("private-value".into());
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"first");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"second");
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    let since = db.read_control::<u64>("erasure_since").unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"third");
+    assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    assert_eq!(db.read_control::<u64>("erasure_since").unwrap(), since);
+    assert_eq!(
+        serde_json::to_value(db.maintenance_stats()).unwrap()["vacuum_attempts"]
+            .as_u64()
+            .unwrap(),
+        0
+    );
+    drop(db);
+    let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    // PASSIVE and idle TRUNCATE alone cannot claim erasure.
+    assert_eq!(
+        db.checkpoint(CheckpointMode::IdleReclaim).state,
+        CheckpointState::Complete
+    );
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    db.maintenance(true).unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
+    assert_eq!(
+        serde_json::to_value(db.maintenance_stats()).unwrap()["vacuum_attempts"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn f8_vacuum_churn_removes_deleted_keys_and_pl_values() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    db.set_purge_policy(
+        std::time::Duration::from_secs(86400),
+        std::time::Duration::from_secs(5),
+    )
+    .unwrap();
+    let markers: Vec<String> = (0..512)
+        .map(|i| format!("synthetic-purge-marker-{i:06}-{}", "x".repeat(80 + i % 63)))
+        .collect();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    for (i, marker) in markers.iter().enumerate() {
+        let key = RowKey::Hold {
+            kind: 1,
+            field: "synthetic".into(),
+            key: format!("{i:06}"),
+        };
+        put(&mut tx, &key, marker.as_bytes());
+    }
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    for i in 0..512 {
+        let key = RowKey::Hold {
+            kind: 1,
+            field: "synthetic".into(),
+            key: format!("{i:06}"),
+        };
+        if i % 7 == 0 {
+            tx.delete(&key).unwrap();
+        } else {
+            put(&mut tx, &key, &vec![b'z'; 17 + i % 117]);
+        }
+    }
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    db.maintenance(true).unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
+    for suffix in ["", "-wal", "-shm"] {
+        let path = tmp.0.join(format!("index.v2.sqlite.import{suffix}"));
+        if path.exists() {
+            let bytes = fs::read(path).unwrap();
+            for marker in &markers {
+                assert!(!bytes.windows(marker.len()).any(|w| w == marker.as_bytes()));
+            }
+        }
+    }
+    let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
+    assert_eq!(stats["free_space_admitted"], true);
+    assert!(stats["vacuum_latency_ms"].is_u64());
+    assert!(stats["vacuum_wal_peak_bytes"].is_u64());
 }

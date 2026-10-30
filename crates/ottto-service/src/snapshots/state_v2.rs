@@ -76,14 +76,14 @@ pub(super) enum Fixed {
         birth_ns: Option<u64>,
         witness_rev: u64,
         flags: u64,
-        source_fp: Vec<u8>,
-        last_snapshot_fp: Option<Vec<u8>>,
-        body_witness: Option<Vec<u8>>,
+        source_fp: String,
+        last_snapshot_fp: Option<String>,
+        body_witness: Option<String>,
         scan_identity: Option<String>,
     },
     RequestSet {
         commitment: Vec<u8>,
-        hash_count: u64,
+        hash_count: Option<u64>,
         refs: u64,
     },
     Census {
@@ -100,14 +100,14 @@ pub(super) enum Fixed {
         birth: Option<Vec<u8>>,
     },
     AccountPending {
-        version_ord: Option<u64>,
-        window_end: u64,
-        account_hash: Option<Vec<u8>>,
-        evidence_count: u64,
+        version_ord: u64,
+        window_end: String,
+        account_hash: String,
+        evidence_count: u128,
         flags: u64,
     },
     UsagePending {
-        window_end: u64,
+        window_end: String,
         flags: u64,
         idless_revision: Option<Vec<u8>>,
     },
@@ -123,7 +123,7 @@ pub(super) enum Fixed {
 pub(super) struct Header {
     key: RowKey,
     fixed: Fixed,
-    digest: [u8; 32],
+    digest: [u8; 16],
     len: u64,
     parts: u16,
 }
@@ -269,33 +269,99 @@ impl Write for Preflight {
         Ok(())
     }
 }
+const KEY_BYTES: usize = 4096;
+
 fn admit_header(key: &RowKey, fixed: &Fixed) -> Result<()> {
-    struct Bound(u64, u64);
-    impl Write for Bound {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self
-                .0
-                .checked_add(bytes.len() as u64)
-                .filter(|n| *n <= self.1)
-                .ok_or_else(|| std::io::Error::other("state_v2_header_admission"))?;
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+    use anyhow::ensure;
+    fn text(s: &str) -> Result<()> {
+        ensure!(s.len() <= KEY_BYTES, "state_v2_string_admission");
+        Ok(())
     }
-    serde_json::to_writer(Bound(0, 16 * 1024), key)?;
-    serde_json::to_writer(Bound(0, 32 * 1024), fixed)?;
+    match key {
+        RowKey::Meta(s)
+        | RowKey::File(s)
+        | RowKey::FamilyRequests(s)
+        | RowKey::Census(s)
+        | RowKey::UsagePending(s)
+        | RowKey::Traversal(s) => text(s)?,
+        RowKey::AccountPending { root, .. } => text(root)?,
+        RowKey::Witness { key, .. } | RowKey::Quarantine { key, .. } => text(key)?,
+        RowKey::Accepted { key, .. } => ensure!(key.len() <= KEY_BYTES, "state_v2_key_admission"),
+        RowKey::Hold { field, key, .. } => {
+            text(field)?;
+            text(key)?;
+        }
+        RowKey::RequestSet(_) | RowKey::Interned { .. } => {}
+    }
+    match fixed {
+        Fixed::File {
+            source_fp,
+            last_snapshot_fp,
+            body_witness,
+            scan_identity,
+            ..
+        } => {
+            text(source_fp)?;
+            for s in [last_snapshot_fp, body_witness, scan_identity]
+                .into_iter()
+                .flatten()
+            {
+                text(s)?;
+            }
+        }
+        Fixed::RequestSet { commitment, .. } => {
+            ensure!(commitment.len() == 32, "state_v2_set_commitment")
+        }
+        Fixed::Census {
+            fp, shape, birth, ..
+        } => {
+            ensure!(fp.len() == 32 && *shape < 5, "state_v2_census_shape");
+            ensure!(
+                birth.as_ref().map_or(true, |b| b.len() == 24),
+                "state_v2_census_birth"
+            );
+        }
+        Fixed::AccountPending {
+            window_end,
+            account_hash,
+            ..
+        } => {
+            text(window_end)?;
+            text(account_hash)?;
+        }
+        Fixed::UsagePending {
+            window_end,
+            idless_revision,
+            ..
+        } => {
+            text(window_end)?;
+            ensure!(
+                idless_revision.as_ref().map_or(true, |b| b.len() == 32),
+                "state_v2_idless_revision"
+            );
+        }
+        _ => {}
+    }
     Ok(())
 }
-fn preflight(row: &RowInput<'_>) -> Result<Header> {
+
+fn integrity(hash: sha2::Sha256) -> [u8; 16] {
     use sha2::Digest;
+    hash.finalize()[..16]
+        .try_into()
+        .expect("fixed digest width")
+}
+fn preflight(row: &RowInput<'_>) -> Result<Header> {
     admit_header(row.key, row.fixed)?;
     let mut out = Preflight {
         hash: digest_start(row.key, row.fixed)?,
         bytes: 0,
     };
     row.value.write(&mut out)?;
+    anyhow::ensure!(
+        !matches!(row.key, RowKey::Census(_)) || out.bytes == 0,
+        "state_v2_census_has_no_value"
+    );
     let parts = if out.bytes <= INLINE_BYTES as u64 {
         0
     } else {
@@ -304,7 +370,7 @@ fn preflight(row: &RowInput<'_>) -> Result<Header> {
     Ok(Header {
         key: row.key.clone(),
         fixed: row.fixed.clone(),
-        digest: out.hash.finalize().into(),
+        digest: integrity(out.hash),
         len: out.bytes,
         parts,
     })

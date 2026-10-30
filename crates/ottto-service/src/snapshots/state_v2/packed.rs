@@ -169,3 +169,49 @@ impl<T: Serialize + ?Sized> Value for Json<'_, T> {
         Ok(())
     }
 }
+
+/// HSTR packs only canonical lowercase 64-digit hashes. Literal spellings,
+/// including malformed strings, uppercase and empty, remain byte-exact.
+pub(super) fn hash_string(value: &str) -> Result<Vec<u8>> {
+    anyhow::ensure!(value.len() <= KEY_BYTES, "state_v2_string_admission");
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        let mut bytes = Vec::with_capacity(33);
+        bytes.push(1);
+        let nibble = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+        for pair in value.as_bytes().chunks_exact(2) {
+            bytes.push((nibble(pair[0]) << 4) | nibble(pair[1]));
+        }
+        Ok(bytes)
+    } else {
+        let mut bytes = Vec::with_capacity(value.len() + 1);
+        bytes.push(0);
+        bytes.extend_from_slice(value.as_bytes());
+        Ok(bytes)
+    }
+}
+
+pub(super) fn read_hash_string(bytes: &[u8]) -> Result<String> {
+    anyhow::ensure!(bytes.len() <= KEY_BYTES + 1, "state_v2_string_admission");
+    match bytes.split_first() {
+        Some((0, rest)) => {
+            let s = std::str::from_utf8(rest)?;
+            // Reject a second spelling of canonical packed bytes.
+            anyhow::ensure!(hash_string(s)? == bytes, "state_v2_hstr_noncanonical");
+            Ok(s.to_owned())
+        }
+        Some((1, rest)) if rest.len() == 32 => Ok(rest
+            .iter()
+            .flat_map(|b| {
+                [
+                    b"0123456789abcdef"[(b >> 4) as usize] as char,
+                    b"0123456789abcdef"[(b & 15) as usize] as char,
+                ]
+            })
+            .collect()),
+        _ => anyhow::bail!("state_v2_hstr_tag"),
+    }
+}
