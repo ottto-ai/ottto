@@ -181,8 +181,12 @@ pub(super) struct Runtime {
     // unread data keeps the family's coverage incomplete until that member's
     // growth is recorded (Lead B unread-scope veto).
     unread: BTreeMap<String, UnreadKeys>,
+    // The census-prefix veto index of the census window it was built for
+    // (Lead B round 8). Derived from the census; rebuilt per complete pass.
+    // Keyed by window and whether a complete pass built it.
+    census_prefix: Option<(String, bool, Arc<usage_census_prefix::CensusPrefixIndex>)>,
 }
-crate::heap_layout_bound::fields!(Runtime; slots, slot_occurrences, paced, withheld, audited, custody, unread);
+crate::heap_layout_bound::fields!(Runtime; slots, slot_occurrences, paced, withheld, audited, custody, unread, census_prefix);
 
 /// One held family's refused keys. Past the bound the family is saturated:
 /// it stays unread (vetoing conservatively) until the hold itself ends.
@@ -413,6 +417,10 @@ impl Holds {
     // ordinary current evidence, not a stale token record, and is never held.
     fn build(index: &ScanIndex, current: Option<&str>) -> Option<Self> {
         use crate::heap_layout_bound::Counter;
+        // An overflowed census-prefix index answers nothing: B3 Unknown.
+        if index.usage_guard_census_prefix_unknown() {
+            return None;
+        }
         let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
         let owners = index
             .claude_usage_family_witnesses
@@ -741,6 +749,47 @@ impl ScanIndex {
         runtime.custody = Some(path);
         self.usage_guard_holds.runtime = runtime;
     }
+    pub(super) fn usage_guard_census_prefix(
+        &self,
+    ) -> Option<Arc<usage_census_prefix::CensusPrefixIndex>> {
+        let (_, _, built) = self.usage_guard_holds.runtime.census_prefix.as_ref()?;
+        Some(built.clone())
+    }
+    /// The cached index for `window`; a complete pass needs one it built.
+    pub(super) fn usage_guard_census_prefix_for(
+        &self,
+        window: &str,
+        complete: bool,
+    ) -> Option<Arc<usage_census_prefix::CensusPrefixIndex>> {
+        let (built_for, built_complete, built) =
+            self.usage_guard_holds.runtime.census_prefix.as_ref()?;
+        (built_for == window && (*built_complete || !complete)).then(|| built.clone())
+    }
+    pub(super) fn usage_guard_set_census_prefix(
+        &mut self,
+        window: &str,
+        complete: bool,
+        built: Arc<usage_census_prefix::CensusPrefixIndex>,
+    ) {
+        let unknown = built.unknown();
+        let was_unknown = self.usage_guard_census_prefix_unknown();
+        let runtime = &mut self.usage_guard_holds.runtime;
+        runtime.census_prefix = Some((window.to_owned(), complete, built));
+        stash(runtime);
+        if unknown && !self.usage_guard_holds.global() {
+            self.refresh_usage_guard_holds_at(Some(window));
+        } else if was_unknown && !unknown {
+            // The global hold it forced is lifted at the next projection.
+            self.usage_guard_holds.invalidate();
+        }
+    }
+    fn usage_guard_census_prefix_unknown(&self) -> bool {
+        self.usage_guard_holds
+            .runtime
+            .census_prefix
+            .as_ref()
+            .is_some_and(|(_, _, built)| built.unknown())
+    }
     pub(super) fn refresh_usage_guard_after_native_completion(&mut self) {
         if self.usage_guard_holds.dirty {
             self.refresh_usage_guard_holds();
@@ -873,12 +922,16 @@ impl ScanIndex {
 /// retained pending and this window's held growth. A global hold already
 /// vetoes every family, so it adds nothing here.
 pub(super) fn unread_scope(index: &ScanIndex, window: &str) -> BTreeSet<String> {
-    let holds = &index.usage_guard_holds;
+    unread_scope_of(index, &index.usage_guard_holds, window)
+}
+
+fn unread_scope_of(index: &ScanIndex, holds: &Holds, window: &str) -> BTreeSet<String> {
+    let runtime = &index.usage_guard_holds.runtime;
     let mut scope = BTreeSet::new();
     if holds.global() {
         return scope;
     }
-    for (root, unread) in &holds.runtime.unread {
+    for (root, unread) in &runtime.unread {
         if holds.holds(root)
             && (unread.saturated || unread.keys.iter().any(|key| index.files.contains_key(key)))
         {
@@ -900,8 +953,7 @@ pub(super) fn unread_scope(index: &ScanIndex, window: &str) -> BTreeSet<String> 
             continue;
         };
         let covered = pending.membership().contains_key(&id)
-            || holds
-                .runtime
+            || runtime
                 .slots
                 .get(&id)
                 .is_some_and(|slot| slot.root == root && slot.window == window);
@@ -910,6 +962,27 @@ pub(super) fn unread_scope(index: &ScanIndex, window: &str) -> BTreeSet<String> 
         }
     }
     scope
+}
+
+/// Fork-lineage gate (Lead B round 8, b'+c part c): whether ANY Claude
+/// family on the source has incomplete coverage: a paced or refused read
+/// still unread, an indexed sibling missing from its evidence, held growth
+/// not yet merged, or a global (Unknown) hold. While it does, a family's
+/// fork lineage cannot be ruled out, so no family's pending may retire.
+pub(super) fn fork_lineage_incomplete(index: &ScanIndex) -> bool {
+    let current = index.current_census_window();
+    // An unbuilt or dirty projection may miss a newly held family.
+    let rebuilt;
+    let holds = if index.usage_guard_holds.fresh() {
+        &index.usage_guard_holds
+    } else {
+        rebuilt = projection(index, current.as_deref());
+        &rebuilt
+    };
+    holds.global()
+        || index.usage_guard_census_prefix_unknown()
+        || !index.usage_guard_holds.runtime.slots.is_empty()
+        || !unread_scope_of(index, holds, current.as_deref().unwrap_or_default()).is_empty()
 }
 
 /// Page families an incomplete held family vetoes: (a) those sharing its

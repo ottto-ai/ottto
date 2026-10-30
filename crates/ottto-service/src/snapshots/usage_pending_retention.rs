@@ -299,8 +299,23 @@ fn negative_scheduling_carrier_durable(_index: &ScanIndex, _root: &str) -> bool 
     false
 }
 
-fn may_retire(index: &ScanIndex, root: &str, result: &Settlement<'_>) -> bool {
-    matches!(result, Settlement::Settled(_)) && negative_scheduling_carrier_durable(index, root)
+/// Why a family that may otherwise settle keeps its pending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RetireRefusal {
+    /// Some Claude family's coverage is incomplete (Lead B round 8).
+    ForkLineageUnknown,
+}
+
+fn may_retire(
+    index: &ScanIndex,
+    root: &str,
+    result: &Settlement<'_>,
+    fork_lineage_unknown: bool,
+) -> bool {
+    matches!(result, Settlement::Settled(_))
+        && !fork_lineage_unknown
+        && negative_scheduling_carrier_durable(index, root)
 }
 
 #[derive(Default, Serialize)]
@@ -327,6 +342,9 @@ pub(super) struct Counts {
     pub(super) compacted: Weight,
     pub(super) compaction_scratch_refused: Weight,
     pub(super) retirement_carrier_refused: Weight,
+    // Every considered family a retirement gate holds back, overlapping the
+    // totals above (a settled family is refused retirement by it too).
+    pub(super) retire_refused: BTreeMap<RetireRefusal, Weight>,
     pub(super) retired: Weight,
 }
 
@@ -360,6 +378,7 @@ fn classify_index(
         return counts;
     }
     let inventory = inventory(index);
+    let fork_lineage_unknown = usage_pending_guard::fork_lineage_incomplete(index);
     for (root, pending) in &index.claude_usage_family_pending {
         let bytes = pending_bytes(pending).unwrap_or_else(|| {
             counts.byte_measurement_failed += 1;
@@ -376,6 +395,13 @@ fn classify_index(
                 .or_default()
                 .add(bytes);
         }
+        if fork_lineage_unknown {
+            counts
+                .retire_refused
+                .entry(RetireRefusal::ForkLineageUnknown)
+                .or_default()
+                .add(bytes);
+        }
         let result = match &inventory {
             Some(inventory) => settlement(index, root, pending, inventory.get(root.as_str())),
             None => Settlement::Refused(Refusal::Scratch),
@@ -386,7 +412,7 @@ fn classify_index(
         ) {
             counts.accepted_body.add(bytes);
         }
-        let retire = may_retire(index, root, &result);
+        let retire = may_retire(index, root, &result, fork_lineage_unknown);
         match result {
             Settlement::Settled(commitment) => {
                 // H commitment exists only when the exact receipt gate earns it.
@@ -638,11 +664,12 @@ mod tests {
         ));
         refused(&index, Refusal::RetryCarryB3);
         assert!(!negative_scheduling_carrier_durable(&index, ROOT));
-        assert!(!may_retire(&index, ROOT, &decision(&index)));
+        assert!(!may_retire(&index, ROOT, &decision(&index), false));
         assert!(!may_retire(
             &index,
             ROOT,
-            &Settlement::Settled(&index.claude_usage_family_witnesses[ROOT])
+            &Settlement::Settled(&index.claude_usage_family_witnesses[ROOT]),
+            false
         ));
         for accepted in [BTreeSet::from(["1".repeat(64)]), BTreeSet::new()] {
             let mut changed = index.clone();

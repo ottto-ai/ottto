@@ -4419,3 +4419,166 @@ fn e2_identity_incomplete_clock_survives_discarded_twin_in_both_orders() {
         }
     });
 }
+
+#[test]
+fn retire_then_untagged_copy_within_35_days_is_vetoed_and_counted_once_by_e2() {
+    // Lead B round 8: family F's usage pending is retired (none is left),
+    // but its census record lives on for 35 idle days. A later untagged copy
+    // of F's session (all lines before its birth, no fork-context-ref) is
+    // proved by E2 from that record and counts F's requests once; the
+    // census-prefix index vetoes its scheduling all the same.
+    use crate::snapshots::claude_request_census::{
+        record_claude_request_census, ClaudeRequestCensusParse,
+    };
+    use crate::snapshots::usage_census_prefix::{self, CensusPrefixIndex, CensusPrefixVerdict};
+    const COPY: &str = "c0000000-0000-4000-8000-00000000000c";
+    const WINDOW: &str = "2026-08-02T09:00:00Z";
+    with_enabled(|| {
+        let original = root_file("retired-original");
+        let copy = original.with_file_name(format!("{COPY}.jsonl"));
+        fs::write(&copy, b"fixture\n").unwrap();
+        let history = [line("h1", &at(1), 1), line("h2", &at(2), 2)];
+        let mut index = ScanIndex::default();
+        let original_item = parse_and_remember(&original, t0(), &mut index, &history);
+        assert_eq!(fold(&original_item).entity.totals().1, 2);
+        // F's census record, current for its file, as its scan wrote it.
+        let key = local_index_key(&original);
+        let metadata = fs::metadata(&original).unwrap();
+        let modified = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let entry = index.files.get_mut(&key).unwrap();
+        entry.source_file_fingerprint = "a".repeat(64);
+        entry.size_bytes = metadata.len();
+        record_claude_request_census(
+            &mut index,
+            ClaudeRequestCensusParse {
+                path: &original,
+                index_key: &key,
+                source_file_fingerprint: &"a".repeat(64),
+                census_window_end: WINDOW,
+                complete: true,
+                lossy: false,
+                source_verified: true,
+                itemless_request_hashes: Vec::new(),
+                opened_birth: None,
+                modified_unix_seconds: modified,
+            },
+            std::slice::from_ref(&original_item),
+        );
+        assert!(index
+            .claude_request_census
+            .get(&key)
+            .is_some_and(|record| record.proves_current(&"a".repeat(64))));
+        // Retired: F keeps no usage pending, only its census record.
+        assert!(index.claude_usage_family_pending.is_empty());
+        let copied = history
+            .iter()
+            .map(|value| {
+                let mut value = value.clone();
+                value["sessionId"] = json!(COPY);
+                value
+            })
+            .collect::<Vec<_>>();
+        let copy_item = parse(&copy, Some(t0() + 100_000_000_000), &index, &copied);
+        assert_eq!(
+            fold(&copy_item).entity.removed_requests,
+            2,
+            "E2 proves the copies from F's census record"
+        );
+        let got = publish(vec![copy_item.clone()], None, TelemetryRead::Loaded, &index);
+        assert_eq!(
+            got.iter().map(|item| item.request_count).sum::<u64>(),
+            0,
+            "F's requests count once, in F"
+        );
+        // The scheduling veto: the copy's requests hit F's prefixes.
+        let prefixes = CensusPrefixIndex::build(&index);
+        let hashes = ["h1", "h2"]
+            .map(|id| format!("{:x}", Sha256::digest(id.as_bytes())))
+            .to_vec();
+        assert_eq!(
+            prefixes.verdict_hex(COPY, &hashes),
+            CensusPrefixVerdict::Held
+        );
+        assert_eq!(
+            prefixes.verdict_hex(ROOT, &hashes),
+            CensusPrefixVerdict::Clear,
+            "a family never vetoes itself"
+        );
+        let (vetoed, rows) = crate::local_resource_diagnostics::capture(|| {
+            usage_census_prefix::duplicated_pending_hashes(
+                &index,
+                &prefixes,
+                WINDOW,
+                std::slice::from_ref(&copy_item),
+            )
+        });
+        assert_eq!(vetoed, {
+            let mut sorted = hashes.clone();
+            sorted.sort();
+            sorted
+        });
+        assert!(rows
+            .iter()
+            .any(|row| row["counts"]["census_prefix_vetoed_hashes"] == 2));
+        cleanup(&[&original]);
+    })
+}
+
+#[test]
+fn v1_listed_body_untagged_copy_with_preserved_birth() {
+    // Pinning, not a ruling (Lead B round 8 item 4): today's v1 (listed,
+    // non-E2) body for an untagged copy of a session whose file birth was
+    // preserved. With no fork-context-ref, no telemetry and no legacy
+    // prefix witness, v1 has no cross-session copy rule: the copy's
+    // requests count again, so the page counts each inherited request
+    // twice. Money code is unchanged; this records the behaviour.
+    const COPY: &str = "c0000000-0000-4000-8000-00000000000c";
+    const WINDOW: &str = "2026-08-02T09:00:00Z";
+    with_disabled(|| {
+        let original = root_file("v1-preserved-original");
+        let copy = original.with_file_name(format!("{COPY}.jsonl"));
+        fs::write(&copy, b"fixture\n").unwrap();
+        let history = [line("h1", &at(1), 1), line("h2", &at(2), 2)];
+        let copied = history
+            .iter()
+            .map(|value| {
+                let mut value = value.clone();
+                value["sessionId"] = json!(COPY);
+                value
+            })
+            .collect::<Vec<_>>();
+        let mut index = ScanIndex::default();
+        // Preserved birth: the copy reports the original's birth, so even
+        // E2's pre-birth rule would see its lines as its own.
+        let mut items = vec![
+            parse(&original, Some(t0()), &index, &history),
+            parse(&copy, Some(t0()), &index, &copied),
+        ];
+        crate::snapshots::apply_claude_reported_usage_with_index(
+            &mut items,
+            &ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &ClaudeTraceOwnershipLoadReport::default(),
+            &mut index,
+            true,
+            WINDOW,
+        );
+        let counts = items
+            .iter()
+            .map(|item| (item.source_session_id.clone(), item.request_count))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            counts,
+            BTreeMap::from([(ROOT.to_owned(), 2), (COPY.to_owned(), 2)]),
+            "v1 counts the preserved-birth untagged copy a second time"
+        );
+        cleanup(&[&original]);
+    })
+}

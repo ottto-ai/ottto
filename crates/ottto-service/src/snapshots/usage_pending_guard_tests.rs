@@ -679,11 +679,23 @@ struct Beside {
     shares_member: bool,
     /// E2's copy proof names the held family's root file as its original.
     fork_child: bool,
+    /// A pending-free (retired) root's live census record holds the owned
+    /// request: the census-prefix veto (Lead B round 8).
+    retired_census: bool,
+    /// The census-prefix index cap for this fold (None: production).
+    census_cap: Option<usize>,
 }
 
 /// An owned start of a family beside an Unknown-held stale family. Returns
 /// its posture admission and the unread-scope veto count.
 fn owned_start_beside(beside: Beside) -> (Option<&'static str>, u64) {
+    let (admission, vetoes, _, _) = owned_start_beside_rows(beside);
+    (admission, vetoes)
+}
+
+fn owned_start_beside_rows(
+    beside: Beside,
+) -> (Option<&'static str>, u64, Vec<serde_json::Value>, ScanIndex) {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let path = temp_file("claude-held-unrelated-owned-start");
     let source_session_id = path
@@ -781,10 +793,22 @@ fn owned_start_beside(beside: Beside) -> (Option<&'static str>, u64) {
         index.refresh_usage_guard_holds_at(Some("2026-08-20T11:02:00Z"));
         index.usage_guard_full_blocked(Path::new(&carry_key(held, None)));
     }
+    if beside.retired_census {
+        // CARRY_OTHER keeps no usage pending: only its census record.
+        let _ = index.claude_request_census_mut_for_test().insert(
+            carry_key(CARRY_OTHER, None),
+            claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+                &"a".repeat(64),
+                1,
+                claude_request_census::ClaudeRequestCensusShape::Exact,
+                vec![claude_request_census::claude_request_hash("req_owned")],
+            ),
+        );
+    }
     let before = index.claude_usage_family_pending[held].clone();
-    let (disposition, rows) = crate::local_resource_diagnostics::capture(|| {
+    let fold = |index: &mut ScanIndex, items: &mut Vec<SnapshotItem>| {
         apply_claude_reported_usage_with_index(
-        &mut items,
+        items,
         &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
             evidence: BTreeMap::from([(source_session_id.clone(), vec![api])]),
             health: Default::default(),
@@ -793,10 +817,16 @@ fn owned_start_beside(beside: Beside) -> (Option<&'static str>, u64) {
             evidence: BTreeMap::from([(source_session_id, vec![trace])]),
             ..Default::default()
         },
-        &mut index,
+        index,
         true,
         "2026-08-20T11:02:00Z",
         )
+    };
+    let (disposition, rows) = crate::local_resource_diagnostics::capture(|| match beside.census_cap {
+        Some(cap) => {
+            usage_census_prefix::with_cap_for_test(cap, || fold(&mut index, &mut items))
+        }
+        None => fold(&mut index, &mut items),
     });
     assert!(index.usage_guard_reason(held).is_some());
     assert_eq!(
@@ -811,7 +841,7 @@ fn owned_start_beside(beside: Beside) -> (Option<&'static str>, u64) {
         .filter_map(|row| row["counts"]["held_unread_scope_veto_families"].as_u64())
         .sum();
     let _ = fs::remove_file(path);
-    (admission, vetoes)
+    (admission, vetoes, rows, index)
 }
 
 #[test]
@@ -899,6 +929,111 @@ fn unread_scope_complete_coverage_narrows_back_to_the_request_key_veto() {
     assert_eq!(vetoes, 0);
 }
 
+#[test]
+fn census_prefix_veto_overflow_holds() {
+    // Lead B round 8: a pending-free root's live census record holding the
+    // owned request vetoes its strict posture (a prefix hit, counted).
+    let (admission, _, rows, index) = owned_start_beside_rows(Beside {
+        retired_census: true,
+        ..Beside::default()
+    });
+    assert_ne!(admission, Some("strict"));
+    assert!(rows
+        .iter()
+        .any(|row| row["counts"]["census_prefix_vetoed_hashes"] == 1));
+    assert!(!index.usage_guard_holds.global());
+    // Past the cap the index is Unknown, never a dropped hash: it holds
+    // globally (B3) and vetoes every family, counted as overflow.
+    let (admission, _, rows, index) = owned_start_beside_rows(Beside {
+        retired_census: true,
+        census_cap: Some(0),
+        ..Beside::default()
+    });
+    assert_ne!(admission, Some("strict"));
+    assert!(rows
+        .iter()
+        .any(|row| row["counts"]["census_prefix_overflow"] == 1));
+    assert!(index.usage_guard_holds.global());
+    assert_eq!(
+        usage_census_prefix::current(&index).verdict(CARRY_ROOT, [0]),
+        usage_census_prefix::CensusPrefixVerdict::Unknown
+    );
+    assert!(usage_pending_guard::fork_lineage_incomplete(&index));
+    // Without the record the same owned start stays strict.
+    assert_eq!(owned_start_beside(Beside::default()), (Some("strict"), 0));
+}
+
+fn retirement_attempt(index: &mut ScanIndex) -> serde_json::Value {
+    let (prepared, rows) = crate::local_resource_diagnostics::capture(|| {
+        index.prepare_claude_usage_pending_settlement()
+    });
+    prepared.finish(index, false);
+    rows.into_iter()
+        .find(|row| row["stage"] == "claude_usage_pending_settlement_attempt")
+        .map(|row| row["counts"].clone())
+        .expect("settlement attempt row")
+}
+
+#[test]
+fn fork_lineage_unknown_refuses_retirement_while_any_family_incomplete() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    // Lead B round 8 (b'+c, part c): while ANY Claude family's coverage is
+    // incomplete, no family retires, an unrelated one included; each
+    // considered family is counted retire_refused{fork_lineage_unknown}.
+    let (mut index, root, items) = held_family_index();
+    let pending = index.claude_usage_family_pending[&root].clone();
+    index
+        .claude_usage_family_pending
+        .insert(CARRY_OTHER.to_owned(), pending);
+    index.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
+    assert!(!usage_pending_guard::fork_lineage_incomplete(&index));
+    let counts = retirement_attempt(&mut index);
+    assert!(counts["retire_refused"]["fork_lineage_unknown"].is_null());
+    assert_eq!(counts["retired"]["families"], 0);
+    let parent = index
+        .files
+        .keys()
+        .find(|key| {
+            claude_index_path_member_ref(Path::new(key))
+                .is_some_and(|member| member.root == root && member.subagent_stem.is_none())
+        })
+        .cloned()
+        .unwrap();
+    // (1) A paced or refused read of the held family.
+    let mut refused = index.clone();
+    refused.usage_guard_full_blocked(Path::new(&parent));
+    // (2) Held growth recorded in its runtime slot, not yet merged.
+    let mut growth = index.clone();
+    accumulate_guarded(&mut growth, &items[..1]);
+    // (3) An indexed sibling missing from the held family's evidence.
+    let mut sibling = index.clone();
+    sibling.files.insert(
+        local_index_key(
+            &Path::new(&parent)
+                .with_extension("")
+                .join("subagents")
+                .join("agent-missing.jsonl"),
+        ),
+        manifest_index_entry(Some("missing-sibling")),
+    );
+    for (label, mut incomplete) in [("refused", refused), ("growth", growth), ("sibling", sibling)]
+    {
+        assert!(
+            usage_pending_guard::fork_lineage_incomplete(&incomplete),
+            "{label}"
+        );
+        let counts = retirement_attempt(&mut incomplete);
+        assert_eq!(
+            counts["retire_refused"]["fork_lineage_unknown"]["families"],
+            2,
+            "{label}: the unrelated family is held back too"
+        );
+        assert_eq!(counts["retired"]["families"], 0, "{label}");
+    }
+}
+
 /// Counts-only inventory comparison entry. Supply one frozen ScanIndex, or a
 /// directory of ordered *.json checkpoint copies. This never opens transcripts,
 /// saves state, uploads, or repairs the input. A single selected generation has
@@ -936,6 +1071,14 @@ fn phase1_replay_frozen_scan_index_guard_comparison() {
     let mut cap_headroom_min = [u64::MAX; 2];
     let mut invalid_families = [0_u64; 2];
     let mut compacted_families = 0_u64;
+    // Lead B round 8: the fork-lineage retirement gate and the census-prefix
+    // index on the same frozen input. Runtime unread marks and held growth
+    // do not survive a reload, so only global holds, Unknown prefix indexes
+    // and missing siblings of held families can fire it here.
+    let mut fork_lineage_unknown_checkpoints = 0_u64;
+    let mut fork_lineage_unknown_families = 0_u64;
+    let mut census_prefix_entries_max = 0_u64;
+    let mut census_prefix_unknown = 0_u64;
     for path in paths {
         let file = File::open(path).expect("frozen checkpoint unavailable");
         let mut index =
@@ -947,6 +1090,13 @@ fn phase1_replay_frozen_scan_index_guard_comparison() {
         index.refresh_usage_guard_holds_at(None);
         checkpoints += 1;
         global_unknown += u64::from(index.usage_guard_holds.global());
+        let prefixes = usage_census_prefix::CensusPrefixIndex::build(&index);
+        census_prefix_entries_max = census_prefix_entries_max.max(prefixes.len() as u64);
+        census_prefix_unknown += u64::from(prefixes.unknown());
+        if usage_pending_guard::fork_lineage_incomplete(&index) {
+            fork_lineage_unknown_checkpoints += 1;
+            fork_lineage_unknown_families += index.claude_usage_family_pending.len() as u64;
+        }
         let roots = index
             .claude_usage_family_pending
             .keys()
@@ -1010,7 +1160,13 @@ fn phase1_replay_frozen_scan_index_guard_comparison() {
         "compaction_simulated_families":compacted_families,
         "pending_occurrence_cap":MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
         "historical_decision_log_unavailable":1,"acquisition_money_replay_unavailable":1,
-        "activation_zero_diff_proven":false})
+        "activation_zero_diff_proven":false,
+        "fork_lineage_unknown_checkpoints":fork_lineage_unknown_checkpoints,
+        "retire_refused_fork_lineage_unknown_families":fork_lineage_unknown_families,
+        "fork_lineage_runtime_marks_unavailable":1,
+        "census_prefix_entries_max":census_prefix_entries_max,
+        "census_prefix_cap":usage_census_prefix::CENSUS_PREFIX_MAX_ENTRIES,
+        "census_prefix_unknown_checkpoints":census_prefix_unknown})
     );
     assert_eq!(known_diffs, 0, "known guard differences; counts only");
 }

@@ -159,6 +159,7 @@ mod stale_carry_diagnostics;
 #[cfg(test)]
 mod transcript_acquisition_tests;
 mod traversal_transition;
+mod usage_census_prefix;
 mod usage_pending_guard;
 mod usage_pending_membership;
 mod usage_pending_retention;
@@ -6112,12 +6113,32 @@ fn claude_fence_closed_retry_carry_observed(
             }
         }
     }
+    // Lead B round 8: a carried root whose requests a pending-free root's
+    // live census record also holds (a retired family's copy, or its
+    // original) is not carried; neither is any while the census-prefix
+    // index is Unknown. Veto only, whatever the admission above.
+    let census_prefix = usage_census_prefix::current(index);
+    let census_prefix_shared = carried
+        .iter()
+        .filter(|root_session_id| {
+            census_prefix.verdict(
+                root_session_id,
+                index.claude_usage_family_pending[root_session_id.as_str()]
+                    .membership()
+                    .values()
+                    .flat_map(|hashes| hashes.iter())
+                    .filter_map(|hash| usage_census_prefix::pending_hash_prefix(hash)),
+            ) != usage_census_prefix::CensusPrefixVerdict::Clear
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
     carried.retain(|root_session_id| {
-        (accepted_admitted
-            && blocked
-                .get(root_session_id.as_str())
-                .is_some_and(|(_, refused)| !refused))
-            || !shared_owners.contains(root_session_id)
+        !census_prefix_shared.contains(root_session_id)
+            && ((accepted_admitted
+                && blocked
+                    .get(root_session_id.as_str())
+                    .is_some_and(|(_, refused)| !refused))
+                || !shared_owners.contains(root_session_id))
     });
     diagnostics.reject(
         if index.claude_request_identity_contract_changed {
@@ -9356,6 +9377,18 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     } else {
         native_duplicate_request_owners
     };
+    // Lead B round 8 census-prefix veto: a current request whose 8-byte
+    // prefix a pending-free root's live census record holds (a retired
+    // family's later untagged copy) is duplicated. Veto only: it never
+    // enters the ownership mask or the changed-duplicate sets. An overflowed
+    // index already made the hold projection global (B3 Unknown).
+    let census_prefix = index.refresh_claude_census_prefix(census_window_end, census_complete);
+    let census_prefix_hashes = usage_census_prefix::duplicated_pending_hashes(
+        index,
+        &census_prefix,
+        census_window_end,
+        snapshots,
+    );
     // B3 phase 1 (Lead B 4c): a held stale family's request keys, old window
     // and held growth, are excluded from duplicate detection above, so they
     // still veto any other family that shares them.
@@ -9377,6 +9410,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         .keys()
         .chain(detected_duplicate_request_owners.keys())
         .chain(held_request_hashes)
+        .chain(census_prefix_hashes.iter())
         .cloned()
         .collect::<BTreeSet<_>>();
     // Lead B unread-scope veto: request keys cannot cover what a held family
