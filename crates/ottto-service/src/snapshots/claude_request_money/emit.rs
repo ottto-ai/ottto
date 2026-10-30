@@ -33,6 +33,9 @@ pub(super) fn grain_row(
     account: Option<String>,
 ) -> SnapshotModelUsage {
     let mut selector_context = key.2.clone();
+    let copy_unproven = selector_context
+        .remove(super::e2::COPY_UNPROVEN_KEY)
+        .is_some();
     let mut selector_sources = BTreeMap::new();
     if let Some(origin) = origin {
         let name = match origin {
@@ -65,6 +68,7 @@ pub(super) fn grain_row(
         account_identifier_hash: account,
         evidence_ref: None,
         identity_parts: None,
+        copy_unproven,
         cost_usd: grain.cost().map(dollars),
         input_cost_usd: None,
         output_cost_usd: None,
@@ -219,6 +223,19 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
         })
         .collect();
     super::super::rebuild_snapshot_model_usage_with(item, &mut hashes);
+    let mut rows = 0;
+    let mut requests = 0;
+    for row in item
+        .usage_buckets
+        .iter()
+        .flat_map(|bucket| &bucket.model_usage)
+        .filter(|row| row.copy_unproven)
+    {
+        rows += 1;
+        requests += row.request_count;
+    }
+    item.copy_unproven_counts =
+        (rows > 0).then_some(super::super::CopyUnprovenCounts { rows, requests });
     // The ordinary token-only rebuild deliberately drops monetary fields.
     // Literal top rows must retain the exact per-row sum of own costs so
     // contract 5 can reproduce both bucket and top-level rows.

@@ -688,6 +688,9 @@ pub struct ActivityHintResponse {
     /// Exact accepted-log cache evidence capability; absent or unknown disables wire emission.
     #[serde(default)]
     pub session_cache_observations_contract: Option<String>,
+    /// Provisional class-N copy disclosure contract. Missing/null/unknown OFF.
+    #[serde(default)]
+    pub copy_unproven_contract: Option<String>,
     /// Existing server mandate: ordinary bootstrap may not bypass required CAS.
     #[serde(default)]
     pub snapshot_head_cas_required: bool,
@@ -3640,6 +3643,30 @@ mod tests {
     }
 
     #[test]
+    fn copy_unproven_capability_defaults_off_and_requires_exact_contract() {
+        for extra in [
+            "",
+            r#", "copy_unproven_contract":null"#,
+            r#", "copy_unproven_contract":"unknown""#,
+        ] {
+            let hint: ActivityHintResponse =
+                serde_json::from_str(&activity_hint_json(extra)).unwrap();
+            assert_ne!(
+                hint.copy_unproven_contract.as_deref(),
+                Some("copy_unproven:v1")
+            );
+        }
+        let hint: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
+            r#", "copy_unproven_contract":"copy_unproven:v1""#,
+        ))
+        .unwrap();
+        assert_eq!(
+            hint.copy_unproven_contract.as_deref(),
+            Some("copy_unproven:v1")
+        );
+    }
+
+    #[test]
     fn context_curve_capability_defaults_off_and_requires_exact_contract() {
         let old_backend: ActivityHintResponse =
             serde_json::from_str(&activity_hint_json("")).expect("old activity hint");
@@ -5307,7 +5334,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, copy_unproven_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

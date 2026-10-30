@@ -67,6 +67,13 @@ mod rejection_log;
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const SNAPSHOT_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+pub(crate) fn copy_prefix_pacing_seconds() -> (u64, u64) {
+    (
+        SNAPSHOT_SYNC_INTERVAL.as_secs(),
+        MAX_CYCLE_INTERVAL.as_secs(),
+    )
+}
 // Both scan workers' stack. Headroom, not a fix: the release cycle fits the
 // 2 MiB spawn default (scan_worker_stack_margin_receipt), and an overflow
 // would abort the daemon.
@@ -4686,6 +4693,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         removed_usage: item.removed_usage,
         telemetry_owned_complete: item.telemetry_owned_complete,
         resolver_conflict_count: item.resolver_conflict_count,
+        copy_unproven_counts: item.copy_unproven_counts,
         claude_money: None,
         claude_usage_request_ids: BTreeSet::new(),
         claude_usage_occurrences: BTreeMap::new(),
@@ -5942,6 +5950,31 @@ fn cycle_upload_context(
     }
 }
 
+/// Bind persisted retry pages to the local money mode. OFF is the released
+/// context; an operator's next launch in another mode cannot replay old bodies.
+pub(crate) fn resumed_prefix_upload_context(context: String, enabled: bool) -> String {
+    if enabled {
+        format!(
+            "{:x}",
+            Sha256::digest(format!("{context}:resumed-prefix:v1"))
+        )
+    } else {
+        context
+    }
+}
+
+/// Keep capability-qualified ACK contexts in the loader's 64-hex domain.
+pub(crate) fn copy_unproven_upload_context(context: String, enabled: bool) -> String {
+    if enabled {
+        format!(
+            "{:x}",
+            Sha256::digest(format!("{context}:copy_unproven:v1"))
+        )
+    } else {
+        context
+    }
+}
+
 /// The replay generation of a cycle over `index` (pure; shared as above).
 fn cycle_replay_generation(
     source: SnapshotSource,
@@ -6257,6 +6290,15 @@ fn prepare_sync_source_inner(
         checkpoint_namespace.as_deref(),
         cache_observations_enabled,
     );
+    let base_upload_context = upload_context.clone();
+    let resumed_prefix_enabled = source == SnapshotSource::ClaudeCode
+        && crate::snapshots::claude_request_money::e2::resumed_prefix_enabled();
+    let copy_unproven_enabled = resumed_prefix_enabled
+        && activity_hint.copy_unproven_contract.as_deref() == Some("copy_unproven:v1");
+    // Context adoption invalidates stale pending pages on capability downgrade.
+    // OFF preserves the exact released context and body bytes.
+    let upload_context = resumed_prefix_upload_context(upload_context, resumed_prefix_enabled);
+    let upload_context = copy_unproven_upload_context(upload_context, copy_unproven_enabled);
     let legacy_policy_index_path = legacy_policy_scoped_snapshot_index_path(
         support_dir,
         source,
@@ -6338,6 +6380,9 @@ fn prepare_sync_source_inner(
     }
     continuation::observe(source, &upload_context, upload_policy);
     activate_source_upload_context(source, upload_context, &mut index, &mut upload_progress);
+    index.copy_unproven_enabled = copy_unproven_enabled;
+    index.copy_prefix_base_upload_context =
+        (source == SnapshotSource::ClaudeCode).then_some(base_upload_context);
     if !context_curve_enabled {
         // Stamp the off transition before taking the partial-commit baseline.
         // If an ordinary no-curve upload is partially accepted and then shed,
@@ -6467,6 +6512,28 @@ fn prepare_sync_source_inner(
         // unaccepted/shed page keeps it and its latch. It re-owes no history.
         index.observe_claude_request_identity_contract(true);
     }
+    let scan_window_days = scan_request_window_days(
+        receipt_window_days,
+        backfill_pending || admission_reoffer_pending,
+        curve_replay_pending,
+    );
+    let copy_prefix_scope = if source == SnapshotSource::ClaudeCode {
+        match crate::snapshots::claude_copy_prefix_reread::prepare(
+            &mut index,
+            support_dir,
+            &roots,
+            &scan_started_at,
+            scan_window_days,
+        ) {
+            Ok(paths) => paths,
+            Err(_) => {
+                eprintln!("local Claude copy-prefix re-read: request_refused=1");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
     let committed_index = index.clone();
     let reoffer_paths =
         index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
@@ -6522,27 +6589,25 @@ fn prepare_sync_source_inner(
         &sampled_scope,
         request_identity_capture,
     );
-    let mut scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
-        source,
-        &roots,
-        index,
-        &scan_started_at,
-        scan_request_window_days(
-            receipt_window_days,
-            backfill_pending || admission_reoffer_pending,
-            curve_replay_pending,
-        ),
-        MAX_BACKFILL_FILES_PER_SOURCE,
-        upload_policy.session_artifacts_enabled,
-        (source == SnapshotSource::ClaudeCode).then_some(support_dir),
-        &watcher_hints.paths,
-        watcher_hints.overflowed,
-        context_curve_enabled,
-        request_identity_capture,
-    )
-    .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
-    .with_codex_side_pass(codex_side_pass)
-    .with_codex_versions(daemon.codex_versions.clone());
+    let mut scan =
+        crate::snapshots::OwnedSourceScan::new_with_identity_capture_and_recovery_priority(
+            source,
+            &roots,
+            index,
+            &scan_started_at,
+            scan_window_days,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            upload_policy.session_artifacts_enabled,
+            (source == SnapshotSource::ClaudeCode).then_some(support_dir),
+            &watcher_hints.paths,
+            watcher_hints.overflowed,
+            context_curve_enabled,
+            request_identity_capture,
+            &copy_prefix_scope,
+        )
+        .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
+        .with_codex_side_pass(codex_side_pass)
+        .with_codex_versions(daemon.codex_versions.clone());
     if source == SnapshotSource::ClaudeCode {
         scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
     } else if source == SnapshotSource::Codex {
@@ -9313,7 +9378,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     crate::snapshots::claude_request_money::e2::decide_page_copies(
         &mut scan_result.snapshots,
         index,
-    );
+    )
+    .apply(index);
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
     let mut full_rearm_evidence_complete = true;
     let api_load = match prepared.as_mut() {
@@ -18752,6 +18818,38 @@ mod tests {
                 "/support/snapshots/codex-scan-index-attribution-pending-attribution-labels.json"
             )
         );
+    }
+
+    #[test]
+    fn copy_capability_context_preserves_partial_ack_progress_after_restart() {
+        let base = cycle_upload_context(SnapshotUploadPolicy::default(), None, false);
+        assert_eq!(copy_unproven_upload_context(base.clone(), false), base);
+        assert_eq!(resumed_prefix_upload_context(base.clone(), false), base);
+        let local_context = resumed_prefix_upload_context(base.clone(), true);
+        assert_ne!(local_context, base);
+        assert!(is_snapshot_fingerprint(&local_context));
+        let context = copy_unproven_upload_context(local_context, true);
+        assert_ne!(context, base);
+        assert!(is_snapshot_fingerprint(&context));
+        let root = test_dir("copy-capability-ack-context");
+        let path = root.join("progress.json");
+        let destination = "d".repeat(64);
+        let entity = "e".repeat(64);
+        let mut progress =
+            SnapshotUploadProgress::new(destination.clone(), test_quarantine_witness());
+        progress.accepted_fingerprints.insert(entity.clone());
+        progress
+            .accepted_body_witnesses
+            .insert(entity.clone(), "b".repeat(64));
+        progress
+            .accepted_body_contexts
+            .insert(entity.clone(), context.clone());
+        progress.save(&path).unwrap();
+        let loaded =
+            SnapshotUploadProgress::load(&path, &destination, test_quarantine_witness()).unwrap();
+        assert_eq!(loaded.accepted_body_contexts.get(&entity), Some(&context));
+        assert!(loaded.accepted_fingerprints.contains(&entity));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

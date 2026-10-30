@@ -18,8 +18,18 @@ pub(crate) struct E2ScanFixture {
     pub(crate) cache: Arc<sampled_scan::SharedCache>,
     observed: Mutex<Vec<PathBuf>>,
     pub(crate) versions: Option<Arc<codex_version::CodexVersionFeed>>,
+    capture_claude_identity: bool,
 }
 impl E2ScanFixture {
+    /// Opt in when the fixture asserts marker/identity behavior. Money-only
+    /// fixtures retain their historical capture-off scope and bytes.
+    pub(crate) fn capturing_identity() -> Self {
+        Self {
+            capture_claude_identity: true,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
         self.observed.lock().unwrap().clone()
     }
@@ -34,6 +44,11 @@ impl E2ScanFixture {
         index_path: &Path,
     ) {
         let (scope, capture) = durable_binding(source);
+        let capture = if source == SnapshotSource::ClaudeCode {
+            self.capture_claude_identity
+        } else {
+            capture
+        };
         begin_durable_pass(
             &self.cache,
             state_dir,
@@ -80,7 +95,7 @@ impl E2ScanFixture {
             hints,
             false,
             true,
-            CLAUDE_IDENTITY_CAPTURE,
+            self.capture_claude_identity,
         );
         if sampled {
             let (scope, _) = durable_binding(SnapshotSource::ClaudeCode);
@@ -201,4 +216,16 @@ pub(crate) fn indexed_size(index: &ScanIndex, path: &Path) -> Option<u64> {
         .files
         .get(&local_index_key(path))
         .map(|entry| entry.size_bytes)
+}
+
+/// Establish the completed legacy census precondition after the synthetic
+/// uploader has ACKed every current entity. Partial subsets intentionally
+/// retain the previous context; this creates no per-file receipt or ACK.
+pub(crate) fn adopt_acked_census_for_test(index: &mut ScanIndex, context: &str) {
+    let delivered = index.current_snapshot_fingerprints();
+    assert!(!delivered.is_empty());
+    assert!(delivered
+        .iter()
+        .all(|fp| index.accepted_snapshot_fingerprint_recorded(fp)));
+    index.upload_context_fingerprint = Some(context.into());
 }
