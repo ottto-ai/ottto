@@ -185,6 +185,16 @@ pub(crate) fn prepare(
     }
     let request: Request = bounded_json(&path)?;
     let mut request = plan(request.members)?;
+    // Match discovery's supported configured-root symlink semantics. Scope
+    // members and indexed keys use the resolved spelling, never a descendant
+    // symlink or the configured alias.
+    let mut census = ScanCensus::default();
+    let resolved_roots = roots
+        .iter()
+        .filter_map(|root| {
+            resolve_configured_scan_root(SnapshotSource::ClaudeCode, root, &mut census)
+        })
+        .collect::<Vec<_>>();
     for m in &mut request.members {
         let now = member(&m.path)?;
         ensure!(
@@ -192,7 +202,7 @@ pub(crate) fn prepare(
             "scope metadata changed; request refused"
         );
         ensure!(
-            roots.iter().any(|root| m.path.starts_with(root)),
+            resolved_roots.iter().any(|root| m.path.starts_with(root)),
             "scope outside source roots"
         );
         let key = local_index_key(&m.path);

@@ -470,6 +470,71 @@ fn pre_scope_mode_qualified_receipt_keeps_unaffected_history_quiet() {
     f.index.copy_prefix_base_upload_context = Some("e".repeat(64));
     assert!(f.index.file_upload_context_requires_adoption(&f.key()));
 }
+
+#[test]
+fn scoped_mode_preserves_census_settlement_after_acked_file_becomes_empty_or_suppressed() {
+    for empty in [true, false] {
+        let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+        assert_eq!(f.adopt().files, 1);
+        let old_receipt = f.entry().upload_context_receipt.clone();
+        let base = "d".repeat(64);
+        f.index.copy_prefix_base_upload_context = Some(base.clone());
+        f.index.upload_context_fingerprint = Some(base.clone());
+        f.index.activate_file_upload_context(
+            f.source,
+            crate::snapshot_sync::resumed_prefix_upload_context(base, true),
+        );
+        if empty {
+            fs::write(&f.path, "").unwrap();
+        } else {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&f.path)
+                .unwrap()
+                .write_all(b"\n")
+                .unwrap();
+        }
+        let (mut scan, _) = f.walk(false);
+        assert_eq!(scan.scanned_file_count, 1, "real change reads once");
+        if !empty {
+            assert!(!scan.snapshots.is_empty());
+            // The post-policy finalizer receives no permitted bodies.
+            scan.snapshots.clear();
+        }
+        scan.census_complete = true;
+        finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+        assert!(f.index.confirmed_empty_files.contains(&f.key()));
+        assert!(f.entry().last_upload_body_witness.is_none());
+        assert_eq!(f.entry().upload_context_receipt, old_receipt);
+        // Drain a prior incomplete census's unsettled marker through the
+        // ordinary complete-census finalizer, without manufacturing an ACK.
+        for _ in 0..2 {
+            if f.index.source_upload_context_matches() {
+                break;
+            }
+            let (mut census, _) = f.walk(false);
+            census.census_complete = true;
+            finalize_scan_after_policy(f.source, &mut census, &mut f.index);
+        }
+        assert!(f.index.source_upload_context_matches());
+        for _ in 0..3 {
+            let (scan, bytes) = f.walk(true);
+            assert_eq!(
+                (scan.scanned_file_count, bytes, scan.snapshots.len()),
+                (0, 0, 0)
+            );
+        }
+        // An actual policy change still revisits suppressed/empty outcomes.
+        let changed = "e".repeat(64);
+        f.index.copy_prefix_base_upload_context = Some(changed.clone());
+        f.index.activate_file_upload_context(
+            f.source,
+            crate::snapshot_sync::resumed_prefix_upload_context(changed, true),
+        );
+        assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+    }
+}
 #[test]
 fn upload_context_receipt_stale_source_witness_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);

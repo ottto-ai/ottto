@@ -143,6 +143,30 @@ fn mode_context_reads_only_requested_set_and_matches_estimate() {
     fs::remove_dir_all(home).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn configured_root_symlink_uses_the_same_resolved_scope_as_discovery() {
+    let (home, root, mut index, _) = setup("copy-prefix-configured-symlink");
+    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
+    let configured = home.join("configured-project");
+    std::os::unix::fs::symlink(&root, &configured).unwrap();
+    let support = home.join("support");
+    let counts = run(&home.join("scope.json"), &support, true).unwrap();
+    activate_mode(&mut index, "ctx-1", true, false);
+    let pending = prepare(&mut index, &support, std::slice::from_ref(&configured)).unwrap();
+    let (_, scan, opened) = walk(&configured, index, &pending);
+    assert_eq!(opened, pending);
+    assert_eq!(scan.scanned_file_count, counts.files);
+    assert_eq!(
+        opened
+            .iter()
+            .map(|p| fs::metadata(p).unwrap().len())
+            .sum::<u64>(),
+        counts.bytes
+    );
+    fs::remove_dir_all(home).unwrap();
+}
+
 #[test]
 fn estimate_is_metadata_only_and_changes_no_files_or_index() {
     let (home, _, index, _) = setup("copy-prefix-estimate");

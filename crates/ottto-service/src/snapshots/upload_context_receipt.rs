@@ -149,6 +149,19 @@ impl ScanIndex {
             if self.upload_context_fingerprint.as_ref() == expected {
                 return false;
             }
+            if self.confirmed_empty_files.contains(key) {
+                // Empty/suppressed files cannot earn an ACK receipt. Their
+                // existing census settlement remains authoritative, including
+                // an old receipt whose now-empty body witness cannot match.
+                return if self.unaffected_file(key) {
+                    !self
+                        .upload_context_fingerprint
+                        .as_deref()
+                        .is_some_and(|context| self.same_copy_prefix_base(context))
+                } else {
+                    true
+                };
+            }
             let Some(entry) = self.files.get(key) else {
                 return true;
             };
