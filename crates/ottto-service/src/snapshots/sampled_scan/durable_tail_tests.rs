@@ -2491,8 +2491,11 @@ fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
         stats.gc_bytes_read,
         (keys.len() * store::HEADER_BYTES) as u64
     );
-    assert_eq!(stats.gc_records_deleted, 1);
-    assert_eq!(stats.disk_records, 3);
+    assert_eq!(
+        stats.gc_records_deleted, 0,
+        "index omission is not finish proof"
+    );
+    assert_eq!(stats.disk_records, 4);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -3323,34 +3326,19 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                         false,
                         true,
                     );
-                    let claude = source == SnapshotSource::ClaudeCode;
-                    assert_eq!(
+                    assert!(
                         absent_path.exists(),
-                        claude,
-                        "cold Claude keeps unproved records; Codex deletes verified absences"
+                        "a fresh index cannot finish an appendable file"
+                    );
+                    assert!(
+                        record_path.exists(),
+                        "{source:?}/{kind}: active custody survives cleanup"
                     );
                     let (_, cleanup) = cache.durable_counters(source).unwrap();
-                    // The unmarked control also has a known selected record
-                    // with no index entry: Codex collects both known absences.
-                    let selected_survives = claude || kind != "none";
-                    assert_eq!(record_path.exists(), selected_survives, "{source:?}/{kind}");
+                    assert_eq!(cleanup.gc_records_deleted, 0);
                     assert_eq!(
-                        cleanup.gc_records_deleted,
-                        if claude {
-                            0
-                        } else {
-                            1 + u64::from(kind == "none")
-                        },
-                        "{source:?}/{kind}: exact known absent records collected"
-                    );
-                    assert_eq!(
-                        cleanup.mutation_unproved,
-                        if claude {
-                            1 + u64::from(kind == "none")
-                        } else {
-                            0
-                        },
-                        "every unproved known Claude survivor remains in custody"
+                        cleanup.mutation_unproved, 0,
+                        "active retention attempts no mutation"
                     );
                 } else {
                     cache.durable_begin_pass(source, &index_path, &namespace, false);

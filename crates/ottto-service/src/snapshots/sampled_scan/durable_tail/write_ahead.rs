@@ -754,7 +754,7 @@ impl SharedCache {
                 Err(failure) => return self.resolve_failed_preparation(failure, fences),
             }
         };
-        // Outside Stores: conditional rename of the already fsynced candidate.
+        // Outside Stores: conditional rename and survivor stamp; pass fsync is unchanged.
         let committed = match pending.commit() {
             Ok(committed) => committed,
             Err(failure) => return self.resolve_failed_preparation(failure, fences),

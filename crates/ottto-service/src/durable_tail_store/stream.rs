@@ -294,7 +294,6 @@ impl StreamPreparation {
             let (temp, _) = output.into_parts();
             self.attempt.temp = Some(temp);
             result?;
-            self.attempt.temp.as_ref().expect("owned stream").sync()?;
             self.attempt.content = content.finalize().into();
             self.attempt.identity = Some(RecordIdentity {
                 binding: self.header.binding.clone(),

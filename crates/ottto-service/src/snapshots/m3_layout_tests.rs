@@ -222,7 +222,7 @@ fn unsupported_native_finish_keeps_legacy_path_without_a_v3_record() {
 }
 
 #[test]
-fn preexisting_v3_on_unsupported_layout_reads_only_selected_key_then_retires_after_settlement() {
+fn preexisting_v3_on_unsupported_layout_reads_only_selected_key_and_keeps_active_record() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
@@ -264,10 +264,13 @@ fn preexisting_v3_on_unsupported_layout_reads_only_selected_key_then_retires_aft
             "usage, tier selectors and costs must match cold Full as well as additive evidence"
         );
         f.settle(&cache, &mut read);
-        assert!(!record.exists());
+        assert!(
+            record.exists(),
+            "settlement is not irreversible finish proof"
+        );
         let (counts, disk) = cache.durable_counters(SOURCE).unwrap();
         assert_eq!(counts.ineligible["restore_unavailable.layout"], 1);
-        assert_eq!(disk.restore_unavailable_layout_gc, 1);
+        assert_eq!(disk.restore_unavailable_layout_gc, 0);
         assert!(read.index.files[&f.key()]
             .last_upload_body_witness
             .is_some());
@@ -294,7 +297,7 @@ fn preexisting_v3_on_unsupported_layout_reads_only_selected_key_then_retires_aft
             counts.ineligible["restore_unavailable.layout"], 1,
             "no second unavailable-A fallback"
         );
-        assert_eq!(disk.restore_unavailable_layout_gc, 1);
+        assert_eq!(disk.restore_unavailable_layout_gc, 0);
     });
 }
 
@@ -434,14 +437,17 @@ fn unsupported_layout_budget_deferral_keeps_a_until_a_real_selected_read() {
         assert_eq!(read.modes, (1, 0, 0));
         assert_eq!(read.bytes, fs::metadata(&f.path).unwrap().len());
         f.settle(&cache, &mut read);
-        assert!(!path.exists());
+        assert!(
+            path.exists(),
+            "a selected read does not finish an appendable file"
+        );
         assert_eq!(
             cache
                 .durable_counters(SOURCE)
                 .unwrap()
                 .1
                 .restore_unavailable_layout_gc,
-            1
+            0
         );
     });
 }
@@ -565,10 +571,14 @@ fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
                 }
             }
             let reset = ResetUnlink;
-            store::test_hooks::set_before_unlink(Some(Box::new(|_| {
+            let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = attempts.clone();
+            store::test_hooks::set_before_unlink(Some(Box::new(move |_| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Err(std::io::Error::from_raw_os_error(libc::EIO))
             })));
-            assert!(cache.durable_gc(f.writer, SOURCE, &committed).is_err());
+            cache.durable_gc(f.writer, SOURCE, &committed).unwrap();
+            assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 0);
             drop(reset);
             assert_eq!(fs::read(&record).unwrap(), original);
             assert_eq!(
@@ -581,14 +591,17 @@ fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
             );
 
             cache.durable_gc(f.writer, SOURCE, &committed).unwrap();
-            assert!(!record.exists());
+            assert!(
+                record.exists(),
+                "settlement is not irreversible finish proof"
+            );
             assert_eq!(
                 cache
                     .durable_counters(SOURCE)
                     .unwrap()
                     .1
                     .restore_unavailable_layout_gc,
-                1
+                0
             );
             let restarted_index = ScanIndex::load(&f.index_path()).unwrap();
             assert_eq!(
@@ -662,14 +675,17 @@ fn unsupported_layout_retryable_loss_preserves_prior_body_and_debt_after_gc() {
         );
 
         f.settle(&cache, &mut failed);
-        assert!(!record.exists());
+        assert!(
+            record.exists(),
+            "settlement is not irreversible finish proof"
+        );
         assert_eq!(
             cache
                 .durable_counters(SOURCE)
                 .unwrap()
                 .1
                 .restore_unavailable_layout_gc,
-            1
+            0
         );
         let restarted = ScanIndex::load(&f.index_path()).unwrap();
         let entry = &restarted.files[&key];

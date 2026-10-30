@@ -5182,7 +5182,14 @@ impl SharedCache {
         // with cause-only totals omits an empty snapshot, including on repeat
         // calls after its delta has been reported.
         let cause_only = now[..5] == [0; 5] && now[5..].iter().any(|&n| n != 0);
-        if store != store::StoreCounters::default() || !cause_only || hold_alarm || hold_changed {
+        // A configured quota alone is not store activity. Keep it in snapshots
+        // that otherwise emit, without adding a second cause-only alarm.
+        let activity = store::StoreCounters {
+            tail_quota_bytes: 0,
+            ..store
+        };
+        if activity != store::StoreCounters::default() || !cause_only || hold_alarm || hold_changed
+        {
             // One existing store snapshot carries the fault reason, degraded
             // publishes, refusals, pause duration and per-key hold age together.
             crate::local_resource_diagnostics::durable_tail_alarm(

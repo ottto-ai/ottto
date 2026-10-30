@@ -2097,6 +2097,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
             | "resume_census_window_end"
             | "historical_replay_generation"
             | "completed_context_curve_replay_generation" => serde_json::json!("non-default"),
+            "tail_capacity_debt" => serde_json::json!({"synthetic-capacity": 1}),
             _ => panic!("add a non-default native fixture for persisted field {field}"),
         };
         value[field] = replacement;
@@ -2181,13 +2182,20 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
 fn desktop_inventory_keeps_existing_positional_index_slots() {
     let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
     let mut legacy = current.clone();
+    legacy.as_object_mut().unwrap().remove("tail_capacity_debt");
+    let previous = legacy.clone();
     legacy
         .as_object_mut()
         .unwrap()
         .remove("claude_desktop_store_inventory");
     let fields = lenient_decode::FIELDS;
-    assert_eq!(fields.last(), Some(&"claude_desktop_store_inventory"));
-    for (expected, slots) in [(&legacy, &fields[..fields.len() - 1]), (&current, fields)] {
+    assert_eq!(fields[fields.len() - 2], "claude_desktop_store_inventory");
+    assert_eq!(fields.last(), Some(&"tail_capacity_debt"));
+    for (expected, slots) in [
+        (&legacy, &fields[..fields.len() - 2]),
+        (&previous, &fields[..fields.len() - 1]),
+        (&current, fields),
+    ] {
         let array = Value::Array(slots.iter().map(|name| expected[*name].clone()).collect());
         let bytes = serde_json::to_vec(&array).unwrap();
         let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
