@@ -236,6 +236,7 @@ impl ColdReplay {
     }
 }
 
+/// [format] cold store each fence class and certificate reason retires before one full.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -388,6 +389,7 @@ fn cold_store_each_fence_class_and_certificate_reason_retires_before_one_full() 
     }
 }
 
+/// [behaviour] restored chain append during identity samples keeps tail and exact cold body.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -452,6 +454,7 @@ fn restored_chain_append_during_identity_samples_keeps_tail_and_exact_cold_body(
     lease.release();
 }
 
+/// [behaviour] twenty failed heads and evictions cannot starve maximal waiter past aged fallback.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -638,6 +641,7 @@ fn twenty_failed_heads_and_evictions_cannot_starve_maximal_waiter_past_aged_fall
     lease.release();
 }
 
+/// [money] claude both restore floor edges hold then catch up without moving accepted facts.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),

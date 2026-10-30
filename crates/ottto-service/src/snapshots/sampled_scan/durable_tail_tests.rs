@@ -63,6 +63,7 @@ impl Drop for ClearPreparationFault {
 
 // Direct owned API: reason precedence cannot turn an incompatible scope into
 // an audit/clock Full. The write-only FD also makes any body read fail.
+/// [format] empty custody scope rejection precedes audit clock and all body reads.
 #[test]
 fn empty_custody_scope_rejection_precedes_audit_clock_and_all_body_reads() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -122,6 +123,7 @@ fn empty_custody_scope_rejection_precedes_audit_clock_and_all_body_reads() {
     }
 }
 
+/// [behaviour] direct return keeps attached guard on heap poison and self eviction.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
 fn direct_return_keeps_attached_guard_on_heap_poison_and_self_eviction() {
@@ -209,6 +211,7 @@ fn direct_return_keeps_attached_guard_on_heap_poison_and_self_eviction() {
     }
 }
 
+/// [behaviour] direct completed absence and heap refusal return checkpoint and custody.
 #[test]
 fn direct_completed_absence_and_heap_refusal_return_checkpoint_and_custody() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -303,6 +306,7 @@ impl Drop for ResetActiveBudget {
 // is a fair delay (pending, predecessor kept, no Q11 or native Tail). Every
 // repeating refusal reads that growth once by the ordinary counted Full,
 // publishing the cumulative body (no duplicated prefix), then idles at 0 reads.
+/// [behaviour] production cold resources delay lease wait and read growth once.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
 fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
@@ -503,6 +507,7 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
 
 // Direct production factory. A write-only FD discriminates any certificate,
 // head or named-line read before the typed resource refusal.
+/// [format] certificate io precedes decode and rederive refusals.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
 fn certificate_io_precedes_decode_and_rederive_refusals() {
@@ -621,6 +626,7 @@ fn certificate_io_precedes_decode_and_rederive_refusals() {
 
 // Direct ordinary admission primitive with take-back enabled. The original
 // graph, rank, guard and flags survive refusal; success has no RAM residue.
+/// [behaviour] atomic cache transit returns same graph and custody or retains original refusal.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native cache layout")]
 fn atomic_cache_transit_returns_same_graph_and_custody_or_retains_original_refusal() {
@@ -739,6 +745,7 @@ fn atomic_cache_transit_returns_same_graph_and_custody_or_retains_original_refus
 // Actual production caller, not the direct API fixtures above. The accepted
 // frontier is the record's frontier: this fixture's exact old-byte overlap is0;
 // its positive Tail and physical guarded bytes discriminate the lost-guard bug.
+/// [behaviour] production cold pending and prepare error next pass tail obeys q11.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
 fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
@@ -1225,6 +1232,7 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
     }
 }
 
+/// [behaviour] admissible codex records survive above the retired aggregate disk cap.
 #[test]
 fn admissible_codex_records_survive_above_the_retired_aggregate_disk_cap() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1281,6 +1289,7 @@ fn admissible_codex_records_survive_above_the_retired_aggregate_disk_cap() {
     }
 }
 
+/// [money] receipt pending guard keeps accepted witness and census without unreadable.
 #[test]
 fn receipt_pending_guard_keeps_accepted_witness_and_census_without_unreadable() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1431,6 +1440,7 @@ fn store_snapshot(dir: &Path) -> BTreeMap<PathBuf, (Vec<u8>, Vec<i128>)> {
         .collect()
 }
 
+/// [money] hold active retains exact completion for one later batch receipt.
 #[test]
 fn hold_active_retains_exact_completion_for_one_later_batch_receipt() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1518,6 +1528,7 @@ impl Drop for ClearWriteFaults {
     }
 }
 
+/// [money] disabled pending store publishes valid ram through production scan without mutation.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1750,6 +1761,7 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
     }
 }
 
+/// [behaviour] m1 setup inventory and statvfs failures are counted and retry with original provenance.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -5329,6 +5341,7 @@ fn retail_reads() -> Vec<(u64, usize, u64)> {
     RETAIL_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut()))
 }
 
+/// [behaviour] q11 custody counts prefetch short reads and failure without renewal.
 #[test]
 fn q11_custody_counts_prefetch_short_reads_and_failure_without_renewal() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -5420,6 +5433,7 @@ fn q11_custody_counts_prefetch_short_reads_and_failure_without_renewal() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// [behaviour] q11 overflow never forgets a spent key and pread charges actual bytes.
 #[test]
 fn q11_overflow_never_forgets_a_spent_key_and_pread_charges_actual_bytes() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -5509,6 +5523,7 @@ fn q11_overflow_never_forgets_a_spent_key_and_pread_charges_actual_bytes() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// [behaviour] q11 strict restore real plain reader tail then retry holds.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS retained layout")]
 fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
@@ -5642,6 +5657,7 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// [money] receipt retry bound reads growth after quiet window and restart is idle.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -5955,6 +5971,7 @@ fn other_source_restore_after_return_release(
 
 /// Existing MAIN/S2 leaves: a real resident take is losslessly returned, then
 /// this SAME native step starts Full with no old graph. These are not cold API tests.
+/// [behaviour] production returned nontransient original reads growth once then quiet restart is idle.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
 fn production_returned_nontransient_original_reads_growth_once_then_quiet_restart_is_idle() {
@@ -6451,6 +6468,7 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
     }
 }
 
+/// [behaviour] q8 strict v1 bridge keeps unknown same and inode reuse conservative.
 #[test]
 fn q8_strict_v1_bridge_keeps_unknown_same_and_inode_reuse_conservative() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -6596,6 +6614,7 @@ fn a1a_scan_at(
     panic!("native transition did not finish");
 }
 
+/// [money] a1a 859 and restart with active carry restore tail zero full fresh census.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
@@ -6845,6 +6864,7 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
     }
 }
 
+/// [behaviour] a1a finite named revisions do not enumerate or mutate future records.
 #[test]
 fn a1a_finite_named_revisions_do_not_enumerate_or_mutate_future_records() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -7006,6 +7026,7 @@ fn a1a_finite_named_revisions_do_not_enumerate_or_mutate_future_records() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// [money] a1a frozen floor holds before certificate even after working entry clear.
 #[test]
 fn a1a_frozen_floor_holds_before_certificate_even_after_working_entry_clear() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -7109,6 +7130,7 @@ fn a1a_frozen_floor_holds_before_certificate_even_after_working_entry_clear() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// [behaviour] a1a strict writer preserves cleared and reverted predecessors after restore permission.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_permission() {
@@ -7223,6 +7245,7 @@ fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_p
     }
 }
 
+/// [format] a1a supported unprovable migration classifies stale on growth without o3.
 #[test]
 fn a1a_supported_unprovable_migration_classifies_stale_on_growth_without_o3() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -7346,6 +7369,7 @@ fn a1a_supported_unprovable_migration_classifies_stale_on_growth_without_o3() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// [behaviour] b1 native upgrade counts an actual failed read but not a changed fd.
 #[test]
 fn b1_native_upgrade_counts_an_actual_failed_read_but_not_a_changed_fd() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -7394,6 +7418,7 @@ fn b1_native_upgrade_counts_an_actual_failed_read_but_not_a_changed_fd() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// [behaviour] b1 absent o3 counts native start then writes and restores.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "native retained layout")]
 fn b1_absent_o3_counts_native_start_then_writes_and_restores() {
@@ -7626,6 +7651,7 @@ fn b1_absent_o3_fixture(sidecar_census_complete: bool, cancel_before_read: bool)
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// [behaviour] b1 strict tail writer retries with the original witness after memo loss.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "native retained layout")]
 fn b1_strict_tail_writer_retries_with_the_original_witness_after_memo_loss() {
@@ -7762,6 +7788,7 @@ fn b1_strict_tail_writer_retries_with_the_original_witness_after_memo_loss() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// [behaviour] c strict writer retires only a successfully acknowledged replacement.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "native retained layout")]
 fn c_strict_writer_retires_only_a_successfully_acknowledged_replacement() {
@@ -8005,6 +8032,7 @@ fn c_strict_writer_retires_only_a_successfully_acknowledged_replacement() {
 }
 
 // Movable A1a-t row: real scanner, original accepted prefix and pinned v1 image.
+/// [behaviour] a1t no match growth full restart recounts without dropping or adding the prefix twice.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_prefix_twice() {
@@ -8415,6 +8443,7 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// [money] a1t transitional full requires known current floor and strict growth.
 #[test]
 fn a1t_transitional_full_requires_known_current_floor_and_strict_growth() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -8530,6 +8559,7 @@ fn a0h_scan(
     owner.scan(roots, root, index, 100, true, &BTreeMap::new(), &[])
 }
 
+/// [behaviour] a0h native exhaustion growth pacing reselection and restart body.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
@@ -8903,6 +8933,7 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
     }
 }
 
+/// [behaviour] stale growth gate keeps transient and future floors held and shares pacing.
 #[test]
 fn stale_growth_gate_keeps_transient_and_future_floors_held_and_shares_pacing() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -8962,6 +8993,7 @@ fn stale_growth_gate_keeps_transient_and_future_floors_held_and_shares_pacing() 
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// [format] stale growth native reason full pacing reselection survivor and restart.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
@@ -9285,6 +9317,7 @@ fn b1g_scan(
     panic!("absent growth failed to complete");
 }
 
+/// [behaviour] b1g absent growth twice overflow cancel restart exact body and idle.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
@@ -9529,6 +9562,7 @@ fn b1g_before_read(
     panic!("native input was never reached");
 }
 
+/// [money] b1 future accepted floor blocks fresh cancelled and restarted inputs before read.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn b1_future_accepted_floor_blocks_fresh_cancelled_and_restarted_inputs_before_read() {
@@ -9620,6 +9654,7 @@ fn b1_future_accepted_floor_blocks_fresh_cancelled_and_restarted_inputs_before_r
 }
 
 // Movable C0 row: existing native scanner and exact emitted-body oracle.
+/// [money] a1t no match shared pacing ram tail eviction release restart and no rebind.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() {
@@ -9990,6 +10025,7 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
 // P2 component skeleton: accepted v1 -> process loss -> restored Tail ->
 // acknowledged successor -> second process loss. Move this row to the shared
 // transition fixture when #882 lands; retain these production scanner/wire calls.
+/// [behaviour] p2 restart restore tail persists successor and restarts again.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn p2_restart_restore_tail_persists_successor_and_restarts_again() {
@@ -10383,6 +10419,7 @@ fn pace_time(at: std::time::Instant) -> std::time::SystemTime {
     }
 }
 
+/// [behaviour] absent upgrade growth is a counted miss and shares the full pace.
 #[test]
 fn absent_upgrade_growth_is_a_counted_miss_and_shares_the_full_pace() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -10438,6 +10475,7 @@ fn absent_upgrade_growth_is_a_counted_miss_and_shares_the_full_pace() {
 
 /// S2 applies even to a missing record/resource refusal: never publish a
 /// smaller body just because this daemon lacks the old optional copy.
+/// [money] accepted floor missing record is neutral and freezes before mutation.
 #[test]
 fn accepted_floor_missing_record_is_neutral_and_freezes_before_mutation() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -10503,6 +10541,7 @@ fn accepted_floor_missing_record_is_neutral_and_freezes_before_mutation() {
     ));
 }
 
+/// [behaviour] growth hold wall expiry restart recovers exact body without prefix duplication.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -10671,6 +10710,7 @@ fn growth_hold_wall_expiry_restart_recovers_exact_body_without_prefix_duplicatio
     );
 }
 
+/// [money] warm shortened old file keeps accepted body floor without publication.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -11008,6 +11048,7 @@ impl Drop for O3Fixture {
     }
 }
 
+/// [money] o3 completion replaces no match idle zero restart tail and money equals cold.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_completion_replaces_no_match_idle_zero_restart_tail_and_money_equals_cold() {
@@ -11188,6 +11229,7 @@ fn o3_completion_replaces_no_match_idle_zero_restart_tail_and_money_equals_cold(
     );
 }
 
+/// [format] o3 save failure cancelled claim restart preserves option i and survivor.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_save_failure_cancelled_claim_restart_preserves_option_i_and_survivor() {
@@ -11276,6 +11318,7 @@ fn o3_save_failure_cancelled_claim_restart_preserves_option_i_and_survivor() {
     }
 }
 
+/// [money] o3 same owner shorter growth expires pace without lowering original floor.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_same_owner_shorter_growth_expires_pace_without_lowering_original_floor() {
@@ -11369,6 +11412,7 @@ fn o3_same_owner_shorter_growth_expires_pace_without_lowering_original_floor() {
     );
 }
 
+/// [money] o3 failed atomic replacement never retires original without its receipt.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_failed_atomic_replacement_never_retires_original_without_its_receipt() {
@@ -11448,6 +11492,7 @@ fn o3_failed_atomic_replacement_never_retires_original_without_its_receipt() {
     }
 }
 
+/// [money] o3 audit selection progresses but owed adoption never borrows migration authority.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_audit_selection_progresses_but_owed_adoption_never_borrows_migration_authority() {
@@ -11497,6 +11542,7 @@ fn o3_audit_selection_progresses_but_owed_adoption_never_borrows_migration_autho
     }
 }
 
+/// [format] o3 custody capacity fails toward counted read without mutating survivor.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_custody_capacity_fails_toward_counted_read_without_mutating_survivor() {
@@ -11538,6 +11584,7 @@ fn o3_custody_capacity_fails_toward_counted_read_without_mutating_survivor() {
     assert_eq!(std::fs::read(&f.record_path).unwrap(), f.survivor);
 }
 
+/// [format] o3 changed object and scope memo capacity read without replacement authority.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_changed_object_and_scope_memo_capacity_read_without_replacement_authority() {
@@ -11608,6 +11655,7 @@ fn o3_changed_object_and_scope_memo_capacity_read_without_replacement_authority(
     }
 }
 
+/// [format] o3 obsolete long record after shorter replacement and failed rename cannot mask growth.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_obsolete_long_record_after_shorter_replacement_and_failed_rename_cannot_mask_growth() {
@@ -11688,6 +11736,7 @@ fn o3_obsolete_long_record_after_shorter_replacement_and_failed_rename_cannot_ma
     assert_eq!(stores.counters.migration[2], 0);
 }
 
+/// [format] o3 generation ahead survivor reads growth without mutation authority.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_generation_ahead_survivor_reads_growth_without_mutation_authority() {
@@ -11766,6 +11815,7 @@ fn o3_generation_ahead_survivor_reads_growth_without_mutation_authority() {
     }
 }
 
+/// [behaviour] o3 paced growth survives idle past window until real native catchup.
 #[test]
 #[ignore = "requires landed E3 generic growth discovery (#876)"]
 fn o3_paced_growth_survives_idle_past_window_until_real_native_catchup() {
@@ -11856,6 +11906,7 @@ fn o3_paced_growth_survives_idle_past_window_until_real_native_catchup() {
         Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
 }
 
+/// [money] claude unregistered money replay keeps typed stale and shared pace.
 #[test]
 fn claude_unregistered_money_replay_keeps_typed_stale_and_shared_pace() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -11984,6 +12035,7 @@ fn claude_unregistered_money_replay_keeps_typed_stale_and_shared_pace() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// [behaviour] stale binding cannot mask equal head edit or shorter replacement across restart.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn stale_binding_cannot_mask_equal_head_edit_or_shorter_replacement_across_restart() {
@@ -12102,6 +12154,7 @@ pub(super) fn before_warm_transfer() {
 
 /// An indexed record-old/index-clean audit crash must not hide an independently
 /// proved shrink behind its retained envelope debt or accepted-body floor.
+/// [behaviour] indexed debt carrier preserves proven shrink before audit rearm.
 #[test]
 fn indexed_debt_carrier_preserves_proven_shrink_before_audit_rearm() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -12192,6 +12245,7 @@ fn indexed_debt_carrier_preserves_proven_shrink_before_audit_rearm() {
 
 /// The growth/shrink discovery backstop must never let a warm optional copy
 /// erase S2. Same inode plus unknown/reused birth is not replacement proof.
+/// [money] verified warm shrink reads exact changed body once and preserves ack.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -12316,6 +12370,7 @@ fn verified_warm_shrink_reads_exact_changed_body_once_and_preserves_ack() {
 
 /// Every retained #865 probe needs input credit even on a memo hit. The
 /// settlement probe remains read-only and missing membership recovers due.
+/// [format] member settlement and final full probes reserve before any classifier io.
 #[test]
 fn member_settlement_and_final_full_probes_reserve_before_any_classifier_io() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -12402,6 +12457,7 @@ fn member_settlement_and_final_full_probes_reserve_before_any_classifier_io() {
 /// Real scanner, native content-bearing v1 writer, RAM loss and no seeded debt.
 /// Both A2 edits must be acquired once, despite persistent rederive refusal;
 /// quiet >W/retirement and restart must not re-emit the accepted changed body.
+/// [behaviour] content v1 resource refusal cannot hide equal edit or truncate then restart.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -12601,6 +12657,7 @@ fn content_v1_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
     }
 }
 
+/// [behaviour] b4 structural growth paced no record reselection no prune and restart.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
 fn b4_structural_growth_paced_no_record_reselection_no_prune_and_restart() {
@@ -12850,6 +12907,7 @@ fn b4_structural_transition(near_cap: bool) {
     drop(index);
 }
 
+/// [money] b4 warm busy keeps aged census through terminal then catches up.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native retained layout")]
 fn b4_warm_busy_keeps_aged_census_through_terminal_then_catches_up() {
@@ -13001,6 +13059,7 @@ fn b4_warm_busy_keeps_aged_census_through_terminal_then_catches_up() {
     );
 }
 
+/// [format] migration input refusal has no classifier claim or pace side effects.
 #[test]
 fn migration_input_refusal_has_no_classifier_claim_or_pace_side_effects() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -13044,6 +13103,7 @@ fn migration_input_refusal_has_no_classifier_claim_or_pace_side_effects() {
     assert_eq!(stores.counters.migration[2], 0);
 }
 
+/// [behaviour] codex resource probe deferral does not spend recovery pace.
 #[test]
 fn codex_resource_probe_deferral_does_not_spend_recovery_pace() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -13096,6 +13156,7 @@ fn codex_resource_probe_deferral_does_not_spend_recovery_pace() {
 
 /// Failed post-ACK rename -> a quiet selected pass rewrites the retained
 /// reduction without acquisition or selection renewal -> fresh-owner restore.
+/// [format] m3 post save failed rename requeues quiet ram then restart restores without full.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -13507,6 +13568,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// [format] consent off post save purges pl records and on does not force a read or write.
 #[test]
 fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -13570,6 +13632,7 @@ fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write
     );
 }
 
+/// [format] quiet restore has no sample or content input before decode on all sources.
 #[test]
 fn quiet_restore_has_no_sample_or_content_input_before_decode_on_all_sources() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -13696,6 +13759,7 @@ pub(in crate::snapshots) fn evict_failed_replay_pace(
     assert!(stores.key_debt.contains_key(&digest));
 }
 
+/// [behaviour] rederive failure full and near cap allowance survive repeated real evictions.
 #[test]
 fn rederive_failure_full_and_near_cap_allowance_survive_repeated_real_evictions() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -13762,6 +13826,7 @@ fn rederive_failure_full_and_near_cap_allowance_survive_repeated_real_evictions(
 
 // F4: all certificate edit reasons dominate decode on the production scoped
 // entry. This portable row complements the macOS writer/retirement matrix.
+/// [format] bounded restore certificate edit reasons precede decode and count first failure.
 #[test]
 fn bounded_restore_certificate_edit_reasons_precede_decode_and_count_first_failure() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -13873,6 +13938,7 @@ fn bounded_restore_certificate_edit_reasons_precede_decode_and_count_first_failu
     }
 }
 
+/// [behaviour] rederive unfunded key custody keeps existing counted paced full fallback.
 #[test]
 fn rederive_unfunded_key_custody_keeps_existing_counted_paced_full_fallback() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -13921,6 +13987,7 @@ fn rederive_unfunded_key_custody_keeps_existing_counted_paced_full_fallback() {
     assert!(stores.owed_overflow[ds.slot()]);
 }
 
+/// [behaviour] key debt pressure preserves live custody and only reclaims expired full spends.
 #[test]
 fn key_debt_pressure_preserves_live_custody_and_only_reclaims_expired_full_spends() {
     let mut stores = Stores::default();
@@ -13947,6 +14014,7 @@ fn key_debt_pressure_preserves_live_custody_and_only_reclaims_expired_full_spend
     assert!(stores.key_debt.contains_key(&retained));
 }
 
+/// [format] retirement each edge holds without witness then exits by revalidated exact retirement.
 #[test]
 fn retirement_each_edge_holds_without_witness_then_exits_by_revalidated_exact_retirement() {
     let _on = crate::snapshots::RestartRestoreForTest::enabled();

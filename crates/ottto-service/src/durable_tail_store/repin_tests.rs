@@ -20,6 +20,7 @@ fn item(source: DurableSource, path: &Path, n: u64) -> PendingRecord {
     record
 }
 
+/// [format] repin classification is exact source format pin and never decodes old body.
 #[test]
 fn repin_classification_is_exact_source_format_pin_and_never_decodes_old_body() {
     for source in [DurableSource::ClaudeCode, DurableSource::Codex] {
@@ -85,6 +86,7 @@ fn repin_classification_is_exact_source_format_pin_and_never_decodes_old_body() 
     }
 }
 
+/// [format] repin exact retirement follows durable successor and retries sync without input.
 #[test]
 fn repin_exact_retirement_follows_durable_successor_and_retries_sync_without_input() {
     for source in [DurableSource::ClaudeCode, DurableSource::Codex] {
@@ -144,6 +146,7 @@ fn repin_exact_retirement_follows_durable_successor_and_retries_sync_without_inp
     }
 }
 
+/// [format] repin unknown or newer survivor never retires under an old proof.
 #[test]
 fn repin_unknown_or_newer_survivor_never_retires_under_an_old_proof() {
     for future in [false, true] {

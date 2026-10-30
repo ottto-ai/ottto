@@ -45,6 +45,7 @@ fn entry() -> ScanIndexEntry {
 /// SOURCE cond. 5 carrier without a new field: a Codex selection cleared
 /// over a record not proved absent (the D3 strict-rebind store is disabled)
 /// counts a stale refusal and takes one paced Full under its own cause.
+/// [behaviour] codex cleared selection over a surviving record is refused and paced.
 #[test]
 fn codex_cleared_selection_over_a_surviving_record_is_refused_and_paced() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -118,6 +119,7 @@ fn codex_cleared_selection_over_a_surviving_record_is_refused_and_paced() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// [behaviour] native debt reservation refuses before io and preserves every funded hold.
 #[test]
 fn native_debt_reservation_refuses_before_io_and_preserves_every_funded_hold() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -147,6 +149,7 @@ fn native_debt_reservation_refuses_before_io_and_preserves_every_funded_hold() {
     assert!(stores.hold(&key).is_some());
 }
 
+/// [behaviour] overflow preserves discovery without forcing quiet keys to parse.
 #[test]
 fn overflow_preserves_discovery_without_forcing_quiet_keys_to_parse() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -171,6 +174,7 @@ fn overflow_preserves_discovery_without_forcing_quiet_keys_to_parse() {
     assert!(cache.owes_discovery(SnapshotSource::Codex, "unfunded"));
 }
 
+/// [behaviour] native full debt map declines before write and keeps the emitted body.
 #[test]
 fn native_full_debt_map_declines_before_write_and_keeps_the_emitted_body() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -263,6 +267,7 @@ fn native_full_debt_map_declines_before_write_and_keeps_the_emitted_body() {
 
 /// Persisted post-read class flags survive begin_pass without another class
 /// encoding. These are the existing canonical protected-history carriers.
+/// [behaviour] protected history refuses singleton restore across passes before record io.
 #[test]
 fn protected_history_refuses_singleton_restore_across_passes_before_record_io() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -349,6 +354,7 @@ fn protected_history_refuses_singleton_restore_across_passes_before_record_io() 
     }
 }
 
+/// [behaviour] layout unavailability preserves future audit and state missing selection cause.
 #[test]
 fn layout_unavailability_preserves_future_audit_and_state_missing_selection_cause() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();

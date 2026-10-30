@@ -1060,6 +1060,7 @@ mod tests {
             .unwrap();
         store.finish_stream(committed).unwrap()
     }
+    /// [behaviour] native population beyond memo bound reverifies and updates without hold.
     #[test]
     fn native_population_beyond_memo_bound_reverifies_and_updates_without_hold() {
         if !crate::test_isolation::run_here() {
@@ -1109,6 +1110,7 @@ mod tests {
         assert!(store.disabled().is_none());
     }
 
+    /// [behaviour] native full authorized memo evicts only permission and reverifies for both sources.
     #[test]
     fn native_full_authorized_memo_evicts_only_permission_and_reverifies_for_both_sources() {
         if !crate::test_isolation::run_here() {
@@ -1200,6 +1202,7 @@ mod tests {
         }
     }
 
+    /// [format] newly staged codex record is refused by both released decoders.
     #[test]
     fn newly_staged_codex_record_is_refused_by_both_released_decoders() {
         if !crate::test_isolation::run_here() {
@@ -1238,6 +1241,7 @@ mod tests {
             "old reader leaves A unchanged"
         );
     }
+    /// [behaviour] stream is byte identical and flush is once per dirty pass.
     #[test]
     fn stream_is_byte_identical_and_flush_is_once_per_dirty_pass() {
         if !crate::test_isolation::run_here() {
@@ -1291,6 +1295,7 @@ mod tests {
         assert!(store.flush_pass(lock).unwrap().is_none());
         assert!(store.stream_reserve_bytes().unwrap() >= STREAM_BYTES as u64);
     }
+    /// [behaviour] double failure is per source and enospc never unlinks a.
     #[test]
     fn double_failure_is_per_source_and_enospc_never_unlinks_a() {
         if !crate::test_isolation::run_here() {
@@ -1354,6 +1359,7 @@ mod tests {
             assert_eq!(store.counters().store_write_cleanup_failed, 1);
         }
     }
+    /// [format] first complete stage failed rename is absent not a survivor.
     #[test]
     fn first_complete_stage_failed_rename_is_absent_not_a_survivor() {
         if !crate::test_isolation::run_here() {
@@ -1393,6 +1399,7 @@ mod tests {
             assert!(store.pending.is_empty());
         }
     }
+    /// [format] claude cleanup proves absence and recovery receipts only exact candidate.
     #[test]
     fn claude_cleanup_proves_absence_and_recovery_receipts_only_exact_candidate() {
         if !crate::test_isolation::run_here() {

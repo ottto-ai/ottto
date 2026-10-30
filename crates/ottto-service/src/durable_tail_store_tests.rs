@@ -22,6 +22,7 @@ pub(super) fn placeholder_body(count: u64, sum: u64) -> Vec<u8> {
     )
 }
 
+/// [format] cold read reserves before classifier input or body allocation.
 #[test]
 fn cold_read_reserves_before_classifier_input_or_body_allocation() {
     if !crate::test_isolation::run_here() {
@@ -166,6 +167,7 @@ pub(crate) fn pending_snapshot(store: &DurableTailStore) -> Vec<u8> {
 
 const NOW: u64 = 1_800_000_000;
 
+/// [money] checked floor exact boundary and existing update bypass.
 #[test]
 fn checked_floor_exact_boundary_and_existing_update_bypass() {
     let reserve = 2 * 1024 * 1024 * 1024;
@@ -221,6 +223,7 @@ fn checked_floor_exact_boundary_and_existing_update_bypass() {
     );
 }
 
+/// [money] failed rename preserves verified predecessor without receipt or retirement.
 #[test]
 fn failed_rename_preserves_verified_predecessor_without_receipt_or_retirement() {
     let scratch = Scratch::new();
@@ -262,6 +265,7 @@ fn failed_rename_preserves_verified_predecessor_without_receipt_or_retirement() 
     );
 }
 
+/// [money] equal generation impostor never elects receipt and unknown swap is protected.
 #[test]
 fn equal_generation_impostor_never_elects_receipt_and_unknown_swap_is_protected() {
     for unknown in [false, true] {
@@ -320,6 +324,7 @@ fn equal_generation_impostor_never_elects_receipt_and_unknown_swap_is_protected(
     }
 }
 
+/// [format] exact survivor uses original trailer not canonicalized retired fields.
 #[test]
 fn exact_survivor_uses_original_trailer_not_canonicalized_retired_fields() {
     let scratch = Scratch::new();
@@ -376,6 +381,7 @@ fn exact_survivor_uses_original_trailer_not_canonicalized_retired_fields() {
     store.retain_receipt(proof).unwrap();
 }
 
+/// [money] replacement during successful directory sync cannot receipt an impostor.
 #[test]
 fn replacement_during_successful_directory_sync_cannot_receipt_an_impostor() {
     let scratch = Scratch::new();
@@ -416,6 +422,7 @@ fn replacement_during_successful_directory_sync_cannot_receipt_an_impostor() {
     assert_eq!(store.hold(&b.key), Some(Refusal::ReceiptPending));
 }
 
+/// [behaviour] retained completion rejects wrong candidate and final path swap.
 #[test]
 fn retained_completion_rejects_wrong_candidate_and_final_path_swap() {
     let scratch = Scratch::new();
@@ -503,6 +510,7 @@ fn retained_completion_rejects_wrong_candidate_and_final_path_swap() {
     assert!(store.reconcile_pending(&lock, &b.key).is_err());
 }
 
+/// [format] startup sync precedes warming and no writer never repairs modes.
 #[test]
 fn startup_sync_precedes_warming_and_no_writer_never_repairs_modes() {
     let scratch = Scratch::new();
@@ -547,6 +555,7 @@ fn startup_sync_precedes_warming_and_no_writer_never_repairs_modes() {
     assert_eq!(readonly.counters().mode_repaired, 0);
 }
 
+/// [behaviour] pending capacity failure retains every existing obligation.
 #[test]
 fn pending_capacity_failure_retains_every_existing_obligation() {
     let scratch = Scratch::new();
@@ -617,6 +626,7 @@ fn pending_capacity_failure_retains_every_existing_obligation() {
     }
 }
 
+/// [money] post rename sync failure keeps b pending until its exact receipt.
 #[test]
 fn post_rename_sync_failure_keeps_b_pending_until_its_exact_receipt() {
     for parent in [false, true] {
@@ -711,6 +721,7 @@ fn post_rename_sync_failure_keeps_b_pending_until_its_exact_receipt() {
 
 // A subprocess death fixture for the store's actual write hooks, independent
 // of the shared full restore/Tail/money transition harness. No power-loss claim.
+/// [format] sigkill writer child.
 #[test]
 #[ignore = "invoked only by sigkill_writer_edges_preserve_verified_survivors"]
 fn sigkill_writer_child() {
@@ -770,6 +781,7 @@ fn sigkill_writer_child() {
     panic!("child missed edge");
 }
 
+/// [format] sigkill writer edges preserve verified survivors.
 #[test]
 fn sigkill_writer_edges_preserve_verified_survivors() {
     use std::os::unix::process::ExitStatusExt;
@@ -1169,6 +1181,7 @@ fn every_binding_mismatch_refuses() {
     assert_eq!(codex.eligible(&want), Err(Ineligible::EntryChanged));
 }
 
+/// [format] private temp replacement cannot be committed or discarded.
 #[test]
 fn private_temp_replacement_cannot_be_committed_or_discarded() {
     let scratch = Scratch::new();
@@ -1192,6 +1205,7 @@ fn private_temp_replacement_cannot_be_committed_or_discarded() {
 
 /// Unwinding after temp sync keeps the old record and exercises counted Drop
 /// cleanup. Real SIGKILL edges (which cannot run Drop) remain in the crash matrix.
+/// [behaviour] interrupted replacement unwind discards temp and keeps the old record.
 #[test]
 fn interrupted_replacement_unwind_discards_temp_and_keeps_the_old_record() {
     let scratch = Scratch::new();
@@ -3139,6 +3153,7 @@ fn unoffered_started_rebuild_survives_save_until_its_replacement_is_offered() {
 /// Exercise the shared fixture's real failure seams without assigning a1
 /// publication/owed semantics to this older store. Unlink failure keeps the
 /// predecessor; sync failure is unproved retirement even if the name is gone.
+/// [format] transition store failure controls and verified retirement.
 #[test]
 fn transition_store_failure_controls_and_verified_retirement() {
     use crate::snapshots::sampled_scan::transition_fixture::{fail_store_at, CrashPoint};
@@ -3235,6 +3250,7 @@ fn transition_store_failure_controls_and_verified_retirement() {
     }
 }
 
+/// [format] shared transition store crash child.
 #[test]
 fn shared_transition_store_crash_child() {
     use crate::snapshots::sampled_scan::transition_fixture::{arm_crashes, CrashPoint};
@@ -3273,6 +3289,7 @@ fn shared_transition_store_crash_child() {
     panic!("requested store crash edge was not reached");
 }
 
+/// [format] shared transition store crashes reach physical edges.
 #[test]
 fn shared_transition_store_crashes_reach_physical_edges() {
     use crate::snapshots::sampled_scan::transition_fixture::{assert_child_killed, CrashPoint};
@@ -3511,6 +3528,7 @@ fn read_memo_keeps_stored_debt_until_a_clean_replacement_is_written() {
     );
 }
 
+/// [format] claude mutations require exact strict proof and a current stamp.
 #[test]
 fn claude_mutations_require_exact_strict_proof_and_a_current_stamp() {
     for seam in ["overwrite", "delete", "gc"] {
@@ -3593,6 +3611,7 @@ fn claude_mutations_require_exact_strict_proof_and_a_current_stamp() {
     }
 }
 
+/// [behaviour] original witness survives memo turnover but never a different record.
 #[test]
 fn original_witness_survives_memo_turnover_but_never_a_different_record() {
     for arm in [
@@ -3686,6 +3705,7 @@ fn original_witness_survives_memo_turnover_but_never_a_different_record() {
     }
 }
 
+/// [money] batch ack is key specific and bound to the written target stamp.
 #[test]
 fn batch_ack_is_key_specific_and_bound_to_the_written_target_stamp() {
     let scratch = Scratch::new();
@@ -3769,6 +3789,7 @@ fn batch_ack_is_key_specific_and_bound_to_the_written_target_stamp() {
     assert!(!store.replacement_committed(&proofs[0], &receipt));
 }
 
+/// [money] batch ack requires durable reconciliation and never a clean retry.
 #[test]
 fn batch_ack_requires_durable_reconciliation_and_never_a_clean_retry() {
     for edge in ["pre_rename", "post_rename", "dir_sync"] {
@@ -3907,6 +3928,7 @@ fn batch_ack_requires_durable_reconciliation_and_never_a_clean_retry() {
     }
 }
 
+/// [format] claude mutation proof expires at pass boundary and unmemoized records survive.
 #[test]
 fn claude_mutation_proof_expires_at_pass_boundary_and_unmemoized_records_survive() {
     let scratch = Scratch::new();
@@ -3942,6 +3964,7 @@ fn claude_mutation_proof_expires_at_pass_boundary_and_unmemoized_records_survive
     assert_eq!(fs::read(&disk).unwrap(), before);
 }
 
+/// [format] property table keeps both historical v1 envelopes byte identical.
 #[test]
 fn property_table_keeps_both_historical_v1_envelopes_byte_identical() {
     use crate::snapshots::durable_sources::SOURCES;
@@ -4024,6 +4047,7 @@ pub(crate) fn continuation_pass_state(store: &DurableTailStore) -> ContinuationP
     }
 }
 
+/// [money] receipt failure bound is per obligation and disable preserves custody.
 #[test]
 fn receipt_failure_bound_is_per_obligation_and_disable_preserves_custody() {
     let scratch = Scratch::new();
@@ -4071,6 +4095,7 @@ fn receipt_failure_bound_is_per_obligation_and_disable_preserves_custody() {
     assert!(matches!(restarted.read(&b.key), ReadOutcome::Found(_)));
 }
 
+/// [money] o3 conditional replacement binds original current object and real floor.
 #[test]
 fn o3_conditional_replacement_binds_original_current_object_and_real_floor() {
     for arm in [
@@ -4154,6 +4179,7 @@ fn o3_conditional_replacement_binds_original_current_object_and_real_floor() {
     }
 }
 
+/// [format] o3 witness rejects unclassified source context format and future record.
 #[test]
 fn o3_witness_rejects_unclassified_source_context_format_and_future_record() {
     let scratch = Scratch::new();
@@ -4199,6 +4225,7 @@ fn o3_witness_rejects_unclassified_source_context_format_and_future_record() {
 
 /// Cross-mechanism regression: a delayed positive receipt must retire T14's
 /// rebuild latch even if the next offer is clean and needs no physical write.
+/// [money] delayed t14 receipt allows clean then changed offer without second rebuild.
 #[test]
 fn delayed_t14_receipt_allows_clean_then_changed_offer_without_second_rebuild() {
     for reconcile_before_offer in [false, true] {
@@ -4291,6 +4318,7 @@ fn delayed_t14_receipt_allows_clean_then_changed_offer_without_second_rebuild() 
     }
 }
 
+/// [behaviour] gc rotates past the first page and preserves unknown records.
 #[test]
 fn gc_rotates_past_the_first_page_and_preserves_unknown_records() {
     let scratch = Scratch::new();
@@ -4345,6 +4373,7 @@ fn gc_rotates_past_the_first_page_and_preserves_unknown_records() {
     assert_eq!(store.counters().disk_records, 1);
 }
 
+/// [behaviour] retained completion delivers b and requeues newer c without b body.
 #[test]
 fn retained_completion_delivers_b_and_requeues_newer_c_without_b_body() {
     let scratch = Scratch::new();
@@ -4428,6 +4457,7 @@ fn retained_completion_delivers_b_and_requeues_newer_c_without_b_body() {
     assert_eq!(current.record.body, newer_c.body);
 }
 
+/// [format] verified retirement requeues the unwritten successor.
 #[test]
 fn verified_retirement_requeues_the_unwritten_successor() {
     let scratch = Scratch::new();
@@ -4463,6 +4493,7 @@ fn verified_retirement_requeues_the_unwritten_successor() {
     assert_eq!(retried.completed.len(), 1);
 }
 
+/// [behaviour] completed batch entries defer at capacity without disabling store.
 #[test]
 fn completed_batch_entries_defer_at_capacity_without_disabling_store() {
     let scratch = Scratch::new();
@@ -4523,6 +4554,7 @@ fn completed_batch_entries_defer_at_capacity_without_disabling_store() {
 
 /// Distinguish the D3 input from a write failure whose fallback really cleaned
 /// up. This exercises the I/O boundary only, not native publication authority.
+/// [format] atomic write reports double failure only after both cleanup boundaries fail.
 #[test]
 fn atomic_write_reports_double_failure_only_after_both_cleanup_boundaries_fail() {
     use std::cell::Cell;
@@ -4608,6 +4640,7 @@ fn atomic_write_reports_double_failure_only_after_both_cleanup_boundaries_fail()
     }
 }
 
+/// [money] private label purge erases known labelled records without receipt or money credit.
 #[test]
 fn private_label_purge_erases_known_labelled_records_without_receipt_or_money_credit() {
     let scratch = Scratch::new();
@@ -4656,6 +4689,7 @@ fn private_label_purge_erases_known_labelled_records_without_receipt_or_money_cr
     assert!(matches!(store.read(&empty.key), ReadOutcome::Found(_)));
 }
 
+/// [format] private label purge continues past corruption and reports partial progress.
 #[test]
 fn private_label_purge_continues_past_corruption_and_reports_partial_progress() {
     let scratch = Scratch::new();
@@ -4692,6 +4726,7 @@ fn private_label_purge_continues_past_corruption_and_reports_partial_progress() 
     );
 }
 
+/// [money] private label purge revokes retained completion but keeps candidate owed.
 #[test]
 fn private_label_purge_revokes_retained_completion_but_keeps_candidate_owed() {
     let _reset = ResetFaults;
@@ -4733,6 +4768,7 @@ fn private_label_purge_revokes_retained_completion_but_keeps_candidate_owed() {
     assert!(store.disabled().is_none());
 }
 
+/// [format] m1 reader ceiling refuses newer envelopes before any body read.
 #[test]
 fn m1_reader_ceiling_refuses_newer_envelopes_before_any_body_read() {
     for format in [2u16, FORMAT_V3, FORMAT_V3 + 1] {
@@ -4765,6 +4801,7 @@ fn m1_reader_ceiling_refuses_newer_envelopes_before_any_body_read() {
     }
 }
 
+/// [behaviour] m1 reader ceiling keeps consent erasure for known v3 private labels.
 #[test]
 fn m1_reader_ceiling_keeps_consent_erasure_for_known_v3_private_labels() {
     let scratch = Scratch::new();
@@ -4808,6 +4845,7 @@ fn m1_reader_ceiling_keeps_consent_erasure_for_known_v3_private_labels() {
     assert_eq!(reader.counters().records_written, 0);
 }
 
+/// [format] m1 without a successor writer never strands corruption recovery.
 #[test]
 fn m1_without_a_successor_writer_never_strands_corruption_recovery() {
     let scratch = Scratch::new();
@@ -4843,6 +4881,7 @@ fn m1_without_a_successor_writer_never_strands_corruption_recovery() {
     assert_eq!(fs::read(&record_path).unwrap(), bytes);
 }
 
+/// [format] m1 blocked group leaves earlier corrupt member recoverable.
 #[test]
 fn m1_blocked_group_leaves_earlier_corrupt_member_recoverable() {
     let scratch = Scratch::new();
@@ -4893,6 +4932,7 @@ fn m1_blocked_group_leaves_earlier_corrupt_member_recoverable() {
     assert_eq!(reader.counters().t14_rebuild_full_started, 0);
 }
 
+/// [format] exact retirement retries unlink and absent path directory barrier.
 #[test]
 fn exact_retirement_retries_unlink_and_absent_path_directory_barrier() {
     use crate::snapshots::sampled_scan::transition_fixture::{fail_store_at, CrashPoint};
@@ -4954,6 +4994,7 @@ fn exact_retirement_retries_unlink_and_absent_path_directory_barrier() {
     }
 }
 
+/// [format] exact retirement verifies changed survivor and never deletes unknown bytes.
 #[test]
 fn exact_retirement_verifies_changed_survivor_and_never_deletes_unknown_bytes() {
     for unknown in [false, true] {
@@ -5001,6 +5042,7 @@ fn exact_retirement_verifies_changed_survivor_and_never_deletes_unknown_bytes() 
 
 // F11: an exact retirement witness never converts a pending successor or a
 // retained exact completion into absence/ACK credit for its predecessor.
+/// [money] exact retirement preserves pending and retained receipt successors.
 #[test]
 fn exact_retirement_preserves_pending_and_retained_receipt_successors() {
     let _reset = ResetFaults;
@@ -5069,6 +5111,7 @@ fn exact_retirement_preserves_pending_and_retained_receipt_successors() {
     }
 }
 
+/// [format] exact retirement stat io error is retry and never proven absence.
 #[test]
 fn exact_retirement_stat_io_error_is_retry_and_never_proven_absence() {
     let scratch = Scratch::new();

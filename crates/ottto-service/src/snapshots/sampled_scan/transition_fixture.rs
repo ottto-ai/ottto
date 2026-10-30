@@ -596,22 +596,26 @@ pub(crate) mod money_oracle {
             result
         }
 
+        /// [behaviour] quiet default accepts zero anchor reads.
         #[test]
         fn quiet_default_accepts_zero_anchor_reads() {
             assert_quiet_restart_zero_bytes(&quiet_result(0));
         }
 
+        /// [behaviour] quiet default rejects anchor reads.
         #[test]
         #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
         fn quiet_default_rejects_anchor_reads() {
             assert_quiet_restart_zero_bytes(&quiet_result(ANCHOR_WINDOW));
         }
 
+        /// [behaviour] quiet anchor window accepts exact count.
         #[test]
         fn quiet_anchor_window_accepts_exact_count() {
             assert_quiet_restart_with_anchor_window(&quiet_result(ANCHOR_WINDOW), ANCHOR_WINDOW);
         }
 
+        /// [behaviour] quiet anchor window rejects short count.
         #[test]
         #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
         fn quiet_anchor_window_rejects_short_count() {
@@ -621,6 +625,7 @@ pub(crate) mod money_oracle {
             );
         }
 
+        /// [behaviour] quiet anchor window rejects excess count.
         #[test]
         #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
         fn quiet_anchor_window_rejects_excess_count() {
@@ -630,6 +635,7 @@ pub(crate) mod money_oracle {
             );
         }
 
+        /// [behaviour] quiet anchor window rejects body bytes.
         #[test]
         fn quiet_anchor_window_rejects_body_bytes() {
             let baseline = quiet_result(ANCHOR_WINDOW);
@@ -656,6 +662,7 @@ pub(crate) mod money_oracle {
             }
         }
 
+        /// [behaviour] quiet anchor window rejects other reads.
         #[test]
         #[should_panic(expected = "other I/O unmeasured/nonzero")]
         fn quiet_anchor_window_rejects_other_reads() {
@@ -664,6 +671,7 @@ pub(crate) mod money_oracle {
             assert_quiet_restart_with_anchor_window(&result, ANCHOR_WINDOW);
         }
 
+        /// [behaviour] quiet anchor window rejects unmeasured anchors.
         #[test]
         #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
         fn quiet_anchor_window_rejects_unmeasured_anchors() {
@@ -778,6 +786,7 @@ pub(crate) fn fail_store_at(point: CrashPoint, nth: usize) -> StoreFailure {
     StoreFailure { previous, hits }
 }
 
+/// [format] scan clock restores after nested scope and unwind.
 #[test]
 fn scan_clock_restores_after_nested_scope_and_unwind() {
     with_scan_clock(100, || {
@@ -789,6 +798,7 @@ fn scan_clock_restores_after_nested_scope_and_unwind() {
     });
 }
 
+/// [behaviour] transition failure restores outer hook after unwind.
 #[test]
 fn transition_failure_restores_outer_hook_after_unwind() {
     use crate::durable_tail_store::test_hooks;
@@ -818,6 +828,7 @@ fn transition_failure_restores_outer_hook_after_unwind() {
 
 /// Protect the existing matrix while publishing new names for owners. This
 /// checks vocabulary only; it is not evidence that live call sites execute.
+/// [format] crash extension names are disjoint from the m1 matrix.
 #[test]
 fn crash_extension_names_are_disjoint_from_the_m1_matrix() {
     let mut names = BTreeSet::new();
@@ -832,6 +843,7 @@ fn crash_extension_names_are_disjoint_from_the_m1_matrix() {
     assert!(names.contains("BeforeCodexPublication"));
 }
 
+/// [format] native m3 plain flush matrix has no file fsync boundary.
 #[test]
 fn native_m3_plain_flush_matrix_has_no_file_fsync_boundary() {
     assert!(CrashPoint::ALL.contains(&CrashPoint::FileSynced));

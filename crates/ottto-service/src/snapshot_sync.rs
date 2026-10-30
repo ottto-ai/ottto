@@ -23800,6 +23800,7 @@ mod tests {
     // F9/F11: real restored+rederived+Tailed bodies enter the unchanged
     // exact page/ACK machinery. Linux cannot qualify native decode layout.
     #[cfg(target_os = "macos")]
+    /// [money] bounded restored tail exact ack and saved ack skip transport.
     #[test]
     fn bounded_restored_tail_exact_ack_and_saved_ack_skip_transport() {
         if !crate::test_isolation::run_here() {

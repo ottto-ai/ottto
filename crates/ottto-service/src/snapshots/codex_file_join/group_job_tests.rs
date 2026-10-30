@@ -3582,6 +3582,7 @@ fn parked_group_across_fresh_index_reprobes_member_debt_on_resume() {
 }
 
 #[cfg(unix)]
+/// [format] protected group peer does not spend corruption rebuild before input.
 #[test]
 fn protected_group_peer_does_not_spend_corruption_rebuild_before_input() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();

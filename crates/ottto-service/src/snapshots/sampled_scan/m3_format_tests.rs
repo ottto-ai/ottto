@@ -68,6 +68,7 @@ fn resign(bytes: &mut [u8]) {
     bytes[end..].copy_from_slice(&trailer);
 }
 
+/// [behaviour] m3 p4a source table admits exact triples without repinning body.
 #[test]
 fn m3_p4a_source_table_admits_exact_triples_without_repinning_body() {
     let rows = crate::snapshots::durable_sources::SOURCES;
@@ -99,6 +100,7 @@ fn m3_p4a_source_table_admits_exact_triples_without_repinning_body() {
     }
 }
 
+/// [format] m3 p4a wire offsets generation and mixed restart twice.
 #[test]
 fn m3_p4a_wire_offsets_generation_and_mixed_restart_twice() {
     let root = crate::test_scratch::private_dir("ottto-m3-mixed-envelope");
@@ -185,6 +187,7 @@ fn m3_p4a_wire_offsets_generation_and_mixed_restart_twice() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// [format] m3 p4a v3 dispatch lengths and unknown survivors.
 #[test]
 fn m3_p4a_v3_dispatch_lengths_and_unknown_survivors() {
     let root = crate::test_scratch::private_dir("ottto-m3-dispatch");
@@ -243,6 +246,7 @@ fn m3_p4a_v3_dispatch_lengths_and_unknown_survivors() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// [format] m3 p4a scope formula uses canonical counting and distinct domain.
 #[test]
 fn m3_p4a_scope_formula_uses_canonical_counting_and_distinct_domain() {
     let acc = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);

@@ -189,6 +189,7 @@ mod tests {
         });
     }
 
+    /// [behaviour] tiny budget is thread local checked and cannot raise the production cap.
     #[test]
     fn tiny_budget_is_thread_local_checked_and_cannot_raise_the_production_cap() {
         if !crate::test_isolation::run_here() {
@@ -237,6 +238,7 @@ mod tests {
         })
     }
 
+    /// [behaviour] poisoned isolated owner refuses without poisoning global owner.
     #[test]
     fn poisoned_isolated_owner_refuses_without_poisoning_global_owner() {
         let owner = isolated_owner();
@@ -251,6 +253,7 @@ mod tests {
         assert!(!OWNER.is_poisoned());
     }
 
+    /// [behaviour] full isolated queue refuses without registering or taking ownership.
     #[test]
     fn full_isolated_queue_refuses_without_registering_or_taking_ownership() {
         let owner = isolated_owner();
@@ -271,6 +274,7 @@ mod tests {
         assert_eq!(state.queue, std::array::from_fn(|i| i as u64 + 1));
     }
 
+    /// [behaviour] checked credit explicit release and counted drop.
     #[test]
     fn checked_credit_explicit_release_and_counted_drop() {
         let (_, events) = capture(|| {
@@ -306,6 +310,7 @@ mod tests {
         );
     }
 
+    /// [behaviour] refund preserves peak and rejects underflow.
     #[test]
     fn refund_preserves_peak_and_rejects_underflow() {
         let (_, events) = capture(|| {
@@ -322,6 +327,7 @@ mod tests {
             .any(|e| e["counts"]["active_peak_bytes"] == 1024));
     }
 
+    /// [behaviour] timeout removes ticket and live waiters progress in fifo order.
     #[test]
     fn timeout_removes_ticket_and_live_waiters_progress_in_fifo_order() {
         let first = granted();

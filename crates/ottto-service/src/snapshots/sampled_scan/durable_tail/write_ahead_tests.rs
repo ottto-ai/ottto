@@ -7,6 +7,7 @@ const A: store::Digest32 = [1; 32];
 const B: store::Digest32 = [2; 32];
 const OBJECT: (u64, u64, u64) = (7, 11, 13);
 
+/// [behaviour] d3 hold releases on write or replaced object only.
 #[test]
 fn d3_hold_releases_on_write_or_replaced_object_only() {
     let mut stores = Stores::default();
@@ -28,6 +29,7 @@ fn d3_hold_releases_on_write_or_replaced_object_only() {
     assert_eq!(stores.claude_holds(), [0, 0]);
 }
 
+/// [money] owed hold is not downgraded and source clear is scoped.
 #[test]
 fn owed_hold_is_not_downgraded_and_source_clear_is_scoped() {
     let mut stores = Stores::default();
@@ -45,6 +47,7 @@ fn owed_hold_is_not_downgraded_and_source_clear_is_scoped() {
     assert_eq!(stores.owed_mark(&B), OwedMark::None);
 }
 
+/// [behaviour] d3 edit proof survives subsequent failed settlement and not discovery.
 #[test]
 fn d3_edit_proof_survives_subsequent_failed_settlement_and_not_discovery() {
     let mut stores = Stores::default();

@@ -178,6 +178,7 @@ impl Fixture {
     }
 }
 
+/// [behaviour] unsupported native finish keeps legacy path without a v3 record.
 #[test]
 fn unsupported_native_finish_keeps_legacy_path_without_a_v3_record() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -221,6 +222,7 @@ fn unsupported_native_finish_keeps_legacy_path_without_a_v3_record() {
     });
 }
 
+/// [behaviour] preexisting v3 on unsupported layout reads only selected key and keeps active record.
 #[test]
 fn preexisting_v3_on_unsupported_layout_reads_only_selected_key_and_keeps_active_record() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -303,6 +305,7 @@ fn preexisting_v3_on_unsupported_layout_reads_only_selected_key_and_keeps_active
     });
 }
 
+/// [behaviour] unsupported layout never retires a newer or unknown record.
 #[test]
 fn unsupported_layout_never_retires_a_newer_or_unknown_record() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -337,6 +340,7 @@ fn unsupported_layout_never_retires_a_newer_or_unknown_record() {
     });
 }
 
+/// [behaviour] supported native layout still restores a grown key.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -377,6 +381,7 @@ fn supported_native_layout_still_restores_a_grown_key() {
     );
 }
 
+/// [behaviour] unsupported layout budget deferral keeps a until a real selected read.
 #[test]
 fn unsupported_layout_budget_deferral_keeps_a_until_a_real_selected_read() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -456,6 +461,7 @@ fn unsupported_layout_budget_deferral_keeps_a_until_a_real_selected_read() {
 
 /// A real lossy selection may retire unsupported A only after #865 has an
 /// equal-or-earlier persisted carrier. GC counts successful unlink, not intent.
+/// [behaviour] unsupported layout lossy read carries debt through failed gc and restart.
 #[test]
 fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -624,6 +630,7 @@ fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
 
 /// Retryable JSON corruption withholds a replacement; it may neither emit $0
 /// nor erase the already finalized positive body or its re-armed audit debt.
+/// [behaviour] unsupported layout retryable loss preserves prior body and debt after gc.
 #[test]
 fn unsupported_layout_retryable_loss_preserves_prior_body_and_debt_after_gc() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();

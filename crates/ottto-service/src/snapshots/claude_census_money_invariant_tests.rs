@@ -771,6 +771,7 @@ fn census_admission_releases_kept_records_oldest_first() {
 /// not spend a record the terminal would keep. Each source of the held set
 /// spares the oldest record; the next kept record pays instead. The negative
 /// control is `census_admission_releases_kept_records_oldest_first`.
+/// [money] census admission never releases held residue.
 #[test]
 fn census_admission_never_releases_held_residue() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);

@@ -988,6 +988,7 @@ fn downgrade_then_reupgrade() {
 // commits. Do not remove an ignore until its stated production feature exists.
 macro_rules! pending {
     ($name:ident, $reason:literal) => {
+        /// [money] codex admission branches preserve emitted totals.
         #[test]
         #[ignore = $reason]
         fn $name() {

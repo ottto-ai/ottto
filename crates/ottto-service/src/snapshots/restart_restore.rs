@@ -84,6 +84,7 @@ impl Drop for RestartRestoreForTest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// [behaviour] sentinel requires regular file and defaults off.
     #[test]
     fn sentinel_requires_regular_file_and_defaults_off() {
         let scratch = crate::test_scratch::ScratchDir::new("restart-restore-policy");
@@ -101,6 +102,7 @@ mod tests {
             assert!(!requested_at(&scratch));
         }
     }
+    /// [behaviour] dependency is hard and thread guards never read host or propagate.
     #[test]
     fn dependency_is_hard_and_thread_guards_never_read_host_or_propagate() {
         assert!(!enabled());

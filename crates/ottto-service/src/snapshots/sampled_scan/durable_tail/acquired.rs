@@ -227,6 +227,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for AcquiredChain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// [behaviour] immutable counting distinguishes absent none legacy v2 and zero date.
     #[test]
     fn immutable_counting_distinguishes_absent_none_legacy_v2_and_zero_date() {
         let absent = ImmutableCounting::canonical(SnapshotSource::ClaudeCode, None).unwrap();

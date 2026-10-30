@@ -756,6 +756,7 @@ mod tests {
         })
     }
     // Direct cache API controls: this does not claim the native scan retry gate.
+    /// [behaviour] lossless refusals preserve original box graph checkpoint and flags.
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "validated native cache layout")]
     fn lossless_refusals_preserve_original_box_graph_checkpoint_and_flags() {
@@ -862,6 +863,7 @@ mod tests {
             false
         }
     }
+    /// [behaviour] unfrozen state is returned in the same original box.
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "validated native cache layout")]
     fn unfrozen_state_is_returned_in_the_same_original_box() {
@@ -890,6 +892,7 @@ mod tests {
         assert_eq!(events.insert_frozen_charge_refused, 1);
     }
 
+    /// [behaviour] unsupported layout returns the original without admission.
     #[test]
     #[cfg(not(target_os = "macos"))]
     fn unsupported_layout_returns_the_original_without_admission() {
@@ -908,6 +911,7 @@ mod tests {
         assert!(cache.entries.is_empty());
     }
 
+    /// [behaviour] ordinary admission matches predecessor limits victims clocks and events.
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "validated native cache layout")]
     fn ordinary_admission_matches_predecessor_limits_victims_clocks_and_events() {
@@ -963,6 +967,7 @@ mod tests {
         }
     }
 
+    /// [behaviour] attached retail guard survives virtual self eviction and real admission.
     #[test]
     #[cfg(unix)]
     #[cfg_attr(not(target_os = "macos"), ignore = "validated native cache layout")]

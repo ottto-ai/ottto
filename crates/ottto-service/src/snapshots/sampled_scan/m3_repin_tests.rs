@@ -103,6 +103,7 @@ impl Cohort {
     }
 }
 
+/// [behaviour] repin quiet has zero source input and grown starts exactly once off and on.
 #[test]
 fn repin_quiet_has_zero_source_input_and_grown_starts_exactly_once_off_and_on() {
     if !crate::test_isolation::run_here() {
@@ -138,6 +139,7 @@ fn repin_quiet_has_zero_source_input_and_grown_starts_exactly_once_off_and_on() 
     }
 }
 
+/// [behaviour] repin file cap carries without spending and next pass completes admission.
 #[test]
 fn repin_file_cap_carries_without_spending_and_next_pass_completes_admission() {
     if !crate::test_isolation::run_here() {
@@ -197,6 +199,7 @@ fn repin_file_cap_carries_without_spending_and_next_pass_completes_admission() {
     }
 }
 
+/// [behaviour] repin byte cap has no first file escape and counts partial error input.
 #[test]
 fn repin_byte_cap_has_no_first_file_escape_and_counts_partial_error_input() {
     if !crate::test_isolation::run_here() {
@@ -232,6 +235,7 @@ fn repin_byte_cap_has_no_first_file_escape_and_counts_partial_error_input() {
     assert!(rows.iter().all(|r| r["counts"]["repin_completed"] == 0));
 }
 
+/// [behaviour] repin native full then successor quiet restart and tail off and on.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn repin_native_full_then_successor_quiet_restart_and_tail_off_and_on() {
@@ -276,6 +280,7 @@ fn repin_native_full_then_successor_quiet_restart_and_tail_off_and_on() {
     }
 }
 
+/// [behaviour] repin native over cap keeps extent and next pass completes.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn repin_native_over_cap_keeps_extent_and_next_pass_completes() {
@@ -323,6 +328,7 @@ fn repin_native_over_cap_keeps_extent_and_next_pass_completes() {
     }
 }
 
+/// [behaviour] repin cold growth survives age filters and partial retry uses shared pace.
 #[test]
 fn repin_cold_growth_survives_age_filters_and_partial_retry_uses_shared_pace() {
     if !crate::test_isolation::run_here() {
@@ -390,6 +396,7 @@ fn repin_cold_growth_survives_age_filters_and_partial_retry_uses_shared_pace() {
     }
 }
 
+/// [behaviour] repin repaired mode refusal has a funded held counter slot.
 #[test]
 fn repin_repaired_mode_refusal_has_a_funded_held_counter_slot() {
     if !crate::test_isolation::run_here() {
@@ -448,6 +455,7 @@ fn repin_repaired_mode_refusal_has_a_funded_held_counter_slot() {
     );
 }
 
+/// [behaviour] repin ready members pass the final group guard off and on.
 #[test]
 fn repin_ready_members_pass_the_final_group_guard_off_and_on() {
     if !crate::test_isolation::run_here() {
@@ -483,6 +491,7 @@ fn repin_ready_members_pass_the_final_group_guard_off_and_on() {
     }
 }
 
+/// [behaviour] repin codex singleton applies a valid trailing record only at unchanged eof.
 #[test]
 fn repin_codex_singleton_applies_a_valid_trailing_record_only_at_unchanged_eof() {
     if !crate::test_isolation::run_here() {

@@ -142,6 +142,7 @@ mod tests {
         });
         (value, meter)
     }
+    /// [behaviour] ordinary json matches native and magic keys refuse without reparse.
     #[test]
     fn ordinary_json_matches_native_and_magic_keys_refuse_without_reparse() {
         for s in [
@@ -172,6 +173,7 @@ mod tests {
             assert_eq!(meter.stop, Some("raw_value_key"));
         }
     }
+    /// [behaviour] dense objects stop at credit and malformed is not a budget refusal.
     #[test]
     fn dense_objects_stop_at_credit_and_malformed_is_not_a_budget_refusal() {
         let s = format!(

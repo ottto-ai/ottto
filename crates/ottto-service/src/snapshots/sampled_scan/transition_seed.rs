@@ -281,6 +281,7 @@ fn assert_pinned_body_writer() {
         .expect("pinned MAIN 53d05a43 writer changed; provide genuine archived writer bytes");
 }
 
+/// [format] pinned v1 serializer regions match main.
 #[test]
 fn pinned_v1_serializer_regions_match_main() {
     // Portable positive control: provenance must also run without native layout.
@@ -303,11 +304,13 @@ fn assert_source_drift_refused(path: &str, before: &str, after: &str) {
     assert_eq!(verify_pinned_sources(Some((path, &changed))), Err(pin.path));
 }
 
+/// [format] pinned v1 refuses enum tag drift.
 #[test]
 fn pinned_v1_refuses_enum_tag_drift() {
     assert_source_drift_refused("snapshots.rs", "    0 => Codex,", "    9 => Codex,");
 }
 
+/// [format] pinned v1 refuses handwritten codec order drift.
 #[test]
 fn pinned_v1_refuses_handwritten_codec_order_drift() {
     assert_source_drift_refused(
@@ -317,6 +320,7 @@ fn pinned_v1_refuses_handwritten_codec_order_drift() {
     );
 }
 
+/// [format] pinned v1 refuses nested counting version drift.
 #[test]
 fn pinned_v1_refuses_nested_counting_version_drift() {
     assert_source_drift_refused(
@@ -326,6 +330,7 @@ fn pinned_v1_refuses_nested_counting_version_drift() {
     );
 }
 
+/// [format] pinned v1 accepts unrelated function and comment edits.
 #[test]
 fn pinned_v1_accepts_unrelated_function_and_comment_edits() {
     let path = "snapshots.rs";
@@ -335,6 +340,7 @@ fn pinned_v1_accepts_unrelated_function_and_comment_edits() {
     assert_eq!(verify_pinned_sources(Some((path, &changed))), Ok(()));
 }
 
+/// [format] pinned v1 refuses added durable struct.
 #[test]
 fn pinned_v1_refuses_added_durable_struct() {
     let path = "snapshots.rs";
@@ -346,6 +352,7 @@ fn pinned_v1_refuses_added_durable_struct() {
     assert_eq!(verify_pinned_sources(Some((path, &changed))), Err(path));
 }
 
+/// [format] pinned v1 refuses added manual durable impl.
 #[test]
 fn pinned_v1_refuses_added_manual_durable_impl() {
     let path = "snapshots.rs";
@@ -354,6 +361,7 @@ fn pinned_v1_refuses_added_manual_durable_impl() {
     assert_eq!(verify_pinned_sources(Some((path, &changed))), Err(path));
 }
 
+/// [format] pinned v1 refuses encoding constant and local helper drift.
 #[test]
 fn pinned_v1_refuses_encoding_constant_and_local_helper_drift() {
     assert_source_drift_refused(
@@ -373,6 +381,7 @@ fn pinned_v1_refuses_encoding_constant_and_local_helper_drift() {
     );
 }
 
+/// [format] pinned v1 refuses serializer in non catalog source.
 #[test]
 fn pinned_v1_refuses_serializer_in_non_catalog_source() {
     for (path, original) in [
@@ -398,6 +407,7 @@ fn pinned_v1_refuses_serializer_in_non_catalog_source() {
     }
 }
 
+/// [format] pinned v1 accepts test only serializers outside catalog.
 #[test]
 fn pinned_v1_accepts_test_only_serializers_outside_catalog() {
     // Inline, file-level and externally declared test modules are excluded.
@@ -459,11 +469,13 @@ fn assert_added_source_and_body_refused(original: &str) {
     }
 }
 
+/// [format] pinned v1 refuses const generic impl and body drift.
 #[test]
 fn pinned_v1_refuses_const_generic_impl_and_body_drift() {
     assert_added_impl_and_body_refused("impl<T: Marker<{ 1 + 1 }>> Durable for Added<T>");
 }
 
+/// [format] pinned v1 refuses where clause impl and body drift.
 #[test]
 fn pinned_v1_refuses_where_clause_impl_and_body_drift() {
     assert_added_impl_and_body_refused(
@@ -471,6 +483,7 @@ fn pinned_v1_refuses_where_clause_impl_and_body_drift() {
     );
 }
 
+/// [format] pinned v1 refuses trait path turbofish and body drift.
 #[test]
 fn pinned_v1_refuses_trait_path_turbofish_and_body_drift() {
     // E1's exact counterexample, including its actual trait import and type.
@@ -488,6 +501,7 @@ fn pinned_v1_refuses_trait_path_turbofish_and_body_drift() {
     }
 }
 
+/// [format] pinned v1 accepts raw keyword identifier and discovers raw self type.
 #[test]
 fn pinned_v1_accepts_raw_keyword_identifier_and_discovers_raw_self_type() {
     assert_eq!(
@@ -507,6 +521,7 @@ fn pinned_v1_accepts_raw_keyword_identifier_and_discovers_raw_self_type() {
     ));
 }
 
+/// [format] pinned v1 accepts negative and higher ranked self type headers.
 #[test]
 fn pinned_v1_accepts_negative_and_higher_ranked_self_type_headers() {
     // Previously `!` failed classification even for an unrelated negative impl;
@@ -527,6 +542,7 @@ fn pinned_v1_accepts_negative_and_higher_ranked_self_type_headers() {
     assert_added_impl_and_body_refused("impl Durable for for<'a> fn(&'a ())");
 }
 
+/// [format] pinned v1 refuses projected self type and body drift.
 #[test]
 fn pinned_v1_refuses_projected_self_type_and_body_drift() {
     // E1's concrete projection must select Durable independently of the
@@ -536,11 +552,13 @@ fn pinned_v1_refuses_projected_self_type_and_body_drift() {
     ));
 }
 
+/// [format] pinned v1 refuses where clause hrtb impl and body drift.
 #[test]
 fn pinned_v1_refuses_where_clause_hrtb_impl_and_body_drift() {
     assert_added_impl_and_body_refused("impl<F> Durable for Wrap<F> where F: for<'a> Fn(&'a u8)");
 }
 
+/// [money] pinned v1 refuses impl with opaque header tokens.
 #[test]
 fn pinned_v1_refuses_impl_with_opaque_header_tokens() {
     // Each form must independently select the impl and its changed put body;
@@ -557,6 +575,7 @@ fn pinned_v1_refuses_impl_with_opaque_header_tokens() {
     ));
 }
 
+/// [format] pinned v1 missing python fails loudly.
 #[test]
 #[should_panic(expected = "serializer extractor requires python3 interpreter")]
 fn pinned_v1_missing_python_fails_loudly() {
@@ -570,6 +589,7 @@ fn pinned_v1_missing_python_fails_loudly() {
     );
 }
 
+/// [format] pinned v1 missing source tree fails loudly.
 #[test]
 #[should_panic(expected = "serializer source walk requires an existing src directory")]
 fn pinned_v1_missing_source_tree_fails_loudly() {
@@ -579,6 +599,7 @@ fn pinned_v1_missing_source_tree_fails_loudly() {
     extract_sources(None, std::ffi::OsStr::new("python3"), &missing);
 }
 
+/// [format] pinned v1 unparseable headers fail loudly.
 #[test]
 fn pinned_v1_unparseable_headers_fail_loudly() {
     for (source, expected) in [
@@ -628,6 +649,7 @@ fn verify_source_tree(replacements: &[(&str, &str)]) -> Result<(), &'static str>
     ))
 }
 
+/// [money] pinned v1 refuses body publication and shadowed iterator.
 #[test]
 fn pinned_v1_refuses_body_publication_and_shadowed_iterator() {
     assert_source_drift_refused(
@@ -646,6 +668,7 @@ fn pinned_v1_refuses_body_publication_and_shadowed_iterator() {
     assert_eq!(verify_pinned_sources(Some((path, &changed))), Err(path));
 }
 
+/// [format] pinned v1 accepts test item with generic commas.
 #[test]
 fn pinned_v1_accepts_test_item_with_generic_commas() {
     for source in [
@@ -658,6 +681,7 @@ fn pinned_v1_accepts_test_item_with_generic_commas() {
 
 const ADDED_SERIALIZER: &str = "crate::durable_tail_codec::durable_struct!(Added { N n: u64 });";
 
+/// [format] pinned v1 accepts external tests in inline modules.
 #[test]
 fn pinned_v1_accepts_external_tests_in_inline_modules() {
     let lib = format!("{}\nmod fixture_parent;", include_str!("../../lib.rs"));
@@ -674,6 +698,7 @@ fn pinned_v1_accepts_external_tests_in_inline_modules() {
     ]), Ok(()));
 }
 
+/// [format] pinned v1 production module membership overrides test paths.
 #[test]
 fn pinned_v1_production_module_membership_overrides_test_paths() {
     let lib = format!("{}\n#[cfg(test)] #[path = \"fixture_parent.rs\"] mod fixtures; #[path = \"fixture_parent/production.rs\"] mod production_fixture;", include_str!("../../lib.rs"));

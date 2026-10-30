@@ -82,6 +82,7 @@ impl Drop for Fixture {
     }
 }
 
+/// [behaviour] m3 p4b q11 n10 physical byte budget.
 #[test]
 fn m3_p4b_q11_n10_physical_byte_budget() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -134,6 +135,7 @@ fn m3_p4b_q11_n10_physical_byte_budget() {
     assert!(matches!(f.begin(tomorrow), Err(RetailHold::Exhausted)));
 }
 
+/// [behaviour] n10 interruption pass clear and five relabels do not refund.
 #[test]
 fn n10_interruption_pass_clear_and_five_relabels_do_not_refund() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -182,6 +184,7 @@ fn n10_interruption_pass_clear_and_five_relabels_do_not_refund() {
     assert_eq!(stores.counters.retail_attempts, 3);
 }
 
+/// [behaviour] n10 clock rollback and custody overflow fail before any read.
 #[test]
 fn n10_clock_rollback_and_custody_overflow_fail_before_any_read() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -220,6 +223,7 @@ fn n10_clock_rollback_and_custody_overflow_fail_before_any_read() {
     assert!(physical().is_empty());
 }
 
+/// [behaviour] n10 pacing eviction allows growth without evicting spent authority.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -273,6 +277,7 @@ fn n10_pacing_eviction_allows_growth_without_evicting_spent_authority() {
     assert!(physical().is_empty());
 }
 
+/// [behaviour] n10 replaced shorter object cannot reduce the spent high water.
 #[test]
 fn n10_replaced_shorter_object_cannot_reduce_the_spent_high_water() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();

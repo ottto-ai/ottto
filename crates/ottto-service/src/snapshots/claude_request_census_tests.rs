@@ -2674,6 +2674,7 @@ fn held_original_production_exit_conserves_copy_money_while_committed_entry_unch
     );
 }
 
+/// [money] paced restore residue prevents 35 day census retirement until catchup.
 #[test]
 fn paced_restore_residue_prevents_35_day_census_retirement_until_catchup() {
     let scratch = crate::test_scratch::ScratchDir::new("census-paced-retention");
@@ -2730,6 +2731,7 @@ fn paced_restore_residue_prevents_35_day_census_retirement_until_catchup() {
     );
 }
 
+/// [money] native shrink requires exact committed census and opened object.
 #[test]
 #[cfg(unix)]
 fn native_shrink_requires_exact_committed_census_and_opened_object() {
