@@ -1,6 +1,4 @@
-//! Pi body codec controls on synthetic ledgers: byte identity with the
-//! back-patched framing, pinned section bytes, the decode allowance, the
-//! ledger cap and the section guards.
+//! Pi body codec controls: trailing fields, decode funding and integrity.
 use super::*;
 use crate::durable_tail_codec::{DecodeFailure, HDigest};
 use crate::durable_tail_store::RECORD_BYTES;
@@ -76,34 +74,22 @@ fn body(reduction: &CachedJsonlReduction) -> Result<Vec<u8>, Refuse> {
 
 fn section(keys: &BTreeMap<String, PiUsageDedupState>) -> Vec<u8> {
     let mut e = Enc::bytes(RECORD_BYTES);
-    e.section(SECTION_TAG, |e| {
-        PiSection::put_borrowed(e, keys, &false, &None)
-    })
-    .unwrap();
+    PiSection::put_borrowed(&mut e, keys, &false, &None).unwrap();
     e.into_bytes()
 }
 
-/// The branch's framing: the whole reduction with the ledger moved out, then
-/// a section whose zeroed u64 length was patched after its bytes. No cap.
-fn back_patched(reduction: &CachedJsonlReduction) -> Vec<u8> {
+/// Forge an over-cap current-format body to exercise reader refusal.
+fn unbounded_body(reduction: &CachedJsonlReduction) -> Vec<u8> {
     let mut e = Enc::bytes(RECORD_BYTES);
     e.with_moved_field("SnapshotAccumulator.seen_pi_usage_keys", |e| {
         reduction.put(e)
     })
     .unwrap();
     Rederive::default().put(&mut e).unwrap();
-    let mut out = e.into_bytes();
-    out.push(1);
-    let start = out.len();
-    out.extend([0_u8; 8]);
-    let mut e = Enc::bytes(RECORD_BYTES);
     let ledger = &reduction.accumulator.seen_pi_usage_keys;
     let (has_parent, header_nanos) = ledger.fork_parts();
     PiSection::put_borrowed(&mut e, ledger.usage_keys(), &has_parent, &header_nanos).unwrap();
-    out.extend(e.into_bytes());
-    let len = (out.len() - start - 8) as u64;
-    out[start..start + 8].copy_from_slice(&len.to_le_bytes());
-    out
+    e.into_bytes()
 }
 
 fn verify_without_allocation(body: &[u8]) -> Result<(), Corrupt> {
@@ -114,13 +100,12 @@ fn verify_without_allocation(body: &[u8]) -> Result<(), Corrupt> {
 }
 
 fn take_section(d: &mut Dec<'_>) -> Result<PiSection, Corrupt> {
-    d.section(SECTION_TAG, PiSection::take)
+    PiSection::take(d)
 }
 
-/// E1-2: the count-pass length writes the back-patched bytes exactly, and a
-/// decoded body re-encodes to the same bytes.
+/// [format] The populated body counts exactly and round-trips.
 #[test]
-fn count_pass_section_is_byte_identical_and_round_trips() {
+fn plain_trailing_pi_body_counts_and_round_trips() {
     let original = reduction(ledger());
     assert!(original
         .accumulator
@@ -130,7 +115,7 @@ fn count_pass_section_is_byte_identical_and_round_trips() {
             && !state.message_end.is_empty()
             && !state.paired_digests.is_empty()));
     let bytes = body(&original).unwrap();
-    assert_eq!(bytes, back_patched(&original));
+    assert_eq!(bytes, unbounded_body(&original));
     let mut count = Enc::count(usize::MAX);
     put(&mut count, &original, &Rederive::default()).unwrap();
     assert_eq!(count.counted(), bytes.len());
@@ -145,6 +130,7 @@ fn count_pass_section_is_byte_identical_and_round_trips() {
     assert_eq!(again.into_bytes(), bytes);
 }
 
+/// [format] Pi fork accounting and durable body contract.
 #[test]
 fn pi_section_bytes_are_pinned() {
     let keys = BTreeMap::from([(
@@ -156,13 +142,13 @@ fn pi_section_bytes_are_pinned() {
         },
     )]);
     let golden = [
-        &[1_u8, 103, 0, 0, 0, 0, 0, 0, 0, 1][..],
+        &[1_u8][..],
         &[0x11; 32],
         &[1],
         &[0x22; 32],
         &[1, 0, 1],
         &[0x33; 32],
-        // M-2: `has_parent` false, no header time.
+        // No parent, no local header time.
         &[0, 0],
     ]
     .concat();
@@ -170,6 +156,7 @@ fn pi_section_bytes_are_pinned() {
     assert!(body(&reduction(keys)).unwrap().ends_with(&golden));
 }
 
+/// [format] Pi fork accounting and durable body contract.
 /// E1-4: the ledger charges the decode allowance before it allocates, and a
 /// refused charge leaves nothing allocated.
 #[test]
@@ -225,6 +212,7 @@ fn ledger_decode_funds_the_tree_before_any_allocation() {
     assert_eq!(stats.allocations, 0, "unfunded H string: {stats:?}");
 }
 
+/// [format] Pi fork accounting and durable body contract.
 #[test]
 fn ledger_cap_decodes_at_the_bound_and_refuses_past_it() {
     let mut keys = (0..PI_LEDGER_MAX_KEYS)
@@ -245,7 +233,7 @@ fn ledger_cap_decodes_at_the_bound_and_refuses_past_it() {
     assert_eq!(body(&over), Err(Refuse::TooLarge));
     // A record that carries one key too many anyway is corrupt (T14), refused
     // before the ledger asks the allowance for anything.
-    let forged = back_patched(&over);
+    let forged = unbounded_body(&over);
     assert_eq!(verify_without_allocation(&forged), Err(Corrupt));
     assert!(take_body(&mut Dec::new(&forged)).is_err());
     let bytes = section(&over.accumulator.seen_pi_usage_keys);
@@ -260,6 +248,7 @@ fn ledger_cap_decodes_at_the_bound_and_refuses_past_it() {
     assert_eq!(calls, 0);
 }
 
+/// [format] Pi fork accounting and durable body contract.
 /// Only the ledger may leave the shared body, only inside one Pi body's
 /// scope, and only from a Pi accumulator.
 #[test]
@@ -307,8 +296,9 @@ fn moved_ledger_allowance_is_scoped_to_one_pi_body() {
     }
 }
 
+/// [format] Truncation, trailing bytes and duplicate ledger keys refuse.
 #[test]
-fn corrupt_truncated_or_misframed_sections_are_refused() {
+fn corrupt_or_truncated_trailing_fields_are_refused() {
     let keys = ledger();
     let bytes = body(&reduction(keys.clone())).unwrap();
     let section = section(&keys);
@@ -317,73 +307,24 @@ fn corrupt_truncated_or_misframed_sections_are_refused() {
         assert_eq!(verify_without_allocation(candidate), Err(Corrupt));
         assert!(take_body(&mut Dec::new(candidate)).is_err());
     };
-    // Truncated anywhere, including a body with no section at all.
     for end in 0..bytes.len() {
         refused(&bytes[..end]);
     }
-    // Trailing bytes, or the section twice.
     refused(&[&bytes[..], &[0_u8]].concat());
     refused(&[&bytes[..], &section].concat());
-    // A wrong tag, a length one short or one long, or past usize.
-    let mut wrong_tag = bytes.clone();
-    wrong_tag[at] = 2;
-    refused(&wrong_tag);
-    let content = (section.len() - 9) as u64;
-    for len in [content - 1, content + 1, u64::MAX] {
-        let mut wrong_len = bytes.clone();
-        wrong_len[at + 1..at + 9].copy_from_slice(&len.to_le_bytes());
-        refused(&wrong_len);
-    }
-    // A length that covers one extra byte the ledger does not consume.
-    let mut long = bytes.clone();
-    long[at + 1..at + 9].copy_from_slice(&(content + 1).to_le_bytes());
-    long.push(0);
-    refused(&long);
-    // A duplicated ledger key.
     let (key, state) = keys.into_iter().next().unwrap();
     let mut e = Enc::bytes(RECORD_BYTES);
-    e.section(SECTION_TAG, |e| {
-        e.varint(2)?;
-        for _ in 0..2 {
-            key.put_h(e, "fixture")?;
-            state.put(e)?;
-        }
-        Ok(())
-    })
-    .unwrap();
-    refused(&[&bytes[..at], &e.into_bytes()].concat());
-    // Taking the section is not enough: the end check needs the refill.
-    let mut d = Dec::new(&bytes);
-    d.require_section();
-    CachedJsonlReduction::take(&mut d).unwrap();
-    Rederive::take(&mut d).unwrap();
-    take_ledger(&mut d).unwrap();
-    assert_eq!(d.ended(), Err(Corrupt));
-    d.refilled_section();
-    assert_eq!(d.finish(), Ok(()));
-}
-
-#[test]
-fn section_count_write_length_mismatch_refuses_on_every_sink() {
-    for shorter in [false, true] {
-        for mut e in [
-            Enc::bytes(RECORD_BYTES),
-            Enc::count(RECORD_BYTES),
-            Enc::hash("synthetic-section"),
-        ] {
-            let pass = std::cell::Cell::new(0);
-            assert_eq!(
-                e.section(SECTION_TAG, |e| {
-                    pass.set(pass.get() + 1);
-                    let len = if shorter { 3 - pass.get() } else { pass.get() };
-                    e.raw(&[0, 0][..len])
-                }),
-                Err(Refuse::TooLarge)
-            );
-        }
+    e.varint(2).unwrap();
+    for _ in 0..2 {
+        key.put_h(&mut e, "fixture").unwrap();
+        state.put(&mut e).unwrap();
     }
+    false.put(&mut e).unwrap();
+    Option::<i128>::None.put(&mut e).unwrap();
+    refused(&[&bytes[..at], &e.into_bytes()].concat());
 }
 
+/// [format] Pi fork accounting and durable body contract.
 /// SOURCE condition 1: every ledger key and digest is 64-char lower hex.
 #[test]
 fn ledger_h_values_must_be_lower_hex_digests() {
@@ -411,8 +352,9 @@ fn ledger_h_values_must_be_lower_hex_digests() {
     }
 }
 
+/// [format] Pi fork accounting and durable body contract.
 #[test]
-fn pi_registered_body_rows_preserve_populated_round_one_bytes() {
+fn pi_registered_body_rows_preserve_populated_body_bytes() {
     use crate::durable_tail_store::DurableSource;
     let original = reduction(ledger());
     let row = DurableSource::Pi.properties();
@@ -431,7 +373,7 @@ fn pi_registered_body_rows_preserve_populated_round_one_bytes() {
     }
     assert!(row.representation(3, &[0; 32]).is_none());
     let bytes = (row.encode)(&original, RECORD_BYTES, 1024 * 1024).unwrap();
-    assert_eq!(bytes, back_patched(&original));
+    assert_eq!(bytes, unbounded_body(&original));
     assert_eq!((row.verify)(&bytes), Ok(()));
     let decoded = (row.decode)(&bytes, SnapshotSource::Pi).unwrap();
     assert_eq!(
@@ -456,6 +398,7 @@ fn pi_registered_body_rows_preserve_populated_round_one_bytes() {
     }
 }
 
+/// [format] Pi fork accounting and durable body contract.
 #[cfg(unix)]
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -505,6 +448,7 @@ fn fork_usage(kind: &str, id: &str, at: &str, input: u64) -> Value {
     }
 }
 
+/// [regress] Pi fork accounting and durable body contract.
 #[test]
 fn fork_copies_before_the_header_skip_usage_but_at_and_after_count() {
     use crate::local_resource_diagnostics::cache_lifecycle;
@@ -552,6 +496,7 @@ fn fork_copies_before_the_header_skip_usage_but_at_and_after_count() {
     }
 }
 
+/// [regress] Pi fork accounting and durable body contract.
 #[test]
 fn fork_cutoff_uses_envelope_then_provider_only_when_envelope_is_absent() {
     let header = fork_header(Some(PARENT_CANARY), FORK_TIME);
@@ -592,8 +537,9 @@ fn fork_cutoff_uses_envelope_then_provider_only_when_envelope_is_absent() {
     }
 }
 
+/// [format] Pi fork accounting and durable body contract.
 #[test]
-fn fork_round_trip_keeps_only_the_two_n_fields_and_funds_the_box() {
+fn fork_round_trip_keeps_only_local_cutoff_fields_and_funds_the_box() {
     let mut original = reduction(ledger());
     original
         .accumulator
@@ -621,6 +567,7 @@ fn fork_round_trip_keeps_only_the_two_n_fields_and_funds_the_box() {
     assert!(cloned.fork.as_ref().unwrap().parent_ref.is_none());
 }
 
+/// [format] Pi fork accounting and durable body contract.
 #[test]
 fn non_pi_fork_refuses_instead_of_silently_dropping_and_default_is_empty() {
     use crate::durable_tail_codec::DurableEmpty;
@@ -639,6 +586,7 @@ fn non_pi_fork_refuses_instead_of_silently_dropping_and_default_is_empty() {
     }
 }
 
+/// [format] Pi fork accounting and durable body contract.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "native heap layout")]
 fn fork_heap_bound_charges_inline_box_allocation_and_parent_capacity() {
@@ -649,10 +597,7 @@ fn fork_heap_bound_charges_inline_box_allocation_and_parent_capacity() {
     let with_fork = PiLedger::from_parts(BTreeMap::new(), true, pi_timestamp_nanos(FORK_TIME));
     let mut e = Enc::bytes(RECORD_BYTES);
     let (has_parent, nanos) = with_fork.fork_parts();
-    e.section(SECTION_TAG, |e| {
-        PiSection::put_borrowed(e, with_fork.usage_keys(), &has_parent, &nanos)
-    })
-    .unwrap();
+    PiSection::put_borrowed(&mut e, with_fork.usage_keys(), &has_parent, &nanos).unwrap();
     let section = e.into_bytes();
     let mut charged = 0;
     let mut grant = |n| {
@@ -691,6 +636,7 @@ fn fork_heap_bound_charges_inline_box_allocation_and_parent_capacity() {
     }
 }
 
+/// [format] Pi fork accounting and durable body contract.
 #[test]
 fn fork_parent_membership_is_full_read_only_and_never_retained() {
     use crate::local_resource_diagnostics::cache_lifecycle;
@@ -724,21 +670,20 @@ fn fork_parent_membership_is_full_read_only_and_never_retained() {
     }
 }
 
+/// [format] Pi fork accounting and durable body contract.
 #[test]
 fn fork_section_semantics_agree_between_verify_and_decode() {
     let reduction = reduction(BTreeMap::new());
     let original = body(&reduction).unwrap();
     let prefix = original.len() - section(&BTreeMap::new()).len();
     let mut e = Enc::bytes(RECORD_BYTES);
-    e.section(SECTION_TAG, |e| {
-        PiSection::put_borrowed(e, &BTreeMap::new(), &false, &Some(1))
-    })
-    .unwrap();
+    PiSection::put_borrowed(&mut e, &BTreeMap::new(), &false, &Some(1)).unwrap();
     let bad = [&original[..prefix], &e.into_bytes()].concat();
     assert_eq!(verify_without_allocation(&bad), Err(Corrupt));
     assert!(take_body(&mut Dec::new(&bad)).is_err());
 }
 
+/// [regress] Pi fork accounting and durable body contract.
 #[test]
 fn copied_top_level_usage_keeps_the_model_for_owned_summaries() {
     let mut acc = SnapshotAccumulator::new(SnapshotSource::Pi);

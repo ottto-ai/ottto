@@ -95,7 +95,6 @@ enum Sink<'a> {
 pub(crate) struct Enc<'a> {
     sink: Sink<'a>,
     moved_field: Option<&'static str>,
-    written: usize,
     #[cfg(test)]
     include_content_bytes: bool,
 }
@@ -104,7 +103,6 @@ impl<'a> Enc<'a> {
     pub(crate) fn bytes(limit: usize) -> Self {
         Self {
             moved_field: None,
-            written: 0,
             #[cfg(test)]
             include_content_bytes: false,
             sink: Sink::Bytes {
@@ -140,7 +138,6 @@ impl<'a> Enc<'a> {
     pub(crate) fn writer(out: &'a mut dyn Write, exact_len: usize) -> Self {
         Self {
             moved_field: None,
-            written: 0,
             #[cfg(test)]
             include_content_bytes: false,
             sink: Sink::Write {
@@ -160,7 +157,6 @@ impl<'a> Enc<'a> {
     pub(crate) fn count(limit: usize) -> Self {
         Self {
             moved_field: None,
-            written: 0,
             #[cfg(test)]
             include_content_bytes: false,
             sink: Sink::Count { len: 0, limit },
@@ -178,7 +174,6 @@ impl<'a> Enc<'a> {
         hasher.update(domain.as_bytes());
         Self {
             moved_field: None,
-            written: 0,
             #[cfg(test)]
             include_content_bytes: false,
             sink: Sink::Hash(Box::new(hasher)),
@@ -204,24 +199,6 @@ impl<'a> Enc<'a> {
     pub(crate) fn field_moved(&self, path: &str) -> bool {
         self.moved_field == Some(path)
     }
-    /// Tagged section, `varint tag ‖ u64 LE length ‖ bytes`. The length comes
-    /// from a count pass of the same walk, so no sink is ever back-patched.
-    pub(crate) fn section(
-        &mut self,
-        tag: u64,
-        put: impl Fn(&mut Enc) -> Result<(), Refuse>,
-    ) -> Result<(), Refuse> {
-        let mut count = Enc::count(usize::MAX);
-        put(&mut count)?;
-        self.varint(tag)?;
-        self.raw(&(count.counted() as u64).to_le_bytes())?;
-        let start = self.written;
-        put(self)?;
-        // A changed walk cannot leave a successfully prepared malformed body.
-        (self.written - start == count.counted())
-            .then_some(())
-            .ok_or(Refuse::TooLarge)
-    }
     pub(crate) fn hashing(&self) -> bool {
         let hashing = matches!(self.sink, Sink::Hash(_));
         #[cfg(test)]
@@ -238,10 +215,6 @@ impl<'a> Enc<'a> {
         }
     }
     pub(crate) fn raw(&mut self, bytes: &[u8]) -> Result<(), Refuse> {
-        let written = self
-            .written
-            .checked_add(bytes.len())
-            .ok_or(Refuse::TooLarge)?;
         match &mut self.sink {
             Sink::Write { out, len, limit } => {
                 let end = len.checked_add(bytes.len()).ok_or(Refuse::TooLarge)?;
@@ -265,7 +238,6 @@ impl<'a> Enc<'a> {
                 }
             }
         }
-        self.written = written;
         Ok(())
     }
     pub(crate) fn varint(&mut self, mut value: u64) -> Result<(), Refuse> {
@@ -311,7 +283,6 @@ pub(crate) struct Dec<'a> {
     at: usize,
     allowance: Option<&'a mut dyn FnMut(u64) -> bool>,
     refused: bool,
-    required_section: Option<bool>,
     pl_labels_nonempty: bool,
 }
 
@@ -322,7 +293,6 @@ impl<'a> Dec<'a> {
             at: 0,
             allowance: None,
             refused: false,
-            required_section: None,
             pl_labels_nonempty: false,
         }
     }
@@ -332,7 +302,6 @@ impl<'a> Dec<'a> {
             at: 0,
             allowance: Some(allowance),
             refused: false,
-            required_section: None,
             pl_labels_nonempty: false,
         }
     }
@@ -423,48 +392,9 @@ impl<'a> Dec<'a> {
     pub(crate) fn remaining(&self) -> usize {
         self.bytes.len() - self.at
     }
-    /// The next length without consuming it, so a bound is checked before
-    /// any allocation.
-    pub(crate) fn peek_len(&self) -> Result<usize, Corrupt> {
-        Dec::new(&self.bytes[self.at..]).take_len()
-    }
-    /// A tagged section with a u64 LE length, decoded in place so it keeps
-    /// this decoder's allowance. `take` must consume exactly the section.
-    pub(crate) fn section<T>(
-        &mut self,
-        tag: u64,
-        take: impl FnOnce(&mut Self) -> Result<T, Corrupt>,
-    ) -> Result<T, Corrupt> {
-        if self.varint()? != tag {
-            return Err(Corrupt);
-        }
-        let len = u64::from_le_bytes(self.raw(8)?.try_into().map_err(|_| Corrupt)?);
-        let end = usize::try_from(len)
-            .ok()
-            .and_then(|len| self.at.checked_add(len))
-            .filter(|end| *end <= self.bytes.len())
-            .ok_or(Corrupt)?;
-        let body = self.bytes;
-        self.bytes = &body[..end];
-        let out = take(self);
-        self.bytes = body;
-        let out = out?;
-        (self.at == end).then_some(out).ok_or(Corrupt)
-    }
-    pub(crate) fn require_section(&mut self) {
-        self.required_section = Some(false);
-    }
-    pub(crate) fn refilled_section(&mut self) {
-        self.required_section = Some(true);
-    }
-    /// Every byte read and any required section refilled.
-    pub(crate) fn ended(&self) -> Result<(), Corrupt> {
-        (self.at == self.bytes.len() && self.required_section != Some(false))
-            .then_some(())
-            .ok_or(Corrupt)
-    }
-    pub(crate) fn finish(self) -> Result<(), Corrupt> {
-        self.ended()
+    /// Every byte in the body must be consumed.
+    pub(crate) fn finish(&self) -> Result<(), Corrupt> {
+        (self.at == self.bytes.len()).then_some(()).ok_or(Corrupt)
     }
 }
 
@@ -671,18 +601,10 @@ impl<K: HDigestKey + Ord, V: Durable> HDigest for BTreeMap<K, V> {
         Ok(())
     }
     fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
-        let len = d.take_len()?;
-        d.tree::<K, V>(len)?;
-        let mut out = BTreeMap::new();
-        for _ in 0..len {
-            if out.insert(K::take_h(d)?, V::take(d)?).is_some() {
-                return Err(Corrupt);
-            }
-        }
-        Ok(out)
+        take_h_map(d, usize::MAX)
     }
     fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-        verify_entries(d, K::key_h, V::verify)
+        verify_h_map::<K, V>(d, usize::MAX)
     }
     fn shape_h(s: &mut Shape) {
         s.push("HKeyMap<");
@@ -690,6 +612,32 @@ impl<K: HDigestKey + Ord, V: Durable> HDigest for BTreeMap<K, V> {
         V::shape(s);
         s.push(">");
     }
+}
+
+/// The shared H-key map decoder, with a caller's pre-allocation key bound.
+pub(crate) fn take_h_map<K: HDigestKey + Ord, V: Durable>(
+    d: &mut Dec<'_>,
+    max: usize,
+) -> Result<BTreeMap<K, V>, Corrupt> {
+    let len = d.take_len()?;
+    if len > max {
+        return Err(Corrupt);
+    }
+    d.tree::<K, V>(len)?;
+    let mut out = BTreeMap::new();
+    for _ in 0..len {
+        if out.insert(K::take_h(d)?, V::take(d)?).is_some() {
+            return Err(Corrupt);
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn verify_h_map<K: HDigestKey + Ord, V: Durable>(
+    d: &mut Dec<'_>,
+    max: usize,
+) -> Result<(), Corrupt> {
+    verify_entries_bounded(d, max, K::key_h, V::verify)
 }
 
 fn verify_seq(
@@ -819,7 +767,19 @@ fn verify_entries<'a, K: Ord>(
     key: impl Fn(&mut Dec<'a>) -> Result<K, Corrupt>,
     value: impl Fn(&mut Dec<'a>) -> Result<(), Corrupt>,
 ) -> Result<(), Corrupt> {
+    verify_entries_bounded(d, usize::MAX, key, value)
+}
+
+fn verify_entries_bounded<'a, K: Ord>(
+    d: &mut Dec<'a>,
+    max: usize,
+    key: impl Fn(&mut Dec<'a>) -> Result<K, Corrupt>,
+    value: impl Fn(&mut Dec<'a>) -> Result<(), Corrupt>,
+) -> Result<(), Corrupt> {
     let len = d.take_len()?;
+    if len > max {
+        return Err(Corrupt);
+    }
     let start = d.at;
     let mut previous = None;
     let mut sorted = true;
@@ -1962,7 +1922,6 @@ mod tests {
         {
             let mut e = Enc {
                 moved_field: None,
-                written: 0,
                 include_content_bytes: false,
                 sink: Sink::Write {
                     out: &mut out,
@@ -1978,7 +1937,6 @@ mod tests {
         let mut empty = &mut [][..];
         let mut e = Enc {
             moved_field: None,
-            written: 0,
             include_content_bytes: false,
             sink: Sink::Write {
                 out: &mut empty,
