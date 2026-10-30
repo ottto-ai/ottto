@@ -37201,21 +37201,6 @@ exit 0
 
     /// Claude Code's refresh grant has expired: the slot's upkeep stops
     /// collection after the identity gate passed.
-    fn expire_slot_refresh(fixture: &ClaudeBindingFixture) {
-        let mut credential = claude_credential_fixture(
-            "fixture-secret-token-expired",
-            TimeDuration::hours(6),
-            Some("team"),
-        );
-        credential["claudeAiOauth"]["refreshTokenExpiresAt"] = serde_json::json!(
-            (OffsetDateTime::now_utc() - TimeDuration::hours(1)).unix_timestamp() * 1_000
-        );
-        fs::write(
-            fixture.slot_dir.join(".credentials.json"),
-            serde_json::to_vec(&credential).expect("serialize credential"),
-        )
-        .expect("write credential");
-    }
 
     fn respond_variant_unrecognized(_endpoint: &str) -> Result<Value, u16> {
         Ok(serde_json::json!({
