@@ -62,6 +62,23 @@ def main():
         helpers = Path("crates/ottto-service/src/snapshots/e2_pipeline_scan_fixture.rs")
         shutil.copy2(repo / helpers, base / helpers)
         shutil.copy2(repo / sync / "money_equivalence_tests.rs", base / sync / "money_equivalence_tests.rs")
+        # Bases before #870 have no audit-retirement reconcile: their post-save
+        # step is durable_after_save alone. Call the base's own production step.
+        snapshots = (base / "crates/ottto-service/src/snapshots.rs").read_text()
+        if "fn durable_after_save_and_retire(" not in snapshots:
+            transplanted = base / sync / "money_equivalence_tests.rs"
+            text = transplanted.read_text()
+            head_call = ("crate::snapshots::durable_after_save_and_retire(\n"
+                         "            cache,\n"
+                         "            &self.dir,\n"
+                         "            source,\n"
+                         "            index,\n"
+                         "            &self.index,\n"
+                         "        );")
+            if text.count(head_call) != 1:
+                raise RuntimeError("base compat: expected exactly one durable_after_save_and_retire call")
+            transplanted.write_text(text.replace(
+                head_call, "crate::snapshots::durable_after_save(cache, &self.dir, source, index);"))
         tests = base / sync / "claude_money_e2_pipeline_tests.rs"
         include = '\nmod money_equivalence_tests { include!("money_equivalence_tests.rs"); }\n'
         if "mod money_equivalence_tests" not in tests.read_text():
