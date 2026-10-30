@@ -5653,3 +5653,156 @@ fn terminal_off_two_member_new_copy_cohort_emits_shared_request_once() {
         );
     });
 }
+
+#[test]
+fn terminal_off_on_deferred_strict_root_never_grants_negative_money() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    with_e2(|| {
+        for byte_exhaustion in [false, true] {
+            let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
+            let mut c = Corpus::new("on-deferred-negative-money");
+            c.root(ROOT, &line(ROOT, "shared-X", AT, 37));
+            c.evidence(&[api("shared-X", 37, 123)], &[trace("shared-X", "")]);
+            let deferred = "f338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+            for n in 0..130 {
+                let session = if n == 129 {
+                    deferred.to_string()
+                } else {
+                    format!("3338a80a-f36e-4cbc-a5bb-{n:012}")
+                };
+                let request = if n == 129 {
+                    "shared-X".to_string()
+                } else {
+                    format!("filler-{n}")
+                };
+                c.root(&session, &line(&session, &request, AT, 37));
+                c.evidence_for(
+                    &session,
+                    &[api_for(&session, &request, 37, 123)],
+                    &[trace_for(&session, &request, "")],
+                );
+            }
+            if byte_exhaustion {
+                // Metadata alone exhausts the byte admission; never allocate
+                // a 16 MiB row graph or grant absence from its unread suffix.
+                let path = c
+                    .support
+                    .join("local-otel/claude-code-effort")
+                    .join(format!("{:x}.jsonl", Sha256::digest(deferred.as_bytes())));
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_len(crate::snapshot_sync::strict_cohort::BYTES_PER_PASS + 1)
+                    .unwrap();
+            }
+            let scanner = E2ScanFixture::default();
+            let mut raw = c.raw(&scanner, ScanIndex::default(), 1000, false, &[]);
+            // This is the real native occurrence fold for all scanned roots.
+            // Later pages retain these dependencies even when only ROOT emits.
+            let _observations =
+                crate::snapshots::record_claude_native_observations(&raw.scan, &mut raw.index);
+            assert!(raw
+                .index
+                .claude_usage_family_pending_retained_for_test(deferred));
+            raw.scan
+                .snapshots
+                .retain(|item| item.source_session_id == ROOT);
+            assert_eq!(raw.scan.snapshots.len(), 1);
+            let prior = raw.index.clone();
+            let accepted = prior.accepted_snapshot_fingerprints.clone();
+            crate::claude_local_otel::reset_evidence_read_counts_for_test();
+            assert!(crate::snapshots::claude_terminal_off());
+            raw.enrich(&c);
+            assert!(raw.scan.strict_cohort_deferred_root_count >= 3);
+            assert!(
+                crate::claude_local_otel::evidence_read_counts_for_test().1 <= 128,
+                "deferred trace bodies are unopened"
+            );
+            let trace_reads = crate::claude_local_otel::trace_session_reads_for_test();
+            assert!(
+                trace_reads.iter().all(|(root, _)| root != deferred),
+                "the deferred duplicate is never opened"
+            );
+            let healthy_trace = c
+                .support
+                .join("local-otel/claude-code-trace-ownership")
+                .join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes())));
+            assert_eq!(
+                trace_reads
+                    .iter()
+                    .filter(|(root, _)| root == ROOT)
+                    .map(|(_, bytes)| *bytes)
+                    .sum::<u64>(),
+                std::fs::metadata(healthy_trace).unwrap().len()
+            );
+            assert!(!raw.disposition.duplicate_census.census_complete);
+            assert!(raw.disposition.duplicate_census.fence_after);
+            assert_eq!(
+                raw.disposition
+                    .context_file_birth
+                    .total
+                    .file_birth_rule_session_count,
+                0,
+                "unread negative dependencies cannot certify scalar birth"
+            );
+            assert_eq!(
+                raw.disposition
+                    .context_file_birth
+                    .total
+                    .proof_basis_session_count,
+                0
+            );
+            raw.finish();
+            assert_eq!(raw.index.accepted_snapshot_fingerprints, accepted);
+            assert!(raw
+                .index
+                .claude_usage_family_pending_retained_for_test(deferred));
+            assert_eq!(total(&raw), 1);
+            let item = &raw.scan.snapshots[0];
+            assert_eq!(
+                (item.input_tokens, item.output_tokens, item.request_count),
+                (37, 37, 1)
+            );
+            assert_eq!(
+                item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+                Some("0.000123")
+            );
+            assert!(item
+                .model_usage
+                .iter()
+                .all(|row| row.account_identifier_hash.is_none()));
+            let display = item.claude_account_display.as_ref().unwrap();
+            assert_eq!(
+                display.current.status,
+                crate::snapshots::claude_request_identity::CURRENT_UNKNOWN
+            );
+            // Independent cold Full executes the same real evidence pipeline;
+            // source bytes and money bodies must be identical despite rotation.
+            let _control = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
+            let mut cold = c.raw(
+                &E2ScanFixture::default(),
+                ScanIndex::default(),
+                1000,
+                false,
+                &[],
+            );
+            cold.index = prior;
+            cold.scan
+                .snapshots
+                .retain(|item| item.source_session_id == ROOT);
+            cold.enrich(&c);
+            cold.finish();
+            assert_eq!(
+                canonical(&raw.scan.snapshots),
+                canonical(&cold.scan.snapshots)
+            );
+            assert_eq!(cold.index.accepted_snapshot_fingerprints, accepted);
+        }
+    });
+}
+
+mod terminal_off_on_money_receipts {
+    include!("money_equivalence_on_tests.rs");
+}
