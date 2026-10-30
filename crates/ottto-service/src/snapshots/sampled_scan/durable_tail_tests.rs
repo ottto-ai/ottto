@@ -13351,15 +13351,6 @@ fn pace_clock_anomaly_is_separate_from_overflow_and_never_refunds_q11() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Advance only the shared Full clock; never clear a spend or restore grant.
-pub(crate) fn expire_full_pace(cache: &SharedCache, key: &str) {
-    let mut stores = cache.durable().unwrap();
-    let digest = store::key_digest(DurableSource::ClaudeCode, key);
-    if let Some(at) = stores.retail_full_at.get(&digest).copied() {
-        stores.retail_full_now = Some(at.at + std::time::Duration::from_secs(PACE_SECS));
-    }
-}
-
 pub(super) fn before_warm_transfer() {
     let hook = BEFORE_WARM_TRANSFER.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
