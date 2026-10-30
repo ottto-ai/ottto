@@ -533,67 +533,29 @@ fn c1a_late_identity_row_reselects_and_tags_skipped_family() {
     assert_eq!(late, base_late, "the late window equals BASE");
 }
 
-#[derive(Debug, Clone, Copy)]
-enum C1aContractChange {
-    /// No permit when the fence closed, a permit from the next cycle on.
-    OffToOn,
-    /// A record left by an older collector token.
-    OlderCollector,
-    /// No record: an index from before the field, or one an older decoder
-    /// rewrote without it (downgrade, then upgrade).
-    Unknown,
-    /// A record that names no contract.
-    Malformed,
-}
-
 /// X(b), contract change after the skip is active: the changed contract
 /// latches at the next traversal start, nothing skips, and that traversal's
 /// complete closed-fence terminal re-arms every family file, including the
 /// members the skip left unread, then clears the latch. The next window
 /// re-reads them under the new contract and the skip resumes.
-fn c1a_contract_change_rearms_skipped_family(change: C1aContractChange) {
+#[test]
+#[serial(source_manifests)]
+fn c1a_contract_off_to_on_rearms_skipped_family() {
     if !c1a_layout_supported("c1a_contract_change") {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
     let family = rearm_family_sessions().len();
-    let mut fixture = c1a_fixture(match change {
-        C1aContractChange::OffToOn => "c1a-contract-off-to-on",
-        C1aContractChange::OlderCollector => "c1a-contract-older-collector",
-        C1aContractChange::Unknown => "c1a-contract-unknown",
-        C1aContractChange::Malformed => "c1a-contract-malformed",
-    });
-    let before = if matches!(change, C1aContractChange::OffToOn) {
-        fixture.request_identity = false;
-        fixture.owned_base_preparation = true;
-        Some(String::new())
-    } else {
-        c1a_collector()
-    };
+    let mut fixture = c1a_fixture("c1a-contract-off-to-on");
+    fixture.request_identity = false;
+    fixture.owned_base_preparation = true;
+    let before = Some(String::new());
     let (_, reproved) = c1a_close_and_reprove(&fixture, "fix");
     assert_eq!(c1a_latch(&fixture), (before, false));
     assert_eq!(reproved.debt, 0, "the skip is active");
     let quiet = c1a_window(&c1a_generation(&fixture, "fix", (8, 20)));
     assert_eq!(quiet.family_reads, 0);
-    match change {
-        C1aContractChange::OffToOn => fixture.request_identity = true,
-        C1aContractChange::OlderCollector => c1a_edit_index(&fixture, |saved| {
-            saved.insert(
-                "claude_request_identity_contract".to_owned(),
-                serde_json::json!("claude_code_jsonl:own_request_identity_rows:v0"),
-            );
-        }),
-        C1aContractChange::Unknown => c1a_edit_index(&fixture, |saved| {
-            saved.remove("claude_request_identity_contract");
-            saved.remove("claude_request_identity_contract_changed");
-        }),
-        C1aContractChange::Malformed => c1a_edit_index(&fixture, |saved| {
-            saved.insert(
-                "claude_request_identity_contract".to_owned(),
-                serde_json::json!("not a contract"),
-            );
-        }),
-    }
+    fixture.request_identity = true;
     let changed = c1a_window(&c1a_generation(&fixture, "fix", (8, 30)));
     assert!(changed.fence_before && changed.fence_after && !changed.full_rearm);
     assert_eq!(changed.family_reads, 0, "nothing re-selected the family");
@@ -614,12 +576,6 @@ fn c1a_contract_change_rearms_skipped_family(change: C1aContractChange) {
         c1a_window(&c1a_generation(&fixture, "fix", (8, 52)))
     };
     assert_eq!(quiet.family_reads, 0);
-}
-
-#[test]
-#[serial(source_manifests)]
-fn c1a_contract_off_to_on_rearms_skipped_family() {
-    c1a_contract_change_rearms_skipped_family(C1aContractChange::OffToOn);
 }
 
 /// X(b), A-B-A within one traversal: off, on, off across its pages. The

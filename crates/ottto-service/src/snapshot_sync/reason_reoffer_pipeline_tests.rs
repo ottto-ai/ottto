@@ -1347,6 +1347,94 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
     );
 }
 
+/// SOURCE condition 5 (Round 13): a protected root, named by the local
+/// re-emission list, whose family a census retired as absent (tombstoned,
+/// witness kept) and whose member then returns, through the real
+/// prepare/finish pipeline and the recording server. The return re-enters
+/// the authority path, and nothing emitted for the root is a request-owned
+/// literal (`claude_request_counting:v1`, the "new v1"), nor is any file of
+/// it stamped with body-witness revision 3. The root either settles its proof
+/// (tombstone cleared, no record) or stays held with nothing offered.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn protected_returning_root_emits_no_literal_v1_or_revision_3() {
+    if !supported("protected_returning_root_emits_no_literal_v1_or_revision_3") {
+        return;
+    }
+    let root = IDENTITY_PIPELINE_ROOT;
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("patha-protected-return", Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let key = first
+        .index
+        .files
+        .keys()
+        .find(|key| key.ends_with(&format!("{root}.jsonl")))
+        .cloned()
+        .expect("the root is indexed");
+
+    crate::snapshots::write_claude_reemission_list_for_test(&pipeline.support, &[root]);
+    let mut index = ScanIndex::load(&first.index_path).unwrap();
+    index.tombstone_claude_family_for_test(root);
+    index.save(&first.index_path).unwrap();
+    let transcript = pipeline
+        .fixture
+        .home
+        .join(".claude/projects/-synthetic-repo")
+        .join(format!("{root}.jsonl"));
+    let bytes = std::fs::read(&transcript).unwrap();
+    std::fs::remove_file(&transcript).unwrap();
+    let absent = pipeline.cycle(t0 + 600);
+    assert!(absent.result.is_ok(), "{:?}", absent.result);
+    assert!(!absent.index.files.contains_key(&key));
+    assert!(absent.index.claude_family_tombstoned_for_test(root));
+
+    let offered_before = pipeline.server.offered().len();
+    std::fs::write(&transcript, &bytes).unwrap();
+    let returned = pipeline.cycle(t0 + 1_200);
+    assert!(returned.result.is_ok(), "{:?}", returned.result);
+    let offered = pipeline.server.offered();
+    let root_offers = offered[offered_before..]
+        .iter()
+        .filter(|offer| offer["source_session_id"] == root)
+        .collect::<Vec<_>>();
+    for offer in &root_offers {
+        assert_ne!(
+            offer["usage_accounting_contract"], "claude_request_counting:v1",
+            "no request-owned literal for a protected root"
+        );
+        assert!(
+            !offer.to_string().contains("claude_request_counting"),
+            "no literal body for a protected root"
+        );
+    }
+    if let Some(entry) = returned.index.files.get(&key) {
+        assert_ne!(entry.effective_upload_body_witness_revision, 3);
+        assert!(
+            entry.effective_upload_body_witness_revision
+                <= effective_upload_body_witness_revision(SnapshotSource::ClaudeCode)
+        );
+    }
+    let settled = !returned.index.claude_family_tombstoned_for_test(root)
+        && returned
+            .index
+            .claude_authority_record_for_test(root)
+            .is_none();
+    let held = returned.index.claude_family_tombstoned_for_test(root)
+        && returned
+            .index
+            .claude_authority_record_for_test(root)
+            .is_some()
+        && root_offers.is_empty();
+    assert!(
+        settled || held,
+        "the return re-enters the authority path: settled={settled} held={held}"
+    );
+}
+
 /// The refusal, a conflict on its due daily offer, and the conflict's
 /// ordinary retry made due: the state whose quiet cycles re-read the file.
 fn refused_then_conflicted(name: &str) -> (ReofferPipeline, String, u64, serde_json::Value) {
