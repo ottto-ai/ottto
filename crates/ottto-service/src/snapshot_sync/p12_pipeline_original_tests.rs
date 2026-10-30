@@ -4139,7 +4139,7 @@ fn terminal_off_on_closed_effective_fence_refuses_native_comparison() {
         serde_json::to_value(&index).unwrap(),
         serde_json::to_value(&base_index).unwrap()
     );
-    assert!(index.accepted_snapshot_fingerprints.is_empty());
+    assert!(serde_json::to_value(&index).unwrap()["accepted_snapshot_fingerprints"].is_null());
     assert!(!disposition.duplicate_census.census_complete);
     assert!(disposition.duplicate_census.fence_after);
     drop(_on);
