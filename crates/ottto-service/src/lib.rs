@@ -8,6 +8,10 @@ mod app_bundle_version;
 pub mod backfill;
 pub mod canonical_json;
 pub mod claude_browser_auth;
+// Test-only until the full #851 re-land wires a caller. No production path can
+// reach it, so sibling Desktop roots cannot change status, census or selection.
+#[cfg(test)]
+mod claude_desktop;
 pub mod claude_local_otel;
 pub(crate) mod claude_refresher;
 mod claude_session_registrations;

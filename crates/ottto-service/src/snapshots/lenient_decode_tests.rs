@@ -2019,6 +2019,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
             }
             "claude_request_census_shadow" => serde_json::json!({"o":true}),
             "reread_guard" => serde_json::json!({"closed":true}),
+            "claude_desktop_store_inventory" => serde_json::json!("a".repeat(64)),
             "claude_retired_family_tombstones" => {
                 serde_json::json!({"a".repeat(64): 1})
             }
@@ -2118,7 +2119,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
         lenient_decode::FIELDS
             .iter()
             .copied()
-            .filter(|name| *name != "reread_guard")
+            .filter(|name| !matches!(*name, "reread_guard" | "claude_desktop_store_inventory"))
             .collect()
     );
     let decoded =
@@ -2135,11 +2136,12 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
     let current = serde_json::to_value(&seed).unwrap();
     let fields = lenient_decode::FIELDS;
     assert_eq!(
-        &fields[fields.len() - 4..],
+        &fields[fields.len() - 5..],
         &[
             "upload_ack_retirement_handoff",
             "held_audit_progress",
             "claude_money_birth_store",
+            "claude_desktop_store_inventory",
             "growth_retention",
         ]
     );
@@ -2181,6 +2183,162 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
     }
 }
 
+const DESKTOP_INVENTORY: &str = "claude_desktop_store_inventory";
+
+/// An index with #851's key and one without both load; the key steers nothing
+/// and the next save holds exactly what an index without it holds, which is
+/// also all a reader that predates the key ever sees.
+#[test]
+fn desktop_inventory_key_is_decoded_ignored_and_never_saved() {
+    let seed = every_persisted_field_fixture();
+    let without = serde_json::to_vec(&seed).unwrap();
+    let plain: Value = serde_json::from_slice(&without).unwrap();
+    assert!(plain.get(DESKTOP_INVENTORY).is_none());
+    let mut carrying = plain.clone();
+    carrying[DESKTOP_INVENTORY] = serde_json::json!("a".repeat(64));
+    let carrying = serde_json::to_vec(&carrying).unwrap();
+    for (bytes, expected) in [(&carrying, Some("a".repeat(64))), (&without, None)] {
+        let streaming =
+            lenient_decode::read(std::io::Cursor::new(bytes), "load", "unattributed").unwrap();
+        let bounded = lenient_decode::read_bounded(bytes).unwrap();
+        for decoded in [streaming, bounded] {
+            assert!(decoded.decode_holds.is_empty());
+            assert_eq!(decoded.claude_desktop_store_inventory, expected);
+            assert_eq!(serde_json::to_vec(&decoded).unwrap(), without);
+        }
+    }
+}
+
+#[test]
+fn desktop_inventory_production_load_save_drops_key_with_exact_bytes_and_counts() {
+    let scratch = crate::test_scratch::ScratchDir::new("desktop-inventory-load-save");
+    let path = scratch.as_ref().join("index.json");
+    let seed = fixture();
+    let without = serde_json::to_string(&seed).unwrap();
+    let load_and_save = |input: &str, inventory: Option<&str>| {
+        fs::write(&path, input).unwrap();
+        let before = claude_absence_counters_for_test().tombstone_decode_drops;
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        let drops = claude_absence_counters_for_test().tombstone_decode_drops - before;
+        assert_eq!(fs::read(&path).unwrap(), input.as_bytes());
+        assert!(loaded.decode_holds.is_empty());
+        assert_eq!(loaded.generation, seed.generation);
+        assert_eq!(loaded.claude_desktop_store_inventory.as_deref(), inventory);
+        loaded.save(&path).unwrap();
+        let saved = fs::read(&path).unwrap();
+        let value: Value = serde_json::from_slice(&saved).unwrap();
+        assert!(value.get(DESKTOP_INVENTORY).is_none());
+        (saved, drops)
+    };
+    let (baseline, drops) = load_and_save(&without, None);
+    assert_eq!(drops, 0);
+    let digest = "a".repeat(64);
+    for (case, fields, inventory, expected_drops) in [
+        (
+            "valid",
+            format!("\"{DESKTOP_INVENTORY}\":\"{digest}\""),
+            Some(digest.as_str()),
+            0,
+        ),
+        (
+            "wrong-length",
+            format!("\"{DESKTOP_INVENTORY}\":\"{}\"", "a".repeat(63)),
+            None,
+            1,
+        ),
+        (
+            "duplicate",
+            format!(
+                "\"{DESKTOP_INVENTORY}\":\"{digest}\",\"{DESKTOP_INVENTORY}\":\"{}\"",
+                "b".repeat(64)
+            ),
+            Some(digest.as_str()),
+            1,
+        ),
+    ] {
+        let input = format!("{{{fields},{}", &without[1..]);
+        let (saved, drops) = load_and_save(&input, inventory);
+        assert_eq!(saved, baseline, "{case}: production save bytes");
+        assert_eq!(drops, expected_drops, "{case}: one count per dropped value");
+    }
+}
+
+/// This key was unknown to the last release, so no value of it may refuse.
+#[test]
+fn bad_desktop_inventory_is_dropped_and_counted_never_refused() {
+    let seed = every_persisted_field_fixture();
+    let without = serde_json::to_vec(&seed).unwrap();
+    let plain: Value = serde_json::from_slice(&without).unwrap();
+    let load = |value: Value| {
+        let mut form = plain.clone();
+        form[DESKTOP_INVENTORY] = value;
+        let bytes = serde_json::to_vec(&form).unwrap();
+        let before = claude_absence_counters_for_test().tombstone_decode_drops;
+        let decoded =
+            lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+        assert!(decoded.decode_holds.is_empty());
+        assert_eq!(decoded.claude_desktop_store_inventory, None);
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), without);
+        claude_absence_counters_for_test().tombstone_decode_drops - before
+    };
+    assert_eq!(load(Value::Null), 0, "null is an absent optional");
+    for bad in [
+        serde_json::json!(7),
+        serde_json::json!(true),
+        serde_json::json!([1, 2]),
+        serde_json::json!({"nested":{"value":1}}),
+        serde_json::json!(""),
+        serde_json::json!("short"),
+        serde_json::json!("a".repeat(65)),
+        serde_json::json!("a".repeat(1 << 20)),
+    ] {
+        assert_eq!(load(bad), 1);
+    }
+}
+
+#[test]
+fn duplicate_desktop_inventory_is_not_a_new_refusal() {
+    let seed = every_persisted_field_fixture();
+    let without = serde_json::to_vec(&seed).unwrap();
+    let body = std::str::from_utf8(&without).unwrap();
+    let bytes = format!(
+        "{{\"{DESKTOP_INVENTORY}\":\"{}\",\"{DESKTOP_INVENTORY}\":7,{}",
+        "a".repeat(64),
+        &body[1..]
+    )
+    .into_bytes();
+    let streaming =
+        lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+    let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+    for decoded in [streaming, bounded] {
+        assert!(decoded.decode_holds.is_empty());
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), without);
+    }
+}
+
+#[test]
+fn desktop_inventory_keeps_existing_positional_index_slots() {
+    let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
+    let fields = lenient_decode::FIELDS;
+    assert_eq!(fields[86], DESKTOP_INVENTORY);
+    let mut legacy = current.clone();
+    legacy.as_object_mut().unwrap().remove("growth_retention");
+    let slot = |name: &&str| legacy[*name].clone();
+    let shorter: Vec<Value> = fields[..86].iter().map(slot).collect();
+    let mut full = shorter.clone();
+    full.push(serde_json::json!("a".repeat(64)));
+    for slots in [shorter, full] {
+        let bytes = serde_json::to_vec(&Value::Array(slots)).unwrap();
+        let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+        let streaming =
+            lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+        let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+        for decoded in [native, streaming, bounded] {
+            assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+        }
+    }
+}
+
 #[test]
 fn growth_retention_keeps_existing_positional_index_slots() {
     let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
@@ -2188,9 +2346,10 @@ fn growth_retention_keeps_existing_positional_index_slots() {
     legacy.as_object_mut().unwrap().remove("growth_retention");
     let fields = lenient_decode::FIELDS;
     assert_eq!(fields[85], "claude_money_birth_store");
-    assert_eq!(fields[86], "growth_retention");
-    assert_eq!(fields.len(), 87);
-    for (expected, slots) in [(&legacy, &fields[..86]), (&current, fields)] {
+    assert_eq!(fields[86], DESKTOP_INVENTORY);
+    assert_eq!(fields[87], "growth_retention");
+    assert_eq!(fields.len(), 88);
+    for (expected, slots) in [(&legacy, &fields[..87]), (&current, fields)] {
         let array = Value::Array(slots.iter().map(|name| expected[*name].clone()).collect());
         let bytes = serde_json::to_vec(&array).unwrap();
         let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
@@ -4633,11 +4792,17 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
         let bytes = form.as_bytes();
         let path = scratch.join(format!("old-{number}.json"));
         fs::write(&path, bytes).unwrap();
+        let drops_before = claude_absence_counters_for_test().tombstone_decode_drops;
         let native = claude_request_census::decode_index(bytes).expect("native legacy decode");
         let streaming = lenient_decode::read(std::io::Cursor::new(bytes), "load", "unattributed")
             .expect("no extra positional field");
         let bounded = lenient_decode::read_bounded(bytes).unwrap();
         let disk = ScanIndex::load(&path).expect("no reset");
+        assert_eq!(
+            claude_absence_counters_for_test().tombstone_decode_drops,
+            drops_before,
+            "retired reread_guard duplicates stay silently ignored"
+        );
         for mut decoded in [native, streaming, bounded, disk] {
             assert!(decoded.decode_holds.is_empty(), "no quarantine");
             assert_eq!(

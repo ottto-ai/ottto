@@ -1224,6 +1224,35 @@ Capacity/availability retain their existing degraded behavior. Full-cause
 admission and its other counter projections arrive in subsequent slices.
 
 
+## Pi reported-cost parsing
+
+Pi cost fields use checked decimal arithmetic and an inclusive $100,000 ceiling
+per field per source record. Negative values, including numeric or string `-0`,
+and malformed fields remain Unknown. Arithmetic overflow or a value above the
+ceiling also remains Unknown, preserving valid sibling fields. Strings retain
+their original decimal lexeme; JSON floating numbers use serde_json's shortest
+round-trip f64 representation because their original lexeme is unavailable.
+Integers remain exact.
+
+More than twelve fractional decimal places after applying the exponent rounds
+half-to-even to picos. `pi_cost_precision_rounded` counts each accepted field with
+that precision, including trailing zeros and values rounded to zero. It measures
+lexical source precision, not an anomaly: Pi computes costs with floating point,
+so their decimal representations often carry more than twelve fractional digits.
+`pi_cost_refused_overflow` counts each field refused for arithmetic overflow or
+the ceiling, including a sub-pico excess above it. A string lexeme whose digits
+overflow checked `u128` arithmetic also counts, even when its mathematical value
+is in range; that field safely remains Unknown. Other invalid fields do not increment
+these counters.
+
+Both counters are cumulative saturating process totals in the lifecycle registry,
+reported through `process_retained_cache_lifecycle_totals`. There is no labelled
+log line or per-line diagnostic emission. Counts are per observed usage line,
+before response deduplication, timestamp drops and token-field validation;
+rereads count again. Shape probes do not count. These are observations rather
+than retention failures. The replay harness classifies both as `Observation`.
+
+
 ## Compressed Codex reader refusals
 
 The existing `local_resources` carrier emits stage `codex_zst_refused` with
