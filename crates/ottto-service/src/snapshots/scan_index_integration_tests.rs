@@ -826,7 +826,8 @@ fn restored_behind_accepted_publication_waits_for_policy_and_noop_suppression() 
     for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
         for complete in [false, true] {
             for equal in [false, true] {
-                let item = cache_adapter_tests::cache_fixture_item();
+                let mut item = cache_adapter_tests::cache_fixture_item();
+                item.snapshot_fingerprint = snapshot_fingerprint(source, &item);
                 let file = item.source_file_fingerprint.clone().unwrap();
                 let entities = BTreeSet::from([item.snapshot_fingerprint.clone()]);
                 let witnesses = BTreeSet::from([snapshot_upload_body_witness(&item)]);
