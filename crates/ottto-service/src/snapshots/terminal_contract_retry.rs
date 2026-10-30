@@ -265,3 +265,32 @@ pub(crate) fn source_acquisitions<T>(
     let reads = SOURCE_ACQUISITIONS.with(|reads| reads.replace(None).unwrap());
     (result, reads)
 }
+
+// Group replay swaps physical readers inside step_group; observe before that
+// swap rather than attributing a post-step delta to the canonical parser.
+#[cfg(test)]
+thread_local! {
+    static GROUP_BODY_BYTES: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn record_group_body_bytes(bytes: u64) {
+    GROUP_BODY_BYTES.with(|value| {
+        if let Some(current) = value.get() {
+            value.set(Some(current.saturating_add(bytes)));
+        }
+    });
+}
+#[cfg(test)]
+pub(crate) fn group_body_bytes<T>(run: impl FnOnce() -> T) -> (T, u64) {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            GROUP_BODY_BYTES.with(|value| value.set(None));
+        }
+    }
+    let _guard = Guard;
+    GROUP_BODY_BYTES.with(|value| assert!(value.replace(Some(0)).is_none()));
+    let result = run();
+    let bytes = GROUP_BODY_BYTES.with(|value| value.replace(None).unwrap());
+    (result, bytes)
+}

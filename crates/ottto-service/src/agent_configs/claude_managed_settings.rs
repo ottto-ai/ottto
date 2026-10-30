@@ -283,7 +283,10 @@ mod unix {
             })
         }
         fn read(&self) -> io::Result<Option<Vec<u8>>> {
-            let mut file = match self.open_file(c"settings.json", libc::O_RDONLY, 0) {
+            self.read_named(c"settings.json")
+        }
+        fn read_named(&self, name: &std::ffi::CStr) -> io::Result<Option<Vec<u8>>> {
+            let mut file = match self.open_file(name, libc::O_RDONLY, 0) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error),
@@ -330,6 +333,16 @@ mod unix {
         if path.file_name() != Some(std::ffi::OsStr::new("settings.json")) {
             return Err(invalid("unexpected settings file name"));
         }
+        read_settings_file(path)
+    }
+
+    pub(super) fn read_settings_file(path: &Path) -> io::Result<Option<String>> {
+        use std::os::unix::ffi::OsStrExt;
+        let name = path
+            .file_name()
+            .ok_or_else(|| invalid("settings has no file name"))?;
+        let name =
+            CString::new(name.as_bytes()).map_err(|_| invalid("invalid settings file name"))?;
         let parent = path
             .parent()
             .ok_or_else(|| invalid("settings has no parent"))?;
@@ -339,7 +352,7 @@ mod unix {
             Err(error) => return Err(error),
         };
         directory
-            .read()?
+            .read_named(&name)?
             .map(|body| String::from_utf8(body).map_err(|_| invalid("settings is not UTF-8")))
             .transpose()
     }
@@ -813,6 +826,22 @@ pub(crate) fn read_settings(path: &Path) -> io::Result<Option<String>> {
     #[cfg(unix)]
     {
         unix::read_settings(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "managed settings require no-follow filesystem support",
+        ))
+    }
+}
+
+/// Read a retained settings backup with the normal owner, size and no-follow checks.
+pub(crate) fn read_settings_backup(path: &Path) -> io::Result<Option<String>> {
+    #[cfg(unix)]
+    {
+        unix::read_settings_file(path)
     }
     #[cfg(not(unix))]
     {

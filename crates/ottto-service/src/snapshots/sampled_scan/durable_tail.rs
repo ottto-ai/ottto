@@ -42,6 +42,13 @@ use sampled_jsonl::CachedJsonlReduction;
 /// retained lock stays bounded. Entries past it are deferred to a later save.
 pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 
+#[cfg(test)]
+thread_local! { static TEST_WRITE_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(in crate::snapshots) fn set_test_write_bytes(bytes: Option<usize>) {
+    TEST_WRITE_BYTES.with(|budget| budget.set(bytes));
+}
+
 /// Upper bound of both stores' resident digest maps (two sources).
 #[cfg(test)]
 pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 128;
@@ -180,8 +187,15 @@ struct Slot {
     reported: [u64; 5],
 }
 
+#[derive(Clone, Copy)]
+struct QuietRetirement {
+    key: store::Digest32,
+    source: SnapshotSource,
+    fingerprint: store::Digest32,
+    durable: bool,
+}
+
 /// Process-lifetime durable state beside the RAM cache.
-#[derive(Default)]
 pub(crate) struct Stores {
     claude: Option<Slot>,
     codex: Option<Slot>,
@@ -192,12 +206,29 @@ pub(crate) struct Stores {
     /// committed entry with this same fingerprint; local-hold settlement that
     /// reverts or clears the entry makes it refuse (F2).
     selected: BTreeMap<String, String>,
+    // At most CACHE_ENTRIES; the persisted marker remains owed until receipt.
+    retiring: [Option<QuietRetirement>; crate::transcript_cache::CACHE_ENTRIES],
     /// Keys whose restore refused the record as `entry_changed`, until their
     /// next acquisition completes. Process-local, never persisted.
     stale_predecessor: BTreeSet<String>,
     /// When this process last emitted the restart-Full alarm.
     restart_full_alarmed: Option<std::time::Instant>,
     counters: Counters,
+}
+
+impl Default for Stores {
+    fn default() -> Self {
+        Self {
+            claude: None,
+            codex: None,
+            touched: BTreeSet::new(),
+            selected: BTreeMap::new(),
+            retiring: [None; crate::transcript_cache::CACHE_ENTRIES],
+            stale_predecessor: BTreeSet::new(),
+            restart_full_alarmed: None,
+            counters: Counters::default(),
+        }
+    }
 }
 
 impl Stores {
@@ -536,6 +567,18 @@ impl SharedCache {
             return;
         };
         let dir = store::store_dir_for_index(index_path);
+        let changed = stores.slot(source).as_ref().map_or(true, |slot| {
+            slot.dir != dir
+                || slot.namespace != *namespace
+                || slot.identity_capture != identity_capture
+        });
+        if changed {
+            for pending in &mut stores.retiring {
+                if pending.is_some_and(|pending| durable_source(pending.source) == Some(source)) {
+                    *pending = None;
+                }
+            }
+        }
         let slot = stores.slot(source);
         if let Some(current) = slot.as_mut().filter(|current| current.dir == dir) {
             current.decided.clear();
@@ -1026,6 +1069,123 @@ impl SharedCache {
         }
     }
 
+    /// No durable slot means no old certificate exists in this acquisition
+    /// context. Otherwise keep the persisted marker until this exact body's
+    /// debt-free replacement and a second index CAS both succeed.
+    pub(crate) fn durable_stage_quiet_retirement(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        fingerprint: &str,
+    ) -> bool {
+        let Some(mut stores) = self.durable() else {
+            return true;
+        };
+        let Some(durable_source) = durable_source(source) else {
+            return false;
+        };
+        if stores.slot(durable_source).is_none() {
+            return false;
+        }
+        let key = store::key_digest(durable_source, key);
+        let slot = stores
+            .retiring
+            .iter()
+            .position(|pending| pending.is_some_and(|p| p.key == key))
+            .or_else(|| stores.retiring.iter().position(Option::is_none))
+            .unwrap_or(0);
+        // Replacing a RAM proof candidate never removes its persisted marker;
+        // that key must revalidate on its next visit before it can retire.
+        stores.retiring[slot] = Some(QuietRetirement {
+            key,
+            source,
+            fingerprint: Sha256::digest(fingerprint.as_bytes()).into(),
+            durable: false,
+        });
+        true
+    }
+
+    pub(crate) fn durable_reconcile_retirements<W: SingleWriter>(
+        &self,
+        writer: &W,
+        source: SnapshotSource,
+        index: &mut ScanIndex,
+        index_path: &Path,
+    ) -> usize {
+        if !index_path.starts_with(writer.state_dir()) {
+            return 0;
+        }
+        let Some(durable_source) = durable_source(source) else {
+            return 0;
+        };
+        let ready: Vec<_> = self
+            .durable()
+            .map(|stores| {
+                index
+                    .files
+                    .iter()
+                    .filter(|(key, entry)| {
+                        stores
+                            .retiring
+                            .iter()
+                            .flatten()
+                            .find(|pending| pending.key == store::key_digest(durable_source, key))
+                            .is_some_and(|pending| {
+                                pending.source == source
+                                    && pending.durable
+                                    && pending.fingerprint
+                                        == <[u8; 32]>::from(Sha256::digest(
+                                            entry.source_file_fingerprint.as_bytes(),
+                                        ))
+                            })
+                    })
+                    .map(|(key, entry)| (key.clone(), entry.source_file_fingerprint.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut undo = BTreeMap::new();
+        for (key, fingerprint) in &ready {
+            let previous = index
+                .files
+                .get(key)
+                .and_then(|entry| entry.scan_identity_version.clone());
+            if !index.claude_account_deferred_holds.contains_key(key)
+                && index.retire_quiet_audit(key, fingerprint)
+            {
+                undo.insert(key.clone(), previous);
+            }
+        }
+        if undo.is_empty() {
+            return 0;
+        }
+        if index.save(index_path).is_err() {
+            for (key, previous) in undo {
+                if let Some(entry) = index.files.get_mut(&key) {
+                    entry.scan_identity_version = previous;
+                }
+            }
+            return 0;
+        }
+        let retired = undo.len();
+        if let Some(mut stores) = self.durable() {
+            for pending in &mut stores.retiring {
+                if pending.is_some_and(|p| {
+                    undo.keys()
+                        .any(|key| store::key_digest(durable_source, key) == p.key)
+                }) {
+                    *pending = None;
+                }
+            }
+        }
+        crate::local_resource_diagnostics::traversal_point(
+            "sampled_audit_retirement",
+            source.api_slug(),
+            &serde_json::json!({"audit_quiet_retired": retired,
+                "pending_audits": index.files.values().filter(|entry| entry.has_unverified_source()).count()}),
+        );
+        retired
+    }
+
     /// After a successful save of `index` (the committed generation), writes
     /// the records of this source's entries admitted since its last write
     /// that are still resident and kept by the save, then collects records
@@ -1039,7 +1199,7 @@ impl SharedCache {
     ) -> Option<store::BatchReceipt> {
         let source = durable_source(snapshot_source)?;
         let allowlist = codec::allowlist_digest(snapshot_source);
-        let (touched, mut selected, namespace, identity_capture) = {
+        let (touched, mut selected, namespace, identity_capture, retiring) = {
             let mut stores = self.durable()?;
             let slot = stores.slot(source).as_ref()?;
             let pass = (slot.namespace.clone(), slot.identity_capture);
@@ -1048,13 +1208,25 @@ impl SharedCache {
                 std::mem::take(&mut stores.selected),
                 pass.0,
                 pass.1,
+                stores
+                    .retiring
+                    .iter()
+                    .flatten()
+                    .filter(|pending| pending.source == snapshot_source)
+                    .map(|pending| (pending.key, pending.fingerprint))
+                    .collect::<BTreeMap<_, _>>(),
             )
         };
         let namespace = &namespace;
         let mut pending = Vec::new();
         let mut offered = BTreeMap::new();
+        let mut retirement_offers = BTreeSet::new();
         let mut later = BTreeSet::new();
         let mut budget = WRITE_PASS_BYTES;
+        #[cfg(test)]
+        if let Some(bytes) = TEST_WRITE_BYTES.with(std::cell::Cell::get) {
+            budget = budget.min(bytes);
+        }
         let mut not_persisted = Vec::new();
         let mut invalidate = BTreeSet::new();
         let mut peak = 0_u64;
@@ -1107,7 +1279,7 @@ impl SharedCache {
                 ) else {
                     continue;
                 };
-                let Some(certificate) = certificate_at(
+                let Some(mut certificate) = certificate_at(
                     &key,
                     &retained.checkpoint,
                     index,
@@ -1116,6 +1288,21 @@ impl SharedCache {
                     not_persisted.push("certificate");
                     continue;
                 };
+                let retiring = retiring
+                    .get(&expected.binding.key)
+                    .is_some_and(|fingerprint| {
+                        index.files.get(&key).is_some_and(|entry| {
+                            <[u8; 32]>::from(Sha256::digest(
+                                entry.source_file_fingerprint.as_bytes(),
+                            )) == *fingerprint
+                                && entry.has_unverified_source()
+                                && !entry.has_prefix_provenance()
+                        }) && !index.claude_account_deferred_holds.contains_key(&key)
+                            && retained.checkpoint.audit_debt().is_none()
+                    });
+                if retiring {
+                    certificate.audit_debt_unix_seconds = None;
+                }
                 // Byte-budget deferral keeps the acquired provenance (the
                 // requeue below carries it to the next save).
                 if budget == 0 {
@@ -1131,6 +1318,9 @@ impl SharedCache {
                     Ok(body) => {
                         budget = budget.saturating_sub(body.len());
                         peak = peak.max(body.len() as u64);
+                        if retiring {
+                            retirement_offers.insert(expected.binding.key);
+                        }
                         offered.insert(expected.binding.key, key);
                         pending.push(PendingRecord {
                             binding: expected.binding,
@@ -1176,6 +1366,25 @@ impl SharedCache {
             stores.counters.store_write_after_save_failed += offered_files;
             return None;
         };
+        // Count totals must account for EVERY offer. A held/unknown/skipped
+        // record, budget refusal or any writer error keeps all affected debt.
+        if receipt.budget_refused == 0
+            && receipt.written + receipt.clean + receipt.deferred_keys.len() == offered.len()
+        {
+            for digest in retirement_offers {
+                if !receipt.deferred_keys.contains(&digest) {
+                    if let Some(pending) = offered.get(&digest).and_then(|_| {
+                        stores
+                            .retiring
+                            .iter_mut()
+                            .flatten()
+                            .find(|pending| pending.key == digest)
+                    }) {
+                        pending.durable = true;
+                    }
+                }
+            }
+        }
         // Records past the batch limit are offered again after the next save.
         for key in &receipt.deferred_keys {
             if let Some(key) = offered.remove(key) {
@@ -1267,6 +1476,11 @@ impl SharedCache {
         let Some(mut stores) = self.durable() else {
             return Ok(());
         };
+        for pending in &mut stores.retiring {
+            if pending.is_some_and(|pending| pending.source == snapshot_source) {
+                *pending = None;
+            }
+        }
         match stores.slot(source).as_mut() {
             Some(slot) => slot.store.gc(writer, &[0; 32], &BTreeMap::new()),
             None => Ok(()),
@@ -1283,6 +1497,7 @@ impl SharedCache {
         if let Some(mut stores) = self.durable() {
             stores.touched.clear();
             stores.selected.clear();
+            stores.retiring.fill(None);
             stores.counters.write_unlocked += 1;
         }
     }

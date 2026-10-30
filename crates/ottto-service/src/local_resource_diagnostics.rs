@@ -12,7 +12,65 @@ pub(crate) mod claude_contract;
 pub(crate) mod claude_reread;
 pub(crate) mod codex_memo_lifecycle;
 pub(crate) mod codex_side_lifecycle;
+mod footprint;
 pub(crate) mod rearm_cause;
+
+#[cfg(not(test))]
+static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 6] = const { [const { AtomicU64::new(0) }; 6] };
+}
+
+/// Append-only reason labels, cumulative per process (not distinct sessions).
+/// Records each attempted over-cap body before its identities are stripped.
+pub(crate) fn claude_identity_over_cap(
+    reasons: &std::collections::BTreeSet<crate::snapshots::claude_request_identity::OverCap>,
+    item_bytes: usize,
+) {
+    use crate::snapshots::claude_request_identity::OverCap;
+    const LABELS: [&str; 6] = [
+        "evidence_entries",
+        "authority_keys",
+        "parts_per_row",
+        "parts_per_item",
+        "rows",
+        "bytes",
+    ];
+    let record = |counters: &[AtomicU64; 6]| {
+        for reason in reasons {
+            let index = match reason {
+                OverCap::EvidenceEntries => 0,
+                OverCap::AuthorityKeys => 1,
+                OverCap::PartsPerRow => 2,
+                OverCap::PartsPerItem => 3,
+                OverCap::Rows => 4,
+                OverCap::Bytes => 5,
+            };
+            let _ = counters[index].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+        }
+        #[derive(Serialize)]
+        struct Counts {
+            claude_request_identity_over_cap: BTreeMap<&'static str, u64>,
+            claude_request_identity_last_over_cap_item_bytes: usize,
+        }
+        traversal_point(
+            "claude_request_identity_over_cap",
+            "claude_code",
+            &Counts {
+                claude_request_identity_over_cap: LABELS
+                    .into_iter()
+                    .zip(counters.iter().map(|n| n.load(Relaxed)))
+                    .collect(),
+                claude_request_identity_last_over_cap_item_bytes: item_bytes,
+            },
+        );
+    };
+    #[cfg(test)]
+    CLAUDE_IDENTITY_OVER_CAP.with(record);
+    #[cfg(not(test))]
+    record(&CLAUDE_IDENTITY_OVER_CAP);
+}
 
 /// Closed, content-free refusal labels; cumulative process counters on #799.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -63,6 +121,16 @@ pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
             BTreeMap::from([(cause, previous.saturating_add(1))]),
         )]),
     );
+}
+
+/// Counts per observed usage line, before response deduplication and timestamp
+/// drops; rereads count again. Only the lifecycle registry atomics are updated.
+pub(crate) fn pi_cost_observations(refused: u64, rounded: u64) {
+    if refused == 0 && rounded == 0 {
+        return;
+    }
+    cache_lifecycle::add(cache_lifecycle::Event::PiCostRefusedOverflow, refused);
+    cache_lifecycle::add(cache_lifecycle::Event::PiCostPrecisionRounded, rounded);
 }
 
 /// Per-pass observations, not distinct entries/files or a lifetime counter.
@@ -191,6 +259,16 @@ fn line_unselected(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u6
 /// One skip decision, recorded after the gate decided; never a gate input.
 pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
     line_unselected(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
+}
+
+// Same public seam as E3/#876. Its merged withheld carrier can keep this
+// signature; this branch emits the count on the existing diagnostics carrier.
+pub(crate) fn audit_retired_absent(source: &str) {
+    traversal_point(
+        "audit_retired_absent",
+        source,
+        &serde_json::json!({"audit_retired_absent": {"events": 1}}),
+    );
 }
 
 const SCHEMA_VERSION: u8 = 2;
@@ -434,6 +512,12 @@ impl Probe {
             index_reuse_skips: std::cell::Cell::new(0),
         }
     }
+    fn stage_observation(&self, footprint: Option<&footprint::Stage>) -> Observation {
+        let mut observation = self.observation();
+        observation.footprint =
+            footprint.map_or_else(footprint::unavailable, footprint::Stage::finish);
+        observation
+    }
     #[cfg(feature = "replay-harness")]
     pub(crate) fn index_reuse_skip(&self) {
         self.index_reuse_skips
@@ -578,6 +662,8 @@ struct Observation {
     shared_process_cpu_delta_us: Option<u64>,
     process_lifetime_max_rss_bytes: Option<u64>,
     process_lifetime_max_rss_before_bytes: Option<u64>,
+    #[serde(flatten)]
+    footprint: footprint::Observation,
 }
 impl Observation {
     fn between(wall: u64, before: Option<ProcessSample>, after: Option<ProcessSample>) -> Self {
@@ -587,6 +673,7 @@ impl Observation {
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: wall,
+            footprint: Default::default(),
             shared_process_cpu_delta_us: before
                 .zip(after)
                 .and_then(|(before, after)| after.cpu_us.checked_sub(before.cpu_us)),
@@ -599,16 +686,21 @@ impl Observation {
     }
 }
 
-// Final upload candidates compared with their retained accepted bodies on this worker.
-// Drained by the existing finish record; no identifiers reach the log.
-thread_local! {
-    static ACCOUNT_HASH_CHANGED: std::cell::RefCell<std::collections::BTreeSet<String>> =
-        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
-}
-pub(crate) fn account_hash_changed(session_key: &str) {
-    ACCOUNT_HASH_CHANGED.with(|sessions| {
-        sessions.borrow_mut().insert(session_key.to_string());
+/// Local prepare window, including index load/baseline work before page probes.
+/// Return values and errors pass through; unwinding closes sampling silently.
+pub(crate) fn source_prepare<T>(source: &str, inner: impl FnOnce() -> T) -> T {
+    let probe = Probe::start();
+    let footprint = footprint::Stage::begin();
+    let result = inner();
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage: "source_prepare",
+        source: Source::from_slug(source),
+        observation: probe.stage_observation(footprint.as_ref()),
+        counts: BTreeMap::<&str, u64>::new(),
     });
+    result
 }
 
 /// Observe only a normally returned finish; move its value/error through unchanged.
@@ -617,26 +709,16 @@ pub(crate) fn source_finish<T>(
     source: &str,
     inner: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    #[derive(Serialize)]
-    struct Counts {
-        account_hash_changed: u64,
-    }
-    ACCOUNT_HASH_CHANGED.with(|sessions| sessions.borrow_mut().clear());
     let probe = Probe::start();
+    let footprint = footprint::Stage::begin();
     let result = inner();
     emit(&Record {
         schema_version: SCHEMA_VERSION,
         process_id: std::process::id(),
         stage: "source_finish",
         source: Source::from_slug(source),
-        observation: probe.observation(),
-        counts: Counts {
-            account_hash_changed: ACCOUNT_HASH_CHANGED.with(|sessions| {
-                let count = sessions.borrow().len() as u64;
-                sessions.borrow_mut().clear();
-                count
-            }),
-        },
+        observation: probe.stage_observation(footprint.as_ref()),
+        counts: EmptyCounts {},
     });
     result
 }
@@ -667,6 +749,7 @@ pub(crate) fn codex_census_fence(
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: 0,
+            footprint: Default::default(),
             shared_process_cpu_delta_us: None,
             process_lifetime_max_rss_bytes: None,
             process_lifetime_max_rss_before_bytes: None,
@@ -678,6 +761,9 @@ pub(crate) fn codex_census_fence(
         },
     });
 }
+
+#[derive(Serialize)]
+struct EmptyCounts {}
 
 /// Fixed-schema traversal decisions only; no CPU/RSS sample or wire event.
 pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {
@@ -806,6 +892,97 @@ pub(crate) fn claude_reemission_family_closure_root_absent_excluded(members: u64
         },
     );
 }
+static CENSUS_RETIRE_KEPT_OVERLAP_TOTAL: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// One `claude_census_retire_kept_overlap` row (E7 stopgap): a complete
+/// terminal's kept records, their hashes and those retired because the
+/// census was above 90% occupancy, with the terminal's census-full tombstone
+/// count; or the records an insert retired so it fits (admission overflow,
+/// no terminal count); or a new key refused at the live record bound.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CensusRetireKeptOverlapCounts {
+    pub(crate) records: u64,
+    pub(crate) hashes: u64,
+    pub(crate) overflow_occupancy: u64,
+    pub(crate) overflow_admission: u64,
+    /// New keys refused at the live census record bound.
+    pub(crate) record_limit_refused: u64,
+    /// The terminal's shadow `missing_over_budget`; None on admission rows.
+    pub(crate) missing_over_budget: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct CensusRetireKeptOverlap {
+    census_retire_kept_overlap_records: u64,
+    census_retire_kept_overlap_hashes: u64,
+    census_retire_kept_overflow: u64,
+    census_retire_kept_overflow_occupancy: u64,
+    census_retire_kept_overflow_admission: u64,
+    census_record_limit_refused: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    census_missing_over_budget: Option<u64>,
+    census_retire_kept_overlap_records_total: u64,
+    census_retire_kept_overlap_hashes_total: u64,
+    census_retire_kept_overflow_total: u64,
+    census_retire_kept_overflow_occupancy_total: u64,
+    census_retire_kept_overflow_admission_total: u64,
+    census_record_limit_refused_total: u64,
+}
+
+/// Local counter (E7 stopgap): aged Claude transcript census records kept
+/// because they share a request id with another unretired record, and those
+/// retired anyway: above 90% census occupancy at a terminal, or so an insert
+/// fits. `census_retire_kept_overflow` counts both reasons, `_occupancy`
+/// and `_admission` each one. `census_record_limit_refused` counts new keys
+/// refused at the live record bound. The row's counts and saturating process totals; a positive
+/// overflow or refusal (each loses money proof) also emits
+/// `claude_census_retire_kept_overlap_alarm`. Counts only; no path, id or
+/// wire event.
+pub(crate) fn claude_census_retire_kept_overlap(counts: CensusRetireKeptOverlapCounts) {
+    let add = |slot: usize, count: u64| {
+        CENSUS_RETIRE_KEPT_OVERLAP_TOTAL[slot]
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |total| Some(total.saturating_add(count)),
+            )
+            .unwrap_or(u64::MAX)
+            .saturating_add(count)
+    };
+    let overflow = counts
+        .overflow_occupancy
+        .saturating_add(counts.overflow_admission);
+    let row = CensusRetireKeptOverlap {
+        census_retire_kept_overlap_records: counts.records,
+        census_retire_kept_overlap_hashes: counts.hashes,
+        census_retire_kept_overflow: overflow,
+        census_retire_kept_overflow_occupancy: counts.overflow_occupancy,
+        census_retire_kept_overflow_admission: counts.overflow_admission,
+        census_record_limit_refused: counts.record_limit_refused,
+        census_missing_over_budget: counts.missing_over_budget,
+        census_retire_kept_overlap_records_total: add(0, counts.records),
+        census_retire_kept_overlap_hashes_total: add(1, counts.hashes),
+        census_retire_kept_overflow_total: add(2, overflow),
+        census_retire_kept_overflow_occupancy_total: add(3, counts.overflow_occupancy),
+        census_retire_kept_overflow_admission_total: add(4, counts.overflow_admission),
+        census_record_limit_refused_total: add(5, counts.record_limit_refused),
+    };
+    traversal_point("claude_census_retire_kept_overlap", "claude_code", &row);
+    if overflow > 0 || counts.record_limit_refused > 0 {
+        traversal_point(
+            "claude_census_retire_kept_overlap_alarm",
+            "claude_code",
+            &row,
+        );
+    }
+}
 /// Local alarm: the one-time Claude history re-read latched its stop until
 /// the daemon restarts (SOURCE Amendment 10), once when it sets and at most
 /// hourly as a reminder. Counts and hashed root refs only; no wire event.
@@ -849,6 +1026,7 @@ pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl S
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: 0,
+            footprint: Default::default(),
             shared_process_cpu_delta_us: None,
             process_lifetime_max_rss_bytes: None,
             process_lifetime_max_rss_before_bytes: None,
@@ -1229,6 +1407,7 @@ pub(crate) fn sampled_audit_comparison(
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: 0,
+            footprint: Default::default(),
             shared_process_cpu_delta_us: None,
             process_lifetime_max_rss_bytes: None,
             process_lifetime_max_rss_before_bytes: None,
@@ -1254,6 +1433,8 @@ pub(crate) struct PageEvents {
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct IndexState {
+    pub(crate) audit_quiet_retired: usize,
+    pub(crate) audit_cap_full: usize,
     pub(crate) pending_audits: usize,
     pub(crate) overdue_audits: usize,
     pub(crate) oldest_due_age_seconds: u64,
@@ -1675,6 +1856,8 @@ mod tests {
                 max_completion_overdue_seconds: u64::MAX,
             },
             index_state_at_page_end: IndexState {
+                audit_quiet_retired: usize::MAX,
+                audit_cap_full: usize::MAX,
                 pending_audits: usize::MAX,
                 overdue_audits: usize::MAX,
                 oldest_due_age_seconds: u64::MAX,
@@ -1730,10 +1913,7 @@ mod tests {
         assert_eq!(record["schema_version"], SCHEMA_VERSION);
         assert_eq!(record["stage"], "source_finish");
         assert_eq!(record["source"], source);
-        assert_eq!(
-            record["counts"],
-            serde_json::json!({"account_hash_changed": 0})
-        );
+        assert_eq!(record["counts"], serde_json::json!({}));
         assert!(record.get("result").is_none());
         println!("RESOURCE_V2_FINISH_FIXTURE {record}");
     }
@@ -1914,6 +2094,50 @@ mod tests {
         println!("CENSUS_FENCE_OVERHEAD iterations={ITERATIONS} elapsed_us={} peak_bytes={} allocations={} live_bytes={} includes_encoding_and_existing_stderr=true",
             started.elapsed().as_micros(), stats.requested_peak_with_overlap,
             stats.allocations, stats.requested_live);
+    }
+
+    #[test]
+    fn footprint_fields_are_stage_only_for_all_native_sources() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (result, records) = capture(|| {
+                source_prepare(source, || {
+                    source_finish(source, || Ok::<_, anyhow::Error>(17))
+                })
+            });
+            assert_eq!(result.unwrap(), 17);
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0]["stage"], "source_finish");
+            assert_eq!(records[1]["stage"], "source_prepare");
+            for record in records {
+                assert_eq!(record["source"], source);
+                assert!(record["observation"]["footprint_sample_failures"].is_u64());
+                let row = &record["observation"];
+                if let Some(peak) = row["stage_peak_footprint_bytes"].as_u64() {
+                    for endpoint in ["stage_start_footprint_bytes", "stage_end_footprint_bytes"] {
+                        if let Some(bytes) = row[endpoint].as_u64() {
+                            assert!(peak >= bytes);
+                        }
+                    }
+                    assert!(row["footprint_samples"].as_u64().unwrap() >= 1);
+                }
+            }
+        }
+        let (_, records) = capture(|| {
+            drop(UploadCall::start("codex"));
+            traversal_point("synthetic", "pi", &BTreeMap::<&str, u64>::new());
+        });
+        let page = serde_json::to_value(Probe::start().observation()).unwrap();
+        for row in records.iter().map(|r| &r["observation"]).chain([&page]) {
+            for field in [
+                "stage_peak_footprint_bytes",
+                "stage_start_footprint_bytes",
+                "stage_end_footprint_bytes",
+                "footprint_samples",
+                "footprint_sample_failures",
+            ] {
+                assert!(row.get(field).is_none());
+            }
+        }
     }
 
     #[test]
@@ -2152,6 +2376,19 @@ mod tests {
     }
 
     #[test]
+    fn pi_cost_observations_update_registry_without_emitting_records() {
+        let (((), counts), rows) = capture(|| {
+            cache_lifecycle::observe(|| {
+                pi_cost_observations(0, 0);
+                pi_cost_observations(2, 3);
+            })
+        });
+        assert_eq!(counts.pi_cost_refused_overflow, 2);
+        assert_eq!(counts.pi_cost_precision_rounded, 3);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
     fn cache_lifecycle_record_is_bounded_and_explicitly_process_global() {
         let (_, records) = capture(|| {
             traversal_point(
@@ -2167,7 +2404,8 @@ mod tests {
         assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        assert!(serde_json::to_string(record).unwrap().len() < 2048);
+        // The two Pi observation fields add 97 bytes at u64::MAX.
+        assert!(serde_json::to_string(record).unwrap().len() < 2304);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);
@@ -2527,4 +2765,115 @@ mod continuation_tests {
             );
         }
     }
+}
+
+/// Fixed low-cardinality storage observations on the existing #799 envelope.
+pub(crate) fn scan_index_storage(
+    source: &'static str,
+    orphans: u64,
+    reserved: u64,
+    unavailable: [[u64; 6]; 3],
+) {
+    #[cfg(test)]
+    SCAN_INDEX_STORAGE_OBSERVATIONS.with(|v| v.borrow_mut().push((orphans, unavailable, reserved)));
+
+    static TOTAL_ORPHANS: AtomicU64 = AtomicU64::new(0);
+    static ROOT_MISSING_RESERVED_ONLY: AtomicU64 = AtomicU64::new(0);
+    static UNAVAILABLE: [[AtomicU64; 6]; 3] = [const { [const { AtomicU64::new(0) }; 6] }; 3];
+    let add = |counter: &AtomicU64, n: u64| {
+        counter
+            .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(n)))
+            .unwrap_or_else(|v| v)
+            .saturating_add(n)
+    };
+    let reserved_total = add(&ROOT_MISSING_RESERVED_ONLY, reserved);
+    if reserved != 0 {
+        traversal_point(
+            "scan_index_storage",
+            source,
+            &BTreeMap::from([("root_missing_reserved_only", reserved_total)]),
+        );
+    }
+    let total = add(&TOTAL_ORPHANS, orphans);
+    for (map, counts) in unavailable.into_iter().enumerate() {
+        for (cause, n) in counts.into_iter().enumerate() {
+            let count = add(&UNAVAILABLE[map][cause], n);
+            if n != 0 {
+                traversal_point(
+                    "scan_index_storage",
+                    source,
+                    &serde_json::json!({"index_shard_unavailable": {"map": (["account_pending", "usage_pending", "request_census"][map]), "cause": ([crate::snapshots::scan_index_persistence::UnavailableCause::Missing, crate::snapshots::scan_index_persistence::UnavailableCause::Generation, crate::snapshots::scan_index_persistence::UnavailableCause::Digest, crate::snapshots::scan_index_persistence::UnavailableCause::Decode, crate::snapshots::scan_index_persistence::UnavailableCause::Descriptor, crate::snapshots::scan_index_persistence::UnavailableCause::Unsafe][cause].label()), "count": count}}),
+                );
+            }
+        }
+    }
+    if orphans != 0 {
+        traversal_point(
+            "scan_index_storage",
+            source,
+            &BTreeMap::from([("scanindex_orphan_init_discarded", total)]),
+        );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCAN_INDEX_STORAGE_OBSERVATIONS: std::cell::RefCell<Vec<StorageReadObservation>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(test)]
+pub(crate) fn take_scan_index_storage_observations() -> Vec<StorageReadObservation> {
+    SCAN_INDEX_STORAGE_OBSERVATIONS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+#[cfg(test)]
+type StorageReadObservation = (u64, [[u64; 6]; 3], u64);
+
+/// One content-free alarm on entry to a shard-unavailable source episode.
+pub(crate) fn scan_index_shard_alarm(source: &'static str, unavailable: usize, transitions: u64) {
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "index_shard_unavailable_alarm": 1,
+            "unavailable_maps": unavailable,
+            "blocked_sources": 1,
+            "transitions": transitions,
+        }),
+    );
+}
+pub(crate) fn scan_index_manifest_refused(source: &'static str) {
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    let count = TOTAL
+        .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
+        .unwrap_or_else(|v| v)
+        .saturating_add(1);
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "scanindex_manifest_unavailable_refused": count,
+        }),
+    );
+}
+
+/// Per-refused-load counter, independent of the repair blocker's episode alarm.
+/// Only fixed causes and numeric counts; never include the originating error.
+pub(crate) fn scan_index_repair_required(
+    source: &str,
+    cause: crate::snapshots::scan_index_health::RepairCause,
+) {
+    static TOTALS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    let count = TOTALS[cause as usize]
+        .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
+        .unwrap_or_else(|v| v)
+        .saturating_add(1);
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "scan_index_repair_required": {
+                "cause": cause.label(), "delta": 1, "count": count,
+            },
+        }),
+    );
 }

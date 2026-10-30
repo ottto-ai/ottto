@@ -14,6 +14,10 @@ on:
     - cron: "30 2 * * *"
   workflow_dispatch:
     inputs:
+      rust_test_filter:
+        description: Partial pre-check only (never merge evidence); Rust test path substring, empty runs the full suite
+        type: string
+        default: ""
       money_equivalence:
         description: Compare emitted retained Tail/Unchanged money with cold Full (synthetic inputs)
         type: boolean
@@ -52,7 +56,7 @@ on:
         default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.money_equivalence && '-money-equivalence' || '' }}${{ inputs.scan_stack_margin && '-scan-stack-margin' || '' }}${{ github.event_name == 'schedule' && '-cache-refresh' || '' }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.money_equivalence && '-money-equivalence' || '' }}${{ inputs.scan_stack_margin && '-scan-stack-margin' || '' }}${{ github.event_name == 'schedule' && '-cache-refresh' || '' }}${{ github.event_name == 'workflow_dispatch' && inputs.rust_test_filter != '' && !(inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin) && '-rust-filter' || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -60,6 +64,8 @@ permissions:
 
 jobs:
   rust:
+    # Keep this literal: skipped jobs can expose an unevaluated name expression.
+    # Partial dispatches run in the separate, explicitly named job below.
     name: Rust contracts
     # macOS runs only in the merge queue, on dispatch and on the daily main
     # cache-refresh schedule: GitHub Free allows five hosted Macs org-wide.
@@ -69,21 +75,36 @@ jobs:
     # the queue. Rollback: revert step 3 (Mac on PRs) FIRST, then the queue
     # rule; never leave the PR skip without the queue. Step 4 (this main-push
     # skip) can be reverted on its own at any time.
-    if: ${{ github.event_name != 'pull_request' && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin)) }}
+    if: ${{ github.event_name != 'pull_request' && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin || inputs.rust_test_filter != '')) }}
     # Main's own queue run takes about 38 min (runs 40321546891, 40331916601,
     # 40348583388); 40 cancelled #791 (run 40378483829). Headroom, not a target.
     timeout-minutes: 55
     runs-on: macos-15
-    env:
+    env: &rust-contract-env
       RUSTUP_TOOLCHAIN: "1.95.0"
       OTTTO_REQUIRE_LAYOUT: "1"
       # Job-level so "Runtime tests" and "Layout coverage receipt" share one build.
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
-    steps:
+      # Dispatch-only; the special-purpose dispatch jobs keep their precedence.
+      # Queue/schedule runs always execute the original full commands below.
+      OTTTO_CI_TEST_FILTER: ${{ github.event_name == 'workflow_dispatch' && inputs.rust_test_filter || '' }}
+    steps: &rust-contract-steps
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      - name: Identify partial pre-check
+        if: env.OTTTO_CI_TEST_FILTER != ''
+        run: |
+          set -euo pipefail
+          # A single Rust path substring, never shell code or test-runner flags.
+          if [[ ! "$OTTTO_CI_TEST_FILTER" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_:]*$ ]]; then
+            echo "::error::rust_test_filter must contain only Rust path characters (letters, digits, underscores, colons)"
+            exit 1
+          fi
+          echo "::warning::Partial Rust pre-check only; a full merge-queue run is still required"
+          printf '### Partial Rust pre-check\n\nFilter: %s\n\nOnly matching non-ignored tests run. Layout and peak-memory receipts are omitted. This is not merge evidence; the full merge-queue run is still required.\n' "$OTTTO_CI_TEST_FILTER" >> "$GITHUB_STEP_SUMMARY"
 
       # Keep layout-sensitive tests on the compiler validated by the runtime.
       - name: Install validated Rust toolchain
@@ -96,10 +117,12 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          # Same prefix as the existing "rust" job; partial pre-checks restore it.
+          shared-key: rust
           workspaces: |
             . -> target
             crates -> target
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && env.OTTTO_CI_TEST_FILTER == '' }}
           cache-bin: "false"
 
       - name: Compiler receipt
@@ -123,12 +146,31 @@ jobs:
         run: cargo clippy --manifest-path crates/Cargo.toml --workspace --all-targets --locked -- -D warnings
 
       - name: Runtime tests
+        if: env.OTTTO_CI_TEST_FILTER == ''
         # Print a failing assertion when it happens, not only after the suite.
         # Four threads on the 3-core runner: many tests wait on I/O or #[serial].
         # Six exposed shared-state races (control.rs notes some fail above 4).
-        run: cargo test --workspace --locked -- --nocapture --test-threads=4
+        # Branch Mac runs (dispatch) keep going past a failing test binary so
+        # scripts/mac_batch.py can map every failure to a PR; merge_group and
+        # schedule runs still stop at the first failing binary.
+        run: cargo test --workspace --locked ${{ github.event_name == 'workflow_dispatch' && '--no-fail-fast' || '' }} -- --nocapture --test-threads=4
+
+      - name: Filtered Rust tests (partial pre-check)
+        if: env.OTTTO_CI_TEST_FILTER != ''
+        run: |
+          set -euo pipefail
+          # A name filter saves execution time, not compilation: both workspaces
+          # still build their test binaries. Pass one quoted positional argument.
+          # Dispatch-only job: keep going past a failing test binary, as in
+          # "Runtime tests", so every failure is listed.
+          cargo test --workspace --locked ${{ github.event_name == 'workflow_dispatch' && '--no-fail-fast' || '' }} "$OTTTO_CI_TEST_FILTER" -- --nocapture --test-threads=4 2>&1 | tee "$RUNNER_TEMP/filtered-rust-tests.log"
+          cargo test --manifest-path crates/Cargo.toml --workspace --locked ${{ github.event_name == 'workflow_dispatch' && '--no-fail-fast' || '' }} "$OTTTO_CI_TEST_FILTER" -- --nocapture --test-threads=4 2>&1 | tee -a "$RUNNER_TEMP/filtered-rust-tests.log"
+          # Cargo succeeds when nothing matches. A typo or ignored-only filter
+          # must fail this pre-check, including when the other workspace is empty.
+          grep -E '^test result: ok\. [1-9][0-9]* passed;' "$RUNNER_TEMP/filtered-rust-tests.log"
 
       - name: Layout coverage receipt
+        if: env.OTTTO_CI_TEST_FILTER == ''
         run: |
           set -euo pipefail
           cargo test -p ottto-service --lib --locked heap_layout_bound::sampled_scalar_buffer_tests::layout_gate_coverage_receipt -- --exact --nocapture | tee "$RUNNER_TEMP/layout-coverage-receipt.log"
@@ -136,6 +178,7 @@ jobs:
           grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/layout-coverage-receipt.log"
 
       - name: Synthetic Codex counting peak memory
+        if: env.OTTTO_CI_TEST_FILTER == ''
         timeout-minutes: 15
         run: |
           set -euo pipefail
@@ -144,10 +187,21 @@ jobs:
           test "$(grep -c '^codex_v2_rss_receipt: ' "$RUNNER_TEMP/codex-rss-receipt.log")" -eq 2
 
       - name: Connector tests
+        if: env.OTTTO_CI_TEST_FILTER == ''
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked
 
       - name: Connector package tests
+        if: env.OTTTO_CI_TEST_FILTER == ''
         run: cargo test --manifest-path crates/Cargo.toml --locked -p ottto-connector-testkit --test first_party_sources
+
+  rust-partial:
+    # Separate static names also preserve the full check when either job skips.
+    name: Rust contracts (partial pre-check)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.rust_test_filter != '' && !(inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin) }}
+    timeout-minutes: 55
+    runs-on: macos-15
+    env: *rust-contract-env
+    steps: *rust-contract-steps
 
   public-surface:
     if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin)) }}
