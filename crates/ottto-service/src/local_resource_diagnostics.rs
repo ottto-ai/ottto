@@ -12,6 +12,7 @@ pub(crate) mod claude_contract;
 pub(crate) mod claude_reread;
 pub(crate) mod codex_memo_lifecycle;
 pub(crate) mod codex_side_lifecycle;
+mod footprint;
 pub(crate) mod rearm_cause;
 
 /// Closed, content-free refusal labels; cumulative process counters on #799.
@@ -444,6 +445,12 @@ impl Probe {
             index_reuse_skips: std::cell::Cell::new(0),
         }
     }
+    fn stage_observation(&self, footprint: Option<&footprint::Stage>) -> Observation {
+        let mut observation = self.observation();
+        observation.footprint =
+            footprint.map_or_else(footprint::unavailable, footprint::Stage::finish);
+        observation
+    }
     #[cfg(feature = "replay-harness")]
     pub(crate) fn index_reuse_skip(&self) {
         self.index_reuse_skips
@@ -588,6 +595,8 @@ struct Observation {
     shared_process_cpu_delta_us: Option<u64>,
     process_lifetime_max_rss_bytes: Option<u64>,
     process_lifetime_max_rss_before_bytes: Option<u64>,
+    #[serde(flatten)]
+    footprint: footprint::Observation,
 }
 impl Observation {
     fn between(wall: u64, before: Option<ProcessSample>, after: Option<ProcessSample>) -> Self {
@@ -597,6 +606,7 @@ impl Observation {
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: wall,
+            footprint: Default::default(),
             shared_process_cpu_delta_us: before
                 .zip(after)
                 .and_then(|(before, after)| after.cpu_us.checked_sub(before.cpu_us)),
@@ -621,6 +631,23 @@ pub(crate) fn account_hash_changed(session_key: &str) {
     });
 }
 
+/// Local prepare window, including index load/baseline work before page probes.
+/// Return values and errors pass through; unwinding closes sampling silently.
+pub(crate) fn source_prepare<T>(source: &str, inner: impl FnOnce() -> T) -> T {
+    let probe = Probe::start();
+    let footprint = footprint::Stage::begin();
+    let result = inner();
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage: "source_prepare",
+        source: Source::from_slug(source),
+        observation: probe.stage_observation(footprint.as_ref()),
+        counts: BTreeMap::<&str, u64>::new(),
+    });
+    result
+}
+
 /// Observe only a normally returned finish; move its value/error through unchanged.
 /// A panic drops the probe silently. Outcome reporting remains with the caller.
 pub(crate) fn source_finish<T>(
@@ -633,13 +660,14 @@ pub(crate) fn source_finish<T>(
     }
     ACCOUNT_HASH_CHANGED.with(|sessions| sessions.borrow_mut().clear());
     let probe = Probe::start();
+    let footprint = footprint::Stage::begin();
     let result = inner();
     emit(&Record {
         schema_version: SCHEMA_VERSION,
         process_id: std::process::id(),
         stage: "source_finish",
         source: Source::from_slug(source),
-        observation: probe.observation(),
+        observation: probe.stage_observation(footprint.as_ref()),
         counts: Counts {
             account_hash_changed: ACCOUNT_HASH_CHANGED.with(|sessions| {
                 let count = sessions.borrow().len() as u64;
@@ -677,6 +705,7 @@ pub(crate) fn codex_census_fence(
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: 0,
+            footprint: Default::default(),
             shared_process_cpu_delta_us: None,
             process_lifetime_max_rss_bytes: None,
             process_lifetime_max_rss_before_bytes: None,
@@ -859,6 +888,7 @@ pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl S
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: 0,
+            footprint: Default::default(),
             shared_process_cpu_delta_us: None,
             process_lifetime_max_rss_bytes: None,
             process_lifetime_max_rss_before_bytes: None,
@@ -1239,6 +1269,7 @@ pub(crate) fn sampled_audit_comparison(
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: 0,
+            footprint: Default::default(),
             shared_process_cpu_delta_us: None,
             process_lifetime_max_rss_bytes: None,
             process_lifetime_max_rss_before_bytes: None,
@@ -1928,6 +1959,50 @@ mod tests {
         println!("CENSUS_FENCE_OVERHEAD iterations={ITERATIONS} elapsed_us={} peak_bytes={} allocations={} live_bytes={} includes_encoding_and_existing_stderr=true",
             started.elapsed().as_micros(), stats.requested_peak_with_overlap,
             stats.allocations, stats.requested_live);
+    }
+
+    #[test]
+    fn footprint_fields_are_stage_only_for_all_native_sources() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (result, records) = capture(|| {
+                source_prepare(source, || {
+                    source_finish(source, || Ok::<_, anyhow::Error>(17))
+                })
+            });
+            assert_eq!(result.unwrap(), 17);
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0]["stage"], "source_finish");
+            assert_eq!(records[1]["stage"], "source_prepare");
+            for record in records {
+                assert_eq!(record["source"], source);
+                assert!(record["observation"]["footprint_sample_failures"].is_u64());
+                let row = &record["observation"];
+                if let Some(peak) = row["stage_peak_footprint_bytes"].as_u64() {
+                    for endpoint in ["stage_start_footprint_bytes", "stage_end_footprint_bytes"] {
+                        if let Some(bytes) = row[endpoint].as_u64() {
+                            assert!(peak >= bytes);
+                        }
+                    }
+                    assert!(row["footprint_samples"].as_u64().unwrap() >= 1);
+                }
+            }
+        }
+        let (_, records) = capture(|| {
+            drop(UploadCall::start("codex"));
+            traversal_point("synthetic", "pi", &BTreeMap::<&str, u64>::new());
+        });
+        let page = serde_json::to_value(Probe::start().observation()).unwrap();
+        for row in records.iter().map(|r| &r["observation"]).chain([&page]) {
+            for field in [
+                "stage_peak_footprint_bytes",
+                "stage_start_footprint_bytes",
+                "stage_end_footprint_bytes",
+                "footprint_samples",
+                "footprint_sample_failures",
+            ] {
+                assert!(row.get(field).is_none());
+            }
+        }
     }
 
     #[test]

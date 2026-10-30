@@ -229,18 +229,36 @@ lifetime memory high-water mark, not a collection/cycle peak or current RSS.
 `process_lifetime_max_rss_before_bytes` preserves the start sample when both
 samples are available and non-regressing; otherwise it is `null`. A rise
 correlates only with a process-wide time window, not allocation ownership.
-Unavailable measurements and regressing CPU deltas are `null`. Unix observation
-time and process id support comparison with an independently measured matching
-process. Never subtract or sum overlapping windows or infer per-stage memory
-use: the finish window contains its batch-call windows.
+`source_prepare` wraps synchronous source preparation (including index load
+and baseline construction); it emits an empty counts object on normal return,
+including errors or no-frame returns. Like `source_finish`, it emits no record
+on panic. Both stages, for Claude Code, Codex and Pi, include
+`stage_peak_footprint_bytes`, `stage_start_footprint_bytes`,
+`stage_end_footprint_bytes` and `footprint_samples` when available. One shared
+background thread samples current process footprint every 50 ms while stages
+are open and parks when idle. Start and end reads also contribute to the peak
+and successful sample count. macOS uses `TASK_VM_INFO.phys_footprint`, falling
+back to resident size; Linux uses resident pages from `/proc/self/statm`.
+These are sampled process-wide peaks during a stage, including concurrent work;
+shorter spikes can be missed. They do not establish allocation ownership.
+Up to 16 overlapping stages have independent bounded counters; overflow or
+thread-start failure leaves the measurements absent. `footprint_sample_failures`
+counts unavailable reads (or one refused sampler/slot attempt). Failed endpoints
+and wholly unavailable measurements are absent, as are all footprint fields
+on unsampled stages. Other unavailable measurements and regressing CPU deltas
+are `null`. Unix observation time and process id support comparison with an
+independently measured matching process. Never subtract or sum overlapping
+windows or infer allocation ownership: the finish window contains its batch-call
+windows.
 
 There is one bounded observation per completed page, batch call and normally
-returned finish, with two OS resource samples per observation, no per-row
-sampling, extra transcript reads or new diagnostic store. Version 2 adds one
-record per finish and removes one text line per sampled page; total log writes
-are not unchanged. Output is a synchronous best-effort write on the calling
-thread under std's stderr lock; errors are ignored, with no retry, queue or
-thread. It may block for the duration of a regular-file write, like existing
+returned prepare or finish, with two CPU/lifetime-RSS samples per observation,
+plus the bounded prepare/finish footprint sampler. There is no per-row sampling,
+extra transcript read or new diagnostic store. Version 2 adds one record per
+finish and removes one text line per sampled page; the footprint gauge adds one
+record per prepare. Output is a synchronous best-effort write on the calling
+thread under std's stderr lock; errors are ignored, with no retry or queue for
+log output. It may block for the duration of a regular-file write, like existing
 service stderr lines. Log output uses existing service retention and may be
 unavailable; diagnostic write errors do not fail collection or upload.
 Status/quota refresh, OTLP reception and independent metadata/discovery work are
