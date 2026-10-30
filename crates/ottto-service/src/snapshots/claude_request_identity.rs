@@ -1442,11 +1442,12 @@ pub(crate) struct CopyInvalidation {
 }
 
 /// SOURCE 2026-10-31 (#944 xPR F5): proof a copied marker lent must not keep
-/// placing. A frozen row whose shares change and include the account a copied
-/// marker lent to that very row (one the copy-prefix switch re-derived
-/// without it) is copy-derived: it is treated as never accepted (fresh own
-/// tags or untagged, never a refusal or marker). Other changed rows keep
-/// #909's refusal, and rows their own evidence still proves are unchanged.
+/// placing. A frozen row whose shares change and are only accounts copied
+/// markers lent to that very row's requests (ones the copy-prefix switch
+/// re-derived without them) is copy-derived: it is treated as never accepted
+/// (fresh own tags or untagged, never a refusal or marker). Other changed
+/// rows keep #909's refusal, and rows their own evidence still proves are
+/// unchanged.
 fn copy_derived_rows(
     item: &SnapshotItem,
     grouping: &Grouping,
@@ -1455,20 +1456,16 @@ fn copy_derived_rows(
     let Some(accepted) = accepted else {
         return Vec::new();
     };
-    type Shares = BTreeSet<Option<[u8; 32]>>;
-    // Per row: the accounts copied markers lent, and those requests' own.
-    let mut lent = BTreeMap::<(i64, RowKey), (Shares, Shares)>::new();
-    for (bucket, row, slot) in super::claude_request_money::e2::copied_marker_lent_rows(item) {
+    let mut lent = BTreeMap::<(i64, RowKey), BTreeSet<Option<[u8; 32]>>>::new();
+    for (bucket, row, key) in super::claude_request_money::e2::copied_marker_lent_rows(item) {
         if let Some(start) = accepted::bucket_key(bucket) {
-            let (lent, own) = lent
-                .entry((start, row_key_from_model_usage(&row)))
-                .or_default();
-            lent.insert(Some(accepted.authority_hash(&slot.lent)));
-            own.insert(slot.own.as_ref().map(|key| accepted.authority_hash(key)));
+            lent.entry((start, row_key_from_model_usage(&row)))
+                .or_default()
+                .insert(Some(accepted.authority_hash(&key)));
         }
     }
     let mut rows = Vec::new();
-    for ((start, row), (lent, own)) in lent {
+    for ((start, row), lent) in lent {
         let group = grouping
             .groups
             .iter()
@@ -1476,9 +1473,10 @@ fn copy_derived_rows(
             .and_then(|(_, rows)| rows.get(&row));
         if group
             .and_then(|group| changed_shares(accepted, start, &row, group))
-            // A freeze of the corrected body holds the lent requests' own
-            // shares; only an earlier freeze holds the lent account alone.
-            .is_some_and(|prior| !prior.is_disjoint(&lent) && prior.is_disjoint(&own))
+            // Only shares copied markers lent to this row's requests. Without
+            // per-ACK provenance, a freeze holding any other share may be a
+            // corrected body's and keeps #909's protection.
+            .is_some_and(|prior| prior.is_subset(&lent))
         {
             rows.push((start, row));
         }
@@ -2602,16 +2600,12 @@ impl OrgMarkers {
 // E2 consumes this compact, native-sequence-ordered placement before any
 // requests aggregate. Marker state is bounded independently of request count.
 pub(crate) type AccountPartition = Option<Arc<AuthorityKey>>;
-/// A counted request's grain slot (live key, origin), the account a copied
-/// marker lent it, and its own final account.
-#[derive(Clone, Debug)]
-pub(crate) struct LentSlot {
-    pub(crate) key: super::claude_request_money::body::ClaudeLiveKey,
-    pub(crate) origin: Option<super::claude_request_money::body::ClaudeRequestUsageOrigin>,
-    pub(crate) lent: Arc<AuthorityKey>,
-    pub(crate) own: AccountPartition,
-}
-crate::heap_layout_bound::fields!(LentSlot; key, origin, lent, own);
+/// A request's grain slot (live key, origin) and the account lent to it.
+pub(crate) type LentSlot = (
+    super::claude_request_money::body::ClaudeLiveKey,
+    Option<super::claude_request_money::body::ClaudeRequestUsageOrigin>,
+    Arc<AuthorityKey>,
+);
 
 #[derive(Clone, Debug)]
 struct AccountRun {
@@ -2641,8 +2635,8 @@ pub(crate) struct RequestAccounts {
     root_fallback_pending: bool,
     /// Copy-prefix switch on: per counted request whose account a copied
     /// marker had lent (the copy decision re-derived it without the marker),
-    /// its grain slot and own account, both kept current through final
-    /// placement, and that lent account (see `copy_derived_rows`).
+    /// its grain slot, kept current through telemetry placement, and that
+    /// account (see `copy_derived_rows`).
     pub(crate) copied_marker_lent: BTreeMap<u64, LentSlot>,
 }
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
@@ -3176,16 +3170,13 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
                 account
             };
             occurrence.e2_inherited = account.as_ref().map(|_| accounts.inherited > before);
-            // A loan follows the request's final account; own evidence for
-            // the lent account itself ends it.
-            if let std::collections::btree_map::Entry::Occupied(mut lent) =
-                accounts.copied_marker_lent.entry(sequence)
+            // Own evidence for the lent account itself ends the loan.
+            if accounts
+                .copied_marker_lent
+                .get(&sequence)
+                .is_some_and(|lent| account.as_ref() == Some(&lent.2))
             {
-                if account.as_ref() == Some(&lent.get().lent) {
-                    lent.remove();
-                } else {
-                    lent.get_mut().own = account.clone();
-                }
+                accounts.copied_marker_lent.remove(&sequence);
             }
             place_request_identity(
                 &mut fold,

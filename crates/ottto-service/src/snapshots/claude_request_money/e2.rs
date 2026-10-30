@@ -11,7 +11,7 @@ use super::super::claude_history_upgrade::{
 use super::super::claude_money_birth_store::{location_key, LocationKey};
 use super::super::claude_request_census::claude_request_hash;
 use super::super::claude_request_identity::{
-    self, AcceptedBuckets, AccountPartition, LentSlot, RequestAccounts,
+    self, AcceptedBuckets, AccountPartition, AuthorityKey, RequestAccounts,
 };
 use super::super::{
     claude_api_cache_creation, claude_api_matches_transcript_occurrence,
@@ -2319,13 +2319,7 @@ fn finish_holder_identity(item: &mut SnapshotItem) {
                 if own.account(o.sequence).as_ref() == Some(&lent) {
                     return None;
                 }
-                let slot = LentSlot {
-                    key: fold.occurrence_key(o)?,
-                    origin: None,
-                    lent,
-                    own: own.account(o.sequence),
-                };
-                Some((o.sequence, slot))
+                Some((o.sequence, (fold.occurrence_key(o)?, None, lent)))
             })
             .collect();
         own.copied_marker_lent = lent;
@@ -3203,7 +3197,7 @@ fn attach_one(
         .as_mut()
         .and_then(|accounts| accounts.copied_marker_lent.get_mut(&occurrence.sequence))
     {
-        (lent.key, lent.origin) = (reported.0.clone(), reported.1);
+        (lent.0, lent.1) = (reported.0.clone(), reported.1);
     }
     if let Some(cost) = row.cost_usd_micros {
         if fold.resumed_prefix && fold.unproven_copy(occurrence) {
@@ -4246,7 +4240,7 @@ fn record_decided(held: bool, counts: Counts) {
 /// (bucket start, row, lent account).
 pub(crate) fn copied_marker_lent_rows(
     item: &SnapshotItem,
-) -> Vec<(&str, super::super::SnapshotModelUsage, &LentSlot)> {
+) -> Vec<(&str, super::super::SnapshotModelUsage, Arc<AuthorityKey>)> {
     let Some(accounts) = item
         .claude_money
         .as_deref()
@@ -4258,9 +4252,9 @@ pub(crate) fn copied_marker_lent_rows(
     accounts
         .copied_marker_lent
         .values()
-        .map(|slot| {
-            let row = super::emit::grain_row(&slot.key, slot.origin, &Default::default(), None);
-            (slot.key.0.as_str(), row, slot)
+        .map(|(key, origin, account)| {
+            let row = super::emit::grain_row(key, *origin, &Default::default(), None);
+            (key.0.as_str(), row, account.clone())
         })
         .collect()
 }
