@@ -626,9 +626,25 @@ fn phase1_withheld_full_needs_real_growth_and_is_paced_per_key() {
     assert!(!known.index.usage_guard_admit_withheld_full(&grown));
 }
 
-/// An owned start of an unrelated family beside an Unknown-held stale family.
-/// With `overlap`, the held family's old-window proof shares its request key.
-fn owned_start_beside_held_family(overlap: bool) -> Option<&'static str> {
+/// How the owned-start family relates to the held family, and how complete
+/// the held family's coverage is.
+#[derive(Clone, Copy, Default)]
+struct Beside {
+    /// The held family's old-window proof shares the owned request key.
+    overlap: bool,
+    /// The held family has an indexed sibling absent from its pending.
+    unread_sibling: bool,
+    /// A read of the held family's root file was refused (paced or blocked).
+    refused_read: bool,
+    /// The owned-start session is also a member of the held family.
+    shares_member: bool,
+    /// E2's copy proof names the held family's root file as its original.
+    fork_child: bool,
+}
+
+/// An owned start of a family beside an Unknown-held stale family. Returns
+/// its posture admission and the unread-scope veto count.
+fn owned_start_beside(beside: Beside) -> (Option<&'static str>, u64) {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let path = temp_file("claude-held-unrelated-owned-start");
     let source_session_id = path
@@ -670,7 +686,7 @@ fn owned_start_beside_held_family(overlap: bool) -> Option<&'static str> {
     );
     // An unrelated Unknown-held family: stale pending, no witness, indexed.
     let held = CARRY_ROOT;
-    let hash = if overlap {
+    let hash = if beside.overlap {
         format!("{:x}", Sha256::digest(b"req_owned"))
     } else {
         "a".repeat(64)
@@ -678,6 +694,12 @@ fn owned_start_beside_held_family(overlap: bool) -> Option<&'static str> {
     index
         .files
         .insert(carry_key(held, None), manifest_index_entry(Some("held")));
+    if beside.unread_sibling {
+        index.files.insert(
+            carry_key(held, Some(CARRY_AGENT)),
+            manifest_index_entry(Some("held-sibling")),
+        );
+    }
     index.claude_usage_family_pending.insert(
         held.into(),
         ClaudeUsageFamilyPending {
@@ -695,8 +717,34 @@ fn owned_start_beside_held_family(overlap: bool) -> Option<&'static str> {
             idless_revision: None,
         },
     );
+    if beside.shares_member {
+        index
+            .claude_usage_family_pending
+            .get_mut(held)
+            .unwrap()
+            .member_request_id_hashes
+            .insert(source_session_id.clone(), BTreeSet::new());
+    }
+    if beside.fork_child {
+        items[0]
+            .claude_money
+            .get_or_insert_with(|| {
+                Box::new(claude_request_money::e2::FileFold::new(
+                    Default::default(),
+                    None,
+                    Default::default(),
+                    None,
+                ))
+            })
+            .set_fork_parent_for_test(carry_key(held, None));
+    }
+    if beside.refused_read {
+        index.refresh_usage_guard_holds_at(Some("2026-08-20T11:02:00Z"));
+        index.usage_guard_full_blocked(Path::new(&carry_key(held, None)));
+    }
     let before = index.claude_usage_family_pending[held].clone();
-    let disposition = apply_claude_reported_usage_with_index(
+    let (disposition, rows) = crate::local_resource_diagnostics::capture(|| {
+        apply_claude_reported_usage_with_index(
         &mut items,
         &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
             evidence: BTreeMap::from([(source_session_id.clone(), vec![api])]),
@@ -709,8 +757,9 @@ fn owned_start_beside_held_family(overlap: bool) -> Option<&'static str> {
         &mut index,
         true,
         "2026-08-20T11:02:00Z",
-    );
-    assert_eq!(index.usage_guard_reason(held), Some(Unknown::MissingWitness));
+        )
+    });
+    assert!(index.usage_guard_reason(held).is_some());
     assert_eq!(
         items[0].usage_accounting_contract.as_deref(),
         Some("session_exclusive_reported_usage:v1")
@@ -718,21 +767,97 @@ fn owned_start_beside_held_family(overlap: bool) -> Option<&'static str> {
     // The held family keeps its scoped, byte-identical proof through the terminal.
     assert_eq!(index.claude_usage_family_pending[held], before);
     let admission = disposition.posture_admission(&items[0].source_session_id);
+    let vetoes = rows
+        .iter()
+        .filter_map(|row| row["counts"]["held_unread_scope_veto_families"].as_u64())
+        .sum();
     let _ = fs::remove_file(path);
-    admission
+    (admission, vetoes)
 }
 
 #[test]
 fn phase1_held_stale_family_does_not_block_an_unrelated_owned_start() {
     // Lead B 4c: the hold is scoped; an unrelated owned start stays strict.
-    assert_eq!(owned_start_beside_held_family(false), Some("strict"));
+    assert_eq!(owned_start_beside(Beside::default()), (Some("strict"), 0));
 }
 
 #[test]
 fn phase1_held_stale_family_still_vetoes_a_family_sharing_its_request() {
     // Its request keys left duplicate detection with the census veto, so
     // they veto an overlapping family's strict posture directly.
-    assert_ne!(owned_start_beside_held_family(true), Some("strict"));
+    let (admission, _) = owned_start_beside(Beside {
+        overlap: true,
+        ..Beside::default()
+    });
+    assert_ne!(admission, Some("strict"));
+}
+
+#[test]
+fn unread_scope_held_family_with_unread_sibling_vetoes_a_same_root_family() {
+    // (a) Coverage incomplete: a family sharing the held family's root or a
+    // member file cannot be proven duplicate-free by request keys.
+    let (admission, vetoes) = owned_start_beside(Beside {
+        unread_sibling: true,
+        shares_member: true,
+        ..Beside::default()
+    });
+    assert_ne!(admission, Some("strict"));
+    assert_eq!(vetoes, 1);
+}
+
+#[test]
+fn unread_scope_held_family_with_unread_sibling_vetoes_a_cross_root_fork_child() {
+    // (b) E2's copy proof links the owned-start family to the held root.
+    for unread in [
+        Beside {
+            unread_sibling: true,
+            ..Beside::default()
+        },
+        Beside {
+            refused_read: true,
+            ..Beside::default()
+        },
+    ] {
+        let (admission, vetoes) = owned_start_beside(Beside {
+            fork_child: true,
+            ..unread
+        });
+        assert_ne!(admission, Some("strict"));
+        assert_eq!(vetoes, 1);
+    }
+}
+
+#[test]
+fn unread_scope_held_family_with_unread_sibling_leaves_an_unrelated_family() {
+    // (c) No root, member file or lineage edge: unaffected.
+    for unread in [
+        Beside {
+            unread_sibling: true,
+            ..Beside::default()
+        },
+        Beside {
+            refused_read: true,
+            ..Beside::default()
+        },
+    ] {
+        assert_eq!(owned_start_beside(unread), (Some("strict"), 0));
+    }
+}
+
+#[test]
+fn unread_scope_complete_coverage_narrows_back_to_the_request_key_veto() {
+    // Coverage complete: the fork child is vetoed only by a shared request.
+    let fork_child = Beside {
+        fork_child: true,
+        ..Beside::default()
+    };
+    assert_eq!(owned_start_beside(fork_child), (Some("strict"), 0));
+    let (admission, vetoes) = owned_start_beside(Beside {
+        overlap: true,
+        ..fork_child
+    });
+    assert_ne!(admission, Some("strict"));
+    assert_eq!(vetoes, 0);
 }
 
 /// Counts-only inventory comparison entry. Supply one frozen ScanIndex, or a

@@ -177,8 +177,12 @@ pub(super) struct Runtime {
     audited: BTreeSet<String>,
     // The loaded index file this custody belongs to, if any.
     custody: Option<String>,
+    // Held files whose read was refused or paced (index key -> family root):
+    // their unread data keeps the family's coverage incomplete until a read
+    // of that key completes (Lead B unread-scope veto).
+    unread: BTreeMap<String, String>,
 }
-crate::heap_layout_bound::fields!(Runtime; slots, slot_occurrences, paced, withheld, audited, custody);
+crate::heap_layout_bound::fields!(Runtime; slots, slot_occurrences, paced, withheld, audited, custody, unread);
 
 /// The daemon reloads its ScanIndex every sync cycle, so runtime custody
 /// lives for the process, like the RAM checkpoint cache, keyed by index file.
@@ -671,6 +675,7 @@ impl ScanIndex {
         // A family whose pending proof is gone (retired or vanished) has no
         // window left to rejoin; its held growth goes with it.
         let pending = &self.claude_usage_family_pending;
+        runtime.unread.retain(|_, root| pending.contains_key(root));
         if runtime
             .slots
             .values()
@@ -749,6 +754,16 @@ impl ScanIndex {
             return;
         };
         let held = self.usage_guard_holds.holds(member.root);
+        // A completed Tail read the file to its end: its data is read.
+        if self
+            .usage_guard_holds
+            .runtime
+            .unread
+            .remove(&local_index_key(path))
+            .is_some()
+        {
+            stash(&self.usage_guard_holds.runtime);
+        }
         if held {
             crate::local_resource_diagnostics::traversal_point(
                 "claude_usage_held_member_growth",
@@ -773,6 +788,124 @@ impl ScanIndex {
             );
         }
     }
+}
+
+impl ScanIndex {
+    /// A refused or paced read of a held file: the scoped residue below,
+    /// and the file's data stays unread for the unread-scope veto.
+    pub(super) fn usage_guard_full_blocked(&mut self, path: &Path) {
+        full_blocked(path);
+        let Some(member) = claude_index_path_member_ref(path) else {
+            return;
+        };
+        if self.usage_guard_holds.holds(member.root) {
+            let root = member.root.to_owned();
+            let runtime = &mut self.usage_guard_holds.runtime;
+            runtime.unread.insert(local_index_key(path), root);
+            stash(runtime);
+        }
+    }
+}
+
+/// Held families whose coverage is incomplete (Lead B unread-scope veto): a
+/// read of one of their indexed files was refused or paced and has not
+/// completed since, or an indexed, non-empty sibling is absent from both the
+/// retained pending and this window's held growth. A global hold already
+/// vetoes every family, so it adds nothing here.
+pub(super) fn unread_scope(index: &ScanIndex, window: &str) -> BTreeSet<String> {
+    let holds = &index.usage_guard_holds;
+    let mut scope = BTreeSet::new();
+    if holds.global() {
+        return scope;
+    }
+    for (key, root) in &holds.runtime.unread {
+        if holds.holds(root) && index.files.contains_key(key) {
+            scope.insert(root.clone());
+        }
+    }
+    for key in index.files.keys() {
+        let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
+            continue;
+        };
+        if scope.contains(member.root)
+            || !holds.holds(member.root)
+            || index.confirmed_empty_files.contains(key)
+        {
+            continue;
+        }
+        let (root, id) = member.into_owned();
+        let Some(pending) = index.claude_usage_family_pending.get(&root) else {
+            continue;
+        };
+        let covered = pending.membership().contains_key(&id)
+            || holds
+                .runtime
+                .slots
+                .get(&id)
+                .is_some_and(|slot| slot.root == root && slot.window == window);
+        if !covered {
+            scope.insert(root);
+        }
+    }
+    scope
+}
+
+/// Page families an incomplete held family vetoes: (a) those sharing its
+/// root or one of its member files, and (b) those linked to it by a copy or
+/// fork lineage edge E2's copy proof already knows (a `fork-context-ref`
+/// original). Unrelated families are unaffected; once coverage is complete
+/// only the request-key veto remains. Counted, the census untouched.
+pub(super) fn unread_scope_vetoes(
+    index: &ScanIndex,
+    scope: &BTreeSet<String>,
+    items: &[SnapshotItem],
+) -> BTreeSet<String> {
+    let mut vetoed = BTreeSet::new();
+    if scope.is_empty() {
+        return vetoed;
+    }
+    let mut members = BTreeSet::new();
+    for key in index.files.keys() {
+        if let Some(member) = claude_index_path_member_ref(Path::new(key)) {
+            if scope.contains(member.root) {
+                members.insert(member.into_owned().1);
+            }
+        }
+    }
+    for root in scope {
+        if let Some(pending) = index.claude_usage_family_pending.get(root) {
+            members.extend(pending.membership().keys().cloned());
+        }
+    }
+    // (child root, parent root) from E2's lineage on this page.
+    let edges = items
+        .iter()
+        .filter_map(|item| {
+            let parent = item.claude_money.as_deref()?.fork_parent_key()?;
+            let parent = claude_index_path_member_ref(Path::new(parent))?;
+            Some((claude_snapshot_family_root(item), parent.root.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    for item in items {
+        let root = claude_snapshot_family_root(item);
+        if scope.contains(&root)
+            || members.contains(&item.source_session_id)
+            || edges.iter().any(|(child, parent)| {
+                (*child == root && scope.contains(parent))
+                    || (*parent == root && scope.contains(child))
+            })
+        {
+            vetoed.insert(root);
+        }
+    }
+    if !vetoed.is_empty() {
+        crate::local_resource_diagnostics::traversal_point(
+            "claude_usage_held_unread_scope",
+            SnapshotSource::ClaudeCode.api_slug(),
+            &json!({"held_unread_scope_veto_families":vetoed.len()}),
+        );
+    }
+    vetoed
 }
 
 /// Scoped residue exit (Lead B 4d): the refused held read is counted per
@@ -878,10 +1011,11 @@ impl ScanIndex {
     /// stamp are satisfied for this process, so the next visit can Tail.
     pub(super) fn usage_guard_mark_audited(&mut self, key: &str) {
         let runtime = &mut self.usage_guard_holds.runtime;
+        runtime.unread.remove(key);
         if runtime.paced.contains_key(key) {
             runtime.audited.insert(key.to_owned());
-            stash(runtime);
         }
+        stash(runtime);
     }
     pub(super) fn usage_guard_audit_satisfied(&self, key: &str, due_unix_seconds: u64) -> bool {
         let runtime = &self.usage_guard_holds.runtime;

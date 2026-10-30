@@ -1613,6 +1613,19 @@ impl FileFold {
             })
     }
 
+    /// The index key of the original a `fork-context-ref` line names, while
+    /// the copy proof holds it: the fork lineage edge other owners reuse.
+    pub(in crate::snapshots) fn fork_parent_key(&self) -> Option<&str> {
+        match &self.proof {
+            Some(CopyProof::Holders(Some(parent))) => Some(parent),
+            _ => None,
+        }
+    }
+    #[cfg(test)]
+    pub(in crate::snapshots) fn set_fork_parent_for_test(&mut self, parent: String) {
+        self.proof = Some(CopyProof::Holders(Some(parent)));
+    }
+
     /// This fold's (effective birth, location): the total copy order.
     fn copy_order(&self) -> Option<(i128, LocationKey)> {
         let physical = self.physical?;

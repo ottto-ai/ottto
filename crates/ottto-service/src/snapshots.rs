@@ -9379,6 +9379,14 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         .chain(held_request_hashes)
         .cloned()
         .collect::<BTreeSet<_>>();
+    // Lead B unread-scope veto: request keys cannot cover what a held family
+    // has not read, so its root, member files and E2-known lineage stay
+    // vetoed until its coverage is complete. The census is untouched.
+    let unread_scope_vetoed = usage_pending_guard::unread_scope_vetoes(
+        index,
+        &usage_pending_guard::unread_scope(index, census_window_end),
+        snapshots,
+    );
     if census_complete {
         let current_members = complete_families
             .values()
@@ -9402,6 +9410,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     .find(|(_, members)| members.contains(source_session_id))?;
                 if uncertified_roots.contains(root_session_id)
                     || index.usage_guard_holds.holds(root_session_id)
+                    || unread_scope_vetoed.contains(root_session_id)
                 {
                     return None;
                 }
@@ -9459,6 +9468,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         let unresolved_duplicate = duplicate_census_invalid
             || index.claude_duplicate_request_witness_overflowed
             || index.usage_guard_holds.holds(&root_session_id)
+            || unread_scope_vetoed.contains(&root_session_id)
             || item.claude_usage_request_ids.iter().any(|request_id| {
                 let request_hash = format!("{:x}", Sha256::digest(request_id.as_bytes()));
                 duplicated_request_hashes.contains(&request_hash)
@@ -33001,7 +33011,7 @@ impl OwnedSourceScan {
                         || forced
                         || (debt.is_none() && !audited && context.audit_slots == 0)
                     {
-                        usage_pending_guard::full_blocked(&candidate.path);
+                        index.usage_guard_full_blocked(&candidate.path);
                         pending!();
                     }
                     let Some(dependencies) = sampled_scan::reduction_dependencies(
@@ -33011,7 +33021,7 @@ impl OwnedSourceScan {
                         &claude_title_metadata,
                         claude_effort_support_dir_ref,
                     ) else {
-                        usage_pending_guard::full_blocked(&candidate.path);
+                        index.usage_guard_full_blocked(&candidate.path);
                         pending!();
                     };
                     let scope = context.file_scope(
@@ -33023,7 +33033,7 @@ impl OwnedSourceScan {
                         index,
                     );
                     let Ok(checkpoint) = context.cache.claude_checkpoint(&key) else {
-                        usage_pending_guard::full_blocked(&candidate.path);
+                        index.usage_guard_full_blocked(&candidate.path);
                         pending!();
                     };
                     if let Some(checkpoint) = checkpoint {
@@ -33038,7 +33048,7 @@ impl OwnedSourceScan {
                         {
                             let Ok(taken) = context.cache.take_claude_checkpoint(&key, &checkpoint)
                             else {
-                                usage_pending_guard::full_blocked(&candidate.path);
+                                index.usage_guard_full_blocked(&candidate.path);
                                 pending!();
                             };
                             taken
@@ -33047,7 +33057,7 @@ impl OwnedSourceScan {
                             // non-publishing Full rebuilds the checkpoint.
                             context.cache.take(&key)
                         } else {
-                            usage_pending_guard::full_blocked(&candidate.path);
+                            index.usage_guard_full_blocked(&candidate.path);
                             pending!();
                         }
                     } else {
@@ -33252,7 +33262,7 @@ impl OwnedSourceScan {
                                                 && !index
                                                     .usage_guard_admit_withheld_full(&candidate)
                                             {
-                                                usage_pending_guard::full_blocked(&candidate.path);
+                                                index.usage_guard_full_blocked(&candidate.path);
                                                 pending!();
                                             }
                                             (None, taken_admission, debt)
@@ -33300,7 +33310,7 @@ impl OwnedSourceScan {
                             // RAM certificates were rechecked under the lock before take.
                             // Audit due or no usable record: one paced withheld Full.
                             if !index.usage_guard_admit_withheld_full(&candidate) {
-                                usage_pending_guard::full_blocked(&candidate.path);
+                                index.usage_guard_full_blocked(&candidate.path);
                                 pending!();
                             }
                         }
@@ -33636,7 +33646,7 @@ impl OwnedSourceScan {
                     matches!(plan.mode, crate::transcript_acquisition::ReadMode::Full(_))
                 })
             {
-                usage_pending_guard::full_blocked(&active.candidate.path);
+                index.usage_guard_full_blocked(&active.candidate.path);
                 pending!();
             }
             #[cfg(unix)]
