@@ -783,8 +783,98 @@ pub(crate) struct ClaudeRequestCensus {
     hash_total: usize,
     /// Exact serialized bytes of every `"key":record` pair.
     serialized_total: usize,
+    /// Runtime only: transcript keys whose persisted record the decoder
+    /// dropped. The load hands them to the scan's runtime custody.
+    decode_lost: ClaudeCensusLostRecords,
 }
-crate::heap_layout_bound::fields!(ClaudeRequestCensus; records, hash_total, serialized_total);
+crate::heap_layout_bound::fields!(ClaudeRequestCensus; records, hash_total, serialized_total, decode_lost);
+
+/// Transcript keys whose record the census lost (an insert `Refused`, a
+/// decoder drop) and that have none since: their request prefixes are
+/// missing, never empty (Lead B 2026-10-30), so the census-prefix index is
+/// Unknown while one of them belongs to a pending-free root. Runtime only:
+/// never serialized, compared or charged to the census budgets. At most
+/// [`MAX_CLAUDE_CENSUS_LOST_KEYS`] keys; past that, or when the lost keys
+/// are themselves unknown (a whole census or an undrained tail lost), it
+/// saturates and stays Unknown for the process.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ClaudeCensusLostRecords {
+    keys: BTreeSet<String>,
+    saturated: bool,
+}
+crate::heap_layout_bound::fields!(ClaudeCensusLostRecords; keys, saturated);
+
+/// Lost keys kept before the set saturates (each at most
+/// `MAX_CLAUDE_REQUEST_CENSUS_KEY_BYTES`: 1 MiB of keys at worst).
+pub(crate) const MAX_CLAUDE_CENSUS_LOST_KEYS: usize = 256;
+
+// Runtime custody, not census content: two censuses with the same records
+// are equal whatever their loss marks.
+impl PartialEq for ClaudeCensusLostRecords {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for ClaudeCensusLostRecords {}
+
+impl ClaudeCensusLostRecords {
+    /// `key` lost its record. Keys of no transcript member hold no prefix.
+    pub(crate) fn mark(&mut self, key: &str) {
+        if self.saturated
+            || self.keys.contains(key)
+            || super::claude_index_path_member_ref(Path::new(key)).is_none()
+        {
+            return;
+        }
+        if self.keys.len() >= MAX_CLAUDE_CENSUS_LOST_KEYS
+            || key.len() > MAX_CLAUDE_REQUEST_CENSUS_KEY_BYTES
+        {
+            self.saturate();
+        } else {
+            self.keys.insert(key.to_owned());
+        }
+    }
+
+    /// Records were lost whose keys are unknown.
+    pub(crate) fn saturate(&mut self) {
+        self.keys = BTreeSet::new();
+        self.saturated = true;
+    }
+
+    pub(crate) fn absorb(&mut self, other: Self) {
+        if other.saturated {
+            self.saturate();
+        }
+        for key in &other.keys {
+            self.mark(key);
+        }
+    }
+
+    /// `key` has a record again. True when it was marked.
+    pub(crate) fn forget(&mut self, key: &str) -> bool {
+        self.keys.remove(key)
+    }
+
+    pub(crate) fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        self.keys.retain(|key| keep(key));
+    }
+
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.keys.contains(key)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.saturated && self.keys.is_empty()
+    }
+
+    pub(crate) fn saturated(&self) -> bool {
+        self.saturated
+    }
+
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
+        self.keys.iter()
+    }
+}
 
 /// One family's answer from [`ClaudeRequestCensus::family_transcript_holders`].
 #[derive(Debug, Default)]
@@ -912,6 +1002,20 @@ impl ClaudeRequestCensus {
 
     pub(crate) fn serialized_total(&self) -> usize {
         self.serialized_total
+    }
+
+    /// Transcript keys whose persisted record the decoder dropped.
+    pub(crate) fn decode_lost(&self) -> &ClaudeCensusLostRecords {
+        &self.decode_lost
+    }
+
+    /// Hand the decoder's lost keys to runtime custody.
+    pub(crate) fn take_decode_lost(&mut self) -> ClaudeCensusLostRecords {
+        std::mem::take(&mut self.decode_lost)
+    }
+
+    pub(crate) fn forget_decode_lost(&mut self, key: &str) {
+        self.decode_lost.forget(key);
     }
 
     /// Serialized bytes a full record may still take before the tombstone
@@ -1080,7 +1184,7 @@ impl ClaudeRequestCensus {
                 kept = false;
                 continue;
             }
-            kept &= self.insert_decoded(key, record);
+            kept &= self.insert_decoded(key, record) == Ok(true);
         }
         kept
     }
@@ -1156,8 +1260,13 @@ impl ClaudeRequestCensus {
     }
 
     /// A decoded record that would pass either budget is dropped, never
-    /// stored. True when stored without replacing a duplicate key.
-    fn insert_decoded(&mut self, key: String, record: ClaudeRequestCensusRecord) -> bool {
+    /// stored: its key comes back, with no record left under it. True when
+    /// stored without replacing a duplicate key.
+    fn insert_decoded(
+        &mut self,
+        key: String,
+        record: ClaudeRequestCensusRecord,
+    ) -> Result<bool, String> {
         let duplicate = self.records.remove(&key);
         if let Some(old) = &duplicate {
             self.charge(&key, old, false);
@@ -1170,11 +1279,12 @@ impl ClaudeRequestCensus {
                 .serialized_total
                 .checked_add(entry_serialized_bytes(&key, &record))
                 .is_some_and(|total| total <= MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES);
-        if fits {
-            self.charge(&key, &record, true);
-            self.records.insert(key, record);
+        if !fits {
+            return Err(key);
         }
-        fits && duplicate.is_none()
+        self.charge(&key, &record, true);
+        self.records.insert(key, record);
+        Ok(duplicate.is_none())
     }
 
     pub(crate) fn remove(&mut self, key: &str) {
@@ -1247,17 +1357,21 @@ impl ClaudeRequestCensus {
             dropped += u64::from(!kept && !record.is_birth_stub());
             kept
         });
+        // A lost key that vanished can hide nothing.
+        self.decode_lost.retain(&keep);
         self.recount();
         dropped
     }
 
     fn recount(&mut self) {
         let records = std::mem::take(&mut self.records);
+        let decode_lost = std::mem::take(&mut self.decode_lost);
         *self = Self::default();
         for (key, record) in &records {
             self.charge(key, record, true);
         }
         self.records = records;
+        self.decode_lost = decode_lost;
     }
 }
 
@@ -1823,13 +1937,23 @@ impl<'de> Deserialize<'de> for ClaudeRequestCensus {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
         if raw.get().len() > MAX_RAW_BYTES {
-            return Ok(Self::default());
+            return Ok(Self::lost_whole());
         }
         let mut isolated = serde_json::Deserializer::from_str(raw.get());
         Ok(isolated
             .deserialize_any(CensusVisitor { ledger: false })
             .map(|(census, _)| census)
-            .unwrap_or_default())
+            .unwrap_or_else(|_| Self::lost_whole()))
+    }
+}
+
+impl ClaudeRequestCensus {
+    /// A persisted census none of whose records could be kept: empty, and
+    /// every transcript prefix it held is missing (saturated loss).
+    pub(crate) fn lost_whole() -> Self {
+        let mut census = Self::default();
+        census.decode_lost.saturate();
+        census
     }
 }
 
@@ -1914,10 +2038,21 @@ impl<'de> Visitor<'de> for CensusVisitor {
         let mut attempted = 0;
         let mut dropped = 0_u64;
         let mut remaining_work = MAX_RAW_BYTES;
+        // The index census's records lost here leave their keys' prefixes
+        // missing (a ledger shard that loses one is refused whole instead).
+        let lost = |census: &mut ClaudeRequestCensus, key: &str| {
+            if !self.ledger {
+                census.decode_lost.mark(key);
+            }
+        };
         loop {
             if attempted == MAX_DECODE_ENTRIES || remaining_work == 0 {
                 while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {
                     dropped += 1;
+                    // Unread keys: which prefixes are missing is unknown.
+                    if !self.ledger {
+                        census.decode_lost.saturate();
+                    }
                 }
                 break;
             }
@@ -1930,6 +2065,10 @@ impl<'de> Visitor<'de> for CensusVisitor {
                 || is_ledger_key(&key) != self.ledger
             {
                 dropped += 1;
+                // A ledger key never belongs in the index: nothing is lost.
+                if is_ledger_key(&key) == self.ledger {
+                    lost(&mut census, &key);
+                }
                 map.next_value::<IgnoredAny>()?;
                 continue;
             }
@@ -1943,14 +2082,27 @@ impl<'de> Visitor<'de> for CensusVisitor {
             };
             if bytes > record_limit || bytes > remaining_work {
                 dropped += 1;
+                lost(&mut census, &key);
                 remaining_work = 0;
                 continue;
             }
             remaining_work -= bytes;
             let mut isolated = serde_json::Deserializer::from_str(raw.get());
             let kept = match (RecordSeed { remaining }).deserialize(&mut isolated) {
-                Ok(Some(record)) => census.insert_decoded(key, record),
-                _ => false,
+                Ok(Some(record)) => match census.insert_decoded(key, record) {
+                    Ok(kept) => kept,
+                    Err(key) => {
+                        lost(&mut census, &key);
+                        false
+                    }
+                },
+                _ => {
+                    // A malformed record of a key no earlier entry stored.
+                    if !census.records.contains_key(&key) {
+                        lost(&mut census, &key);
+                    }
+                    false
+                }
             };
             dropped += u64::from(!kept);
         }
@@ -2723,9 +2875,17 @@ pub(crate) fn record_claude_request_census(
             record.retire();
         }
     }
-    let _ = index
+    // Not even a tombstone fit: the key has no record, and its prefixes are
+    // missing until one is stored or the key vanishes (Lead B 2026-10-30).
+    match index
         .claude_request_census
-        .insert(parse.index_key.to_owned(), record);
+        .insert(parse.index_key.to_owned(), record)
+    {
+        ClaudeRequestCensusInsert::Refused => index.usage_guard_mark_census_lost(parse.index_key),
+        ClaudeRequestCensusInsert::Stored | ClaudeRequestCensusInsert::Tombstone => {
+            index.usage_guard_census_recorded(parse.index_key);
+        }
+    }
     if let Some(stored) = index.claude_request_census.get(parse.index_key) {
         note_identity_incomplete_hold(
             !was_held && stored.identity_incomplete_hold(),
@@ -3470,6 +3630,11 @@ impl ClaudeRequestCensus {
     }
     pub(crate) fn serialized_total_for_test(&self) -> usize {
         self.serialized_total
+    }
+    /// Charge the whole serialized budget, tombstone reserve included, so
+    /// the next insert of any record is `Refused`.
+    pub(crate) fn fill_serialized_budget_for_test(&mut self) {
+        self.serialized_total = MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES;
     }
     pub(crate) fn exact_serialized_len_for_test(&self) -> usize {
         serialized_bytes(self)

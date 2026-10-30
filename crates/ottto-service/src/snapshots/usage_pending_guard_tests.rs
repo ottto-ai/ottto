@@ -1321,6 +1321,263 @@ fn census_prefix_overbudget_gauge_counts_blocked_roots_and_alarms_hourly() {
     assert_eq!(alarms(&rows), 0);
 }
 
+/// Lead B 2026-10-30 (r16) fixtures: the build row's lost-record counts.
+fn census_prefix_lost_gauge(rows: &[serde_json::Value]) -> (serde_json::Value, serde_json::Value) {
+    let row = rows
+        .iter()
+        .find(|row| {
+            row["stage"] == "claude_census_prefix_veto"
+                && row["counts"]["census_prefix_unknown"].is_u64()
+        })
+        .expect("census-prefix build row");
+    (
+        row["counts"]["census_prefix_unknown_refused_records"].clone(),
+        row["counts"]["census_prefix_unknown_overbudget_records"].clone(),
+    )
+}
+
+/// Counts only: every count is a number (the peak may be null), and no
+/// root, key, request id or fingerprint reaches a row.
+fn assert_census_prefix_rows_private(rows: &[serde_json::Value], secrets: &[&str]) {
+    for row in rows {
+        for value in row["counts"].as_object().unwrap().values() {
+            assert!(value.is_u64() || value.is_null(), "{row}");
+        }
+        let text = row.to_string();
+        for secret in secrets {
+            assert!(!text.contains(secret), "{row}");
+        }
+    }
+}
+
+#[test]
+fn census_prefix_refused_insert_is_unknown_never_clear_for_a_copy() {
+    // Lead B 2026-10-30 (r16, blocking): a record the census refuses (not
+    // even its tombstone fits) leaves its file's prefixes missing. Missing is
+    // not empty: the veto must hold an untagged copy of that file, never
+    // answer Clear.
+    let copy = [claude_request_census::claude_request_hash("req_copy")];
+    let source_key = carry_key(CARRY_UNWITNESSED, None);
+    let mut index = ScanIndex::default();
+    let _ = index.claude_request_census_mut_for_test().insert(
+        carry_key(CARRY_OTHER, None),
+        claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+            &"a".repeat(64),
+            1,
+            claude_request_census::ClaudeRequestCensusShape::Exact,
+            vec![claude_request_census::claude_request_hash("req_other")],
+        ),
+    );
+    // Before the refusal the index is Known and cached for this window.
+    let cached = index.refresh_claude_census_prefix(CARRY_FAILED, true);
+    assert!(!cached.unknown());
+    assert!(!usage_pending_guard::fork_lineage_incomplete(&index));
+    // The census is full: the source file's own record is refused.
+    index
+        .claude_request_census_mut_for_test()
+        .fill_serialized_budget_for_test();
+    let path = PathBuf::from(&source_key);
+    claude_request_census::record_claude_request_census(
+        &mut index,
+        claude_request_census::ClaudeRequestCensusParse {
+            path: &path,
+            index_key: &source_key,
+            source_file_fingerprint: &"b".repeat(64),
+            census_window_end: CARRY_FAILED,
+            complete: true,
+            lossy: false,
+            source_verified: true,
+            itemless_request_hashes: copy.to_vec(),
+            opened_birth: None,
+            modified_unix_seconds: 1,
+        },
+        &[],
+    );
+    assert!(index
+        .claude_request_census_for_test()
+        .record_for_test(&source_key)
+        .is_none());
+    assert_eq!(
+        usage_census_prefix::lost_records(&index),
+        usage_census_prefix::LostRecords {
+            records: 1,
+            saturated: false
+        }
+    );
+    // The cached Known index is stale.
+    assert!(cached.stale(&index));
+    let (built, rows) = crate::local_resource_diagnostics::capture(|| {
+        usage_census_prefix::CensusPrefixIndex::build(&index)
+    });
+    assert!(built.unknown());
+    assert_eq!(
+        built.verdict(CARRY_ROOT, copy),
+        usage_census_prefix::CensusPrefixVerdict::Unknown
+    );
+    assert_eq!(census_prefix_lost_gauge(&rows), (json!(1), json!(0)));
+    let alarm = rows
+        .iter()
+        .find(|row| row["stage"] == "census_prefix_unknown_overbudget_alarm")
+        .expect("same hourly alarm as OverBudget");
+    assert_eq!(alarm["counts"]["census_prefix_unknown_refused_records"], 1);
+    assert_census_prefix_rows_private(
+        &rows,
+        &[
+            CARRY_ROOT,
+            CARRY_OTHER,
+            CARRY_UNWITNESSED,
+            "req_copy",
+            "req_other",
+            ".jsonl",
+            "aaaaaaaa",
+            "bbbbbbbb",
+        ],
+    );
+    // Every reader answers Unknown, and no family's pending may retire.
+    assert_eq!(
+        usage_census_prefix::census_prefix_verdict(&index, CARRY_ROOT, copy),
+        usage_census_prefix::CensusPrefixVerdict::Unknown
+    );
+    assert!(usage_pending_guard::fork_lineage_incomplete(&index));
+    // Same scope as OverBudget: a root with usage pending is out of the index.
+    index.claude_usage_family_pending.insert(
+        CARRY_UNWITNESSED.into(),
+        ClaudeUsageFamilyPending {
+            derived_request_members: BTreeSet::new(),
+            census_window_end: CARRY_FAILED.into(),
+            member_request_id_hashes: BTreeMap::new(),
+            member_occurrences: BTreeMap::new(),
+            invalid: false,
+            idless_revision: None,
+        },
+    );
+    assert!(!usage_census_prefix::lost_records(&index).unknown());
+    index.claude_usage_family_pending.remove(CARRY_UNWITNESSED);
+    assert!(usage_census_prefix::CensusPrefixIndex::build(&index).unknown());
+    // A key neither indexed nor walked has vanished and hides nothing.
+    index.usage_guard_prune_refused(&BTreeSet::new());
+    assert!(!usage_census_prefix::lost_records(&index).unknown());
+    let known = usage_census_prefix::CensusPrefixIndex::build(&index);
+    assert!(!known.unknown());
+    assert_eq!(
+        known.verdict(CARRY_ROOT, copy),
+        usage_census_prefix::CensusPrefixVerdict::Clear
+    );
+}
+
+#[test]
+fn census_prefix_decoder_dropped_record_is_unknown_across_reloads() {
+    // Lead B 2026-10-30 (r16, blocking): a persisted record the decoder
+    // drops leaves its file's prefixes missing, also after the next save
+    // writes the census without it. The veto holds the copy, never Clear.
+    let copy = [claude_request_census::claude_request_hash("req_copy")];
+    let source_key = carry_key(CARRY_UNWITNESSED, None);
+    let scratch = crate::test_scratch::ScratchDir::new("census-prefix-decoder-drop");
+    let path = scratch.join("index.json");
+    let mut index = ScanIndex::default();
+    for (root, seed, request) in [
+        (CARRY_OTHER, 'a', "req_other"),
+        (CARRY_UNWITNESSED, 'b', "req_copy"),
+    ] {
+        let _ = index.claude_request_census_mut_for_test().insert(
+            carry_key(root, None),
+            claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+                &seed.to_string().repeat(64),
+                1,
+                claude_request_census::ClaudeRequestCensusShape::Exact,
+                vec![claude_request_census::claude_request_hash(request)],
+            ),
+        );
+    }
+    let mut json = serde_json::to_value(&index).expect("index value");
+    // Intact, the source's record holds the copy's request: Held.
+    std::fs::write(&path, json.to_string()).expect("write index");
+    let intact = ScanIndex::load(&path).expect("load index");
+    assert_eq!(
+        usage_census_prefix::CensusPrefixIndex::build(&intact).verdict(CARRY_ROOT, copy),
+        usage_census_prefix::CensusPrefixVerdict::Held
+    );
+    // A malformed persisted record (unknown shape) is dropped on decode.
+    json["claude_request_census"][source_key.as_str()]["s"] = json!("multi_item");
+    std::fs::write(&path, json.to_string()).expect("write index");
+    let mut loaded = ScanIndex::load(&path).expect("load index");
+    assert!(loaded
+        .claude_request_census_for_test()
+        .record_for_test(&source_key)
+        .is_none());
+    let (built, rows) = crate::local_resource_diagnostics::capture(|| {
+        usage_census_prefix::CensusPrefixIndex::build(&loaded)
+    });
+    assert!(built.unknown());
+    assert_eq!(
+        built.verdict(CARRY_ROOT, copy),
+        usage_census_prefix::CensusPrefixVerdict::Unknown
+    );
+    assert_eq!(census_prefix_lost_gauge(&rows), (json!(1), json!(0)));
+    assert!(rows.iter().any(
+        |row| row["stage"] == "census_prefix_unknown_overbudget_alarm"
+            && row["counts"]["census_prefix_unknown_refused_records"] == 1
+    ));
+    assert_census_prefix_rows_private(
+        &rows,
+        &[
+            CARRY_ROOT,
+            CARRY_OTHER,
+            CARRY_UNWITNESSED,
+            "req_copy",
+            "req_other",
+            ".jsonl",
+            "aaaaaaaa",
+            "bbbbbbbb",
+        ],
+    );
+    // The daemon load hands the loss to runtime custody.
+    loaded.usage_guard_adopt_custody(&path);
+    assert!(loaded
+        .claude_request_census_for_test()
+        .decode_lost()
+        .is_empty());
+    assert_eq!(
+        usage_census_prefix::census_prefix_verdict(&loaded, CARRY_ROOT, copy),
+        usage_census_prefix::CensusPrefixVerdict::Unknown
+    );
+    assert!(usage_pending_guard::fork_lineage_incomplete(&loaded));
+    // The next save drops the record for good; the next cycle's reload
+    // decodes cleanly, and custody still makes the index Unknown.
+    std::fs::write(&path, serde_json::to_string(&loaded).expect("index json"))
+        .expect("write index");
+    let mut reloaded = ScanIndex::load(&path).expect("load index");
+    assert!(reloaded
+        .claude_request_census_for_test()
+        .decode_lost()
+        .is_empty());
+    reloaded.usage_guard_adopt_custody(&path);
+    assert_eq!(
+        usage_census_prefix::lost_records(&reloaded),
+        usage_census_prefix::LostRecords {
+            records: 1,
+            saturated: false
+        }
+    );
+    assert_eq!(
+        usage_census_prefix::census_prefix_verdict(&reloaded, CARRY_ROOT, copy),
+        usage_census_prefix::CensusPrefixVerdict::Unknown
+    );
+    // A census the decoder loses whole hides every prefix: saturated.
+    let lost = claude_request_census::ClaudeRequestCensus::lost_whole();
+    assert!(lost.decode_lost().saturated());
+    let mut whole = ScanIndex::default();
+    *whole.claude_request_census_mut_for_test() = lost;
+    let (built, rows) = crate::local_resource_diagnostics::capture(|| {
+        usage_census_prefix::CensusPrefixIndex::build(&whole)
+    });
+    assert!(built.unknown());
+    assert!(rows.iter().any(|row| {
+        row["stage"] == "claude_census_prefix_veto"
+            && row["counts"]["census_prefix_unknown_refused_saturated"] == 1
+    }));
+}
+
 #[test]
 fn fork_lineage_unknown_is_source_wide_beside_an_unrelated_qualified_family() {
     if !crate::heap_layout_bound::layout_supported() {

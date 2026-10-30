@@ -5,8 +5,10 @@
 //! negative scheduling veto. Nothing is persisted: retention is the census
 //! rule (35 idle days, pruned when the file vanishes), inherited by deriving
 //! from it. A prefix collision only over-vetoes. An index past its byte
-//! budget, or a pending-free record whose hashes the census dropped (over
-//! budget), is Unknown: a B3 hold, never a dropped hash or a "Clear".
+//! budget, a pending-free record whose hashes the census dropped (over
+//! budget), or a pending-free transcript whose record the census refused or
+//! the decoder dropped (missing, never empty) is Unknown: a B3 hold, never a
+//! dropped hash or a "Clear".
 use super::*;
 
 /// Byte budget of one build: the prefix and root-id arrays at their actual
@@ -83,6 +85,44 @@ fn take_overbudget_alarm_slot(now: std::time::Instant) -> bool {
     })
 }
 
+/// Census records lost to the prefix index (Lead B 2026-10-30): an insert
+/// `Refused` (not even its tombstone fit) or a decoder drop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LostRecords {
+    /// Lost keys of pending-free roots that still have no record.
+    pub(crate) records: u64,
+    /// Lost records whose keys are unknown (scope: every root).
+    pub(crate) saturated: bool,
+}
+
+impl LostRecords {
+    pub(crate) fn unknown(self) -> bool {
+        self.records != 0 || self.saturated
+    }
+}
+
+/// Same scope as an OverBudget tombstone: a lost key counts while its root
+/// has no usage pending and the census still holds no record for it (a
+/// birth stub is none). Bounded walk of the runtime and decoder marks.
+pub(crate) fn lost_records(index: &ScanIndex) -> LostRecords {
+    let runtime = index.usage_guard_census_lost();
+    let decoded = index.claude_request_census.decode_lost();
+    let records = runtime
+        .keys()
+        .chain(decoded.keys().filter(|key| !runtime.contains(key)))
+        .filter(|key| {
+            index.claude_request_census.get(key).is_none()
+                && claude_index_path_member_ref(Path::new(key.as_str())).is_some_and(|member| {
+                    !index.claude_usage_family_pending.contains_key(member.root)
+                })
+        })
+        .count();
+    LostRecords {
+        records: u64::try_from(records).unwrap_or(u64::MAX),
+        saturated: runtime.saturated() || decoded.saturated(),
+    }
+}
+
 /// What the census says about some request prefixes of one family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CensusPrefixVerdict {
@@ -91,7 +131,8 @@ pub(crate) enum CensusPrefixVerdict {
     /// Another root holds one: veto (a collision only over-vetoes).
     Held,
     /// No negative answer (B3 hold): the index would pass its byte budget,
-    /// or a pending-free record's hashes were dropped (over budget).
+    /// a pending-free record's hashes were dropped (over budget), or a
+    /// pending-free transcript's record was refused or dropped on decode.
     Unknown,
 }
 
@@ -217,25 +258,29 @@ impl CensusPrefixIndex {
             .and_then(|n| {
                 n.checked_add(std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>())
             });
-        if over_budget == 0 && peak.is_some_and(|n| n <= budget) {
+        // Lead B 2026-10-30: a refused or decoder-dropped record is missing,
+        // never empty. Same scope and alarm as an OverBudget tombstone.
+        let lost = lost_records(index);
+        let missing = over_budget != 0 || lost.unknown();
+        if !missing && peak.is_some_and(|n| n <= budget) {
             overflow = u64::from(out.fill(index, records, total, budget).is_none());
-        } else if over_budget == 0 {
+        } else if !missing {
             overflow = 1;
         }
-        if over_budget != 0 || overflow != 0 {
+        if missing || overflow != 0 {
             out = Self {
                 unknown: true,
                 ..Self::default()
             };
         }
-        // Gauge (B), Lead B 2026-10-30: each OverBudget record alone makes
-        // the index Unknown, and an Unknown index refuses retirement to every
-        // family with usage pending (`fork_lineage_incomplete` is
+        // Gauge (B), Lead B 2026-10-30: each OverBudget or lost record alone
+        // makes the index Unknown, and an Unknown index refuses retirement to
+        // every family with usage pending (`fork_lineage_incomplete` is
         // source-wide). Overflow alone counts in neither.
-        let blocked_roots = if over_budget == 0 {
-            0
-        } else {
+        let blocked_roots = if missing {
             index.claude_usage_family_pending.len()
+        } else {
+            0
         };
         crate::local_resource_diagnostics::traversal_point(
             "claude_census_prefix_veto",
@@ -245,13 +290,20 @@ impl CensusPrefixIndex {
                 "census_prefix_over_budget_records":over_budget,"census_prefix_overflow":overflow,
                 "census_prefix_unknown":u64::from(out.unknown),
                 "census_prefix_unknown_overbudget_records":over_budget,
+                "census_prefix_unknown_refused_records":lost.records,
+                "census_prefix_unknown_refused_saturated":u64::from(lost.saturated),
                 "census_prefix_unknown_blocked_roots":blocked_roots}),
         );
-        if over_budget >= OVERBUDGET_ALARM_RECORDS
+        let alarm_records = over_budget
+            .saturating_add(lost.records)
+            .saturating_add(u64::from(lost.saturated));
+        if alarm_records >= OVERBUDGET_ALARM_RECORDS
             && take_overbudget_alarm_slot(std::time::Instant::now())
         {
             crate::local_resource_diagnostics::claude_census_prefix_unknown_overbudget_alarm(
                 &json!({"census_prefix_unknown_overbudget_records":over_budget,
+                    "census_prefix_unknown_refused_records":lost.records,
+                    "census_prefix_unknown_refused_saturated":u64::from(lost.saturated),
                     "census_prefix_unknown_blocked_roots":blocked_roots}),
             );
         }
@@ -359,11 +411,13 @@ impl CensusPrefixIndex {
         self.prefixes.len()
     }
 
-    /// A root excluded at build time has since lost its usage pending.
+    /// A root excluded at build time has since lost its usage pending, or a
+    /// Known index has since lost a census record it needs.
     pub(crate) fn stale(&self, index: &ScanIndex) -> bool {
         self.pending
             .iter()
             .any(|root| !index.claude_usage_family_pending.contains_key(root))
+            || (!self.unknown && lost_records(index).unknown())
     }
 
     /// Whether a pending-free root other than `family_root` holds any of

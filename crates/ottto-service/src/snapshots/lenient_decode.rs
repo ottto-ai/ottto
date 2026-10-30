@@ -2229,7 +2229,16 @@ impl<R: BufRead + Seek> Decoder<R> {
             || (optional_census(Some(field))
                 && self.census_resources[usize::from(field == "claude_request_census_shadow")])
         {
-            return Ok(ScanIndex::default());
+            // A request census skipped whole: its transcript prefixes are
+            // missing, never empty (census-prefix index Unknown).
+            return Ok(ScanIndex {
+                claude_request_census: if field == "claude_request_census" {
+                    claude_request_census::ClaudeRequestCensus::lost_whole()
+                } else {
+                    claude_request_census::ClaudeRequestCensus::default()
+                },
+                ..ScanIndex::default()
+            });
         }
         self.reader.seek(SeekFrom::Start(span.start))?;
         let prefix = format!("{{\"files\":{{}},\"{field}\":");

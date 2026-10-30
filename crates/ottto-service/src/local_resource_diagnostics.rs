@@ -717,10 +717,10 @@ pub(crate) fn claude_usage_held_no_witness_alarm(counts: &impl Serialize) {
     traversal_point("usage_held_no_witness_alarm", "claude_code", counts);
 }
 /// Local alarm, at most hourly: pending-free Claude census records whose
-/// hashes the census dropped (OverBudget) make the census-prefix index
-/// Unknown, which holds every family and refuses every usage-pending
-/// retirement (gauge on the `claude_census_prefix_veto` row). Counts only;
-/// no path, id or wire event.
+/// hashes the census dropped (OverBudget), or that the census refused or the
+/// decoder dropped, make the census-prefix index Unknown, which holds every
+/// family and refuses every usage-pending retirement (gauge on the
+/// `claude_census_prefix_veto` row). Counts only; no path, id or wire event.
 pub(crate) fn claude_census_prefix_unknown_overbudget_alarm(counts: &impl Serialize) {
     traversal_point(
         "census_prefix_unknown_overbudget_alarm",
