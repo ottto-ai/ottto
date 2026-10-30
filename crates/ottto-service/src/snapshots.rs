@@ -46,6 +46,7 @@ pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileB
 pub(crate) use claude_context_file_birth::{
     ClaudeFileBirth, ClaudeFileBirthVerdict, ClaudeVetoApiRows,
 };
+pub mod claude_copy_prefix_reread;
 mod claude_history_upgrade;
 mod codex_root_copies;
 pub(crate) mod ownership_diagnostics;
@@ -8223,7 +8224,8 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 let retired = index
                     .claude_money_birth_store
                     .money_marks(claude_money_birth_store::location_key(&pending.index_key))
-                    & claude_request_money::e2::money_mark::RETIRED_PERMIT;
+                    & (claude_request_money::e2::money_mark::RETIRED_PERMIT
+                        | claude_copy_prefix_reread::REOWED);
                 let marks = items.fold(retired, |marks, item| {
                     marks | claude_request_money::e2::money_marks(item)
                 });
@@ -26968,10 +26970,21 @@ impl OwnedSourceScan {
         if source == SnapshotSource::ClaudeCode {
             claude_retry_queue_due_families(index, collected_at);
         }
+        let mut scoped_prefix_paths = Vec::new();
+        if source == SnapshotSource::ClaudeCode
+            && claude_request_money::e2::resumed_prefix_enabled()
+        {
+            claude_copy_prefix_reread::select(
+                index,
+                recovery_priority,
+                &mut scoped_prefix_paths,
+                file_limit,
+            );
+        }
         let traversal = index.traversal.as_mut().expect("traversal initialized");
         let census_window_end = traversal.census_window_end.clone();
         let discovered_file_count = traversal.counts.discovered_file_count;
-        let mut pending_paths = Vec::new();
+        let mut pending_paths = scoped_prefix_paths;
         // Watcher freshness must not starve the durable census when callers use a
         // small page size. Production reserves almost the whole 10k page already,
         // but the explicit slot also makes liveness independent of that ratio.

@@ -3257,12 +3257,14 @@ fn e2_pipeline_resumed_switch_counts_removed_partial_dollars_and_own_turns() {
         let on = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
         assert_eq!(body(&on, COPY).unwrap().removed_request_count, Some(2));
         assert_eq!(copy_diag(&["copy_prefix_removed_priced_requests",
-            "copy_prefix_removed_cost_micros", "copy_prefix_own_requests"]), [2, 300, 1]);
+            "copy_prefix_removed_cost_micros", "copy_prefix_own_requests",
+            "copy_prefix_families_corrected"]), [2, 300, 1, 1]);
         let _off = e2::ResumedPrefixForTest::set(false);
         let off = ready(&c, &E2ScanFixture::default(), prior, 100, false);
         assert_eq!(body(&off, COPY).unwrap().request_count, 3);
         assert_eq!(copy_diag(&["copy_prefix_removed_priced_requests",
-            "copy_prefix_removed_cost_micros", "copy_prefix_own_requests"]), [0; 3]);
+            "copy_prefix_removed_cost_micros", "copy_prefix_own_requests",
+            "copy_prefix_families_corrected"]), [0; 4]);
     });
 }
 

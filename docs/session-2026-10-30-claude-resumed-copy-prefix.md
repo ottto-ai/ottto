@@ -134,3 +134,66 @@ A separate counts-only local-state measurement still needs files, holder
 groups, saved copied requests, longest resume chain and charged bytes. The
 4 MiB bound and 2 MiB escalation threshold remain. No such measurement has
 been performed by this implementation task.
+
+## Scoped re-read and counts-only estimate
+
+`ottto-service claude-copy-prefix-reread --scope SCOPE.json --support-dir SUPPORT --estimate`
+(`--dry-run` is an alias) accepts a private JSON array of absolute affected
+Claude main-file paths, including their earlier proof holders. The money owner
+supplies that explicit cohort from its PLAN; the tool does not infer ownership
+by opening transcripts. It stats only those files, refuses symlink paths,
+requires creation-time metadata, and emits numeric counts/durations only.
+Estimate neither creates a support directory nor changes state or uploads.
+Files/bytes cover the exact scope; oversized files are counted as blocked,
+and apply refuses them. Scope is bounded by the existing 10,000-file scan
+limit and a 4 MiB local request envelope.
+
+After the change is merged and installed, money sign-off and a same-cohort
+PLAN are prerequisites for the authorized operator to replace `--estimate`
+with `--apply`. Apply publishes one private create-new request under
+`snapshots/claude-copy-prefix-reread.json`; it does not enable the local switch,
+restart the service, read transcript bodies or upload. Existing intent is never
+overwritten. Only the ordinary daemon, with the existing local switch ON,
+processes it under its sync lock. No helper or implementing agent runs apply,
+enables the switch or starts this re-read.
+
+The daemon validates every requested file remains indexed, lies inside the
+configured Claude roots and has the same size, creation time and modification
+time. Any mismatch refuses the whole request, with a counts-only refusal.
+It uses `re_owe_effective_upload_body_witness_revision(key, 2)` to lower only
+those files, without clearing a fingerprint, census record, ACK or global
+replay generation. A local bit in the existing per-file money-mark byte
+records that this one-shot request already re-owed the file; ordinary money
+restamps preserve it. Completed revision-3 entries are never re-owed again by
+that request, across restart. Removing an indexed file clears its marks as
+before. An index rebuild is not authorized by this tool.
+
+Files are offered in `(min(stored effective birth, physical birth), path)`
+order, earlier first, ahead of ordinary census/audits within the same selection
+limit. The native history gate still owns admission, protected lists, fences,
+byte/file budgets and ACK settlement. There is no new worker, continuation,
+pace, rate, cap increase or first-file byte exception. The estimate packs
+metadata sizes in creation-time order, next-fit, using the existing
+`HISTORY_UPGRADE_FILES_PER_PAGE = 2000` and
+`HISTORY_UPGRADE_BYTES_PER_PAGE = 1 GiB`. Runtime stored move-history births can
+refine that order; estimates are metadata-based capacity forecasts rather than
+a guarantee of exact page boundaries under other ordinary work or twins.
+
+For `P` forecast pages, pacing-only duration is `(P - 1) * 300` seconds at the
+existing `SNAPSHOT_SYNC_INTERVAL` floor, and `(P - 1) * 1800` seconds at the
+existing `MAX_CYCLE_INTERVAL` cold ceiling. Zero or one page has zero inter-page
+wait. Actual expected wall duration adds scan/enrichment/upload/ACK time and
+initial scheduling delay; list/fence/metadata/transport holds can extend it
+indefinitely. No measured throughput is invented. These are the existing
+ordinary-cycle constants, not a new timer. Lead B must pair the counts with
+current daemon readiness and measured page work when scheduling the operation.
+
+`copy_prefix_families_corrected` is an additional sparse diagnostic count on
+`native_collection_page.counts.money`: distinct families on that page whose
+successfully rebuilt native body removed a proven copied request from an
+uncertified resumed file that local OFF would have emitted. Certified skips,
+all-copy files, unresolved holds and unproven emitted prefixes add zero.
+This is a per-page decision event, not a process-wide unique-family ledger;
+repeated reads can count a family again. Add the sum of this field to the
+same bounded cohort/pass evidence query alongside removed requests/dollars,
+unproven residuals, held/expired counts and unchanged own-turn counts.

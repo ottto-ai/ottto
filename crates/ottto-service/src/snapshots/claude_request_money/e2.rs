@@ -3932,6 +3932,7 @@ pub(crate) fn finish_page(
         claude_request_identity::inherit_root_accounts(items, true);
         claude_request_identity::record_page_identity_counts(items);
     }
+    let mut corrected_sessions = BTreeSet::new();
     let mut sessions = BTreeMap::<&str, Session>::new();
     for item in items.iter_mut() {
         let SnapshotItem {
@@ -3944,6 +3945,15 @@ pub(crate) fn finish_page(
             continue;
         };
         let source_session_id: &String = source_session_id;
+        // OFF would restore an uncertified resumed prefix. Count only a
+        // proven removal, never a held/unproven request or certified skip.
+        if fold.resumed_prefix
+            && fold.first_own.is_some()
+            && !fold.money_birth.writer_certified(fold.first_own)
+            && fold.entity.removed_requests > 0
+        {
+            corrected_sessions.insert(source_session_id.clone());
+        }
         // Work counts on every read; decisions only when decided (below).
         diag_max("max_file_fold_us", fold.e2_nanos.0 / 1_000);
         record_counts(Counts::work([
@@ -4067,6 +4077,7 @@ pub(crate) fn finish_page(
         })
         .collect::<BTreeMap<_, _>>();
     let mut withheld = BTreeSet::new();
+    let mut corrected_families = BTreeSet::new();
     items.retain_mut(|item| {
         if item.claude_money.is_none() {
             return true;
@@ -4081,6 +4092,9 @@ pub(crate) fn finish_page(
         // its fold gets its own entity back (moved out above).
         let emitted = super::emit::apply(item, &entity);
         if emitted {
+            if corrected_sessions.contains(&item.source_session_id) {
+                corrected_families.insert(claude_snapshot_family_root_ref(item).to_owned());
+            }
             if let Some(marked) = item.copy_unproven_counts {
                 let mut counts = Counts::default();
                 counts.0[19] = marked.rows;
@@ -4109,6 +4123,12 @@ pub(crate) fn finish_page(
         }
         true
     });
+    if !corrected_families.is_empty() {
+        let mut counts = Counts::default();
+        counts.0[23] = corrected_families.len() as u64;
+        diag("copy_prefix_families_corrected", counts.0[23]);
+        record_counts(counts);
+    }
     diag("withheld_sessions", withheld.len() as u64);
     // A withheld session is read again: its decisions count on that page.
     for (session, counts) in decided {
@@ -4186,7 +4206,7 @@ fn absent_twins(sessions: &[(&str, &[LocationKey])], index: &ScanIndex) -> BTree
 // Existing native_collection_page carrier, nonzero only. These are shared
 // process fold deltas since its previous Claude page line.
 use std::sync::atomic::{AtomicU64, Ordering};
-const COUNT_NAMES: [&str; 23] = [
+const COUNT_NAMES: [&str; 24] = [
     "fold_us",
     "responses",
     "copy_skipped",
@@ -4214,8 +4234,9 @@ const COUNT_NAMES: [&str; 23] = [
     "copy_prefix_removed_priced_requests",
     "copy_prefix_removed_cost_micros",
     "copy_prefix_own_requests",
+    "copy_prefix_families_corrected",
 ];
-static COUNTS: [AtomicU64; 23] = [const { AtomicU64::new(0) }; 23];
+static COUNTS: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(
     Instant,
@@ -4247,18 +4268,18 @@ pub(crate) fn take_counts() -> Counts {
     Counts(COUNTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed)))
 }
 #[derive(Debug, Default)]
-pub(crate) struct Counts([u64; 23]);
+pub(crate) struct Counts([u64; 24]);
 impl Counts {
     /// The first seven (work and decision) counters.
     fn work(values: [u64; 7]) -> Self {
-        let mut all = [0; 23];
+        let mut all = [0; 24];
         all[..7].copy_from_slice(&values);
         Self(all)
     }
     /// A decided fold's copied-prefix outcome.
     fn prefix(tally: &PrefixTally) -> Self {
         let unproven = tally.unproven_requests + tally.unproven_idless;
-        let mut all = [0; 23];
+        let mut all = [0; 24];
         all[7..12].copy_from_slice(&[
             unproven,
             u64::from(unproven > 0),
@@ -4275,7 +4296,7 @@ impl Counts {
         Self(all)
     }
     fn removal_store(added: u64, overflow: u64) -> Self {
-        let mut all = [0; 23];
+        let mut all = [0; 24];
         all[12] = added;
         all[13] = overflow;
         all[14] = overflow;
