@@ -608,3 +608,208 @@ fn e2_pipeline_discarded_trace_read_leaves_requests_unbound_never_another_accoun
         fs::remove_dir_all(dir).unwrap();
     }
 }
+
+/// Retained creator A, complete own telemetry B, and permitted history custody.
+/// Scan and evidence application are production stages; only custody is seeded.
+fn e2_bound_trace_page(
+    dir: &Path,
+    support: &Path,
+    root: &str,
+    index: &mut ScanIndex,
+    unhealthy: bool,
+) -> (Vec<SnapshotItem>, crate::snapshot_sync::ClaudeLocalEvidenceStats) {
+    claude_request_money::e2::with_enabled(|| {
+        let mut scan = scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            &[dir.to_path_buf()],
+            index,
+            "2026-08-02T07:10:00Z",
+            7,
+            100,
+            false,
+        )
+        .unwrap();
+        claude_request_identity::retain_root_accounts(
+            &mut scan.snapshots,
+            index,
+            "e2-identity-machine",
+        );
+        let previous = claude_history_upgrade::HeldUploadTuple {
+            last_snapshot_fingerprint: Some("owed-snapshot".into()),
+            last_upload_body_witness: Some("owed-witness".into()),
+            file_snapshot_fingerprints: Some(BTreeSet::from(["owed-member".into()])),
+            confirmed_empty: false,
+        };
+        index.claude_history_emission.files.clear();
+        for item in &scan.snapshots {
+            let path = if item.source_session_id == root {
+                dir.join(format!("{root}.jsonl"))
+            } else {
+                dir.join(root)
+                    .join("subagents")
+                    .join(format!("agent-{E2_CHILD}.jsonl"))
+            };
+            index.claude_history_emission.files.insert(
+                item.source_file_fingerprint.clone().unwrap(),
+                claude_history_upgrade::GatedHistory {
+                    index_key: local_index_key(&path),
+                    permitted: true,
+                    previous: Some(previous.clone()),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(index.claude_history_emission.files.len(), 2);
+        let (_, _, stats) =
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, &mut scan, index);
+        for gated in index.claude_history_emission.files.values() {
+            assert!(gated.permitted, "owed permission is retained");
+            assert_eq!(gated.previous.as_ref(), Some(&previous), "custody is kept");
+            assert_eq!(
+                gated.held,
+                unhealthy.then_some(HistoryHold::TelemetryUnread),
+                "root and child history use the existing hold"
+            );
+        }
+        assert_eq!(
+            index.session_account_bindings
+                [&sha256_hex(&["session_owner:v1", "e2-identity-machine", root])]
+                .account_identifier_hash,
+            e2_account(),
+            "the durable creator binding A is untouched"
+        );
+        (scan.snapshots, stats)
+    })
+}
+
+fn e2_bound_trace_assert_logins(items: &[SnapshotItem], root: &str, login: Option<String>) {
+    assert_eq!(items.len(), 2, "root and child both emit");
+    for item in items {
+        let requests = if item.source_session_id == root { 4 } else { 1 };
+        assert!(e2_is_literal(item));
+        assert_eq!(item.request_count, requests);
+        assert_eq!(
+            e2_login_counts(item),
+            BTreeMap::from([(login.clone(), requests)]),
+            "every request share, including child inheritance"
+        );
+        for row in e2_rows(item) {
+            assert_eq!(row.account_identifier_hash, login);
+            if let Some(parts) = &row.identity_parts {
+                for part in parts {
+                    assert_eq!(part.account_identifier_hash, login, "identity_parts");
+                }
+            }
+        }
+    }
+}
+
+fn e2_bound_trace_totals(items: &[SnapshotItem]) -> BTreeMap<String, serde_json::Value> {
+    items
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                json!({
+                    "requests": item.request_count,
+                    "input": item.input_tokens, "output": item.output_tokens,
+                    "cache_read": item.cache_read_tokens,
+                    "cache_5m": item.cache_creation_5m_tokens,
+                    "cache_1h": item.cache_creation_1h_tokens,
+                    "reasoning": item.reasoning_output_tokens,
+                    "unattributed": item.unattributed_total_tokens,
+                    "cost": item.cost,
+                }),
+            )
+        })
+        .collect()
+}
+
+fn e2_bound_trace_regression(mode: &str) {
+    let (dir, root, _) = claude_account_family_fixture();
+    let support = dir.join("support");
+    let (mut api, trace) = e2_family_evidence(&root);
+    for row in &mut api {
+        row.account_identifier_hash = Some("b".repeat(64));
+        e2_resign(row);
+    }
+    e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
+    e2_write_rows(&support, "local-otel/claude-code-trace-ownership", &root, &trace);
+    let path = support
+        .join("local-otel/claude-code-trace-ownership")
+        .join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
+    let mut index = ScanIndex::default();
+    index.session_account_bindings.insert(
+        sha256_hex(&["session_owner:v1", "e2-identity-machine", &root]),
+        SessionAccountBinding {
+            account_identifier_hash: e2_account(),
+            workspace_identifier_hash: None,
+        },
+    );
+    let (clean, stats) = e2_bound_trace_page(&dir, &support, &root, &mut index, false);
+    e2_bound_trace_assert_logins(&clean, &root, Some("b".repeat(64)));
+    assert_eq!(stats.trace_discard_no_fallback_requests, 0);
+    assert!(serde_json::to_value(&stats).unwrap().get("trace_discard_no_fallback_requests").is_none());
+    let totals = e2_bound_trace_totals(&clean);
+    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+    if mode == "malformed" {
+        fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"malformed\n").unwrap();
+    } else {
+        let expected = path.clone();
+        let duplicate = serde_json::to_string(&trace[0]).unwrap();
+        let fired = fired.clone();
+        let generation = mode == "generation";
+        crate::claude_local_otel::before_next_trace_read_for_test(move |path| {
+            assert_eq!(path, expected);
+            if generation {
+                let replacement = path.with_extension("replacement");
+                fs::copy(path, &replacement).unwrap();
+                fs::rename(replacement, path).unwrap();
+            } else {
+                fs::OpenOptions::new().append(true).open(path).unwrap()
+                    .write_all(format!("{duplicate}\n").as_bytes()).unwrap();
+            }
+            fired.set(true);
+        });
+    }
+    let (items, stats) = e2_bound_trace_page(&dir, &support, &root, &mut index, true);
+    assert_eq!(fired.get(), mode != "malformed");
+    assert_eq!(stats.trace_incomplete_root_count, 1);
+    assert_eq!(e2_bound_trace_totals(&items), totals, "per-session money is unchanged");
+    let discarded = mode != "malformed";
+    e2_bound_trace_assert_logins(&items, &root, (!discarded).then(e2_account));
+    assert_eq!(stats.trace_discard_no_fallback_requests, if discarded { 5 } else { 0 });
+    if discarded {
+        let line = serde_json::to_value(&stats).unwrap();
+        assert_eq!(line["trace_discard_no_fallback_requests"], 5);
+        assert_eq!(stats.trace_rows_discarded.cap, u64::from(mode == "cap"));
+        assert_eq!(stats.trace_rows_discarded.generation, u64::from(mode == "generation"));
+    } else {
+        assert!(stats.trace_rows_discarded.is_empty(), "malformed is not a discard");
+        assert!(serde_json::to_value(&stats).unwrap().get("trace_discard_no_fallback_requests").is_none());
+    }
+    // Settle the sidecar; the next page must use B despite the retained A.
+    e2_write_rows(&support, "local-otel/claude-code-trace-ownership", &root, &trace);
+    let (recovered, stats) = e2_bound_trace_page(&dir, &support, &root, &mut index, false);
+    e2_bound_trace_assert_logins(&recovered, &root, Some("b".repeat(64)));
+    assert_eq!(e2_bound_trace_totals(&recovered), totals);
+    assert_eq!(stats.trace_discard_no_fallback_requests, 0);
+    assert!(stats.trace_rows_discarded.is_empty());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn e2_pipeline_bound_a_own_b_cap_discard_has_no_fallback_then_recovers() {
+    e2_bound_trace_regression("cap");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2_pipeline_bound_a_own_b_generation_discard_has_no_fallback_then_recovers() {
+    e2_bound_trace_regression("generation");
+}
+
+#[test]
+fn e2_pipeline_bound_a_malformed_trace_keeps_main_fallback() {
+    e2_bound_trace_regression("malformed");
+}
