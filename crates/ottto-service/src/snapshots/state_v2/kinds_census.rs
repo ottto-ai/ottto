@@ -738,6 +738,97 @@ pub(super) fn hydrate_txn(
 
 /// Integrator dispatches only our kinds here. Values are packed exact custody;
 /// unknown #915 marks MUST NOT be treated as zero references or path-free.
+// Only decoded presence affects CAS repair custody; the immutable manifest
+// authenticates the tombstone count without a second tombstone history map.
+pub(super) fn hydrate_cas_controls(tx: &mut dyn Transaction, index: &mut ScanIndex) -> Result<()> {
+    let h = tx
+        .get(&key("v1_field.census_shadow", "")?)?
+        .context("state_v2_census_partial")?;
+    let manifest: CensusManifest = read(tx, &h)?;
+    let mut count = 0_u64;
+    let mut after = None;
+    let kind = RecordKind::parse("tombstone.claude_retired_family_tombstones")?;
+    loop {
+        let page = tx.scan_kind(&kind, after.as_ref(), 128)?;
+        if page.is_empty() {
+            break;
+        }
+        for h in &page {
+            let _: u64 = read(tx, h)?;
+            count += 1;
+        }
+        after = page.last().map(|h| h.key.clone());
+    }
+    ensure!(count == manifest.tombstones, "state_v2_census_partial");
+    index.claude_retired_family_tombstones.decoded = true;
+    let h = tx
+        .get(&key(
+            "setting.claude_retired_family_tombstones_initialized",
+            "",
+        )?)?
+        .context("state_v2_census_partial")?;
+    index.claude_retired_family_tombstones_initialized = read(tx, &h)?;
+    Ok(())
+}
+pub(super) fn hydrate_cas_families(
+    tx: &mut dyn Transaction,
+    index: &mut ScanIndex,
+    roots: &BTreeSet<String>,
+) -> Result<()> {
+    let mut families = Families::new();
+    let mut after = None;
+    let mut charged = 0_u64;
+    let kind = RecordKind::parse("family.requests")?;
+    loop {
+        let page = tx.scan_kind(&kind, after.as_ref(), 128)?;
+        if page.is_empty() {
+            break;
+        }
+        for h in &page {
+            let RowKey::Record { key_bytes, .. } = &h.key else {
+                anyhow::bail!("state_v2_census_key")
+            };
+            let parts = components(key_bytes)?;
+            if !roots.contains(&parts[0]) {
+                continue;
+            }
+            charged = charged.saturating_add(h.len + key_bytes.len() as u64 + 256);
+            ensure!(charged <= 8 * 1024 * 1024, "state_v2_cas_view_admission");
+            match (parts.as_slice(), read::<FamilyRow>(tx, h)?) {
+                ([root], FamilyRow::Root { members }) => {
+                    families.entry(root.clone()).or_default().0 = Some(members);
+                }
+                ([root, member], FamilyRow::Member { set }) => {
+                    let set_header = tx
+                        .get(&RowKey::RequestSet(set))?
+                        .context("state_v2_reference_missing")?;
+                    charged = charged.saturating_add(set_header.len);
+                    ensure!(charged <= 8 * 1024 * 1024, "state_v2_cas_view_admission");
+                    families
+                        .entry(root.clone())
+                        .or_default()
+                        .1
+                        .insert(member.clone(), load_strings(tx, set)?);
+                }
+                _ => anyhow::bail!("state_v2_census_family_key"),
+            }
+        }
+        after = page.last().map(|h| h.key.clone());
+    }
+    for (root, (count, members)) in families {
+        ensure!(
+            count == Some(members.len() as u64),
+            "state_v2_census_partial"
+        );
+        index
+            .claude_usage_family_pending
+            .get_mut(&root)
+            .context("state_v2_census_partial")?
+            .member_request_id_hashes = members;
+    }
+    Ok(())
+}
+
 pub(super) fn references(
     h: &Header,
     value: &dyn Value,

@@ -135,7 +135,10 @@ fn header(table: Table, row: &rusqlite::Row<'_>) -> rusqlite::Result<Header> {
             RowKey::RequestSet(row.get(1)?)
         };
         let version: u32 = row.get(if table == Table::Records { 3 } else { 4 })?;
-        ensure!(version == 1, "scan_index_representation_refused");
+        ensure!(
+            value_version_supported(&key, version),
+            "scan_index_representation_refused"
+        );
         let shared = if table == Table::RequestSets {
             Some((row.get(2)?, row.get(3)?))
         } else {

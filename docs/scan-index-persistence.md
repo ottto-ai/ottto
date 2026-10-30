@@ -482,13 +482,32 @@ with `ProgressRecovery::seal_import`; this operation does not infer ownership fr
 filename. Backup/recovery owners must use `RecoverySet::capture` in the consistent
 DB snapshot and protect the companion plus every exact `resume.checkpoint` reference.
 The descriptor binds DB identity/generation, the complete receipt digest, ordered
-reference keys/positions and exact value digests. Reconcile newer external receipts
-before restore/collection, and verify the descriptor before GC; any missing or
-mismatched member holds and is counted. These owner hooks do not enable conversion
-or implement backup orchestration. Companions contain private local state and share
-the source's backup, erasure and immediate-removal obligations.
+reference keys/positions, exact encoded tuples and value digests. Before fence
+publication, the import owner persists a private `.v2-recovery` bundle containing
+the closed import DB, independently retained fence bytes, companion, baselines
+and copied exact restart files. Every restart copy is checked against its trailer.
+The descriptor is published last and read back before fence replacement starts.
+Explicit restore verifies every member and replays newer external receipts first;
+newer or conflicting custody refuses restoration without overwriting progress.
+The bundle is removed before a later semantic write can retire private state,
+and immediately on source erasure. It covers the sealed import, rather than a
+rolling backup of later saves. Destructive migrations require an independently
+verified bundle for the exact database; a DB-only copy is insufficient.
+Companions share the source's erasure and immediate-removal obligations.
 
 Explicit source erasure also removes the exact ACK companion. Maintenance reports
 its count/bytes through `ack_receipt_inventory`; inventory alone grants no recovery
 or GC authority. Baseline age/escalation gauges refresh after import preservation,
 on authenticated saves and at maintenance/load boundaries.
+
+Deferred selected-save custody uses version 2 of `unit.deferred`: a bounded
+manifest at position zero names exact before/after headers and payload positions;
+other positions hold original row bytes. Keys and payloads inherit their owner
+classes. Old version-1 carries retain a legacy decoder whose per-payload scratch
+descriptors can exhaust the process limit; this remains an activation blocker. Private anonymous scratch files
+stream planned values with one shared file descriptor per plan/carry; they are
+unlinked before receiving private bytes. Metadata retains its 8 MiB admission,
+individual payloads retain their kind limits, and selected writes plus deferred
+custody retain the 256 MiB transaction ceiling. Excess custody holds the save and
+raises the oversize alarm; it is never truncated or acknowledged. These seams do
+not enable conversion: the Claude route still returns `publication_pending`.

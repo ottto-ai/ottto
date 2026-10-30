@@ -243,6 +243,7 @@ pub(super) fn cleanup_unpublished(path: &Path, latched: bool) -> Result<u64> {
         !latched && !exists(&sibling(path, ".v2.sqlite"))? && read(path)?.is_none(),
         Hold::DbUnavailable
     );
+    super::recovery_backup::erase(path)?;
     let mut removed = 0;
     for suffix in [
         ".v2.sqlite.import",

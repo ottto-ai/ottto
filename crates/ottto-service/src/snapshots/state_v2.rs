@@ -28,10 +28,12 @@ mod kinds_census;
 mod kinds_files;
 mod kinds_misc;
 mod packed;
+mod recovery_backup;
 mod shape;
 mod sqlite;
 mod units;
 mod units_graph;
+mod units_spool;
 use kinds::KindCx;
 
 /// Runtime-only custody carrier. Only the verified v2 load route may install it.
@@ -454,9 +456,17 @@ impl Write for Preflight {
         Ok(())
     }
 }
+fn value_version_supported(key: &RowKey, version: u32) -> bool {
+    version == 1
+        || version == 2
+            && matches!(key, RowKey::Record { kind, .. } if kind.name() == "unit.deferred")
+}
 fn preflight(row: &RowInput<'_>) -> Result<Header> {
     admit_header(row.key, row.fixed)?;
-    anyhow::ensure!(row.value_version == 1, "scan_index_representation_refused");
+    anyhow::ensure!(
+        value_version_supported(row.key, row.value_version),
+        "scan_index_representation_refused"
+    );
     let mut out = Preflight {
         hash: value_digest_start(row.value_version),
         bytes: 0,

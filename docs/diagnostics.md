@@ -1519,3 +1519,11 @@ buckets; already stripped proof cannot be recovered from the hint ledger.
 Upstream authority-key allocation loss remains fail-closed: inherited partitions
 are not reclassified as request proof by budget recovery or a uniform starting-account
 retry. Only an intact current grouping can enter the cap allocator.
+
+The default-OFF Claude state-v2 route also emits `growth_claim_refused` with fixed
+lineage/publication labels and `recovery_backup_verified` / `recovery_backup_restored`
+counts. Backup verification is evidence for a sealed import only; it is not a
+rolling-backup, restore-qualification or collection-activation claim. Streamed
+selected saves retain `unit_selected`, `unit_deferred`, charge rows/bytes/pages,
+`unit_oversize_alarm`, retained-account-window counts and `save_page_reduced`.
+These events contain no keys, paths, restart names, reference tuples or digests.

@@ -159,6 +159,16 @@ pub(super) trait Mapper {
         let _ = (db, identity, prev, index, cx);
         Ok(false)
     }
+    fn selected_claim_save(
+        &self,
+        db: &mut sqlite::Sqlite,
+        identity: &Identity,
+        prev: &ScanIndex,
+        index: &mut ScanIndex,
+        cx: &mut KindCx,
+    ) -> Result<bool> {
+        self.selected_save(db, identity, prev, index, cx)
+    }
     fn restore_selected(
         &self,
         db: &mut sqlite::Sqlite,
@@ -282,6 +292,25 @@ impl Mapper for ClaudeMapper {
         )?;
         Ok(true)
     }
+    fn selected_claim_save(
+        &self,
+        db: &mut sqlite::Sqlite,
+        identity: &Identity,
+        prev: &ScanIndex,
+        index: &mut ScanIndex,
+        cx: &mut KindCx,
+    ) -> Result<bool> {
+        self.save_admitted_mode(
+            db,
+            identity,
+            prev,
+            index,
+            cx,
+            &mut kinds_files::NoResumeHooks,
+            true,
+        )?;
+        Ok(true)
+    }
     fn restore_selected(
         &self,
         db: &mut sqlite::Sqlite,
@@ -293,6 +322,11 @@ impl Mapper for ClaudeMapper {
             identity(&mut tx)?
         };
         if let Some(mut desired) = units_graph::restore(db, &identity, index)? {
+            super::super::lenient_decode::post_decode_hydrated(
+                &mut desired,
+                "load",
+                "claude_code",
+            )?;
             self.save_admitted(
                 db,
                 &identity,
@@ -316,12 +350,27 @@ impl ClaudeMapper {
         cx: &mut KindCx,
         hooks: &mut dyn kinds_files::ResumeHooks,
     ) -> Result<()> {
+        self.save_admitted_mode(db, identity, prev, next, cx, hooks, false)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn save_admitted_mode(
+        &self,
+        db: &mut sqlite::Sqlite,
+        identity: &Identity,
+        prev: &ScanIndex,
+        next: &mut ScanIndex,
+        cx: &mut KindCx,
+        hooks: &mut dyn kinds_files::ResumeHooks,
+        claim_only: bool,
+    ) -> Result<()> {
         {
             let mut tx = db.begin(TxnMode::Read)?;
             kinds_misc::merge_cas_at(&mut tx, next, prev.generation)?;
             kinds_files::merge_growth_cas(&mut tx, next)?;
         }
-        next.retire_committed_claude_account_pending_windows();
+        if !claim_only {
+            next.retire_committed_claude_account_pending_windows();
+        }
         super::super::lenient_decode::check_held_output(next)?;
         let plan = units_graph::plan(db, identity, prev, next, cx, hooks)?;
         kinds::save_selected(db, prev, next, cx, plan, hooks, self)
@@ -965,10 +1014,11 @@ impl Original {
         self.progress
             .as_ref()
             .ok_or(Pause::Mismatch)?
-            .with_sealed_import(path, identity, db, |db, _recovery| {
+            .with_sealed_import(path, identity, db, |db, recovery| {
                 db.finish_import()?;
                 fence::boundary(fence::Boundary::ImportFinished)?;
                 self.unchanged()?;
+                super::recovery_backup::persist_import(path, recovery)?;
                 fence::publish(path, identity, latched)
             })
     }

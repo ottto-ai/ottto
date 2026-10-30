@@ -6,6 +6,8 @@ use anyhow::{bail, ensure, Context};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use units::{Change, Planner, Schedule, Scope, Selection};
+use units_spool::{Arena, Builder, Payload};
+const SPOOL_LIMIT: u64 = 512 * 1024 * 1024;
 
 const SCRATCH: usize = 8 * 1024 * 1024;
 const CARRY: &str = "unit.deferred";
@@ -17,23 +19,6 @@ impl Value for Bytes<'_> {
         Ok(())
     }
 }
-struct Limited<'a> {
-    bytes: &'a mut Vec<u8>,
-    cap: usize,
-}
-impl Write for Limited<'_> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.bytes.len().saturating_add(bytes.len()) > self.cap {
-            return Err(std::io::Error::other("state_v2_save_admission"));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// The packed and expanded forms must both satisfy restoration admission.
 fn admit_json(value: &impl Serialize, cap: usize) -> Result<()> {
     struct Count {
@@ -65,20 +50,20 @@ struct Mutation {
     after: Option<Header>,
     // None for a tombstone or a reference-only change to an existing value.
     #[serde(with = "payload")]
-    value: Option<Arc<Vec<u8>>>,
+    value: Option<Arc<Payload>>,
 }
 mod payload {
     use super::*;
     pub fn serialize<S: serde::Serializer>(
-        value: &Option<Arc<Vec<u8>>>,
+        value: &Option<Arc<Payload>>,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         value.as_deref().serialize(serializer)
     }
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
-    ) -> std::result::Result<Option<Arc<Vec<u8>>>, D::Error> {
-        Option::<Vec<u8>>::deserialize(deserializer).map(|value| value.map(Arc::new))
+    ) -> std::result::Result<Option<Arc<Payload>>, D::Error> {
+        Option::<Payload>::deserialize(deserializer).map(|value| value.map(Arc::new))
     }
 }
 impl Mutation {
@@ -113,7 +98,7 @@ impl Mutation {
                     key: &self.key,
                     fixed: &h.fixed,
                     value_version: h.value_version,
-                    value: &Bytes(value),
+                    value: value.as_ref(),
                 })? == *h,
                 "state_v2_deferred_digest"
             );
@@ -154,10 +139,10 @@ pub(super) fn owns_header(header: &Header) -> Result<bool> {
         return Ok(false);
     }
     ensure!(
-        header.key == carry_key()?
+        matches!(&header.key, RowKey::Record { key_bytes, position, .. } if key_bytes.is_empty() && (*position == 0 || header.value_version == 2))
             && header.fixed == Fixed::None
-            && header.value_version == 1
-            && header.len <= SCRATCH as u64,
+            && matches!(header.value_version, 1 | 2)
+            && header.len <= VALUE_BYTES,
         "state_v2_deferred_shape"
     );
     Ok(true)
@@ -165,35 +150,111 @@ pub(super) fn owns_header(header: &Header) -> Result<bool> {
 fn is_carry(key: &RowKey) -> bool {
     matches!(key, RowKey::Record { kind, .. } if kind.name() == CARRY)
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredMutation {
+    key: RowKey,
+    before: Option<Header>,
+    after: Option<Header>,
+    payload_position: Option<u64>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Manifest {
+    version: u32,
+    identity: Identity,
+    generation: u64,
+    mutations: Vec<StoredMutation>,
+}
+fn payload_key(position: u64) -> Result<RowKey> {
+    RowKey::record(CARRY, Vec::new(), position)
+}
 fn carry(
     tx: &mut dyn Transaction,
     identity: &Identity,
     generation: u64,
 ) -> Result<Option<Deferred>> {
     let Some(h) = tx.get(&carry_key()?)? else {
+        ensure!(
+            tx.scan_kind(&RecordKind::parse(CARRY)?, None, 1)?
+                .is_empty(),
+            "state_v2_deferred_orphan"
+        );
         return Ok(None);
     };
     ensure!(
-        h.len <= SCRATCH as u64 && h.value_version == 1,
+        h.len <= SCRATCH as u64 && matches!(h.value_version, 1 | 2),
         "state_v2_deferred_admission"
     );
-    let mut bytes = Vec::new();
-    tx.read_value(
-        &h,
-        &mut Limited {
-            bytes: &mut bytes,
-            cap: SCRATCH,
-        },
-    )?;
-    let mut json = Vec::new();
-    packed::decode(
-        bytes.as_slice(),
-        &mut Limited {
-            bytes: &mut json,
-            cap: SCRATCH,
-        },
-    )?;
-    let carry: Deferred = serde_json::from_slice(&json)?;
+    let mut bytes = Builder::new(SCRATCH as u64)?;
+    tx.read_value(&h, &mut bytes)?;
+    let bytes = bytes.finish()?;
+    let mut json = Builder::new(SCRATCH as u64)?;
+    packed::decode(bytes.reader(), &mut json)?;
+    let json = json.finish()?;
+    let carry: Deferred = if h.value_version == 1 {
+        serde_json::from_reader(json.reader())?
+    } else {
+        let manifest: Manifest = serde_json::from_reader(json.reader())?;
+        ensure!(
+            manifest.version == 2
+                && manifest.identity == *identity
+                && manifest.generation == generation
+                && manifest.mutations.len() <= 65_536,
+            "state_v2_deferred_binding"
+        );
+        let mut mutations = Vec::new();
+        let mut arena = Arena::default();
+        let mut positions = BTreeSet::new();
+        let mut charged = 0_u64;
+        for m in manifest.mutations {
+            let value = if let Some(position) = m.payload_position {
+                ensure!(
+                    position > 0 && positions.insert(position),
+                    "state_v2_deferred_payload"
+                );
+                let payload = tx
+                    .get(&payload_key(position)?)?
+                    .context("state_v2_deferred_payload")?;
+                ensure!(
+                    payload.value_version == 2
+                        && payload.fixed == Fixed::None
+                        && payload.len <= VALUE_BYTES,
+                    "state_v2_deferred_payload"
+                );
+                charged = charged.saturating_add(payload.len);
+                ensure!(charged <= SPOOL_LIMIT, "state_v2_deferred_admission");
+                Some(Arc::new(
+                    arena.append(payload.len, |out| tx.read_value(&payload, out))?,
+                ))
+            } else {
+                None
+            };
+            mutations.push(Mutation {
+                key: m.key,
+                before: m.before,
+                after: m.after,
+                value,
+            });
+        }
+        let mut count = 0;
+        let mut after = None;
+        loop {
+            let page = tx.scan_kind(&RecordKind::parse(CARRY)?, after.as_ref(), 128)?;
+            if page.is_empty() {
+                break;
+            }
+            count += page.len();
+            after = page.last().map(|h| h.key.clone());
+        }
+        ensure!(count == positions.len() + 1, "state_v2_deferred_orphan");
+        Deferred {
+            version: 1,
+            identity: manifest.identity,
+            generation: manifest.generation,
+            mutations,
+        }
+    };
     ensure!(
         carry.version == 1
             && carry.identity == *identity
@@ -219,6 +280,7 @@ struct Recording<'a> {
     inner: &'a mut dyn Transaction,
     rows: BTreeMap<RowKey, Mutation>,
     bytes: usize,
+    arena: Arena,
 }
 impl<'a> Recording<'a> {
     fn new(inner: &'a mut dyn Transaction) -> Self {
@@ -226,6 +288,7 @@ impl<'a> Recording<'a> {
             inner,
             rows: BTreeMap::new(),
             bytes: 0,
+            arena: Arena::default(),
         }
     }
     fn page(
@@ -278,16 +341,14 @@ impl<'a> Recording<'a> {
         &mut self,
         key: &RowKey,
         after: Option<Header>,
-        value: Option<Arc<Vec<u8>>>,
+        value: Option<Arc<Payload>>,
     ) -> Result<()> {
         let before = match self.rows.get(key) {
             Some(m) => m.before.clone(),
             None => self.inner.get(key)?,
         };
-        let old_cost = self.rows.get(key).map_or(0, |m| {
-            m.value.as_ref().map_or(0, |v| v.len()) + metadata_cost(key)
-        });
-        let cost = value.as_ref().map_or(0, |v| v.len()) + metadata_cost(key);
+        let old_cost = self.rows.get(key).map_or(0, |_| metadata_cost(key));
+        let cost = metadata_cost(key);
         let bytes = self
             .bytes
             .saturating_sub(old_cost)
@@ -335,8 +396,7 @@ impl Transaction for Recording<'_> {
         if let Some(m) = self.rows.get(&header.key) {
             ensure!(m.after.as_ref() == Some(header), "state_v2_unit_stale_plan");
             if let Some(bytes) = &m.value {
-                out.write_all(bytes)?;
-                return Ok(());
+                return bytes.write(out);
             }
             let old = m.before.as_ref().context("state_v2_deferred_value")?;
             return self.inner.read_value(old, out);
@@ -345,18 +405,20 @@ impl Transaction for Recording<'_> {
     }
     fn put(&mut self, row: RowInput<'_>) -> Result<Header> {
         let h = preflight(&row)?;
-        ensure!(
-            h.len as usize + self.bytes <= SCRATCH,
-            "state_v2_save_admission"
-        );
-        let mut bytes = Vec::new();
-        row.value.write(&mut Limited {
-            bytes: &mut bytes,
-            cap: SCRATCH - self.bytes,
-        })?;
+        let payload_bytes: u64 = self
+            .rows
+            .values()
+            .filter_map(|m| m.value.as_ref())
+            .map(|v| v.len())
+            .sum();
+        if payload_bytes.saturating_add(h.len) > SPOOL_LIMIT {
+            telemetry::event("unit_oversize_alarm", &1);
+            bail!(Hold::SaveAdmission);
+        }
+        let bytes = self.arena.append(h.len, |out| row.value.write(out))?;
         ensure!(
             preflight(&RowInput {
-                value: &Bytes(&bytes),
+                value: &bytes,
                 ..row
             })? == h,
             "state_v2_value_changed_after_preflight"
@@ -370,21 +432,11 @@ impl Transaction for Recording<'_> {
         Ok(present)
     }
     fn value_matches(&mut self, h: &Header, value: &dyn Value) -> Result<bool> {
-        let mut old = Vec::new();
-        ensure!(h.len as usize <= SCRATCH, "state_v2_save_admission");
-        self.read_value(
-            h,
-            &mut Limited {
-                bytes: &mut old,
-                cap: SCRATCH,
-            },
-        )?;
-        let mut new = Vec::new();
-        value.write(&mut Limited {
-            bytes: &mut new,
-            cap: SCRATCH,
-        })?;
-        Ok(old == new)
+        let mut old = Builder::new(h.len)?;
+        self.read_value(h, &mut old)?;
+        let old = old.finish()?;
+        let new = Payload::capture(value, value_cap(&h.key))?;
+        old.matches(&new)
     }
     fn request_set_candidates(
         &mut self,
@@ -420,14 +472,9 @@ impl Transaction for Recording<'_> {
             self.delete(key)?;
             return Ok(0);
         }
-        let mut value = Vec::new();
-        self.read_value(
-            &h,
-            &mut Limited {
-                bytes: &mut value,
-                cap: SCRATCH,
-            },
-        )?;
+        let mut value = Builder::new(h.len)?;
+        self.read_value(&h, &mut value)?;
+        let value = value.finish()?;
         let after = preflight(&RowInput {
             key,
             fixed: &Fixed::RequestSet {
@@ -435,7 +482,7 @@ impl Transaction for Recording<'_> {
                 refs: refs as u64,
             },
             value_version: h.value_version,
-            value: &Bytes(&value),
+            value: &value,
         })?;
         let bytes = self.rows.get(key).and_then(|m| m.value.clone());
         self.replace(key, Some(after), bytes)?;
@@ -513,7 +560,7 @@ impl RowPlan {
                                 key: &m.key,
                                 fixed: &h.fixed,
                                 value_version: h.value_version,
-                                value: &Bytes(bytes)
+                                value: bytes.as_ref()
                             })? == *h,
                             "state_v2_unit_changed"
                         );
@@ -586,13 +633,14 @@ fn scopes(m: &Mutation, tx: &mut Recording<'_>) -> Result<Vec<Scope>> {
     };
     for h in [m.before.as_ref(), m.after.as_ref()].into_iter().flatten() {
         if matches!(h.key, RowKey::Record { .. }) {
-            let mut bytes = Vec::new();
+            let mut bytes = Builder::new(h.len)?;
             if m.after.as_ref() == Some(h) {
                 tx.read_value(h, &mut bytes)?;
             } else {
                 tx.inner.read_value(h, &mut bytes)?;
             }
-            kinds::references(h, &Bytes(&bytes), &mut |key| {
+            let bytes = bytes.finish()?;
+            kinds::references(h, &bytes, &mut |key| {
                 let RowKey::RequestSet(id) = key else {
                     bail!("state_v2_reference_kind")
                 };
@@ -698,51 +746,99 @@ pub(super) fn plan(
             }
         }
         let has_deferred = !deferred.is_empty();
-        let key = carry_key()?;
-        let before = recorder.inner.get(&key)?;
-        let custody = if has_deferred {
-            let deferred = Deferred {
-                version: 1,
-                identity: identity.clone(),
-                generation: next.generation,
-                mutations: deferred,
+        let mut custody_rows = BTreeMap::new();
+        let mut manifest = Manifest {
+            version: 2,
+            identity: identity.clone(),
+            generation: next.generation,
+            mutations: Vec::new(),
+        };
+        for (n, m) in deferred.into_iter().enumerate() {
+            let position = n as u64 + 1;
+            let payload_position = if let Some(value) = m.value {
+                let key = payload_key(position)?;
+                let h = preflight(&RowInput {
+                    key: &key,
+                    fixed: &Fixed::None,
+                    value_version: 2,
+                    value: value.as_ref(),
+                })?;
+                custody_rows.insert(
+                    key.clone(),
+                    Mutation {
+                        before: recorder.inner.get(&key)?,
+                        key,
+                        after: Some(h),
+                        value: Some(value),
+                    },
+                );
+                Some(position)
+            } else {
+                None
             };
-            admit_json(&deferred, SCRATCH)?;
-            let value = packed::Json(&deferred);
+            manifest.mutations.push(StoredMutation {
+                key: m.key,
+                before: m.before,
+                after: m.after,
+                payload_position,
+            });
+        }
+        if has_deferred {
+            admit_json(&manifest, SCRATCH)?;
+            let key = carry_key()?;
+            let value = Arc::new(Payload::capture(&packed::Json(&manifest), SCRATCH as u64)?);
             let h = preflight(&RowInput {
                 key: &key,
                 fixed: &Fixed::None,
-                value_version: 1,
-                value: &value,
+                value_version: 2,
+                value: value.as_ref(),
             })?;
-            ensure!(h.len <= SCRATCH as u64, "state_v2_deferred_admission");
-            let mut bytes = Vec::new();
-            value.write(&mut Limited {
-                bytes: &mut bytes,
-                cap: SCRATCH,
-            })?;
-            Some(Mutation {
-                key: key.clone(),
-                before,
-                after: Some(h),
-                value: Some(Arc::new(bytes)),
-            })
-        } else {
-            before.map(|h| Mutation {
-                key: key.clone(),
-                before: Some(h),
-                after: None,
-                value: None,
-            })
-        };
-        if let Some(custody) = custody {
-            selection.add_custody(custody.change())?;
+            custody_rows.insert(
+                key.clone(),
+                Mutation {
+                    before: recorder.inner.get(&key)?,
+                    key,
+                    after: Some(h),
+                    value: Some(value),
+                },
+            );
+        }
+        let mut after = None;
+        loop {
+            let page = recorder
+                .inner
+                .scan_kind(&RecordKind::parse(CARRY)?, after.as_ref(), 128)?;
+            if page.is_empty() {
+                break;
+            }
+            for h in &page {
+                custody_rows
+                    .entry(h.key.clone())
+                    .or_insert_with(|| Mutation {
+                        key: h.key.clone(),
+                        before: Some(h.clone()),
+                        after: None,
+                        value: None,
+                    });
+            }
+            after = page.last().map(|h| h.key.clone());
+        }
+        // Include every byte of the deferred payloads, their prior versions,
+        // metadata and tombstones in the same selected transaction admission.
+        for (key, custody) in custody_rows {
+            if custody.before == custody.after {
+                continue;
+            }
+            if let Err(error) = selection.add_custody(custody.change()) {
+                telemetry::event("unit_oversize_alarm", &1);
+                return Err(error);
+            }
             selected_rows.insert(key, custody);
         }
         // Hydrate the selected semantic projection with the exact staged-ref
         // plan. Deferred mutations never masquerade as committed graph state.
         recorder.rows = selected_rows.clone();
-        recorder.rows.remove(&carry_key()?);
+        recorder.rows.retain(|key, _| !is_carry(key));
         let generation_key = RowKey::Meta("generation".into());
         let generation = next.generation;
         recorder.put(RowInput {
@@ -754,7 +850,11 @@ pub(super) fn plan(
         // Release the working persisted graph before allocating its admitted
         // projection. Keep only runtime ownership/policy on the caller shell.
         discard_working(next);
-        let (graph, context) = kinds::hydrate_txn(&mut recorder, identity.binding.clone())?;
+        let (mut graph, context) = kinds::hydrate_txn(&mut recorder, identity.binding.clone())?;
+        // Normalize this unpublished committed projection, never the mutated
+        // working graph that admission consumed. Metadata still describes the
+        // exact selected rows, including retained raw repair evidence.
+        super::super::lenient_decode::post_decode_hydrated(&mut graph, "cas", "claude_code")?;
         Ok(Planned {
             selection,
             rows: RowPlan {
@@ -827,7 +927,7 @@ pub(super) fn private_paths(
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     ensure!(
-        is_carry(&header.key) && header.value_version == 1,
+        is_carry(&header.key) && matches!(header.value_version, 1 | 2),
         "state_v2_deferred_shape"
     );
     // The entire inert journal inherits PL from its contained keys and values.

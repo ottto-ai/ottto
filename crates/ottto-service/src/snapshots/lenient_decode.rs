@@ -1456,6 +1456,28 @@ fn family_hold_roots<'a>(holds: &'a BTreeMap<&'static str, HeldSlots>) -> BTreeS
         .collect()
 }
 
+// CAS materializes only roots that can acquire raw sibling custody. Other
+// authorities/quarantines are normalized one record/family at a time.
+pub(super) fn cas_hold_roots(index: &ScanIndex) -> BTreeSet<String> {
+    family_hold_roots(&index.decode_holds.0)
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+pub(super) fn add_cas_provenance(target: &mut ScanIndex, normalized: &ScanIndex) {
+    target.decode_holds.1.sum = target
+        .decode_holds
+        .1
+        .sum
+        .wrapping_add(normalized.decode_holds.1.sum);
+    target.decode_holds.1.count = target
+        .decode_holds
+        .1
+        .count
+        .checked_add(normalized.decode_holds.1.count)
+        .expect("record admission");
+}
+
 fn authority_is_unbound(index: &ScanIndex, key: &str) -> bool {
     index
         .claude_usage_authority_quarantine

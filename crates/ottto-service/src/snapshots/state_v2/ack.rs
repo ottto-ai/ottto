@@ -535,6 +535,8 @@ struct ResumeReference {
     key: Vec<u8>,
     position: u64,
     digest: [u8; 32],
+    // Exact independently decodable reference tuple, not a content hash alone.
+    encoded: Vec<u8>,
 }
 fn control<T: serde::de::DeserializeOwned>(tx: &mut dyn Transaction, name: &str) -> Result<T> {
     let header = tx
@@ -594,23 +596,16 @@ impl RecoverySet {
                     charged <= 8 * 1024 * 1024 && resume.len() < 65_536,
                     "backup_size",
                 )?;
-                // Consume the exact reference to verify chunks as well as headers.
-                struct Sink(sha2::Sha256);
-                impl Write for Sink {
-                    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                        self.0.update(bytes);
-                        Ok(bytes.len())
-                    }
-                    fn flush(&mut self) -> std::io::Result<()> {
-                        Ok(())
-                    }
-                }
-                let mut sink = Sink(Sha256::new());
-                tx.read_value(header, &mut sink)?;
+                require(header.len <= MUTABLE_VALUE_BYTES, "backup_size")?;
+                charged = charged.saturating_add(header.len.saturating_mul(4));
+                require(charged <= 8 * 1024 * 1024, "backup_size")?;
+                let mut encoded = Vec::new();
+                tx.read_value(header, &mut encoded)?;
                 resume.push(ResumeReference {
                     key: key_bytes.clone(),
                     position: *position,
-                    digest: sink.0.finalize().into(),
+                    digest: Sha256::digest(&encoded).into(),
+                    encoded,
                 });
             }
             after = page.last().map(|h| h.key.clone());
@@ -622,6 +617,75 @@ impl RecoverySet {
         })
     }
 
+    pub(super) fn identity(&self) -> &Identity {
+        &self.scope.identity
+    }
+    pub(super) fn checkpoints(&self) -> Result<Vec<kinds_files::ResumeCheckpoint>> {
+        let mut checkpoints = Vec::new();
+        for reference in &self.resume {
+            require(
+                reference.position == 0
+                    && <[u8; 32]>::from(Sha256::digest(&reference.encoded)) == reference.digest,
+                "backup_resume",
+            )?;
+            let mut decoded = units_spool::Builder::new(MUTABLE_VALUE_BYTES)?;
+            packed::decode(reference.encoded.as_slice(), &mut decoded)?;
+            let decoded = decoded.finish()?;
+            let checkpoint: kinds_files::ResumeCheckpoint =
+                serde_json::from_reader(decoded.reader())?;
+            require(
+                checkpoint.binding == self.scope.identity.binding,
+                "backup_resume",
+            )?;
+            checkpoints.push(checkpoint);
+        }
+        Ok(checkpoints)
+    }
+    pub(super) fn reconcile_before_restore(
+        &self,
+        index_path: &Path,
+        progress_path: &Path,
+        backup_receipt: &Path,
+    ) -> Result<()> {
+        let companion = fence::sibling(index_path, ".v2-ack-receipt");
+        if read(&companion)?.is_none() {
+            let bytes = read(backup_receipt)?.context("state_v2_backup_receipt")?;
+            require(digest(&bytes) == self.receipt_digest, "backup_receipt")?;
+            ottto_core::write_owner_only_file_atomic(&companion, &bytes)?;
+            super::super::sync_checkpoint_parent(&companion)?;
+        }
+        let bytes = read(&companion)?.context("state_v2_backup_receipt")?;
+        let receipt: Receipt = serde_json::from_slice(&bytes)?;
+        require(
+            receipt.scope.identity == self.scope.identity,
+            "backup_receipt",
+        )?;
+        let recovery = ProgressRecovery {
+            scope: Scope {
+                identity: self.scope.identity.clone(),
+                generation: receipt.scope.generation.max(self.scope.generation),
+            },
+            path: companion,
+            db_path: None,
+        };
+        // Replay independently retained newer receipts BEFORE rejecting an old
+        // snapshot. Accepted external state is never rolled back to the backup.
+        recovery.recover(progress_path)?;
+        require(
+            receipt.scope.generation <= self.scope.generation
+                && digest(&bytes) == self.receipt_digest,
+            "backup_newer_receipt",
+        )?;
+        let db_path = fence::sibling(index_path, ".v2.sqlite");
+        if fence::exists(&db_path)? {
+            require(
+                sqlite::Sqlite::ack_generation(&db_path, &self.scope.identity)?
+                    == self.scope.generation,
+                "backup_newer_database",
+            )?;
+        }
+        Ok(())
+    }
     pub(super) fn verify(
         &self,
         tx: &mut dyn Transaction,

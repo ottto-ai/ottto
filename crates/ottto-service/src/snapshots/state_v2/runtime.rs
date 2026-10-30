@@ -229,6 +229,14 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
                         let (mut index, mut cx) = mapper.hydrate_context(&mut session.db)?;
                         ensure!(index.generation == stamp.0, Hold::DbUnavailable);
                         normalize_hydrated(&mut index)?;
+                        if session
+                            .db
+                            .begin(TxnMode::Read)?
+                            .get(&RowKey::record("unit.deferred", Vec::new(), 0)?)?
+                            .is_some()
+                        {
+                            super::recovery_backup::erase(path)?;
+                        }
                         mapper.restore_selected(&mut session.db, &mut index, &mut cx)?;
                         session.stamp = session.db.stamp()?;
                         ensure!(index.generation == session.stamp.0, Hold::DbUnavailable);
@@ -254,6 +262,14 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
             let stamp = db.stamp()?;
             super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
             let (mut index, mut cx) = mapper.hydrate_context(&mut db)?;
+            normalize_hydrated(&mut index)?;
+            if db
+                .begin(TxnMode::Read)?
+                .get(&RowKey::record("unit.deferred", Vec::new(), 0)?)?
+                .is_some()
+            {
+                super::recovery_backup::erase(path)?;
+            }
             mapper.restore_selected(&mut db, &mut index, &mut cx)?;
             let stamp = db.stamp()?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
@@ -503,10 +519,23 @@ fn preserve_baseline(path: &Path, original: Option<&import::Original>) -> Result
 }
 
 /// All save routes check independent evidence before any v1 CAS or publication.
-pub(in super::super) fn save_locked(path: &Path, index: &mut ScanIndex) -> Result<bool> {
-    save_with(path, index, &ClaudeMapper)
+pub(in super::super) fn save_locked(
+    path: &Path,
+    index: &mut ScanIndex,
+    claim_only: bool,
+) -> Result<bool> {
+    save_with_mode(path, index, &ClaudeMapper, claim_only)
 }
+#[cfg(test)]
 fn save_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Result<bool> {
+    save_with_mode(path, index, mapper, false)
+}
+fn save_with_mode<M: Mapper>(
+    path: &Path,
+    index: &mut ScanIndex,
+    mapper: &M,
+    claim_only: bool,
+) -> Result<bool> {
     let Some(binding) = binding(path) else {
         ensure!(index.persistence_v2.is_none(), Hold::ForeignBinding);
         return Ok(false);
@@ -514,6 +543,8 @@ fn save_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Resul
     if index.persistence_v2.is_none() && !route_needed(path, false)? {
         return Ok(false);
     }
+    // This accessor authenticates the owner/session; call before route/session locks.
+    let claim_generation = super::super::sampled_audit::own_growth_claim_generation(index, path);
     let result = held(with_state(path, |state| {
         let pair = fence::reconcile(path, &binding, state.latched)?;
         let Some(runtime) = index.persistence_v2.clone() else {
@@ -532,10 +563,22 @@ fn save_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Resul
         let _gauge = telemetry::Stage::new(telemetry::Kind::Save);
         let previous = state.cached.take().ok_or(Hold::ReloadRequired)?;
         ensure!(
-            previous.generation == session.stamp.0 && index.generation == previous.generation,
+            previous.generation == session.stamp.0
+                && claim_generation.unwrap_or(index.generation) == previous.generation,
             Hold::ReloadRequired
         );
-        if mapper.selected_save(
+        if claim_generation.is_some() {
+            index.generation = previous.generation;
+        }
+        super::ack::ProgressRecovery::recover_route(&identity, session.stamp.0, path)?;
+        super::recovery_backup::erase(path)?;
+        let selected = if claim_only {
+            M::selected_claim_save
+        } else {
+            M::selected_save
+        };
+        if selected(
+            mapper,
             &mut session.db,
             &identity,
             &previous,
@@ -552,7 +595,9 @@ fn save_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Resul
         // Identity is independently authenticated; generation is atomically
         // compared again by commit. Hold comparisons remain mapper-owned.
         mapper.merge_cas(&mut tx, index)?;
-        index.retire_committed_claude_account_pending_windows();
+        if !claim_only {
+            index.retire_committed_claude_account_pending_windows();
+        }
         lenient_check(index)?;
         let previous = index.generation;
         let next = previous.checked_add(1).ok_or(Hold::DbUnavailable)?;
@@ -588,6 +633,13 @@ fn save_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Resul
                     session.reload = true;
                 }
             }
+            Ok(())
+        })?;
+    }
+    if result.as_ref().is_ok_and(|saved| *saved) && !claim_only {
+        super::super::sampled_audit::renew_growth_claims(index, path);
+        with_state(path, |state| {
+            state.cached = Some(index.clone());
             Ok(())
         })?;
     }
@@ -859,6 +911,7 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
             Err(e) => return Err(e.into()),
         }
     }
+    super::recovery_backup::erase(path)?;
     super::ack::erase_failed_imports(path)?;
     super::super::sync_checkpoint_parent(path)?;
     let records = crate::durable_tail_store::store_dir_for_index(path);

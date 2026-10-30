@@ -908,349 +908,395 @@ pub(super) fn hydrate_txn(
     index: &mut ScanIndex,
     cx: &mut KindCx,
 ) -> Result<()> {
+    hydrate_filtered(tx, index, cx, None)
+}
+/// A current-snapshot CAS view contains only affected roots and the requested
+/// authority/witness kinds. Headers outside the view never decode payloads.
+pub(super) fn hydrate_filtered(
+    tx: &mut dyn Transaction,
+    index: &mut ScanIndex,
+    cx: &mut KindCx,
+    filter: Option<(&BTreeSet<String>, bool)>,
+) -> Result<()> {
     cx.accounts_ready = false;
+    let mut charged = 0_u64;
     let mut out = ScanIndex::default();
     let mut staged = KindCx::default();
     let mut pointers = BTreeMap::<String, (Option<u64>, u64)>::new();
     let mut slots = BTreeMap::new();
     let mut inventory = BTreeMap::<(String, String, u64), (Option<u64>, u64)>::new();
     for kind in KINDS {
+        if filter.is_some_and(|(_, authority_only)| {
+            authority_only && !matches!(*kind, "proof.usage" | "refusal.authority")
+        }) {
+            continue;
+        }
         let parsed = RecordKind::parse(kind)?;
-        let mut after = None;
-        loop {
-            let page = tx.scan_kind(&parsed, after.as_ref(), 64)?;
-            if page.is_empty() {
-                break;
-            }
-            after = page.last().map(|h| h.key.clone());
-            for h in page {
-                let RowKey::Record {
-                    key_bytes,
-                    position,
-                    ..
-                } = &h.key
-                else {
-                    bail!("accounts_row_kind")
-                };
-                let position = *position;
-                let components = decode(key_bytes)?;
-                let family = &components[0];
-                let part = read(tx, &h)?;
-                part.data.texts(&mut |s| {
-                    ensure!(s.len() <= KEY_BYTES, "state_v2_string_admission");
-                    Ok(())
-                })?;
-                ensure!(
-                    part.path == components[1..],
-                    "accounts_key_payload_mismatch"
-                );
-                let path: Vec<_> = part.path.iter().map(String::as_str).collect();
-                let root = path.is_empty();
-                let state = inventory
-                    .entry(((*kind).into(), family.clone(), position))
-                    .or_default();
-                if root {
-                    ensure!(state.0.is_none(), "accounts_duplicate_root");
-                    state.0 = Some(part.data.children().unwrap_or_else(|| {
-                        if *kind == "account.absent_members" {
-                            if let Data::Number(n) = part.data {
-                                return n;
+        let selected_roots: Vec<_> = match filter {
+            Some((roots, _)) => roots.iter().map(Some).collect(),
+            None => vec![None],
+        };
+        for only_root in selected_roots {
+            let mut after = if let Some(root) = only_root {
+                let mut lower = encode(&[root])?;
+                lower.pop(); // strict prefix sorts before the complete root row
+                Some(RowKey::record(kind, lower, 0)?)
+            } else {
+                None
+            };
+            loop {
+                let page = tx.scan_kind(&parsed, after.as_ref(), 64)?;
+                if page.is_empty() {
+                    break;
+                }
+                after = page.last().map(|h| h.key.clone());
+                for h in page {
+                    let RowKey::Record {
+                        key_bytes,
+                        position,
+                        ..
+                    } = &h.key
+                    else {
+                        bail!("accounts_row_kind")
+                    };
+                    let position = *position;
+                    let components = decode(key_bytes)?;
+                    let family = &components[0];
+                    if only_root.is_some_and(|root| root != family) {
+                        continue;
+                    }
+                    if filter.is_some() {
+                        charged = charged
+                            .saturating_add(h.len)
+                            .saturating_add(key_bytes.len() as u64 + 512);
+                        ensure!(charged <= 8 * 1024 * 1024, "state_v2_cas_view_admission");
+                    }
+                    let part = read(tx, &h)?;
+                    part.data.texts(&mut |s| {
+                        ensure!(s.len() <= KEY_BYTES, "state_v2_string_admission");
+                        Ok(())
+                    })?;
+                    ensure!(
+                        part.path == components[1..],
+                        "accounts_key_payload_mismatch"
+                    );
+                    let path: Vec<_> = part.path.iter().map(String::as_str).collect();
+                    let root = path.is_empty();
+                    let state = inventory
+                        .entry(((*kind).into(), family.clone(), position))
+                        .or_default();
+                    if root {
+                        ensure!(state.0.is_none(), "accounts_duplicate_root");
+                        state.0 = Some(part.data.children().unwrap_or_else(|| {
+                            if *kind == "account.absent_members" {
+                                if let Data::Number(n) = part.data {
+                                    return n;
+                                }
+                            }
+                            0
+                        }));
+                    } else {
+                        state.1 += 1;
+                    }
+                    match (*kind, path.as_slice(), part.data) {
+                        ("account.current", [], Data::Current { current, next }) => {
+                            ensure!(
+                                position == 0
+                                    && next > 0
+                                    && next <= i64::MAX as u64 + 1
+                                    && current.map_or(true, |id| id > 0 && id < next),
+                                "accounts_high_water"
+                            );
+                            pointers.insert(family.clone(), (current, next));
+                            if current.is_some() {
+                                out.claude_account_family_pending.insert(
+                                    family.clone(),
+                                    ClaudeAccountFamilyPending {
+                                        current: blank_window(),
+                                        previous_windows: Vec::new(),
+                                        confirmed_absent_members: BTreeSet::new(),
+                                    },
+                                );
                             }
                         }
-                        0
-                    }));
-                } else {
-                    state.1 += 1;
-                }
-                match (*kind, path.as_slice(), part.data) {
-                    ("account.current", [], Data::Current { current, next }) => {
-                        ensure!(
-                            position == 0
-                                && next > 0
-                                && next <= i64::MAX as u64 + 1
-                                && current.map_or(true, |id| id > 0 && id < next),
-                            "accounts_high_water"
-                        );
-                        pointers.insert(family.clone(), (current, next));
-                        if current.is_some() {
-                            out.claude_account_family_pending.insert(
+                        (
+                            "account_window",
+                            [],
+                            Data::Window {
+                                version,
+                                boundary,
+                                account,
+                                evidence,
+                                complete,
+                                invalid,
+                                ..
+                            },
+                        ) => {
+                            let (current, next) =
+                                pointers.get(family).context("accounts_pointer_missing")?;
+                            let current = current.context("accounts_pointer_empty")?;
+                            ensure!(
+                                position > 0 && position < *next && position <= current,
+                                "accounts_window_order"
+                            );
+                            let p = out
+                                .claude_account_family_pending
+                                .get_mut(family)
+                                .context("accounts_family_missing")?;
+                            let w = ClaudeAccountFamilyPendingWindow {
+                                version,
+                                census_window_end: boundary,
+                                account_identifier_hash: account,
+                                evidence_request_count: evidence,
+                                census_complete: complete,
+                                invalid,
+                                members: BTreeMap::new(),
+                                member_requests: BTreeMap::new(),
+                            };
+                            let slot = if current == position {
+                                p.current = w;
+                                None
+                            } else {
+                                let at = p.previous_windows.len();
+                                p.previous_windows.push(w);
+                                Some(at)
+                            };
+                            ensure!(
+                                slots.insert((family.clone(), position), slot).is_none(),
+                                "accounts_duplicate_window"
+                            );
+                        }
+                        ("account_window", ["members", m], Data::Number(n)) => {
+                            active_window(&mut out, &slots, family, position)?
+                                .members
+                                .insert((*m).into(), n);
+                        }
+                        ("account_window", ["requests", m], Data::Shared(id)) => {
+                            let set = account_set(tx, id)?;
+                            active_window(&mut out, &slots, family, position)?
+                                .member_requests
+                                .insert((*m).into(), set);
+                        }
+                        ("account.absent_members", [], Data::Number(_)) => {
+                            ensure!(
+                                position == 0
+                                    && out.claude_account_family_pending.contains_key(family),
+                                "accounts_family_missing"
+                            );
+                        }
+                        ("account.absent_members", [m], Data::Empty) => {
+                            out.claude_account_family_pending
+                                .get_mut(family)
+                                .context("accounts_family_missing")?
+                                .confirmed_absent_members
+                                .insert((*m).into());
+                        }
+                        (
+                            "usage.pending",
+                            [],
+                            Data::Usage {
+                                boundary,
+                                invalid,
+                                idless,
+                                ..
+                            },
+                        ) => {
+                            out.claude_usage_family_pending.insert(
                                 family.clone(),
-                                ClaudeAccountFamilyPending {
-                                    current: blank_window(),
-                                    previous_windows: Vec::new(),
-                                    confirmed_absent_members: BTreeSet::new(),
+                                ClaudeUsageFamilyPending {
+                                    census_window_end: boundary,
+                                    member_request_id_hashes: BTreeMap::new(),
+                                    member_occurrences: BTreeMap::new(),
+                                    invalid,
+                                    idless_revision: idless,
                                 },
                             );
                         }
-                    }
-                    (
-                        "account_window",
-                        [],
-                        Data::Window {
-                            version,
-                            boundary,
-                            account,
-                            evidence,
-                            complete,
-                            invalid,
-                            ..
-                        },
-                    ) => {
-                        let (current, next) =
-                            pointers.get(family).context("accounts_pointer_missing")?;
-                        let current = current.context("accounts_pointer_empty")?;
-                        ensure!(
-                            position > 0 && position < *next && position <= current,
-                            "accounts_window_order"
-                        );
-                        let p = out
-                            .claude_account_family_pending
-                            .get_mut(family)
-                            .context("accounts_family_missing")?;
-                        let w = ClaudeAccountFamilyPendingWindow {
-                            version,
-                            census_window_end: boundary,
-                            account_identifier_hash: account,
-                            evidence_request_count: evidence,
-                            census_complete: complete,
-                            invalid,
-                            members: BTreeMap::new(),
-                            member_requests: BTreeMap::new(),
-                        };
-                        let slot = if current == position {
-                            p.current = w;
-                            None
-                        } else {
-                            let at = p.previous_windows.len();
-                            p.previous_windows.push(w);
-                            Some(at)
-                        };
-                        ensure!(
-                            slots.insert((family.clone(), position), slot).is_none(),
-                            "accounts_duplicate_window"
-                        );
-                    }
-                    ("account_window", ["members", m], Data::Number(n)) => {
-                        active_window(&mut out, &slots, family, position)?
-                            .members
-                            .insert((*m).into(), n);
-                    }
-                    ("account_window", ["requests", m], Data::Shared(id)) => {
-                        let set = account_set(tx, id)?;
-                        active_window(&mut out, &slots, family, position)?
-                            .member_requests
-                            .insert((*m).into(), set);
-                    }
-                    ("account.absent_members", [], Data::Number(_)) => {
-                        ensure!(
-                            position == 0 && out.claude_account_family_pending.contains_key(family),
-                            "accounts_family_missing"
-                        );
-                    }
-                    ("account.absent_members", [m], Data::Empty) => {
-                        out.claude_account_family_pending
-                            .get_mut(family)
-                            .context("accounts_family_missing")?
-                            .confirmed_absent_members
-                            .insert((*m).into());
-                    }
-                    (
-                        "usage.pending",
-                        [],
-                        Data::Usage {
-                            boundary,
-                            invalid,
-                            idless,
-                            ..
-                        },
-                    ) => {
-                        out.claude_usage_family_pending.insert(
-                            family.clone(),
-                            ClaudeUsageFamilyPending {
-                                census_window_end: boundary,
-                                member_request_id_hashes: BTreeMap::new(),
-                                member_occurrences: BTreeMap::new(),
-                                invalid,
-                                idless_revision: idless,
+                        ("usage.pending", [m], Data::Empty) => {
+                            out.claude_usage_family_pending
+                                .get_mut(family)
+                                .context("accounts_usage_missing")?
+                                .member_occurrences
+                                .insert((*m).into(), BTreeMap::new());
+                        }
+                        ("usage.pending", [m, r], Data::Occurrence(o)) => {
+                            out.claude_usage_family_pending
+                                .get_mut(family)
+                                .context("accounts_usage_missing")?
+                                .member_occurrences
+                                .get_mut(*m)
+                                .context("accounts_member_missing")?
+                                .insert((*r).into(), o);
+                        }
+                        (
+                            "proof.account",
+                            [],
+                            Data::AccountProof {
+                                account, evidence, ..
                             },
-                        );
-                    }
-                    ("usage.pending", [m], Data::Empty) => {
-                        out.claude_usage_family_pending
-                            .get_mut(family)
-                            .context("accounts_usage_missing")?
-                            .member_occurrences
-                            .insert((*m).into(), BTreeMap::new());
-                    }
-                    ("usage.pending", [m, r], Data::Occurrence(o)) => {
-                        out.claude_usage_family_pending
-                            .get_mut(family)
-                            .context("accounts_usage_missing")?
-                            .member_occurrences
-                            .get_mut(*m)
-                            .context("accounts_member_missing")?
-                            .insert((*r).into(), o);
-                    }
-                    (
-                        "proof.account",
-                        [],
-                        Data::AccountProof {
-                            account, evidence, ..
-                        },
-                    ) => {
-                        out.claude_account_family_witnesses.insert(
-                            family.clone(),
-                            ClaudeAccountFamilyWitness {
-                                account_identifier_hash: account,
-                                evidence_request_count: evidence,
-                                members: BTreeMap::new(),
-                                member_request_id_fingerprints: BTreeMap::new(),
+                        ) => {
+                            out.claude_account_family_witnesses.insert(
+                                family.clone(),
+                                ClaudeAccountFamilyWitness {
+                                    account_identifier_hash: account,
+                                    evidence_request_count: evidence,
+                                    members: BTreeMap::new(),
+                                    member_request_id_fingerprints: BTreeMap::new(),
+                                },
+                            );
+                        }
+                        ("proof.account", ["members", m], Data::Number(n)) => {
+                            out.claude_account_family_witnesses
+                                .get_mut(family)
+                                .context("accounts_proof_missing")?
+                                .members
+                                .insert((*m).into(), n);
+                        }
+                        ("proof.account", ["fingerprints", m], Data::Text(fp)) => {
+                            out.claude_account_family_witnesses
+                                .get_mut(family)
+                                .context("accounts_proof_missing")?
+                                .member_request_id_fingerprints
+                                .insert((*m).into(), fp);
+                        }
+                        (
+                            "proof.usage",
+                            [],
+                            Data::UsageProof {
+                                evidence,
+                                exclusion,
+                                ..
                             },
-                        );
-                    }
-                    ("proof.account", ["members", m], Data::Number(n)) => {
-                        out.claude_account_family_witnesses
-                            .get_mut(family)
-                            .context("accounts_proof_missing")?
-                            .members
-                            .insert((*m).into(), n);
-                    }
-                    ("proof.account", ["fingerprints", m], Data::Text(fp)) => {
-                        out.claude_account_family_witnesses
-                            .get_mut(family)
-                            .context("accounts_proof_missing")?
-                            .member_request_id_fingerprints
-                            .insert((*m).into(), fp);
-                    }
-                    (
-                        "proof.usage",
-                        [],
-                        Data::UsageProof {
-                            evidence,
-                            exclusion,
-                            ..
-                        },
-                    ) => {
-                        out.claude_usage_family_witnesses.insert(
-                            family.clone(),
-                            ClaudeUsageFamilyWitness {
-                                evidence_fingerprint: evidence,
-                                member_request_id_fingerprints: BTreeMap::new(),
-                                member_occurrence_fingerprints: BTreeMap::new(),
-                                assigned_request_id_fingerprints: BTreeMap::new(),
-                                legacy_excluded_request_id_hashes: BTreeMap::new(),
-                                legacy_exclusion_evidence_fingerprint: exclusion,
-                                legacy_owner_roots: BTreeSet::new(),
-                            },
-                        );
-                    }
-                    (
-                        "proof.usage",
-                        [slot @ ("requests" | "occurrences" | "assigned"), m],
-                        Data::Text(fp),
-                    ) => {
-                        let p = out
-                            .claude_usage_family_witnesses
-                            .get_mut(family)
-                            .context("accounts_proof_missing")?;
-                        let map = match *slot {
-                            "requests" => &mut p.member_request_id_fingerprints,
-                            "occurrences" => &mut p.member_occurrence_fingerprints,
-                            _ => &mut p.assigned_request_id_fingerprints,
-                        };
-                        map.insert((*m).into(), fp);
-                    }
-                    ("proof.usage", ["excluded", m], Data::Shared(id)) => {
-                        let set = full_set(tx, id)?;
-                        out.claude_usage_family_witnesses
-                            .get_mut(family)
-                            .context("accounts_proof_missing")?
-                            .legacy_excluded_request_id_hashes
-                            .insert((*m).into(), set);
-                    }
-                    ("proof.usage", ["owners", m], Data::Empty) => {
-                        out.claude_usage_family_witnesses
-                            .get_mut(family)
-                            .context("accounts_proof_missing")?
-                            .legacy_owner_roots
-                            .insert((*m).into());
-                    }
-                    ("proof.deferred_account", [], Data::Text(fp)) => {
-                        out.claude_account_deferred_holds.insert(family.clone(), fp);
-                    }
-                    ("setting.binding", [], Data::Binding(binding)) => {
-                        out.session_account_bindings.insert(family.clone(), binding);
-                    }
-                    (
-                        "refusal.authority",
-                        [],
-                        Data::Authority {
-                            contract,
-                            proven,
-                            failed,
-                            disposition,
-                            retry,
-                            correction,
-                            ..
-                        },
-                    ) => {
-                        out.claude_usage_authority_quarantine.insert(
-                            family.clone(),
-                            ClaudeUsageAuthorityQuarantineRecord {
+                        ) => {
+                            out.claude_usage_family_witnesses.insert(
+                                family.clone(),
+                                ClaudeUsageFamilyWitness {
+                                    evidence_fingerprint: evidence,
+                                    member_request_id_fingerprints: BTreeMap::new(),
+                                    member_occurrence_fingerprints: BTreeMap::new(),
+                                    assigned_request_id_fingerprints: BTreeMap::new(),
+                                    legacy_excluded_request_id_hashes: BTreeMap::new(),
+                                    legacy_exclusion_evidence_fingerprint: exclusion,
+                                    legacy_owner_roots: BTreeSet::new(),
+                                },
+                            );
+                        }
+                        (
+                            "proof.usage",
+                            [slot @ ("requests" | "occurrences" | "assigned"), m],
+                            Data::Text(fp),
+                        ) => {
+                            let p = out
+                                .claude_usage_family_witnesses
+                                .get_mut(family)
+                                .context("accounts_proof_missing")?;
+                            let map = match *slot {
+                                "requests" => &mut p.member_request_id_fingerprints,
+                                "occurrences" => &mut p.member_occurrence_fingerprints,
+                                _ => &mut p.assigned_request_id_fingerprints,
+                            };
+                            map.insert((*m).into(), fp);
+                        }
+                        ("proof.usage", ["excluded", m], Data::Shared(id)) => {
+                            let set = full_set(tx, id)?;
+                            out.claude_usage_family_witnesses
+                                .get_mut(family)
+                                .context("accounts_proof_missing")?
+                                .legacy_excluded_request_id_hashes
+                                .insert((*m).into(), set);
+                        }
+                        ("proof.usage", ["owners", m], Data::Empty) => {
+                            out.claude_usage_family_witnesses
+                                .get_mut(family)
+                                .context("accounts_proof_missing")?
+                                .legacy_owner_roots
+                                .insert((*m).into());
+                        }
+                        ("proof.deferred_account", [], Data::Text(fp)) => {
+                            out.claude_account_deferred_holds.insert(family.clone(), fp);
+                        }
+                        ("setting.binding", [], Data::Binding(binding)) => {
+                            out.session_account_bindings.insert(family.clone(), binding);
+                        }
+                        (
+                            "refusal.authority",
+                            [],
+                            Data::Authority {
                                 contract,
-                                proven_witness_fingerprint: proven,
-                                failed_reconstruction_count: failed,
+                                proven,
+                                failed,
                                 disposition,
-                                retry_after_unix_seconds: retry,
-                                member_source_file_fingerprints: BTreeMap::new(),
-                                proof_correction: correction.map(|proof| {
-                                    ClaudeAuthorityProofCorrection {
-                                        proof_witness_fingerprint: proof,
-                                        owed_member_ids: BTreeSet::new(),
-                                    }
-                                }),
+                                retry,
+                                correction,
+                                ..
                             },
-                        );
+                        ) => {
+                            out.claude_usage_authority_quarantine.insert(
+                                family.clone(),
+                                ClaudeUsageAuthorityQuarantineRecord {
+                                    contract,
+                                    proven_witness_fingerprint: proven,
+                                    failed_reconstruction_count: failed,
+                                    disposition,
+                                    retry_after_unix_seconds: retry,
+                                    member_source_file_fingerprints: BTreeMap::new(),
+                                    proof_correction: correction.map(|proof| {
+                                        ClaudeAuthorityProofCorrection {
+                                            proof_witness_fingerprint: proof,
+                                            owed_member_ids: BTreeSet::new(),
+                                        }
+                                    }),
+                                },
+                            );
+                        }
+                        ("refusal.authority", ["sources", m], Data::Text(fp)) => {
+                            out.claude_usage_authority_quarantine
+                                .get_mut(family)
+                                .context("accounts_authority_missing")?
+                                .member_source_file_fingerprints
+                                .insert((*m).into(), fp);
+                        }
+                        ("refusal.authority", ["owed", m], Data::Empty) => {
+                            out.claude_usage_authority_quarantine
+                                .get_mut(family)
+                                .context("accounts_authority_missing")?
+                                .proof_correction
+                                .as_mut()
+                                .context("accounts_correction_missing")?
+                                .owed_member_ids
+                                .insert((*m).into());
+                        }
+                        (RETENTION, [], Data::Retention(c)) => {
+                            ensure!(family.is_empty(), "accounts_retention_shape");
+                            out.claude_account_window_retention =
+                                account_pending_retention::Counts {
+                                    roots_collapsed: c[0],
+                                    windows_collapsed: c[1],
+                                    window_bytes_saved: c[2],
+                                    roots_refused: c[3],
+                                    window_bytes_before: c[4],
+                                    window_bytes_after: c[5],
+                                };
+                        }
+                        _ => bail!("accounts_bucket_shape"),
                     }
-                    ("refusal.authority", ["sources", m], Data::Text(fp)) => {
-                        out.claude_usage_authority_quarantine
-                            .get_mut(family)
-                            .context("accounts_authority_missing")?
-                            .member_source_file_fingerprints
-                            .insert((*m).into(), fp);
-                    }
-                    ("refusal.authority", ["owed", m], Data::Empty) => {
-                        out.claude_usage_authority_quarantine
-                            .get_mut(family)
-                            .context("accounts_authority_missing")?
-                            .proof_correction
-                            .as_mut()
-                            .context("accounts_correction_missing")?
-                            .owed_member_ids
-                            .insert((*m).into());
-                    }
-                    (RETENTION, [], Data::Retention(c)) => {
-                        ensure!(family.is_empty(), "accounts_retention_shape");
-                        out.claude_account_window_retention = account_pending_retention::Counts {
-                            roots_collapsed: c[0],
-                            windows_collapsed: c[1],
-                            window_bytes_saved: c[2],
-                            roots_refused: c[3],
-                            window_bytes_before: c[4],
-                            window_bytes_after: c[5],
-                        };
-                    }
-                    _ => bail!("accounts_bucket_shape"),
+                    ensure!(
+                        *kind == "account_window" || position == 0,
+                        "accounts_position_shape"
+                    );
+                    staged
+                        .account_rows
+                        .entry(((*kind).into(), family.clone()))
+                        .or_default()
+                        .insert(h.key.clone(), h);
                 }
-                ensure!(
-                    *kind == "account_window" || position == 0,
-                    "accounts_position_shape"
-                );
-                staged
-                    .account_rows
-                    .entry(((*kind).into(), family.clone()))
-                    .or_default()
-                    .insert(h.key.clone(), h);
+                if let (Some(root), Some(RowKey::Record { key_bytes, .. })) =
+                    (only_root, after.as_ref())
+                {
+                    if dependency_family(key_bytes)? != *root {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1333,9 +1379,10 @@ pub(super) fn hydrate_txn(
         }
     }
     ensure!(
-        staged
-            .account_rows
-            .contains_key(&(RETENTION.into(), String::new())),
+        filter.is_some()
+            || staged
+                .account_rows
+                .contains_key(&(RETENTION.into(), String::new())),
         "accounts_retention_missing"
     );
     staged.accounts_ready = true;

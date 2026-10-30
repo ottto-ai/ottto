@@ -161,6 +161,8 @@ pub(super) fn run(conn: &Connection) -> Result<()> {
             continue;
         }
         if step.destructive {
+            let path = Path::new(conn.path().context("state_v2_backup_path")?);
+            super::super::recovery_backup::require_destructive_backup(path)?;
             verified_backup(conn).map_err(|_| super::super::Hold::MigrationFailed)?;
         }
         if conn.execute_batch("BEGIN IMMEDIATE").is_err() {

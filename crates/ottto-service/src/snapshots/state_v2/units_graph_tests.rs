@@ -190,7 +190,7 @@ fn deferred_binding_and_before_headers_are_authenticated_before_restoration() {
         key: &m.key,
         fixed: &h.fixed,
         value_version: h.value_version,
-        value: &Bytes(m.value.as_ref().unwrap()),
+        value: m.value.as_ref().unwrap().as_ref(),
     })
     .unwrap();
     tx.put(RowInput {
@@ -390,4 +390,52 @@ fn overlay_merges_tombstones_with_indexed_kind_family_and_candidate_queries() {
         .request_set_candidates(&[9; 32], 0, 1)
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn streamed_family_units_preserve_more_than_eight_mib_of_deferred_payload() {
+    let (f, mut db, prev, mut cx) = Fixture::new();
+    let mut next = prev.clone();
+    for family in ["large-a", "large-b"] {
+        let fingerprints: BTreeMap<_, _> = (0..2_300)
+            .map(|n| (format!("member-{n:05}"), "x".repeat(KEY_BYTES)))
+            .collect();
+        next.claude_account_family_witnesses.insert(
+            family.into(),
+            serde_json::from_value(serde_json::json!({
+                "account_identifier_hash": "a".repeat(64),
+                "evidence_request_count": 0,
+                "members": {},
+                "member_request_id_fingerprints": fingerprints,
+            }))
+            .unwrap(),
+        );
+    }
+    let expected = next.claude_account_family_witnesses.clone();
+    let error = ClaudeMapper
+        .selected_save(&mut db, &f.1, &prev, &mut next, &mut cx)
+        .unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveAdmission));
+    assert_eq!(next.claude_account_family_witnesses.len(), 1);
+    let pending = carry(&mut db.begin(TxnMode::Read).unwrap(), &f.1, next.generation)
+        .unwrap()
+        .unwrap();
+    let bytes: u64 = pending
+        .mutations
+        .iter()
+        .filter_map(|m| m.value.as_ref())
+        .map(|p| p.len())
+        .sum();
+    assert!(bytes > SCRATCH as u64);
+    drop(pending);
+    drop(db);
+    let mut db = f.open();
+    let (mut base, mut cx) = kinds::hydrate(&mut db, f.1.binding.clone()).unwrap();
+    let restored = restore(&mut db, &f.1, &base).unwrap().unwrap();
+    assert_eq!(restored.claude_account_family_witnesses, expected);
+    ClaudeMapper
+        .restore_selected(&mut db, &mut base, &mut cx)
+        .unwrap();
+    assert_eq!(base.claude_account_family_witnesses, expected);
+    assert!(restore(&mut db, &f.1, &base).unwrap().is_none());
 }

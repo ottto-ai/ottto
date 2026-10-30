@@ -305,3 +305,46 @@ fn same_generation_db_replacement_cannot_borrow_constant_fence() {
         NOW + INTERVAL
     ));
 }
+
+#[test]
+fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority() {
+    let f = Fixture::new();
+    let mut claim = f.load();
+    let mut old = claim.clone();
+    let context = claim.growth_claim_context.clone().unwrap();
+    claim
+        .growth_retention
+        .insert(f.key.clone(), debt(Some(NOW)));
+    claim.save_growth_claim(&f.path).unwrap();
+    assert!(Arc::ptr_eq(
+        claim.growth_claim_context.as_ref().unwrap(),
+        &context
+    ));
+    {
+        let _lock = crate::snapshots::CheckpointLock::acquire(&f.path).unwrap();
+        sampled_audit::publish_growth_claim_receipt(&claim, &f.path).unwrap();
+    }
+    assert_eq!(
+        sampled_audit::own_growth_claim_generation(&old, &f.path),
+        Some(claim.generation)
+    );
+    old.upload_context_fingerprint = Some("synthetic-next-context".into());
+    old.save(&f.path).unwrap();
+    assert!(!Arc::ptr_eq(
+        old.growth_claim_context.as_ref().unwrap(),
+        &context
+    ));
+    assert_eq!(
+        sampled_audit::own_growth_claim_generation(&claim, &f.path),
+        None
+    );
+    let reopened = f.load();
+    assert_eq!(
+        reopened.upload_context_fingerprint,
+        old.upload_context_fingerprint
+    );
+    assert_eq!(
+        serde_json::to_value(&reopened.growth_retention[&f.key]).unwrap()["last_growth_full_unix"],
+        serde_json::json!(NOW)
+    );
+}

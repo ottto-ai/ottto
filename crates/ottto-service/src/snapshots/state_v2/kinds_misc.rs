@@ -1221,12 +1221,71 @@ pub(super) fn merge_cas_at(
     );
     let mut custody = ScanIndex::default();
     read_holds(&mut custody, tx, &mut cx)?;
-    ensure!(
-        custody.decode_holds.same_as(&working.decode_holds)
-            && custody.decode_repairs_match(working),
-        "current_index_requires_reload"
-    );
-    struct Claims<'a>(&'a mut ScanIndex);
+    custody.schema_version = schema;
+    custody.generation = generation;
+    custody.accepted_snapshot_fingerprint_ledger_version = read_field(
+        "accepted_snapshot_fingerprint_ledger_version",
+        "v1_field.accepted_snapshot_fingerprint_ledger_version",
+        tx,
+        &mut cx,
+    )?;
+    kinds_census::hydrate_cas_controls(tx, &mut custody)?;
+    let raw_quarantines: BTreeSet<_> = custody
+        .decode_holds
+        .v2_entries()
+        .filter(|(field, ..)| *field == "quarantined_snapshot_fingerprints")
+        .map(|(_, key, ..)| key.to_owned())
+        .collect();
+    let roots = super::super::lenient_decode::cas_hold_roots(&custody);
+    kinds_accounts::hydrate_filtered(
+        tx,
+        &mut custody,
+        &mut KindCx::default(),
+        Some((&roots, false)),
+    )?;
+    kinds_census::hydrate_cas_families(tx, &mut custody, &roots)?;
+    super::super::lenient_decode::post_decode_hydrated(&mut custody, "cas", "claude_code")?;
+
+    // Outside held roots, only authority+witness binding affects the repair
+    // commitment. Visit one family, never a second full account graph.
+    let kind = RecordKind::parse("refusal.authority")?;
+    let mut after = None;
+    let mut last = None;
+    loop {
+        let page = tx.scan_kind(&kind, after.as_ref(), 64)?;
+        if page.is_empty() {
+            break;
+        }
+        for h in &page {
+            let RowKey::Record { key_bytes, .. } = &h.key else {
+                bail!("state_v2_cas_authority_key");
+            };
+            let root = kinds_accounts::dependency_family(key_bytes)?;
+            if last.as_ref() == Some(&root) {
+                continue;
+            }
+            last = Some(root.clone());
+            if roots.contains(&root) {
+                continue;
+            }
+            let one = BTreeSet::from([root]);
+            let mut family = ScanIndex::default();
+            kinds_accounts::hydrate_filtered(
+                tx,
+                &mut family,
+                &mut KindCx::default(),
+                Some((&one, true)),
+            )?;
+            super::super::lenient_decode::post_decode_hydrated(&mut family, "cas", "claude_code")?;
+            super::super::lenient_decode::add_cas_provenance(&mut custody, &family);
+        }
+        after = page.last().map(|h| h.key.clone());
+    }
+    struct Claims<'a> {
+        target: &'a mut ScanIndex,
+        raw: &'a BTreeSet<String>,
+        merge: bool,
+    }
     impl<'de> Visitor<'de> for Claims<'_> {
         type Value = ();
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1236,8 +1295,28 @@ pub(super) fn merge_cas_at(
             while let Some((key, current)) =
                 map.next_entry::<String, super::super::SnapshotQuarantineRecord>()?
             {
-                if let Some(working) = self.0.quarantined_snapshot_fingerprints.get_mut(&key) {
-                    terminal_contract_retry::merge_claims(working, &current);
+                if self.raw.contains(&key) {
+                    continue;
+                }
+                let mut current_view = ScanIndex::default();
+                current_view
+                    .quarantined_snapshot_fingerprints
+                    .insert(key.clone(), current);
+                super::super::lenient_decode::post_decode_hydrated(
+                    &mut current_view,
+                    "cas",
+                    "claude_code",
+                )
+                .map_err(serde::de::Error::custom)?;
+                if self.merge {
+                    if let (Some(working), Some(current)) = (
+                        self.target.quarantined_snapshot_fingerprints.get_mut(&key),
+                        current_view.quarantined_snapshot_fingerprints.get(&key),
+                    ) {
+                        terminal_contract_retry::merge_claims(working, current);
+                    }
+                } else {
+                    super::super::lenient_decode::add_cas_provenance(self.target, &current_view);
                 }
             }
             Ok(())
@@ -1252,15 +1331,33 @@ pub(super) fn merge_cas_at(
             de.deserialize_map(self)
         }
     }
-    let reader = JsonReader::transient(
-        tx,
-        &mut cx,
-        "refusal.snapshot",
-        "quarantined_snapshot_fingerprints",
-    )?;
-    let mut de = serde_json::Deserializer::from_reader(reader);
-    Claims(working).deserialize(&mut de)?;
-    de.end()?;
+    for merge in [false, true] {
+        if merge {
+            ensure!(
+                custody.decode_holds.same_as(&working.decode_holds)
+                    && custody.decode_repairs_match(working),
+                "current_index_requires_reload"
+            );
+            terminal_contract_retry::merge_maps(
+                &mut working.quarantined_snapshot_fingerprints,
+                &custody.quarantined_snapshot_fingerprints,
+            );
+        }
+        let reader = JsonReader::transient(
+            tx,
+            &mut cx,
+            "refusal.snapshot",
+            "quarantined_snapshot_fingerprints",
+        )?;
+        let mut de = serde_json::Deserializer::from_reader(reader);
+        Claims {
+            target: if merge { working } else { &mut custody },
+            raw: &raw_quarantines,
+            merge,
+        }
+        .deserialize(&mut de)?;
+        de.end()?;
+    }
     Ok(())
 }
 

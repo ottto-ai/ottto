@@ -408,7 +408,7 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
     index.upload_context_fingerprint = Some("synthetic-policy".into());
     index.active_upload_context_fingerprint = Some("active-synthetic-policy".into());
     index.file_upload_context_enabled = true;
-    assert!(save_locked(&f.path, &mut index).unwrap());
+    assert!(save_locked(&f.path, &mut index, false).unwrap());
     assert_eq!(index.generation, 2);
     assert_eq!(
         index.active_upload_context_fingerprint.as_deref(),
@@ -564,6 +564,30 @@ mod hydrate_parity {
             .0
         };
         let actual = load();
+        // Both production save modes enter this exact current-snapshot CAS.
+        // Keep working edits/removals intact; compare normalized custody only.
+        for claim_only in [false, true] {
+            let mut working = actual.clone();
+            if !claim_only {
+                working.accepted_snapshot_fingerprints.clear();
+            }
+            let runtime = working.persistence_v2.clone().unwrap();
+            let mut guard = runtime.session.lock().unwrap();
+            let session = guard.as_mut().unwrap();
+            let mut tx = session.db.begin(TxnMode::Read).unwrap();
+            import::ClaudeMapper
+                .merge_cas(&mut tx, &mut working)
+                .unwrap();
+            assert!(working.decode_holds.same_as(&actual.decode_holds));
+            assert_eq!(
+                working.decode_holds.v2_provenance(),
+                actual.decode_holds.v2_provenance()
+            );
+            if !claim_only {
+                assert!(working.accepted_snapshot_fingerprints.is_empty());
+            }
+        }
+
         assert_graph(&expected, &actual);
         assert_graph(&expected, &load()); // cached graph still runs outer load steps
         with_state(&f.path, |state| {

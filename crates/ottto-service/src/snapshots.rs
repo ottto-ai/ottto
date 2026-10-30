@@ -48327,7 +48327,7 @@ impl ScanIndex {
         let _lock = CheckpointLock::acquire(path)?;
         #[cfg(test)]
         pause_scan_index_cas_if_requested_for_test();
-        if state_v2::save_locked(path, self)? {
+        if state_v2::save_locked(path, self, claim_only)? {
             return Ok(());
         }
         if path.exists() {
