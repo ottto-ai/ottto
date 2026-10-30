@@ -26969,20 +26969,35 @@ impl OwnedSourceScan {
         let pending_finalization = Vec::new();
         let claude_authority_preflight = source == SnapshotSource::ClaudeCode
             && !index.claude_usage_authority_quarantine.is_empty();
-        let mut identified_candidates = if claude_authority_preflight {
+        // Before opening, the fingerprint slot holds only the sidecar digest.
+        // Fix P needs the full opened identity on both sides of its gate-free
+        // comparison, including healthy families with context debt.
+        let context_preflight = source == SnapshotSource::ClaudeCode
+            && claude_terminal_off()
+            && index.file_upload_context_enabled;
+        let mut identified_candidates = if claude_authority_preflight || context_preflight {
             files
                 .into_iter()
                 .filter_map(|candidate| {
-                    open_and_identify_scan_candidate_at(
-                        source,
-                        candidate,
-                        &mut census,
-                        census_unix_seconds,
-                        backfill_window_days,
-                        &index.files,
-                        audit_now,
-                    )
-                    .map(|(candidate, _)| candidate)
+                    if claude_authority_preflight
+                        || index
+                            .candidate_decision_with_reason_at(&candidate, audit_now)
+                            .1
+                            == Some(CandidateParseReason::UploadContext)
+                    {
+                        open_and_identify_scan_candidate_at(
+                            source,
+                            candidate,
+                            &mut census,
+                            census_unix_seconds,
+                            backfill_window_days,
+                            &index.files,
+                            audit_now,
+                        )
+                        .map(|(candidate, _)| candidate)
+                    } else {
+                        Some(candidate)
+                    }
                 })
                 .collect::<Vec<_>>()
         } else {
