@@ -218,15 +218,45 @@ fn claude_unacked_head_members(index: &ScanIndex, roots: &BTreeSet<String>) -> B
         .filter(|(key, head)| {
             claude_index_path_member_ref(Path::new(key.as_str()))
                 .is_some_and(|member| roots.contains(member.root))
-                && head.iter().any(|fingerprint| {
-                    !index.accepted_snapshot_fingerprints.contains(fingerprint)
-                        && !index
-                            .quarantined_snapshot_fingerprints
-                            .contains_key(fingerprint)
-                })
+                && claude_head_has_unacked_body(index, head)
         })
         .map(|(key, _)| key.clone())
         .collect()
+}
+
+fn claude_head_has_unacked_body(index: &ScanIndex, head: &BTreeSet<String>) -> bool {
+    head.iter().any(|fingerprint| {
+        !index.accepted_snapshot_fingerprints.contains(fingerprint)
+            && !index
+                .quarantined_snapshot_fingerprints
+                .contains_key(fingerprint)
+    })
+}
+
+/// B-P2: the re-armed unACKed head is offered again. Forgetting its upload
+/// body witness (as main does for a placeholder) keeps the re-parse from
+/// being suppressed as a semantic no-op; the persisted shape is unchanged.
+/// Reached only for members `claude_unacked_head_members` returned, which is
+/// empty outside containment.
+fn claude_reoffer_unacked_head(entry: &mut ScanIndexEntry) {
+    entry.last_upload_body_witness = None;
+}
+
+/// B-P2: a partial checkpoint that reverts an unsettled member to its
+/// committed entry keeps the cleared source witness (main) and, under
+/// containment, also the cleared body witness while its head is still
+/// unACKed, so the re-offer debt survives until that member is parsed.
+fn claude_retain_unacked_reoffer(result: &mut ScanIndex, key: &str, working: &ScanIndexEntry) {
+    if !claude_terminal_off() || working.last_upload_body_witness.is_some() {
+        return;
+    }
+    let unacked = result
+        .file_snapshot_fingerprints
+        .get(key)
+        .is_some_and(|head| claude_head_has_unacked_body(result, head));
+    if let Some(retained) = result.files.get_mut(key).filter(|_| unacked) {
+        retained.last_upload_body_witness = None;
+    }
 }
 
 // B-P5: under containment neither the identity-contract latch nor

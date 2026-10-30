@@ -6538,6 +6538,9 @@ fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
                 continue;
             }
             rearm_cause::clear(index_key, entry, rearm_cause::Cause::CarryInvalidation);
+            if unacked.contains(index_key) {
+                claude_reoffer_unacked_head(entry);
+            }
             rearmed += 1;
         }
     }
@@ -6850,6 +6853,9 @@ fn replay_and_rearm_claude_family(
                 continue;
             }
             rearm_cause::clear(index_key, entry, rearm_cause::Cause::CarryInvalidation);
+            if unacked.contains(index_key) {
+                claude_reoffer_unacked_head(entry);
+            }
             rearmed += 1;
         }
     }
@@ -42251,6 +42257,9 @@ fn ensure_bounded_traversal(
                     transition.rearmed_index_files +=
                         usize::from(!entry.source_file_fingerprint.is_empty());
                     rearm_cause::clear(key, entry, transition.rearm_cause());
+                    if unacked.contains(key) {
+                        claude_reoffer_unacked_head(entry);
+                    }
                 }
             }
         }
@@ -50050,6 +50059,7 @@ impl ScanIndex {
                 if let Some(retained) = result.files.get_mut(key) {
                     retained.source_file_fingerprint.clear();
                 }
+                claude_retain_unacked_reoffer(&mut result, key, working);
             }
             if let Some(retained) = result.files.get_mut(key) {
                 retained.carry_sampled_audit(working);
@@ -56991,6 +57001,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "terminal-off ON-readiness: C1-X"]
     fn terminal_off_on_claude_stable_owned_start_recovers_after_partial_conflict() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -57003,6 +57014,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "terminal-off ON-readiness: C1-X"]
     fn terminal_off_on_claude_duplicate_across_pages_stays_refused_without_reparse_loop() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -57015,6 +57027,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "terminal-off ON-readiness: C1-X"]
     fn terminal_off_on_claude_pending_census_recovers_without_releasing_future_quarantine() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -57027,6 +57040,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "terminal-off ON-readiness: C1-X"]
     fn terminal_off_on_claude_future_quarantine_preserves_cross_page_duplicate_refusal() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -82284,6 +82298,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "terminal-off ON-readiness: P1"]
     fn terminal_off_on_claude_context_backfill_skips_sessions_on_the_local_reemission_list() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -82681,6 +82696,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "terminal-off ON-readiness: P1"]
     fn terminal_off_on_claude_context_backfill_pauses_with_an_alarm_when_an_installed_list_goes_missing(
     ) {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();

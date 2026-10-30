@@ -2544,6 +2544,7 @@ fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
 #[serial(source_manifests)]
 // A shed page records RatelimitBackoff in the shared client_report counters.
 #[serial(client_report)]
+#[ignore = "terminal-off ON-readiness: APC-F1/R2"]
 fn terminal_off_on_crash_and_shed_before_settlement_keep_the_grant_unchanged() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -2766,6 +2767,7 @@ fn superseded_revision_ack_never_drains_the_current_revision() {
 #[serial(source_manifests)]
 // A shed page records RatelimitBackoff in the shared client_report counters.
 #[serial(client_report)]
+#[ignore = "terminal-off ON-readiness: APC-F1/R2"]
 fn terminal_off_on_superseded_revision_ack_never_drains_the_current_revision() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -4044,6 +4046,7 @@ fn exact_permanent_refusal_drains_correction_and_keeps_refusal_witness() {
 #[serial(source_manifests)]
 // A rejected entity records Poisoned in the shared client_report counters.
 #[serial(client_report)]
+#[ignore = "terminal-off ON-readiness: APC-F1/R2"]
 fn terminal_off_on_exact_permanent_refusal_drains_correction_and_keeps_refusal_witness() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

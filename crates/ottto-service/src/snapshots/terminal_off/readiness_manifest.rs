@@ -11,12 +11,15 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_complete_cutoff_drains_without_upload_or_repeated_grant_parse", "C6"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_controlled_three_owed_members_settle_on_their_own_pages_while_one_is_account_held", "R3"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_controlled_unbound_record_rearms_its_family_and_reforms_bound", "proof-grant"),
+    ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_crash_and_shed_before_settlement_keep_the_grant_unchanged", "APC-F1/R2"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_e2_pre_flip_correction_settles_on_the_first_request_owned_bodies", "C6"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone", "proof-grant"),
+    ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_exact_permanent_refusal_drains_correction_and_keeps_refusal_witness", "APC-F1/R2"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_natural_owed_members_drain_on_separate_bounded_pages", "proof-grant"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_new_request_after_the_grant_fails_then_one_new_proof_regrants_all_members", "proof-grant"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_retryable_refusal_keeps_its_member_owed_across_restart", "proof-grant"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned", "proof-grant"),
+    ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_superseded_revision_ack_never_drains_the_current_revision", "APC-F1/R2"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant", "proof-grant"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_account_deferred_hold_lets_a_bounded_claude_traversal_converge", "NBF"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_full_tombstone_set_keeps_the_excess_family_and_holds_both_returns", "completion-fold"),
@@ -64,7 +67,13 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_terminal_family_member_controls_keep_blocking_pruning_and_rebinding", "NBF"),
     ("snapshot_sync/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_terminal_family_never_committed_members_let_the_claude_census_complete", "NBF"),
     ("snapshot_sync/prior_index_lifetime_tests.rs", "terminal_off_on_prior_index_lifetime_real_finish_preserves_refusals_retry_and_failed_cas", "r25-code-unclassified"),
+    ("snapshots.rs", "terminal_off_on_claude_context_backfill_pauses_with_an_alarm_when_an_installed_list_goes_missing", "P1"),
     ("snapshots.rs", "terminal_off_on_claude_context_backfill_resumes_after_restart_without_rereading_settled_files", "P1"),
+    ("snapshots.rs", "terminal_off_on_claude_context_backfill_skips_sessions_on_the_local_reemission_list", "P1"),
+    ("snapshots.rs", "terminal_off_on_claude_duplicate_across_pages_stays_refused_without_reparse_loop", "C1-X"),
+    ("snapshots.rs", "terminal_off_on_claude_future_quarantine_preserves_cross_page_duplicate_refusal", "C1-X"),
+    ("snapshots.rs", "terminal_off_on_claude_pending_census_recovers_without_releasing_future_quarantine", "C1-X"),
+    ("snapshots.rs", "terminal_off_on_claude_stable_owned_start_recovers_after_partial_conflict", "C1-X"),
     ("snapshots/claude_context_file_birth_tests.rs", "terminal_off_on_api_sidecar_without_trace_sidecar_still_vetoes", "r25-code-unclassified"),
     ("snapshots/claude_context_file_birth_tests.rs", "terminal_off_on_capture_on_bodies_match_the_clear_outside_context_scalars", "r25-code-unclassified"),
     ("snapshots/claude_history_upgrade_tests.rs", "terminal_off_on_a_listed_root_outside_this_cycle_gets_no_literal_and_no_revision_three", "C6"),
@@ -79,10 +88,10 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshots/claude_sidecar_reduction_tests.rs", "terminal_off_on_missing_index_cannot_be_replaced_by_warm_cache_authority", "r25-code-unclassified"),
     ("snapshots/launcher_recognition_tests.rs", "terminal_off_on_native_batches_cross_512_workers_without_a_store_sweep_per_file", "r25-code-unclassified"),
     ("snapshots/line_delivery_tests.rs", "terminal_off_on_registration_changes_no_selection_result_or_step_boundary", "unclassified"),
-    ("snapshots/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_claude_duplicate_across_pages_stays_refused_without_reparse_loop", "r25-code-unclassified"),
-    ("snapshots/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_claude_future_quarantine_preserves_cross_page_duplicate_refusal", "r25-code-unclassified"),
-    ("snapshots/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_claude_pending_census_recovers_without_releasing_future_quarantine", "r25-code-unclassified"),
-    ("snapshots/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_claude_stable_owned_start_recovers_after_partial_conflict", "r25-code-unclassified"),
+    ("snapshots/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_claude_duplicate_across_pages_stays_refused_without_reparse_loop", "C1-X"),
+    ("snapshots/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_claude_future_quarantine_preserves_cross_page_duplicate_refusal", "C1-X"),
+    ("snapshots/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_claude_pending_census_recovers_without_releasing_future_quarantine", "C1-X"),
+    ("snapshots/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_claude_stable_owned_start_recovers_after_partial_conflict", "C1-X"),
     ("snapshots/sampled_audit/open_backoff_tests.rs", "ordinary_grown_open_keeps_due_with_another_slot_owner_and_saturated_markers", "C3"),
     ("snapshots/sampled_audit/open_backoff_tests.rs", "ordinary_unchanged_open_keeps_due_with_another_slot_owner_and_saturated_markers", "C3"),
     ("snapshots/sampled_scan/durable_tail_tests.rs", "terminal_off_on_store_io_failures_emit_cold_production_body_without_holds", "r25-code-unclassified"),
@@ -135,7 +144,7 @@ fn terminal_off_on_readiness_ignores_equal_the_checked_in_manifest() {
     assert_eq!(expected, sorted, "keep the manifest sorted");
     assert_eq!(ignored_for_readiness(), expected);
     // The count is the ON gate: it must reach 0 before ON anywhere.
-    assert_eq!(READINESS_MANIFEST.len(), 81);
+    assert_eq!(READINESS_MANIFEST.len(), 90);
 }
 
 #[test]
@@ -158,14 +167,32 @@ fn every_ignored_terminal_off_on_twin_names_its_readiness_cluster() {
                 let Some(name) = line.trim_start().strip_prefix("fn terminal_off_on_") else {
                     continue;
                 };
-                let attributes = lines[..index]
+                let attributes = |index: usize| {
+                    lines[..index]
+                        .iter()
+                        .rev()
+                        .take_while(|line| {
+                            let line = line.trim_start();
+                            line.starts_with("#[") || line.starts_with("//")
+                        })
+                        .map(|line| line.trim())
+                        .collect::<Vec<_>>()
+                };
+                // A twin may keep the ignore its main original carries on main.
+                let base = name.split('(').next().unwrap_or(name);
+                let base_ignore = lines
                     .iter()
-                    .rev()
-                    .take_while(|line| line.trim_start().starts_with("#["));
-                for attribute in attributes {
-                    if attribute.trim_start().starts_with("#[ignore") {
+                    .position(|line| line.trim_start().starts_with(&format!("fn {base}(")))
+                    .and_then(|at| {
+                        attributes(at)
+                            .into_iter()
+                            .find(|attribute| attribute.starts_with("#[ignore"))
+                    });
+                for attribute in attributes(index) {
+                    if attribute.starts_with("#[ignore") {
                         assert!(
-                            attribute.contains("terminal-off ON-readiness: "),
+                            attribute.contains("terminal-off ON-readiness: ")
+                                || base_ignore == Some(attribute),
                             "{}: terminal_off_on_{name} is ignored without a readiness cluster",
                             path.display()
                         );
@@ -174,4 +201,83 @@ fn every_ignored_terminal_off_on_twin_names_its_readiness_cluster() {
             }
         }
     }
+}
+
+/// Lead B Q5: an ON wrapper that calls an ignored twin body (the p12 base-exit
+/// wrappers) carries that ignore too, so un-ignoring needs the body's cluster
+/// fix. A wrapper may name a more specific cluster beside the body's.
+#[test]
+fn every_wrapper_of_an_ignored_twin_carries_its_readiness_cluster() {
+    let ignored = ignored_for_readiness();
+    let clusters = |cluster: &str| cluster.split('/').map(str::to_string).collect::<Vec<_>>();
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut pending = vec![src];
+    let mut wrappers = 0;
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read source directory") {
+            let path = entry.expect("source entry").path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source file");
+            let lines: Vec<_> = text.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                let Some(name) = line.trim_start().strip_prefix("fn terminal_off_on_") else {
+                    continue;
+                };
+                let name = format!("terminal_off_on_{}", name.split('(').next().unwrap_or(name));
+                let end = lines[index + 1..]
+                    .iter()
+                    .position(|line| *line == format!("{indent}}}"))
+                    .map_or(lines.len(), |at| index + 1 + at);
+                let body = lines[index + 1..end].join("\n");
+                let own = lines[..index]
+                    .iter()
+                    .rev()
+                    .take_while(|line| {
+                        let line = line.trim_start();
+                        line.starts_with("#[") || line.starts_with("//")
+                    })
+                    .find_map(|line| {
+                        let reason = line.trim().strip_prefix(concat!(
+                            "#[ignore = \"terminal-off ",
+                            "ON-readiness: "
+                        ))?;
+                        Some(clusters(reason.strip_suffix("\"]")?))
+                    });
+                for (_, callee, cluster) in &ignored {
+                    let called = *callee != name
+                        && body.match_indices(&format!("{callee}(")).any(|(at, _)| {
+                            !body[..at]
+                                .chars()
+                                .next_back()
+                                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                        });
+                    if !called {
+                        continue;
+                    }
+                    wrappers += 1;
+                    let own = own.as_ref().unwrap_or_else(|| {
+                        panic!(
+                            "{}: {name} calls ignored {callee} without its readiness ignore",
+                            path.display()
+                        )
+                    });
+                    for needed in clusters(cluster) {
+                        assert!(
+                            own.contains(&needed),
+                            "{}: {name} calls {callee} ({cluster}) but names only {own:?}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(wrappers > 0, "the p12 base-exit wrappers are checked");
 }

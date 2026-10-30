@@ -75,8 +75,11 @@ Linux and the merge-queue Mac. Two ON blockers are fixed here, both gated on
 
 - **B-P2 (missing ACK):** a stale family member whose committed head carries a
   body the server never accepted (and no refusal quarantine owns) is never
-  covered by the redundant stale-clear suppression. It stays Parse and its
-  head is offered again; ACKed members keep the suppressed clear (Skip).
+  covered by the redundant stale-clear suppression. It stays Parse, and the
+  re-arm also forgets its upload body witness (as main does for a
+  placeholder), so that re-parse is not a semantic no-op and its head is
+  offered again, also across a partial checkpoint taken before it is parsed;
+  ACKed members keep the suppressed clear (Skip).
 - **B-P5 (re-arm loop):** under containment neither the contract latch nor
   source-wide context adoption discharges, so the semantic stale clear used to
   re-arm every stale family at every red-retry or floor start. A bounded RAM
