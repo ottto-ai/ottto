@@ -48,6 +48,12 @@
   macOS-only tests): `gh workflow run ci.yml --ref <branch>`; one run per head, and never
   restart a run because it is queued. Do not put `[skip ci]` in PR commits. Merge
   only after a green pull-request run on the final head.
+- Several PRs waiting for macOS evidence share one run:
+  `scripts/mac_batch.py plan <pr> <pr>...` merges their heads onto `main` in
+  memory and names conflicting pairs; `dispatch --gate <script>` pushes a
+  temporary `mac-batch/*` branch and starts one `ci.yml` run after the gate says
+  go; `report --run <id> --delete-branch` maps failing tests to PRs. `detect <pr>`
+  tells from the diff alone whether a PR needs macOS evidence (exit 10).
 - Merge only with `scripts/pr_merge_when_mac_green.sh <pr>`. It marks a draft
   ready, waits until the `ci.yml` checks of the pull-request run on the PR's head
   commit pass (Linux `Public surface checks`, `Rust advisory audit`, `Dependency
