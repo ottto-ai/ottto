@@ -31,8 +31,6 @@ macro_rules! counters {
             fn from_array(values: [u64; COUNT]) -> Self {
                 Self { $($field: values[Event::$event as usize]),+ }
             }
-            #[cfg(test)]
-            fn maximum() -> Self { Self { $($field: u64::MAX),+ } }
         }
     };
 }
@@ -81,21 +79,6 @@ pub(crate) struct Record {
     pub(crate) counts: Counts,
     #[serde(flatten)]
     pub(crate) gauges: Gauges,
-}
-impl Record {
-    #[cfg(test)]
-    pub(super) fn maximum() -> Self {
-        Self {
-            counts: Counts::maximum(),
-            gauges: Gauges {
-                side_records: u64::MAX,
-                side_record_bytes: u64::MAX,
-                side_requests: u64::MAX,
-                side_request_bytes: u64::MAX,
-                side_ledger_entries: u64::MAX,
-            },
-        }
-    }
 }
 
 pub(crate) fn add(event: Event, amount: u64) {

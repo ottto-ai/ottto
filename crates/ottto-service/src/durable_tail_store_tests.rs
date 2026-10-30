@@ -1785,11 +1785,6 @@ fn access_failures_disable_instead_of_holding_and_not_found_stays_absent() {
         "missing",
         "retry_missing",
         "metadata_missing",
-        "header",
-        "body",
-        "restore_open",
-        "restore_metadata",
-        "restore_missing",
     ] {
         let _reset = ResetFaults;
         let scratch = Scratch::new();
@@ -1814,12 +1809,6 @@ fn access_failures_disable_instead_of_holding_and_not_found_stays_absent() {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         }
         test_hooks::set_before_access(Some(Box::new(move |path, op| {
-            if arm == op && matches!(arm, "header" | "body" | "restore_open" | "restore_metadata") {
-                return Err(io::Error::from_raw_os_error(libc::EIO));
-            }
-            if arm == "restore_missing" && op == "restore_open" {
-                return Err(io::ErrorKind::NotFound.into());
-            }
             let deny = (path == record_path && op == "open")
                 || (arm == "directory" && path == store_path && op == "metadata")
                 || (arm == "fstat" && op == "fstat");
@@ -1854,11 +1843,7 @@ fn access_failures_disable_instead_of_holding_and_not_found_stays_absent() {
             })));
         }
         let mut cold = scratch.store();
-        if arm.starts_with("restore") {
-            assert_eq!(cold.read(&b.key), ReadOutcome::Missing, "{arm}");
-        } else {
-            assert_eq!(cold.hold(&b.key), None, "{arm}");
-        }
+        assert_eq!(cold.hold(&b.key), None, "{arm}");
         let missing = arm.ends_with("missing");
         assert_eq!(cold.disabled().is_some(), !missing, "{arm}");
         assert_eq!(cold.counters().format_hold, [0; 5], "{arm}");
@@ -2057,6 +2042,116 @@ fn rebuilt_t14_replaces_once_or_stays_memory_only_until_restart() {
         assert_eq!(restarted.full_hold(&b.key, true), None);
         assert_eq!(restarted.counters().t14_rebuild_full_started, 1);
         assert_eq!(restarted.full_hold(&b.key, true), Some(Refusal::Corrupt));
+    }
+}
+
+#[test]
+fn process_rebuild_history_overflow_disables_without_forgetting_an_attempt() {
+    let scratch = Scratch::new();
+    let mut store = scratch.store();
+    ensure_private_dir(store.dir()).unwrap();
+    let transcript = scratch.transcript("t.jsonl", b"{}\n");
+    let mut records = Vec::new();
+    for n in 0..=REBUILT_BOUND {
+        let mut b = binding("acct", "scope", ("fp", None));
+        b.key = key_digest(DurableSource::ClaudeCode, &format!("corrupt-{n}"));
+        let mut bytes = encode(&DurableRecord {
+            envelope_audit_debt: None,
+            format: FORMAT_VERSION,
+            record: pending(b.clone(), certificate(&transcript), 1),
+            index_generation: 1,
+        });
+        *bytes.last_mut().unwrap() ^= 1;
+        let path = record_file(&store, &b.key);
+        put_record(&path, &bytes);
+        records.push((path, bytes));
+        store.begin_pass();
+        assert_eq!(store.hold(&b.key), None);
+        assert_eq!(store.rebuilt.len(), (n + 1).min(REBUILT_BOUND));
+        assert_eq!(
+            store.disabled(),
+            (n == REBUILT_BOUND).then_some("t14_rebuilt_overflow")
+        );
+    }
+    assert_eq!(store.counters().t14_rebuild, REBUILT_BOUND as u64);
+    assert!(store.inventory().unwrap().is_empty());
+    for (path, bytes) in records {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn restore_read_access_failure_disables_but_disappearance_is_absence() {
+    for arm in ["permission", "metadata", "missing"] {
+        let _reset = ResetFaults;
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let transcript = scratch.transcript("t.jsonl", b"{}\n");
+        let b = binding("acct", "scope", ("fp", None));
+        let mut store = scratch.store();
+        store
+            .write_after_save(
+                &lock,
+                1,
+                vec![pending(b.clone(), certificate(&transcript), 1)],
+            )
+            .unwrap();
+        let path = record_file(&store, &b.key);
+        let before = fs::read(&path).unwrap();
+        test_hooks::set_before_access(Some(Box::new(move |_, op| match (arm, op) {
+            ("permission", "restore_open") => Err(io::ErrorKind::PermissionDenied.into()),
+            ("metadata", "restore_metadata") => Err(io::ErrorKind::Other.into()),
+            ("missing", "restore_open") => Err(io::ErrorKind::NotFound.into()),
+            _ => Ok(()),
+        })));
+        let mut cold = scratch.store();
+        assert_eq!(cold.read(&b.key), ReadOutcome::Missing);
+        assert_eq!(cold.disabled().is_some(), arm != "missing");
+        assert_eq!(cold.counters().format_hold, [0; 5]);
+        assert_eq!(cold.counters().t14_rebuild, 0);
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
+fn non_format_io_errors_disable_at_every_read_boundary_without_spending_t14() {
+    for stage in ["open", "header", "body", "restore_open", "restore_metadata"] {
+        for errno in [libc::EIO, libc::EMFILE, libc::ENFILE, libc::EPERM] {
+            let _reset = ResetFaults;
+            let scratch = Scratch::new();
+            let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+            let transcript = scratch.transcript("t.jsonl", b"{}\n");
+            let b = binding("acct", "scope", ("fp", None));
+            let mut store = scratch.store();
+            store
+                .write_after_save(
+                    &lock,
+                    1,
+                    vec![pending(b.clone(), certificate(&transcript), 1)],
+                )
+                .unwrap();
+            let record = record_file(&store, &b.key);
+            let before = fs::read(&record).unwrap();
+            test_hooks::set_before_access(Some(Box::new(move |_, op| {
+                if op == stage {
+                    Err(io::Error::from_raw_os_error(errno))
+                } else {
+                    Ok(())
+                }
+            })));
+            let mut cold = scratch.store();
+            if stage.starts_with("restore") {
+                assert_eq!(cold.read(&b.key), ReadOutcome::Missing);
+            } else {
+                assert_eq!(cold.hold(&b.key), None);
+            }
+            assert!(cold.disabled().is_some(), "{stage}/{errno}");
+            assert_eq!(cold.hold(&b.key), None);
+            assert_eq!(cold.counters().format_hold, [0; 5]);
+            assert_eq!(cold.counters().t14_rebuild, 0);
+            assert!(cold.rebuilt.is_empty());
+            assert_eq!(fs::read(&record).unwrap(), before);
+        }
     }
 }
 
