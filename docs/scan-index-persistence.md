@@ -518,9 +518,18 @@ an unambiguous durable COMMIT; Published/Ambiguous outcomes require reopening.
 If restart staging excludes any file, the complete save is discarded and the
 committed graph is reloaded. No acceptance, ACK handoff, rebuild-debt retirement,
 owned-start census or account-window retirement from that attempt is published.
-The route retains excluded keys for a short backoff; the next pass omits them
-before candidate parsing while independent files can commit. Exclusions are
-counted by `v2_resume_stage_excluded`.
+The route retains excluded keys through a 60-second parsing backoff while
+independent files can commit. Excluded keys stay in bounded discovery and age
+retention; their committed extent, prior restart reference and owed debt remain
+unchanged. The existing growth retention metadata keeps them eligible even when
+they age outside the ordinary scan window. Backoff expiry permits a normal retry;
+only a durably staged replacement or witnessed finish resolves the exclusion.
+`v2_resume_stage_excluded` counts retained keys per Claude source pass and
+`v2_resume_excluded_growth_bytes` counts additional bytes observed while held.
+`v2_resume_stage_excluded_alarm` reports the same key still excluded after three
+passes or six hours. These retry clocks are process-local; durable file/ref/debt
+custody survives restart. Directory-fsync or store-level failures refuse the whole
+transaction and must not be reported by the adapter as a per-file exclusion.
 
 The 5,000-mutation / 32 MiB soft target sizes the next collection page. A save over
 target still commits and halves the next page; a collection save under target
