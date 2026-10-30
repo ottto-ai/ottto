@@ -7391,6 +7391,9 @@ fn finish_sync_source(
     index.retain_claude_history_emission_permitted(&mut scan_result.snapshots);
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
+    // Validated unstored ACKs are evidence only for this destination and this
+    // invocation. Never retain them in process-global selection history.
+    let mut desktop_identity_unstored_bodies = BTreeMap::new();
     let mut accepted = 0;
     let bootstrap_offer_finished = bootstrap_capacity_error.is_some();
     let upload_result = if let Some(error) = bootstrap_capacity_error {
@@ -7461,7 +7464,12 @@ fn finish_sync_source(
                 // leaves the counters in place so the losses are reported on the
                 // next batch instead of vanishing with the request that died.
                 client_report.commit();
-                crate::snapshots::classify_desktop_identity_reoffers(&request.snapshots, &response);
+                desktop_identity_unstored_bodies.extend(
+                    crate::snapshots::classify_desktop_identity_reoffers(
+                        &request.snapshots,
+                        &response,
+                    ),
+                );
                 Ok(response)
             },
             |progress| progress.save(&upload_progress_path),
@@ -7517,6 +7525,7 @@ fn finish_sync_source(
         index.settle_desktop_identity_reoffers(
             &scan_result,
             &upload_progress.accepted_body_witnesses,
+            &desktop_identity_unstored_bodies,
             &upload_progress.quarantined_fingerprints,
         );
     }

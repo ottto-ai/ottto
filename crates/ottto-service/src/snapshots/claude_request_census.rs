@@ -1492,6 +1492,7 @@ struct CensusRead<R> {
     shadow_key: bool,
     shadow_state: bool,
     desktop_selector: Option<&'static str>,
+    selectors: super::desktop_lineage::SelectorDecodeAllowance,
     capture: bool,
     syntax_only: bool,
     #[cfg(test)]
@@ -1521,6 +1522,7 @@ impl<R: std::io::Read> CensusRead<R> {
             shadow_key: false,
             shadow_state: false,
             desktop_selector: None,
+            selectors: super::desktop_lineage::SelectorDecodeAllowance::default(),
             capture: false,
             syntax_only: false,
             #[cfg(test)]
@@ -1646,7 +1648,14 @@ impl<R: std::io::Read> CensusRead<R> {
         // boundary. The syntax-only pass substitutes null without buffering
         // or interpreting census records, even before header controls run.
         let mut overflow = self.syntax_only || self.retired_guard;
-        let max_bytes = if self.desktop_selector.is_some() {
+        let joint_selector = matches!(
+            self.desktop_selector,
+            Some("claude_desktop_lineage_file_edges" | "claude_desktop_identity_latches")
+        );
+        let mut raw_bytes = 0_u64;
+        let max_bytes = if joint_selector {
+            self.selectors.remaining() as usize
+        } else if self.desktop_selector.is_some() {
             super::desktop_lineage::MAX_DECODE_BYTES as usize
         } else {
             MAX_RAW_BYTES
@@ -1656,6 +1665,7 @@ impl<R: std::io::Read> CensusRead<R> {
                 self.replay = Some(byte);
                 break;
             }
+            raw_bytes = raw_bytes.saturating_add(1);
             if !overflow {
                 if bytes.len() == max_bytes {
                     bytes = Vec::new();
@@ -1686,6 +1696,9 @@ impl<R: std::io::Read> CensusRead<R> {
                     _ => {}
                 }
             }
+        }
+        if joint_selector {
+            overflow |= !self.selectors.admit(raw_bytes);
         }
         if self.syntax_only {
             // The original-input gate already checked admitted grammar. This

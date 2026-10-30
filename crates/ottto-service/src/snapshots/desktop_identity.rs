@@ -16,7 +16,7 @@ pub(super) enum IdentityLatch {
     /// This child's own disposition was missing at a stored-body ACK.
     #[serde(rename = "identity_pending")]
     Pending,
-    /// A complete disposition, or a re-offer, settled at a stored-body ACK.
+    /// This destination ACKed the exact complete body.
     #[serde(rename = "settled")]
     Settled,
 }
@@ -74,20 +74,17 @@ impl BoundedMemo<[u8; 32]> {
 }
 /// `posted` holds a re-offer on its way to the backend, keyed by SHA-256 of
 /// its body's fingerprint, until a response names that body. An eviction or a
-/// new process loses at most that count. `unstored` maps a fingerprint to the
-/// exact body answered unchanged with nothing stored, which leaves no ACK in
-/// the upload ledger.
+/// new process loses at most that count. ACK evidence never lives here: an
+/// unstored verdict belongs only to the validated upload invocation.
 struct ReofferMemos {
     refused: BoundedMemo<[u8; 32]>,
     posted: BoundedMemo<(IdentityReoffer, u64)>,
-    unstored: BoundedMemo<[u8; 32]>,
 }
 impl ReofferMemos {
     const fn new() -> Self {
         Self {
             refused: BoundedMemo::new(REFUSED_MEMO_CAP),
             posted: BoundedMemo::new(REFUSED_MEMO_CAP),
-            unstored: BoundedMemo::new(REFUSED_MEMO_CAP),
         }
     }
 }
@@ -234,10 +231,12 @@ fn edge_bytes(edges: &BTreeMap<String, String>) -> usize {
 /// from `response.accepted`, which sums accepted and unchanged. A conflict
 /// settles with the upload ledger; a count-only ACK names no entity and counts
 /// nothing.
+/// Returns exact unstored ACK witnesses for the caller's validated upload
+/// invocation only; never reuse this map for another destination or replay.
 pub(crate) fn classify_desktop_identity_reoffers(
     sent: &[SnapshotItem],
     response: &crate::snapshot_client::SnapshotBatchResponse,
-) {
+) -> BTreeMap<String, String> {
     use crate::local_resource_diagnostics::claude_reread::{
         desktop_identity_reoffer, IdentityReoffered,
     };
@@ -263,16 +262,19 @@ pub(crate) fn classify_desktop_identity_reoffers(
         .unchanged_entities
         .iter()
         .filter(|entity| entity.unchanged_basis.is_some());
+    let mut unstored_bodies = BTreeMap::new();
     for entity in unstored {
         let body = sent
             .iter()
             .find(|item| item.snapshot_fingerprint == entity.snapshot_fingerprint);
         if let Some(body) = body {
-            let key = memo_key(&entity.snapshot_fingerprint);
-            let witness = memo_key(&snapshot_upload_body_witness(body));
-            with_reoffer_memos(|memos| memos.unstored.record(key, witness));
+            unstored_bodies.insert(
+                entity.snapshot_fingerprint.clone(),
+                snapshot_upload_body_witness(body),
+            );
         }
     }
+    unstored_bodies
 }
 
 fn own_bodies<'a>(
@@ -323,18 +325,24 @@ fn emitted_complete(pending: &PendingIndexFinalization, items: &[SnapshotItem]) 
     })
 }
 
-/// A pending child has no ACK for its complete body, even when the working
+/// An unlatched or pending child has no ACK for its complete body, even when the working
 /// entry already names that body: its fingerprint can outlive the missing one
 /// in the upload ledger, so an unACKed upload can advance the entry. The
 /// backend answers an exact repeat with unchanged.
 pub(super) fn recovery_must_send(
+    index: &ScanIndex,
     pending: &PendingIndexFinalization,
     items: &[SnapshotItem],
 ) -> bool {
-    matches!(
-        pending.desktop_identity_reoffer,
-        Some((IdentityReoffer::Recovered, _))
-    ) && emitted_complete(pending, items)
+    index
+        .claude_desktop_identity_latches
+        .get(&pending.index_key)
+        != Some(&IdentityLatch::Settled)
+        && !matches!(
+            pending.desktop_identity_reoffer,
+            Some((IdentityReoffer::Adoption, _))
+        )
+        && emitted_complete(pending, items)
 }
 
 impl ScanIndex {
@@ -437,25 +445,28 @@ impl ScanIndex {
                 }),
                 (None, None) => {}
             }
-            if complete && unchanged {
-                Some(IdentityLatch::Settled)
-            } else if local.is_none() && kind == IdentityReoffer::Adoption {
-                // If an unACKed upload advances the entry, the retry must send.
-                Some(IdentityLatch::Pending)
-            } else {
-                None
+            // A carried fingerprint certifies the old body only. Defer this
+            // identity-only selection until evidence changes or the memo is
+            // evicted; ordinary growth/source-change selection still runs.
+            if complete && (unchanged || body.is_some_and(|body| carried.contains(body))) {
+                if let Some(evidence) = pending.desktop_identity_evidence {
+                    remember_refused(&pending.index_key, evidence);
+                }
             }
+            (complete
+                && self.claude_desktop_identity_latches.get(&pending.index_key)
+                    != Some(&IdentityLatch::Settled))
+            .then_some(IdentityLatch::Pending)
         } else {
             match emitted {
-                // A pending child settles only on this body's own ACK.
+                // Natural emissions owe the same exact-body ACK as re-offers.
+                // Finalization and fingerprint-safe saves grant no settlement.
                 Some("complete")
                     if self.claude_desktop_identity_latches.get(&pending.index_key)
-                        == Some(&IdentityLatch::Pending) =>
+                        != Some(&IdentityLatch::Settled) =>
                 {
-                    None
+                    Some(IdentityLatch::Pending)
                 }
-                // After the creation-proof, ownership and request downgrades.
-                Some("complete") => Some(IdentityLatch::Settled),
                 // Only a Desktop child carrying its own pair can later
                 // resolve complete from the same metadata; other Claude
                 // sessions never enter the map. A downgrade of a resolved
@@ -490,14 +501,12 @@ impl ScanIndex {
         &mut self,
         scan: &SourceScanResult,
         accepted_bodies: &BTreeMap<String, String>,
+        invocation_unstored_bodies: &BTreeMap<String, String>,
         quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
     ) {
         for pending in &scan.pending_finalization {
             let latch = self.claude_desktop_identity_latches.get(&pending.index_key);
-            if latch == Some(&IdentityLatch::Settled)
-                || (pending.desktop_identity_reoffer.is_none()
-                    && latch != Some(&IdentityLatch::Pending))
-                || !emitted_complete(pending, &scan.snapshots)
+            if latch == Some(&IdentityLatch::Settled) || !emitted_complete(pending, &scan.snapshots)
             {
                 continue;
             }
@@ -517,11 +526,7 @@ impl ScanIndex {
                 .collect::<Vec<_>>();
             if own.iter().all(|(fingerprint, witness)| {
                 accepted_bodies.get(*fingerprint) == Some(witness)
-                    || with_reoffer_memos(|memos| {
-                        memos
-                            .unstored
-                            .holds(&memo_key(fingerprint), &memo_key(witness))
-                    })
+                    || invocation_unstored_bodies.get(*fingerprint) == Some(witness)
             }) {
                 self.record_desktop_identity_latch(&pending.index_key, IdentityLatch::Settled);
                 continue;

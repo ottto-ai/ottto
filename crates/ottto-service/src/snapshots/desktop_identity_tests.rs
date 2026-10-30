@@ -276,7 +276,7 @@ fn ledger(item: &SnapshotItem) -> BTreeMap<String, String> {
 }
 
 fn settle(index: &mut ScanIndex, result: &SourceScanResult, ledger: &BTreeMap<String, String>) {
-    index.settle_desktop_identity_reoffers(result, ledger, &BTreeMap::new());
+    index.settle_desktop_identity_reoffers(result, ledger, &BTreeMap::new(), &BTreeMap::new());
 }
 
 /// Everything but the disposition: the re-offer is the FULL current body.
@@ -473,7 +473,18 @@ fn desktop_identity_settles_on_this_bodys_ack_never_on_an_older_bodys_fingerprin
     let at = "2026-08-02T07:12:00Z";
     let (unstored, _) = f.run_answered(committed.clone(), cache(), at, Backend::Unstored);
     let mut working = unstored.index;
-    settle(&mut working, &unstored.result, &BTreeMap::new());
+    let verdict = classify_desktop_identity_reoffers(
+        &unstored.result.snapshots,
+        &Backend::Unstored
+            .response(&unstored.result.snapshots)
+            .unwrap(),
+    );
+    working.settle_desktop_identity_reoffers(
+        &unstored.result,
+        &BTreeMap::new(),
+        &verdict,
+        &BTreeMap::new(),
+    );
     assert_eq!(f.latch(&working), Some(Settled));
 
     // A refusal is no ACK: pending, and this evidence is not offered again.
@@ -494,7 +505,12 @@ fn desktop_identity_settles_on_this_bodys_ack_never_on_an_older_bodys_fingerprin
         },
     )]);
     let mut working = rejected.index;
-    working.settle_desktop_identity_reoffers(&rejected.result, &BTreeMap::new(), &held);
+    working.settle_desktop_identity_reoffers(
+        &rejected.result,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &held,
+    );
     assert_eq!(f.latch(&working), Some(Pending));
     let (quiet, counts) = f.run(working, "2026-08-02T07:15:00Z");
     assert!(quiet.result.snapshots.is_empty());
@@ -629,9 +645,22 @@ fn desktop_identity_downgraded_emission_never_latches_and_recovers_when_evidence
     f.write_store(CREATED, "creation proof recovered");
     let (recovered, _) = f.run(ack(quiet), "2026-08-02T07:15:00Z");
     assert_eq!(disposition(f.child(&recovered)), Some("complete"));
-    let index = ack(recovered);
-    assert_eq!(f.latch(&index), Some(Settled));
-    f.quiet(f.restart(index), &["2026-08-02T07:16:00Z"]);
+    assert_eq!(
+        f.latch(&recovered.index),
+        Some(Pending),
+        "natural completion still owes an exact ACK"
+    );
+    let mut working = recovered.index;
+    settle(&mut working, &recovered.result, &BTreeMap::new());
+    assert_eq!(
+        f.latch(&working),
+        Some(Pending),
+        "no synthetic ack helper before the verdict"
+    );
+    let body = &recovered.result.snapshots[0];
+    settle(&mut working, &recovered.result, &ledger(body));
+    assert_eq!(f.latch(&working), Some(Settled));
+    f.quiet(f.restart(working), &["2026-08-02T07:16:00Z"]);
 }
 
 #[test]
@@ -767,7 +796,7 @@ fn desktop_identity_adoption_waits_when_uncached_and_unchanged_body_sends_nothin
     index.active_upload_context_fingerprint = context.clone();
     index.upload_context_fingerprint = context;
     // Cached: one adoption pass from the retained reduction; the body is
-    // unchanged, so nothing new is sent and the child settles.
+    // unchanged, so nothing new is sent; without an exact ACK it stays pending.
     let supported = u64::from(crate::heap_layout_bound::layout_supported());
     let (warm, counts) = f.run_with(index, cache.clone(), "2026-08-02T07:13:00Z");
     assert!(warm.result.snapshots.is_empty(), "fingerprint dedupe");
@@ -826,4 +855,170 @@ fn desktop_identity_adoption_sends_once_from_cache_with_the_childs_own_account()
     let (quiet, counts) = f.run_with(index, cache, "2026-08-02T07:14:00Z");
     assert!(quiet.result.snapshots.is_empty());
     assert_eq!((quiet.native_bytes, counts), (0, Reoffers::default()));
+}
+
+#[test]
+fn desktop_identity_natural_complete_refusal_cannot_settle_whole_or_partial_save() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    for backend in [Backend::Rejected, Backend::Conflict] {
+        for downgraded in [false, true] {
+            desktop_identity::reset_refused_memo_for_test();
+            let f = IdentityFixture::new(if downgraded { CREATED_LATE } else { CREATED });
+            let (committed, old_acks) = if downgraded {
+                let (missing, _) = f.run(ScanIndex::default(), COLLECTED);
+                assert_eq!(disposition(f.child(&missing)), Some("missing"));
+                let old = ledger(f.child(&missing));
+                let committed = ack(missing);
+                assert_eq!(f.latch(&committed), None);
+                f.write_store(CREATED, "natural proof recovery");
+                (committed, old)
+            } else {
+                (ScanIndex::default(), BTreeMap::new())
+            };
+            let (run, _) = f.run_answered(
+                committed.clone(),
+                Arc::new(SharedCache::default()),
+                "2026-08-02T07:12:00Z",
+                backend,
+            );
+            let body = f.child(&run);
+            assert_eq!(disposition(body), Some("complete"));
+            assert!(run
+                .result
+                .pending_finalization
+                .iter()
+                .all(|p| p.desktop_identity_reoffer.is_none()));
+            if downgraded {
+                assert!(old_acks.contains_key(&body.snapshot_fingerprint));
+                assert_ne!(ledger(body), old_acks);
+            }
+            let quarantine = BTreeMap::from([(
+                body.snapshot_fingerprint.clone(),
+                SnapshotQuarantineRecord {
+                    upload_body_witness: Some(snapshot_upload_body_witness(body)),
+                    ..snapshot_quarantine_record(SOURCE)
+                },
+            )]);
+            let mut working = run.index;
+            working.settle_desktop_identity_reoffers(
+                &run.result,
+                &old_acks,
+                &BTreeMap::new(),
+                &quarantine,
+            );
+            assert_eq!(
+                f.latch(&f.restart(working.clone())),
+                Some(Pending),
+                "whole-index save"
+            );
+            let accepted = old_acks.keys().cloned().collect();
+            let partial = working.committable_subset(&committed, &accepted, &quarantine);
+            assert_eq!(
+                f.latch(&f.restart(partial)),
+                Some(Pending),
+                "fingerprint/quarantine-safe partial save"
+            );
+        }
+    }
+}
+
+#[test]
+fn desktop_identity_legacy_unknown_carry_bounds_reads_and_preserves_growth() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let f = IdentityFixture::new(CREATED);
+    let (missing, _) = f.run(f.loaded_incomplete("2026-08-02T07:11:00Z"), COLLECTED);
+    let fingerprint = f.child(&missing).snapshot_fingerprint.clone();
+    let mut index = ack(missing);
+    index
+        .accepted_rebuild_incidence
+        .insert(String::new(), BTreeSet::from([fingerprint.clone()]));
+    index.accepted_incidence_pending_census = true;
+    let len = f.len();
+    let (carried, counts) = f.run(index, "2026-08-02T07:12:00Z");
+    assert!(
+        carried.result.snapshots.is_empty(),
+        "legacy carry still protects the old ACK"
+    );
+    assert_eq!(carried.native_bytes, len);
+    assert_eq!(counts.recovered, [0, 1, 0, len]);
+    assert_eq!(f.latch(&carried.index), Some(Pending));
+    assert!(carried.index.accepted_rebuild_incidence[""].contains(&fingerprint));
+    let index = f.quiet(
+        carried.index,
+        &[
+            "2026-08-02T07:13:00Z",
+            "2026-08-02T07:14:00Z",
+            "2026-08-02T07:15:00Z",
+        ],
+    );
+    f.native.append_transcript(1);
+    let (grown, counts) = f.run(index, "2026-08-02T07:16:00Z");
+    assert!(
+        grown.native_bytes > 0,
+        "growth takes the ordinary read before identity deferral"
+    );
+    assert_eq!(grown.index.files[&f.key()].size_bytes, f.len());
+    assert!(f.child(&grown).input_tokens > 0);
+    assert_ne!(
+        f.child(&grown).snapshot_fingerprint,
+        fingerprint,
+        "appended usage is offered"
+    );
+    assert_eq!(counts, Reoffers::default());
+}
+
+#[test]
+fn desktop_identity_unstored_ack_is_local_to_destination_and_invocation() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let f = IdentityFixture::new(CREATED);
+    let (missing, _) = f.run(f.loaded_incomplete("2026-08-02T07:11:00Z"), COLLECTED);
+    let committed = ack(missing);
+    let (run, _) = f.run_answered(
+        committed,
+        Arc::new(SharedCache::default()),
+        "2026-08-02T07:12:00Z",
+        Backend::Silent,
+    );
+    let response = Backend::Unstored.response(&run.result.snapshots).unwrap();
+    let a_verdict = classify_desktop_identity_reoffers(&run.result.snapshots, &response);
+    assert_eq!(
+        a_verdict,
+        ledger(f.child(&run)),
+        "exact body answered under A"
+    );
+    let mut a = run.index.clone();
+    a.activate_upload_context("destination-a".into());
+    a.settle_desktop_identity_reoffers(&run.result, &BTreeMap::new(), &a_verdict, &BTreeMap::new());
+    assert_eq!(f.latch(&a), Some(Settled));
+    for (destination, rejected) in [
+        ("destination-b", false),
+        ("destination-b", true),
+        ("destination-a", false),
+    ] {
+        let mut other = run.index.clone();
+        other.activate_upload_context(destination.into());
+        let quarantine = if rejected {
+            let body = f.child(&run);
+            BTreeMap::from([(
+                body.snapshot_fingerprint.clone(),
+                SnapshotQuarantineRecord {
+                    upload_body_witness: Some(snapshot_upload_body_witness(body)),
+                    ..snapshot_quarantine_record(SOURCE)
+                },
+            )])
+        } else {
+            BTreeMap::new()
+        };
+        other.settle_desktop_identity_reoffers(
+            &run.result,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &quarantine,
+        );
+        assert_eq!(
+            f.latch(&other),
+            Some(Pending),
+            "{destination}: a prior invocation's ACK is no evidence"
+        );
+    }
 }

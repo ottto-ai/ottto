@@ -4,6 +4,20 @@ use serde::de::{MapAccess, Visitor};
 
 pub(super) const MAX_EDGES: usize = 4096;
 pub(super) const MAX_DECODE_BYTES: u64 = 1024 * 1024;
+/// One raw decode allowance shared by the two file-keyed selector maps.
+/// Refusal drops optional selection history only; file custody is independent.
+#[derive(Default)]
+pub(super) struct SelectorDecodeAllowance(u64);
+impl SelectorDecodeAllowance {
+    pub(super) fn remaining(&self) -> u64 {
+        MAX_DECODE_BYTES.saturating_sub(self.0)
+    }
+    pub(super) fn admit(&mut self, bytes: u64) -> bool {
+        let admitted = bytes <= self.remaining();
+        self.0 = self.0.saturating_add(bytes);
+        admitted
+    }
+}
 // Each canonical UUID pair occupies 78 bytes including its comma. The final
 // comma is replaced by the closing brace; this maximum always fits our reader.
 pub(super) const MAX_PROJECTION_JSON_BYTES: usize = MAX_EDGES * 78 + 1;

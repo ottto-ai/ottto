@@ -4793,3 +4793,89 @@ fn retired_reread_new_writer_keeps_previous_default_contract() {
         serde_json::to_vec(&seed.claude_request_census).unwrap()
     );
 }
+
+#[test]
+fn desktop_selector_readers_share_one_raw_decode_allowance_and_keep_custody() {
+    let dir = crate::test_scratch::ScratchDir::new("desktop-selector-joint-decode");
+    let original = fixture();
+    let base = serde_json::to_string(&original).unwrap();
+    // Bypass writer admission: individually valid maps below 1 MiB, jointly
+    // above it. Few long keys also stay below the bounded reader's node cap.
+    let edges = (0..80)
+        .map(|n| {
+            (
+                format!("/synthetic/{n:03}/{}", "x".repeat(7600)),
+                "a".repeat(64),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let latches = edges
+        .keys()
+        .map(|key| (key.clone(), "settled"))
+        .collect::<BTreeMap<_, _>>();
+    let edges = serde_json::to_string(&edges).unwrap();
+    let latches = serde_json::to_string(&latches).unwrap();
+    let limit = desktop_lineage::MAX_DECODE_BYTES as usize;
+    assert!(edges.len() < limit && latches.len() < limit);
+    assert!(edges.len() + latches.len() > limit);
+    for edges_first in [true, false] {
+        let fields = if edges_first {
+            format!("\"claude_desktop_lineage_file_edges\":{edges},\"claude_desktop_identity_latches\":{latches}")
+        } else {
+            format!("\"claude_desktop_identity_latches\":{latches},\"claude_desktop_lineage_file_edges\":{edges}")
+        };
+        let bytes = format!("{{{fields},{}", &base[1..]).into_bytes();
+        let path = dir.join("index.json");
+        fs::write(&path, &bytes).unwrap();
+        for reader in 0..5 {
+            let (decoded, rows) = crate::local_resource_diagnostics::capture(|| match reader {
+                0 => lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed")
+                    .unwrap(),
+                1 => claude_request_census::decode_index(bytes.as_slice()).unwrap(),
+                2 => lenient_decode::read_bounded(&bytes).unwrap(),
+                3 => {
+                    lenient_decode::read_identity_carry(File::open(&path).unwrap(), "unattributed")
+                        .unwrap()
+                }
+                _ => {
+                    let (normalized, _, _) =
+                        claude_request_census::normalized_bounded_bytes(&bytes).unwrap();
+                    claude_request_census::decode_index(normalized.as_slice()).unwrap()
+                }
+            });
+            assert_eq!(
+                decoded.claude_desktop_lineage_file_edges.len(),
+                if edges_first { 80 } else { 0 },
+                "reader {reader}"
+            );
+            assert_eq!(
+                decoded.claude_desktop_identity_latches.len(),
+                if edges_first { 0 } else { 80 },
+                "reader {reader}"
+            );
+            let drops = rows
+                .iter()
+                .filter_map(|row| {
+                    row["counts"]["desktop_metadata"]["lineage_selector_drops"].as_u64()
+                })
+                .sum::<u64>();
+            assert_eq!(
+                drops, 1,
+                "count only the refused optional span, reader {reader}"
+            );
+            if reader != 3 {
+                assert_eq!(decoded.files.len(), original.files.len());
+                assert_sibling(&decoded);
+                assert!(
+                    decoded.decode_holds.is_empty(),
+                    "selector loss never holds a file"
+                );
+            } else {
+                assert_eq!(
+                    decoded.accepted_snapshot_fingerprints, original.accepted_snapshot_fingerprints,
+                    "Repair preserves ACK custody"
+                );
+            }
+        }
+    }
+}

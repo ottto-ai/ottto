@@ -2772,3 +2772,87 @@ fn returning_tombstoned_family_that_grew_reproves_in_a_fresh_window() {
         "the accepted cumulative head is not offered again"
     );
 }
+
+
+/// Real prepare/finish, HTTP validation, upload ledger, selected save and load.
+/// No layout/cache gate: the native acquisition may use its ordinary fallback.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn desktop_identity_real_sync_rejected_body_stays_pending_exact_acked_retry_settles() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let _manifests = SourceManifestTestGuard::new();
+    let start = 2_000_000_000;
+    let mut pipeline = ReofferPipeline::new(
+        "desktop-identity-exact-ack",
+        Answer::Refuse(ORIGINAL_PAIR),
+        start,
+    );
+    let store = pipeline
+        .fixture
+        .home
+        .join("Library/Application Support/Claude/claude-code-sessions")
+        .join("123e4567-e89b-12d3-a456-426614174000")
+        .join(IDENTITY_PIPELINE_ORG);
+    std::fs::create_dir_all(&store).unwrap();
+    let created = (OffsetDateTime::now_utc() - TimeDuration::days(1))
+        .format(&Rfc3339)
+        .unwrap();
+    std::fs::write(store.join("child.json"), serde_json::json!({
+        "cliSessionId": IDENTITY_PIPELINE_ROOT, "sessionId": "local_child", "createdAt": created,
+        "title": "synthetic child", "titleSource": "user"
+    }).to_string()).unwrap();
+    let key = pipeline.transcript().to_string_lossy().to_string();
+    let refused = pipeline.cycle(start);
+    refused.result.unwrap(); // Validated permanent refusal settles transport only.
+    let offered = pipeline.server.offered.lock().unwrap().clone();
+    assert_eq!(offered.len(), 1, "the real upload was attempted");
+    assert_eq!(
+        offered[0]["session_account_evidence"]["identity_disposition"],
+        "complete"
+    );
+    assert!(offered[0]["session_account_evidence"]["account_identifier_hash"].is_string());
+    assert_eq!(
+        serde_json::to_value(&refused.index).unwrap()["claude_desktop_identity_latches"][&key],
+        "identity_pending",
+        "natural completion has no ACK"
+    );
+    let fingerprint = fingerprint_of(&offered[0]);
+    assert!(!refused
+        .progress
+        .accepted_body_witnesses
+        .contains_key(&fingerprint));
+    let refused_witness = refused.progress.permanent_rejections[&fingerprint]
+        .body_witness
+        .clone();
+    // Use the EXISTING reason-scoped daily retry, without changing source bytes,
+    // receipt state or identity selection history. It precedes identity deferral.
+    *pipeline.server.answer.lock().unwrap() = Answer::Accept;
+    let acked = pipeline.cycle(start + DAY);
+    acked.result.unwrap();
+    assert_eq!(
+        acked.leased_offers, 1,
+        "ordinary reason-scoped retry was earned"
+    );
+    let offered = pipeline.server.offered.lock().unwrap();
+    assert_eq!(
+        offered.len(),
+        2,
+        "retry reached HTTP rather than a synthetic ack helper"
+    );
+    assert_eq!(fingerprint_of(&offered[1]), fingerprint);
+    assert_eq!(
+        offered[1]["session_account_evidence"],
+        offered[0]["session_account_evidence"]
+    );
+    assert_eq!(
+        acked.progress.accepted_body_witnesses.get(&fingerprint),
+        Some(&refused_witness),
+        "ACK bound the exact retried bytes"
+    );
+    assert_eq!(
+        serde_json::to_value(&acked.index).unwrap()["claude_desktop_identity_latches"][&key],
+        "settled",
+        "the real sync settlement hook promoted before the selected save"
+    );
+}

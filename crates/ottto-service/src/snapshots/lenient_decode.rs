@@ -1575,6 +1575,7 @@ impl<R: BufRead + Seek> Decoder<R> {
         let array = self.ws()? == Some(b'[');
         self.eat(if array { b'[' } else { b'{' })?;
         let mut seen = BTreeSet::new();
+        let mut selectors = desktop_lineage::SelectorDecodeAllowance::default();
         let mut position = 0;
         while self.ws()? != Some(if array { b']' } else { b'}' }) {
             let name = if array {
@@ -1654,21 +1655,20 @@ impl<R: BufRead + Seek> Decoder<R> {
                             };
                         }
                         "claude_desktop_lineage_file_edges" => {
-                            index.claude_desktop_lineage_file_edges = if value.resource
-                                || value.len > desktop_lineage::MAX_DECODE_BYTES
-                            {
-                                desktop_lineage::dropped();
-                                BTreeMap::new()
-                            } else {
-                                self.desktop_selector::<desktop_lineage::FileEdges>(value)?
-                                    .0
-                            };
+                            index.claude_desktop_lineage_file_edges =
+                                if !selectors.admit(value.len) || value.resource {
+                                    desktop_lineage::dropped();
+                                    BTreeMap::new()
+                                } else {
+                                    self.desktop_selector::<desktop_lineage::FileEdges>(value)?
+                                        .0
+                                };
                         }
                         "claude_desktop_identity_latches" => {
                             // Damage or loss is not settled: at most one
                             // counted re-offer, never a wrong account.
-                            index.claude_desktop_identity_latches = if value.resource
-                                || value.len > desktop_lineage::MAX_DECODE_BYTES
+                            index.claude_desktop_identity_latches = if !selectors.admit(value.len)
+                                || value.resource
                             {
                                 desktop_lineage::dropped();
                                 BTreeMap::new()
