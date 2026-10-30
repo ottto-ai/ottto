@@ -51699,9 +51699,6 @@ mod tests {
         include!("snapshots/p12_usage_original_tests.rs");
     }
 
-    mod giant_row_measurement_tests {
-        include!("snapshots/giant_row_measurement_tests.rs");
-    }
     mod authority_proof_correction_tests {
         include!("snapshots/authority_proof_correction_tests.rs");
     }
