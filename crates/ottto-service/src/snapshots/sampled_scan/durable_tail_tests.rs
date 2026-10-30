@@ -6206,6 +6206,7 @@ fn q11_complete_map_is_paid_before_the_first_key() {
     assert_eq!(
         super::super::STATE_BYTES
             + super::super::KEY_RESERVE_BYTES
+            + super::super::STALE_PREDECESSOR_RESERVE_BYTES
             + reserve
             + crate::source_rotation::OVERLAP_BUDGET
             + super::super::AUDIT_AND_SCRATCH_BYTES,

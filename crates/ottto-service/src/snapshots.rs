@@ -142,6 +142,8 @@ mod m3_d3_tests;
 mod m3_layout_tests;
 #[cfg(all(test, unix))]
 mod m3_native_tests;
+#[cfg(all(test, unix))]
+mod native_publication_tests;
 #[cfg(test)]
 pub(crate) use codex_counting_version::TestCutover;
 #[cfg(test)]
@@ -7440,6 +7442,71 @@ pub struct SnapshotSourceManifest {
     pub rolling_hash: String,
 }
 
+/// E1 disposition-table note4 / E2-1: the native caller's five publishing
+/// classes and three held classes. RAM-only transport, never persisted authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativePublication {
+    Receipted,
+    PublishWithoutRecord,
+    FailedPublishedWithoutRecord,
+    PublishRetainingPrior,
+    PublishStoreUntouched,
+    FailedHeld,
+    ReceiptPending,
+    Hold,
+}
+impl NativePublication {
+    /// The ONE publication policy, shared by transport and retained capture.
+    /// New outcome classes must be adjudicated here; no page-shape inference.
+    pub(crate) const fn publishes(self) -> bool {
+        match self {
+            Self::Receipted
+            | Self::PublishWithoutRecord
+            | Self::FailedPublishedWithoutRecord
+            | Self::PublishRetainingPrior
+            | Self::PublishStoreUntouched => true,
+            Self::FailedHeld | Self::ReceiptPending | Self::Hold => false,
+        }
+    }
+
+    #[cfg(unix)]
+    fn strict_rebind(source: SnapshotSource) -> Self {
+        // E1 r20 D2: only Codex has D3's strict rebind + degraded publication.
+        // Every non-Codex source keeps the caller's existing owed/hold conversion.
+        match source {
+            SnapshotSource::Codex => Self::FailedPublishedWithoutRecord,
+            SnapshotSource::ClaudeCode | SnapshotSource::Pi => Self::Hold,
+        }
+    }
+
+    #[cfg(unix)]
+    fn carry(page: &mut Option<Self>, completion: Option<Self>) {
+        // A bounded page can settle several files. Preserve its FIRST held
+        // completion even if a later sibling publishes; no extra key set/debt.
+        if let Some(completion) = completion {
+            if page.map_or(true, Self::publishes) {
+                *page = Some(completion);
+            }
+        }
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for NativePublication {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Receipted
+            | Self::PublishWithoutRecord
+            | Self::FailedPublishedWithoutRecord
+            | Self::PublishRetainingPrior
+            | Self::PublishStoreUntouched
+            | Self::FailedHeld
+            | Self::ReceiptPending
+            | Self::Hold => c.add(0),
+        }
+    }
+}
+
 macro_rules! scan_result {
     (pub struct $name:ident { pub source: SnapshotSource,
         $($(#[$attr:meta])* $vis:vis $field:ident: $ty:ty,)*
@@ -7456,6 +7523,9 @@ macro_rules! scan_result {
 scan_result! {
 pub struct SourceScanResult {
     pub source: SnapshotSource,
+    /// Actual native settlement class; first held completion wins within this
+    /// page. None means no e4 decision, never a fabricated publishing class.
+    pub(crate) native_publication: Option<NativePublication>,
     pub backfill_window_days: u64,
     pub backfill_file_limit: usize,
     pub discovered_file_count: usize,
@@ -26050,6 +26120,7 @@ fn prepare_owned_scan_candidate(
 pub(crate) mod claude_native_comparison;
 
 pub(crate) struct OwnedSourceScan {
+    native_publication: Option<NativePublication>,
     native_comparison: Option<claude_native_comparison::NativePhase>,
     resource_probe: crate::local_resource_diagnostics::Probe,
     sampling: Option<sampled_scan::Context>,
@@ -26641,6 +26712,7 @@ impl OwnedSourceScan {
         let mut codex_page = sampled_scan::codex_cursor::PageBudget::default();
         codex_page.set_continuation(ordinary_equivalent);
         Self {
+            native_publication: None,
             native_comparison: None,
             resource_probe: crate::local_resource_diagnostics::Probe::start(),
             sampling: None,
@@ -27357,6 +27429,7 @@ impl OwnedSourceScan {
             });
         resource_probe.page_events.merge(diagnostics.finish());
         Self {
+            native_publication: None,
             native_comparison: None,
             resource_probe,
             sampling: None,
@@ -27547,6 +27620,7 @@ impl OwnedSourceScan {
             );
         }
         let Self {
+            mut native_publication,
             mut native_comparison,
             mut resource_probe,
             mut sampling,
@@ -30013,7 +30087,7 @@ impl OwnedSourceScan {
                         Some((context, active, held))
                     });
                 #[cfg(unix)]
-                let (parsed_file, m3_disposition, m3_staged) = match m3_route {
+                let (parsed_file, m3_publication, m3_strict_rebind, m3_staged) = match m3_route {
                     Some((context, active, held)) => {
                         let request = NativeChainRequest {
                             source,
@@ -30052,12 +30126,19 @@ impl OwnedSourceScan {
                                 committed_index: index,
                             },
                         );
+                        NativePublication::carry(&mut native_publication, settled.publication);
                         completed_acquisition = settled.completed;
-                        (settled.native, settled.disposition, settled.staged)
+                        (
+                            settled.native,
+                            settled.publication,
+                            settled.strict_rebind,
+                            settled.staged,
+                        )
                     }
                     None => (
                         parser.finish_native(finish_request, None),
-                        NativeDisposition::Publish,
+                        None,
+                        false,
                         false,
                     ),
                 };
@@ -30081,7 +30162,9 @@ impl OwnedSourceScan {
                 // its accepted body and witness; the key stays indexed and its
                 // grown length keeps it discoverable regardless of age.
                 #[cfg(unix)]
-                if m3_disposition == NativeDisposition::Hold && parsed_file.is_ok() {
+                if m3_publication.is_some_and(|completion| !completion.publishes())
+                    && parsed_file.is_ok()
+                {
                     if let Some((context, publication)) =
                         sampling.as_ref().zip(cursor_publication.take())
                     {
@@ -30093,8 +30176,6 @@ impl OwnedSourceScan {
                 sampled_scan::test_hooks::fire(
                     sampled_scan::test_hooks::Point::BeforeNativeEffects,
                 );
-                #[cfg(unix)]
-                let m3_strict_rebind = m3_disposition == NativeDisposition::PublishStrictRebind;
                 // A committed cursor attempt counts as published only now (M4).
                 if let Some((context, publication)) =
                     sampling.as_ref().zip(cursor_publication.take())
@@ -31465,6 +31546,7 @@ impl OwnedSourceScan {
                         index: index_storage,
                         terminal_native_traversal: None,
                         scan: SourceScanResult {
+                            native_publication,
                             continuation_ticket,
                             continuation_evidence,
                             ..SourceScanResult::empty(SnapshotSource::Codex)
@@ -32193,6 +32275,7 @@ impl OwnedSourceScan {
                 }
                 let scan = SourceScanResult {
                     source,
+                    native_publication,
                     backfill_window_days,
                     backfill_file_limit: file_limit,
                     discovered_file_count,
@@ -34584,6 +34667,7 @@ impl OwnedSourceScan {
             delivery.left_active();
         }
         Ok(OwnedSourceScanStep::Pending(Self {
+            native_publication,
             native_comparison,
             resource_probe,
             sampling,
@@ -36221,22 +36305,6 @@ fn custody_chain(custody: &DurableCustody) -> Option<&sampled_scan::durable_tail
         .or_else(|| custody.owed.as_ref().map(|owed| owed.chain()))
 }
 
-/// How a native completion proceeds after its M3 settlement (G1 + D3).
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NativeDisposition {
-    /// Ordinary native effects: a matching receipt, a proven no-record
-    /// disposition, or a completion that is not on the M3 route.
-    Publish,
-    /// D3 Codex double failure: the store is disabled with record A on disk.
-    /// Publish only with the retained entry strictly rebound in the working
-    /// index whose save settles this publication.
-    PublishStrictRebind,
-    /// No effect this pass. The completion keeps its debt, the committed
-    /// entry its accepted body and witness, and the key stays discoverable.
-    Hold,
-}
-
 /// Descriptor acquisition for the already admitted M3 finish route. Use the
 /// existing input-kind predicate before chain/lease/debt acquisition: archive
 /// checkpoints belong to the ordinary archive owner, never physical prefixes.
@@ -36381,7 +36449,10 @@ struct NativeSettlement {
     native: Result<ParsedJsonlFile>,
     /// The certified completion the caller may still admit.
     completed: Option<sampled_jsonl::CompletedNativeAcquisition>,
-    disposition: NativeDisposition,
+    /// Existing PRE-index action only; this never decides publication.
+    strict_rebind: bool,
+    /// Classified once while consuming the real e4 result, including early holds.
+    publication: Option<NativePublication>,
     /// The M3 route decided this completion's record; no post-save offer.
     staged: bool,
 }
@@ -36422,7 +36493,7 @@ fn settle_native_attempt(
         preparation,
     } = attempt;
     let staged = preparation.is_some();
-    let disposition = match preparation {
+    let (publication, strict_rebind) = match preparation {
         // Not staged (no chain or no lease). A Claude key held by D3 still
         // never publishes over its surviving A; the query counts its growth
         // and releases it if the held object itself changed.
@@ -36430,9 +36501,9 @@ fn settle_native_attempt(
             && fence.source == SnapshotSource::ClaudeCode
             && cache.durable_claude_hold(fence.source, fence.key, &held) =>
         {
-            NativeDisposition::Hold
+            (Some(NativePublication::Hold), false)
         }
-        None => NativeDisposition::Publish,
+        None => (None, false),
         Some(staged) if native.is_err() => {
             // E4: no candidate becomes canonical; the caller's existing error
             // exit publishes nothing. Debt keeps its discovery obligation.
@@ -36440,7 +36511,7 @@ fn settle_native_attempt(
             if acquisition.custody().owed.is_some() {
                 cache.retain_owed_discovery(fence.source, fence.key);
             }
-            NativeDisposition::Publish
+            (None, false)
         }
         Some(staged) => {
             // Bound before the staging is consumed: a pending or held write
@@ -36461,7 +36532,8 @@ fn settle_native_attempt(
                     return NativeSettlement {
                         native,
                         completed: None,
-                        disposition: NativeDisposition::Hold,
+                        strict_rebind: false,
+                        publication: Some(NativePublication::Hold),
                         staged: true,
                     };
                 }
@@ -36477,53 +36549,65 @@ fn settle_native_attempt(
                 ),
                 None => Err(sampled_scan::durable_tail::HeldCause::Fence),
             };
-            match fences {
+            let (publication, strict_rebind) = match fences {
                 Err(_cause) => {
                     #[cfg(test)]
                     eprintln!("M3 native commit fence refused: {_cause:?}");
                     // The fences, not the staging, refused: discard the stage
                     // and hold the custody for an exact retry.
                     discard_staging(cache, staged);
-                    owe_receipt(cache, &mut acquisition, None)
+                    owe_receipt(cache, &mut acquisition, None);
+                    (NativePublication::Hold, false)
                 }
                 // Each outcome is computed (fences consumed) before the
                 // acquisition is borrowed again to bind or owe it.
                 Ok(fences) => match staged {
                     PrepareOutcome::Prepared(prepared) => {
                         let outcome = cache.commit_prepared(prepared, fences);
-                        write_disposition(cache, &mut acquisition, outcome, candidate.as_ref())
+                        write_disposition(
+                            cache,
+                            &mut acquisition,
+                            fence.source,
+                            outcome,
+                            candidate.as_ref(),
+                        )
                     }
                     PrepareOutcome::StoreFailed(failure) => {
                         let outcome = cache.resolve_failed_preparation(failure, fences);
-                        write_disposition(cache, &mut acquisition, outcome, candidate.as_ref())
+                        write_disposition(
+                            cache,
+                            &mut acquisition,
+                            fence.source,
+                            outcome,
+                            candidate.as_ref(),
+                        )
                     }
                     PrepareOutcome::NotPersisted(reason) => {
                         let outcome =
                             cache.resolve_unprepared(Unprepared::NotPersisted(reason), fences);
-                        unprepared_disposition(cache, &mut acquisition, outcome)
+                        unprepared_disposition(cache, &mut acquisition, fence.source, outcome)
                     }
                     PrepareOutcome::Degraded(reason) => {
                         let outcome =
                             cache.resolve_unprepared(Unprepared::Degraded(reason), fences);
-                        unprepared_disposition(cache, &mut acquisition, outcome)
+                        unprepared_disposition(cache, &mut acquisition, fence.source, outcome)
                     }
                 },
-            }
+            };
+            (Some(publication), strict_rebind)
         }
     };
     // Only Codex rebinds strictly. Any other source never publishes over a
     // surviving A: its key holds (Claude's original-v1 adapter would bind A).
-    let disposition = if disposition == NativeDisposition::PublishStrictRebind
-        && fence.source != SnapshotSource::Codex
-    {
-        owe_receipt(cache, &mut acquisition, None)
-    } else {
-        disposition
-    };
+    if strict_rebind && fence.source != SnapshotSource::Codex {
+        owe_receipt(cache, &mut acquisition, None);
+    }
     // The process-wide lease ends before any cache admission or effect.
     acquisition.custody_mut().release_active();
     let completed = match acquisition {
-        FinishAcquisition::Certified(completed) if disposition == NativeDisposition::Hold => {
+        FinishAcquisition::Certified(completed)
+            if publication.is_some_and(|completion| !completion.publishes()) =>
+        {
             // Funded owed retention, or the debt survives through the
             // index-held discovery obligation without the graph.
             if let OwedCompletionAdmission::Refused(completed) =
@@ -36536,7 +36620,9 @@ fn settle_native_attempt(
         }
         FinishAcquisition::Certified(completed) => Some(completed),
         FinishAcquisition::Uncertified(custody) => {
-            if disposition == NativeDisposition::Hold && custody.owed.is_some() {
+            if publication.is_some_and(|completion| !completion.publishes())
+                && custody.owed.is_some()
+            {
                 cache.retain_owed_discovery(fence.source, fence.key);
             }
             drop(custody);
@@ -36546,7 +36632,8 @@ fn settle_native_attempt(
     NativeSettlement {
         native,
         completed,
-        disposition,
+        strict_rebind,
+        publication,
         staged,
     }
 }
@@ -36559,18 +36646,18 @@ fn owe_receipt(
     cache: &sampled_scan::SharedCache,
     acquisition: &mut sampled_scan::durable_tail::FinishAcquisition,
     candidate: Option<&sampled_scan::durable_tail::RecordIdentity>,
-) -> NativeDisposition {
+) {
     let _held = cache.mark_receipt_owed(acquisition, candidate);
-    NativeDisposition::Hold
 }
 
 #[cfg(unix)]
 fn write_disposition(
     cache: &sampled_scan::SharedCache,
     acquisition: &mut sampled_scan::durable_tail::FinishAcquisition,
+    source: SnapshotSource,
     outcome: sampled_scan::durable_tail::WriteOutcome,
     candidate: Option<&sampled_scan::durable_tail::RecordIdentity>,
-) -> NativeDisposition {
+) -> (NativePublication, bool) {
     use sampled_scan::durable_tail::{DegradedCause, WriteOutcome};
     match outcome {
         // Only the exact receipt for this acquisition's candidate publishes.
@@ -36580,11 +36667,17 @@ fn write_disposition(
         } => {
             debug_assert_eq!(generation, receipt.generation());
             match cache.receipt_acquisition(acquisition, &receipt) {
-                Ok(()) => NativeDisposition::Publish,
-                Err(_) => owe_receipt(cache, acquisition, candidate),
+                Ok(()) => (NativePublication::Receipted, false),
+                Err(_) => {
+                    owe_receipt(cache, acquisition, candidate);
+                    (NativePublication::Hold, false)
+                }
             }
         }
-        WriteOutcome::ReceiptPending => owe_receipt(cache, acquisition, candidate),
+        WriteOutcome::ReceiptPending => {
+            owe_receipt(cache, acquisition, candidate);
+            (NativePublication::ReceiptPending, false)
+        }
         WriteOutcome::FailedHeld(cause) => {
             #[cfg(test)]
             eprintln!("M3 native write held: {cause:?}");
@@ -36593,16 +36686,20 @@ fn write_disposition(
                     cache.retain_owed_discovery(chain.source(), chain.key());
                 }
             }
-            owe_receipt(cache, acquisition, candidate)
+            owe_receipt(cache, acquisition, candidate);
+            (NativePublication::FailedHeld, false)
         }
         WriteOutcome::FailedPublishedWithoutRecord(DegradedCause::StrictRebind) => {
             acquisition.custody_mut().take_owed();
-            NativeDisposition::PublishStrictRebind
+            (NativePublication::strict_rebind(source), true)
         }
-        // Verified retirement or an untouched store: degraded, no record.
-        WriteOutcome::FailedPublishedWithoutRecord(_) => {
+        WriteOutcome::FailedPublishedWithoutRecord(
+            DegradedCause::WriteFailedRetired
+            | DegradedCause::StoreUntouched
+            | DegradedCause::PriorUnbindable,
+        ) => {
             acquisition.custody_mut().take_owed();
-            NativeDisposition::Publish
+            (NativePublication::FailedPublishedWithoutRecord, false)
         }
     }
 }
@@ -36611,17 +36708,17 @@ fn write_disposition(
 fn unprepared_disposition(
     cache: &sampled_scan::SharedCache,
     acquisition: &mut sampled_scan::durable_tail::FinishAcquisition,
+    source: SnapshotSource,
     disposition: sampled_scan::durable_tail::UnpreparedDisposition,
-) -> NativeDisposition {
+) -> (NativePublication, bool) {
     use sampled_scan::durable_tail::UnpreparedDisposition;
-    if !matches!(
-        disposition,
-        sampled_scan::durable_tail::UnpreparedDisposition::Hold(_)
-    ) {
+    if !matches!(disposition, UnpreparedDisposition::Hold(_)) {
         acquisition.custody_mut().take_owed();
     }
     match disposition {
-        UnpreparedDisposition::PublishStrictRebind => NativeDisposition::PublishStrictRebind,
+        UnpreparedDisposition::PublishStrictRebind => {
+            (NativePublication::strict_rebind(source), true)
+        }
         UnpreparedDisposition::PublishRetainingPrior { format, cause } => {
             debug_assert!(matches!(format, 1 | 3));
             debug_assert!(matches!(
@@ -36629,7 +36726,7 @@ fn unprepared_disposition(
                 sampled_scan::durable_tail::Unprepared::NotPersisted(_)
                     | sampled_scan::durable_tail::Unprepared::Degraded(_)
             ));
-            NativeDisposition::Publish
+            (NativePublication::PublishRetainingPrior, false)
         }
         UnpreparedDisposition::PublishWithoutRecord { cause } => {
             debug_assert!(matches!(
@@ -36637,7 +36734,7 @@ fn unprepared_disposition(
                 sampled_scan::durable_tail::Unprepared::NotPersisted(_)
                     | sampled_scan::durable_tail::Unprepared::Degraded(_)
             ));
-            NativeDisposition::Publish
+            (NativePublication::PublishWithoutRecord, false)
         }
         UnpreparedDisposition::PublishStoreUntouched { cause } => {
             debug_assert!(matches!(
@@ -36647,7 +36744,7 @@ fn unprepared_disposition(
                     | sampled_scan::durable_tail::Degraded::Paused
                     | sampled_scan::durable_tail::Degraded::Refused
             ));
-            NativeDisposition::Publish
+            (NativePublication::PublishStoreUntouched, false)
         }
         UnpreparedDisposition::Hold(cause) => {
             debug_assert!(matches!(
@@ -36659,7 +36756,8 @@ fn unprepared_disposition(
                     | sampled_scan::durable_tail::HeldCause::Incompatible
                     | sampled_scan::durable_tail::HeldCause::StaleSurvivor
             ));
-            owe_receipt(cache, acquisition, None)
+            owe_receipt(cache, acquisition, None);
+            (NativePublication::Hold, false)
         }
     }
 }
@@ -94800,7 +94898,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; pending_taken, pending_returns, #[cfg(unix)] pending_funding, #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_publication, native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
