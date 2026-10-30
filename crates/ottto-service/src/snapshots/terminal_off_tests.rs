@@ -38,7 +38,14 @@ fn refresh_terminal_off_discovery_at_test(
     at: &str,
     overflow: bool,
 ) {
-    refresh_terminal_off_discovery(index, roots, rfc3339_unix_seconds(at).unwrap(), overflow);
+    refresh_terminal_off_discovery(
+        index,
+        roots,
+        rfc3339_unix_seconds(at).unwrap(),
+        overflow,
+        at,
+        MAX_BACKFILL_FILES_PER_SOURCE,
+    );
 }
 
 fn off_scan(index: &mut ScanIndex, root: &Path, at: &str, limit: usize) -> SourceScanResult {

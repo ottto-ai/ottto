@@ -27010,7 +27010,14 @@ impl OwnedSourceScan {
             index.record_started_claude_request_identity_contract(claude_request_identity_capture);
         }
         if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
-            refresh_terminal_off_discovery(index, roots, audit_now, watcher_overflowed);
+            refresh_terminal_off_discovery(
+                index,
+                roots,
+                audit_now,
+                watcher_overflowed,
+                collected_at,
+                file_limit,
+            );
         }
         let next_generation_hints;
         {
@@ -33276,6 +33283,9 @@ impl OwnedSourceScan {
             // U1a-2a G5: a side read is not a scanned file.
             if side_plan.is_none() {
                 scanned_file_count += 1;
+                if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+                    terminal_off_discovery::served(index, &candidate);
+                }
             }
             // U1a-2a G7 (row 15): the side read's charge and start line,
             // before the parser or any acquisition reads P. A refused charge
@@ -43199,18 +43209,21 @@ fn enqueue_watcher_hints(
         {
             continue;
         }
-        if source == SnapshotSource::ClaudeCode
-            && traversal
+        if source == SnapshotSource::ClaudeCode {
+            if claude_terminal_off() {
+                if !terminal_off_discovery::hint_allowed(traversal, path) {
+                    continue;
+                }
+            } else if traversal
                 .oversized_discovery
                 .contains_key(&oversized_discovery::path_hash(path))
-        {
-            continue;
+            {
+                continue;
+            }
         }
         if let Some(&position) = pending.get(path) {
-            if source == SnapshotSource::Codex {
-                if let Some(candidate) = traversal.pending_candidates.get_mut(position) {
-                    candidate.watcher_hint = true;
-                }
+            if let Some(candidate) = traversal.pending_candidates.get_mut(position) {
+                candidate.watcher_hint = true;
             }
             continue;
         }
@@ -43227,13 +43240,21 @@ fn enqueue_watcher_hints(
         // `census_window_end`, so its growth is next-generation evidence. It
         // is still read when the page budget allows, but it no longer holds
         // the census; the next generation's walk re-reads it if it is stale.
-        let census_member = source != SnapshotSource::Codex
-            || !traversal
-                .observed_index_keys
-                .contains(&local_index_key(path));
+        let census_member = !(source == SnapshotSource::ClaudeCode && claude_terminal_off())
+            && (source != SnapshotSource::Codex
+                || !traversal
+                    .observed_index_keys
+                    .contains(&local_index_key(path)));
         next_generation += u64::from(!census_member);
         // FIFO keeps an actively rewritten path from repeatedly jumping ahead
         // of an older remove/rename hint in a small bounded page.
+        if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+            crate::local_resource_diagnostics::traversal_point(
+                "terminal_off_targeted",
+                "claude_code",
+                &json!({"cause":"watcher_stat_change","keys":1,"bytes":0}),
+            );
+        }
         pending.insert(path.clone(), traversal.pending_candidates.len());
         traversal.pending_candidates.push_back(ScanTraversalPath {
             scan_root,
@@ -43561,6 +43582,12 @@ fn advance_bounded_directory_traversal_with_budget(
     // silently age boundary files out while still publishing the earlier
     // `census_window_end` as its agreement scope.
     let census_unix_seconds = rfc3339_unix_seconds(&traversal.census_window_end);
+    let mut pending = traversal
+        .pending_candidates
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.path.clone(), i))
+        .collect::<BTreeMap<_, _>>();
     let mut remaining = max_entries;
     while remaining > 0 {
         let Some(directory) = traversal.pending_directories.pop_front() else {
@@ -43700,6 +43727,18 @@ fn advance_bounded_directory_traversal_with_budget(
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 continue;
             }
+            if source == SnapshotSource::ClaudeCode
+                && claude_terminal_off()
+                && terminal_off_discovery::walk_path(
+                    traversal,
+                    &path,
+                    &metadata,
+                    pending.contains_key(&path),
+                    directory.watcher_hint,
+                )
+            {
+                continue;
+            }
             traversal.counts.discovered_file_count += 1;
             traversal.observed_index_keys.insert(local_index_key(&path));
             if metadata.len() > max_jsonl_file_bytes(source) {
@@ -43713,14 +43752,15 @@ fn advance_bounded_directory_traversal_with_budget(
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
                 continue;
             }
-            if let Some(existing) = traversal
-                .pending_candidates
-                .iter_mut()
-                .find(|candidate| candidate.path == path)
-            {
+            if let Some(&position) = pending.get(&path) {
+                let existing = traversal
+                    .pending_candidates
+                    .get_mut(position)
+                    .expect("walk queue position");
                 existing.census_member = true;
                 existing.watcher_hint |= directory.watcher_hint;
             } else {
+                pending.insert(path.clone(), traversal.pending_candidates.len());
                 traversal.pending_candidates.push_back(ScanTraversalPath {
                     scan_root: directory.scan_root.clone(),
                     path,

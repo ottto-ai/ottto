@@ -1,3 +1,6 @@
+#[path = "terminal_off/discovery.rs"]
+mod terminal_off_discovery;
+
 // Temporary containment. No admitted read path or new persisted shape.
 // A future paged fold must replace the reconstruction guard, not just flip a
 // switch: a changed member may have replaced the old window's negative proof.
@@ -382,6 +385,20 @@ thread_local! {
     static TERMINAL_OFF_REDISCOVERY: std::cell::RefCell<BTreeMap<String, u64>> =
         const { std::cell::RefCell::new(BTreeMap::new()) };
 }
+fn terminal_off_cadence_requested(scope: &str, now: u64) -> bool {
+    #[cfg(test)]
+    {
+        TERMINAL_OFF_REDISCOVERY.with(|m| m.borrow().get(scope).map_or(true, |due| now >= *due))
+    }
+    #[cfg(not(test))]
+    {
+        TERMINAL_OFF_REDISCOVERY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(scope)
+            .map_or(true, |due| now >= *due)
+    }
+}
 fn terminal_off_rediscovery_due(scope: String, now: u64, force: bool) -> bool {
     let check = |memo: &mut BTreeMap<String, u64>| {
         if !force && memo.get(&scope).is_some_and(|due| now < *due) {
@@ -425,6 +442,7 @@ pub(crate) fn expire_terminal_off_discovery_for_test(index: &ScanIndex) {
 #[cfg(test)]
 pub(crate) struct TerminalOffDiscoveryPreviewForTest {
     saved: BTreeMap<String, u64>,
+    _walks: terminal_off_discovery::Preview,
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 #[cfg(test)]
@@ -432,6 +450,7 @@ impl TerminalOffDiscoveryPreviewForTest {
     pub(crate) fn begin() -> Self {
         Self {
             saved: TERMINAL_OFF_REDISCOVERY.with(|memo| memo.borrow().clone()),
+            _walks: terminal_off_discovery::Preview::begin(),
             _thread: std::marker::PhantomData,
         }
     }
@@ -444,18 +463,12 @@ impl Drop for TerminalOffDiscoveryPreviewForTest {
 }
 
 fn terminal_off_rediscovery_scope(index: &ScanIndex) -> Option<String> {
-    let traversal = index.traversal.as_ref()?;
+    terminal_off_traversal_scope(index.traversal.as_ref()?)
+}
+fn terminal_off_traversal_scope(traversal: &ScanTraversalCheckpoint) -> Option<String> {
     let mut digest = Sha256::new();
     for value in [
-        "terminal-off-rediscovery:v1",
-        index
-            .active_upload_context_fingerprint
-            .as_deref()
-            .unwrap_or("none"),
-        index
-            .historical_replay_generation
-            .as_deref()
-            .unwrap_or("none"),
+        "terminal-off-rediscovery:v2",
         &traversal.context_fingerprint,
         &traversal.census_window_end,
     ] {
@@ -472,6 +485,8 @@ fn refresh_terminal_off_discovery(
     roots: &[PathBuf],
     now: u64,
     overflow: bool,
+    at: &str,
+    file_limit: usize,
 ) {
     // The selecting page owns this clock, including all cooperative yields.
     // Revalidate configured targets EVERY pass, before selecting retained
@@ -504,45 +519,18 @@ fn refresh_terminal_off_discovery(
             .retain(|p| traversal.scan_roots.contains(&p.scan_root));
     }
     let scope = terminal_off_rediscovery_scope(index).expect("retained traversal");
-    // Cadence parks only discovery of otherwise idle work. It must not
-    // suppress already admitted reconstruction/transport/history debt when
-    // the corresponding path was consumed earlier in this retained window.
-    // This wakes the existing bounded metadata walk; the ordinary candidate
-    // selector and privacy/history/backoff gates still own every body read.
-    let owed = index
-        .terminal_contract_retries
-        .values()
-        .any(|key| !sampled_audit::candidate_open_blocked(key, now))
-        || index.files.iter().any(|(key, entry)| {
-            // No receipt can discharge an empty or body-witness-less key.
-            // Those keys keep ordinary discovery cadence and independent debt.
-            let receipt_mintable = entry.last_upload_body_witness.is_some()
-                && index
-                    .file_snapshot_fingerprints
-                    .get(key)
-                    .is_some_and(|members| !members.is_empty());
-            let needs_service = (receipt_mintable
-                && ((index.file_upload_context_requires_adoption(key)
-                    && !index.file_upload_context_waits_for_retry(key))
-                    || index.effective_upload_body_witness_revision_requires_adoption(key)))
-                || entry.source_file_fingerprint.is_empty()
-                || (!entry.has_unverified_source()
-                    && entry.scan_identity_version.as_deref()
-                        != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION))
-                || sampled_audit::debt_for_key(index, key, now)
-                    .is_some_and(|debt| now >= debt.due_unix_seconds);
-            // Keep D, but a forbidden open cannot authorize a whole-corpus
-            // rewalk. This is metadata-only: #903's same-stat backoff/park
-            // remains authoritative, while a changed stat wakes this key.
-            needs_service && !sampled_audit::candidate_open_blocked(key, now)
-        });
-    if !terminal_off_rediscovery_due(scope, now, changed || overflow || owed) {
+    let requested = changed || overflow || terminal_off_cadence_requested(&scope, now);
+    let start = terminal_off_discovery::prepare(index, now, at, requested);
+    if start {
+        terminal_off_rediscovery_due(scope, now, true);
+    }
+    // Existing gates own every body read. Owed work queues a bounded key,
+    // never another whole root walk; retained candidates keep their custody.
+    terminal_off_discovery::targeted(index, now, file_limit);
+    if !start {
         return;
     }
     let traversal = index.traversal.as_mut().expect("retained traversal");
-    if !traversal.pending_directories.is_empty() {
-        return;
-    }
     reset_start_identity_samples();
     claude_terminal_rewind(traversal);
     index
