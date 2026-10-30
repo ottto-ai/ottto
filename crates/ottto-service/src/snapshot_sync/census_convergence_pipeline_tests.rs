@@ -7260,8 +7260,9 @@ fn terminal_off_new_unindexed_session_is_held_and_counted_behind_closed_fence() 
     let session = "f9999999-9999-4999-8999-999999999999";
     let mut index = ScanIndex::load(&fixture.index_path).unwrap();
     let mut state = serde_json::to_value(&index).unwrap();
-    state["claude_duplicate_request_witness_overflowed"] = serde_json::json!(true);
+    state["claude_retired_family_tombstones_uncertain"] = serde_json::json!(true);
     index = serde_json::from_value(state).unwrap();
+    assert!(index.claude_retired_family_tombstones_uncertain_for_test());
     index.save(&fixture.index_path).unwrap();
     let path = fixture.root.join(format!("{session}.jsonl"));
     assert!(!index.files.contains_key(path.to_string_lossy().as_ref()));
@@ -7272,5 +7273,6 @@ fn terminal_off_new_unindexed_session_is_held_and_counted_behind_closed_fence() 
     assert!(pages.iter().map(|page| page.scan.ownership_incomplete_file_count).sum::<usize>() > 0);
     assert!(pages.iter().any(|page| !page.held.is_empty()));
     assert!(pages.iter().all(|page| page.uploaded.is_empty()));
+    assert!(pages.last().unwrap().index.claude_retired_family_tombstones_uncertain_for_test());
     assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
 }

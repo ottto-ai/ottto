@@ -927,7 +927,10 @@ fn terminal_off_on_missing_index_cannot_be_replaced_by_warm_cache_authority() {
         seed_predecessor(&f, &cache);
     }
     f.evidence(1);
-    let cached = enriched(&f, raw_scan(&f, ScanIndex::default(), Some(cache), |_| {}));
+    let cached = {
+        let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
+        enriched(&f, raw_scan(&f, ScanIndex::default(), Some(cache), |_| {}))
+    };
     assert_eq!(cached.modes, (1, 0, 0));
     assert_oracle(&f, &cached, ScanIndex::default());
 }
