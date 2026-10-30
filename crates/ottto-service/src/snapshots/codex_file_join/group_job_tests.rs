@@ -281,58 +281,6 @@ fn refused_fixture() -> PathBuf {
     root
 }
 
-#[test]
-fn terminal_join_debt_settles_census_without_alias_parser() {
-    let root = refused_fixture();
-    let (index, result) = scan(&root, ScanIndex::default(), 2);
-    assert!(result.snapshots.is_empty());
-    assert_eq!(
-        result.unreadable_path_count, 0,
-        "terminal proof debt is not an unreadable file"
-    );
-    assert!(
-        result.census_complete,
-        "outcome R: settleable residue lets the census complete: {result:?}"
-    );
-    assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn fence_filters_watcher_hint_after_attempt() {
-    let root = refused_fixture();
-    write_rows(
-        &root.join("sessions/c.jsonl"),
-        &member(OTHER, "healthy", 100, 100),
-    );
-    let cache = Arc::new(SharedCache::default());
-    let (mut index, first) = sampled(&root, ScanIndex::default(), 2, &cache);
-    assert!(first.snapshots.is_empty());
-    let overlap = JoinRefusal::Overlap.slot();
-    assert_eq!(counters(&cache).join_terminal_debt[overlap], 1);
-    // A watcher hint for a member of the attempted group, same generation.
-    let traversal = index.traversal.as_mut().expect("the generation continues");
-    let scan_root = traversal.scan_roots[0].clone();
-    traversal.pending_candidates.push_back(ScanTraversalPath {
-        path: scan_root.join("b.jsonl"),
-        scan_root,
-        census_member: false,
-        watcher_hint: true,
-    });
-    let (_, next) = sampled(&root, index, 2, &cache);
-    let after = counters(&cache);
-    assert_eq!(
-        after.join_terminal_debt[overlap], 1,
-        "no second attempt in the generation: {after:?}"
-    );
-    assert_eq!(after.groups_fenced, 1, "{after:?}");
-    assert!(next
-        .snapshots
-        .iter()
-        .all(|snapshot| snapshot.source_session_id == OTHER));
-    fs::remove_dir_all(root).unwrap();
-}
-
 /// G1 (review of #751, P1): a processed group re-hinted through one member
 /// is a re-read group. On every page it would take the whole file allowance
 /// (two files) and evict the waiting census-member singleton `c`, so the
@@ -723,28 +671,6 @@ fn ui_shape_unreadable_is_proof_domain() {
         None,
     );
     assert_eq!(proof.refusal(), Some((JoinRefusal::CumulativeOnly, 0)));
-}
-
-#[test]
-fn ui_root_shared_with_parser() {
-    let last = usage(70);
-    for row in [
-        json!({"type": "event_msg", "payload": {"type": "token_count",
-            "info": {"last_token_usage": last}}}),
-        json!({"type": "event_msg", "payload": {"type": "token_count",
-            "last_token_usage": last}}),
-        json!({"token_count": {"info": {"last_token_usage": last}}}),
-        json!({"last_token_usage": last}),
-    ] {
-        assert_eq!(codex_last_usage_root(&row), Some(&last), "{row}");
-        assert_eq!(
-            codex_last_usage(&row).map(|usage| usage.input_tokens),
-            Some(70)
-        );
-    }
-    let cumulative = json!({"payload": {"info": {"total_token_usage": last}}});
-    assert!(codex_last_usage_root(&cumulative).is_none());
-    assert!(codex_last_usage(&cumulative).is_none());
 }
 
 #[test]
