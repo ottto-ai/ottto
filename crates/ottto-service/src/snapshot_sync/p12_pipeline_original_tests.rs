@@ -4061,3 +4061,95 @@ fn terminal_off_on_native_comparison_deferred_policy_resource_usefulness() {
 
     eprintln!("native_comparison_deferred_usefulness: quiet_base_reads={base_quiet_reads} quiet_candidate_reads={candidate_quiet_reads} quiet_base_logical_native_bytes={base_quiet_bytes} quiet_candidate_logical_native_bytes={candidate_quiet_bytes} base_total_reads={base_total_reads} candidate_total_reads={candidate_total_reads} base_copy_reads_including_followup={base_copy_reads_all} candidate_copy_reads_including_followup={candidate_copy_reads_all} deferrals={deferrals} max_consecutive_deferrals={max_consecutive} base_copy_parses={base_copy_parses} candidate_copy_parses={candidate_copy_parses} hit_extra_logical_bytes={hit_extra_bytes} net_logical_bytes_saved={} full_2000family_admission=UNPROVED installed_RSS_savings=UNPROVED", saved_bytes - hit_extra_bytes);
 }
+
+#[test]
+fn terminal_off_on_closed_effective_fence_refuses_native_comparison() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    let mut fixture = RearmFixture::new("on-closed-effective-comparison");
+    fixture.native_file_limit = 100;
+    let mut index = ScanIndex::default();
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "upload-context-rearm".into());
+    let mut scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        "2026-08-02T08:00:00Z",
+        183,
+        100,
+        &fixture.support,
+    )
+    .unwrap();
+    let mut base_index = index.clone();
+    let mut base_scan = scan.clone();
+    let roots = claude_evidence_root_session_ids(&scan.snapshots);
+    let api = crate::claude_local_otel::load_claude_api_request_evidence_report(
+        &fixture.support,
+        roots.clone(),
+    );
+    let trace =
+        crate::claude_local_otel::load_claude_trace_ownership_evidence(&fixture.support, roots);
+    let base = crate::snapshots::apply_claude_reported_usage_to_scan_with_observations(
+        &mut base_scan,
+        &api,
+        &trace,
+        &mut base_index,
+        None,
+        None,
+    );
+    let observations = crate::snapshots::record_claude_native_observations(&scan, &mut index);
+    let disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_observations(
+        &mut scan,
+        &api,
+        &trace,
+        &mut index,
+        None,
+        Some(observations),
+    );
+    assert!(scan.state_census_complete);
+    assert!(scan.sidecar_census_complete);
+    let mut clean_observation = disposition.clone();
+    clean_observation.duplicate_census.census_invalid = false;
+    clean_observation.duplicate_census.fence_after = false;
+    assert!(crate::snapshots::claude_terminal_off());
+    assert!(
+        !crate::snapshots::claude_native_comparison::selected_page_is_clean(
+            &scan,
+            &index,
+            &clean_observation
+        )
+    );
+
+    assert!(crate::snapshots::claude_terminal_off());
+    assert!(
+        !crate::snapshots::claude_native_comparison::selected_page_is_clean(
+            &scan,
+            &index,
+            &disposition
+        )
+    );
+    assert_eq!(
+        serde_json::to_value(&scan.snapshots).unwrap(),
+        serde_json::to_value(&base_scan.snapshots).unwrap()
+    );
+    assert_eq!(
+        disposition, base,
+        "exact money, held membership and proof decisions equal the base fold"
+    );
+    assert_eq!(
+        serde_json::to_value(&index).unwrap(),
+        serde_json::to_value(&base_index).unwrap()
+    );
+    assert!(index.accepted_snapshot_fingerprints.is_empty());
+    assert!(!disposition.duplicate_census.census_complete);
+    assert!(disposition.duplicate_census.fence_after);
+    drop(_on);
+    assert!(!crate::snapshots::claude_terminal_off());
+    assert!(
+        crate::snapshots::claude_native_comparison::selected_page_is_clean(
+            &scan,
+            &index,
+            &clean_observation
+        ),
+        "all conditions except the effective ON fence are satisfied"
+    );
+}
