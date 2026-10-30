@@ -20,6 +20,7 @@ pub(super) use runtime::{
     idle, load_locked, save_locked,
 };
 mod interning;
+mod kinds_accounts;
 mod packed;
 mod shape;
 mod sqlite;
@@ -83,6 +84,7 @@ impl RecordKind {
                 | "file.census"
                 | "file.growth_retention"
                 | "account_window"
+                | "account.window_retention"
                 | "account.current"
                 | "account.absent_members"
                 | "usage.pending"
