@@ -144,7 +144,10 @@ impl CopyRemovals {
         let added = groups
             .iter()
             .map(|(holder, hashes)| {
-                let prior = old.iter().find(|(known, _)| known == holder);
+                let prior = old
+                    .binary_search_by_key(holder, |(known, _)| *known)
+                    .ok()
+                    .map(|at| &old[at]);
                 hashes
                     .iter()
                     .filter(|hash| !prior.is_some_and(|(_, held)| held.binary_search(hash).is_ok()))
@@ -164,7 +167,9 @@ impl CopyRemovals {
             let kept: Groups = old
                 .iter()
                 .filter_map(|(holder, hashes)| {
-                    let desired = groups.iter().find(|(known, _)| known == holder)?;
+                    let desired = &groups[groups
+                        .binary_search_by_key(holder, |(known, _)| *known)
+                        .ok()?];
                     let kept = hashes
                         .iter()
                         .copied()
@@ -510,6 +515,30 @@ mod tests {
         state.forget(file); // ordinary confirmed source-removal path
         assert!(!state.pending(file));
         assert_eq!(state.bytes(), 0);
+    }
+
+    #[test]
+    fn many_holder_groups_allow_a_small_update_within_the_cap() {
+        let file = location_key("many-holder-file");
+        let mut groups = (0..65_000u64)
+            .map(|n| (location_key(&format!("holder-{n}")), BTreeSet::from([n])))
+            .collect::<BTreeMap<_, _>>();
+        let mut state = CopyRemovals::default();
+        assert_eq!(state.store(file, groups.clone()).added, 65_000);
+        groups.values_mut().next().unwrap().insert(65_001);
+        assert_eq!(
+            state.store(file, groups),
+            Stored {
+                added: 1,
+                overflow: 0
+            }
+        );
+        assert_eq!(state.get(file).len(), 65_000);
+        assert_eq!(
+            state.bytes(),
+            FILE_BYTES + 65_000 * (GROUP_BYTES + HASH_BYTES) + HASH_BYTES
+        );
+        assert!(state.bytes() < MAX_BYTES);
     }
 
     #[test]

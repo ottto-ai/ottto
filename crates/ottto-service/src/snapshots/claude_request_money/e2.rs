@@ -2654,17 +2654,17 @@ fn decide_holders(
             .copied()
             .filter(|hash| !wanted.covered.contains_key(hash) && !wanted.stored.contains(hash))
             .collect::<Vec<_>>();
-        if let Some(state) = updates.state.as_mut() {
-            let groups = stored_groups(index, &live, &wanted.covered, wanted.order.1);
-            let stored = state.store(wanted.order.1, groups);
-            updates.added += stored.added;
-            updates.unrecorded += stored.overflow;
-        }
         let reused = wanted
             .stored
             .iter()
             .filter(|hash| !wanted.covered.contains_key(hash))
             .count() as u64;
+        if let Some(state) = updates.state.as_mut() {
+            let groups = stored_groups(index, &live, wanted.covered, wanted.order.1);
+            let stored = state.store(wanted.order.1, groups);
+            updates.added += stored.added;
+            updates.unrecorded += stored.overflow;
+        }
         note_reused(&mut items[wanted.at], reused);
         // Only the unresolved prefix waits. Persisted retry debt reselects
         // the file after its own-turn ACK, even when it is unchanged; its
@@ -2747,7 +2747,7 @@ fn decide_holders(
 fn stored_groups<'a>(
     index: &'a ScanIndex,
     live: &std::cell::OnceCell<BTreeMap<LocationKey, &'a str>>,
-    covered: &BTreeMap<u64, (i128, LocationKey)>,
+    mut covered: BTreeMap<u64, (i128, LocationKey)>,
     file: LocationKey,
 ) -> BTreeMap<LocationKey, BTreeSet<u64>> {
     let mut groups = BTreeMap::<LocationKey, BTreeSet<u64>>::new();
@@ -2759,16 +2759,16 @@ fn stored_groups<'a>(
         let kept = hashes
             .iter()
             .filter(|&&hash| stored_holder_answer(index, key, hash) != Some(false));
-        groups.entry(*holder).or_default().extend(kept);
+        let into = groups.entry(*holder).or_default();
+        for &hash in kept {
+            // Consume covered entries once; never search every holder group
+            // again for every currently proven request.
+            covered.remove(&hash);
+            into.insert(hash);
+        }
     }
     groups.retain(|_, hashes| !hashes.is_empty());
-    let held = |hash: &u64| groups.values().any(|hashes| hashes.contains(hash));
-    let new = covered
-        .iter()
-        .filter(|(hash, _)| !held(hash))
-        .map(|(&hash, &(_, holder))| (holder, hash))
-        .collect::<Vec<_>>();
-    for (holder, hash) in new {
+    for (hash, (_, holder)) in covered {
         groups.entry(holder).or_default().insert(hash);
     }
     groups

@@ -26,6 +26,8 @@ If proof later disappears, those unrecorded decisions cannot be recovered and
 the prefix emits flagged. Own turns never wait for storage capacity.
 Disproven old removals are deleted even when new proof cannot fit; capacity
 refusal cannot preserve a decision invalidated by an answering holder.
+Holder updates use sorted lookups and consume current proof once, avoiding
+pairwise scans across large valid holder-group sets.
 
 A transient proof wait (unscanned or changed holder, walk deadline) holds only
 the unresolved copied prefix. Own turns emit. Retry debt remains in the index
