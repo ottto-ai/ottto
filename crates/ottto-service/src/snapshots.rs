@@ -45769,6 +45769,57 @@ impl ScanIndex {
         root_session_id: &str,
         members: BTreeMap<String, String>,
     ) {
+        self.bind_claude_authority_for_test(
+            root_session_id,
+            members,
+            ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+        );
+    }
+
+    /// The owed correction an older (pre-E2) build persisted for a family,
+    /// built from the persisted types (unchanged since 0.1.203): its terminal
+    /// record bound to the retained witness, owing every indexed member at its
+    /// indexed revision, as `rebind_claude_authority_proof` grants. The
+    /// members are re-armed, so the next pass reads every owed member.
+    #[cfg(test)]
+    pub(crate) fn bind_pre_flip_claude_correction_for_test(&mut self, root_session_id: &str) {
+        let mut members = BTreeMap::new();
+        for (index_key, entry) in &mut self.files {
+            let Some((root, member)) = claude_index_path_family_member(Path::new(index_key)) else {
+                continue;
+            };
+            if root == root_session_id {
+                let revision = std::mem::take(&mut entry.source_file_fingerprint);
+                // A re-armed entry has no revision; any well-formed one pairs it.
+                let revision = if revision.is_empty() {
+                    "5".repeat(64)
+                } else {
+                    revision
+                };
+                members.insert(member, revision);
+            }
+        }
+        self.bind_claude_authority_for_test(
+            root_session_id,
+            members,
+            ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+        );
+        self.seed_census_correction_for_test(root_session_id);
+    }
+
+    #[cfg(test)]
+    fn bind_claude_authority_for_test(
+        &mut self,
+        root_session_id: &str,
+        members: BTreeMap<String, String>,
+        disposition: ClaudeUsageAuthorityQuarantineDisposition,
+    ) {
+        let failed_reconstruction_count = match disposition {
+            ClaudeUsageAuthorityQuarantineDisposition::RetryPending => 1,
+            ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal => {
+                MAX_CLAUDE_USAGE_AUTHORITY_FAILURES
+            }
+        };
         let witness = self
             .claude_usage_family_witnesses
             .get(root_session_id)
@@ -45782,8 +45833,8 @@ impl ScanIndex {
             contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
             proven_witness_fingerprint: claude_usage_family_witness_fingerprint(witness),
             member_source_file_fingerprints: members,
-            failed_reconstruction_count: 1,
-            disposition: ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+            failed_reconstruction_count,
+            disposition,
             retry_after_unix_seconds: now.saturating_add(CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS),
         };
         assert!(claude_usage_authority_preserves_pending(&record, witness));
