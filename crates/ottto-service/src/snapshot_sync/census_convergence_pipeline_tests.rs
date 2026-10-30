@@ -7226,86 +7226,101 @@ pub(super) fn exact_pipeline_accept(
     Ok(response)
 }
 
-/// NBF measures actual body acquisitions, rather than scan selection. Both
-/// non-progressing hold forms keep their original accepted custody throughout.
-/// A fresh hold keeps its one immediate retry (the r26 held-retry contract), so
-/// the floor runs from the last initial page, which owns the last held read.
+/// NBF measures actual body acquisitions, rather than scan selection: the
+/// account-deferred hold. A fresh hold keeps its one immediate retry (the r26
+/// held-retry contract), so the floor runs from the last initial page, which
+/// owns the last held read.
 #[test]
 #[serial(source_manifests)]
 fn terminal_off_nonblocking_held_keys_read_at_six_hours_not_every_page() {
+    nonblocking_held_key_reads_at_six_hours_not_every_page(false);
+}
+
+/// The same NBF control for a bound committed-family member. At 6b2bbe477 its
+/// +6 h round read 0: no targeted cause re-enqueues the floored member, and
+/// the round's walk read nothing. Open: a relist/hint premise (L5 F-C1) or a
+/// floored bound member that nothing re-enqueues.
+#[test]
+#[ignore = "terminal-off ON-readiness: NBF"]
+#[serial(source_manifests)]
+fn terminal_off_nonblocking_bound_member_reads_at_six_hours_not_every_page() {
+    nonblocking_held_key_reads_at_six_hours_not_every_page(true);
+}
+
+/// Both non-progressing hold forms keep their original accepted custody
+/// throughout.
+fn nonblocking_held_key_reads_at_six_hours_not_every_page(bound: bool) {
     let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
     assert!(crate::snapshots::claude_terminal_off());
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _manifests = SourceManifestTestGuard::new();
-    for bound in [false, true] {
-        let (fixture, baseline, initial, minute) = if bound {
-            let (fixture, baseline, first, last) = terminal_bound_hold_traversal(
-                "nbf-bound-committed-member",
-                PipelineUpload::Accept,
-                false,
-            );
-            assert!(!first.progress_blocking);
-            assert_eq!(first.held.len(), 1);
-            // terminal_bound_hold_traversal's last page runs at 09:01.
-            (fixture, baseline, last, 1)
-        } else {
-            let fixture = PipelineFixture::new("nbf-account-deferred");
-            let baseline = fixture.baseline();
-            fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
-            let mut pages = fixture.traversal(9, &PIPELINE_HOLD_CYCLE);
-            assert!(pages
-                .iter()
-                .any(|page| !page.held.is_empty() && !page.progress_blocking));
-            // Pages run at 09:00, 09:01, ...; the last one is minute len - 1.
-            let minute = pages.len() - 1;
-            (fixture, baseline, pages.pop().unwrap(), minute)
-        };
-        let key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
-        let old_entities = &baseline.file_snapshot_fingerprints[&key];
-        let cycle = if bound {
-            PipelineCycle {
-                proven_owner_session: Some(PIPELINE_HELD_SESSION),
-                ..PIPELINE_HOLD_CYCLE
-            }
-        } else {
-            PIPELINE_HOLD_CYCLE
-        };
-        let assert_custody = |page: &PipelinePage| {
-            assert!(!page.scan.census_complete);
-            assert!(!page.index.bounded_sweep_had_unsettled_upload());
-            assert_eq!(&page.index.file_snapshot_fingerprints[&key], old_entities);
-            assert!(old_entities
-                .iter()
-                .all(|fp| page.index.accepted_snapshot_fingerprint_recorded(fp)));
-            assert!(page.uploaded.is_disjoint(&page.held));
-            if bound {
-                assert!(page
-                    .index
-                    .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION)
-                    .is_some());
-            } else {
-                assert_eq!(page.index.claude_account_deferred_hold_count(), 1);
-            }
-        };
-        assert_custody(&initial);
-        // +6 h, +6 h + 300 s and +12 h after the last initial page.
-        for (hour, offset, expected) in [(15, 0, 1), (15, 5, 0), (21, 0, 1)] {
-            let at = format!("{hour:02}:{:02}:00", minute + offset);
-            let (page, reads) =
-                crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
-                    fixture.page(&format!("2026-08-02T{at}Z"), &cycle, PipelineUpload::Accept)
-                });
-            let held_reads = reads
-                .iter()
-                .filter(|(path, _)| {
-                    path.file_stem().and_then(|stem| stem.to_str()) == Some(PIPELINE_HELD_SESSION)
-                })
-                .map(|(_, reads)| reads)
-                .sum::<usize>();
-            assert_eq!(held_reads, expected, "bound={bound}/{at}");
-            assert_custody(&page);
-            assert!(page.uploaded.is_empty(), "held body must never upload");
+    let (fixture, baseline, initial, minute) = if bound {
+        let (fixture, baseline, first, last) = terminal_bound_hold_traversal(
+            "nbf-bound-committed-member",
+            PipelineUpload::Accept,
+            false,
+        );
+        assert!(!first.progress_blocking);
+        assert_eq!(first.held.len(), 1);
+        // terminal_bound_hold_traversal's last page runs at 09:01.
+        (fixture, baseline, last, 1)
+    } else {
+        let fixture = PipelineFixture::new("nbf-account-deferred");
+        let baseline = fixture.baseline();
+        fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
+        let mut pages = fixture.traversal(9, &PIPELINE_HOLD_CYCLE);
+        assert!(pages
+            .iter()
+            .any(|page| !page.held.is_empty() && !page.progress_blocking));
+        // Pages run at 09:00, 09:01, ...; the last one is minute len - 1.
+        let minute = pages.len() - 1;
+        (fixture, baseline, pages.pop().unwrap(), minute)
+    };
+    let key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
+    let old_entities = &baseline.file_snapshot_fingerprints[&key];
+    let cycle = if bound {
+        PipelineCycle {
+            proven_owner_session: Some(PIPELINE_HELD_SESSION),
+            ..PIPELINE_HOLD_CYCLE
         }
+    } else {
+        PIPELINE_HOLD_CYCLE
+    };
+    let assert_custody = |page: &PipelinePage| {
+        assert!(!page.scan.census_complete);
+        assert!(!page.index.bounded_sweep_had_unsettled_upload());
+        assert_eq!(&page.index.file_snapshot_fingerprints[&key], old_entities);
+        assert!(old_entities
+            .iter()
+            .all(|fp| page.index.accepted_snapshot_fingerprint_recorded(fp)));
+        assert!(page.uploaded.is_disjoint(&page.held));
+        if bound {
+            assert!(page
+                .index
+                .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION)
+                .is_some());
+        } else {
+            assert_eq!(page.index.claude_account_deferred_hold_count(), 1);
+        }
+    };
+    assert_custody(&initial);
+    // +6 h, +6 h + 300 s and +12 h after the last initial page.
+    for (hour, offset, expected) in [(15, 0, 1), (15, 5, 0), (21, 0, 1)] {
+        let at = format!("{hour:02}:{:02}:00", minute + offset);
+        let (page, reads) =
+            crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+                fixture.page(&format!("2026-08-02T{at}Z"), &cycle, PipelineUpload::Accept)
+            });
+        let held_reads = reads
+            .iter()
+            .filter(|(path, _)| {
+                path.file_stem().and_then(|stem| stem.to_str()) == Some(PIPELINE_HELD_SESSION)
+            })
+            .map(|(_, reads)| reads)
+            .sum::<usize>();
+        assert_eq!(held_reads, expected, "bound={bound}/{at}");
+        assert_custody(&page);
+        assert!(page.uploaded.is_empty(), "held body must never upload");
     }
 }
