@@ -277,30 +277,29 @@ impl ScanIndex {
         if self.upload_context_fingerprint == self.active_upload_context_fingerprint {
             return false;
         }
-        if !claude_terminal_off() {
-            // Literal main fallback; stale same-process test views cannot grant
-            // context credit when containment is disabled.
+        if claude_terminal_off() {
             if !self.file_upload_context_enabled || self.confirmed_empty_files.contains(key) {
-                return self.upload_context_fingerprint != self.active_upload_context_fingerprint;
+                // Only a complete empty projection in THIS Claude context may
+                // suppress its redundant read. Other sources and unknown debt keep
+                // their existing gate; no delivery receipt or proof is minted.
+                return !(self.file_upload_context_enabled
+                    && self.mixed_context_view.claude
+                    && terminal_off_empty_context_seen(self, key));
             }
-            return self
-                .files
-                .get(key)
-                .map_or(true, |entry| !self.receipt_matches(entry));
+            return !self.mixed_terminal_context_settled(key)
+                && self
+                    .files
+                    .get(key)
+                    .map_or(true, |entry| !self.receipt_matches(entry));
         }
         if !self.file_upload_context_enabled || self.confirmed_empty_files.contains(key) {
-            // Only a complete empty projection in THIS Claude context may
-            // suppress its redundant read. Other sources and unknown debt keep
-            // their existing gate; no delivery receipt or proof is minted.
-            return !(self.file_upload_context_enabled
-                && self.mixed_context_view.claude
-                && terminal_off_empty_context_seen(self, key));
+            // A suppressed/empty result has no ACK receipt. Keep its existing
+            // census-context gate so a new policy can make it uploadable.
+            return self.upload_context_fingerprint != self.active_upload_context_fingerprint;
         }
-        !self.mixed_terminal_context_settled(key)
-            && self
-                .files
-                .get(key)
-                .map_or(true, |entry| !self.receipt_matches(entry))
+        self.files
+            .get(key)
+            .map_or(true, |entry| !self.receipt_matches(entry))
     }
 
     pub(super) fn file_upload_context_backoff_holds(&self, candidate: &CandidateFile) -> bool {
