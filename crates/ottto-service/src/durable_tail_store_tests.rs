@@ -5213,8 +5213,13 @@ fn exact_retirement_preserves_pending_and_retained_receipt_successors() {
             else {
                 panic!("exact successor receipt");
             };
+            let completed_stamp = receipt.stamp;
             store.retain_receipt(receipt).unwrap();
-            assert!(store.receipt_pending(&b.key));
+            assert_eq!(store.pending[&b.key].completed, Some(completed_stamp));
+            assert!(
+                !store.receipt_pending(&b.key),
+                "matching completed stamp has no unresolved I/O"
+            );
         }
         let before = fs::read(record_file(&store, &b.key)).unwrap();
         let invalidated = store.counters().records_invalidated;

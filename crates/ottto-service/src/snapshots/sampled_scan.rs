@@ -1945,6 +1945,12 @@ pub(super) mod test_hooks {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(in crate::snapshots) enum Point {
+        /// A bounded restore is decoded, immediately before identity sampling.
+        BeforeRestoredIdentity,
+        /// The first opened-object identity sample has actually been read.
+        AfterIdentityHead,
+        /// Content replay succeeded, before its final accepted-floor check.
+        AfterRestoredContent,
         /// After revalidation, before `retain_reduction`.
         BeforeRetain,
         /// `retain_reduction`'s deferred path, before the stamp gate.

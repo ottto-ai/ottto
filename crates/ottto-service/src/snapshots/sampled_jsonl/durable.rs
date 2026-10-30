@@ -373,6 +373,25 @@ pub(crate) struct RederiveReceipt {
 }
 
 impl Decoded {
+    /// Persist a deliberately inconsistent H in an otherwise native fixture.
+    #[cfg(test)]
+    pub(in crate::snapshots) fn test_fence_body(mut self, class: usize) -> Vec<u8> {
+        let digest = match class {
+            0 => &mut self.rederive.first_prompt,
+            1 => &mut self.rederive.title,
+            2 => &mut self.rederive.agent_label,
+            3 => &mut self.rederive.session_start,
+            4 => &mut self.rederive.workspace,
+            _ => unreachable!(),
+        };
+        *digest = Some([0; 32]);
+        Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
+            self.reduction.put(e)?;
+            self.rederive.put(e)
+        })
+        .unwrap()
+    }
+
     pub(in crate::snapshots) fn permits_skill_labels(&self, enabled: bool) -> bool {
         enabled
             || self.reduction.accumulator.provider_skills.is_empty()
@@ -610,6 +629,20 @@ pub(crate) fn rederive_parser(
 #[cfg(test)]
 #[path = "durable_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn test_replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
+    tests::replay_privacy_artifacts(root)
+}
+
+#[cfg(test)]
+pub(in crate::snapshots) fn test_finish_items(
+    parser: OwnedJsonlParser,
+    path: &Path,
+    source: SnapshotSource,
+) -> Value {
+    tests::items(parser, path, source)
+}
 
 #[cfg(test)]
 pub(crate) fn store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -> Vec<u8> {

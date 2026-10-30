@@ -7,6 +7,9 @@ use std::io::Read;
 
 const INDEX_KEYS: usize = 20_000;
 
+#[path = "m3_integrated_rederive_tests.rs"]
+mod integrated_rederive;
+
 thread_local! {
     static BEFORE_WARM_TRANSFER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static BEFORE_COLD_TRANSFER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };

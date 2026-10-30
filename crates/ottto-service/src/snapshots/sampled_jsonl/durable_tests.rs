@@ -86,7 +86,7 @@ fn full_read(path: &Path, source: SnapshotSource) -> (CachedJsonlReduction, Chec
 /// finishes with the money context the scan passes (the E2 fold's read
 /// context over an index holding the file), so the money fold is compared
 /// too.
-fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value {
+pub(super) fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value {
     items_at(parser, path, source, None)
 }
 
@@ -2538,7 +2538,23 @@ fn bounded_restore_append_injection_at_samples_head_and_title_matches_cold_body(
             let lines = if source == SnapshotSource::ClaudeCode {
                 claude_lines(20, 20)
             } else {
-                codex_lines()
+                let mut lines = codex_lines();
+                let title = lines
+                    .iter()
+                    .position(|line| line.contains("thread_name_updated"))
+                    .unwrap();
+                let title = lines.remove(title);
+                for n in 2..=3 {
+                    let mut total = codex_usage(100 * n);
+                    total["output_tokens"] = json!(3 * n);
+                    total["total_tokens"] = json!(103 * n);
+                    lines.push(json!({"type":"turn_context","payload":{"turn_id":format!("extra-{n}"),"model":"gpt-5.2"}}).to_string());
+                    lines.push(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":format!("extra-{n}")}}).to_string());
+                    lines.push(json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":codex_usage(100),"total_token_usage":total}}}).to_string());
+                    lines.push(json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":format!("extra-{n}")}}).to_string());
+                }
+                lines.push(title);
+                lines
             };
             let path = root.write("source.jsonl", &lines);
             let (native, checkpoint) = full_read(&path, source);
@@ -2616,5 +2632,325 @@ fn bounded_restore_append_injection_at_samples_head_and_title_matches_cold_body(
                 "{source:?}/{edge}"
             );
         }
+    }
+}
+
+const PRIVACY_CANARIES: [&str; 4] = [
+    "PRIVATE_LITERAL_DIAGNOSTICS_CANARY_20261030",
+    "PRIVATE_REPLAY_HEAD_CANARY_20261030",
+    "PRIVATE_REPLAY_PROMPT_CANARY_20261030",
+    "PRIVATE_REPLAY_LABEL_CANARY_20261030",
+];
+
+/// The support tests consume the actual replay errors and diagnostic lines,
+/// alongside the private input that must never be collected into a bundle.
+pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
+    fs::create_dir_all(root).unwrap();
+    let mut safe_log = String::new();
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let mut lines = match source {
+            SnapshotSource::ClaudeCode => claude_lines(2, 2),
+            SnapshotSource::Codex => codex_lines(),
+            SnapshotSource::Pi => vec![
+                json!({"type":"session","id":"synthetic-pi","cwd":"/synthetic/privacy"})
+                    .to_string(),
+                json!({"type":"message","role":"user","content":"Synthetic Pi prompt"}).to_string(),
+            ],
+        };
+        // Insert canaries in content, a head-only ignored field and an agent
+        // label. A malformed selector and raw-value key are native inputs too.
+        for line in &mut lines {
+            let mut v: Value = serde_json::from_str(line).unwrap();
+            v["private_head"] = json!(PRIVACY_CANARIES[1]);
+            if let Some(content) = v.pointer_mut("/message/content") {
+                if content.is_string() {
+                    *content = json!(PRIVACY_CANARIES[2]);
+                }
+            }
+            if source == SnapshotSource::Pi && v.get("role") == Some(&json!("user")) {
+                v["content"] = json!(PRIVACY_CANARIES[2]);
+            }
+            if v.pointer("/payload/type") == Some(&json!("user_message")) {
+                v["payload"]["message"] = json!(PRIVACY_CANARIES[2]);
+            }
+            if v.get("type") == Some(&json!("session_meta")) {
+                v["payload"]["source"] = json!({"subagent":{"thread_spawn":{"agent_path":format!("/agents/{}", PRIVACY_CANARIES[3])}}});
+            }
+            *line = v.to_string();
+        }
+        lines.insert(
+            0,
+            json!({"selector":{"model":[PRIVACY_CANARIES[0]]}, "private_head":PRIVACY_CANARIES[1]})
+                .to_string(),
+        );
+        let path = root.join(format!("{}-private.jsonl", source.api_slug()));
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let (native, _) = full_read(&path, source);
+        let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
+        let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
+            native.put(e)?;
+            digests.put(e)
+        })
+        .unwrap();
+        for class in 0..5 {
+            let bad = decode_body(&body, source).unwrap().test_fence_body(class);
+            // A real caught panic is a failed test, with a content-free failure
+            // assertion. The subprocess test also inspects the panic hook sink.
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::local_resource_diagnostics::capture(|| {
+                    decode_body(&bad, source)
+                        .unwrap()
+                        .rederive_content(&File::open(&path).unwrap())
+                })
+            }));
+            assert!(
+                caught.is_ok(),
+                "replay must return a typed refusal without panicking"
+            );
+            let (result, rows) = caught.unwrap();
+            let error = result.err().expect("inconsistent H refuses atomically");
+            let text = format!("{error:?}\n{}\n", serde_json::to_string(&rows).unwrap());
+            for canary in PRIVACY_CANARIES {
+                assert!(!text.contains(canary));
+            }
+            safe_log.push_str(&text);
+        }
+        // Native raw-value handling accepts/reparses this physical input;
+        // bounded replay must explicitly refuse the special key, without
+        // reflecting either the input or serde's error payload.
+        let raw = format!(
+            "{{\"$serde_json::private::RawValue\":\"{{}}\",\"ignored\":\"{}\"}}\n",
+            PRIVACY_CANARIES[0]
+        );
+        fs::write(&path, raw + &lines.join("\n") + "\n").unwrap();
+        let (native, _) = full_read(&path, source);
+        let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
+        let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
+            native.put(e)?;
+            digests.put(e)
+        })
+        .unwrap();
+        let result = decode_body(&body, source)
+            .unwrap()
+            .rederive_content(&File::open(&path).unwrap());
+        assert!(matches!(
+            result,
+            Err(Refuse::NotRederivable("raw_value_key"))
+        ));
+        safe_log.push_str(&format!("{:?}\n", result.err().unwrap()));
+        // Corrupt persisted bytes and a descriptor error exercise both error
+        // carriers without formatting a Value, prompt, title or label.
+        assert!(decode_body(&body[..body.len() - 1], source).is_err());
+        let fd = File::options().write(true).open(&path).unwrap();
+        let err = decode_body(&body, source)
+            .unwrap()
+            .rederive_content(&fd)
+            .err()
+            .unwrap();
+        safe_log.push_str(&format!("{err:?}\n"));
+    }
+    for canary in PRIVACY_CANARIES {
+        assert!(!safe_log.contains(canary));
+    }
+    fs::write(root.join("replay-errors.log"), &safe_log).unwrap();
+    eprintln!("{safe_log}");
+    PRIVACY_CANARIES
+}
+
+#[test]
+fn bounded_replay_errors_logs_and_panics_are_content_free() {
+    const CHILD: &str = "OTTTO_BOUNDED_REPLAY_PRIVACY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let root = Scratch::new("privacy-child");
+        replay_privacy_artifacts(&root.0);
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "snapshots::sampled_jsonl::durable::tests::bounded_replay_errors_logs_and_panics_are_content_free", "--nocapture"])
+        .env(CHILD, "1").output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for canary in PRIVACY_CANARIES {
+        assert!(
+            !stdout.contains(canary),
+            "content in stdout or panic payload"
+        );
+        assert!(!stderr.contains(canary), "content in log or panic payload");
+    }
+    assert!(
+        stdout.contains("1 passed"),
+        "child fixture must actually run"
+    );
+    assert!(
+        output.status.success(),
+        "privacy child must return typed errors without panic"
+    );
+}
+
+/// Pi remains unregistered here. This is the production codec/acquisition/
+/// native-finish/finalizer interface E5 will route after registration, with
+/// actual A < C < B extents and a real complete native body (no hand-built item).
+#[test]
+fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
+    let _on = RestartRestoreForTest::enabled();
+    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
+        let root = Scratch::new("pi-publication-race");
+        let pi_lines = vec![
+        json!({"type":"session","id":"synthetic-pi","cwd":"/synthetic/pi"}).to_string(),
+        json!({"type":"message","role":"user","content":"Synthetic first Pi prompt"}).to_string(),
+        json!({"type":"message","message":{"role":"assistant","model":"claude-sonnet-4-5","usage":{"input":20,"output":3},"timestamp":"2026-10-20T10:00:00Z"}}).to_string(),
+    ];
+        let lines = if source == SnapshotSource::Codex {
+            codex_lines()
+        } else {
+            pi_lines
+        };
+        let path = root.write("source.jsonl", &lines);
+        let (native, checkpoint) = full_read(&path, source);
+        let a = fs::metadata(&path).unwrap().len();
+        let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
+        let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
+            native.put(e)?;
+            digests.put(e)
+        })
+        .unwrap();
+        let certificate = checkpoint
+            .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
+            .unwrap();
+        let total_input = std::cell::Cell::new(100);
+        let total_output = std::cell::Cell::new(3);
+        let append = |n| {
+            let lines = if source == SnapshotSource::Codex {
+                total_input.set(total_input.get() + n);
+                total_output.set(total_output.get() + 3);
+                let mut total = codex_usage(total_input.get());
+                total["output_tokens"] = json!(total_output.get());
+                total["total_tokens"] = json!(total_input.get() + total_output.get());
+                vec![
+                    json!({"type":"turn_context","timestamp":COLLECTED,"payload":{"turn_id":format!("race-{n}"),"model":"gpt-5.2"}}),
+                    json!({"type":"event_msg","timestamp":COLLECTED,"payload":{"type":"task_started","turn_id":format!("race-{n}")}}),
+                    json!({"type":"event_msg","timestamp":COLLECTED,"payload":{"type":"token_count","info":{"last_token_usage":codex_usage(n),"total_token_usage":total}}}),
+                    json!({"type":"event_msg","timestamp":COLLECTED,"payload":{"type":"task_complete","turn_id":format!("race-{n}")}}),
+                ]
+            } else {
+                vec![
+                    json!({"type":"message","message":{"role":"assistant","model":"claude-sonnet-4-5","usage":{"input":n,"output":3},"timestamp":"2026-10-20T10:01:00Z"}}),
+                ]
+            };
+            let mut fd = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            for line in lines {
+                writeln!(fd, "{line}").unwrap();
+            }
+        };
+        append(30);
+        let c = fs::metadata(&path).unwrap().len();
+        append(40);
+        let b = fs::metadata(&path).unwrap().len();
+        let finish = |parser: OwnedJsonlParser| {
+            let identity = opened_object_identity(source, &mut File::open(&path).unwrap()).unwrap();
+            parser
+                .finish_with_repository_identity(
+                    &identity,
+                    &path,
+                    COLLECTED,
+                    "race-source".into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+        };
+        let mut accepted = parser(&path, source);
+        while !accepted.step().unwrap() {}
+        let accepted = finish(accepted);
+        assert!(accepted.report.complete());
+        assert!(!accepted.snapshots.is_empty());
+        let previous_entities = accepted
+            .snapshots
+            .iter()
+            .map(|i| snapshot_fingerprint(source, i))
+            .collect();
+        let previous_bodies = accepted
+            .snapshots
+            .iter()
+            .map(snapshot_upload_body_witness)
+            .collect();
+        let (checkpoint, _) = certificate
+            .restore_grown(&mut File::open(&path).unwrap(), scope())
+            .unwrap();
+        let (restored, _) = decode_body(&body, source)
+            .unwrap()
+            .rederive_content(&File::open(&path).unwrap())
+            .unwrap();
+        // The accepted extent remains B while the actual plan freezes C.
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(c)
+            .unwrap();
+        assert!(a < c && c < b);
+        let mut tail = parser(&path, source);
+        let mode = tail
+            .prepare_acquisition(
+                Some(Retained {
+                    checkpoint,
+                    state: restored,
+                }),
+                &scope(),
+                None,
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(mode, ReadMode::Tail);
+        let frozen = tail.reader.acquisition.as_ref().unwrap().frozen_length();
+        while !tail.step().unwrap() {}
+        let parsed = finish(tail);
+        assert!(parsed.report.complete());
+        let mut cold = parser(&path, source);
+        while !cold.step().unwrap() {}
+        assert_eq!(
+            serde_json::to_value(&parsed.snapshots).unwrap(),
+            serde_json::to_value(finish(cold).snapshots).unwrap()
+        );
+        let mut scan = SourceScanResult::empty(source);
+        scan.snapshots = parsed.snapshots;
+        scan.pending_finalization.push(PendingIndexFinalization {
+            restored_behind_accepted: sampled_scan::durable_tail::restored_tail_below_accepted(
+                source,
+                true,
+                mode,
+                Some(frozen),
+                Some(b),
+            ),
+            sampled_audit_verified: false,
+            codex_pending_recovery: false,
+            index_key: local_index_key(&path),
+            source_file_fingerprint: "race-source".into(),
+            previous_snapshot_fingerprint: Some(snapshot_file_entity_set_hex(&previous_entities)),
+            previous_upload_body_witness: Some(snapshot_file_upload_body_set_hex(&previous_bodies)),
+            parse_complete: parsed.report.complete(),
+            diagnostic_reason: FileReason::Complete,
+            parsed_snapshot_count: scan.snapshots.len(),
+            effective_upload_body_witness_revision:
+                effective_upload_body_witness_revision_for_source(source),
+        });
+        let mut index = ScanIndex::default();
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            finalize_scan_after_policy(source, &mut scan, &mut index)
+        });
+        assert!(!scan.snapshots.is_empty());
+        assert_eq!(
+            rows.iter()
+                .filter_map(|r| r["counts"]["restored_behind_accepted"]["published"].as_u64())
+                .sum::<u64>(),
+            1
+        );
     }
 }

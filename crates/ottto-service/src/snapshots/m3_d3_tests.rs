@@ -1711,3 +1711,78 @@ pub(super) fn bounded_restore_tail_items(source: SnapshotSource) -> Vec<Snapshot
     assert_eq!(restored.witness(session), Some(rig.cold(session)));
     restored.snapshots
 }
+
+/// F10: A is a real native v3 checkpoint; B is a later complete accepted
+/// extent while A's replacement is deferred. Truncate only after A has been
+/// restored, before native preparation freezes C with A < C < B.
+#[test]
+fn codex_real_restore_then_shrink_preserves_the_native_identity_guard() {
+    let _on = RestartRestoreForTest::enabled();
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            sampled_jsonl::preparation_tests::set(None);
+        }
+    }
+    let _clear = Clear;
+    let mut rig = Rig::new(SnapshotSource::Codex, "restored-floor-race");
+    let session = CODEX_SESSION;
+    fs::write(rig.path(session), codex_head(session) + &json!({"type":"event_msg","payload":{"type":"user_message","message":"Synthetic restored race prompt"}}).to_string() + "\n").unwrap();
+    rig.append(session, 3);
+    assert_eq!(rig.pass().published(session), 1);
+    rig.assert_native_record(session);
+    let a = fs::read(rig.record(session)).unwrap();
+    rig.append(session, 1);
+    let c = fs::metadata(rig.path(session)).unwrap().len();
+    rig.append(session, 1);
+    // Accept B through the real cold Full/finalizer without a store writer.
+    let (index, items) = scan(
+        rig.source,
+        &rig.sessions,
+        rig.index.clone(),
+        Arc::new(SharedCache::default()),
+        &rig.namespace,
+    );
+    assert_eq!(items.len(), 1);
+    rig.index = index;
+    rig.index.save(&rig.index_path).unwrap();
+    let b = rig.index.files[&rig.key(session)].size_bytes;
+    assert!(c < b);
+    assert_eq!(fs::read(rig.record(session)).unwrap(), a);
+    rig.append(session, 1);
+    rig.restart();
+    let path = rig.path(session);
+    let fired = Rc::new(Cell::new(false));
+    let seen = fired.clone();
+    sampled_jsonl::preparation_tests::set(Some(Box::new(move |_| {
+        if !seen.replace(true) {
+            File::options().write(true).open(&path)?.set_len(c)?;
+        }
+        Ok(())
+    })));
+    let publication = rig.pass();
+    sampled_jsonl::preparation_tests::set(None);
+    assert!(
+        fired.get(),
+        "race reached native preparation with the restored owner"
+    );
+    assert_eq!(rig.counters().0.restored, 1);
+    assert_eq!((publication.full(), publication.tail()), (0, 1));
+    // The discovery identity was frozen before this physical truncation.
+    // A real scanner must retain that TOCTOU guard; parser finish alone may
+    // not mint a published diagnostic or lower the accepted extent.
+    assert_eq!(publication.published(session), 0);
+    assert!(!publication
+        .events
+        .iter()
+        .any(|r| r["counts"]["restored_behind_accepted"]["published"].is_number()));
+    assert_eq!(rig.index.files[&rig.key(session)].size_bytes, b);
+    assert_eq!(fs::read(rig.record(session)).unwrap(), a);
+    assert!(
+        c < b,
+        "the rejected read actually froze below the accepted floor"
+    );
+}

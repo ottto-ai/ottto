@@ -4170,6 +4170,8 @@ impl SharedCache {
                 return Err(MissClass::Failure(class).into());
             }
         };
+        #[cfg(test)]
+        super::test_hooks::fire(super::test_hooks::Point::AfterRestoredContent);
         if interpretation
             .accepted
             .is_some_and(|a| held.metadata().map_or(true, |m| a.behind(m.len())))
@@ -4326,6 +4328,8 @@ impl SharedCache {
             .charge((2 * FILE_CONTENT_SAMPLE_BYTES + 128) as u64)
             .ok()?;
         let position = held.stream_position().ok()?;
+        #[cfg(test)]
+        super::test_hooks::fire(super::test_hooks::Point::BeforeRestoredIdentity);
         let identity = opened_object_identity(snapshot_source, held);
         held.seek(SeekFrom::Start(position)).ok()?;
         let identity = identity.ok()?;

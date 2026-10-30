@@ -46540,6 +46540,8 @@ fn read_opened_content_samples(file: &mut File, len: u64) -> std::io::Result<Ope
     let mut head = vec![0_u8; FILE_CONTENT_SAMPLE_BYTES];
     let first_len = file.read(&mut head)?;
     head.truncate(first_len);
+    #[cfg(test)]
+    sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::AfterIdentityHead);
     let tail = if len > FILE_CONTENT_SAMPLE_BYTES as u64 {
         file.seek(SeekFrom::End(-(FILE_CONTENT_SAMPLE_BYTES as i64)))?;
         let mut tail = vec![0_u8; FILE_CONTENT_SAMPLE_BYTES];
@@ -96319,4 +96321,9 @@ impl ScanIndex {
             }
         }
     }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn test_replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
+    sampled_jsonl::durable::test_replay_privacy_artifacts(root)
 }
