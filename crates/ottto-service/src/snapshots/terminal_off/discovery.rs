@@ -455,16 +455,27 @@ pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
     // metadata sweep on each page. Losing it only restarts scheduling.
     let cursor = with_walks(|m| m.get(&scope).and_then(|w| w.target_cursor.clone()));
     let keys = if let Some(cursor) = cursor.as_ref() {
-        index.files.range((std::ops::Bound::Excluded(cursor.clone()), std::ops::Bound::Unbounded))
+        index
+            .files
+            .range((
+                std::ops::Bound::Excluded(cursor.clone()),
+                std::ops::Bound::Unbounded,
+            ))
             .chain(index.files.range(..=cursor.clone()))
-            .take(limit).map(|(k, _)| k.clone()).collect::<Vec<_>>()
+            .take(limit)
+            .map(|(k, _)| k.clone())
+            .collect::<Vec<_>>()
     } else {
         index.files.keys().take(limit).cloned().collect::<Vec<_>>()
     };
     let inspected = keys.len();
     let mut stats = 0;
     if let Some(last) = keys.last() {
-        with_walks(|m| { if let Some(w) = m.get_mut(&scope) { w.target_cursor = Some(last.clone()); } });
+        with_walks(|m| {
+            if let Some(w) = m.get_mut(&scope) {
+                w.target_cursor = Some(last.clone());
+            }
+        });
     }
     let mut selected = Vec::new();
     for key in &keys {
@@ -506,16 +517,32 @@ pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
             continue;
         }
         let traversal = index.traversal.as_ref().unwrap();
-        let served_root = with_walks(|m| m.get(&scope)
-            .and_then(|w| w.observations.get(&digest(key)))
-            .and_then(|o| o.served_root));
+        let served_root = with_walks(|m| {
+            m.get(&scope)
+                .and_then(|w| w.observations.get(&digest(key)))
+                .and_then(|o| o.served_root)
+        });
         // Preserve actual native acquisition custody. Only cold keys without
         // an admitted/served owner use the traversal's existing inference.
-        let root = served_root.and_then(|owner| traversal.scan_roots.iter()
-            .find(|root| digest(&local_index_key(root)) == owner).cloned())
-            .or_else(|| index.claude_full_rearm_progress.terminal_off_admitted.iter()
-                .find(|p| local_index_key(&p.path) == *key && traversal.scan_roots.contains(&p.scan_root))
-                .map(|p| p.scan_root.clone()))
+        let root = served_root
+            .and_then(|owner| {
+                traversal
+                    .scan_roots
+                    .iter()
+                    .find(|root| digest(&local_index_key(root)) == owner)
+                    .cloned()
+            })
+            .or_else(|| {
+                index
+                    .claude_full_rearm_progress
+                    .terminal_off_admitted
+                    .iter()
+                    .find(|p| {
+                        local_index_key(&p.path) == *key
+                            && traversal.scan_roots.contains(&p.scan_root)
+                    })
+                    .map(|p| p.scan_root.clone())
+            })
             .or_else(|| traversal.owning_scan_root(Path::new(key)).cloned());
         let Some(root) = root else {
             continue;
@@ -540,7 +567,8 @@ pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
         .pending_candidates
         .extend(selected);
     crate::local_resource_diagnostics::traversal_point(
-        "terminal_off_target_inspections", "claude_code",
+        "terminal_off_target_inspections",
+        "claude_code",
         &json!({"keys":inspected,"stat_operations":stats,"allowance":limit,"bytes":0}),
     );
 }
