@@ -713,6 +713,7 @@ thread_local! {
     // Actual API file opens and consumed bytes, isolated from parallel tests.
     static API_BEFORE_OPEN: std::cell::RefCell<Option<ApiReadHook>> = const { std::cell::RefCell::new(None) };
     static API_AFTER_READ: std::cell::RefCell<Option<ApiReadHook>> = const { std::cell::RefCell::new(None) };
+    static API_BEFORE_READ: std::cell::RefCell<Option<ApiReadHook>> = const { std::cell::RefCell::new(None) };
     static API_READ_RECEIPT: std::cell::Cell<(usize, usize, bool)> = const { std::cell::Cell::new((0, 0, false)) };
 }
 
@@ -1138,6 +1139,12 @@ fn decode_api_sidecar(
     let before_opened = api_file_generation(&opened);
     // A concurrent writer must not defeat the existing per-file read bound.
     let limit = strict_budget::allowance().min(opened.len().saturating_add(1));
+    #[cfg(test)]
+    API_BEFORE_READ.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook(&path);
+        }
+    });
     let mut reader = BufReader::new((&file).take(limit));
     let (rows, _) = decode_api_rows(&mut reader, session_id, &mut health);
     let bytes = limit - reader.get_ref().limit();
@@ -1331,6 +1338,8 @@ pub fn load_claude_trace_ownership_evidence(
         strict_budget::consumed(bytes);
         #[cfg(test)]
         TRACE_BYTES_FOR_TEST.with(|count| count.set(count.get() + bytes));
+        #[cfg(test)]
+        TRACE_SESSIONS_FOR_TEST.with(|reads| reads.borrow_mut().push((session_id.clone(), bytes)));
         let unchanged = file.metadata().ok().and_then(|m| api_file_generation(&m))
             == api_file_generation(&opened)
             && fs::metadata(&path)
@@ -1426,16 +1435,23 @@ type TraceBeforeReadHook = Box<dyn FnOnce(&Path)>;
 #[cfg(test)]
 thread_local! {
 static TRACE_BYTES_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+static TRACE_SESSIONS_FOR_TEST: std::cell::RefCell<Vec<(String, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
 static TRACE_BEFORE_READ: std::cell::RefCell<Option<TraceBeforeReadHook>> = const { std::cell::RefCell::new(None) };
 static TRACE_READ_RECEIPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 #[cfg(test)]
 pub(crate) fn reset_evidence_read_counts_for_test() {
+    TRACE_SESSIONS_FOR_TEST.with(|reads| reads.borrow_mut().clear());
     API_READ_RECEIPT.with(|receipt| {
         let (_, _, force) = receipt.get();
         receipt.set((0, 0, force));
     });
     TRACE_READ_RECEIPT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn trace_session_reads_for_test() -> Vec<(String, u64)> {
+    TRACE_SESSIONS_FOR_TEST.with(|reads| reads.borrow().clone())
 }
 
 #[cfg(test)]

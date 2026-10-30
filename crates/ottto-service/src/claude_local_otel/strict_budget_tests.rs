@@ -101,3 +101,56 @@ fn default_off_trace_crossing_real_capture_cap_is_bounded_and_never_complete() {
         "oversized/racing data grants no ownership or absence proof"
     );
 }
+
+#[test]
+fn terminal_off_on_api_allowance_caps_each_open_and_read() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    let scratch = crate::test_scratch::ScratchDir::new("on-api-allowance");
+    let path = evidence_path(&scratch, "cap-root");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for phase in ["stat", "opened", "append"] {
+        fs::write(
+            &path,
+            if phase == "stat" {
+                vec![b' '; 32]
+            } else {
+                b"{}\n".to_vec()
+            },
+        )
+        .unwrap();
+        API_READ_RECEIPT.with(|r| r.set((0, 0, false)));
+        let grow: ApiReadHook = Box::new(|path| {
+            OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(&[b' '; 64])
+                .unwrap();
+        });
+        match phase {
+            "opened" => API_BEFORE_OPEN.with(|h| *h.borrow_mut() = Some(grow)),
+            "append" => API_BEFORE_READ.with(|h| *h.borrow_mut() = Some(grow)),
+            _ => {}
+        }
+        let budget = strict_budget::StrictReadBudget::new(32);
+        assert!(crate::snapshots::claude_terminal_off());
+        let (rows, witness) = decode_api_sidecar(&scratch, "cap-root").unwrap();
+        let (opens, bytes, _) = API_READ_RECEIPT.with(|r| r.get());
+        let expected = match phase {
+            "stat" => (0, 0),
+            "opened" => (1, 0),
+            _ => (1, 4),
+        };
+        assert_eq!((opens, bytes), expected, "{phase}");
+        assert_eq!(budget.consumed(), bytes as u64);
+        assert!(budget.consumed() <= 32);
+        assert_eq!(witness.health.oversized_files, 1);
+        assert!(!witness.health.is_complete());
+        assert!(witness.generation.is_none());
+        assert!(
+            rows.is_empty(),
+            "incomplete evidence grants no ownership or ACK credit"
+        );
+    }
+}
