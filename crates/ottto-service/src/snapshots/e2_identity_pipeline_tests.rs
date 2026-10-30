@@ -688,10 +688,45 @@ fn e2_unhealthy_totals(items: &[SnapshotItem]) -> BTreeMap<String, serde_json::V
         .collect()
 }
 
+/// Mark transcript lines API-key billed: `external` marks root and child,
+/// `mixed` marks only the root's req_3 and req_4. Either way the item leaves
+/// final identity grouping and keeps the emission's uniform row account.
+fn e2_set_billing(dir: &Path, root: &str, billing: &str) {
+    if billing == "subscription" {
+        return;
+    }
+    for path in [
+        dir.join(format!("{root}.jsonl")),
+        dir.join(root)
+            .join("subagents")
+            .join(format!("agent-{E2_CHILD}.jsonl")),
+    ] {
+        let lines = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+                if billing == "external"
+                    || matches!(row["requestId"].as_str(), Some("req_3" | "req_4"))
+                {
+                    row["auth_mode"] = json!("api_key");
+                }
+                format!("{row}\n")
+            })
+            .collect::<String>();
+        fs::write(path, lines).unwrap();
+    }
+}
+
 /// Bound A, own B (child C when `split_logins`), then a trace that is
 /// `malformed`, `unreadable` (a directory) or `oversized` at open.
 fn e2_unhealthy_root_case(mode: &str, split_logins: bool) {
+    e2_unhealthy_root_billing_case(mode, split_logins, "subscription");
+}
+
+fn e2_unhealthy_root_billing_case(mode: &str, split_logins: bool, billing: &str) {
     let (dir, root, _) = claude_account_family_fixture();
+    e2_set_billing(&dir, &root, billing);
     let support = dir.join("support");
     let (mut api, trace) = e2_family_evidence(&root);
     for row in &mut api {
@@ -735,6 +770,13 @@ fn e2_unhealthy_root_case(mode: &str, split_logins: bool) {
     let (clean, _, stats, _) =
         e2_unhealthy_root_page(&dirs, &support, &root, &mut bound_index(), false, None);
     e2_unhealthy_assert_logins(&clean, &root, b.clone(), child.clone());
+    if billing != "subscription" {
+        let root_item = clean.iter().find(|item| item.source_session_id == root).unwrap();
+        assert!(
+            e2_rows(root_item).any(|row| !claude_request_accounts::local_subscription(row)),
+            "this arm bypasses contract-5 identity grouping"
+        );
+    }
     assert!(stats.unhealthy_root_no_fallback_requests.is_empty());
     let line = serde_json::to_value(&stats).unwrap();
     assert!(line.get("unhealthy_root_no_fallback_requests").is_none(), "absent while empty");
@@ -993,6 +1035,23 @@ fn e2_pipeline_bound_a_split_logins_malformed_trace_is_unknown_not_a() {
 #[test]
 fn e2_pipeline_bound_a_uniform_b_malformed_trace_is_unknown_not_a() {
     e2_unhealthy_root_case("malformed", false);
+}
+
+// C2 (Lead B): rows that bypass final identity grouping lose the uniform
+// account the emission would carry, for every unhealthy reason.
+#[test]
+fn e2_pipeline_bound_a_external_billing_malformed_trace_clears_wire_account() {
+    e2_unhealthy_root_billing_case("malformed", true, "external");
+}
+
+#[test]
+fn e2_pipeline_bound_a_mixed_billing_malformed_trace_clears_wire_account() {
+    e2_unhealthy_root_billing_case("malformed", true, "mixed");
+}
+
+#[test]
+fn e2_pipeline_bound_a_external_billing_oversized_trace_clears_wire_account() {
+    e2_unhealthy_root_billing_case("oversized", true, "external");
 }
 
 #[test]
