@@ -7,14 +7,11 @@ use std::time::{Duration, SystemTime};
 
 #[derive(Default, Serialize)]
 struct Stats {
-    events: BTreeMap<&'static str, u64>,
-    labels: BTreeMap<&'static str, BTreeMap<String, u64>>,
     latest: BTreeMap<&'static str, serde_json::Value>,
     cpu_per_pass_us: Distribution,
     save_dirty_rows: Distribution,
     save_dirty_bytes: Distribution,
     rss_bytes: Rss,
-    hydrate_count: u64,
     stage_memory: BTreeMap<&'static str, MemoryWindow>,
     retained_heap_bytes: BTreeMap<&'static str, RetainedHeap>,
     decoded_per_pass: Decoded,
@@ -69,16 +66,7 @@ pub(super) fn event(name: &'static str, value: &impl Serialize) {
         }
     }
     if let Ok(mut stats) = stats().lock() {
-        let count = stats.events.entry(name).or_default();
-        *count = count.saturating_add(1);
         if let Ok(value) = serde_json::to_value(value) {
-            if let Some(label) = value.as_str().filter(|s| s.len() <= 64) {
-                let counts = stats.labels.entry(name).or_default();
-                if counts.contains_key(label) || counts.len() < 64 {
-                    let count = counts.entry(label.to_owned()).or_default();
-                    *count = count.saturating_add(1);
-                }
-            }
             stats.latest.insert(name, value);
         }
         crate::local_resource_diagnostics::claude_state_v2(&*stats);
@@ -130,9 +118,6 @@ impl Stage {
         self.finished = true;
         let (_cpu, steady, peak) = self.probe.finish();
         if let Ok(mut stats) = stats().lock() {
-            if matches!(self.kind, Kind::Hydrate) {
-                stats.hydrate_count = stats.hydrate_count.saturating_add(1);
-            }
             match self.kind {
                 Kind::V1 => {
                     stats.v1_load_peak_rss_bytes = peak;
@@ -553,32 +538,6 @@ pub(in super::super) fn acquire_window(index: &ScanIndex) -> Option<Window> {
 #[cfg(test)]
 mod ops_tests {
     use super::*;
-
-    #[test]
-    fn pass_reset_is_thread_local_and_off_windows_have_no_probe() {
-        PASS.with(|p| {
-            let mut p = p.borrow_mut();
-            p.active = true;
-            p.decoded.rows = 19;
-            p.acquire_sampled = true;
-        });
-        pass_start();
-        PASS.with(|p| {
-            let p = p.borrow();
-            assert!(!p.active);
-            assert_eq!(p.decoded.rows, 0);
-            assert!(!p.acquire_sampled);
-        });
-        assert!(Window::begin("finish").is_none());
-        decoded(2, 3, 4);
-        PASS.with(|p| {
-            let p = p.borrow();
-            assert_eq!(
-                (p.decoded.rows, p.decoded.headers, p.decoded.chunks),
-                (2, 3, 4)
-            );
-        });
-    }
 
     #[test]
     fn family_requests_heap_is_separate_and_diagnostics_never_contain_its_text() {

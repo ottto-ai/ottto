@@ -99,7 +99,7 @@ fn progress_generation(bytes: &[u8]) -> Result<u64> {
     Ok(serde_json::from_slice::<Generation>(bytes)?.generation)
 }
 /// Bounded temporary custody for an obsolete, provably unpublished seal. Keep
-/// exact predecessor bytes until a new seal + RecoverySet have been verified.
+/// exact predecessor bytes until the new seal has been independently read back.
 /// A crash leaves both copies, never an overwritten companion. New successful
 /// sealing removes these remnants under the same progress/checkpoint owners.
 fn failed_imports(index_path: &Path) -> Result<Vec<PathBuf>> {
@@ -281,7 +281,7 @@ impl OriginalProgress {
         identity: &Identity,
         progress_path: &Path,
         store: &mut S,
-    ) -> Result<RecoverySet> {
+    ) -> Result<()> {
         require(
             index_path == self.index_path && identity.binding.namespace_hash == self.namespace,
             "identity",
@@ -295,19 +295,30 @@ impl OriginalProgress {
             bytes.as_deref(),
         )?;
         let mut tx = store.begin(TxnMode::Read)?;
-        let set = RecoverySet::capture(&mut tx, &recovery, progress_path)?;
-        set.verify(&mut tx, &recovery, progress_path)?;
+        let scope = Scope {
+            identity: control(&mut tx, "identity")?,
+            generation: control(&mut tx, "generation")?,
+        };
+        require(scope == recovery.scope, "identity")?;
+        let receipt = recovery.receipt_at(&scope)?;
+        require(
+            bytes.as_deref().map(digest) == Some(receipt.digest)
+                || (receipt.generation == 0
+                    && receipt.previous_digest.is_none()
+                    && bytes.is_none()),
+            "import_progress",
+        )?;
         drop(tx);
         erase_failed_imports(index_path)?;
-        Ok(set)
+        Ok(())
     }
     #[cfg(test)]
-    pub(super) fn seal_and_capture<S: Store>(
+    pub(super) fn seal<S: Store>(
         &self,
         index_path: &Path,
         identity: &Identity,
         store: &mut S,
-    ) -> Result<RecoverySet> {
+    ) -> Result<()> {
         crate::snapshot_sync::with_state_v2_progress_lock(index_path, |path| {
             self.seal_locked(index_path, identity, path, store)
         })
@@ -319,26 +330,16 @@ impl OriginalProgress {
         index_path: &Path,
         identity: &Identity,
         mut store: S,
-        publish: impl FnOnce(S, RecoverySet) -> Result<T>,
+        publish: impl FnOnce(S) -> Result<T>,
     ) -> Result<T> {
         crate::snapshot_sync::with_state_v2_progress_lock(index_path, |path| {
-            let set = self.seal_locked(index_path, identity, path, &mut store)?;
-            publish(store, set)
+            self.seal_locked(index_path, identity, path, &mut store)?;
+            publish(store)
         })
     }
 }
 
 impl ProgressRecovery {
-    pub(super) fn for_backup(identity: Identity, generation: u64, path: &Path) -> Self {
-        Self {
-            scope: Scope {
-                identity,
-                generation,
-            },
-            path: fence::sibling(path, ".v2-ack-receipt"),
-            db_path: None,
-        }
-    }
     /// Runtime load already holds CheckpointLock and has authenticated the DB.
     /// Replay before returning either a hydrated or cached graph, without
     /// recursively acquiring the checkpoint/route/session locks.
@@ -544,27 +545,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for Identity {
     }
 }
 
-/// Exact recovery-set descriptor for a consistent DB backup plus its external
-/// progress receipt and immutable restart references. A restore must reconcile
-/// newer receipts first, then verify this descriptor before collection/GC.
-/// No age, filename prefix or body hash can stand in for a missing member.
-#[allow(dead_code)] // Import/backup owner calls this before publication is enabled.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct RecoverySet {
-    scope: Scope,
-    receipt_digest: [u8; 32],
-    resume: Vec<ResumeReference>,
-}
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ResumeReference {
-    key: Vec<u8>,
-    position: u64,
-    digest: [u8; 32],
-    // Exact independently decodable reference tuple, not a content hash alone.
-    encoded: Vec<u8>,
-}
 fn control<T: serde::de::DeserializeOwned>(tx: &mut dyn Transaction, name: &str) -> Result<T> {
     let header = tx
         .get(&RowKey::Meta(name.into()))?
@@ -574,163 +554,6 @@ fn control<T: serde::de::DeserializeOwned>(tx: &mut dyn Transaction, name: &str)
     tx.read_value(&header, &mut bytes)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
-#[allow(dead_code)]
-impl RecoverySet {
-    /// Caller holds source ownership and one read snapshot through backup.
-    pub(super) fn capture(
-        tx: &mut dyn Transaction,
-        recovery: &ProgressRecovery,
-        progress_path: &Path,
-    ) -> Result<Self> {
-        let scope = Scope {
-            identity: control(tx, "identity")?,
-            generation: control(tx, "generation")?,
-        };
-        recovery.scope.check(&scope)?;
-        let receipt = recovery.receipt_at(&scope)?;
-        receipt.scope.check(&scope)?;
-        let progress = read(progress_path)?;
-        require(
-            progress.as_deref().map(digest) == Some(receipt.digest)
-                || (receipt.generation == 0
-                    && receipt.previous_digest.is_none()
-                    && progress.is_none()),
-            "backup_progress",
-        )?;
-        let mut resume = Vec::new();
-        let mut after = None;
-        let mut charged = 0_u64;
-        loop {
-            let page = tx.scan_kind(
-                &RecordKind::parse("resume.checkpoint")?,
-                after.as_ref(),
-                128,
-            )?;
-            if page.is_empty() {
-                break;
-            }
-            for header in &page {
-                let RowKey::Record {
-                    key_bytes,
-                    position,
-                    ..
-                } = &header.key
-                else {
-                    anyhow::bail!("state_v2_ack_resume_key");
-                };
-                charged = charged.saturating_add(key_bytes.len() as u64 + 128);
-                require(
-                    charged <= 8 * 1024 * 1024 && resume.len() < 65_536,
-                    "backup_size",
-                )?;
-                require(header.len <= MUTABLE_VALUE_BYTES, "backup_size")?;
-                charged = charged.saturating_add(header.len.saturating_mul(4));
-                require(charged <= 8 * 1024 * 1024, "backup_size")?;
-                let mut encoded = Vec::new();
-                tx.read_value(header, &mut encoded)?;
-                resume.push(ResumeReference {
-                    key: key_bytes.clone(),
-                    position: *position,
-                    digest: Sha256::digest(&encoded).into(),
-                    encoded,
-                });
-            }
-            after = page.last().map(|h| h.key.clone());
-        }
-        Ok(Self {
-            scope,
-            receipt_digest: digest(&serde_json::to_vec(&receipt)?),
-            resume,
-        })
-    }
-
-    pub(super) fn identity(&self) -> &Identity {
-        &self.scope.identity
-    }
-    pub(super) fn checkpoints(&self) -> Result<Vec<kinds_files::ResumeCheckpoint>> {
-        let mut checkpoints = Vec::new();
-        for reference in &self.resume {
-            require(
-                reference.position == 0
-                    && <[u8; 32]>::from(Sha256::digest(&reference.encoded)) == reference.digest,
-                "backup_resume",
-            )?;
-            let mut decoded = CheckpointBytes(Vec::new());
-            codec::unpack(reference.encoded.as_slice(), &mut decoded)?;
-            let checkpoint: kinds_files::ResumeCheckpoint = serde_json::from_slice(&decoded.0)?;
-            require(
-                checkpoint.binding == self.scope.identity.binding,
-                "backup_resume",
-            )?;
-            checkpoints.push(checkpoint);
-        }
-        Ok(checkpoints)
-    }
-    pub(super) fn reconcile_receipt_before_restore(
-        &self,
-        index_path: &Path,
-        progress_path: &Path,
-        backup_receipt: &Path,
-    ) -> Result<()> {
-        let companion = fence::sibling(index_path, ".v2-ack-receipt");
-        if read(&companion)?.is_none() {
-            let bytes = read(backup_receipt)?.context("state_v2_backup_receipt")?;
-            require(digest(&bytes) == self.receipt_digest, "backup_receipt")?;
-            ottto_core::write_owner_only_file_atomic(&companion, &bytes)?;
-            super::super::sync_checkpoint_parent(&companion)?;
-        }
-        let bytes = read(&companion)?.context("state_v2_backup_receipt")?;
-        let receipt: Receipt = serde_json::from_slice(&bytes)?;
-        require(
-            receipt.scope.identity == self.scope.identity,
-            "backup_receipt",
-        )?;
-        let recovery = ProgressRecovery {
-            scope: Scope {
-                identity: self.scope.identity.clone(),
-                generation: receipt.scope.generation.max(self.scope.generation),
-            },
-            path: companion,
-            db_path: None,
-        };
-        // Replay independently retained newer receipts BEFORE rejecting an old
-        // snapshot. Accepted external state is never rolled back to the backup.
-        recovery.recover(progress_path)?;
-        require(
-            receipt.scope.generation <= self.scope.generation
-                && digest(&bytes) == self.receipt_digest,
-            "backup_newer_receipt",
-        )?;
-        Ok(())
-    }
-    pub(super) fn reconcile_before_restore(
-        &self,
-        index_path: &Path,
-        progress_path: &Path,
-        backup_receipt: &Path,
-    ) -> Result<()> {
-        self.reconcile_receipt_before_restore(index_path, progress_path, backup_receipt)?;
-        let db_path = fence::sibling(index_path, ".v2.sqlite");
-        if fence::exists(&db_path)? {
-            require(
-                sqlite::Sqlite::ack_generation(&db_path, &self.scope.identity)?
-                    == self.scope.generation,
-                "backup_newer_database",
-            )?;
-        }
-        Ok(())
-    }
-    pub(super) fn verify(
-        &self,
-        tx: &mut dyn Transaction,
-        recovery: &ProgressRecovery,
-        progress_path: &Path,
-    ) -> Result<()> {
-        let actual = Self::capture(tx, recovery, progress_path)?;
-        require(*self == actual, "recovery_set")
-    }
-}
-
 #[cfg(test)]
 impl ProgressRecovery {
     pub(crate) fn synthetic(index_path: &Path, namespace: &str, generation: u64) -> Self {

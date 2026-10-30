@@ -257,11 +257,9 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
                         // A concurrent borrower consumed the graph, so hydrate
                         // on the same connection; never acquire another owner.
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
-                        telemetry::event("hydrate_count", &1);
                         let (mut index, cx) = mapper.hydrate_context(&mut session.db)?;
                         ensure!(index.generation == stamp.0, Hold::DbUnavailable);
                         normalize_hydrated(&mut index)?;
-                        super::recovery_backup::roll(path, &mut session.db, &identity)?;
                         session.stamp = session.db.stamp()?;
                         ensure!(index.generation == session.stamp.0, Hold::DbUnavailable);
                         normalize_hydrated(&mut index)?;
@@ -277,7 +275,6 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
                 state.current = None;
             }
             let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
-            telemetry::event("hydrate_count", &1);
             let (deadline, work) = purge_policy();
             let mut db = sqlite::Sqlite::open_with_policy(&db_path, &identity, deadline, work)
                 .map_err(Hold::storage)?;
@@ -287,7 +284,6 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
             super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
             let (mut index, cx) = mapper.hydrate_context(&mut db)?;
             normalize_hydrated(&mut index)?;
-            super::recovery_backup::roll(path, &mut db, &identity)?;
             let stamp = db.stamp()?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
             normalize_hydrated(&mut index)?;
@@ -408,12 +404,11 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             return Ok(());
         }
         let result = (|| -> Result<KindCx> {
-            if let Some(original) = &mut state.original {
-                original.unchanged()?;
-                // Progress locking belongs to the actual conversion attempt,
-                // never the read-only inventory or a paused conversion.
-                original.capture_progress(path)?;
-            }
+            let original = state.original.as_mut().ok_or(Pause::Mismatch)?;
+            original.unchanged()?;
+            // Progress locking belongs to the actual conversion attempt,
+            // never the read-only inventory or a paused conversion.
+            original.capture_progress(path)?;
             telemetry::event(
                 "orphan_removed",
                 &fence::cleanup_unpublished(path, state.latched)?,
@@ -427,11 +422,10 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
                 binding,
                 fence_generation: generation,
             };
-            let identity = match &state.original {
-                Some(original) => original.retry_identity(identity)?,
-                None => identity,
-            };
-            preserve_baseline(path, state.original.as_ref())?;
+            let original = state.original.as_ref().ok_or(Pause::Mismatch)?;
+            let identity = original.retry_identity(identity)?;
+            original.preserve(path)?;
+            telemetry::baseline(path);
             let import = fence::sibling(path, ".v2.sqlite.import");
             let mut db = sqlite::Sqlite::create_import(&import)?;
             db.path_extractor(M::private_paths);
@@ -439,14 +433,8 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             db.control("identity", &identity)?;
             db.control("generation", &index.generation)?;
             let cx = mapper.import_graph(&mut db, index, state.original.as_ref())?;
-            if let Some(original) = &state.original {
-                original.unchanged()?;
-                original.publish_import(path, &identity, db, &mut state.latched)?;
-            } else {
-                db.finish_import()?;
-                fence::boundary(fence::Boundary::ImportFinished)?;
-                fence::publish(path, &identity, &mut state.latched)?;
-            }
+            original.unchanged()?;
+            original.publish_import(path, &identity, db, &mut state.latched)?;
             Ok(cx)
         })();
         let cx = match result {
@@ -494,45 +482,6 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
 }
 fn binding_for(path: &Path) -> Result<super::super::scan_index_persistence::Binding> {
     binding(path).ok_or_else(|| Hold::ForeignBinding.into())
-}
-
-fn preserve_baseline(path: &Path, original: Option<&import::Original>) -> Result<()> {
-    if let Some(original) = original {
-        original.preserve(path)?;
-        telemetry::baseline(path);
-        return Ok(());
-    }
-    if !fence::exists(path)? {
-        return Ok(());
-    }
-    let mut bytes = fence::preserve_file(path, &fence::sibling(path, ".v1-readonly"))?;
-    // Preserve the entire immutable shard directory, including every referenced
-    // payload. Never parse row content or follow links. Reject nested objects.
-    let shards = fence::sibling(path, ".shards");
-    if fence::exists(&shards)? {
-        let metadata = fs::symlink_metadata(&shards)?;
-        ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "state_v2_unsafe_baseline"
-        );
-        let target = fence::sibling(path, ".v1-readonly.shards");
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new().mode(0o700).create(&target)?;
-        for entry in fs::read_dir(shards)? {
-            let entry = entry?;
-            bytes = bytes
-                .checked_add(fence::preserve_file(
-                    &entry.path(),
-                    &target.join(entry.file_name()),
-                )?)
-                .ok_or(Hold::DbUnavailable)?;
-        }
-        super::super::sync_checkpoint_parent(&target.join("unused"))?;
-        super::super::sync_checkpoint_parent(path)?;
-    }
-    telemetry::event("baseline_bytes", &bytes);
-    telemetry::baseline(path);
-    Ok(())
 }
 
 /// All save routes check independent evidence before any v1 CAS or publication.
@@ -597,7 +546,6 @@ fn save_with_mode<M: Mapper>(
                     path,
                     owner,
                 )?;
-                super::recovery_backup::roll_locked(path, &mut session.db, &identity, owner)?;
                 let save = if claim_only {
                     M::save_claim_delta
                 } else {
@@ -611,11 +559,6 @@ fn save_with_mode<M: Mapper>(
                     index,
                     &mut session.cx,
                 );
-                // Protect the exact committed generation before releasing ACK custody.
-                // A save never publishes a subset of its dirty delta.
-                if session.db.stamp()?.0 != previous.generation {
-                    super::recovery_backup::roll_locked(path, &mut session.db, &identity, owner)?;
-                }
                 if save_result? {
                     session.stamp = session.db.stamp()?;
                     state.cached = Some(index.clone());
@@ -871,25 +814,14 @@ fn register(state: &mut RouteState, index: &ScanIndex) -> Result<()> {
 /// Inventory only: the baseline's explicit single-file erasure exception and
 /// the H/N/L-only restart cache are not covered by a DB VACUUM claim.
 fn erasure_inventory(path: &Path) -> Result<()> {
-    for (class, artifact) in [
-        (
-            "migration_backup_inventory",
-            fence::sibling(path, ".v2.sqlite.migration-backup"),
-        ),
-        (
-            "import_remnant_inventory",
-            fence::sibling(path, ".v2.sqlite.import"),
-        ),
-        ("baseline_inventory", fence::sibling(path, ".v1-readonly")),
-        (
-            "ack_receipt_inventory",
-            fence::sibling(path, ".v2-ack-receipt"),
-        ),
-        (
+    let artifacts = fence::ARTIFACTS
+        .iter()
+        .filter_map(|(suffix, _, class)| class.map(|class| (class, fence::sibling(path, suffix))))
+        .chain(std::iter::once((
             "restart_record_inventory",
             crate::durable_tail_store::store_dir_for_index(path),
-        ),
-    ] {
+        )));
+    for (class, artifact) in artifacts {
         let mut count = 0_u64;
         let mut bytes = 0_u64;
         let mut bounded = false;
@@ -975,30 +907,9 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
             .map_err(|_| Hold::DbUnavailable)?
             .take();
     }
-    for suffix in [
-        "",
-        ".shards",
-        ".v2.sqlite",
-        ".v2.sqlite-wal",
-        ".v2.sqlite-shm",
-        ".v2.sqlite.migration-backup",
-        ".v2.sqlite.import",
-        ".v2.sqlite.import-wal",
-        ".v2.sqlite.import-shm",
-        ".v1-readonly",
-        ".v1-readonly.shards",
-        ".v2-fence.tmp",
-        ".v2-ack-receipt",
-    ] {
-        let artifact = fence::sibling(path, suffix);
-        match fs::symlink_metadata(&artifact) {
-            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => fs::remove_dir_all(&artifact)?,
-            Ok(_) => fs::remove_file(&artifact)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
+    for (suffix, _, _) in fence::ARTIFACTS {
+        fence::remove_artifact(&fence::sibling(path, suffix))?;
     }
-    super::recovery_backup::erase(path)?;
     super::ack::erase_failed_imports(path)?;
     super::super::sync_checkpoint_parent(path)?;
     let records = crate::durable_tail_store::store_dir_for_index(path);

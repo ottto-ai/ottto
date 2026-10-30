@@ -43,6 +43,67 @@ pub(super) fn sibling(path: &Path, suffix: &str) -> PathBuf {
     name.push(suffix);
     name.into()
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Cleanup {
+    SourceOnly,
+    Unpublished,
+    ObsoleteBackup,
+}
+/// One inventory drives orphan cleanup, explicit erasure and erasure gauges.
+/// Publication must be excluded before deleting any unpublished artifact.
+pub(super) const ARTIFACTS: &[(&str, Cleanup, Option<&str>)] = &[
+    ("", Cleanup::SourceOnly, None),
+    (".shards", Cleanup::SourceOnly, None),
+    (".v2.sqlite", Cleanup::SourceOnly, None),
+    (".v2.sqlite-wal", Cleanup::SourceOnly, None),
+    (".v2.sqlite-shm", Cleanup::SourceOnly, None),
+    // Cleanup-only names: no writer or recovery/adoption path remains.
+    (".v2.sqlite.migration-backup", Cleanup::ObsoleteBackup, None),
+    (".v2-recovery", Cleanup::ObsoleteBackup, None),
+    (
+        ".v2.sqlite.import",
+        Cleanup::Unpublished,
+        Some("import_remnant_inventory"),
+    ),
+    (".v2.sqlite.import-wal", Cleanup::Unpublished, None),
+    (".v2.sqlite.import-shm", Cleanup::Unpublished, None),
+    (
+        ".v1-readonly",
+        Cleanup::Unpublished,
+        Some("baseline_inventory"),
+    ),
+    (".v1-readonly.shards", Cleanup::Unpublished, None),
+    (".v2-fence.tmp", Cleanup::Unpublished, None),
+    (
+        ".v2-ack-receipt",
+        Cleanup::SourceOnly,
+        Some("ack_receipt_inventory"),
+    ),
+];
+
+/// Old backup copies still carry private-text debt after their writers are
+/// removed. Delete and fsync them before maintenance clears that obligation.
+pub(super) fn purge_obsolete_backups(path: &Path) -> Result<()> {
+    for (suffix, cleanup, _) in ARTIFACTS {
+        if *cleanup == Cleanup::ObsoleteBackup {
+            remove_artifact(&sibling(path, suffix))?;
+        }
+    }
+    // Also sync on retry when a prior attempt unlinked a name but its parent
+    // fsync failed; absence alone cannot certify that deletion is durable.
+    super::super::sync_checkpoint_parent(path)
+}
+
+pub(super) fn remove_artifact(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => fs::remove_dir_all(path)?,
+        Ok(_) => fs::remove_file(path)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    }
+    Ok(true)
+}
+
 pub(super) fn exists(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -243,28 +304,10 @@ pub(super) fn cleanup_unpublished(path: &Path, latched: bool) -> Result<u64> {
         !latched && !exists(&sibling(path, ".v2.sqlite"))? && read(path)?.is_none(),
         Hold::DbUnavailable
     );
-    super::recovery_backup::erase(path)?;
     let mut removed = 0;
-    for suffix in [
-        ".v2.sqlite.import",
-        ".v2.sqlite.import-wal",
-        ".v2.sqlite.import-shm",
-        ".v2-fence.tmp",
-        ".v1-readonly",
-        ".v1-readonly.shards",
-    ] {
-        let artifact = sibling(path, suffix);
-        match fs::symlink_metadata(&artifact) {
-            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {
-                fs::remove_dir_all(&artifact)?;
-                removed += 1;
-            }
-            Ok(_) => {
-                fs::remove_file(&artifact)?;
-                removed += 1;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+    for (suffix, cleanup, _) in ARTIFACTS {
+        if *cleanup != Cleanup::SourceOnly && remove_artifact(&sibling(path, suffix))? {
+            removed += 1;
         }
     }
     if removed != 0 {

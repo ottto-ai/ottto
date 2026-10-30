@@ -72,7 +72,6 @@ Codex and Pi keep their existing measurements.
 | `retained_heap_bytes.{active_graph,cached_graph}.{account_pending,usage_pending,family.requests,census,side_maps,files}` | Requested-layout retained heap estimates by owning graph and class, excluding inline stack slots. Usage excludes the separately charged request-membership maps. Side maps cover remaining index fields, excluding runtime route handles. Cached graph is sampled once before acquisition; active graph at post-pass maintenance before finish releases its inputs. |
 | `cpu_per_pass_us.{p50,p95,max}` | Process CPU delta from prepare through finish returning; p50/p95 use the latest 128 samples, max is the observed lifetime maximum. Concurrent daemon work may contribute. |
 | `rss_bytes.{steady,peak}` | Current endpoint and sampled process RSS peak around save/hydrate. |
-| `hydrate_count` | Actual hydrate probe completions, including failed attempts; cached graph reuse adds none. |
 | `decoded_per_pass.{rows,headers,chunks}` | Successful physical value/header/chunk decodes since prepare, including repeated reads for validation or encoding. A failed value may still contribute validated chunks. Reset at each prepare, published at the completed pass boundary. |
 | `cache_used_bytes` | SQLite `SQLITE_DBSTATUS_CACHE_USED` current connection bytes, refreshed at maintenance boundaries. |
 | `bytes_written_per_pass` | Process-attributed physical writes from prepare through finish returning, including other concurrent daemon work. No encoded-size estimate is substituted. |
@@ -1520,12 +1519,11 @@ Upstream authority-key allocation loss remains fail-closed: inherited partitions
 are not reclassified as request proof by budget recovery or a uniform starting-account
 retry. Only an intact current grouping can enter the cap allocator.
 
-The default-OFF Claude state-v2 route also emits `growth_claim_refused` with fixed
-lineage/publication labels and `recovery_backup_verified` / `recovery_backup_restored`
-counts, plus `recovery_backup_superseded` after a verified replacement switches
-the current pointer. `recovery_backup_unpublished_reclaimed` counts cleanup of
-failed attempts. These counters describe rolling artifact protection, without
-claiming runtime/native restore qualification or enabling conversion.
+The default-OFF Claude state-v2 route reports current bounded states through the
+existing local resource diagnostics sink, including `growth_claim_refused` labels.
+It keeps CPU/RSS, WAL, import peak versus the same-process v1 load, erasure inventory
+and baseline-age/escalation gauges. It does not maintain a second cumulative event
+or label counter registry. Hydration and saves create no rolling backup copies.
 Each save reports `save_dirty_rows` and `save_dirty_bytes` distributions (`p50`, `p95`, `max`)
 on the `claude_state_v2` row. Samples include refused attempts; percentiles use
 the last 128 samples and maximum is process-lifetime. Charges include old/new

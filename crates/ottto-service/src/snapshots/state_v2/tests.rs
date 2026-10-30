@@ -507,7 +507,11 @@ fn f6_deadline_keeps_writes_live_without_resetting_oldest_purge() {
 #[test]
 fn f8_vacuum_churn_removes_deleted_keys_and_pl_values() {
     let tmp = Scratch::new();
-    let mut db = tmp.live_store();
+    tmp.store().finish_import().unwrap();
+    let database = tmp.0.join("index.v2.sqlite");
+    fs::rename(tmp.path(), &database).unwrap();
+    let mut db = sqlite::Sqlite::open(&database, &tmp.identity()).unwrap();
+    db.path_extractor(test_paths);
     db.set_purge_policy(
         std::time::Duration::from_secs(86400),
         std::time::Duration::from_secs(5),
@@ -532,11 +536,21 @@ fn f8_vacuum_churn_removes_deleted_keys_and_pl_values() {
         }
     }
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    // Remnants from removed backup writers must not outlive erasure debt.
+    let backup = tmp.0.join("index.v2.sqlite.migration-backup");
+    fs::write(&backup, markers.join("\n")).unwrap();
+    let recovery = tmp.0.join("index.v2-recovery");
+    fs::create_dir(&recovery).unwrap();
+    let interrupted = recovery.join("generation-interrupted");
+    fs::create_dir(&interrupted).unwrap();
+    fs::write(interrupted.join("private-member"), markers.join("\n")).unwrap();
     age_erasure(&mut db, 13 * 3600);
     db.maintenance(true).unwrap();
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
+    assert!(!backup.exists());
+    assert!(!recovery.exists());
     for suffix in ["", "-wal", "-shm"] {
-        let path = tmp.0.join(format!("index.v2.sqlite.import{suffix}"));
+        let path = tmp.0.join(format!("index.v2.sqlite{suffix}"));
         if path.exists() {
             let bytes = fs::read(path).unwrap();
             for marker in &markers {

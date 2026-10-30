@@ -30,7 +30,6 @@ mod kinds_census;
 mod kinds_files;
 mod kinds_misc;
 mod mapper;
-mod recovery_backup;
 pub(crate) mod resume;
 use codec as shape;
 mod sqlite;
