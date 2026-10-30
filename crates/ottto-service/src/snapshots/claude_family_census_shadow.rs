@@ -23,6 +23,15 @@
 //! rows only gain an account from a prior witness or a family proven at a
 //! terminal page, so a fresh multi-member family stays `evidence` mid-walk.
 //!
+//! For 8b's ruling the shadow also measures how many families missing only a
+//! child's finalized revision could have it finalized without a terminal
+//! (`family_child_finalize_eligible`, `family_child_finalize_blocked{cause}`).
+//! It reads only per-member state a page already holds and finalizes nothing.
+//! `session_account_bindings` is out of reach here (its key needs the machine
+//! id), and cross-family state a terminal derives from parsed bodies is not
+//! persisted, so the eligible count is an upper bound. See
+//! [`ChildFinalizeBlocked`].
+//!
 //! Runtime state (rotation cursor, root path counts, attestations, sticky
 //! vetoes, `first_pending_at`) is process-local, bounded and charged in
 //! `runtime_heap_bytes`; it is never persisted and never used for a decision.
@@ -65,6 +74,9 @@ const ATTESTATION_FLUSH: usize = 1_024;
 /// Equality Skips one page may attest. Later ones run no decision and count
 /// `attest_capped`; their members stay `presence_only`.
 pub(super) const MAX_EQUALITY_ATTESTS_PER_PAGE: u64 = 4_096;
+/// Entries of each cross-family record one page may read for child-finalize
+/// candidates; past it every candidate counts `cross_family_unknown`.
+pub(super) const MAX_CROSS_FAMILY_ENTRIES: usize = 16_384;
 const OVER_24H_SECONDS: u64 = 24 * 60 * 60;
 
 /// First-match reason an evaluated family is incomplete. The order is the
@@ -118,6 +130,53 @@ pub(super) enum Incomplete {
 pub(super) enum Completion {
     Complete,
     Incomplete(Incomplete),
+}
+
+/// First-match reason a family that lacks only child revisions fails E1's
+/// conditions for finalizing them without a terminal. The order is the match
+/// order (E1's conditions 1 to 4), with what a source-wide veto hides after the
+/// veto, so the causes partition the blocked count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ChildFinalizeBlocked {
+    /// A child has no account evidence: it is outside the pending proof's
+    /// members or request sets, or has no source/entity/body tuple to bind.
+    WitnessMissing,
+    /// A prior family witness names another account than the pending proof.
+    WitnessConflict,
+    /// A member counts `held`, or a decode hold covers the family's account or
+    /// usage records.
+    WitnessHeld,
+    /// The family's usage witness carries a legacy copied prefix, or another
+    /// family's witness names this root as the owner of one.
+    SharedParent,
+    /// A persisted duplicate-request witness names this root.
+    NativeOwnershipConflict,
+    /// The duplicate witness overflowed, or the cross-family records are over
+    /// `MAX_CROSS_FAMILY_ENTRIES`, so neither check above is proven.
+    CrossFamilyUnknown,
+    /// A request-identity contract change is pending.
+    IdentityContractChanged,
+    /// A member path has a twin: the root has more paths than the family, or a
+    /// member name maps to two paths. Terminal co-scheduling resolves these.
+    TwinSet,
+    /// A sticky namespace-loss or unattributed veto.
+    StickyVeto,
+    /// The directory queue has not drained, or the watcher overflowed.
+    EnumerationOpen,
+    /// The uniqueness pass has not finished, so a twin is not ruled out.
+    UniquenessUnknown,
+    /// The pending proof is not this traversal's account window.
+    WindowMoved,
+    /// A member's body was not uploaded under the active context policy.
+    PolicyChanged,
+}
+
+/// A candidate family's verdict for child finalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildFinalize {
+    Eligible,
+    Blocked(ChildFinalizeBlocked),
 }
 
 /// The consumers E7-8b may wire a complete verdict to once Lead B and SOURCE
@@ -280,6 +339,12 @@ pub(super) struct FamilyCounts {
     /// and unrelated keys included.
     #[serde(rename = "member_keys_visited")]
     pub(super) member_keys: u64,
+    /// Families that lack only child revisions and pass E1's conditions.
+    #[serde(rename = "family_child_finalize_eligible")]
+    pub(super) child_finalize_eligible: u64,
+    /// Families that lack only child revisions, by first failed condition.
+    #[serde(rename = "family_child_finalize_blocked")]
+    pub(super) child_finalize_blocked: BTreeMap<ChildFinalizeBlocked, u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -290,6 +355,10 @@ pub(super) struct Deferred {
 impl FamilyCounts {
     pub(super) fn incomplete_total(&self) -> u64 {
         self.incomplete.values().sum()
+    }
+
+    pub(super) fn child_finalize_candidates(&self) -> u64 {
+        self.child_finalize_eligible + self.child_finalize_blocked.values().sum::<u64>()
     }
 }
 
@@ -726,6 +795,67 @@ impl Sticky {
     }
 }
 
+/// Roots the persisted cross-family records name, sorted by hash. Read at most
+/// once per page, and only when a child-finalize candidate asks. A hash
+/// collision only blocks a family, which fails closed.
+#[derive(Debug, Default)]
+struct CrossFamily {
+    legacy_owners: Vec<u64>,
+    duplicate_owners: Vec<u64>,
+    overflowed: bool,
+    visited: u64,
+}
+
+impl CrossFamily {
+    fn of(index: &ScanIndex) -> Self {
+        let witnesses = &index.claude_usage_family_witnesses;
+        let duplicates = &index.claude_duplicate_request_owners;
+        if witnesses.len().max(duplicates.len()) > MAX_CROSS_FAMILY_ENTRIES {
+            return Self {
+                overflowed: true,
+                ..Self::default()
+            };
+        }
+        fn sorted(roots: impl Iterator<Item = u64>) -> Vec<u64> {
+            let mut roots = roots.take(MAX_CROSS_FAMILY_ENTRIES + 1).collect::<Vec<_>>();
+            roots.sort_unstable();
+            roots
+        }
+        let legacy_owners = sorted(
+            witnesses
+                .values()
+                .flat_map(|witness| &witness.legacy_owner_roots)
+                .map(|root| hash64(root.as_bytes())),
+        );
+        let duplicate_owners = sorted(
+            duplicates
+                .values()
+                .flatten()
+                .map(|owner| hash64(owner.root_session_id_hash.as_bytes())),
+        );
+        Self {
+            overflowed: index.claude_duplicate_request_witness_overflowed
+                || legacy_owners.len().max(duplicate_owners.len()) > MAX_CROSS_FAMILY_ENTRIES,
+            visited: (witnesses.len() + duplicates.len()) as u64,
+            legacy_owners,
+            duplicate_owners,
+        }
+    }
+
+    fn owns_legacy_prefix(&self, root: &str) -> bool {
+        self.legacy_owners
+            .binary_search(&hash64(root.as_bytes()))
+            .is_ok()
+    }
+
+    fn duplicates_requests_of(&self, root: &str) -> bool {
+        let owner = claude_duplicate_request_owner(root, "");
+        self.duplicate_owners
+            .binary_search(&hash64(owner.root_session_id_hash.as_bytes()))
+            .is_ok()
+    }
+}
+
 /// The page's view of the persisted state and runtime attestations every
 /// verdict reads.
 pub(super) struct View<'a> {
@@ -746,6 +876,7 @@ pub(super) struct View<'a> {
     /// `MAX_HISTORY_GATES` gates it overflows and every family counts held.
     held_history_roots: Vec<u64>,
     history_gates_overflowed: bool,
+    cross_family: std::cell::OnceCell<CrossFamily>,
 }
 
 /// The shared budget of one page's member lookups, in range advances.
@@ -820,6 +951,7 @@ impl<'a> View<'a> {
             queued_roots_overflowed,
             held_history_roots,
             history_gates_overflowed,
+            cross_family: std::cell::OnceCell::new(),
         }
     }
 
@@ -881,13 +1013,10 @@ impl<'a> View<'a> {
         Ok(Members { live: keys, paths })
     }
 
-    /// `None` when `family` is complete in the current window, else its
-    /// first-match reason. Pure: no stat, open, read or write.
-    fn classify(&self, family: &FamilyRef, family_members: &Members) -> Option<Incomplete> {
-        let index = self.index;
+    /// The checks before `held`, under `vetoes`.
+    fn closure(&self, family: &FamilyRef, members: &[&str], vetoes: Vetoes) -> Option<Incomplete> {
         let traversal = self.traversal;
-        let members = family_members.live.as_slice();
-        if self.vetoes.membership_unknown()
+        if vetoes.membership_unknown()
             || members
                 .iter()
                 .any(|key| !traversal.observed_index_keys.contains(*key))
@@ -908,10 +1037,14 @@ impl<'a> View<'a> {
         {
             return Some(Incomplete::RefusedRead);
         }
-        if self.vetoes.unattributed {
-            return Some(Incomplete::RefusedReadUnattributed);
-        }
-        if self.history_gates_overflowed
+        vetoes
+            .unattributed
+            .then_some(Incomplete::RefusedReadUnattributed)
+    }
+
+    fn held(&self, family: &FamilyRef, members: &[&str]) -> bool {
+        let index = self.index;
+        self.history_gates_overflowed
             || self
                 .held_history_roots
                 .binary_search(&hash64(family.root.as_bytes()))
@@ -920,14 +1053,16 @@ impl<'a> View<'a> {
                 index.claude_account_deferred_holds.contains_key(*key)
                     || index.decode_holds_file(key)
             })
-        {
-            return Some(Incomplete::Held);
-        }
-        let names = members
-            .iter()
-            .filter_map(|key| claude_index_path_family_member(Path::new(key)))
-            .map(|(_, member)| member)
-            .collect::<Vec<_>>();
+    }
+
+    /// The checks between `held` and the account proof.
+    fn custody(
+        &self,
+        family: &FamilyRef,
+        members: &[&str],
+        names: &[String],
+    ) -> Option<Incomplete> {
+        let index = self.index;
         if index
             .claude_usage_authority_quarantine
             .contains_key(&family.root)
@@ -937,11 +1072,27 @@ impl<'a> View<'a> {
         {
             return Some(Incomplete::Quarantine);
         }
-        if members
+        members
             .iter()
-            .any(|key| traversal.residue.index_keys.contains(*key))
-        {
-            return Some(Incomplete::Residue);
+            .any(|key| self.traversal.residue.index_keys.contains(*key))
+            .then_some(Incomplete::Residue)
+    }
+
+    /// `None` when `family` is complete in the current window, else its
+    /// first-match reason. Pure: no stat, open, read or write.
+    fn classify(&self, family: &FamilyRef, family_members: &Members) -> Option<Incomplete> {
+        let index = self.index;
+        let traversal = self.traversal;
+        let members = family_members.live.as_slice();
+        if let Some(reason) = self.closure(family, members, self.vetoes) {
+            return Some(reason);
+        }
+        if self.held(family, members) {
+            return Some(Incomplete::Held);
+        }
+        let names = member_names(members);
+        if let Some(reason) = self.custody(family, members, &names) {
+            return Some(reason);
         }
         let name_set = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
         let proven = index
@@ -1005,6 +1156,150 @@ impl<'a> View<'a> {
         None
     }
 
+    /// `family`'s verdict for child finalization, or `None` unless it lacks
+    /// only child revisions: every other member check passes, ignoring what E1's
+    /// conditions themselves name (source-wide vetoes, holds, window, uniqueness),
+    /// the root is bound, no bound child is stale, and each member's current
+    /// revision is attested. Pure, like `classify`.
+    fn child_finalize(
+        &self,
+        family: &FamilyRef,
+        family_members: &Members,
+    ) -> Option<ChildFinalize> {
+        let index = self.index;
+        let members = family_members.live.as_slice();
+        if self.closure(family, members, Vetoes::default()).is_some() {
+            return None;
+        }
+        let names = member_names(members);
+        if self.custody(family, members, &names).is_some() {
+            return None;
+        }
+        let pending = index
+            .claude_account_family_pending
+            .get(&family.root)
+            .filter(|pending| !pending.invalid)?;
+        let name_set = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        if pending
+            .members
+            .keys()
+            .chain(pending.member_requests.keys())
+            .any(|member| !name_set.contains(member.as_str()))
+        {
+            return None;
+        }
+        let mut unfinalized = false;
+        let mut unwitnessed = false;
+        let mut revisions = Vec::with_capacity(members.len());
+        for (key, member) in members.iter().zip(&names) {
+            let entry = index
+                .files
+                .get(*key)
+                .filter(|entry| !entry.source_file_fingerprint.is_empty())?;
+            let current = claude_account_identity_revision(
+                &entry.source_file_fingerprint,
+                entry.last_snapshot_fingerprint.as_deref(),
+                entry.last_upload_body_witness.as_deref(),
+            );
+            let requests = pending
+                .member_requests
+                .get(member)
+                .filter(|_| pending.members.contains_key(member));
+            match requests.map(|requests| requests.identity_revision.as_ref()) {
+                Some(Some(finalized)) if current.as_ref() != Some(finalized) => return None,
+                Some(Some(_)) => {}
+                _ if *member == family.root => return None,
+                unbound => {
+                    unfinalized = true;
+                    unwitnessed |= unbound.is_none() || current.is_none();
+                }
+            }
+            revisions.push(entry.source_file_fingerprint.as_str());
+        }
+        if !unfinalized
+            || revisions.len() != members.len()
+            || !self.attested_current
+            || !members
+                .iter()
+                .zip(&revisions)
+                .all(|(key, revision)| self.attested.covers(key, revision))
+        {
+            return None;
+        }
+        let twin = name_set.len() != members.len();
+        let cause = self.child_finalize_blocked(family, family_members, pending, unwitnessed, twin);
+        Some(cause.map_or(ChildFinalize::Eligible, ChildFinalize::Blocked))
+    }
+
+    /// E1's conditions on a candidate, first failure first.
+    fn child_finalize_blocked(
+        &self,
+        family: &FamilyRef,
+        family_members: &Members,
+        pending: &ClaudeAccountFamilyPending,
+        unwitnessed: bool,
+        twin: bool,
+    ) -> Option<ChildFinalizeBlocked> {
+        use ChildFinalizeBlocked as Blocked;
+        let index = self.index;
+        let members = family_members.live.as_slice();
+        let root = family.root.as_str();
+        if unwitnessed {
+            return Some(Blocked::WitnessMissing);
+        }
+        if index
+            .claude_account_family_witnesses
+            .get(root)
+            .is_some_and(|witness| {
+                witness.account_identifier_hash != pending.account_identifier_hash
+            })
+        {
+            return Some(Blocked::WitnessConflict);
+        }
+        if self.held(family, members) || index.decode_holds_family(root) {
+            return Some(Blocked::WitnessHeld);
+        }
+        let cross = self.cross_family.get_or_init(|| CrossFamily::of(index));
+        if cross.owns_legacy_prefix(root)
+            || index
+                .claude_usage_family_witnesses
+                .get(root)
+                .is_some_and(|witness| !claude_usage_family_witness_legacy_free(witness))
+        {
+            return Some(Blocked::SharedParent);
+        }
+        if cross.duplicates_requests_of(root) {
+            return Some(Blocked::NativeOwnershipConflict);
+        }
+        if cross.overflowed {
+            return Some(Blocked::CrossFamilyUnknown);
+        }
+        if index.claude_request_identity_contract_changed {
+            return Some(Blocked::IdentityContractChanged);
+        }
+        let root_paths = self.roots.paths_of(root);
+        let family_paths = u32::try_from(family_members.paths).ok();
+        if twin || root_paths.is_some_and(|paths| Some(paths) != family_paths) {
+            return Some(Blocked::TwinSet);
+        }
+        if self.vetoes.namespace_loss || self.vetoes.unattributed {
+            return Some(Blocked::StickyVeto);
+        }
+        if self.vetoes.enumeration_open {
+            return Some(Blocked::EnumerationOpen);
+        }
+        if root_paths.is_none() {
+            return Some(Blocked::UniquenessUnknown);
+        }
+        if pending.census_window_end != self.traversal.census_window_end {
+            return Some(Blocked::WindowMoved);
+        }
+        members
+            .iter()
+            .any(|key| index.file_upload_context_requires_adoption(key))
+            .then_some(Blocked::PolicyChanged)
+    }
+
     /// Classify `families` in order. The first `FAMILY_QUANTUM` complete
     /// families count complete; later complete ones count deferred. Member
     /// lookups share one page budget.
@@ -1037,8 +1332,26 @@ impl<'a> View<'a> {
                 Ok(members) if members.live.is_empty() => continue,
                 Ok(members) => {
                     counts.singletons += u64::from(members.live.len() == 1);
-                    self.classify(family, &members)
-                        .map_or(Completion::Complete, Completion::Incomplete)
+                    let reason = self.classify(family, &members);
+                    // Reasons at or before the proof that E1's conditions name.
+                    if matches!(
+                        reason,
+                        Some(
+                            Incomplete::MembershipUnknown
+                                | Incomplete::RefusedReadUnattributed
+                                | Incomplete::Held
+                                | Incomplete::Evidence
+                        )
+                    ) {
+                        match self.child_finalize(family, &members) {
+                            Some(ChildFinalize::Eligible) => counts.child_finalize_eligible += 1,
+                            Some(ChildFinalize::Blocked(cause)) => {
+                                *counts.child_finalize_blocked.entry(cause).or_default() += 1
+                            }
+                            None => {}
+                        }
+                    }
+                    reason.map_or(Completion::Complete, Completion::Incomplete)
                 }
             };
             counts.evaluated += 1;
@@ -1055,6 +1368,15 @@ impl<'a> View<'a> {
         counts.member_keys = budget.used;
         counts
     }
+}
+
+/// Each key's member name, in key order.
+fn member_names(members: &[&str]) -> Vec<String> {
+    members
+        .iter()
+        .filter_map(|key| claude_index_path_family_member(Path::new(key)))
+        .map(|(_, member)| member)
+        .collect()
 }
 
 /// The next families after `cursor` in key order, wrapping once, skipping
@@ -1317,6 +1639,9 @@ pub(super) struct Cost {
     pub(super) rotation_keys_visited: u64,
     pub(super) queue_entries_visited: u64,
     pub(super) history_gates_visited: u64,
+    /// Cross-family records read, on a page with a child-finalize candidate.
+    pub(super) cross_family_entries_visited: u64,
+    pub(super) cross_family_overflowed: bool,
     pub(super) root_index_restarted: bool,
     pub(super) root_index_complete: bool,
     pub(super) root_index_overflowed: bool,
@@ -1426,7 +1751,15 @@ pub(super) fn evaluate_page<'p>(
         families.evaluated,
         "the reasons partition the incomplete count"
     );
+    debug_assert!(
+        families.child_finalize_candidates() <= families.evaluated,
+        "a family is one child-finalize candidate at most"
+    );
     let queued_roots_overflowed = view.queued_roots_overflowed;
+    let (cross_family_entries_visited, cross_family_overflowed) = view
+        .cross_family
+        .get()
+        .map_or((0, false), |cross| (cross.visited, cross.overflowed));
     let history_gates_overflowed = view.history_gates_overflowed;
     let queue_entries =
         traversal.pending_candidates.len() + index.claude_stale_family_carry.replay.len();
@@ -1446,6 +1779,8 @@ pub(super) fn evaluate_page<'p>(
         } else {
             history_gates as u64
         },
+        cross_family_entries_visited,
+        cross_family_overflowed,
         root_index_restarted,
         root_index_complete: runtime.roots.complete(),
         root_index_overflowed: runtime.roots.overflowed,
@@ -1498,7 +1833,7 @@ pub(super) const RUNTIME_RETAINED_WORST_BYTES: usize = {
 /// uniqueness cursors 2K, for key length K and root length R. At K = 4,096
 /// (Linux `PATH_MAX`) and R = 255 that is 2,068,224 bytes (1.97 MiB) before
 /// allocator rounding; at a typical K = 200, R = 36 it is about 1.0 MiB. Inline:
-/// under 512 bytes. A page's transients add at most 1.6 MiB more (0.9 MiB at
+/// under 512 bytes. A page's transients add at most 1.8 MiB more (1.1 MiB at
 /// typical lengths), outside `runtime_heap_bytes`. Counts only, so nothing is
 /// refused at the bound.
 ///
@@ -1506,8 +1841,8 @@ pub(super) const RUNTIME_RETAINED_WORST_BYTES: usize = {
 /// Skip for its own attestation, so every update is whole: a sticky veto,
 /// attestation or cap meter is never overwritten, and one state exists. The
 /// hold is bounded by the page budgets (16,384 member advances, 8,192 root
-/// advances, 4,096 rotation keys, 16,384 history gates) plus the queue passes,
-/// which are O(queue). No I/O runs under it and it nests no other lock.
+/// advances, 4,096 rotation keys, 16,384 history gates, 2 × 16,384 cross-family
+/// entries) plus the queue passes, which are O(queue). No I/O runs under it and it nests no other lock.
 #[cfg(not(test))]
 static RUNTIME: Mutex<Runtime> = Mutex::new(Runtime::new());
 
