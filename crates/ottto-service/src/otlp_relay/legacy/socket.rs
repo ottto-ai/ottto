@@ -83,6 +83,10 @@ pub(super) fn bind_ipv6_wildcard(port: u16) -> io::Result<OwnedFd> {
 
 #[cfg(unix)]
 pub(super) fn bind(port: u16) -> io::Result<TcpListener> {
+    #[cfg(test)]
+    if let Some(result) = super::tests::planned_bind(port) {
+        return result;
+    }
     bind_with_probe(port, bind_ipv6_wildcard)
 }
 
