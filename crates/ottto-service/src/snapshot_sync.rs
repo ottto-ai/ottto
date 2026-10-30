@@ -1240,7 +1240,7 @@ struct SnapshotUploadProgress {
     retained_stale_ack_count: usize,
     #[serde(default)]
     accepted_cache_states: BTreeMap<String, serde_json::Value>,
-    /// Class L bucket-start priority hints, written only for stored-body ACKs.
+    /// Class L bucket/share fingerprints, written only for stored-body ACKs.
     #[serde(
         default,
         skip_serializing_if = "crate::snapshots::claude_request_identity::AcceptedBuckets::is_empty"

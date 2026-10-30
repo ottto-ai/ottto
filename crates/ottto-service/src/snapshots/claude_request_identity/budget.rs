@@ -233,7 +233,7 @@ struct Selection {
 }
 
 // A lower bound, not a standalone fit check. Other buckets can collapse a
-// temporary top Parts row to Single or poison its money. Charge only the
+// temporary top Parts row to Single. Charge only the
 // unavoidable top representation: Single for one key, key-only parts with no
 // money for multiple keys. Excluding a bucket on this bound cannot exclude a
 // collectively fitting set, including the otherwise protected open bucket.

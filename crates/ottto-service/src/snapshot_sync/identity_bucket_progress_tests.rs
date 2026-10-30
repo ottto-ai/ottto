@@ -11,7 +11,7 @@ fn body() -> Value {
     json!({"source_session_id":"synthetic-sticky-session", "snapshot_fingerprint":"b".repeat(64),
         "provenance":{"collector":crate::snapshots::claude_request_identity::COLLECTOR},
         "request_evidence":[{"identity_basis":"telemetry_login"}],
-        "usage_buckets":[{"bucket_start":"2026-09-01T10:00:00Z","model_usage":[{"model":"claude-synthetic","evidence_ref":0}]}]})
+        "usage_buckets":[{"bucket_start":"2026-09-01T10:00:00Z","model_usage":[{"model":"claude-synthetic","evidence_ref":0,"account_identifier_hash":"a".repeat(64)}]}]})
 }
 #[test]
 fn acknowledged_bucket_keys_survive_progress_restart_and_older_decoder_drops_only_hint() {

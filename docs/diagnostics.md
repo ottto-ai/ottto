@@ -1187,7 +1187,7 @@ has no accepted tagged fingerprint and is not spuriously refused.
 
 Limits are 16 sessions, 5,000 starts and 1,536 share-presence records per session.
 Each share record occupies 80 inline bytes on the requested 64-bit layout;
-the maximum requested-layout fixture remains below 3 MiB. Whole buckets are
+the maximum requested-layout fixture is 2,628,072 bytes (below 3 MiB). Whole buckets are
 evicted from the hint ledger at the share limit, never partial share sets;
 `accepted_state_unknown` counts attempts using incomplete or missing state.
 Eviction, timestamp-only migration and older-decoder loss degrade to currently

@@ -532,9 +532,8 @@ fn sticky_partial_body_displays_only_the_kept_newest_own_account() {
 fn sticky_partial_money_absence_cannot_emit_unreconciled_known_cost_shares() {
     let (mut item, mut proof) = sticky_session(576);
     for (hour, bucket) in item.usage_buckets.iter_mut().enumerate() {
-        // The newest day's authority has no unpriced companion. Other
-        // authorities do, so recovery must preserve their reconciled shares
-        // while refusing the newest bucket's unreconcilable known costs.
+        // Missing hours do not erase present money. The newest priced
+        // bucket remains eligible without an unpriced companion.
         let reported = ![0, 24, 48].contains(&hour);
         bucket.model_usage[0].cost_usd = reported.then(|| "0.000003".into());
         for c in &mut proof[hour * 3..hour * 3 + 3] {
@@ -546,7 +545,7 @@ fn sticky_partial_money_absence_cannot_emit_unreconciled_known_cost_shares() {
             };
         }
     }
-    item.model_usage[0].cost_usd = None;
+    sticky_receiver_totals(&mut item);
     let result = sticky_apply(&mut item, &proof, &identity::AcceptedBuckets::default()).unwrap();
     assert!(matches!(result, Tagged::Sent { .. }));
     assert!(item.request_identity_refusals > 0);
@@ -662,7 +661,7 @@ fn sticky_complete_accepted_set_is_checked_before_intermediate_money_fit() {
             };
         }
     }
-    item.model_usage[0].cost_usd = None;
+    sticky_receiver_totals(&mut item);
     let mut accepted = identity::AcceptedBuckets::default();
     sticky_apply(&mut item, &proof, &accepted).unwrap();
     accepted.record(&serde_json::to_value(&item).unwrap());
@@ -1145,7 +1144,7 @@ fn sticky_unreconcilable_newer_accepted_money_does_not_erase_an_older_joint_pair
         .unwrap();
     pro.input_tokens += 1;
     pro.request_count += 1;
-    pro.cost_usd = None;
+    sticky_receiver_totals(&mut item);
     let mut clean = stripped(&item);
     clean.provenance.collector = identity::COLLECTOR.into();
     let mut pair = clean.clone();

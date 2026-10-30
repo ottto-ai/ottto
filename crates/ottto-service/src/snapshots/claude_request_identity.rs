@@ -1016,6 +1016,20 @@ fn apply_grouped_with_accepted(
     }
     crate::local_resource_diagnostics::claude_identity_over_cap(&over_cap, attempted_bytes);
     let attempted_counts = cap_counts(item, &grouping, accepted, None);
+    let accepted_tagged_attempted = item
+        .usage_buckets
+        .iter()
+        .filter(|bucket| {
+            accepted::bucket_key(&bucket.bucket_start)
+                .is_some_and(|key| accepted.is_some_and(|known| known.binary_search(&key).is_ok()))
+                && bucket.model_usage.iter().any(|row| {
+                    row.evidence_ref.is_some()
+                        || row.identity_parts.as_ref().is_some_and(|parts| {
+                            parts.iter().any(|part| part.evidence_ref.is_some())
+                        })
+                })
+        })
+        .count() as u64;
     let selected = (!grouping.upstream_proof_lost)
         .then(|| budget::select(item, &grouping, prior_refusals, accepted))
         .flatten();
@@ -1044,7 +1058,7 @@ fn apply_grouped_with_accepted(
         });
     }
     let mut counts = attempted_counts;
-    counts.accepted_overflow.differs = counts.retained_buckets;
+    counts.accepted_overflow.differs = accepted_tagged_attempted;
     counts.retained_buckets = 0;
     counts.refused_new_buckets = grouping
         .groups

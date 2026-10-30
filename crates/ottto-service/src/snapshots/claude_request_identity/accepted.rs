@@ -239,7 +239,9 @@ impl AcceptedBuckets {
             .map(|share| share.bucket)
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .collect();
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+            .into_vec();
         entry.shares = shares
             .into_iter()
             .collect::<Vec<_>>()
@@ -273,7 +275,7 @@ mod tests {
     fn body(tagged: bool) -> Value {
         json!({"source_session_id":"synthetic", "provenance":{"collector":COLLECTOR},
         "request_evidence":[{"identity_basis":TELEMETRY_LOGIN}], "usage_buckets":[{"bucket_start":"2026-09-01T10:00:00Z", "model_usage":[
-            if tagged { json!({"model":"claude-synthetic","evidence_ref":0}) } else { json!({"model":"claude-synthetic"}) }
+            if tagged { json!({"model":"claude-synthetic","evidence_ref":0,"account_identifier_hash":"a".repeat(64)}) } else { json!({"model":"claude-synthetic"}) }
         ]}]})
     }
     #[test]
@@ -283,6 +285,7 @@ mod tests {
         state.record(&body(false));
         let bytes = serde_json::to_vec(&state).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("synthetic"));
+        assert!(!String::from_utf8_lossy(&bytes).contains(&"a".repeat(64)));
         let mut restored: AcceptedBuckets = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(restored, state);
         assert_eq!(restored.get("synthetic").unwrap().len(), 1);
@@ -348,6 +351,7 @@ mod heap_tests {
         counter.add(std::mem::size_of_val(&state)).unwrap();
         state.heap_bound(&mut counter).unwrap();
         assert!(counter.bytes < 3 * 1024 * 1024);
+        assert_eq!(counter.bytes, 2_628_072);
         eprintln!(
             "accepted-share requested-layout maximum={} bytes",
             counter.bytes
@@ -367,5 +371,36 @@ mod migration_tests {
         let state: AcceptedBuckets =
             serde_json::from_value(json!({session_key("old"): [1, 2]})).unwrap();
         assert!(state.get("old").is_none());
+    }
+}
+
+#[cfg(test)]
+mod share_bound_tests {
+    use super::*;
+    #[test]
+    fn record_evicts_whole_share_sets_and_counts_state_as_incomplete() {
+        let start = OffsetDateTime::parse("2026-09-01T00:00:00Z", &Rfc3339).unwrap();
+        let body = json!({"source_session_id":"bounded-shares","provenance":{"collector":COLLECTOR},
+            "request_evidence":[{"identity_basis":TELEMETRY_LOGIN}],
+            "usage_buckets":(0..MAX_SHARES / 3 + 1).map(|hour| json!({
+                "bucket_start":(start+time::Duration::hours(hour as i64)).format(&Rfc3339).unwrap(),
+                "model_usage":[{"model":"claude-synthetic","identity_parts":(0..3).map(|key| json!({
+                    "evidence_ref":0,"account_identifier_hash":format!("{key:064x}")
+                })).collect::<Vec<_>>()}]
+            })).collect::<Vec<_>>()});
+        let mut state = AcceptedBuckets::default();
+        state.record(&body);
+        let known = state.get("bounded-shares").unwrap();
+        assert!(known.incomplete);
+        assert_eq!(known.shares.len(), MAX_SHARES);
+        assert_eq!(known.shares.capacity(), MAX_SHARES);
+        assert_eq!(known.starts.len(), MAX_SHARES / 3);
+        assert!(known
+            .shares
+            .iter()
+            .all(|share| share.bucket != start.unix_timestamp()));
+        let restored: AcceptedBuckets =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(restored, state);
     }
 }
