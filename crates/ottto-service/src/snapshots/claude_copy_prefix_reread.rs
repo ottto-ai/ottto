@@ -20,15 +20,19 @@ struct Member {
 #[derive(Serialize, Deserialize)]
 struct Request {
     members: Vec<Member>,
+    window_days: u64,
 }
 
 /// Counts/durations only; never expose local scope identities.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Estimate {
+    window_days: u64,
     files: usize,
     bytes: u64,
     pages: usize,
     blocked_files: usize,
+    runnable_files: usize,
+    runnable_bytes: u64,
     pacing_floor_seconds: u64,
     pacing_cold_seconds: u64,
 }
@@ -68,7 +72,11 @@ fn member(path: &Path) -> Result<Member> {
         modified: stat.modified()?.duration_since(UNIX_EPOCH)?.as_nanos(),
     })
 }
-fn plan(mut members: Vec<Member>) -> Result<Request> {
+fn plan(mut members: Vec<Member>, window_days: u64) -> Result<Request> {
+    ensure!(
+        window_days <= BACKFILL_WINDOW_DAYS,
+        "window exceeds existing policy"
+    );
     ensure!(
         !members.is_empty() && members.len() <= MAX_BACKFILL_FILES_PER_SOURCE,
         "scope exceeds existing file bound"
@@ -86,15 +94,26 @@ fn plan(mut members: Vec<Member>) -> Result<Request> {
         members.iter().all(|m| unique.insert(&m.path)),
         "duplicate scope member"
     );
-    Ok(Request { members })
+    Ok(Request {
+        members,
+        window_days,
+    })
 }
-fn estimate(request: &Request) -> Estimate {
+fn in_window(member: &Member, now: u64, days: u64) -> bool {
+    u64::try_from(member.modified / 1_000_000_000)
+        .ok()
+        .is_some_and(|modified| is_recent_enough_at(modified, now, days))
+}
+fn estimate(request: &Request, now: u64) -> Estimate {
     let mut pages: usize = 0;
     let mut files = 0;
     let mut bytes = 0_u64;
     let mut blocked = 0;
+    let mut runnable_files = 0;
+    let mut runnable_bytes = 0;
     for m in &request.members {
-        if m.bytes > body_witness_adoption_byte_budget() {
+        if m.bytes > body_witness_adoption_byte_budget() || !in_window(m, now, request.window_days)
+        {
             blocked += 1;
             continue;
         }
@@ -108,14 +127,19 @@ fn estimate(request: &Request) -> Estimate {
         }
         files += 1;
         bytes += m.bytes;
+        runnable_files += 1;
+        runnable_bytes += m.bytes;
     }
     let gaps = pages.saturating_sub(1) as u64;
     let (floor, cold) = crate::snapshot_sync::copy_prefix_pacing_seconds();
     Estimate {
+        window_days: request.window_days,
         files: request.members.len(),
         bytes: request.members.iter().map(|m| m.bytes).sum(),
         pages,
         blocked_files: blocked,
+        runnable_files,
+        runnable_bytes,
         pacing_floor_seconds: gaps * floor,
         pacing_cold_seconds: gaps * cold,
     }
@@ -124,18 +148,24 @@ fn estimate(request: &Request) -> Estimate {
 /// An operator-supplied private JSON array of exact main-file paths defines
 /// the affected copy families. Estimate reads only scope + filesystem metadata.
 /// Apply publishes a private request; it neither enables nor runs collection.
-pub fn run(scope: &Path, support: &Path, apply: bool) -> Result<Estimate> {
+pub fn run(scope: &Path, support: &Path, apply: bool, window_days: u64) -> Result<Estimate> {
     let paths: Vec<PathBuf> = bounded_json(scope)?;
     ensure!(
         !paths.is_empty() && paths.len() <= MAX_BACKFILL_FILES_PER_SOURCE,
         "scope exceeds existing file bound"
     );
-    let request = plan(paths.iter().map(|p| member(p)).collect::<Result<_>>()?)?;
-    let counts = estimate(&request);
+    let request = plan(
+        paths.iter().map(|p| member(p)).collect::<Result<_>>()?,
+        window_days,
+    )?;
+    let counts = estimate(
+        &request,
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+    );
     if apply {
         ensure!(
             counts.blocked_files == 0,
-            "scope cannot fit existing page budget"
+            "scope outside existing window or page budget"
         );
         let encoded = serde_json::to_vec(&request)?;
         ensure!(
@@ -175,6 +205,8 @@ pub(crate) fn prepare(
     index: &mut ScanIndex,
     support: &Path,
     roots: &[PathBuf],
+    collected_at: &str,
+    window_days: u64,
 ) -> Result<Vec<PathBuf>> {
     if !claude_request_money::e2::resumed_prefix_enabled() {
         return Ok(Vec::new());
@@ -184,7 +216,13 @@ pub(crate) fn prepare(
         return Ok(Vec::new());
     }
     let request: Request = bounded_json(&path)?;
-    let mut request = plan(request.members)?;
+    let mut request = plan(request.members, request.window_days)?;
+    ensure!(
+        request.window_days == effective_backfill_window_days(window_days),
+        "scope window changed; request refused"
+    );
+    let scan_now =
+        rfc3339_unix_seconds(collected_at).ok_or_else(|| anyhow::anyhow!("invalid scan clock"))?;
     // Match discovery's supported configured-root symlink semantics. Scope
     // members and indexed keys use the resolved spelling, never a descendant
     // symlink or the configured alias.
@@ -200,6 +238,10 @@ pub(crate) fn prepare(
         ensure!(
             now.bytes == m.bytes && now.birth == m.birth && now.modified == m.modified,
             "scope metadata changed; request refused"
+        );
+        ensure!(
+            in_window(m, scan_now, request.window_days),
+            "scope outside scan window"
         );
         ensure!(
             resolved_roots.iter().any(|root| m.path.starts_with(root)),

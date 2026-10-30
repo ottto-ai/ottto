@@ -51,6 +51,9 @@ enum Command {
         scope: PathBuf,
         #[arg(long)]
         support_dir: PathBuf,
+        /// Current negotiated scan window, in days (from the ordinary daemon).
+        #[arg(long)]
+        window_days: u64,
         #[arg(
             long,
             alias = "dry-run",
@@ -212,10 +215,16 @@ fn main() -> Result<()> {
         ref scope,
         ref support_dir,
         apply,
+        window_days,
         ..
     }) = cli.command
     {
-        match ottto_service::snapshots::claude_copy_prefix_reread::run(scope, support_dir, apply) {
+        match ottto_service::snapshots::claude_copy_prefix_reread::run(
+            scope,
+            support_dir,
+            apply,
+            window_days,
+        ) {
             Ok(counts) => println!("{}", serde_json::to_string(&counts)?),
             Err(_) => {
                 eprintln!("copy-prefix re-read request refused");

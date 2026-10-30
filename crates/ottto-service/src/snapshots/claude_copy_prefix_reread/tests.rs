@@ -1,5 +1,15 @@
 use super::*;
 
+fn run(scope: &Path, support: &Path, apply: bool) -> Result<Estimate> {
+    super::run(scope, support, apply, BACKFILL_WINDOW_DAYS)
+}
+fn prepare(index: &mut ScanIndex, support: &Path, roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    super::prepare(index, support, roots, &at, BACKFILL_WINDOW_DAYS)
+}
+
 fn setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, Vec<PathBuf>) {
     let (home, root, mut index) = super::super::claude_history_upgrade_tests::families(name, 3);
     // The shared helper uses a partial-commit subset, which deliberately
@@ -199,6 +209,53 @@ fn combined_context_and_revision_debt_never_reads_past_native_page_budget() {
                 <= limit
         );
     });
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn estimate_reports_out_of_window_members_and_apply_refuses_without_state() {
+    let (home, _, index, paths) = setup("copy-prefix-window-estimate");
+    fs::File::open(&paths[0])
+        .unwrap()
+        .set_modified(UNIX_EPOCH)
+        .unwrap();
+    let support = home.join("never-created-window-support");
+    let before = serde_json::to_value(&index).unwrap();
+    let counts = run(&home.join("scope.json"), &support, false).unwrap();
+    assert_eq!(
+        (counts.files, counts.runnable_files, counts.blocked_files),
+        (3, 2, 1)
+    );
+    assert!(run(&home.join("scope.json"), &support, true).is_err());
+    assert!(!support.exists());
+    assert_eq!(serde_json::to_value(&index).unwrap(), before);
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn aged_or_changed_scan_window_refuses_before_any_reowe() {
+    let (home, root, mut index, _) = setup("copy-prefix-window-runtime");
+    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
+    let support = home.join("support");
+    run(&home.join("scope.json"), &support, true).unwrap();
+    let before = serde_json::to_value(&index).unwrap();
+    let at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    assert!(super::prepare(
+        &mut index,
+        &support,
+        std::slice::from_ref(&root),
+        &at,
+        BACKFILL_WINDOW_DAYS - 1
+    )
+    .is_err());
+    let later = (time::OffsetDateTime::now_utc()
+        + time::Duration::days(BACKFILL_WINDOW_DAYS as i64 + 1))
+    .format(&time::format_description::well_known::Rfc3339)
+    .unwrap();
+    assert!(super::prepare(&mut index, &support, &[root], &later, BACKFILL_WINDOW_DAYS).is_err());
+    assert_eq!(serde_json::to_value(&index).unwrap(), before);
     fs::remove_dir_all(home).unwrap();
 }
 

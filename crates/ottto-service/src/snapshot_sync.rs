@@ -6462,9 +6462,19 @@ fn prepare_sync_source_inner(
         // unaccepted/shed page keeps it and its latch. It re-owes no history.
         index.observe_claude_request_identity_contract(true);
     }
+    let scan_window_days = scan_request_window_days(
+        receipt_window_days,
+        backfill_pending || admission_reoffer_pending,
+        curve_replay_pending,
+    );
     let copy_prefix_scope = if source == SnapshotSource::ClaudeCode {
-        match crate::snapshots::claude_copy_prefix_reread::prepare(&mut index, support_dir, &roots)
-        {
+        match crate::snapshots::claude_copy_prefix_reread::prepare(
+            &mut index,
+            support_dir,
+            &roots,
+            &scan_started_at,
+            scan_window_days,
+        ) {
             Ok(paths) => paths,
             Err(_) => {
                 eprintln!("local Claude copy-prefix re-read: request_refused=1");
@@ -6535,11 +6545,7 @@ fn prepare_sync_source_inner(
             &roots,
             index,
             &scan_started_at,
-            scan_request_window_days(
-                receipt_window_days,
-                backfill_pending || admission_reoffer_pending,
-                curve_replay_pending,
-            ),
+            scan_window_days,
             MAX_BACKFILL_FILES_PER_SOURCE,
             upload_policy.session_artifacts_enabled,
             (source == SnapshotSource::ClaudeCode).then_some(support_dir),

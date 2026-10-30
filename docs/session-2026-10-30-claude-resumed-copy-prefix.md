@@ -137,15 +137,17 @@ been performed by this implementation task.
 
 ## Scoped re-read and counts-only estimate
 
-`ottto-service claude-copy-prefix-reread --scope SCOPE.json --support-dir SUPPORT --estimate`
+`ottto-service claude-copy-prefix-reread --scope SCOPE.json --support-dir SUPPORT --window-days DAYS --estimate`
 (`--dry-run` is an alias) accepts a private JSON array of absolute affected
 Claude main-file paths, including their earlier proof holders. The money owner
 supplies that explicit cohort from its PLAN; the tool does not infer ownership
 by opening transcripts. It stats only those files, refuses symlink paths,
 requires creation-time metadata, and emits numeric counts/durations only.
 Estimate neither creates a support directory nor changes state or uploads.
-Files/bytes cover the exact scope; oversized files are counted as blocked,
-and apply refuses them. Scope is bounded by the existing 10,000-file scan
+Files/bytes cover the exact scope; runnable files/bytes exclude oversized
+and out-of-window members. Either kind is counted as blocked and apply
+refuses the whole request. Required `--window-days` is the ordinary daemon
+scan window, at most the existing 183-day limit; it never widens scanning. Scope is bounded by the existing 10,000-file scan
 limit and a 4 MiB local request envelope.
 
 After the change is merged and installed, money sign-off and a same-cohort
@@ -230,3 +232,11 @@ without the exact advertised token. Money-owner sign-off, an installed merged
 build and a same-cohort PLAN still precede any authorized operator enable or
 application of a re-read request. Implementation and review do not perform
 those runtime actions.
+
+The request binds that window. Runtime validation uses the SAME effective
+window and scan clock as ordinary candidate selection, before any re-owe. A
+changed window or a member aging past its cutoff refuses the whole cohort
+without changing debt. The money owner must obtain the current effective
+scan-window day count alongside PLAN, use it for estimate/apply, and
+re-estimate if it changes. An out-of-window proof holder is reported blocked;
+it is never silently accepted as runnable. No unrelated window is widened.
