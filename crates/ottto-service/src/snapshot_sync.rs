@@ -2159,17 +2159,18 @@ impl SnapshotUploadProgress {
         self.record_stored_state(item, head_changed_without_proof, None)
     }
 
-    /// `stored_ref` is the item's stored-body entity ACK (fingerprint-exact,
-    /// no `unchanged_basis`). Option (ii) admits positive tags only when that
-    /// ref carries a body witness, which the entity-ACK validator already
-    /// requires to equal this body's, and only while the server advertises
-    /// retention. Count-only and legacy ACKs pass `None`.
+    /// `stored` is the item's stored-body entity ACK (fingerprint-exact, no
+    /// `unchanged_basis`) and this body's local witness. Option (ii) admits
+    /// positive tags only while the server advertises retention and the ref
+    /// carries a versioned witness equal to the local one on a body with a
+    /// public witness version, so the entity-ACK validator also checked the
+    /// exact version. Count-only and legacy ACKs pass `None`.
     /// `retained_proof_missing` only removes, so it is always applied.
     fn record_stored_state<T: Serialize>(
         &mut self,
         item: &T,
         head_changed_without_proof: bool,
-        stored_ref: Option<&crate::snapshot_client::SnapshotEntityRef>,
+        stored: Option<(&crate::snapshot_client::SnapshotEntityRef, &str)>,
     ) -> Result<()> {
         let value = serde_json::to_value(item)?;
         let Some(session) = value
@@ -2180,9 +2181,19 @@ impl SnapshotUploadProgress {
         };
         self.accepted_account_hashes.record(&value);
         self.accepted_identity_buckets.record(&value);
-        if let Some(entity) = stored_ref {
-            let witnessed = entity.body_witness_digest.is_some()
-                && self.accepted_identity_buckets.retained_enabled();
+        if let Some((entity, local_witness)) = stored {
+            // Mirrors `snapshot_ack_body_witness_version`'s public domains.
+            let versioned_body = [
+                "context_curve",
+                "session_account_evidence",
+                "cache_observations",
+            ]
+            .iter()
+            .any(|field| value.get(field).is_some_and(|leaf| !leaf.is_null()));
+            let witnessed = self.accepted_identity_buckets.retained_enabled()
+                && versioned_body
+                && entity.body_witness_version.is_some()
+                && entity.body_witness_digest.as_deref() == Some(local_witness);
             if witnessed || !entity.retained_proof_missing.is_empty() {
                 self.accepted_identity_buckets.record_proved(
                     &value,
@@ -10238,8 +10249,8 @@ where
             let item = &items[*index];
             let item_fingerprint = fingerprint(item);
             if settled.contains(item_fingerprint) {
-                let body = body_witness(item);
-                progress.record_body(item_fingerprint, &body);
+                let witness = body_witness(item);
+                progress.record_body(item_fingerprint, &witness);
                 if let Some(context) = &progress.context_resend.active {
                     progress
                         .accepted_body_contexts
@@ -10247,11 +10258,13 @@ where
                 }
                 progress
                     .fresh_context_body_acks
-                    .insert(item_fingerprint.to_string(), body);
+                    .insert(item_fingerprint.to_string(), witness.clone());
                 progress.record_stored_state(
                     item,
                     false,
-                    stored_refs.get(item_fingerprint).copied(),
+                    stored_refs
+                        .get(item_fingerprint)
+                        .map(|entity| (*entity, witness.as_str())),
                 )?;
             } else if not_stored.contains(item_fingerprint) {
                 progress.hold_unstored_body(item_fingerprint, &body_witness(item));

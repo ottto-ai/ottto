@@ -210,8 +210,14 @@ fn maximum_accepted_ledger_progress_json_and_actual_load_peak_are_bounded() {
     assert!(load_peak < 32 * 1024 * 1024, "peak={load_peak}");
     std::fs::remove_dir_all(root).unwrap();
 }
-// Option (ii): only a stored-body entity ACK with a body witness admits rows to
-// the proved ledger; `retained_proof_missing` is optional and only removes.
+// Option (ii): only a stored-body entity ACK whose versioned body witness equals
+// the local one admits rows to the proved ledger, and only for a body with a
+// public witness version; `retained_proof_missing` is optional and only removes.
+fn witnessed_body() -> Value {
+    let mut item = body();
+    item["context_curve"] = json!({"points": []});
+    item
+}
 fn retained_ack(
     progress: &mut SnapshotUploadProgress,
     items: &[Value],
@@ -228,7 +234,12 @@ fn retained_ack(
         progress,
         &mut accepted,
         &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
-        &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap().to_string(),
+        // The local witness; the ACK below always claims "d" * 64.
+        &|value: &Value| {
+            value["local_witness"]
+                .as_str()
+                .map_or_else(|| "d".repeat(64), str::to_owned)
+        },
         &|value: &Value| value["source_session_id"].as_str(),
         &mut |_| {
             let entity = crate::snapshot_client::SnapshotEntityRef {
@@ -280,7 +291,7 @@ fn retained_proof_needs_a_witnessed_stored_body_entity_ack() {
         (false, true, false),
     ] {
         let mut progress = retained_progress();
-        let mut item = body();
+        let mut item = witnessed_body();
         item["snapshot_fingerprint"] = json!(format!(
             "{:064x}",
             u8::from(legacy) * 4 + u8::from(stored) * 2 + u8::from(digest)
@@ -294,13 +305,38 @@ fn retained_proof_needs_a_witnessed_stored_body_entity_ack() {
     }
     // Before the server advertises retention, a witnessed ACK proves nothing.
     let mut progress = progress();
-    retained_ack(&mut progress, &[body()], false, true, true, vec![]);
+    retained_ack(
+        &mut progress,
+        &[witnessed_body()],
+        false,
+        true,
+        true,
+        vec![],
+    );
+    assert_eq!(retained_rows(&progress), Some((0, 0)));
+    // A digest that is not this body's witness proves nothing, and neither
+    // does any digest on a body without a public witness version (the ACK
+    // validator compares none there).
+    let mut progress = retained_progress();
+    let mut wrong = witnessed_body();
+    wrong["local_witness"] = json!("c".repeat(64));
+    retained_ack(&mut progress, &[wrong], false, true, true, vec![]);
     assert_eq!(retained_rows(&progress), Some((0, 0)));
     let mut progress = retained_progress();
     retained_ack(&mut progress, &[body()], false, true, true, vec![]);
+    assert_eq!(retained_rows(&progress), Some((0, 0)));
+    let mut progress = retained_progress();
+    retained_ack(
+        &mut progress,
+        &[witnessed_body()],
+        false,
+        true,
+        true,
+        vec![],
+    );
     assert_eq!(retained_rows(&progress), Some((1, 0)));
     // An older server omits the field; a newer one may list a marked bucket.
-    let mut marked = body();
+    let mut marked = witnessed_body();
     marked["snapshot_fingerprint"] = json!("e".repeat(64));
     marked["usage_buckets"][0]["model_usage"][0] =
         json!({"model":"claude-synthetic","identity_retained":true});
@@ -330,7 +366,14 @@ fn retained_proof_needs_a_witnessed_stored_body_entity_ack() {
 #[test]
 fn replay_generation_or_namespace_change_clears_retained_proof() {
     let mut progress = retained_progress();
-    retained_ack(&mut progress, &[body()], false, true, true, vec![]);
+    retained_ack(
+        &mut progress,
+        &[witnessed_body()],
+        false,
+        true,
+        true,
+        vec![],
+    );
     assert_eq!(retained_rows(&progress), Some((1, 0)));
     let path = crate::test_scratch::unique_path("ottto-e2-optii-namespace").join("progress.json");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();

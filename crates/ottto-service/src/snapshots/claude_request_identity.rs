@@ -914,7 +914,7 @@ fn apply_grouped_with_accepted(
             group.refused = true;
         }
     }
-    let deferred = defer_retained_rows(item, &mut grouping, proved);
+    let mut deferred = defer_retained_rows(item, &mut grouping, proved);
     // Marker bytes are constant across every tag selection; markers go on
     // the item only after measurement, as the last change before hashing.
     grouping.extra_wire_bytes = grouping
@@ -1133,14 +1133,23 @@ fn apply_grouped_with_accepted(
         .count() as u64;
     let refusals = lost.max(1).saturating_add(prior_refusals);
     strip(item);
-    deferred.mark(item);
-    deferred.count(item, retained, &mut counts);
-    budget::record(&counts);
     item.provenance.collector = COLLECTOR.to_string();
     #[cfg(test)]
     {
         item.provenance.collector = cycle_contract(true).to_owned();
     }
+    // Markers must fit beside the stripped body; the newest ones are kept.
+    // A dropped marker is a stripped proved row, so it counts as a refusal.
+    // Measured at the largest refusal count, so the final digits never grow.
+    item.request_identity_refusals = refusals.saturating_add(deferred.rows.len() as u64);
+    let unmarked = grouping
+        .item_bytes(item)
+        .saturating_sub(deferred.marker_bytes());
+    let dropped = deferred.keep_newest(MAX_ITEM_BYTES.saturating_sub(unmarked) / MARKER_BYTES);
+    let refusals = refusals.saturating_add(dropped);
+    deferred.mark(item);
+    deferred.count(item, retained, &mut counts);
+    budget::record(&counts);
     item.request_identity_refusals = refusals;
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
     // The rows carry no identity, so neither may the display.
@@ -1174,6 +1183,17 @@ struct Deferred {
 impl Deferred {
     fn marker_bytes(&self) -> usize {
         self.rows.len().saturating_mul(MARKER_BYTES)
+    }
+
+    /// Keeps the `fit` newest-bucket rows; returns how many were dropped.
+    fn keep_newest(&mut self, fit: usize) -> u64 {
+        let before = self.rows.len();
+        if fit < before {
+            self.rows
+                .sort_by(|left, right| right.bucket.cmp(&left.bucket));
+            self.rows.truncate(fit);
+        }
+        before.saturating_sub(self.rows.len()) as u64
     }
 
     fn mark(&self, item: &mut SnapshotItem) {

@@ -369,6 +369,45 @@ fn retained_window_converges_on_markers_under_the_unchanged_caps() {
     sticky_assert_reconciled(&second);
 }
 
+#[test]
+fn retained_fallback_keeps_only_the_newest_markers_that_fit() {
+    const MARKER: usize = r#","identity_retained":true"#.len();
+    let (original, proof) = sticky_session(4);
+    let mut state = retained_state();
+    let mut first = original.clone();
+    sticky_apply(&mut first, &proof, &state).unwrap();
+    retained_ack(&mut state, &first, &[]);
+    let reserved = |item: &mut SnapshotItem, extra: usize| {
+        sticky_receiver_totals(item);
+        identity::apply_with_reserved_bytes_for_test(item, &proof, &state, extra)
+    };
+    // No room beside the stripped body: each proved row is a stripped refusal.
+    let mut bare = original.clone();
+    assert!(matches!(
+        reserved(&mut bare, identity::MAX_ITEM_BYTES).unwrap(),
+        Tagged::Fallback { .. }
+    ));
+    assert_eq!(retained_marked(&bare), vec![false; 4]);
+    assert_eq!(bare.request_identity_refusals, 4);
+    // Room for exactly one marker: the newest closed proved row keeps it.
+    let extra = identity::MAX_ITEM_BYTES - identity::item_bytes(&bare) - MARKER;
+    let mut one = original.clone();
+    identity::take_identity_counts();
+    assert!(matches!(
+        reserved(&mut one, extra).unwrap(),
+        Tagged::Fallback { .. }
+    ));
+    assert_eq!(retained_marked(&one), vec![false, false, true, false]);
+    assert_eq!(one.request_identity_refusals, 3);
+    assert_eq!(identity::item_bytes(&one) + extra, identity::MAX_ITEM_BYTES);
+    assert_eq!(
+        retained_count(&retained_counts(), "retained_marker_rows"),
+        1
+    );
+    retained_assert_exclusive(&one);
+    sticky_assert_reconciled(&one);
+}
+
 /// Exact emitted bodies with markers for the backend companion receiver test.
 fn retained_golden_cases() -> Value {
     let mut cases = BTreeMap::new();
