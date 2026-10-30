@@ -498,7 +498,11 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
 fn e2_page_with_stats(
     dir: &Path,
     support: &Path,
-) -> (Vec<SnapshotItem>, crate::snapshot_sync::ClaudeLocalEvidenceStats) {
+) -> (
+    Vec<SnapshotItem>,
+    ClaudeUsageAuthorityDisposition,
+    crate::snapshot_sync::ClaudeLocalEvidenceStats,
+) {
     claude_request_money::e2::with_enabled(|| {
         let mut index = ScanIndex::default();
         let mut scan = scan_source_roots_with_test_limit(
@@ -516,10 +520,28 @@ fn e2_page_with_stats(
             &index,
             "e2-identity-machine",
         );
-        let (_, _, stats) =
+        let (disposition, _, stats) =
             crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, &mut scan, &mut index);
-        (scan.snapshots, stats)
+        (scan.snapshots, disposition, stats)
     })
+}
+
+/// A discard defers the whole family: its items stay on the page withheld
+/// and held, so the production upload filter sends nothing of it.
+fn e2_assert_family_deferred(items: &[SnapshotItem], disposition: &ClaudeUsageAuthorityDisposition) {
+    assert_eq!(items.len(), 2, "root and child stay on the page for the hold");
+    for item in items {
+        assert!(!e2_is_literal(item), "no body is emitted for a deferred item");
+        assert!(
+            disposition
+                .quarantined_source_session_ids
+                .contains(&item.source_session_id),
+            "the deferred item is held"
+        );
+    }
+    let mut uploadable = items.to_vec();
+    disposition.retain_uploadable(&mut uploadable);
+    assert!(uploadable.is_empty(), "nothing of the family uploads this page");
 }
 
 /// A strict trace read dropped because the sidecar grew mid-read leaves every
@@ -558,30 +580,33 @@ fn e2_pipeline_discarded_trace_read_leaves_requests_unbound_never_another_accoun
                 fired.set(true);
             });
         }
-        let (items, stats) = e2_page_with_stats(&dir, &support);
+        let (items, disposition, stats) = e2_page_with_stats(&dir, &support);
         assert_eq!(fired.get(), discard, "discard={discard}");
         assert_eq!(items.len(), 2);
-        for item in &items {
+        if discard {
+            // Deferred, not sent untagged: no other account can receive it.
+            e2_assert_family_deferred(&items, &disposition);
+            assert_eq!(stats.trace_discard_deferred_items, 2);
+        } else {
+            assert_eq!(stats.trace_discard_deferred_items, 0);
+        }
+        for item in items.iter().filter(|_| !discard) {
             let (login, requests) = if item.source_session_id == root {
                 ("a", 4)
             } else {
                 ("b", 1)
             };
-            // Only this item's own login, and none at all after a discard.
-            let allowed = (!discard).then(|| login.repeat(64));
+            // Only this item's own login.
+            let allowed = Some(login.repeat(64));
             for row in e2_rows(item) {
                 assert!(
                     row.account_identifier_hash.is_none()
                         || row.account_identifier_hash == allowed,
-                    "discard={discard}: never another item's account"
+                    "never another item's account"
                 );
             }
-            let expected = if discard {
-                BTreeMap::from([(None, requests)])
-            } else {
-                BTreeMap::from([(Some(login.repeat(64)), requests)])
-            };
-            assert_eq!(e2_login_counts(item), expected, "discard={discard}");
+            let expected = BTreeMap::from([(allowed, requests)]);
+            assert_eq!(e2_login_counts(item), expected);
         }
         if discard {
             assert_eq!(stats.trace_incomplete_root_count, 1);
@@ -596,13 +621,13 @@ fn e2_pipeline_discarded_trace_read_leaves_requests_unbound_never_another_accoun
             let line = serde_json::to_value(&stats).unwrap();
             assert_eq!(line["trace_rows_discarded"]["cap"], 1);
             assert_eq!(line["trace_rows_discarded"]["generation"], 0);
+            assert_eq!(line["trace_discard_deferred_items"], 2);
         } else {
             assert_eq!(stats.trace_incomplete_root_count, 0);
             assert!(stats.trace_rows_discarded.is_empty());
-            assert!(serde_json::to_value(&stats)
-                .unwrap()
-                .get("trace_rows_discarded")
-                .is_none());
+            let line = serde_json::to_value(&stats).unwrap();
+            assert!(line.get("trace_rows_discarded").is_none());
+            assert!(line.get("trace_discard_deferred_items").is_none());
         }
         fs::remove_dir_all(dir).unwrap();
     }
@@ -616,7 +641,12 @@ fn e2_bound_trace_page(
     root: &str,
     index: &mut ScanIndex,
     unhealthy: bool,
-) -> (Vec<SnapshotItem>, crate::snapshot_sync::ClaudeLocalEvidenceStats) {
+    accepted: Option<&claude_request_identity::AcceptedBuckets>,
+) -> (
+    Vec<SnapshotItem>,
+    ClaudeUsageAuthorityDisposition,
+    crate::snapshot_sync::ClaudeLocalEvidenceStats,
+) {
     claude_request_money::e2::with_enabled(|| {
         // Sidecar changes must select the root and child even when their
         // transcript bytes are unchanged (notably malformed -> clean).
@@ -660,9 +690,11 @@ fn e2_bound_trace_page(
             );
         }
         assert_eq!(index.claude_history_emission.files.len(), 2);
-        let ((_, _, stats), counts) =
+        let ((disposition, _, stats), counts) =
             claude_request_money::e2::pipeline_test_observer::capture_identity_counts(|| {
-                crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, &mut scan, index)
+                crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_accepted_for_test(
+                    support, &mut scan, index, accepted,
+                )
             });
         if unhealthy && stats.trace_rows_discarded.is_empty() {
             assert_eq!(counts["claude_inherited_org_requests"], 5,
@@ -684,7 +716,7 @@ fn e2_bound_trace_page(
             e2_account(),
             "the durable creator binding A is untouched"
         );
-        (scan.snapshots, stats)
+        (scan.snapshots, disposition, stats)
     })
 }
 
@@ -737,6 +769,12 @@ fn e2_bound_trace_regression(mode: &str, split_logins: bool) {
 }
 
 fn e2_bound_trace_billing_regression(mode: &str, split_logins: bool, external: bool) {
+    e2_bound_trace_case(mode, split_logins, external, false);
+}
+
+/// `accepted_ledger`: the clean page's bodies enter the accepted-identity
+/// ledger exactly as a stored ACK records them, and every later page reads it.
+fn e2_bound_trace_case(mode: &str, split_logins: bool, external: bool, accepted_ledger: bool) {
     let (dir, root, _) = claude_account_family_fixture();
     if external {
         for path in [
@@ -774,9 +812,21 @@ fn e2_bound_trace_billing_regression(mode: &str, split_logins: bool, external: b
             workspace_identifier_hash: None,
         },
     );
-    let (clean, stats) = e2_bound_trace_page(&dir, &support, &root, &mut index, false);
+    let (clean, _, stats) = e2_bound_trace_page(&dir, &support, &root, &mut index, false, None);
     let child_login = if split_logins { "c" } else { "b" }.repeat(64);
     e2_bound_trace_assert_logins(&clean, &root, Some("b".repeat(64)), Some(child_login.clone()));
+    let mut accepted = claude_request_identity::AcceptedBuckets::for_test();
+    if accepted_ledger {
+        // The same ledger write `record_cache_state` makes for a stored ACK.
+        for item in &clean {
+            accepted.record(&serde_json::to_value(item).unwrap());
+        }
+        assert!(
+            clean.iter().any(|item| accepted.get(&item.source_session_id).is_some()),
+            "a tagged contract-5 body was accepted"
+        );
+    }
+    let accepted = accepted_ledger.then_some(&accepted);
     if external {
         for item in &clean {
             for row in e2_rows(item) {
@@ -787,7 +837,10 @@ fn e2_bound_trace_billing_regression(mode: &str, split_logins: bool, external: b
         }
     }
     assert_eq!(stats.trace_discard_no_fallback_requests, 0);
-    assert!(serde_json::to_value(&stats).unwrap().get("trace_discard_no_fallback_requests").is_none());
+    assert_eq!(stats.trace_discard_deferred_items, 0);
+    let line = serde_json::to_value(&stats).unwrap();
+    assert!(line.get("trace_discard_no_fallback_requests").is_none());
+    assert!(line.get("trace_discard_deferred_items").is_none());
     let totals = e2_bound_trace_totals(&clean);
     let fired = std::rc::Rc::new(std::cell::Cell::new(false));
     if mode == "malformed" {
@@ -819,26 +872,34 @@ fn e2_bound_trace_billing_regression(mode: &str, split_logins: bool, external: b
             fired.set(true);
         });
     }
-    let (items, stats) = e2_bound_trace_page(&dir, &support, &root, &mut index, true);
+    let (items, disposition, stats) =
+        e2_bound_trace_page(&dir, &support, &root, &mut index, true, accepted);
     assert_eq!(fired.get(), mode != "malformed");
     assert_eq!(stats.trace_incomplete_root_count, 1);
-    assert_eq!(e2_bound_trace_totals(&items), totals, "per-session money is unchanged");
     let discarded = mode != "malformed";
-    // Main preserves uniform API-qualified B on markerless wire rows despite
-    // internal A partitions. Split B/C evidence cannot take that shortcut:
-    // the non-discard control then emits the retained A partitions instead.
-    let control_login = if split_logins { e2_account() } else { "b".repeat(64) };
-    let expected = (!discarded).then_some(control_login);
-    e2_bound_trace_assert_logins(&items, &root, expected.clone(), expected);
     assert_eq!(stats.trace_discard_no_fallback_requests, if discarded { 5 } else { 0 });
     if discarded {
+        // Deferred: no revision replaces the accepted body, so the server
+        // keeps its tags and no other account (A or None) receives this hour.
+        e2_assert_family_deferred(&items, &disposition);
+        assert_eq!(stats.trace_discard_deferred_items, 2);
         let line = serde_json::to_value(&stats).unwrap();
         assert_eq!(line["trace_discard_no_fallback_requests"], 5);
+        assert_eq!(line["trace_discard_deferred_items"], 2);
         assert_eq!(stats.trace_rows_discarded.cap, u64::from(mode == "cap"));
         assert_eq!(stats.trace_rows_discarded.generation, u64::from(mode == "generation"));
     } else {
+        assert_eq!(e2_bound_trace_totals(&items), totals, "per-session money is unchanged");
+        // Main preserves uniform API-qualified B on markerless wire rows despite
+        // internal A partitions. Split B/C evidence cannot take that shortcut:
+        // the non-discard control then emits the retained A partitions instead.
+        let control_login = if split_logins { e2_account() } else { "b".repeat(64) };
+        e2_bound_trace_assert_logins(&items, &root, Some(control_login.clone()), Some(control_login));
+        assert_eq!(stats.trace_discard_deferred_items, 0);
         assert!(stats.trace_rows_discarded.is_empty(), "malformed is not a discard");
-        assert!(serde_json::to_value(&stats).unwrap().get("trace_discard_no_fallback_requests").is_none());
+        let line = serde_json::to_value(&stats).unwrap();
+        assert!(line.get("trace_discard_no_fallback_requests").is_none());
+        assert!(line.get("trace_discard_deferred_items").is_none());
         assert_eq!(stats.complete_sidecar_root_count, 0);
         assert_eq!(stats.api_incomplete_root_count, 0);
         assert_eq!(stats.api_evidence_row_count, 0);
@@ -849,10 +910,12 @@ fn e2_bound_trace_billing_regression(mode: &str, split_logins: bool, external: b
     }
     // Settle the sidecar; the next page must use B despite the retained A.
     e2_write_rows(&support, "local-otel/claude-code-trace-ownership", &root, &trace);
-    let (recovered, stats) = e2_bound_trace_page(&dir, &support, &root, &mut index, false);
+    let (recovered, _, stats) =
+        e2_bound_trace_page(&dir, &support, &root, &mut index, false, accepted);
     e2_bound_trace_assert_logins(&recovered, &root, Some("b".repeat(64)), Some(child_login));
-    assert_eq!(e2_bound_trace_totals(&recovered), totals);
+    assert_eq!(e2_bound_trace_totals(&recovered), totals, "the deferred usage is not dropped");
     assert_eq!(stats.trace_discard_no_fallback_requests, 0);
+    assert_eq!(stats.trace_discard_deferred_items, 0);
     assert!(stats.trace_rows_discarded.is_empty());
     fs::remove_dir_all(dir).unwrap();
 }
@@ -906,4 +969,18 @@ fn e2_pipeline_external_billing_generation_discard_clears_wire_account_then_reco
 #[test]
 fn e2_pipeline_external_billing_malformed_trace_keeps_main_account() {
     e2_bound_trace_billing_regression("malformed", false, true);
+}
+
+// A bucket already accepted tagged (B root, C child) is never replaced by an
+// untagged revision: the discard page uploads nothing for the family, and the
+// next clean page uploads B/C again with unchanged totals.
+#[test]
+fn e2_pipeline_accepted_b_cap_discard_defers_upload_then_recovers() {
+    e2_bound_trace_case("cap", true, false, true);
+}
+
+#[cfg(unix)]
+#[test]
+fn e2_pipeline_accepted_b_generation_discard_defers_upload_then_recovers() {
+    e2_bound_trace_case("generation", true, false, true);
 }
