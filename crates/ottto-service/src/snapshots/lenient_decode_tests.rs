@@ -839,6 +839,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
         diagnostic_reason: FileReason::Complete,
         parsed_snapshot_count: 1,
         effective_upload_body_witness_revision: 0,
+        pi_restored_behind_accepted: false,
     });
     finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut loaded);
     assert!(scan.snapshots.is_empty());
@@ -4870,4 +4871,60 @@ fn o3_ambiguous_negative_evidence_refuses_through_every_reader() {
             assert!(!reopened.o3_replay.needs_save());
         }
     }
+}
+
+/// Pi's restored-behind-accepted count settles at finalization: it follows the
+/// flag and needs a body that survived holds and semantic no-op removal. These
+/// are finalization facts, independent of the native layout a restore needs.
+#[test]
+fn pi_restored_behind_accepted_counts_only_a_surviving_offer() {
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-pi-behind-accepted");
+    let key = "/synthetic/0.jsonl".to_string();
+    let mut body = tests::sample_session_artifact_item();
+    body.source_file_fingerprint = Some("source".into());
+    let mut index = fixture();
+    let mut finalize = |flagged: bool, body: Option<&SnapshotItem>, previous: (_, _)| {
+        let mut empty_index = ScanIndex::default();
+        let mut scan = scan_source_roots_with_test_limit(
+            SnapshotSource::Pi,
+            &[scratch.as_ref().to_path_buf()],
+            &mut empty_index,
+            "2026-10-22T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+            4,
+            false,
+        )
+        .unwrap();
+        scan.snapshots = body.into_iter().cloned().collect();
+        scan.pending_finalization.push(PendingIndexFinalization {
+            sampled_audit_verified: false,
+            codex_pending_recovery: false,
+            index_key: key.clone(),
+            source_file_fingerprint: "source".into(),
+            previous_snapshot_fingerprint: previous.0,
+            previous_upload_body_witness: previous.1,
+            parse_complete: true,
+            diagnostic_reason: FileReason::Complete,
+            parsed_snapshot_count: 1,
+            effective_upload_body_witness_revision: 0,
+            pi_restored_behind_accepted: flagged,
+        });
+        let (_, counts) =
+            observe(|| finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut index));
+        let entry = &index.files[&key];
+        (
+            counts.pi_restored_behind_accepted,
+            scan.snapshots.len(),
+            entry.last_snapshot_fingerprint.clone(),
+            entry.last_upload_body_witness.clone(),
+        )
+    };
+    let none = || (None, None);
+    assert_eq!(finalize(false, Some(&body), none()).0, 0, "not flagged");
+    let (count, offered, group, witness) = finalize(true, Some(&body), none());
+    assert_eq!((count, offered), (1, 1), "the offered body");
+    let (count, offered, ..) = finalize(true, Some(&body), (group, witness));
+    assert_eq!((count, offered), (0, 0), "semantic no-op, nothing offered");
+    assert_eq!(finalize(true, None, none()).0, 0, "no body for this file");
 }

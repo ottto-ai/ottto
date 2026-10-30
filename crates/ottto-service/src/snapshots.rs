@@ -7826,6 +7826,8 @@ struct PendingIndexFinalization {
     diagnostic_reason: FileReason,
     parsed_snapshot_count: usize,
     effective_upload_body_witness_revision: u64,
+    /// `Active::pi_restored_behind_accepted`, settled at finalization.
+    pi_restored_behind_accepted: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -8317,6 +8319,21 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .map(|source_file| !noop_source_files.contains(source_file))
                 .unwrap_or(true)
     });
+    // Only an offer that survived policy, holds and semantic no-op removal.
+    for pending in result
+        .pending_finalization
+        .iter()
+        .filter(|pending| pending.pi_restored_behind_accepted)
+    {
+        if result.snapshots.iter().any(|snapshot| {
+            snapshot.source_file_fingerprint.as_deref()
+                == Some(pending.source_file_fingerprint.as_str())
+        }) {
+            crate::local_resource_diagnostics::cache_lifecycle::record(
+                crate::local_resource_diagnostics::cache_lifecycle::Event::PiRestoredBehindAccepted,
+            );
+        }
+    }
 
     // State-only Codex entities do not have a source-file fingerprint, so they
     // cannot use the file finalization table above. Rebind their durable map to
@@ -31092,6 +31109,7 @@ impl OwnedSourceScan {
                             parsed_snapshot_count: parsed.len(),
                             effective_upload_body_witness_revision: index
                                 .active_effective_upload_body_witness_revision,
+                            pi_restored_behind_accepted: false,
                         });
                         let alias_items = parsed
                             .iter()
@@ -31159,6 +31177,9 @@ impl OwnedSourceScan {
                     parsed_snapshot_count,
                     effective_upload_body_witness_revision: index
                         .active_effective_upload_body_witness_revision,
+                    pi_restored_behind_accepted: file_sampling
+                        .as_ref()
+                        .is_some_and(|active| active.pi_restored_behind_accepted),
                 });
                 if source == SnapshotSource::Codex
                     && parse_complete
@@ -33428,6 +33449,7 @@ impl OwnedSourceScan {
                             retained_hint: None,
                             retained_finalization_charge: 0,
                             retained_usage: None,
+                            pi_restored_behind_accepted: false,
                             reinsertion: Default::default(),
                         });
                     }
@@ -33777,6 +33799,8 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         let mut restored_claude = false;
                         #[cfg(unix)]
+                        let mut restored_pi = false;
+                        #[cfg(unix)]
                         let (mut retained, taken_admission, debt) = match retained {
                             None if allow_sample
                                 && !native_edit_proven
@@ -33811,6 +33835,7 @@ impl OwnedSourceScan {
                                     ) => {
                                         preparation_lease = Some(lease);
                                         restored_claude = source == SnapshotSource::ClaudeCode;
+                                        restored_pi = source == SnapshotSource::Pi;
                                         retained_offset =
                                             Some(taken.retained.checkpoint.sealed_offset());
                                         let admission = (
@@ -34196,6 +34221,21 @@ impl OwnedSourceScan {
                         let continued = taken_admission.filter(|_| {
                             !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
                         });
+                        // Pi has no accepted floor (`Interpretation::of`): this
+                        // read publishes below the extent the entry still holds.
+                        #[cfg(unix)]
+                        let pi_restored_behind_accepted = restored_pi
+                            && sampled_scan::tail_behind_accepted(
+                                mode,
+                                parser
+                                    .reader
+                                    .acquisition
+                                    .as_ref()
+                                    .map(|plan| plan.frozen_length()),
+                                index.files.get(&key).map(|entry| entry.size_bytes),
+                            );
+                        #[cfg(not(unix))]
+                        let pi_restored_behind_accepted = false;
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
                             key,
@@ -34206,6 +34246,7 @@ impl OwnedSourceScan {
                             retained_finalization_charge: continued
                                 .map_or(0, |(_, charge, _)| charge),
                             retained_usage: continued.map(|(_, _, usage)| usage),
+                            pi_restored_behind_accepted,
                             reinsertion,
                         });
                     }
@@ -34277,6 +34318,7 @@ impl OwnedSourceScan {
                             retained_hint: None,
                             retained_finalization_charge: 0,
                             retained_usage: None,
+                            pi_restored_behind_accepted: false,
                             reinsertion: Default::default(),
                         });
                     }
@@ -94922,7 +94964,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; pending_taken, pending_returns, #[cfg(unix)] pending_funding, #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_publication, native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision, pi_restored_behind_accepted);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {

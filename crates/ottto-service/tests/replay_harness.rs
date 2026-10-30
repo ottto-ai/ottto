@@ -281,6 +281,9 @@ const LIFECYCLE_COUNTERS: &[(&str, CounterClass)] = &[
     // insertion, a subset of insert_entries_evicted.
     ("cache_evicted_by_pi_claude_code", CounterClass::Observation),
     ("cache_evicted_by_pi_codex", CounterClass::Observation),
+    // snapshots.rs::finalize_scan_after_policy_with_body_witness: a surviving
+    // offer of a restored Pi Tail below the accepted extent; not a refusal.
+    ("pi_restored_behind_accepted", CounterClass::Observation),
     // transcript_cache.rs::evict_until: cursor reservation victim action.
     (
         "cursor_reservation_entries_evicted",

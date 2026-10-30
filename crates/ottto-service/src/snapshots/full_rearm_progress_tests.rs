@@ -2156,6 +2156,7 @@ fn rebuild_reads(index: &ScanIndex) -> Vec<PendingIndexFinalization> {
             diagnostic_reason: FileReason::Complete,
             parsed_snapshot_count: 1,
             effective_upload_body_witness_revision: 0,
+            pi_restored_behind_accepted: false,
         })
         .collect()
 }

@@ -5873,6 +5873,21 @@ fn pi_ledger_cap_counter_prints_in_the_pi_summary_only() {
     }
 }
 
+/// Only a Tail ending strictly below a known accepted extent is behind it.
+#[test]
+fn tail_behind_accepted_needs_a_tail_strictly_below_the_entry() {
+    use crate::snapshots::sampled_scan::tail_behind_accepted as behind;
+    use crate::transcript_acquisition::{FullReason, ReadMode};
+    assert!(behind(ReadMode::Tail, Some(9), Some(10)));
+    assert!(!behind(ReadMode::Tail, Some(10), Some(10)), "at accepted");
+    assert!(!behind(ReadMode::Tail, Some(11), Some(10)), "past accepted");
+    assert!(!behind(ReadMode::Tail, None, Some(10)), "no plan");
+    assert!(!behind(ReadMode::Tail, Some(9), None), "no entry");
+    for mode in [ReadMode::Unchanged, ReadMode::Full(FullReason::Shrunk)] {
+        assert!(!behind(mode, Some(9), Some(10)));
+    }
+}
+
 // Q11 rows are self-contained so they can move into transition_fixture.rs,
 // which is absent at the pinned 5a2a base. Observe successful raw reads, not consumes.
 thread_local! {

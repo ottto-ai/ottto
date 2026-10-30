@@ -1160,6 +1160,17 @@ They also appear on the existing
 saturating process totals since startup, shared across namespaces. They are
 counts and bytes only, with no file names, response ids or content.
 
+`pi_restored_behind_accepted` counts Pi files whose durable-restored body was
+read as a Tail ending below the indexed accepted extent and was then offered for
+upload, after policy, holds and semantic no-op removal. Pi has no accepted-body
+floor, so that offer is the smaller body a cold Full would produce, and the
+accepted state moves down with it. No other mode counts: a Full, a restored
+Unchanged read or a RAM-retained Tail does not. Claude and Codex never count. It
+is an offer count, so an upload retry counts again. It settles after page
+collection, so it appears only on `process_retained_cache_lifecycle_totals`
+(source `unknown`), from the next page's line. It is a count only, with no file
+names, response ids or content.
+
 The tag-1 audit-safe bootstrap core is a hard release pair with the grouped
 custody and stored-representation binding completion. The first part preserves
 main's narrower current-representation binding formula. Grouped Codex members

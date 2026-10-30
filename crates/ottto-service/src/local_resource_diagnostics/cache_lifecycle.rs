@@ -83,6 +83,9 @@ counters! {
     retention_bound_refused_pi_bytes_unavailable: RetentionBoundRefusedPiBytesUnavailable,
     // Transitional Pi Full on change without a RAM record (no durable Pi yet).
     pi: Pi,
+    // A restored Pi Tail below the accepted extent offered for upload (Pi has
+    // no accepted floor). Counted at post-policy finalization.
+    pi_restored_behind_accepted: PiRestoredBehindAccepted,
     retention_no_plan: RetentionNoPlan,
     retention_unsealed_eof: RetentionUnsealedEof,
     retention_clone_bound_refused: RetentionCloneBoundRefused,
