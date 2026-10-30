@@ -215,6 +215,7 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
                 if let Some(session) = guard.as_mut() {
                     let stamp = session.db.stamp()?;
                     if !session.reload && session.identity == identity && session.stamp == stamp {
+                        super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
                         if let Some(index) = state.cached.as_ref() {
                             if index.generation == stamp.0 {
                                 telemetry::event("route", &"v2_cached");
@@ -246,6 +247,7 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
             db.path_extractor(M::private_paths);
             db.reference_extractor(M::references);
             let stamp = db.stamp()?;
+            super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
             let (mut index, cx) = mapper.hydrate_context(&mut db)?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
             db.prime_headers()?;
@@ -428,7 +430,9 @@ fn binding_for(path: &Path) -> Result<super::super::scan_index_persistence::Bind
 
 fn preserve_baseline(path: &Path, original: Option<&import::Original>) -> Result<()> {
     if let Some(original) = original {
-        return original.preserve(path);
+        original.preserve(path)?;
+        telemetry::baseline(path);
+        return Ok(());
     }
     if !fence::exists(path)? {
         return Ok(());
@@ -459,6 +463,7 @@ fn preserve_baseline(path: &Path, original: Option<&import::Original>) -> Result
         super::super::sync_checkpoint_parent(path)?;
     }
     telemetry::event("baseline_bytes", &bytes);
+    telemetry::baseline(path);
     Ok(())
 }
 
@@ -488,6 +493,7 @@ fn save_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Resul
             !session.reload && session.identity == identity && session.path == path,
             Hold::ForeignBinding
         );
+        telemetry::baseline(path);
         let _gauge = telemetry::Stage::new(telemetry::Kind::Save);
         mapper.preflight(index).map_err(|_| Hold::DbUnavailable)?;
         state.cached = None;
@@ -686,6 +692,10 @@ fn erasure_inventory(path: &Path) -> Result<()> {
         ),
         ("baseline_inventory", fence::sibling(path, ".v1-readonly")),
         (
+            "ack_receipt_inventory",
+            fence::sibling(path, ".v2-ack-receipt"),
+        ),
+        (
             "restart_record_inventory",
             crate::durable_tail_store::store_dir_for_index(path),
         ),
@@ -783,6 +793,7 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
         ".v1-readonly",
         ".v1-readonly.shards",
         ".v2-fence.tmp",
+        ".v2-ack-receipt",
     ] {
         let artifact = fence::sibling(path, suffix);
         match fs::symlink_metadata(&artifact) {

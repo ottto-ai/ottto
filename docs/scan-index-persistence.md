@@ -462,6 +462,9 @@ recovery or substitute for a missing exact receipt.
 For **receipt-first** crashes, replay the newest companion before applying any
 source-DB handoff. Only its exact predecessor or replacement is accepted; replay
 restores complete cache-head/refusal state as well as exact accepted body witnesses.
+The runtime route performs this replay before returning a fresh or cached graph,
+under its checkpoint lock and the existing progress lock. Progress loading repeats
+that idempotent check before decoding; no recovery path reacquires the route lock.
 For **DB-first** crashes, the committed `accepted.ack_handoff` retains the original
 exact-body cleanup obligation. Reconcile progress first, durably remove only matching
 ACKs, and then clear the DB handoff. A newer body receipt cannot be retired by an
@@ -484,3 +487,8 @@ before restore/collection, and verify the descriptor before GC; any missing or
 mismatched member holds and is counted. These owner hooks do not enable conversion
 or implement backup orchestration. Companions contain private local state and share
 the source's backup, erasure and immediate-removal obligations.
+
+Explicit source erasure also removes the exact ACK companion. Maintenance reports
+its count/bytes through `ack_receipt_inventory`; inventory alone grants no recovery
+or GC authority. Baseline age/escalation gauges refresh after import preservation,
+on authenticated saves and at maintenance/load boundaries.

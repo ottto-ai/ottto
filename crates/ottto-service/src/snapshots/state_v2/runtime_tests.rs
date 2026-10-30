@@ -37,6 +37,10 @@ impl Fixture {
         db.control("identity", &self.identity()).unwrap();
         db.control("generation", &0_u64).unwrap();
         db.finish_import().unwrap();
+        // Synthetic fixture has no original ledger; seal that exact absence
+        // before any publication boundary, as the production importer must.
+        super::super::ack::ProgressRecovery::seal_import(self.identity(), 0, &self.path, None)
+            .unwrap();
     }
     fn published(&self) {
         self.imported();
@@ -192,6 +196,7 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
         ".v2.sqlite.import-wal",
         ".v2.sqlite.import-shm",
         ".v2-fence.tmp",
+        ".v2-ack-receipt",
     ] {
         fs::write(fence::sibling(&f.path, suffix), b"forgotten-path-canary").unwrap();
     }
@@ -215,6 +220,7 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
         ".v1-readonly",
         ".v1-readonly.shards",
         ".v2-fence.tmp",
+        ".v2-ack-receipt",
     ] {
         assert!(!fence::sibling(&f.path, suffix).exists());
     }
@@ -345,4 +351,34 @@ fn another_graph_save_cannot_advance_a_stale_external_guard() {
     assert_eq!(first.generation, 1);
     assert!(stale().is_err());
     crate::snapshots::state_v2_side_effect_guard(&f.path, &first)().unwrap();
+}
+
+#[test]
+fn route_replays_receipt_before_fresh_or_cached_graph_and_missing_receipt_holds() {
+    for cached in [false, true] {
+        let f = Fixture::new();
+        f.published();
+        if cached {
+            load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+        }
+        let recovery =
+            super::super::ack::ProgressRecovery::seal_import(f.identity(), 0, &f.path, None)
+                .unwrap();
+        let progress = f.path.with_file_name(format!(
+            "{}-upload-progress.json",
+            f.path.file_stem().unwrap().to_str().unwrap()
+        ));
+        let next = br#"{"generation":1,"accepted":"exact-body"}"#;
+        recovery.before_progress_save(None, next).unwrap();
+        assert!(!progress.exists());
+        // Holds the same owner lock as the production load entry point; replay
+        // must not recursively acquire it through the external side-effect guard.
+        let _lock = super::super::super::CheckpointLock::acquire(&f.path).unwrap();
+        assert!(load_with(&f.path, false, &EmptyMapper).unwrap().is_some());
+        assert_eq!(fs::read(&progress).unwrap(), next);
+        fs::remove_file(fence::sibling(&f.path, ".v2-ack-receipt")).unwrap();
+        assert!(load_with(&f.path, false, &EmptyMapper).is_err());
+        assert_eq!(fs::read(&progress).unwrap(), next);
+        assert!(guard_containment_locked(&f.path).is_err());
+    }
 }

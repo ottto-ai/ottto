@@ -96,6 +96,21 @@ fn progress_generation(bytes: &[u8]) -> Result<u64> {
     Ok(serde_json::from_slice::<Generation>(bytes)?.generation)
 }
 impl ProgressRecovery {
+    /// Runtime load already holds CheckpointLock and has authenticated the DB.
+    /// Replay before returning either a hydrated or cached graph, without
+    /// recursively acquiring the checkpoint/route/session locks.
+    pub(super) fn recover_route(identity: &Identity, generation: u64, path: &Path) -> Result<()> {
+        let recovery = Self {
+            scope: Scope {
+                identity: identity.clone(),
+                generation,
+            },
+            path: fence::sibling(path, ".v2-ack-receipt"),
+            db_path: Some(fence::sibling(path, ".v2.sqlite")),
+        };
+        crate::snapshot_sync::recover_state_v2_progress(path, &recovery)
+    }
+
     /// Caller holds the source owner; called before progress decoding/containment.
     /// OFF/v1 and Codex/Pi perform no extra reads, writes or normalization.
     pub(crate) fn for_index(index: &ScanIndex, index_path: &Path) -> Result<Option<Self>> {

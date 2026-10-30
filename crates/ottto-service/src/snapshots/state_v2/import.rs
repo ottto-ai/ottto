@@ -1012,7 +1012,8 @@ mod application_cases {
             out
         }
         fn store(&self) -> sqlite::Sqlite {
-            let mut db = sqlite::Sqlite::create_import(&self.dir.join("proof.import")).unwrap();
+            let mut db =
+                sqlite::Sqlite::create_import(&self.dir.join("proof.v2.sqlite.import")).unwrap();
             db.path_extractor(kinds::private_paths);
             db.reference_extractor(kinds::references);
             db.control(

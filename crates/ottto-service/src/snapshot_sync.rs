@@ -11759,6 +11759,17 @@ fn adopt_legacy_checkpoint_file(legacy_path: &Path, stable_path: &Path) -> Resul
     migration
 }
 
+/// The runtime route owns the checkpoint lock; use the existing progress lock
+/// for exact receipt replay before it exposes any source graph to callers.
+pub(crate) fn recover_state_v2_progress(
+    index_path: &Path,
+    recovery: &crate::snapshots::ProgressRecovery,
+) -> Result<()> {
+    let path = snapshot_upload_progress_path(index_path);
+    let _lock = SnapshotProgressLock::acquire(&path)?;
+    recovery.recover(&path)
+}
+
 fn snapshot_upload_progress_path(index_path: &Path) -> PathBuf {
     let stem = index_path
         .file_stem()

@@ -90,7 +90,7 @@ fn recovery_set_pins_db_identity_generation_progress_and_every_exact_resume_refe
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-recovery-set");
     let index = scratch.join("index");
     let path = scratch.join("progress");
-    let db_path = scratch.join("db.import");
+    let db_path = scratch.join("db.v2.sqlite.import");
     let binding = ProgressRecovery::synthetic(&index, &"a".repeat(64), 0);
     let old = progress(4, "old");
     write(&path, &old);
@@ -181,7 +181,7 @@ fn import_sealing_is_idempotent_but_never_rebinds_a_different_db_or_progress() {
 fn post_commit_cleanup_receipt_binds_latest_db_generation_and_refuses_rollback() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-postcommit-generation");
     let path = scratch.join("progress");
-    let db_path = scratch.join("db.import");
+    let db_path = scratch.join("db.v2.sqlite.import");
     let mut binding = ProgressRecovery::synthetic(&scratch.join("index"), &"a".repeat(64), 0);
     let before = progress(1, "accepted-body");
     write(&path, &before);
