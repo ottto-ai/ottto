@@ -1,3 +1,8 @@
+fn retained_session(hours: usize) -> (SnapshotItem, Vec<Contribution>) {
+    let (mut item, proof) = sticky_session(hours);
+    item.usage_accounting_contract = Some("claude_request_owned_usage:v1".into());
+    (item, proof)
+}
 // Option (ii): `identity_retained` markers over the witnessed proved-row
 // ledger (SOURCE rule (ii) Addendum 1, Lead B Addendum 1). Synthetic proof only.
 fn retained_state() -> identity::AcceptedBuckets {
@@ -36,7 +41,7 @@ fn retained_assert_exclusive(item: &SnapshotItem) {
     {
         if row.identity_retained {
             assert!(!sticky_tagged(row), "marker and tag on one row");
-            assert!(row.account_identifier_hash.is_none());
+            assert!(row.evidence_ref.is_none() && row.identity_parts.is_none());
             let wire = serde_json::to_string(row).unwrap();
             assert!(wire.contains(r#""identity_retained":true"#));
         } else {
@@ -80,7 +85,7 @@ fn retained_wide_open_hour(
 
 #[test]
 fn retained_marker_on_closed_proved_rows_and_fresh_tags_for_the_open_hour() {
-    let (original, proof) = sticky_session(4);
+    let (original, proof) = retained_session(4);
     let mut state = retained_state();
     let mut first = original.clone();
     sticky_apply(&mut first, &proof, &state).unwrap();
@@ -137,7 +142,7 @@ fn retained_marker_on_closed_proved_rows_and_fresh_tags_for_the_open_hour() {
 
 #[test]
 fn retained_different_proof_sends_fresh_tags_counted_and_latest_proof_wins() {
-    let (original, proof) = sticky_session(4);
+    let (original, proof) = retained_session(4);
     let mut state = retained_state();
     let mut first = original.clone();
     sticky_apply(&mut first, &proof, &state).unwrap();
@@ -189,7 +194,7 @@ fn retained_different_proof_sends_fresh_tags_counted_and_latest_proof_wins() {
 
 #[test]
 fn retained_marker_defers_when_the_transcript_no_longer_proves_the_row() {
-    let (original, proof) = sticky_session(4);
+    let (original, proof) = retained_session(4);
     let mut state = retained_state();
     let mut first = original.clone();
     sticky_apply(&mut first, &proof, &state).unwrap();
@@ -224,7 +229,7 @@ fn retained_marker_defers_when_the_transcript_no_longer_proves_the_row() {
 
 #[test]
 fn retained_proof_missing_leaves_the_set_and_the_next_revision_re_tags_when_it_fits() {
-    let (original, proof) = sticky_session(2);
+    let (original, proof) = retained_session(2);
     let mut state = retained_state();
     let mut first = original.clone();
     sticky_apply(&mut first, &proof, &state).unwrap();
@@ -274,7 +279,7 @@ fn retained_proof_missing_leaves_the_set_and_the_next_revision_re_tags_when_it_f
 
 #[test]
 fn retained_unwitnessed_ack_never_adds_and_a_cleared_set_re_tags() {
-    let (original, proof) = sticky_session(3);
+    let (original, proof) = retained_session(3);
     let mut state = retained_state();
     let mut first = original.clone();
     sticky_apply(&mut first, &proof, &state).unwrap();
@@ -332,7 +337,7 @@ fn retained_gate_off_is_byte_identical_to_the_909_goldens() {
         assert_eq!(seeded[case], fixture[case], "{case}");
     }
     // Gate on with no proved rows yet: the plain recent window equals #909's.
-    let (mut window, mut proof) = sticky_session(576);
+    let (mut window, mut proof) = retained_session(576);
     sticky_price_fixture(&mut window, &mut proof);
     sticky_apply(&mut window, &proof, &retained_state()).unwrap();
     assert_eq!(sticky_wire(window), fixture["window"]);
@@ -340,7 +345,7 @@ fn retained_gate_off_is_byte_identical_to_the_909_goldens() {
 
 #[test]
 fn retained_window_converges_on_markers_under_the_unchanged_caps() {
-    let (mut original, mut proof) = sticky_session(576);
+    let (mut original, mut proof) = retained_session(576);
     sticky_price_fixture(&mut original, &mut proof);
     let mut state = retained_state();
     let mut first = original.clone();
@@ -373,7 +378,7 @@ fn retained_window_converges_on_markers_under_the_unchanged_caps() {
 #[test]
 fn retained_fallback_keeps_only_the_newest_markers_that_fit() {
     const MARKER: usize = r#","identity_retained":true"#.len();
-    let (original, proof) = sticky_session(4);
+    let (original, proof) = retained_session(4);
     let mut state = retained_state();
     let mut first = original.clone();
     sticky_apply(&mut first, &proof, &state).unwrap();
@@ -412,7 +417,7 @@ fn retained_fallback_keeps_only_the_newest_markers_that_fit() {
 /// Exact emitted bodies with markers for the backend companion receiver test.
 fn retained_golden_cases() -> Value {
     let mut cases = BTreeMap::new();
-    let (mut original, mut proof) = sticky_session(4);
+    let (mut original, mut proof) = retained_session(4);
     sticky_price_fixture(&mut original, &mut proof);
     let mut state = retained_state();
     let mut first = original.clone();
@@ -420,25 +425,28 @@ fn retained_golden_cases() -> Value {
     retained_ack(&mut state, &first, &[]);
     let mut marked = original.clone();
     sticky_apply(&mut marked, &proof, &state).unwrap();
-    assert_eq!(retained_marked(&marked), vec![true, true, true, false]);
+    sticky_assert_reconciled(&marked);
+    cases.insert("marker_closed_rows_open_hour_fresh_proving", sticky_wire(first.clone()));
+    cases.insert("marker_with_changed_proof_fresh_proving", sticky_wire(first.clone()));
     cases.insert("marker_closed_rows_open_hour_fresh", sticky_wire(marked));
     let mut changed_proof = proof.clone();
     changed_proof[3].identity = login_key(D64);
     let mut changed = original.clone();
     sticky_apply(&mut changed, &changed_proof, &state).unwrap();
-    assert_eq!(retained_marked(&changed), vec![true, false, true, false]);
+    sticky_assert_reconciled(&changed);
     cases.insert("marker_with_changed_proof_fresh", sticky_wire(changed));
 
-    let (mut window, mut window_proof) = sticky_session(576);
+    let (mut window, mut window_proof) = retained_session(576);
     sticky_price_fixture(&mut window, &mut window_proof);
     let mut window_state = retained_state();
     let mut tagged = window.clone();
     sticky_apply(&mut tagged, &window_proof, &window_state).unwrap();
     retained_ack(&mut window_state, &tagged, &[]);
     sticky_apply(&mut window, &window_proof, &window_state).unwrap();
+    cases.insert("marker_window_proving", sticky_wire(tagged));
     cases.insert("marker_window", sticky_wire(window));
 
-    let (two, two_proof) = sticky_session(2);
+    let (two, two_proof) = retained_session(2);
     let mut two_state = retained_state();
     let mut first = two.clone();
     sticky_apply(&mut first, &two_proof, &two_state).unwrap();
@@ -449,10 +457,39 @@ fn retained_golden_cases() -> Value {
     retained_ack(&mut two_state, &second, &[&hour_zero]);
     let (mut unfit, unfit_proof) = retained_wide_open_hour(&two, &two_proof, 16);
     sticky_apply(&mut unfit, &unfit_proof, &two_state).unwrap();
+    cases.insert("missing_proof_retag_unfit_proving", sticky_wire(first.clone()));
+    cases.insert("missing_proof_retag_fit_proving", sticky_wire(first));
     cases.insert("missing_proof_retag_unfit", sticky_wire(unfit));
     let mut retag = two.clone();
     sticky_apply(&mut retag, &two_proof, &two_state).unwrap();
     cases.insert("missing_proof_retag_fit", sticky_wire(retag));
+    let (login, login_proof) = retained_login_session();
+    let mut login_state = retained_state();
+    let mut login_first = login.clone();
+    sticky_apply(&mut login_first, &login_proof, &login_state).unwrap();
+    retained_ack(&mut login_state, &login_first, &[]);
+    let mut login_marked = login.clone();
+    sticky_apply(&mut login_marked, &login_proof, &login_state).unwrap();
+    assert!(login_marked.usage_buckets[0].model_usage[0].identity_retained);
+    assert_eq!(login_marked.usage_buckets[0].model_usage[0].account_identifier_hash.as_deref(), Some(OWNER_A));
+    cases.insert("login_marker_with_hash_proving", sticky_wire(login_first.clone()));
+    cases.insert("login_marker_with_hash", sticky_wire(login_marked));
+    let mut contract5 = login.clone();
+    contract5.usage_accounting_contract = None;
+    sticky_apply(&mut contract5, &login_proof, &login_state).unwrap();
+    assert!(contract5.usage_buckets.iter().all(|b| b.model_usage.iter().all(|r| !r.identity_retained && sticky_tagged(r))));
+    cases.insert("contract5_fresh_proving", sticky_wire(login_first.clone()));
+    cases.insert("contract5_fresh", sticky_wire(contract5));
+    // Force a capacity refusal after witnessed proof; the marker is excluded.
+    let mut refusal = login.clone();
+    let mut changed = login_proof.clone();
+    for contribution in &mut changed[..3] { contribution.identity = login_key(D64); }
+    identity::apply_with_reserved_bytes_for_test(&mut refusal, &changed, &login_state, identity::MAX_ITEM_BYTES).unwrap();
+    assert!(!refusal.usage_buckets[0].model_usage[0].identity_retained);
+    assert!(!sticky_tagged(&refusal.usage_buckets[0].model_usage[0]));
+    assert!(refusal.request_identity_refusals > 0);
+    cases.insert("counted_refusal_after_proof_proving", sticky_wire(login_first));
+    cases.insert("counted_refusal_after_proof", sticky_wire(refusal));
     for case in cases.values() {
         assert!(
             serde_json::to_vec(&case["snapshots"][0]).unwrap().len() <= identity::MAX_ITEM_BYTES
@@ -488,4 +525,88 @@ fn retained_emitted_wire_goldens_for_the_receiver_contract() {
         manifest["sha256"],
         format!("{:x}", sha2::Sha256::digest(fixture.as_bytes()))
     );
+}
+
+fn retained_login_session() -> (SnapshotItem, Vec<Contribution>) {
+    let (item, mut proof) = retained_session(2);
+    for c in &mut proof { c.identity = login_key(OWNER_A); }
+    (item, proof)
+}
+
+#[test]
+fn retained_login_hash_is_ack_bound_even_when_transcript_proof_disappears() {
+    let (original, proof) = retained_login_session();
+    let mut state = retained_state();
+    let mut first = original.clone();
+    sticky_apply(&mut first, &proof, &state).unwrap();
+    assert_eq!(first.usage_buckets[0].model_usage[0].account_identifier_hash.as_deref(), Some(OWNER_A));
+    retained_ack(&mut state, &first, &[]);
+    let mut restored = identity::AcceptedBuckets::restore_for_test(&serde_json::to_vec(&state).unwrap());
+    restored.set_retained_enabled(true);
+    let mut missing = proof.clone();
+    for c in &mut missing { c.identity = RequestIdentity::Missing; }
+    let mut marked = original.clone();
+    sticky_apply(&mut marked, &missing, &restored).unwrap();
+    for bucket in &marked.usage_buckets {
+        let row = &bucket.model_usage[0];
+        assert!(row.identity_retained);
+        assert_eq!(row.account_identifier_hash.as_deref(), Some(OWNER_A));
+        assert!(!sticky_tagged(row));
+    }
+    // Contract 5 always uses fresh tags even with capability + witnessed state.
+    let mut legacy = original.clone();
+    legacy.usage_accounting_contract = None;
+    sticky_apply(&mut legacy, &proof, &restored).unwrap();
+    assert!(legacy.usage_buckets.iter().all(|b| !b.model_usage[0].identity_retained && sticky_tagged(&b.model_usage[0])));
+    sticky_assert_reconciled(&legacy);
+}
+
+#[test]
+fn retained_marker_and_unpriced_strip_compose_at_both_grains() {
+    let (mut original, mut proof) = retained_session(4);
+    sticky_price_fixture(&mut original, &mut proof);
+    let mut state = retained_state();
+    let mut first = original.clone();
+    sticky_apply(&mut first, &proof, &state).unwrap();
+    retained_ack(&mut state, &first, &[]);
+    identity::take_identity_counts();
+    let mut next = original.clone();
+    sticky_apply(&mut next, &proof, &state).unwrap();
+    sticky_assert_reconciled(&next);
+    retained_assert_exclusive(&next);
+    let counts = retained_counts();
+    assert!(retained_count(&counts, "unpriced_part_untagged") > 0);
+    assert!(next.usage_buckets.iter().all(|b| !b.model_usage[0].identity_retained && !sticky_tagged(&b.model_usage[0])));
+    // Marker rows themselves have no parts; a fully deferred closed body is safe.
+    let mut closed = original.clone();
+    closed.collected_at = "2026-09-02T00:00:00Z".into();
+    identity::take_identity_counts();
+    sticky_apply(&mut closed, &proof, &state).unwrap();
+    assert!(retained_marked(&closed).iter().all(|marked| *marked));
+    assert_eq!(retained_count(&retained_counts(), "unpriced_part_untagged"), 0);
+    sticky_assert_reconciled(&closed);
+}
+
+#[test]
+fn retained_capped_rows_send_fresh_tags_through_the_normal_caps() {
+    let (mut original, proof) = retained_session(1_024 + 2);
+    let mut state = retained_state();
+    let mut body = original.clone();
+    // Smaller model spelling + a single login makes this maximum-row body fit.
+    let model = "claude-synthetic";
+    for row in body.model_usage.iter_mut().chain(body.usage_buckets.iter_mut().flat_map(|b| &mut b.model_usage)) { row.model = model.into(); }
+    original = body.clone();
+    let mut proof = proof;
+    for c in &mut proof { c.row_key.model = model.into(); c.identity = login_key(OWNER_A); }
+    sticky_apply(&mut body, &proof, &state).unwrap();
+    // The entire source can exceed the wire cap, so prove compact fixture rows
+    // directly only for rows the emitted body's ACK actually carried.
+    retained_ack(&mut state, &body, &[]);
+    assert!(state.proved_rows_for_test(&body.source_session_id).unwrap().0 <= 1_024);
+    let mut next = original;
+    sticky_apply(&mut next, &proof, &state).unwrap();
+    assert!(sticky_tagged(&next.usage_buckets[0].model_usage[0]));
+    assert!(!next.usage_buckets[0].model_usage[0].identity_retained);
+    assert!(identity::item_bytes(&next) <= identity::MAX_ITEM_BYTES);
+    sticky_assert_reconciled(&next);
 }

@@ -206,8 +206,8 @@ fn maximum_accepted_ledger_progress_json_and_actual_load_peak_are_bounded() {
     let json_bytes = bytes.len();
     let load_peak = allocation.requested_peak_with_overlap;
     eprintln!("E2_ACCEPTED_PROGRESS_JSON_BYTES={json_bytes} E2_ACCEPTED_PROGRESS_LOAD_PEAK_BYTES={load_peak}");
-    assert!(json_bytes < 8 * 1024 * 1024, "json={json_bytes}");
-    assert!(load_peak < 32 * 1024 * 1024, "peak={load_peak}");
+    assert!(json_bytes <= 7_900_000, "json={json_bytes}");
+    assert!(load_peak <= 16 * 1024 * 1024, "peak={load_peak}");
     std::fs::remove_dir_all(root).unwrap();
 }
 // Option (ii): only a stored-body entity ACK whose versioned body witness equals

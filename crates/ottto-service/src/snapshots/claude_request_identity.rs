@@ -852,6 +852,7 @@ fn apply_grouped_with_accepted(
     known: Option<&accepted::AcceptedSession>,
     retained: bool,
 ) -> Result<Tagged, Ineligible> {
+    let retained = retained && super::claude_history_upgrade::is_request_owned_literal(item);
     let (accepted, proved) = if retained {
         (None, known)
     } else {
@@ -920,7 +921,6 @@ fn apply_grouped_with_accepted(
     grouping.extra_wire_bytes = grouping
         .extra_wire_bytes
         .saturating_add(deferred.marker_bytes());
-    let display = |withheld: bool| Some(Box::new(account_display(&grouping, withheld)));
 
     let evidence = grouping
         .rows()
@@ -1043,6 +1043,7 @@ fn apply_grouped_with_accepted(
         if grouping.item_bytes(item) <= MAX_ITEM_BYTES {
             let mut counts = cap_counts(item, &grouping, accepted, None);
             unpriced.count(&mut counts);
+            deferred.drop_stripped(item, &unpriced.keys);
             deferred.mark(item);
             deferred.count(item, retained, &mut counts);
             budget::record(&counts);
@@ -1090,6 +1091,7 @@ fn apply_grouped_with_accepted(
     if let Some((kept, measurement, unpriced)) = selected {
         let mut counts = cap_counts(item, &grouping, accepted, Some(&measurement));
         unpriced.count(&mut counts);
+        deferred.drop_stripped(item, &unpriced.keys);
         deferred.mark(item);
         deferred.count(item, retained, &mut counts);
         budget::record(&counts);
@@ -1150,7 +1152,7 @@ fn apply_grouped_with_accepted(
         let unmarked = grouping
             .item_bytes(item)
             .saturating_sub(deferred.marker_bytes());
-        deferred.keep_newest(MAX_ITEM_BYTES.saturating_sub(unmarked) / MARKER_BYTES)
+        deferred.keep_newest(MAX_ITEM_BYTES.saturating_sub(unmarked))
     };
     let refusals = refusals.saturating_add(dropped);
     deferred.mark(item);
@@ -1159,7 +1161,7 @@ fn apply_grouped_with_accepted(
     item.request_identity_refusals = refusals;
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
     // The rows carry no identity, so neither may the display.
-    item.claude_account_display = display(true);
+    item.claude_account_display = Some(Box::new(account_display(&grouping, true)));
     Ok(Tagged::Fallback {
         over_cap: over_cap.into_iter().collect(),
         refusals,
@@ -1175,6 +1177,7 @@ struct DeferredRow {
     row: RowKey,
     by_key: BTreeMap<Option<AuthorityKey>, Amounts>,
     refused: bool,
+    account: Option<String>,
 }
 
 /// Option (ii) bucket rows that defer to server-retained proof. Each is sent
@@ -1188,18 +1191,42 @@ struct Deferred {
 
 impl Deferred {
     fn marker_bytes(&self) -> usize {
-        self.rows.len().saturating_mul(MARKER_BYTES)
+        self.rows
+            .iter()
+            .map(|row| {
+                MARKER_BYTES
+                    + row.account.as_ref().map_or(0, |hash| {
+                        r#","account_identifier_hash":"""#.len() + hash.len()
+                    })
+            })
+            .sum()
     }
 
-    /// Keeps the `fit` newest-bucket rows; returns how many were dropped.
-    fn keep_newest(&mut self, fit: usize) -> u64 {
+    /// Keep newest markers while their complete wire members fit.
+    fn keep_newest(&mut self, mut available: usize) -> u64 {
         let before = self.rows.len();
-        if fit < before {
-            self.rows
-                .sort_by(|left, right| right.bucket.cmp(&left.bucket));
-            self.rows.truncate(fit);
-        }
+        self.rows
+            .sort_by(|left, right| right.bucket.cmp(&left.bucket));
+        self.rows.retain(|row| {
+            let bytes = MARKER_BYTES
+                + row.account.as_ref().map_or(0, |hash| {
+                    r#","account_identifier_hash":"""#.len() + hash.len()
+                });
+            if bytes > available {
+                return false;
+            }
+            available -= bytes;
+            true
+        });
         before.saturating_sub(self.rows.len()) as u64
+    }
+
+    fn drop_stripped(&mut self, item: &mut SnapshotItem, keys: &BTreeSet<RowKey>) {
+        let before = self.rows.len();
+        self.rows.retain(|row| !keys.contains(&row.row));
+        item.request_identity_refusals = item
+            .request_identity_refusals
+            .saturating_add((before - self.rows.len()) as u64);
     }
 
     fn mark(&self, item: &mut SnapshotItem) {
@@ -1209,14 +1236,18 @@ impl Deferred {
         let marked = self
             .rows
             .iter()
-            .map(|deferred| (deferred.bucket.as_str(), &deferred.row))
-            .collect::<BTreeSet<_>>();
+            .map(|deferred| ((deferred.bucket.as_str(), &deferred.row), &deferred.account))
+            .collect::<BTreeMap<_, _>>();
         for bucket in &mut item.usage_buckets {
             for row in &mut bucket.model_usage {
-                if marked.contains(&(bucket.bucket_start.as_str(), &row_key_from_model_usage(row)))
+                if let Some(account) =
+                    marked.get(&(bucket.bucket_start.as_str(), &row_key_from_model_usage(row)))
                 {
-                    debug_assert!(row.evidence_ref.is_none() && row.identity_parts.is_none());
+                    if row.evidence_ref.is_some() || row.identity_parts.is_some() {
+                        continue;
+                    }
                     row.identity_retained = true;
+                    row.account_identifier_hash = (*account).clone();
                 }
             }
         }
@@ -1242,6 +1273,7 @@ impl Deferred {
             return;
         }
         counts.accepted_state_unknown = 0;
+        counts.accepted_state_unknown_cause = Default::default();
         counts.retained_marker_rows = self.rows.len() as u64;
         counts.retained_missing_unfit = item
             .usage_buckets
@@ -1334,6 +1366,11 @@ fn defer_retained_rows(
                 deferred.missing.insert(bucket.bucket_start.clone());
             }
             let Some(prior) = proved.proved_row(start, &key) else {
+                // A lost replacement ACK must not erase proof the server may
+                // still hold when today's transcript can no longer prove it.
+                if !proves && proved.row_shares(start, &key).iter().any(Option::is_some) {
+                    group.refused = true;
+                }
                 continue;
             };
             if proves {
@@ -1347,6 +1384,7 @@ fn defer_retained_rows(
                     continue;
                 }
             }
+            let account = proved.proved_account(start, &key);
             let by_key = std::mem::replace(
                 &mut group.by_key,
                 BTreeMap::from([(None, group.total.clone())]),
@@ -1355,6 +1393,7 @@ fn defer_retained_rows(
             deferred.rows.push(DeferredRow {
                 bucket: bucket.bucket_start.clone(),
                 row: key,
+                account,
                 by_key,
                 refused,
             });
@@ -4808,7 +4847,7 @@ fn tag_item(
             .wire_size_reservation
             .map_or(0, |reserve| reserve(item));
         grouping.accepted_miss = miss;
-            let tagged = apply_grouped_with_accepted(item, grouping, accepted, retained);
+        let tagged = apply_grouped_with_accepted(item, grouping, accepted, retained);
         if tagged.is_err() {
             (
                 item.source_started_at,

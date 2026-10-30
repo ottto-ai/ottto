@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 pub(crate) const MAX_SESSIONS: usize = 16;
 pub(crate) const MAX_BUCKETS: usize = 5_000;
 const MAX_SHARES: usize = 1_536;
-pub(crate) const MAX_PROVED_ROWS: usize = 1_536;
+pub(crate) const MAX_PROVED_ROWS: usize = 1_024;
 /// Pending `retained_proof_missing` buckets feed one diagnostic only.
 const MAX_PENDING_MISSING: usize = 64;
 
@@ -81,62 +81,59 @@ struct ProvedRow {
     bucket: i64,
     row: [u8; 16],
     proof: [u8; 16],
+    // Class H: ACK-bound grain only, bounded and erased with this session.
+    account: Option<[u8; 32]>,
 }
-/// One lowercase hex string of 40-byte records (big-endian bucket, row,
-/// proof), so the maximum ledger stays inside #909's persisted bound.
+/// Versioned base64 of fixed 73-byte records: bucket, row, proof, optional
+/// ACKed account hash. Old hex hints have no grain provenance and fail closed.
 mod proved_hex {
     use super::*;
-    const RECORD: usize = 40;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    const RECORD: usize = 73;
     pub(super) fn serialize<S: Serializer>(
         rows: &[ProvedRow],
         encoder: S,
     ) -> Result<S::Ok, S::Error> {
-        let mut hex = String::with_capacity(rows.len() * RECORD * 2);
+        let mut bytes = Vec::with_capacity(rows.len() * RECORD);
         for row in rows {
-            for byte in row
-                .bucket
-                .to_be_bytes()
-                .iter()
-                .chain(&row.row)
-                .chain(&row.proof)
-            {
-                hex.push_str(&format!("{byte:02x}"));
-            }
+            bytes.extend_from_slice(&row.bucket.to_be_bytes());
+            bytes.extend_from_slice(&row.row);
+            bytes.extend_from_slice(&row.proof);
+            bytes.push(u8::from(row.account.is_some()));
+            bytes.extend_from_slice(&row.account.unwrap_or([0; 32]));
         }
-        encoder.serialize_str(&hex)
+        encoder.serialize_str(&format!("v2:{}", STANDARD.encode(bytes)))
     }
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         decoder: D,
     ) -> Result<Vec<ProvedRow>, D::Error> {
-        let hex = String::deserialize(decoder)?;
+        let encoded = String::deserialize(decoder)?;
         let invalid = || serde::de::Error::custom("invalid proved rows");
-        if hex.len() % (RECORD * 2) != 0
-            || hex.len() > MAX_PROVED_ROWS * RECORD * 2
-            || !hex
-                .bytes()
-                .all(|n| n.is_ascii_digit() || (b'a'..=b'f').contains(&n))
-        {
+        if encoded.len() > 3 + (MAX_PROVED_ROWS * RECORD).div_ceil(3) * 4 {
             return Err(invalid());
         }
-        let digit = |n: u8| if n <= b'9' { n - b'0' } else { n - b'a' + 10 };
-        Ok(hex
-            .as_bytes()
-            .chunks_exact(RECORD * 2)
+        let bytes = STANDARD
+            .decode(encoded.strip_prefix("v2:").ok_or_else(invalid)?)
+            .map_err(|_| invalid())?;
+        if bytes.len() % RECORD != 0 {
+            return Err(invalid());
+        }
+        bytes
+            .chunks_exact(RECORD)
             .map(|record| {
-                let mut bytes = [0u8; RECORD];
-                for (byte, pair) in bytes.iter_mut().zip(record.chunks_exact(2)) {
-                    *byte = (digit(pair[0]) << 4) | digit(pair[1]);
-                }
-                let mut row = ProvedRow {
-                    bucket: i64::from_be_bytes(bytes[..8].try_into().expect("8 bytes")),
-                    row: [0; 16],
-                    proof: [0; 16],
+                let account = match record[40] {
+                    0 if record[41..].iter().all(|byte| *byte == 0) => None,
+                    1 => Some(record[41..].try_into().expect("32 bytes")),
+                    _ => return Err(invalid()),
                 };
-                row.row.copy_from_slice(&bytes[8..24]);
-                row.proof.copy_from_slice(&bytes[24..]);
-                row
+                Ok(ProvedRow {
+                    bucket: i64::from_be_bytes(record[..8].try_into().expect("8 bytes")),
+                    row: record[8..24].try_into().expect("16 bytes"),
+                    proof: record[24..40].try_into().expect("16 bytes"),
+                    account,
+                })
             })
-            .collect())
+            .collect()
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -383,6 +380,14 @@ impl AcceptedSession {
             .ok()
             .map(|index| self.proved[index].proof)
     }
+    /// ACKed row hash, for grain only; never an identity authority.
+    pub(super) fn proved_account(&self, bucket: i64, row: &RowKey) -> Option<String> {
+        let row = proved_row_hash(self.bound_key(), row);
+        self.proved
+            .binary_search_by_key(&(bucket, row), |entry| (entry.bucket, entry.row))
+            .ok()
+            .and_then(|index| self.proved[index].account.as_ref().map(digest_hex::encode))
+    }
     /// Today's proof digest for a row in its fresh-tag wire form.
     pub(super) fn row_proof(&self, row: &Value, evidence: &Value) -> Option<[u8; 16]> {
         row_proof(self.bound_key(), row, evidence)
@@ -504,6 +509,7 @@ impl AcceptedBuckets {
                                     bucket: starts[n],
                                     row: [255; 16],
                                     proof: [255; 16],
+                                    account: Some([255; 32]),
                                 })
                                 .collect(),
                             missing: starts[..MAX_PENDING_MISSING].to_vec(),
@@ -715,7 +721,7 @@ impl AcceptedBuckets {
         let key = entry.bound_key().clone();
         let mut proved = std::mem::take(&mut entry.proved)
             .into_iter()
-            .map(|entry| ((entry.bucket, entry.row), entry.proof))
+            .map(|entry| ((entry.bucket, entry.row), (entry.proof, entry.account)))
             .collect::<BTreeMap<_, _>>();
         let mut pending = std::mem::take(&mut entry.missing)
             .into_iter()
@@ -740,7 +746,14 @@ impl AcceptedBuckets {
                     continue;
                 }
                 if let Some(proof) = row_proof(&key, row, &body["request_evidence"]) {
-                    proved.insert((start, row_hash), proof);
+                    let account = match row["account_identifier_hash"].as_str() {
+                        Some(hash) => match digest_hex::decode::<serde::de::value::Error>(hash) {
+                            Ok(hash) => Some(hash),
+                            Err(_) => continue,
+                        },
+                        None => None,
+                    };
+                    proved.insert((start, row_hash), (proof, account));
                     pending.remove(&start);
                 }
             }
@@ -755,17 +768,25 @@ impl AcceptedBuckets {
                 pending.insert(start);
             }
         }
+        let mut capped = 0u64;
         // Evict whole oldest buckets: a lost row only means fresh tags later.
         while proved.len() > MAX_PROVED_ROWS {
             let oldest = proved.keys().next().expect("nonempty").0;
+            let before = proved.len();
             proved.retain(|(bucket, _), _| *bucket != oldest);
+            capped += (before - proved.len()) as u64;
         }
         while pending.len() > MAX_PENDING_MISSING {
             pending.pop_first();
         }
         entry.proved = proved
             .into_iter()
-            .map(|((bucket, row), proof)| ProvedRow { bucket, row, proof })
+            .map(|((bucket, row), (proof, account))| ProvedRow {
+                bucket,
+                row,
+                proof,
+                account,
+            })
             .collect::<Vec<_>>()
             .into_boxed_slice()
             .into_vec();
@@ -774,9 +795,10 @@ impl AcceptedBuckets {
             .collect::<Vec<_>>()
             .into_boxed_slice()
             .into_vec();
-        if received > 0 {
+        if received > 0 || capped > 0 {
             super::budget::record(&super::budget::Counts {
                 retained_proof_missing_received: received,
+                proved_rows_capped: capped,
                 ..Default::default()
             });
         }
@@ -1014,6 +1036,7 @@ mod heap_tests {
                 })
                 .collect(),
             None,
+            false,
             false,
         );
         let mut counter = Counter::new(3 * 1024 * 1024);
@@ -1317,7 +1340,7 @@ mod retained_tests {
         );
         let compact: Value = serde_json::from_slice(&encoded).unwrap();
         let session = compact.as_object().unwrap().values().next().unwrap();
-        assert_eq!(session["proved"].as_str().unwrap().len(), 80);
+        assert_eq!(session["proved"].as_str().unwrap().len(), 103);
         for corrupt in [json!("0".repeat(79)), json!("G".repeat(80)), json!([1])] {
             let mut bad = compact.clone();
             for state in bad.as_object_mut().unwrap().values_mut() {
@@ -1351,7 +1374,14 @@ mod retained_tests {
             }))
             .collect::<Vec<_>>());
         let mut state = AcceptedBuckets::for_test();
+        super::super::take_identity_counts();
         state.record_proved(&value, true, &[]);
+        assert_eq!(
+            super::super::take_identity_counts()
+                .identity_cap
+                .proved_rows_capped,
+            2
+        );
         let known = state.get("synthetic").unwrap();
         assert_eq!(known.proved.len(), MAX_PROVED_ROWS);
         assert_eq!(known.proved.capacity(), MAX_PROVED_ROWS);
@@ -1391,7 +1421,8 @@ mod retained_heap_tests {
                                 ProvedRow {
                                     bucket: 1,
                                     row: [0; 16],
-                                    proof: [0; 16]
+                                    proof: [0; 16],
+                                    account: Some([255; 32]),
                                 };
                                 MAX_PROVED_ROWS
                             ],
@@ -1402,12 +1433,13 @@ mod retained_heap_tests {
                 .collect(),
             None,
             false,
+            false,
         );
         let mut counter = Counter::new(4 * 1024 * 1024);
         counter.add(std::mem::size_of_val(&state)).unwrap();
         state.heap_bound(&mut counter).unwrap();
-        assert_eq!(std::mem::size_of::<ProvedRow>(), 40);
-        assert!(counter.bytes < 4 * 1024 * 1024);
+        assert_eq!(std::mem::size_of::<ProvedRow>(), 80);
+        assert!(counter.bytes <= 4_010_000, "layout={}", counter.bytes);
         eprintln!(
             "accepted-share+proved-row requested-layout maximum={} bytes",
             counter.bytes

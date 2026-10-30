@@ -1418,13 +1418,19 @@ A stored-body ACK's optional `retained_proof_missing` bucket starts remove that
 body's marked rows, so a later revision re-tags them through the same
 allocator. A destination namespace or historical replay generation change
 clears all proved rows, as do key rotation and session eviction (the class L
-last-ACK LRU above). Limits: 1,536 proved rows per session, persisted as one
-hex string of 40-byte records, and 64 pending missing buckets (diagnostic
-only). At every cap the progress JSON stays below 8 MiB and the
+last-ACK LRU above). Limits: 1,024 proved rows per session, persisted as
+versioned base64 of 73-byte records, and 64 pending missing buckets (diagnostic
+only). Each proved record also stores the proving revision's optional row-level
+account hash (class H, bounded and erased with the session). Login markers resend
+that ACK-bound hash for grain only; parts markers have no hash. Old records without
+hash provenance fail closed to fresh tags. Markers require contract 6
+(`claude_request_owned_usage:v1`); contract-5-only bodies send fresh tags.
+Rows evicted at the proof cap also send fresh tags through the usual caps. At every cap the progress JSON stays below 8 MiB and the
 requested-layout maximum below 4 MiB.
 
 Sparse `identity_cap` counters, omitted while zero: `retained_marker_rows`,
-`retained_proof_missing_received`, `retained_set_cleared` and
+`retained_proof_missing_received`, `retained_set_cleared`, `proved_rows_capped`
+(rows not retained at the proof cap), and
 `retained_missing_unfit` (a missing-proof bucket whose fresh proof did not fit
 and kept today's untagged/refused rule). `accepted_share_changed` also counts
 proved rows sent with different proof.
