@@ -9003,7 +9003,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             &index.claude_usage_family_pending,
             legacy_request_owners.as_ref(),
         );
-        let retained_occurrences = index
+        // Running total: each resolved replacement counts before the next.
+        let mut retained_occurrences = index
             .claude_usage_family_pending
             .values()
             .flat_map(|pending| pending.member_occurrences.values())
@@ -9035,7 +9036,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     .usage_guard_holds
                     .growth_pending(root_session_id, census_window_end)
             })
-            .filter(|growth| {
+            .map(|growth| {
                 let count = |pending: &ClaudeUsageFamilyPending| {
                     pending
                         .member_occurrences
@@ -9043,12 +9044,15 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                         .map(BTreeMap::len)
                         .fold(0_usize, usize::saturating_add)
                 };
-                retained_occurrences
+                let total = retained_occurrences
                     .saturating_sub(count(base_pending))
-                    .saturating_add(count(growth))
-                    <= max_pending_occurrences
-            });
-            let mut pending = held_growth.clone().unwrap_or_else(|| base_pending.clone());
+                    .saturating_add(count(&growth));
+                (growth, total)
+            })
+            .filter(|(_, total)| *total <= max_pending_occurrences);
+            let mut pending = held_growth
+                .as_ref()
+                .map_or_else(|| base_pending.clone(), |(growth, _)| growth.clone());
             for member in confirmed_empty_claude_family_members(index, root_session_id) {
                 pending
                     .member_request_id_hashes
@@ -9097,7 +9101,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             if !retain_rows {
                 family.rows_by_member = BTreeMap::new();
             }
-            if let Some(growth) = held_growth {
+            if let Some((growth, total)) = held_growth {
+                retained_occurrences = total;
                 resolved_holds.push((root_session_id.clone(), growth));
             }
             proven.insert(root_session_id.clone(), family);
