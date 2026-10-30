@@ -199,32 +199,34 @@ fn identity_pipeline_cycle(
 #[serial]
 #[serial(source_cadences, source_manifests)]
 fn native_comparison_real_source_preparation_stays_base_without_paired_evidence() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let fixture = IdentityPipelineHome::new();
-    let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
-    let cycle = identity_pipeline_cycle(&fixture, "native-preparation", "").unwrap();
-    if crate::heap_layout_bound::layout_supported() {
-        assert!(cycle.prepared_before_body);
-    } else {
-        assert!(
-            !cycle.prepared_before_body,
-            "unsupported layout refuses optional early rows"
-        );
-        assert_eq!(
-            cycle.body, cycle.dark_oracle,
-            "unsupported preparation remains exact ordinary BASE"
-        );
-        writeln!(std::io::stderr().lock(), "native_comparison_real_prepare: unsupported_BASE_body_equal=true optional_early_rows=false positive_preparation=UNEXECUTED").unwrap();
-    }
-    assert!(!cycle.snapshots.is_empty());
-    assert!(cycle
-        .snapshots
-        .iter()
-        .all(|item| item.usage_accounting_contract.is_none()));
-    // The read-only phase is exercised by actual SourcePreparation::step;
-    // absent paired evidence yields zero coverage and the existing base path.
-    writeln!(std::io::stderr().lock(), "native_comparison_checkpoint: real_source_preparation=true missing_pairs_base=true reuse_activated=false").unwrap();
+    run_on_scan_worker_stack(|| {
+        // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+        let fixture = IdentityPipelineHome::new();
+        let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
+        let cycle = identity_pipeline_cycle(&fixture, "native-preparation", "").unwrap();
+        if crate::heap_layout_bound::layout_supported() {
+            assert!(cycle.prepared_before_body);
+        } else {
+            assert!(
+                !cycle.prepared_before_body,
+                "unsupported layout refuses optional early rows"
+            );
+            assert_eq!(
+                cycle.body, cycle.dark_oracle,
+                "unsupported preparation remains exact ordinary BASE"
+            );
+            writeln!(std::io::stderr().lock(), "native_comparison_real_prepare: unsupported_BASE_body_equal=true optional_early_rows=false positive_preparation=UNEXECUTED").unwrap();
+        }
+        assert!(!cycle.snapshots.is_empty());
+        assert!(cycle
+            .snapshots
+            .iter()
+            .all(|item| item.usage_accounting_contract.is_none()));
+        // The read-only phase is exercised by actual SourcePreparation::step;
+        // absent paired evidence yields zero coverage and the existing base path.
+        writeln!(std::io::stderr().lock(), "native_comparison_checkpoint: real_source_preparation=true missing_pairs_base=true reuse_activated=false").unwrap();
+    });
 }
 
 /// Contract 5 is always on: with the old cohort token, without it, or with
@@ -236,88 +238,90 @@ fn native_comparison_real_source_preparation_stays_base_without_paired_evidence(
 #[serial]
 #[serial(source_cadences, source_manifests)]
 fn always_on_emits_contract5_whatever_the_hint_token() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    use crate::snapshots::claude_request_identity as identity;
-    let fixture = IdentityPipelineHome::new();
-    let session = |cycle: &IdentityPipelineCycle| {
-        cycle
-            .snapshots
-            .iter()
-            .find(|item| item.source_session_id == IDENTITY_PIPELINE_ROOT)
-            .expect("the synthetic session is scanned")
-            .clone()
-    };
-    let mut bodies = BTreeSet::new();
-    for (name, extra) in [
-        ("absent", ""),
-        ("null", r#","session_request_identity_contract":null"#),
-        (
-            "token",
-            r#","session_request_identity_contract":"own_request_identity_rows:v1""#,
-        ),
-        (
-            "other",
-            r#","session_request_identity_contract":"own_request_identity_rows:v2""#,
-        ),
-        (
-            "prefixed",
-            r#","session_request_identity_contract":" own_request_identity_rows:v1""#,
-        ),
-        (
-            "collector",
-            r#","session_request_identity_contract":"claude_code_jsonl:own_request_identity_rows:v1""#,
-        ),
-    ] {
-        let cycle = identity_pipeline_cycle(&fixture, name, extra).expect("cycle");
-        let item = session(&cycle);
-        assert_eq!(item.provenance.collector, identity::COLLECTOR, "{name}");
-        assert!(
-            item.claude_org_markers.is_some(),
-            "{name}: markers captured"
-        );
-        assert!(
-            identity::desktop_census(&cycle.scanned_index).is_some(),
-            "{name}: census witness"
-        );
-        // Even a settled pass withdraws marker-only tags. Nothing is refused
-        // and usage is unchanged.
-        assert!(item.request_evidence.is_empty(), "{name}");
-        assert_eq!(item.request_identity_refusals, 0, "{name}");
-        assert_eq!(
-            (item.request_count, item.input_tokens, item.output_tokens),
-            (2, 30, 3)
-        );
-        // Each cycle scans at its own wall time, so compare what the hint
-        // could change: the contract and every tagged row.
-        bodies.insert(
-            serde_json::to_vec(&(
-                &item.provenance.collector,
-                &item.request_evidence,
-                item.request_identity_refusals,
-                &item.model_usage,
-                &item.usage_buckets,
-            ))
-            .expect("serialize identity projection"),
-        );
-    }
-    assert_eq!(bodies.len(), 1, "the hint token changes no identity or usage");
+    run_on_scan_worker_stack(|| {
+        // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+        use crate::snapshots::claude_request_identity as identity;
+        let fixture = IdentityPipelineHome::new();
+        let session = |cycle: &IdentityPipelineCycle| {
+            cycle
+                .snapshots
+                .iter()
+                .find(|item| item.source_session_id == IDENTITY_PIPELINE_ROOT)
+                .expect("the synthetic session is scanned")
+                .clone()
+        };
+        let mut bodies = BTreeSet::new();
+        for (name, extra) in [
+            ("absent", ""),
+            ("null", r#","session_request_identity_contract":null"#),
+            (
+                "token",
+                r#","session_request_identity_contract":"own_request_identity_rows:v1""#,
+            ),
+            (
+                "other",
+                r#","session_request_identity_contract":"own_request_identity_rows:v2""#,
+            ),
+            (
+                "prefixed",
+                r#","session_request_identity_contract":" own_request_identity_rows:v1""#,
+            ),
+            (
+                "collector",
+                r#","session_request_identity_contract":"claude_code_jsonl:own_request_identity_rows:v1""#,
+            ),
+        ] {
+            let cycle = identity_pipeline_cycle(&fixture, name, extra).expect("cycle");
+            let item = session(&cycle);
+            assert_eq!(item.provenance.collector, identity::COLLECTOR, "{name}");
+            assert!(
+                item.claude_org_markers.is_some(),
+                "{name}: markers captured"
+            );
+            assert!(
+                identity::desktop_census(&cycle.scanned_index).is_some(),
+                "{name}: census witness"
+            );
+            // Even a settled pass withdraws marker-only tags. Nothing is refused
+            // and usage is unchanged.
+            assert!(item.request_evidence.is_empty(), "{name}");
+            assert_eq!(item.request_identity_refusals, 0, "{name}");
+            assert_eq!(
+                (item.request_count, item.input_tokens, item.output_tokens),
+                (2, 30, 3)
+            );
+            // Each cycle scans at its own wall time, so compare what the hint
+            // could change: the contract and every tagged row.
+            bodies.insert(
+                serde_json::to_vec(&(
+                    &item.provenance.collector,
+                    &item.request_evidence,
+                    item.request_identity_refusals,
+                    &item.model_usage,
+                    &item.usage_buckets,
+                ))
+                .expect("serialize identity projection"),
+            );
+        }
+        assert_eq!(bodies.len(), 1, "the hint token changes no identity or usage");
 
-    // A hint that cannot be read aborts the cycle: no scan, no fallback body.
-    let support = fixture.base.join("support-unreadable");
-    assert!(identity_pipeline_cycle(
-        &fixture,
-        "unreadable",
-        r#","session_request_identity_contract":"#,
-    )
-    .is_err());
-    assert!(
-        std::fs::read_dir(&support)
-            .expect("support dir")
-            .next()
-            .is_none(),
-        "an aborted cycle writes no scan state"
-    );
+        // A hint that cannot be read aborts the cycle: no scan, no fallback body.
+        let support = fixture.base.join("support-unreadable");
+        assert!(identity_pipeline_cycle(
+            &fixture,
+            "unreadable",
+            r#","session_request_identity_contract":"#,
+        )
+        .is_err());
+        assert!(
+            std::fs::read_dir(&support)
+                .expect("support dir")
+                .next()
+                .is_none(),
+            "an aborted cycle writes no scan state"
+        );
+    });
 }
 
 /// Offline transport for the real source lifecycle. It ACKs exactly the wire
@@ -789,63 +793,168 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
 #[serial]
 #[serial(source_cadences, source_manifests)]
 fn preparation_error_preserves_normalization_counts_with_and_without_a_lease() {
-    for leased in [false, true] {
-        let _enabled = leased.then(crate::snapshots::claude_native_comparison::enable_for_test);
-        let fixture = IdentityPipelineHome::new();
-        let _cadence = IdentityPipelineCadence::new();
-        let source = SnapshotSource::ClaudeCode;
-        let support = fixture.base.join("error-diagnostics-support");
-        std::fs::create_dir_all(&support).unwrap();
-        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
-        let device = report_kind_test_device();
-        let namespace = snapshot_upload_destination_namespace(&device, "device-secret");
-        let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
-            &snapshot_index_path(&support, source),
-            &namespace,
-        ));
-        std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
-        let root = IDENTITY_PIPELINE_ROOT;
-        let key = format!("/synthetic/projects/{root}.jsonl");
-        let mut value = serde_json::to_value(ScanIndex::default()).unwrap();
-        value["files"] = serde_json::json!({key: {
-            "size_bytes": 1, "modified_unix_seconds": 1,
-            "source_file_fingerprint": "a".repeat(64),
-            "last_snapshot_fingerprint": "b".repeat(64)
-        }});
-        // Structurally valid, but no retained witness binds this record.
-        value["claude_usage_authority_quarantine"] = serde_json::json!({root: {
-            "contract": "claude_usage_authority_quarantine:v1",
-            "proven_witness_fingerprint": "9".repeat(64),
-            "member_source_file_fingerprints": {root: "a".repeat(64)},
-            "failed_reconstruction_count": 1, "disposition": "retry_pending",
-            "retry_after_unix_seconds": 0
-        }});
-        std::fs::write(&index_path, serde_json::to_vec(&value).unwrap()).unwrap();
-        let progress_path = snapshot_upload_progress_path(&index_path);
-        let mut progress =
-            SnapshotUploadProgress::new(namespace, snapshot_quarantine_witness(source));
-        progress.generation = u64::MAX;
-        std::fs::write(&progress_path, serde_json::to_vec(&progress).unwrap()).unwrap();
-        let client = SnapshotApiClient::new(snapshot_status_server_with_hint_extras(
-            Arc::new(Mutex::new(Vec::new())),
-            vec![(183, "")],
-        ));
-        let daemon = test_daemon("otm_test");
-        let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-        let (result, rows) = crate::local_resource_diagnostics::capture(|| {
-            crate::agent_status_refresh::with_test_collection(
-                AgentStatusCollection {
-                    snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
-                    source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
-                    codex_scan_homes: Vec::new(),
-                    codex_home_bindings: Vec::new(),
-                },
-                || {
+    run_on_scan_worker_stack(|| {
+        for leased in [false, true] {
+            let _enabled = leased.then(crate::snapshots::claude_native_comparison::enable_for_test);
+            let fixture = IdentityPipelineHome::new();
+            let _cadence = IdentityPipelineCadence::new();
+            let source = SnapshotSource::ClaudeCode;
+            let support = fixture.base.join("error-diagnostics-support");
+            std::fs::create_dir_all(&support).unwrap();
+            let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+            let device = report_kind_test_device();
+            let namespace = snapshot_upload_destination_namespace(&device, "device-secret");
+            let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+                &snapshot_index_path(&support, source),
+                &namespace,
+            ));
+            std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+            let root = IDENTITY_PIPELINE_ROOT;
+            let key = format!("/synthetic/projects/{root}.jsonl");
+            let mut value = serde_json::to_value(ScanIndex::default()).unwrap();
+            value["files"] = serde_json::json!({key: {
+                "size_bytes": 1, "modified_unix_seconds": 1,
+                "source_file_fingerprint": "a".repeat(64),
+                "last_snapshot_fingerprint": "b".repeat(64)
+            }});
+            // Structurally valid, but no retained witness binds this record.
+            value["claude_usage_authority_quarantine"] = serde_json::json!({root: {
+                "contract": "claude_usage_authority_quarantine:v1",
+                "proven_witness_fingerprint": "9".repeat(64),
+                "member_source_file_fingerprints": {root: "a".repeat(64)},
+                "failed_reconstruction_count": 1, "disposition": "retry_pending",
+                "retry_after_unix_seconds": 0
+            }});
+            std::fs::write(&index_path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let progress_path = snapshot_upload_progress_path(&index_path);
+            let mut progress =
+                SnapshotUploadProgress::new(namespace, snapshot_quarantine_witness(source));
+            progress.generation = u64::MAX;
+            std::fs::write(&progress_path, serde_json::to_vec(&progress).unwrap()).unwrap();
+            let client = SnapshotApiClient::new(snapshot_status_server_with_hint_extras(
+                Arc::new(Mutex::new(Vec::new())),
+                vec![(183, "")],
+            ));
+            let daemon = test_daemon("otm_test");
+            let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+            let (result, rows) = crate::local_resource_diagnostics::capture(|| {
+                crate::agent_status_refresh::with_test_collection(
+                    AgentStatusCollection {
+                        snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
+                        source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
+                        codex_scan_homes: Vec::new(),
+                        codex_home_bindings: Vec::new(),
+                    },
+                    || {
+                        prepare_sync_source(
+                            &client,
+                            &device,
+                            "device-secret",
+                            source,
+                            "otm_test",
+                            &fixture.home,
+                            &support,
+                            &daemon,
+                            &mut transport,
+                            [7; 32],
+                            false,
+                        )
+                    },
+                )
+            });
+            let error = result
+                .err()
+                .expect("the progress generation cannot advance");
+            assert!(
+                error
+                    .to_string()
+                    .contains("snapshot upload progress generation overflow"),
+                "{error:#}"
+            );
+            let events = rows
+                .iter()
+                .filter(|row| {
+                    row["counts"]["claude_reread"]["authority_normalization_cleared"]
+                        .as_u64()
+                        .is_some()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(events.len(), 1, "leased={leased}: {rows:?}");
+            assert_eq!(events[0]["stage"], "native_comparison_decision");
+            assert_eq!(events[0]["source"], "claude_code");
+            assert_eq!(
+                events[0]["counts"]["claude_reread"]["authority_normalization_cleared"],
+                1
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(&progress_path).unwrap())
+                    .unwrap()["generation"],
+                u64::MAX
+            );
+            assert!(!crate::local_resource_diagnostics::claude_reread::active());
+        }
+    });
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+fn transport_errors_keep_the_contract_without_observation() {
+    run_on_scan_worker_stack(|| {
+        for leased in [false, true] {
+            let _enabled = leased.then(crate::snapshots::claude_native_comparison::enable_for_test);
+            for failure in ["fetch", "hint", "invalid_hint"] {
+                let fetch = failure == "fetch";
+                let invalid_hint = failure == "invalid_hint";
+                let fixture = IdentityPipelineHome::new();
+                let _cadence = IdentityPipelineCadence::new();
+                let support = fixture.base.join("failure-support");
+                std::fs::create_dir_all(&support).unwrap();
+                let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let client =
+                    SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+                let server = std::thread::spawn(move || {
+                    for step in 0..if fetch { 1 } else { 2 } {
+                        let (mut stream, _) = listener.accept().unwrap();
+                        read_complete_http_request(&mut stream);
+                        let token = !fetch && step == 0;
+                        let body = if token {
+                            r#"{"token":"synthetic-token","expires_at":"2026-08-02T10:00:00Z"}"#
+                        } else if invalid_hint {
+                            r#"{"source":"claude_code","server_time":"2026-08-02T10:00:00Z","last_data_at":null,"record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,"backfill_window_days":18446744073709551615,"recommended_scan_after":"2026-08-02T10:05:00Z"}"#
+                        } else {
+                            r#"{"error":"synthetic"}"#
+                        };
+                        let status = if token || invalid_hint {
+                            "200 OK"
+                        } else {
+                            "500 Internal Server Error"
+                        };
+                        write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    }
+                });
+                let device = report_kind_test_device();
+                let namespace = snapshot_upload_destination_namespace(&device, "device-secret");
+                let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+                    &snapshot_index_path(&support, SnapshotSource::ClaudeCode),
+                    &namespace,
+                ));
+                let mut saved = serde_json::to_value(ScanIndex::default()).unwrap();
+                saved["claude_request_identity_contract"] =
+                    serde_json::json!(crate::snapshots::claude_request_identity::COLLECTOR);
+                saved["claude_request_identity_contract_changed"] = serde_json::json!(true);
+                std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+                let bytes = serde_json::to_vec(&saved).unwrap();
+                std::fs::write(&index_path, &bytes).unwrap();
+                let daemon = test_daemon("otm_test");
+                let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+                let (result, rows) = crate::local_resource_diagnostics::capture(|| {
                     prepare_sync_source(
                         &client,
                         &device,
                         "device-secret",
-                        source,
+                        SnapshotSource::ClaudeCode,
                         "otm_test",
                         &fixture.home,
                         &support,
@@ -854,123 +963,22 @@ fn preparation_error_preserves_normalization_counts_with_and_without_a_lease() {
                         [7; 32],
                         false,
                     )
-                },
-            )
-        });
-        let error = result
-            .err()
-            .expect("the progress generation cannot advance");
-        assert!(
-            error
-                .to_string()
-                .contains("snapshot upload progress generation overflow"),
-            "{error:#}"
-        );
-        let events = rows
-            .iter()
-            .filter(|row| {
-                row["counts"]["claude_reread"]["authority_normalization_cleared"]
-                    .as_u64()
-                    .is_some()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(events.len(), 1, "leased={leased}: {rows:?}");
-        assert_eq!(events[0]["stage"], "native_comparison_decision");
-        assert_eq!(events[0]["source"], "claude_code");
-        assert_eq!(
-            events[0]["counts"]["claude_reread"]["authority_normalization_cleared"],
-            1
-        );
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&progress_path).unwrap())
-                .unwrap()["generation"],
-            u64::MAX
-        );
-        assert!(!crate::local_resource_diagnostics::claude_reread::active());
-    }
-}
-
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-fn transport_errors_keep_the_contract_without_observation() {
-    for leased in [false, true] {
-        let _enabled = leased.then(crate::snapshots::claude_native_comparison::enable_for_test);
-        for failure in ["fetch", "hint", "invalid_hint"] {
-            let fetch = failure == "fetch";
-            let invalid_hint = failure == "invalid_hint";
-            let fixture = IdentityPipelineHome::new();
-            let _cadence = IdentityPipelineCadence::new();
-            let support = fixture.base.join("failure-support");
-            std::fs::create_dir_all(&support).unwrap();
-            let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let client =
-                SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
-            let server = std::thread::spawn(move || {
-                for step in 0..if fetch { 1 } else { 2 } {
-                    let (mut stream, _) = listener.accept().unwrap();
-                    read_complete_http_request(&mut stream);
-                    let token = !fetch && step == 0;
-                    let body = if token {
-                        r#"{"token":"synthetic-token","expires_at":"2026-08-02T10:00:00Z"}"#
-                    } else if invalid_hint {
-                        r#"{"source":"claude_code","server_time":"2026-08-02T10:00:00Z","last_data_at":null,"record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,"backfill_window_days":18446744073709551615,"recommended_scan_after":"2026-08-02T10:05:00Z"}"#
-                    } else {
-                        r#"{"error":"synthetic"}"#
-                    };
-                    let status = if token || invalid_hint {
-                        "200 OK"
-                    } else {
-                        "500 Internal Server Error"
-                    };
-                    write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                });
+                assert!(result.is_err());
+                server.join().unwrap();
+                assert_eq!(
+                    std::fs::read(&index_path).unwrap(),
+                    bytes,
+                    "error preserves last contract and latch"
+                );
+                // The retired permit counters are gone; nothing observes a
+                // contract on a failed preparation.
+                for row in &rows {
+                    assert!(row["counts"].get("request_identity_permit").is_none());
+                    assert!(row["counts"].get("identity_contract_transition").is_none());
                 }
-            });
-            let device = report_kind_test_device();
-            let namespace = snapshot_upload_destination_namespace(&device, "device-secret");
-            let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
-                &snapshot_index_path(&support, SnapshotSource::ClaudeCode),
-                &namespace,
-            ));
-            let mut saved = serde_json::to_value(ScanIndex::default()).unwrap();
-            saved["claude_request_identity_contract"] =
-                serde_json::json!(crate::snapshots::claude_request_identity::COLLECTOR);
-            saved["claude_request_identity_contract_changed"] = serde_json::json!(true);
-            std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
-            let bytes = serde_json::to_vec(&saved).unwrap();
-            std::fs::write(&index_path, &bytes).unwrap();
-            let daemon = test_daemon("otm_test");
-            let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-            let (result, rows) = crate::local_resource_diagnostics::capture(|| {
-                prepare_sync_source(
-                    &client,
-                    &device,
-                    "device-secret",
-                    SnapshotSource::ClaudeCode,
-                    "otm_test",
-                    &fixture.home,
-                    &support,
-                    &daemon,
-                    &mut transport,
-                    [7; 32],
-                    false,
-                )
-            });
-            assert!(result.is_err());
-            server.join().unwrap();
-            assert_eq!(
-                std::fs::read(&index_path).unwrap(),
-                bytes,
-                "error preserves last contract and latch"
-            );
-            // The retired permit counters are gone; nothing observes a
-            // contract on a failed preparation.
-            for row in &rows {
-                assert!(row["counts"].get("request_identity_permit").is_none());
-                assert!(row["counts"].get("identity_contract_transition").is_none());
+                assert!(!crate::local_resource_diagnostics::claude_reread::active());
             }
-            assert!(!crate::local_resource_diagnostics::claude_reread::active());
         }
-    }
+    });
 }

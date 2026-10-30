@@ -499,7 +499,6 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
         return;
     }
     assert!(crate::heap_layout_bound::layout_supported());
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let _clear = ClearPreparationFault;
     for return_mode in [
         "accept",
@@ -1282,7 +1281,6 @@ impl Drop for ClearWriteFaults {
 fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mutation() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(crate::heap_layout_bound::layout_supported());
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     for cause in [
         "obligation_overflow",
         "namespace_pending",
@@ -1864,7 +1862,6 @@ pub(super) fn native_fixture(path: &Path) {
 #[test]
 fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let root = crate::test_scratch::private_dir("ottto-dt-owed");
     let lock = test_locks::hold(&root);
     let source = SnapshotSource::ClaudeCode;
@@ -4143,7 +4140,7 @@ fn restore_scope_attribution_is_typed_and_preserves_binding_formula() {
         crate::snapshot_sync::effective_upload_body_witness_revision(source),
         index.active_effective_upload_body_witness_revision,
         index.claude_money_birth_store.money_rule_version(),
-        claude_request_money::e2::enabled(),
+        true,
     );
     assert_eq!(
         base, prior_formula,
@@ -4593,7 +4590,7 @@ fn scope_for(
         } else {
             0
         },
-        source == DurableSource::ClaudeCode && claude_request_money::e2::enabled(),
+        source == DurableSource::ClaudeCode,
     )
 }
 
@@ -5240,7 +5237,6 @@ fn receipt_retry_bound_reads_growth_after_quiet_window_and_restart_is_idle() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::io::Write;
     assert!(crate::heap_layout_bound::layout_supported());
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let root = crate::test_scratch::ScratchDir::new("receipt-growth-quiet");
     let lock = test_locks::hold(&root);
     let _clear = ClearWriteFaults;
@@ -5554,7 +5550,6 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
         return;
     }
     assert!(crate::heap_layout_bound::layout_supported());
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     struct DependenciesReset;
     impl Drop for DependenciesReset {
         fn drop(&mut self) {
@@ -6194,7 +6189,6 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     for (arm, grow) in [
         ("859", true),
         ("carry", true),
@@ -6949,7 +6943,6 @@ fn b1_strict_tail_writer_retries_with_the_original_witness_after_memo_loss() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let root = crate::test_scratch::private_dir("ottto-b1-witness-retry");
     let lock = test_locks::hold(&root);
     let projects = root.join("projects");
@@ -7087,7 +7080,6 @@ fn c_strict_writer_retires_only_a_successfully_acknowledged_replacement() {
     for edge in ["ordinary", "pre_rename", "post_rename", "dir_sync"] {
         use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
         use std::io::Write;
-        let _gate = claude_request_money::e2::GateForTest::set(true);
         let root = crate::test_scratch::private_dir("ottto-c-batch-ack");
         let lock = test_locks::hold(&root);
         let projects = root.join("projects");
@@ -7330,7 +7322,6 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let root = crate::test_scratch::private_dir("ottto-a1t-no-match");
     let lock = test_locks::hold(&root);
     let projects = root.join("projects");
@@ -7917,7 +7908,6 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     for (cause, reason) in ["context", "restore_semantics", "revision_adoption_required"]
         .into_iter()
         .enumerate()
@@ -8241,7 +8231,6 @@ fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     for arm in ["ordinary", "capacity", "cancel", "restart", "metadata"] {
         let root = crate::test_scratch::private_dir("absent-growth");
         let projects = root.join("projects");
@@ -8486,7 +8475,6 @@ fn b1_future_accepted_floor_blocks_fresh_cancelled_and_restarted_inputs_before_r
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     for arm in ["fresh", "cancel", "restart"] {
         let root = crate::test_scratch::private_dir("absent-future-floor");
         let projects = root.join("projects");
@@ -8578,7 +8566,6 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let root = crate::test_scratch::private_dir("ottto-a1t-no-match-pace");
     let lock = test_locks::hold(&root);
     let projects = root.join("projects");
@@ -8949,7 +8936,6 @@ fn p2_restart_restore_tail_persists_successor_and_restarts_again() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let root = crate::test_scratch::private_dir("ottto-p2-restart");
     let lock = test_locks::hold(&root);
     let projects = root.join("projects");
@@ -9417,7 +9403,6 @@ fn warm_shortened_old_file_keeps_accepted_body_floor_without_publication() {
     }
     use std::io::Write;
     assert!(crate::heap_layout_bound::layout_supported());
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let root = crate::test_scratch::ScratchDir::new("p3-warm-floor");
     let sessions = root.join("sessions");
     std::fs::create_dir(&sessions).unwrap();
@@ -9747,7 +9732,6 @@ impl Drop for O3Fixture {
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_completion_replaces_no_match_idle_zero_restart_tail_and_money_equals_cold() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let f = O3Fixture::new();
     let source = SnapshotSource::ClaudeCode;
     for arm in ["idle", "clear", "mtime"] {
@@ -9929,7 +9913,6 @@ fn o3_completion_replaces_no_match_idle_zero_restart_tail_and_money_equals_cold(
 fn o3_save_failure_cancelled_claim_restart_preserves_option_i_and_survivor() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for cleared in [false, true] {
-        let _gate = claude_request_money::e2::GateForTest::set(true);
         let f = O3Fixture::new();
         f.append("growth", 200);
         let owner = f.owner();
@@ -10017,7 +10000,6 @@ fn o3_save_failure_cancelled_claim_restart_preserves_option_i_and_survivor() {
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_same_owner_shorter_growth_expires_pace_without_lowering_original_floor() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let f = O3Fixture::new();
     f.append("growth", 200);
     let shorter = std::fs::read(&f.path).unwrap();
@@ -10111,7 +10093,6 @@ fn o3_same_owner_shorter_growth_expires_pace_without_lowering_original_floor() {
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_failed_atomic_replacement_never_retires_original_without_its_receipt() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     for edge in ["pre_rename", "dir_sync"] {
         let f = O3Fixture::new();
         f.append("growth", 200);
@@ -10191,7 +10172,6 @@ fn o3_failed_atomic_replacement_never_retires_original_without_its_receipt() {
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_audit_selection_progresses_but_owed_adoption_never_borrows_migration_authority() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     for arm in ["audit", "adoption"] {
         let f = O3Fixture::new();
         f.append("growth", 200);
@@ -10241,7 +10221,6 @@ fn o3_audit_selection_progresses_but_owed_adoption_never_borrows_migration_autho
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_custody_capacity_fails_toward_counted_read_without_mutating_survivor() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let f = O3Fixture::new();
     f.append("growth", 200);
     let owner = f.owner();
@@ -10283,7 +10262,6 @@ fn o3_custody_capacity_fails_toward_counted_read_without_mutating_survivor() {
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_changed_object_and_scope_memo_capacity_read_without_replacement_authority() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     for arm in ["object", "scope-capacity"] {
         let f = O3Fixture::new();
         let old = std::fs::metadata(&f.path).unwrap();
@@ -10354,7 +10332,6 @@ fn o3_changed_object_and_scope_memo_capacity_read_without_replacement_authority(
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_obsolete_long_record_after_shorter_replacement_and_failed_rename_cannot_mask_growth() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let rows = a1a_row("old-one", 1000) + &a1a_row("old-two", 2000) + &a1a_row("old-three", 3000);
     let mut f = O3Fixture::from_rows(&rows, false);
     let old_length = std::fs::metadata(&f.path).unwrap().len();
@@ -10436,7 +10413,6 @@ fn o3_obsolete_long_record_after_shorter_replacement_and_failed_rename_cannot_ma
 fn o3_generation_ahead_survivor_reads_growth_without_mutation_authority() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for overflow in [false, true] {
-        let _gate = claude_request_money::e2::GateForTest::set(true);
         let mut f = O3Fixture::new();
         let future_generation = f.prior.generation + 100_000;
         f.rewrite_survivor(|r| r.index_generation = future_generation);
@@ -10514,7 +10490,6 @@ fn o3_generation_ahead_survivor_reads_growth_without_mutation_authority() {
 #[ignore = "requires landed E3 generic growth discovery (#876)"]
 fn o3_paced_growth_survives_idle_past_window_until_real_native_catchup() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let mut f = O3Fixture::new();
     f.rewrite_survivor(|r| r.index_generation += 100_000); // forces option (i)
     f.append("growth", 200);
@@ -10734,7 +10709,6 @@ fn claude_unregistered_money_replay_keeps_typed_stale_and_shared_pace() {
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn stale_binding_cannot_mask_equal_head_edit_or_shorter_replacement_across_restart() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     for binding in ["context", "no_match"] {
         for edit in ["equal_head", "shorter_object"] {
             let old_unix = 1_785_657_600 - 3 * 86400;
@@ -10952,7 +10926,6 @@ fn verified_warm_shrink_reads_exact_changed_body_once_and_preserves_ack() {
     }
     use std::io::Write;
     assert!(crate::heap_layout_bound::layout_supported());
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let root = crate::test_scratch::ScratchDir::new("p3-warm-floor");
     let sessions = root.join("sessions");
     std::fs::create_dir(&sessions).unwrap();
@@ -11164,7 +11137,6 @@ fn content_v1_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
     }
     use std::io::Write;
     assert!(crate::heap_layout_bound::layout_supported());
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let source = SnapshotSource::ClaudeCode;
     for edit in ["equal", "truncate"] {
         let root = crate::test_scratch::ScratchDir::new("p3-resource-a2");
@@ -11373,7 +11345,6 @@ fn b4_structural_transition(near_cap: bool) {
         return;
     }
     assert!(crate::heap_layout_bound::layout_supported());
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let _reset = ResetActiveBudget;
     let root = crate::test_scratch::ScratchDir::new("b4-structural-growth");
     let lock = test_locks::hold(&root);
@@ -11609,7 +11580,6 @@ fn b4_warm_busy_keeps_aged_census_through_terminal_then_catches_up() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let _clear = ClearPreparationFault;
     let root = crate::test_scratch::ScratchDir::new("b4-warm-busy-aged");
     let lock = test_locks::hold(&root);
@@ -12977,7 +12947,6 @@ fn retired_missing_native_rebuild_then_successor_tails_without_double_count() {
         return;
     }
     let _on = RestartRestoreForTest::enabled();
-    let _money = claude_request_money::e2::GateForTest::set(true);
     let f = O3Fixture::from_rows(&a1a_row("accepted", 100), false);
     let mut old = fs::read(&f.record_path).unwrap();
     old[10..42].copy_from_slice(

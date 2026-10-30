@@ -104,6 +104,7 @@ impl Decoded {
     }
 
     /// All fences precede every X move. Errors carry fixed class names only.
+    #[inline(never)]
     pub(crate) fn rederive_content_planned(
         mut self,
         file: &File,
@@ -401,6 +402,7 @@ fn read_at(file: &File, source: SnapshotSource, bytes: &mut [u8], at: u64) -> Re
     }
     Ok(())
 }
+#[inline(never)]
 fn replay_line(
     source: SnapshotSource,
     bytes: &[u8],

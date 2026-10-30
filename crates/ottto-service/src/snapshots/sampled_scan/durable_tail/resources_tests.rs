@@ -48,12 +48,12 @@ fn native_full_debt_map_declines_before_write_and_keeps_the_emitted_body() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use super::owed::{OwedMark, OwedQuery};
     use crate::snapshots::{OwnedSourceScan, OwnedSourceScanStep};
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let scratch = crate::test_scratch::ScratchDir::new("m3-native-debt-cap-corpus");
     let _lock = crate::locked_state_dir::test_locks::hold(&scratch);
     let sessions = scratch.join("sessions");
     std::fs::create_dir(&sessions).unwrap();
     let session = "11111111-2222-4333-8444-555555555555";
+    crate::snapshots::write_claude_reemission_list_for_test(&scratch, &[session]);
     let path = sessions.join(format!("{session}.jsonl"));
     std::fs::write(
         &path,
@@ -86,7 +86,7 @@ fn native_full_debt_map_declines_before_write_and_keeps_the_emitted_body() {
             365,
             100,
             false,
-            None,
+            Some(&scratch),
             &[],
             false,
             true,

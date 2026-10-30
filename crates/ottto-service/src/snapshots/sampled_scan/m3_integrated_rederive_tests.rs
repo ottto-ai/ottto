@@ -462,7 +462,6 @@ fn restored_chain_append_during_identity_samples_keeps_tail_and_exact_cold_body(
 )]
 fn claude_both_restore_floor_edges_hold_then_catch_up_without_moving_accepted_facts() {
     let _on = crate::snapshots::RestartRestoreForTest::enabled();
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let _hooks = Hooks;
     for late in [false, true] {
         let mut rig = O3Fixture::from_rows(&a1a_row("accepted", 100), false);

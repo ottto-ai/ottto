@@ -440,7 +440,6 @@ fn m3_due_matching_record_lossy_shrink_full_verifies_once_across_restart() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     with_test_line_cap(64 * 1024, || {
         let (mut rig, record) = lossy_shrink_rig();
         let key = rig.key(SESSION_A);
@@ -480,7 +479,6 @@ fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     with_test_line_cap(64 * 1024, || {
         for (control, expected_counter) in [
             ("verified_extent", "accepted_body_floor"),
@@ -651,7 +649,6 @@ fn m3_d3_claude_double_fault_holds_only_that_key_until_its_next_write() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     for cleanup in [Cleanup::NativeStage, Cleanup::Unlink] {
         let _clear = ClearFaults;
         let mut rig = Rig::new(SnapshotSource::ClaudeCode, "m3-d3-hold");
@@ -764,7 +761,6 @@ fn m3_d3_claude_cleanup_proving_a_absent_publishes_degraded() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let _clear = ClearFaults;
     let mut rig = Rig::new(SnapshotSource::ClaudeCode, "m3-d3-degraded");
     rig.create(SESSION_A, 2);
@@ -809,7 +805,6 @@ fn m3_d3_enospc_pauses_the_store_preserves_a_and_resumes_when_space_frees() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let _clear = ClearFaults;
     let mut rig = Rig::new(SnapshotSource::ClaudeCode, "m3-d3-enospc");
     rig.create(SESSION_A, 2);
@@ -894,7 +889,6 @@ fn m3_d3_held_key_keeps_865_debt_membership_and_record_never_absent() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let _clear = ClearFaults;
     let mut rig = Rig::new(SnapshotSource::ClaudeCode, "m3-d3-debt");
     rig.create(SESSION_A, 2);
@@ -976,7 +970,6 @@ fn m3_d3_content_change_releases_a_held_key_while_writes_still_fail() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     for change in [Change::RewriteInPlace, Change::Replace] {
         let _clear = ClearFaults;
         let mut rig = Rig::new(SnapshotSource::ClaudeCode, "m3-d3-content");
@@ -1159,7 +1152,6 @@ fn die(marker: &Path) -> ! {
 
 /// The subprocess: accept A natively, grow the file, die at `point`.
 fn kill_child(root: PathBuf, point: OrderPoint) {
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let mut rig = Rig::open(SnapshotSource::ClaudeCode, root.clone());
     rig.create(SESSION_A, 2);
     // F11: the killed acquisition must restore real content through (b),
@@ -1206,7 +1198,6 @@ fn m3_d3_sigkill_at_native_order_points_recovers_exactly_once() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let test = std::thread::current()
         .name()
         .expect("the harness names the test thread")
@@ -1713,7 +1704,6 @@ fn m3_codex_post_read_tier_transition_refuses_a_across_failed_gc_and_restart() {
 #[cfg(target_os = "macos")]
 pub(super) fn bounded_restore_tail_items(source: SnapshotSource) -> Vec<SnapshotItem> {
     let _restart_restore = RestartRestoreForTest::enabled();
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let mut rig = Rig::new(source, "bounded-settlement-body");
     let session = if source == SnapshotSource::Codex {
         CODEX_SESSION

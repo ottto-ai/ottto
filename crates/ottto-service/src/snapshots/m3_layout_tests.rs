@@ -28,6 +28,7 @@ impl Fixture {
     fn new() -> Self {
         let root = crate::test_scratch::ScratchDir::new("m3-layout-selection");
         let writer = test_locks::hold(&root);
+        write_claude_reemission_list_for_test(&root, &[SESSION]);
         let sessions = root.join("sessions");
         fs::create_dir(&sessions).unwrap();
         let path = sessions.join(format!("{SESSION}.jsonl"));
@@ -68,7 +69,7 @@ impl Fixture {
             365,
             100,
             false,
-            None,
+            Some(&self.root),
             &[],
             false,
             true,
@@ -185,7 +186,6 @@ fn unsupported_native_finish_keeps_legacy_path_without_a_v3_record() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::off();
     with_unsupported_layout_for_test(|| {
         let f = Fixture::new();
         let cache = f.cache();
@@ -229,7 +229,6 @@ fn preexisting_v3_on_unsupported_layout_reads_only_selected_key_then_retires_aft
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::off();
     with_unsupported_layout_for_test(|| {
         let f = Fixture::new();
         let mut initial = f.scan(ScanIndex::default(), None).index;
@@ -309,7 +308,6 @@ fn unsupported_layout_never_retires_a_newer_or_unknown_record() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::off();
     with_unsupported_layout_for_test(|| {
         for unknown in [false, true] {
             let f = Fixture::new();
@@ -346,7 +344,6 @@ fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::off();
     with_test_line_cap(64 * 1024, || {
         with_unsupported_layout_for_test(|| {
             let f = Fixture::new();
@@ -512,7 +509,6 @@ fn unsupported_layout_retryable_loss_preserves_prior_body_and_debt_after_gc() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::off();
     with_unsupported_layout_for_test(|| {
         let f = Fixture::new();
         let mut prior = f.scan(ScanIndex::default(), None);

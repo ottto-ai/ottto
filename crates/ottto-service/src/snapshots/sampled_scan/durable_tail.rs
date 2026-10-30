@@ -1200,7 +1200,7 @@ fn v3_replay_scope(
         } else {
             0
         },
-        source == SnapshotSource::ClaudeCode && claude_request_money::e2::enabled(),
+        source == SnapshotSource::ClaudeCode,
     )
 }
 
@@ -3201,6 +3201,7 @@ impl SharedCache {
     /// the parser's opened FD for `path`, not yet read; bounded positional
     /// content reads preserve its offset, and the read plan repositions it.
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     pub(crate) fn durable_restore(
         &self,
         snapshot_source: SnapshotSource,
@@ -3951,6 +3952,7 @@ impl SharedCache {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     fn restore_known(
         &self,
         snapshot_source: SnapshotSource,
@@ -4502,6 +4504,7 @@ impl SharedCache {
     /// protocol. Codex v1 has no unique mapping and gets no chain; nothing is
     /// restamped. O is computed on the held FD, whose position is restored.
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     fn restored_chain(
         &self,
         snapshot_source: SnapshotSource,
@@ -4648,6 +4651,7 @@ impl SharedCache {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     fn restore_record_content(
         &self,
         source: SnapshotSource,
