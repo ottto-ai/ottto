@@ -5739,8 +5739,8 @@ fn terminal_off_on_e2_production_contract_and_revision_share_one_paced_reread_be
                     if hour == 14 {
                         assert_eq!(
                             page.index.claude_request_identity_contract_for_test(),
-                            (Some(E2_GROUPING), false),
-                            "latch clears"
+                            (Some("e2_identity_adoption_pending"), true),
+                            "identity adoption remains pending behind the closed fence"
                         );
                         assert_eq!(page.scan.scanned_file_count, 0, "no second rearm");
                     }
@@ -6150,7 +6150,7 @@ fn terminal_off_on_e2_always_on_contract_reowes_no_uncaptured_history() {
                     if hour == 14 {
                         assert_eq!(
                             page.index.claude_request_identity_contract_for_test(),
-                            (Some(E2_GROUPING), false)
+                            (Some("e2_identity_adoption_pending"), true)
                         );
                     }
                 }
