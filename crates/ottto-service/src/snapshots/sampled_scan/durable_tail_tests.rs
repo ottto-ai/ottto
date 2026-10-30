@@ -2880,7 +2880,7 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
 /// is kept verbatim in the record body, so it sizes the body. Three counted
 /// requests close the session-start window first, so its re-derived opening
 /// content ends inside the 1 MiB head.
-fn codex_budget_fixture(path: &Path, session: &str, call_id_bytes: Option<usize>) {
+pub(super) fn codex_budget_fixture(path: &Path, session: &str, call_id_bytes: Option<usize>) {
     let at = "2026-10-07T10:00:00Z";
     let usage = |input: u64, output: u64| {
         serde_json::json!({"input_tokens":input,"cached_input_tokens":0,
@@ -14623,6 +14623,9 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
         .durable_write_after_save(lock, source, &index)
         .is_none());
     store::test_hooks::set_before_rename(None);
+    let counts = cache.durable_counters(source).unwrap().0;
+    assert_eq!(counts.store_write_after_save_failed, 1);
+    assert_eq!(counts.store_write_failed_restart_full, [0, 0]);
     assert_eq!(std::fs::read(&record_path).unwrap(), a, "A preserved");
     assert_eq!(cache.durable().unwrap().selected.get(&key).unwrap(), "fp-b");
     assert!(cache.durable().unwrap().touched.contains(&key));
@@ -14644,6 +14647,12 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
             .written,
         1
     );
+    let counts = cache.durable_counters(source).unwrap().0;
+    assert_eq!(
+        counts.store_write_after_save_failed, 1,
+        "successful retry adds no fault"
+    );
+    assert_eq!(counts.store_write_failed_restart_full, [0, 0]);
     assert_ne!(std::fs::read(&record_path).unwrap(), a);
     assert_eq!(serde_json::to_value(&index.files[&key]).unwrap(), accepted);
     assert!(!cache.durable().unwrap().touched.contains(&key));
@@ -14746,6 +14755,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
             reduction: Some(incoming.state),
             released: None,
             unsealed: false,
+            durable: Default::default(),
         },
         0
     ));
@@ -14785,7 +14795,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
     // capacities, rather than assuming that 256 KiB covers the native layout.
     let sizing = SharedCache::default();
     sizing.durable_begin_pass(source, &index_path, &namespace, false);
-    let incoming = match sizing.durable_restore(
+    let (incoming, _sizing_lease) = match sizing.durable_restore(
         source,
         &key,
         &path,
@@ -14794,7 +14804,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
         &index,
         &interpretation,
     ) {
-        RestoreOutcome::Restored(taken) => taken.retained,
+        RestoreOutcome::Restored(taken, lease) => (taken.retained, lease),
         _ => panic!("unscaled sizing restore must succeed"),
     };
     let incoming_heap = bound(&incoming, crate::transcript_cache::ENTRY_BYTES).unwrap()
@@ -14866,11 +14876,8 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
             &interpretation,
         );
         if fits {
-            let taken = match restored {
-                RestoreOutcome::Restored(taken, lease) => {
-                    lease.release();
-                    taken
-                }
+            let (taken, lease) = match restored {
+                RestoreOutcome::Restored(taken, lease) => (taken, lease),
                 _ => panic!("fitting durable record must restore, never miss or hold"),
             };
             let mut parser = OwnedJsonlParser::new(
@@ -14887,12 +14894,14 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
             .unwrap();
             assert_eq!(
                 parser
-                    .prepare_acquisition_owned(Some(*taken), &scope, None, 1_800_000_001)
+                    .prepare_acquisition_owned(Some(taken), &scope, None, 1_800_000_001)
                     .unwrap_or_else(|_| panic!("restored Tail must prepare")),
                 ReadMode::Tail
             );
             while !parser.step().unwrap() {}
             assert_eq!(parser.reader.consumed_bytes(), suffix.len() as u64);
+            drop(parser);
+            lease.release();
             let next = codex_cursor::with_test_state_budget(INVENTORY_LIMIT, || {
                 page(&root, &paths, &cache)
             });
@@ -14902,9 +14911,11 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
             assert!(next.reuse_evictions > 0);
             assert!(next.read_bytes <= paths.len() * (64 * 1024 + 1));
         } else {
+            // M3 reports this grown, structurally unfundable admission through
+            // its existing paced resource path; restore itself performs no Full.
             assert!(matches!(
                 restored,
-                RestoreOutcome::Miss(MissClass::BudgetRefused)
+                RestoreOutcome::Miss(MissClass::Resource("cache_transit"))
             ));
             assert_eq!(
                 cache
@@ -14920,7 +14931,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
         }
         let (counts, _) = cache.durable_counters(source).unwrap();
         assert_eq!(counts.restored, u64::from(fits));
-        assert_eq!(counts.budget_refused, u64::from(!fits));
+        assert_eq!(counts.budget_refused, 0);
         assert_eq!(records(), saved, "restore cannot change durable authority");
     }
     std::fs::remove_dir_all(root).unwrap();

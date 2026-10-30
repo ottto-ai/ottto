@@ -79,7 +79,11 @@ fn r7_every_key_map_node_fits_its_prepaid_charge() {
     );
     assert_eq!(STORES_RESIDENT_BOUND, 2_204_088);
     let full: BTreeSet<u64> = (0..STALE_PREDECESSOR_KEYS as u64).collect();
-    assert!(crate::heap_layout_bound::bound(&full, STALE_PREDECESSOR_RESERVE_BYTES).is_some());
+    // Check the prepaid heap itself; the set's inline owner already lives in
+    // Stores. This arithmetic is portable and does not qualify a native layout.
+    let mut charged = crate::heap_layout_bound::Counter::new(STALE_PREDECESSOR_RESERVE_BYTES);
+    assert!(crate::heap_layout_bound::HeapLayoutBound::heap_bound(&full, &mut charged).is_some());
+    assert_eq!(charged.bytes, STALE_PREDECESSOR_RESERVE_BYTES);
 }
 
 #[test]

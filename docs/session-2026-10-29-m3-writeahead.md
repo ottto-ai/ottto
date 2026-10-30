@@ -192,3 +192,12 @@ receipt, owed, read or money authority. Existing store-failure retries and
 predecessor protection remain authoritative. The alarm fires on the process's
 first counted restart Full, then at most once per 24 hours. No persisted field
 or Full cause is added.
+
+The composed post-save failure fixture drives the actual M1 writer with a
+retained Codex parser/certificate. This isolates the post-save boundary from
+M3's earlier native format-3 stage. A failed rename preserves the exact old
+record; the restarted strict reader refuses it and counts one whole-file Full.
+The healthy control restores and reads only the appended suffix. Both results
+must encode identically to a cold Full. The separate quiet-RAM repair fixture
+requires the failure counter remain one after its successful no-read retry.
+All restored graphs retain their active lease through parsing or disposal.

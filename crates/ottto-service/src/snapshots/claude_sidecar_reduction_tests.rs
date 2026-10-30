@@ -1368,30 +1368,6 @@ mod durable_restart {
     }
 }
 
-trait RestoreTestOutcome {
-    fn into_test_option(
-        self,
-    ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>;
-}
-impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
-    fn into_test_option(
-        self,
-    ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>> {
-        match self {
-            Self::Restored(taken, lease) => {
-                lease.release();
-                Some(*taken)
-            }
-            Self::Miss(_) => None,
-            Self::Stale(reason) => panic!("unexpected stale restore: {reason}"),
-            Self::Pending | Self::FloorHeld | Self::Degraded => {
-                panic!("ordinary restore unexpectedly deferred")
-            }
-            Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
-        }
-    }
-}
-
 #[test]
 fn desktop_metadata_reemit_is_session_scoped_even_during_inventory_backoff() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
