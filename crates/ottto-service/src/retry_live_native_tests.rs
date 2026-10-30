@@ -1606,68 +1606,93 @@ fn pi_publication_case(
     }
 }
 
-macro_rules! pi_publication_test {
-    ($name:ident, $class:ident, $outcome:expr) => {
-        #[test]
-        #[serial(client_report)]
-        #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-        fn $name() {
-            pi_publication_case(crate::snapshots::NativePublication::$class, $outcome);
-        }
-    };
-}
 use crate::snapshots::native_publication_tests::E4Outcome as PiE4;
 use crate::snapshots::native_publication_tests::{
     Degraded as PiDegraded, DegradedCause as PiDegradedCause, HeldCause as PiHeldCause,
     NotPersisted as PiNotPersisted, Unprepared as PiUnprepared,
     UnpreparedDisposition as PiUnpreparedDisposition, WriteOutcome as PiWriteOutcome,
 };
-pi_publication_test!(pi_e4_receipted_captures_and_posts, Receipted, None);
-pi_publication_test!(
-    pi_e4_publish_without_record_captures_and_posts,
-    PublishWithoutRecord,
-    Some(PiE4::Unprepared(
-        PiUnpreparedDisposition::PublishWithoutRecord {
-            cause: PiUnprepared::NotPersisted(PiNotPersisted::Codec),
-        }
-    ))
-);
-pi_publication_test!(
-    pi_e4_failed_published_without_record_captures_and_posts,
-    FailedPublishedWithoutRecord,
-    Some(PiE4::Write(PiWriteOutcome::FailedPublishedWithoutRecord(
-        PiDegradedCause::WriteFailedRetired
-    )))
-);
-pi_publication_test!(
-    pi_e4_publish_retaining_prior_captures_and_posts,
-    PublishRetainingPrior,
-    Some(PiE4::Unprepared(
-        PiUnpreparedDisposition::PublishRetainingPrior {
-            format: 3,
-            cause: PiUnprepared::NotPersisted(PiNotPersisted::Codec),
-        }
-    ))
-);
-pi_publication_test!(
-    pi_e4_publish_store_untouched_captures_and_posts,
-    PublishStoreUntouched,
-    Some(PiE4::Unprepared(
-        PiUnpreparedDisposition::PublishStoreUntouched {
-            cause: PiDegraded::Disabled
-        }
-    ))
-);
-pi_publication_test!(
-    pi_e4_failed_held_refuses_retained_retry,
-    FailedHeld,
-    Some(PiE4::Write(PiWriteOutcome::FailedHeld(PiHeldCause::Fence)))
-);
-pi_publication_test!(
-    pi_e4_receipt_pending_refuses_retained_retry,
-    ReceiptPending,
-    Some(PiE4::Write(PiWriteOutcome::ReceiptPending))
-);
+#[test]
+#[serial(client_report)]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_e4_receipted_captures_and_posts() {
+    pi_publication_case(crate::snapshots::NativePublication::Receipted, None);
+}
+
+#[test]
+#[serial(client_report)]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_e4_publish_without_record_captures_and_posts() {
+    pi_publication_case(
+        crate::snapshots::NativePublication::PublishWithoutRecord,
+        Some(PiE4::Unprepared(
+            PiUnpreparedDisposition::PublishWithoutRecord {
+                cause: PiUnprepared::NotPersisted(PiNotPersisted::Codec),
+            },
+        )),
+    );
+}
+
+#[test]
+#[serial(client_report)]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_e4_failed_published_without_record_captures_and_posts() {
+    pi_publication_case(
+        crate::snapshots::NativePublication::FailedPublishedWithoutRecord,
+        Some(PiE4::Write(PiWriteOutcome::FailedPublishedWithoutRecord(
+            PiDegradedCause::WriteFailedRetired,
+        ))),
+    );
+}
+
+#[test]
+#[serial(client_report)]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_e4_publish_retaining_prior_captures_and_posts() {
+    pi_publication_case(
+        crate::snapshots::NativePublication::PublishRetainingPrior,
+        Some(PiE4::Unprepared(
+            PiUnpreparedDisposition::PublishRetainingPrior {
+                format: 3,
+                cause: PiUnprepared::NotPersisted(PiNotPersisted::Codec),
+            },
+        )),
+    );
+}
+
+#[test]
+#[serial(client_report)]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_e4_publish_store_untouched_captures_and_posts() {
+    pi_publication_case(
+        crate::snapshots::NativePublication::PublishStoreUntouched,
+        Some(PiE4::Unprepared(
+            PiUnpreparedDisposition::PublishStoreUntouched {
+                cause: PiDegraded::Disabled,
+            },
+        )),
+    );
+}
+
+#[test]
+#[serial(client_report)]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_e4_failed_held_refuses_retained_retry() {
+    pi_publication_case(
+        crate::snapshots::NativePublication::FailedHeld,
+        Some(PiE4::Write(PiWriteOutcome::FailedHeld(PiHeldCause::Fence))),
+    );
+}
+
+#[test]
+#[serial(client_report)]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_e4_receipt_pending_refuses_retained_retry() {
+    pi_publication_case(
+        crate::snapshots::NativePublication::ReceiptPending,
+        Some(PiE4::Write(PiWriteOutcome::ReceiptPending)),
+    );
+}
 
 #[test]
 #[serial(client_report)]
