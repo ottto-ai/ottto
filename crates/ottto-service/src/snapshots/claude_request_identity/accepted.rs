@@ -1355,7 +1355,7 @@ mod retained_tests {
         let a = body(tagged(&"a".repeat(64), 1));
         state.record_proved(&a, false, &[]);
         assert_eq!(proof(&state), None, "unwitnessed ACK never adds");
-        assert!(state.get("synthetic").unwrap().proved.is_empty());
+        assert!(state.get("synthetic").is_none(), "gate off: no entry");
         state.record_proved(&a, true, &[]);
         assert_eq!(
             state.get("synthetic").unwrap().proved[0].account,

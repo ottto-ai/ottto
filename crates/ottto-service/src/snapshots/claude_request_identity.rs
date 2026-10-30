@@ -1086,7 +1086,6 @@ fn apply_grouped_undeferred(
         if grouping.item_bytes(item) <= MAX_ITEM_BYTES {
             let mut counts = cap_counts(item, &grouping, accepted, None);
             unpriced.count(&mut counts);
-            deferred.drop_stripped(item, &unpriced.keys);
             deferred.mark(item);
             deferred.count(item, retained, &mut counts);
             budget::record(&counts);
@@ -1139,7 +1138,6 @@ fn apply_grouped_undeferred(
     if let Some((kept, measurement, unpriced)) = selected {
         let mut counts = cap_counts(item, &grouping, accepted, Some(&measurement));
         unpriced.count(&mut counts);
-        deferred.drop_stripped(item, &unpriced.keys);
         deferred.mark(item);
         deferred.count(item, retained, &mut counts);
         budget::record(&counts);
@@ -1272,7 +1270,8 @@ impl Deferred {
     }
 
     /// `undeferred` plus the stripped model keys that have deferred rows, or
-    /// `None` when the strip touches no deferred row.
+    /// `None` when the strip touches no deferred row. A kept attempt is
+    /// always `None`, so a stripped model row never carries a marker.
     fn stripped_keys(
         &self,
         stripped: &BTreeSet<RowKey>,
@@ -1287,14 +1286,6 @@ impl Deferred {
                 .map(|row| row.row.clone()),
         );
         (keys.len() > before).then_some(keys)
-    }
-
-    fn drop_stripped(&mut self, item: &mut SnapshotItem, keys: &BTreeSet<RowKey>) {
-        let before = self.rows.len();
-        self.rows.retain(|row| !keys.contains(&row.row));
-        item.request_identity_refusals = item
-            .request_identity_refusals
-            .saturating_add((before - self.rows.len()) as u64);
     }
 
     /// A row that still carries a tag is never marked; it goes out without

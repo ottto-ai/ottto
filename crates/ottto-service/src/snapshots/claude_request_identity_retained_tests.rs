@@ -505,7 +505,8 @@ fn retained_golden_cases() -> Value {
     assert!(refusal.request_identity_refusals > 0);
     cases.insert("counted_refusal_after_proof_proving", sticky_wire(login_first));
     cases.insert("counted_refusal_after_proof", sticky_wire(refusal));
-    // r7's strip wins over proof: refused and counted, never marked.
+    // r7's fixture after witnessed proof: deferring would trip the unpriced
+    // strip (xpr-944 F1), so the body repeats its fresh tags, never marked.
     let (mut unpriced, mut unpriced_proof) = retained_session(4);
     sticky_price_fixture(&mut unpriced, &mut unpriced_proof);
     let mut unpriced_state = retained_state();
@@ -515,9 +516,8 @@ fn retained_golden_cases() -> Value {
     identity::take_identity_counts();
     sticky_apply(&mut unpriced, &unpriced_proof, &unpriced_state).unwrap();
     assert_eq!(retained_marked(&unpriced), vec![false; 4]);
-    assert!(unpriced.usage_buckets.iter().all(|b| !sticky_tagged(&b.model_usage[0])));
-    assert_eq!(retained_count(&retained_counts(), "unpriced_part_untagged"), 1);
-    assert_eq!(unpriced.request_identity_refusals, 4);
+    assert_eq!(retained_count(&retained_counts(), "unpriced_part_untagged"), 0);
+    assert_eq!(serde_json::to_vec(&unpriced).unwrap(), serde_json::to_vec(&unpriced_first).unwrap());
     cases.insert("unpriced_strip_after_proof_proving", sticky_wire(unpriced_first));
     cases.insert("unpriced_strip_after_proof", sticky_wire(unpriced));
     // xpr-944 F1: deferral must not trigger #909's C8 strip of the model row.
@@ -637,9 +637,11 @@ fn retained_marker_and_unpriced_strip_compose_at_both_grains() {
     sticky_apply(&mut next, &proof, &state).unwrap();
     sticky_assert_reconciled(&next);
     retained_assert_exclusive(&next);
+    // Deferral would trip the unpriced strip (xpr-944 F1): fresh tags again.
     let counts = retained_counts();
-    assert!(retained_count(&counts, "unpriced_part_untagged") > 0);
-    assert!(next.usage_buckets.iter().all(|b| !b.model_usage[0].identity_retained && !sticky_tagged(&b.model_usage[0])));
+    assert_eq!(retained_count(&counts, "unpriced_part_untagged"), 0);
+    assert!(next.usage_buckets.iter().all(|b| !b.model_usage[0].identity_retained));
+    assert_eq!(serde_json::to_vec(&next).unwrap(), serde_json::to_vec(&first).unwrap());
     // Marker rows themselves have no parts; a fully deferred closed body is safe.
     let mut closed = original.clone();
     closed.collected_at = "2026-09-02T00:00:00Z".into();
