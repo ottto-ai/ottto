@@ -746,7 +746,13 @@ impl AcceptedBuckets {
         }
         !replaced.is_empty()
     }
+    /// Runs on every stored-body ACK while the capability is on, so rows the
+    /// body no longer has leave as on the server. With the gate off a listing
+    /// changes nothing: gate-off state stays byte-identical to #909.
     pub(crate) fn record_proved(&mut self, body: &Value, witnessed: bool, missing: &[String]) {
+        if !witnessed && !self.3 {
+            return;
+        }
         if body["provenance"]["collector"].as_str() != Some(COLLECTOR) {
             return;
         }
@@ -762,6 +768,9 @@ impl AcceptedBuckets {
         // `record` normally settled (and LRU-refreshed) this ACK's session;
         // refreshing again would only churn persisted bytes.
         if self.session_mut(session).is_none() {
+            if !witnessed && missing.is_empty() {
+                return;
+            }
             self.session_entry(session);
         }
         let Some(entry) = self.session_mut(session) else {
@@ -792,11 +801,19 @@ impl AcceptedBuckets {
                 };
                 let row_hash = proved_row_hash(&key, &row_key);
                 present_rows.insert((start, row_hash));
-                if row["identity_retained"] == json!(true) || !witnessed || listed.contains(&start)
-                {
+                let listed_row = listed.contains(&start);
+                if row["identity_retained"] == json!(true) || !(witnessed || listed_row) {
                     continue;
                 }
                 if let Some(proof) = row_proof(&key, row, &body["request_evidence"]) {
+                    if listed_row {
+                        // Positive tags the server did not keep: it may hold
+                        // an older proof even if this row was never held.
+                        proved
+                            .entry((start, row_hash))
+                            .or_insert((REPLACED_PROOF, None));
+                        continue;
+                    }
                     let account = match row["account_identifier_hash"].as_str() {
                         Some(hash) => match digest_hex::decode::<serde::de::value::Error>(hash) {
                             Ok(hash) => Some(hash),

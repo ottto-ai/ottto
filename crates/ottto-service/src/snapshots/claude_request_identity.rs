@@ -801,6 +801,7 @@ pub(crate) fn mark_every_row_for_test(item: &mut SnapshotItem) -> u64 {
                 row: row_key_from_model_usage(row),
                 by_key: BTreeMap::new(),
                 refused: false,
+                proves: true,
                 account: None,
             })
         })
@@ -865,6 +866,33 @@ pub(crate) fn apply_grouped(
     grouping: Grouping,
 ) -> Result<Tagged, Ineligible> {
     apply_grouped_with_accepted(item, grouping, None, false)
+}
+
+/// A top-level row's shares: the per-key sum of its bucket rows, each cost
+/// field poisoned where a contributing bucket row lacks it. `None` when the
+/// sums do not merge.
+fn top_shares(
+    grouping: &Grouping,
+    key: &RowKey,
+) -> Option<BTreeMap<Option<AuthorityKey>, Amounts>> {
+    let mut by_key: BTreeMap<Option<AuthorityKey>, Amounts> = BTreeMap::new();
+    for (row_key, group) in grouping.rows() {
+        if row_key == key {
+            for (authority, amounts) in &group.by_key {
+                let mut wire_amount = amounts.clone();
+                for field in 0..5 {
+                    if group.total.wire(field).is_none() {
+                        wire_amount.poisoned[field] = true;
+                    }
+                }
+                by_key
+                    .entry(authority.clone())
+                    .or_default()
+                    .merge_wire(&wire_amount)?;
+            }
+        }
+    }
+    Some(by_key)
 }
 
 /// `retained` is option (ii): the server retains proof per bucket row, so the
@@ -940,6 +968,7 @@ fn apply_grouped_with_accepted(
         }
     }
     let mut deferred = defer_retained_rows(item, &mut grouping, proved);
+    deferred.undefer_unpriced(item, &mut grouping);
     // Marker bytes are constant across every tag selection; markers go on
     // the item only after measurement, as the last change before hashing.
     grouping.extra_wire_bytes = grouping
@@ -992,25 +1021,8 @@ fn apply_grouped_with_accepted(
     }
     let mut top_identities = Vec::with_capacity(item.model_usage.len());
     for row in &item.model_usage {
-        let key = row_key_from_model_usage(row);
-        let mut by_key: BTreeMap<Option<AuthorityKey>, Amounts> = BTreeMap::new();
-        for (row_key, group) in grouping.rows() {
-            if *row_key == key {
-                for (authority, amounts) in &group.by_key {
-                    let mut wire_amount = amounts.clone();
-                    for field in 0..5 {
-                        if group.total.wire(field).is_none() {
-                            wire_amount.poisoned[field] = true;
-                        }
-                    }
-                    by_key
-                        .entry(authority.clone())
-                        .or_default()
-                        .merge_wire(&wire_amount)
-                        .ok_or(Ineligible::RowsNotReproduced)?;
-                }
-            }
-        }
+        let by_key = top_shares(&grouping, &row_key_from_model_usage(row))
+            .ok_or(Ineligible::RowsNotReproduced)?;
         let identity = row_identity(row, &by_key, &evidence_index)?;
         if let RowIdentity::Parts(parts) = &identity {
             if parts.len() > MAX_PARTS_PER_ROW {
@@ -1203,6 +1215,8 @@ struct DeferredRow {
     row: RowKey,
     by_key: BTreeMap<Option<AuthorityKey>, Amounts>,
     refused: bool,
+    /// Today's transcript still proves the row (its proof equals the ACKed one).
+    proves: bool,
     account: Option<String>,
 }
 
@@ -1245,6 +1259,52 @@ impl Deferred {
             true
         });
         before.saturating_sub(self.rows.len()) as u64
+    }
+
+    /// #909's C8 strip untags a whole model row when a top-level part lacks
+    /// a cost field its row carries. Deferred hours fold into one untagged
+    /// top part with only their own cost presence, so they alone could strip
+    /// the model's fresh hours too. Such a model key sends fresh tags instead
+    /// (equal to the ACKed proof); a deferred row today's transcript no longer
+    /// proves goes back to a counted refusal, never a marker.
+    fn undefer_unpriced(&mut self, item: &SnapshotItem, grouping: &mut Grouping) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let deferred_keys = self
+            .rows
+            .iter()
+            .map(|deferred| &deferred.row)
+            .collect::<BTreeSet<_>>();
+        let strip = item
+            .model_usage
+            .iter()
+            .map(|row| (row, row_key_from_model_usage(row)))
+            .filter(|(row, key)| {
+                deferred_keys.contains(key)
+                    && top_shares(grouping, key)
+                        .and_then(|by_key| fresh_row(row, &by_key))
+                        .is_some_and(|(fresh, _)| !parts_presence_holds(&fresh))
+            })
+            .map(|(_, key)| key)
+            .collect::<BTreeSet<_>>();
+        if strip.is_empty() {
+            return;
+        }
+        self.rows.retain(|deferred| {
+            if !strip.contains(&deferred.row) {
+                return true;
+            }
+            if let Some(group) = grouping
+                .groups
+                .get_mut(&deferred.bucket)
+                .and_then(|rows| rows.get_mut(&deferred.row))
+            {
+                group.by_key = deferred.by_key.clone();
+                group.refused = deferred.refused || !deferred.proves;
+            }
+            false
+        });
     }
 
     fn drop_stripped(&mut self, item: &mut SnapshotItem, keys: &BTreeSet<RowKey>) {
@@ -1325,12 +1385,12 @@ impl Deferred {
     }
 }
 
-/// A row's fresh-tag wire form and its evidence list, exactly as `install`
-/// would emit them, so today's proof digest matches an ACKed body's.
-fn fresh_row_value(
+/// A row with its fresh tags and the evidence they reference, indexed in
+/// order as `install` would for this row alone.
+fn fresh_row(
     row: &SnapshotModelUsage,
     by_key: &BTreeMap<Option<AuthorityKey>, Amounts>,
-) -> Option<(Value, Value)> {
+) -> Option<(SnapshotModelUsage, BTreeSet<EvidenceKey>)> {
     let evidence = by_key
         .keys()
         .flatten()
@@ -1344,6 +1404,16 @@ fn fresh_row_value(
     let identity = row_identity(row, by_key, &index).ok()?;
     let mut fresh = row.clone();
     set_row(&mut fresh, identity, &index);
+    Some((fresh, evidence))
+}
+
+/// A row's fresh-tag wire form and its evidence list, exactly as `install`
+/// would emit them, so today's proof digest matches an ACKed body's.
+fn fresh_row_value(
+    row: &SnapshotModelUsage,
+    by_key: &BTreeMap<Option<AuthorityKey>, Amounts>,
+) -> Option<(Value, Value)> {
+    let (fresh, evidence) = fresh_row(row, by_key)?;
     let evidence = evidence
         .into_iter()
         .map(|entry| SnapshotRequestEvidence {
@@ -1433,6 +1503,7 @@ fn defer_retained_rows(
                 account,
                 by_key,
                 refused,
+                proves,
             });
         }
     }

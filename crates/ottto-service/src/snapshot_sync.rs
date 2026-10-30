@@ -2171,7 +2171,10 @@ impl SnapshotUploadProgress {
     /// carries a versioned witness equal to the local one on a body with a
     /// public witness version, so the entity-ACK validator also checked the
     /// exact version. Count-only and legacy ACKs pass `None`.
-    /// `retained_proof_missing` only removes, so it is always applied.
+    /// While the capability is on, every stored-body ACK settles the proved
+    /// set (prune, `retained_proof_missing`); with it off the set is dropped,
+    /// since the server's proof is unknown once it returns (a no-op when
+    /// empty, so gate-off state stays #909's).
     fn record_stored_state<T: Serialize>(
         &mut self,
         item: &T,
@@ -2199,12 +2202,14 @@ impl SnapshotUploadProgress {
                 && versioned_body
                 && entity.body_witness_version.is_some()
                 && entity.body_witness_digest.as_deref() == Some(local_witness);
-            if witnessed || !entity.retained_proof_missing.is_empty() {
+            if self.accepted_identity_buckets.retained_enabled() {
                 self.accepted_identity_buckets.record_proved(
                     &value,
                     witnessed,
                     &entity.retained_proof_missing,
                 );
+            } else {
+                self.accepted_identity_buckets.clear_retained();
             }
         }
         let key = cache_session_key(session);

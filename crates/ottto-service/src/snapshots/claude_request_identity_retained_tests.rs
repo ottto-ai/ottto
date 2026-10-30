@@ -520,6 +520,10 @@ fn retained_golden_cases() -> Value {
     assert_eq!(unpriced.request_identity_refusals, 4);
     cases.insert("unpriced_strip_after_proof_proving", sticky_wire(unpriced_first));
     cases.insert("unpriced_strip_after_proof", sticky_wire(unpriced));
+    // xpr-944 F1: deferral must not trigger #909's C8 strip of the model row.
+    let (split_first, split) = retained_presence_split();
+    cases.insert("presence_split_fresh_proving", sticky_wire(split_first));
+    cases.insert("presence_split_fresh", sticky_wire(split));
     serde_json::to_value(cases).unwrap()
 }
 
@@ -813,4 +817,122 @@ fn retained_tag_guard_never_marks_a_tagged_row_and_counts_a_refusal() {
     assert_eq!(retained_marked(&tagged), vec![false; 4]);
     assert_eq!(tagged.request_identity_refusals, 4);
     retained_assert_exclusive(&tagged);
+}
+
+/// Closed hours 0-2 carry every cost field; the open hour 3 lacks the cache
+/// creation cost. Returns the proving body and the next unchanged revision.
+fn retained_presence_split() -> (SnapshotItem, SnapshotItem) {
+    let (mut original, mut proof) = retained_session(4);
+    sticky_price_rows(&mut original, &mut proof, |hour, field| hour < 3 || field != 4);
+    let mut state = retained_state();
+    let mut first = original.clone();
+    sticky_apply(&mut first, &proof, &state).unwrap();
+    assert!(first
+        .usage_buckets
+        .iter()
+        .all(|bucket| sticky_tagged(&bucket.model_usage[0])));
+    retained_ack(&mut state, &first, &[]);
+    let mut next = original.clone();
+    sticky_apply(&mut next, &proof, &state).unwrap();
+    (first, next)
+}
+
+// xpr-944 F1: marked closed hours fold into one untagged top-level part with
+// only their own cost presence. When that differs from the fresh hours,
+// #909's strip would untag the whole model row, so the model sends fresh tags.
+#[test]
+fn retained_deferral_never_triggers_the_unpriced_strip() {
+    identity::take_identity_counts();
+    let (first, next) = retained_presence_split();
+    assert_eq!(retained_marked(&next), vec![false; 4]);
+    assert!(next
+        .usage_buckets
+        .iter()
+        .all(|bucket| sticky_tagged(&bucket.model_usage[0])));
+    assert!(sticky_tagged(&next.model_usage[0]));
+    assert_eq!(next.request_identity_refusals, 0);
+    let counts = retained_counts();
+    assert_eq!(retained_count(&counts, "unpriced_part_untagged"), 0);
+    assert_eq!(retained_count(&counts, "retained_marker_rows"), 0);
+    // Fresh tags equal the ACKed proof: the body repeats the proving body.
+    assert_eq!(
+        serde_json::to_vec(&next).unwrap(),
+        serde_json::to_vec(&first).unwrap()
+    );
+    retained_assert_exclusive(&next);
+    sticky_assert_reconciled(&next);
+
+    // A deferred hour today's transcript no longer proves goes back to a
+    // counted refusal, never a marker; the proving hours re-tag fresh.
+    let (mut original, mut proof) = retained_session(4);
+    sticky_price_rows(&mut original, &mut proof, |hour, field| hour < 3 || field != 4);
+    let mut state = retained_state();
+    let mut tagged = original.clone();
+    sticky_apply(&mut tagged, &proof, &state).unwrap();
+    retained_ack(&mut state, &tagged, &[]);
+    for contribution in &mut proof[..3] {
+        contribution.identity = RequestIdentity::Missing;
+    }
+    let mut lost = original.clone();
+    sticky_apply(&mut lost, &proof, &state).unwrap();
+    assert_eq!(retained_marked(&lost), vec![false; 4]);
+    assert!(!sticky_tagged(&lost.usage_buckets[0].model_usage[0]));
+    assert!(lost.usage_buckets[1..]
+        .iter()
+        .all(|bucket| sticky_tagged(&bucket.model_usage[0])));
+    assert!(lost.request_identity_refusals > 0);
+    retained_assert_exclusive(&lost);
+    sticky_assert_reconciled(&lost);
+
+    // With equal presence the closed hours still mark (no un-deferral).
+    let (original, proof) = retained_session(4);
+    let mut state = retained_state();
+    let mut even = original.clone();
+    sticky_apply(&mut even, &proof, &state).unwrap();
+    retained_ack(&mut state, &even, &[]);
+    let mut marked = original.clone();
+    sticky_apply(&mut marked, &proof, &state).unwrap();
+    assert_eq!(retained_marked(&marked), vec![true, true, true, false]);
+}
+
+// xpr-944 F6/F7: with the gate off a server listing changes no persisted
+// byte, and the first stored-body ACK of a gate-off cycle drops proof the
+// server may no longer hold.
+#[test]
+fn retained_gate_off_listing_keeps_state_bytes_and_drops_stale_proof() {
+    let (original, proof) = retained_session(2);
+    let mut off = identity::AcceptedBuckets::for_test();
+    let mut first = original.clone();
+    sticky_apply(&mut first, &proof, &off).unwrap();
+    let body = serde_json::to_value(&first).unwrap();
+    off.record(&body);
+    let before = serde_json::to_vec(&off).unwrap();
+    let hour_zero = first.usage_buckets[0].bucket_start.clone();
+    off.record_proved(&body, false, &[hour_zero.clone()]);
+    assert_eq!(serde_json::to_vec(&off).unwrap(), before);
+    off.clear_retained();
+    assert_eq!(serde_json::to_vec(&off).unwrap(), before);
+    // Proof held from an earlier ON cycle survives a gate-off listing
+    // untouched, and clear_retained drops it.
+    let mut held = retained_state();
+    retained_ack(&mut held, &first, &[]);
+    held.set_retained_enabled(false);
+    let bytes = serde_json::to_vec(&held).unwrap();
+    held.record_proved(&body, false, &[hour_zero]);
+    assert_eq!(serde_json::to_vec(&held).unwrap(), bytes);
+    held.clear_retained();
+    assert_eq!(
+        held.proved_rows_for_test(&original.source_session_id),
+        Some((0, 0))
+    );
+    // Gate on: an unwitnessed stored body still prunes rows it no longer has.
+    let mut on = retained_state();
+    retained_ack(&mut on, &first, &[]);
+    let mut shorter = first.clone();
+    shorter.usage_buckets.truncate(1);
+    on.record_proved(&serde_json::to_value(&shorter).unwrap(), false, &[]);
+    assert_eq!(
+        on.proved_rows_for_test(&original.source_session_id),
+        Some((1, 0))
+    );
 }
