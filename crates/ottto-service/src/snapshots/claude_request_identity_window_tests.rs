@@ -1619,6 +1619,7 @@ fn sticky_wire(item: SnapshotItem) -> Value {
 #[test]
 fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
     use base64::Engine;
+    use sha2::Digest;
     use std::io::Write;
     let mut cases = BTreeMap::new();
     let (mut mixed, mut proof) = sticky_session(4);
@@ -1690,8 +1691,8 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
     sticky_assert_reconciled(&original);
     cases.insert("restore_from_held_proof", sticky_wire(original));
     let actual = serde_json::to_value(cases).unwrap();
-    let expected: Value =
-        serde_json::from_str(include_str!("fixtures/claude_identity_cap_emitted.json")).unwrap();
+    let fixture = include_str!("fixtures/claude_identity_cap_emitted.json");
+    let expected: Value = serde_json::from_str(fixture).unwrap();
     if actual != expected {
         // Bootstrap/update on Linux CI only. The compact compressed receipt
         // is lossless; committing it never requires running tests on the Mac.
@@ -1704,4 +1705,12 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
         );
         panic!("emitted identity goldens changed; regenerate from the CI receipt");
     }
+    let manifest: Value = serde_json::from_str(include_str!(
+        "fixtures/claude_identity_cap_emitted.manifest.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        manifest["sha256"],
+        format!("{:x}", sha2::Sha256::digest(fixture.as_bytes()))
+    );
 }
