@@ -945,7 +945,9 @@ impl SharedCache {
                     WriteOutcome::FailedHeld(HeldCause::StaleSurvivor)
                 }
             }
-            // Codex receipt mismatch: transient, the next pass re-acquires.
+            // Codex or Pi receipt mismatch, or Pi's stale survivor (Codex's
+            // double failure is the strict rebind above). Pi has no D3 key
+            // hold: transient, the next pass re-acquires.
             store::FailureDisposition::Hold { .. } => {
                 WriteOutcome::FailedHeld(HeldCause::ReceiptPending)
             }
