@@ -4761,11 +4761,17 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
         let bytes = form.as_bytes();
         let path = scratch.join(format!("old-{number}.json"));
         fs::write(&path, bytes).unwrap();
+        let drops_before = claude_absence_counters_for_test().tombstone_decode_drops;
         let native = claude_request_census::decode_index(bytes).expect("native legacy decode");
         let streaming = lenient_decode::read(std::io::Cursor::new(bytes), "load", "unattributed")
             .expect("no extra positional field");
         let bounded = lenient_decode::read_bounded(bytes).unwrap();
         let disk = ScanIndex::load(&path).expect("no reset");
+        assert_eq!(
+            claude_absence_counters_for_test().tombstone_decode_drops,
+            drops_before,
+            "retired reread_guard duplicates stay silently ignored"
+        );
         for mut decoded in [native, streaming, bounded, disk] {
             assert!(decoded.decode_holds.is_empty(), "no quarantine");
             assert_eq!(

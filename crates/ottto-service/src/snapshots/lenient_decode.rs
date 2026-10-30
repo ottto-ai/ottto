@@ -1610,6 +1610,12 @@ impl<R: BufRead + Seek> Decoder<R> {
                     self.family_spans.insert(name, value);
                 }
                 if !seen.insert(name) {
+                    if name == "claude_desktop_store_inventory" && pass == Pass::Full {
+                        with_claude_absence_counters(|counts| {
+                            counts.tombstone_decode_drops =
+                                counts.tombstone_decode_drops.saturating_add(1);
+                        });
+                    }
                     if name == "claude_request_census" {
                         index.claude_request_census = ClaudeRequestCensus::default();
                     } else if name == "claude_request_census_shadow" {
