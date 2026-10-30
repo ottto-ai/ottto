@@ -1156,6 +1156,86 @@ Capacity/availability retain their existing degraded behavior. Full-cause
 admission and its other counter projections arrive in subsequent slices.
 
 
+## Claude Family Census Shadow (schema 2 additive)
+
+Each Claude Code scan page emits one `local_resources` record with stage
+`claude_family_census_shadow`, under `counts`. It estimates, per session family
+(a root transcript and its subagents), whether the family would be complete in
+the current census window. It is shadow-only: the record changes no read,
+census bit, manifest, upload, retirement or other decision. Other sources emit
+no such record. The row holds counts, ages, fixed reason names and one order-free
+digest; no paths, ids, account hashes or request hashes.
+
+**Units.** A page evaluates the families its selection touched
+(`touched_families`, with `touched_families_over_cap` beyond the bound of 1,024),
+the families its previous page parsed (`followup_families`), and up to 64 others
+from a rotating cursor (`rotation_families`). Family counts are evaluations on
+this page: a family can repeat across pages, so they are neither distinct
+families nor a stock, and rows must not be summed into one.
+
+**Strict partition.** Every evaluated family (`families_evaluated`) is exactly
+one of `family_census_complete`, `family_complete_deferred.quantum` (complete past
+the limit of 64 per page), or one first-match reason in
+`family_census_incomplete`, tried in this order: `membership_unknown`, `queued`,
+`refused_read`, `refused_read_unattributed`, `held`, `quarantine`, `residue`,
+`evidence`, `evidence/presence_only`, `not_current_window`, `path_not_unique`.
+`singleton_families_evaluated` is included in `families_evaluated`.
+`families_unevaluated_member_budget` counts families left for a later page, which
+are not in `families_evaluated`.
+
+**Child finalization partition.** `family_child_finalize_eligible` and
+`family_child_finalize_blocked` are a separate partition of a separate
+population, and a family in it also keeps its strict reason. A candidate has a
+valid account proof that names no outside member, a live root bound at its
+current tuple, no stale bound child, at least one unfinalized child, and every
+member's current revision attested; a family with no live root is blocked
+`root_absent`. Candidates can include `held`, `membership_unknown` and
+`refused_read_unattributed` families, so the total can exceed the `evidence`
+count. Blocked causes are first-match, in this order: `root_absent`,
+`witness_missing`, `witness_conflict`, `witness_held`, `shared_parent`,
+`native_ownership_conflict`, `cross_family_unknown`,
+`identity_contract_changed`, `twin_set`, `sticky_veto`, `enumeration_open`,
+`uniqueness_unknown`, `window_moved`, `policy_changed`.
+
+`family_child_finalize_eligible` is an UPPER BOUND, not a finalization
+certificate. The per-session owner binding cannot be read at the scan step, and
+cross-family dependencies only a terminal census derives are not visible: a
+member's parent reference, a request shared with a family not yet censused, and
+request overlap with another family's pending proof. No code consumes this count.
+
+**Freshness.** `pending_census_members` describes the skipped set: `count`
+(queue plus replay entries), `replay`, `replay_repeat`, `oldest_age_s`,
+`over_24h`, `tracked`, `unqueued_unresolved`, `pace_evicted` and `stamped_for_s`.
+`skipped_set` holds `digest` and `retained`, the entries the previous page also
+skipped. `sticky_vetoes` holds `namespace_loss_age_s` and `unattributed_age_s`,
+null when the veto is not latched. These are process-local, and restart, a scope
+change or an eviction (`pace_evicted`) resets them, so every age is a LOWER BOUND
+across a restart and `stamped_for_s` caps it. Attestations reset the same way, so
+after a restart members count `evidence/presence_only` until ordinary work attests
+them again. Attestations and vetoes also reset with each new traversal generation.
+
+**Work counters.** These are approximate units, not exact operations.
+`member_keys_visited` is range advances of the member lookups, at most 16,384.
+Under `cost`: `root_index_keys_processed` is keys the uniqueness pass consumed,
+at most 8,192, plus one check per parse; the merged loop may also peek up to 2
+keys it does not count. `cross_family_entries_visited` is outer-map entries of the
+cross-family records, not the owner references flattened from them, and is zero
+on a page with no candidate. `rotation_keys_visited`, `queue_entries_visited` (two
+passes over the queue, not bounded by a constant) and `history_gates_visited`
+count entries. `predicate_cpu_us` is thread CPU, and excludes mutex wait.
+`families_evaluated`, `attested_keys`, `attestations_evicted` and
+`runtime_heap_bytes` (retained shadow state after the page, excluding page
+transients) are gauges. `root_index_restarted`, `root_index_complete`,
+`root_index_overflowed`, `queued_roots_overflowed`, `history_gates_overflowed`
+and `cross_family_overflowed` are flags. At the top level, `shadow_decision_calls`
+and `shadow_attest_micros` measure this page's equality attestation, and
+`attest_capped` counts Skips past the limit of 4,096 per page, not attested.
+
+**Zero and unavailable.** A zero count is a real zero for that page. An absent
+record means the page had no traversal state or was not Claude. Uniqueness is
+unavailable while `cost.root_index_complete` is false, and families then count
+`path_not_unique`, or `uniqueness_unknown` among child candidates.
+
 ## Pi reported-cost parsing
 
 Pi cost fields use checked decimal arithmetic and an inclusive $100,000 ceiling

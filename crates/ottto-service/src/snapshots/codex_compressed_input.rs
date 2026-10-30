@@ -74,7 +74,7 @@ pub(super) fn compressed_input_credit() -> io::Result<usize> {
         .ok_or_else(|| invalid("compressed rollout credit overflow"))
 }
 
-fn thread_cpu_micros() -> u64 {
+pub(super) fn thread_cpu_micros() -> u64 {
     let mut spec: libc::timespec = unsafe { std::mem::zeroed() };
     // SAFETY: valid writable timespec, querying only the current thread.
     if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spec) } != 0 {
