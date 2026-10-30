@@ -23,8 +23,6 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_real_rejected_page_records_account_hold_across_reload_and_reparses_next_generation", "R8"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_returning_member_that_never_reproves_is_held_until_its_bounded_terminal", "completion-fold"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_terminal_family_member_controls_keep_blocking_pruning_and_rebinding", "C6"),
-    ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_terminal_family_never_committed_members_let_the_claude_census_complete", "C6"),
-    ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_witness_bound_terminal_family_root_is_not_rearmed_by_a_start", "R7"),
     ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_dark_matches_fold_absent_publication_and_selection", "r25-code-unclassified"),
     ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_held_new_file_lifetime_losses_preserve_main_body", "unclassified"),
     ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_overlapping_restored_histories_count_their_union_once", "prior-code-unclassified"),
@@ -129,7 +127,7 @@ fn terminal_off_on_readiness_ignores_equal_the_checked_in_manifest() {
     assert_eq!(expected, sorted, "keep the manifest sorted");
     assert_eq!(ignored_for_readiness(), expected);
     // The count is the ON gate: it must reach 0 before ON anywhere.
-    assert_eq!(READINESS_MANIFEST.len(), 75);
+    assert_eq!(READINESS_MANIFEST.len(), 73);
 }
 
 #[test]
