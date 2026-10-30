@@ -8682,6 +8682,79 @@ fn terminal_off_red_retry_start(index: &mut ScanIndex, at: &str) -> serde_json::
     carry_start(index, at, BACKFILL_WINDOW_DAYS)
 }
 
+fn terminal_off_stale_member_keys() -> [String; 3] {
+    [
+        carry_key(CARRY_ROOT, None),
+        carry_key(CARRY_ROOT, Some(CARRY_AGENT)),
+        carry_key(CARRY_UNWITNESSED, None),
+    ]
+}
+
+/// What the first start's re-read under this generation commits again: each
+/// member's unchanged revision.
+fn terminal_off_reread_stale_members(index: &mut ScanIndex) {
+    for (root, subagent) in [
+        (CARRY_ROOT, None),
+        (CARRY_ROOT, Some(CARRY_AGENT)),
+        (CARRY_UNWITNESSED, None),
+    ] {
+        let entry = index.files.get_mut(&carry_key(root, subagent)).unwrap();
+        assert!(entry.source_file_fingerprint.is_empty(), "the first start owed this read");
+        entry.source_file_fingerprint = format!("rev-{}", carry_member(root, subagent));
+    }
+}
+
+/// Lead B B-P5: neither the contract latch nor source-wide context adoption
+/// discharges under containment. Two red-retry starts in one generation re-arm
+/// the stale families once; a new generation re-arms them once more.
+fn terminal_off_red_retries_rearm_once_per_generation(context: Option<&str>, latched: bool) {
+    let mut index = terminal_off_rearm_index(context, latched);
+    assert!(claude_terminal_off());
+    assert!(
+        !claude_redundant_stale_clear_suppressed(&index),
+        "this generation owes the semantic clear"
+    );
+    let first = terminal_off_red_retry_start(&mut index, CARRY_RETRY);
+    assert_eq!(first["stale_pending_families"], 2);
+    assert_eq!(first["rearmed_index_files"], 3, "one semantic re-read per member");
+    assert!(!index.files[&carry_key(CARRY_OTHER, None)]
+        .source_file_fingerprint
+        .is_empty());
+    terminal_off_reread_stale_members(&mut index);
+    carry_red(&mut index, CARRY_RETRY, 2);
+
+    let second = terminal_off_red_retry_start(&mut index, CARRY_SECOND_RETRY);
+    assert_eq!(second["stale_pending_families"], 2, "the families stay stale");
+    assert_eq!(
+        second["rearmed_index_files"], 0,
+        "the same generation never re-arms its stale families again"
+    );
+    for key in terminal_off_stale_member_keys() {
+        assert!(!index.files[&key].source_file_fingerprint.is_empty(), "{key}");
+    }
+    // Containment discharged nothing: the generation is still the same.
+    assert_eq!(index.upload_context_fingerprint.as_deref(), context);
+    assert_eq!(index.claude_request_identity_contract_changed, latched);
+
+    // A new generation (here a destination toggle) is owed exactly one more.
+    index.active_upload_context_fingerprint = Some("terminal-off-toggled-destination".into());
+    carry_red(&mut index, CARRY_SECOND_RETRY, 3);
+    let toggled = terminal_off_red_retry_start(&mut index, "2026-08-02T07:40:00Z");
+    assert_eq!(toggled["rearmed_index_files"], 3);
+}
+
+#[test]
+fn terminal_off_red_retries_with_no_adopted_context_rearm_stale_families_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    terminal_off_red_retries_rearm_once_per_generation(None, false);
+}
+
+#[test]
+fn terminal_off_red_retries_with_a_latched_contract_rearm_stale_families_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    terminal_off_red_retries_rearm_once_per_generation(Some(TERMINAL_OFF_DESTINATION), true);
+}
+
 /// Lead B B-P2: with the redundant stale clear suppressed, a member whose head
 /// body the server never ACKed is still cleared (Parse); ACKed members keep
 /// their revision (Skip).

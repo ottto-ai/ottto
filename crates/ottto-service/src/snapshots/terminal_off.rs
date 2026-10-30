@@ -216,6 +216,107 @@ fn claude_unacked_head_members(index: &ScanIndex, roots: &BTreeSet<String>) -> B
         .collect()
 }
 
+// B-P5: under containment neither the identity-contract latch nor
+// source-wide context adoption discharges, so an unsuppressed semantic stale
+// clear would re-arm every stale pending family at every red-retry or floor
+// start. This bounded process memo serves it once per family and generation
+// (traversal context, upload context pair, contract and latch). A cleared
+// member keeps its empty fingerprint persisted until it is actually read, so
+// the debt stays owed. Eviction or restart fails toward one more re-read,
+// never toward proof, ACK or settlement.
+const TERMINAL_OFF_STALE_CLEAR_KEYS: usize = 16_384;
+#[derive(Default)]
+struct TerminalOffStaleClears {
+    keys: BTreeSet<[u8; 32]>,
+    order: VecDeque<[u8; 32]>,
+    evictions: u64,
+}
+impl TerminalOffStaleClears {
+    fn remember(&mut self, key: [u8; 32]) {
+        if !self.keys.insert(key) {
+            return;
+        }
+        self.order.push_back(key);
+        if self.keys.len() > TERMINAL_OFF_STALE_CLEAR_KEYS {
+            let oldest = self.order.pop_front().expect("bounded memo has an owner");
+            self.keys.remove(&oldest);
+            self.evictions = self.evictions.saturating_add(1);
+            eprintln!("claude_terminal_off stale_clear_memo_evicted evictions={} capacity={TERMINAL_OFF_STALE_CLEAR_KEYS}", self.evictions);
+        }
+    }
+}
+#[cfg(test)]
+thread_local! {
+    static TERMINAL_OFF_STALE_CLEARS: std::cell::RefCell<TerminalOffStaleClears> =
+        std::cell::RefCell::new(TerminalOffStaleClears::default());
+}
+fn with_terminal_off_stale_clears<T>(f: impl FnOnce(&mut TerminalOffStaleClears) -> T) -> T {
+    #[cfg(not(test))]
+    {
+        static MEMO: std::sync::OnceLock<std::sync::Mutex<TerminalOffStaleClears>> =
+            std::sync::OnceLock::new();
+        f(&mut MEMO
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+    #[cfg(test)]
+    TERMINAL_OFF_STALE_CLEARS.with(|memo| f(&mut memo.borrow_mut()))
+}
+fn terminal_off_stale_clear_key(index: &ScanIndex, context: &str, root: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for value in [
+        "terminal-off-stale-clear:v1",
+        context,
+        index.upload_context_fingerprint.as_deref().unwrap_or("none"),
+        index
+            .active_upload_context_fingerprint
+            .as_deref()
+            .unwrap_or("none"),
+        index
+            .claude_request_identity_contract
+            .as_deref()
+            .unwrap_or("none"),
+        if index.claude_request_identity_contract_changed {
+            "latched"
+        } else {
+            "settled"
+        },
+        root,
+    ] {
+        update_length_prefixed(&mut digest, value.as_bytes());
+    }
+    digest.finalize().into()
+}
+/// The stale roots whose semantic clear this generation already served.
+fn terminal_off_stale_clear_served(
+    index: &ScanIndex,
+    context: &str,
+    roots: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    with_terminal_off_stale_clears(|memo| {
+        roots
+            .iter()
+            .filter(|root| {
+                memo.keys
+                    .contains(&terminal_off_stale_clear_key(index, context, root))
+            })
+            .cloned()
+            .collect()
+    })
+}
+fn note_terminal_off_stale_clears(index: &ScanIndex, context: &str, roots: &BTreeSet<String>) {
+    let keys: Vec<_> = roots
+        .iter()
+        .map(|root| terminal_off_stale_clear_key(index, context, root))
+        .collect();
+    with_terminal_off_stale_clears(|memo| keys.into_iter().for_each(|key| memo.remember(key)));
+}
+#[cfg(test)]
+fn terminal_off_stale_clear_memo_len_for_test() -> (usize, u64) {
+    with_terminal_off_stale_clears(|memo| (memo.keys.len(), memo.evictions))
+}
+
 fn claude_terminal_stale_roots(index: &ScanIndex, window: &str) -> BTreeSet<String> {
     index
         .claude_usage_family_pending

@@ -2197,3 +2197,29 @@ fn terminal_off_unacked_head_stays_parse_and_is_reoffered_beside_an_acked_contro
     );
     assert!(!index.files[&unacked_key].source_file_fingerprint.is_empty());
 }
+
+#[test]
+fn terminal_off_stale_clear_memo_is_bounded_and_eviction_fails_toward_another_clear() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+    let index = off_index();
+    let roots: BTreeSet<String> = (0..TERMINAL_OFF_STALE_CLEAR_KEYS + 2)
+        .map(|n| format!("root-{n:05}"))
+        .collect();
+    note_terminal_off_stale_clears(&index, "context", &roots);
+    assert_eq!(
+        terminal_off_stale_clear_memo_len_for_test(),
+        (TERMINAL_OFF_STALE_CLEAR_KEYS, 2)
+    );
+    let served = terminal_off_stale_clear_served(&index, "context", &roots);
+    assert_eq!(served.len(), TERMINAL_OFF_STALE_CLEAR_KEYS);
+    assert!(!served.contains("root-00000") && !served.contains("root-00001"));
+    let toggled = ScanIndex {
+        active_upload_context_fingerprint: Some("toggled-destination".into()),
+        ..index.clone()
+    };
+    assert!(
+        terminal_off_stale_clear_served(&toggled, "context", &roots).is_empty(),
+        "another generation is never served by this one"
+    );
+}

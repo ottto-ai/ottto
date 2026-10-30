@@ -42204,15 +42204,21 @@ fn ensure_bounded_traversal(
             admission: (!stale.is_empty()).then_some(admission),
         });
         let suppressed = claude_redundant_stale_clear_suppressed(index);
-        // B-P2: an unACKed head is never suppressed.
+        // B-P2: an unACKed head is never suppressed. B-P5: an unsuppressed
+        // semantic clear is served once per family and generation.
         let unacked = claude_unacked_head_members(index, &stale);
-        if !suppressed || !unacked.is_empty() {
+        let semantic = if suppressed {
+            BTreeSet::new()
+        } else {
+            let served = terminal_off_stale_clear_served(index, &context_fingerprint, &stale);
+            stale.difference(&served).cloned().collect()
+        };
+        if !semantic.is_empty() || !unacked.is_empty() {
             // Actual destination/identity-contract invalidation remains owed.
             for (key, entry) in &mut index.files {
                 if unacked.contains(key)
-                    || (!suppressed
-                        && claude_index_path_member_ref(Path::new(key))
-                            .is_some_and(|m| stale.contains(m.root)))
+                    || claude_index_path_member_ref(Path::new(key))
+                        .is_some_and(|m| semantic.contains(m.root))
                 {
                     transition.rearmed_index_files +=
                         usize::from(!entry.source_file_fingerprint.is_empty());
@@ -42220,7 +42226,8 @@ fn ensure_bounded_traversal(
                 }
             }
         }
-        if !suppressed {
+        if !semantic.is_empty() {
+            note_terminal_off_stale_clears(index, &context_fingerprint, &semantic);
             eprintln!(
                 "claude_terminal_off semantic_context_reselection files={}",
                 index.files.len()
