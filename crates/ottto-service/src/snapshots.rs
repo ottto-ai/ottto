@@ -41504,7 +41504,7 @@ pub(crate) struct PiLedger {
 pub(crate) struct PiFork {
     /// Persisted (N): the header named a parent.
     has_parent: bool,
-    /// Persisted (N): the header time, unix nanos; `None` when the header
+    /// Persisted (L): the local-only header time, unix nanos; `None` when the header
     /// time is missing or invalid, which counts every entry.
     header_nanos: Option<i128>,
     /// RAM only, never encoded, cloned or logged: the header's
@@ -41514,12 +41514,11 @@ pub(crate) struct PiFork {
     copies_this_read: u64,
 }
 
-/// Never prints `parentSession`.
+/// Never prints the local header time or `parentSession`.
 impl std::fmt::Debug for PiFork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PiFork")
             .field("has_parent", &self.has_parent)
-            .field("header_nanos", &self.header_nanos)
             .field("parent_ref", &self.parent_ref.is_some())
             .field("copies_this_read", &self.copies_this_read)
             .finish()

@@ -1366,7 +1366,8 @@ before their session header time. If the envelope time is absent, the provider
 time can establish the cutoff. Entries at or after the header time retain normal
 identity and deduplication. Missing or invalid cutoff evidence never proves a
 copy; ordinary timestamp validation still applies. A fork's durable Pi section
-stores only `has_parent` and the header timestamp alongside its usage ledger.
+stores `has_parent` (N) and the local header timestamp (L) alongside its H usage
+ledger. The L cutoff never enters logs, diagnostics or uploads.
 The `parentSession` value stays in RAM for the read and never enters records,
 logs, diagnostics or uploads.
 
