@@ -31624,6 +31624,7 @@ impl OwnedSourceScan {
                     claude_family_census_shadow::observe_page(
                         index,
                         &claude_family_shadow,
+                        &pending_finalization,
                         sampling
                             .as_ref()
                             .map_or("", |context| context.namespace.0.as_str()),
@@ -32598,6 +32599,18 @@ impl OwnedSourceScan {
                     }
                     if let Some(loss) = index.terminal_jsonl_loss(&candidate) {
                         census.add_terminal_jsonl_loss(loss);
+                    }
+                    // E7-8a: the ordinary equality Skip attests this revision
+                    // for the shadow family census. Counts only.
+                    if source == SnapshotSource::ClaudeCode && parse_reason.is_none() {
+                        claude_family_census_shadow::attest_equality_skip(
+                            index,
+                            &candidate,
+                            audit_now,
+                            sampling
+                                .as_ref()
+                                .map_or("", |context| context.namespace.0.as_str()),
+                        );
                     }
                     pending!();
                 }

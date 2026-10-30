@@ -138,14 +138,52 @@ fn queue(index: &mut ScanIndex, key: &str) {
         });
 }
 
+/// Attest every indexed member at its current revision, as this
+/// generation's parses or equality Skips would.
+fn attest_all(index: &ScanIndex) -> Attestations {
+    let generation = generation_tag(index.traversal.as_ref().unwrap());
+    let mut attested = Attestations::default();
+    for (key, entry) in &index.files {
+        attested.record(generation, key, &entry.source_file_fingerprint);
+    }
+    attested.flush();
+    attested
+}
+
+/// Each indexed key with its current revision, as a page's parses report it.
+fn revisions(index: &ScanIndex) -> Vec<(String, String)> {
+    index
+        .files
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.source_file_fingerprint.clone()))
+        .collect()
+}
+
+fn as_parsed(parsed: &[(String, String)]) -> impl Iterator<Item = (&str, &str)> {
+    parsed
+        .iter()
+        .map(|(key, revision)| (key.as_str(), revision.as_str()))
+}
+
+/// Evaluate `families` with every member attested.
+fn evaluate(index: &ScanIndex, families: &[FamilyRef]) -> FamilyCounts {
+    evaluate_attested(index, families, &attest_all(index))
+}
+
 /// Evaluate `families` with transcript I/O denied, and check the shadow left
 /// the index byte-identical and the counts partition `evaluated`.
-fn evaluate(index: &ScanIndex, families: &[FamilyRef]) -> FamilyCounts {
+fn evaluate_attested(
+    index: &ScanIndex,
+    families: &[FamilyRef],
+    attested: &Attestations,
+) -> FamilyCounts {
     let before = serde_json::to_vec(index).unwrap();
     let traversal = index.traversal.as_ref().unwrap();
     let roots = RootCounts::build(index, traversal);
-    let counts =
-        with_transcript_io_denied(|| View::new(index, traversal, &roots).evaluate(families));
+    let vetoes = Vetoes::current(index, traversal);
+    let counts = with_transcript_io_denied(|| {
+        View::new(index, traversal, &roots, attested, vetoes).evaluate(families)
+    });
     assert_eq!(
         serde_json::to_vec(index).unwrap(),
         before,
@@ -257,7 +295,15 @@ fn each_reason_in_isolation_partitions_the_incomplete_count() {
                 .as_mut()
                 .unwrap()
                 .counts
-                .unreadable_path_count = 1;
+                .disappeared_file_count = 1;
+        }),
+        case(Incomplete::RefusedReadUnattributed, 5, |index| {
+            index
+                .traversal
+                .as_mut()
+                .unwrap()
+                .counts
+                .record_unreadable(UnreadableCause::OpenRead, 1);
         }),
         case(Incomplete::Held, 1, {
             let key = target[0].clone();
@@ -371,9 +417,296 @@ fn unknown_enumeration_keeps_every_family_incomplete() {
         .unwrap()
         .counts
         .symlink_rejected_count = 1;
-    for index in [undrained, overflowed, too_wide, symlinked] {
+    // Namespace loss: an unlistable path or directory, an unreadable
+    // remainder no cause attributes, or an unresolved root.
+    let unlisted = |cause| {
+        let mut index = base.clone();
+        index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .counts
+            .record_unreadable(cause, 1);
+        index
+    };
+    let mut unattributed = base.clone();
+    unattributed
+        .traversal
+        .as_mut()
+        .unwrap()
+        .counts
+        .unreadable_path_count = 1;
+    let mut unresolved = base.clone();
+    unresolved
+        .legacy_unresolved_root_file_witnesses
+        .insert(SCAN_ROOT.into());
+    for index in [
+        undrained,
+        overflowed,
+        too_wide,
+        symlinked,
+        unlisted(UnreadableCause::Metadata),
+        unlisted(UnreadableCause::Directory),
+        unattributed,
+        unresolved,
+    ] {
         let counts = evaluate(&index, &refs);
         assert_eq!(counts.incomplete, only(Incomplete::MembershipUnknown, 3));
+    }
+}
+
+#[test]
+fn coverage_needs_an_attestation_of_the_current_revision() {
+    let mut base = index();
+    let keys = add_family(&mut base, "dir-a", 4, 1);
+    let refs = [family(&keys[0])];
+    let presence_only = only(Incomplete::EvidencePresenceOnly, 1);
+    // Observed and indexed at a non-empty revision, with an exact proof, but
+    // nothing this generation attested it: presence only.
+    let none = Attestations::default();
+    assert_eq!(
+        evaluate_attested(&base, &refs, &none).incomplete,
+        presence_only
+    );
+    // One attested member is not the family.
+    let generation = generation_tag(base.traversal.as_ref().unwrap());
+    let mut partial = Attestations::default();
+    partial.record(generation, &keys[0], "source");
+    partial.flush();
+    assert_eq!(
+        evaluate_attested(&base, &refs, &partial).incomplete,
+        presence_only
+    );
+    let attested = attest_all(&base);
+    assert_eq!(evaluate_attested(&base, &refs, &attested).complete, 1);
+
+    // A later revision the attestation does not name.
+    let mut grown = base.clone();
+    grown
+        .files
+        .get_mut(&keys[1])
+        .unwrap()
+        .source_file_fingerprint = "source-2".into();
+    assert_eq!(
+        evaluate_attested(&grown, &refs, &attested).incomplete,
+        presence_only
+    );
+    // A growth hint after the attestation re-queues a current member
+    // (Q-E1-4).
+    let mut hinted = base.clone();
+    hinted
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_candidates
+        .push_back(ScanTraversalPath {
+            scan_root: PathBuf::from(SCAN_ROOT),
+            path: PathBuf::from(&keys[1]),
+            census_member: false,
+            watcher_hint: true,
+        });
+    assert_eq!(
+        evaluate_attested(&hinted, &refs, &attested).incomplete,
+        only(Incomplete::Queued, 1)
+    );
+    // Another generation's attestations cover nothing.
+    let mut next = base.clone();
+    next.traversal.as_mut().unwrap().context_fingerprint = "context-2".into();
+    assert_eq!(
+        evaluate_attested(&next, &refs, &attested).incomplete,
+        presence_only
+    );
+}
+
+#[test]
+fn only_the_ordinary_equality_skip_attests() {
+    let mut index = index();
+    let key = root_key("dir-e", &root_id(1));
+    let mut entry = tests::manifest_index_entry(Some("entity"));
+    entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+    index.files.insert(key.clone(), entry.clone());
+    index
+        .file_snapshot_fingerprints
+        .insert(key.clone(), BTreeSet::from(["entity".to_string()]));
+    index
+        .snapshot_activity_at
+        .insert("entity".into(), Some("2026-10-14T10:00:00Z".into()));
+    let candidate = CandidateFile {
+        physical_identity: None,
+        scan_root: PathBuf::from(SCAN_ROOT),
+        path: PathBuf::from(&key),
+        size_bytes: entry.size_bytes,
+        modified_unix_seconds: entry.modified_unix_seconds,
+        modified_unix_nanos: entry.modified_unix_nanos.unwrap(),
+        source_file_fingerprint: entry.source_file_fingerprint.clone(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
+    };
+    assert!(equality_skip(&index, &candidate, 0));
+    // A changed revision is a parse, not an attestation.
+    let mut changed = candidate.clone();
+    changed.source_file_fingerprint = "source-2".into();
+    assert!(!equality_skip(&index, &changed, 0));
+    // A held Skip (here the family's authority quarantine) attests nothing.
+    let mut quarantined = index.clone();
+    quarantined.claude_usage_authority_quarantine.insert(
+        root_id(1),
+        ClaudeUsageAuthorityQuarantineRecord {
+            contract: String::new(),
+            proven_witness_fingerprint: "b".repeat(64),
+            member_source_file_fingerprints: BTreeMap::new(),
+            failed_reconstruction_count: 1,
+            disposition: Default::default(),
+            retry_after_unix_seconds: 0,
+            proof_correction: None,
+        },
+    );
+    assert!(!equality_skip(&quarantined, &candidate, 0));
+    // Witness-less upload-context debt (#899 R23) is presence, even when its
+    // backoff lets the file skip.
+    let mut debt = index.clone();
+    debt.active_upload_context_fingerprint = Some("context-new".into());
+    assert!(!equality_skip(&debt, &candidate, 0));
+}
+
+#[test]
+fn loss_vetoes_stay_up_for_the_generation() {
+    let mut index = index();
+    let refs = (0..2)
+        .map(|n| family(&add_family(&mut index, "dir-a", n, 1)[0]))
+        .collect::<Vec<_>>();
+    let keys = refs
+        .iter()
+        .flat_map(|family| {
+            index
+                .files
+                .keys()
+                .filter(|key| FamilyRef::of_key(key).as_ref() == Some(family))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let touched = Touched::from_paths(keys.iter().map(Path::new));
+    let parsed = revisions(&index);
+    let mut runtime = Runtime::default();
+    let mut page = |index: &ScanIndex, parsed: &[(String, String)], now| {
+        with_transcript_io_denied(|| {
+            evaluate_page(
+                &mut runtime,
+                index,
+                &touched,
+                as_parsed(parsed),
+                "scope",
+                now,
+            )
+            .unwrap()
+        })
+    };
+    let complete = page(&index, &parsed, NOW);
+    assert_eq!(complete.families.complete, 2);
+
+    let mut lost = index.clone();
+    lost.traversal
+        .as_mut()
+        .unwrap()
+        .counts
+        .disappeared_file_count = 1;
+    let first = page(&lost, &[], NOW + 60);
+    assert_eq!(
+        first.families.incomplete,
+        only(Incomplete::RefusedReadUnattributed, 2)
+    );
+    // The counter reads zero again in the same generation: still vetoed.
+    let healed = page(&index, &[], NOW + 120);
+    assert_eq!(
+        healed.families.incomplete,
+        only(Incomplete::RefusedReadUnattributed, 2)
+    );
+    assert_eq!(healed.sticky_vetoes.unattributed_age_s, Some(60));
+    let mut walk_lost = index.clone();
+    walk_lost
+        .traversal
+        .as_mut()
+        .unwrap()
+        .counts
+        .record_unreadable(UnreadableCause::Directory, 1);
+    page(&walk_lost, &[], NOW + 180);
+    let after = page(&index, &[], NOW + 240);
+    assert_eq!(
+        after.families.incomplete,
+        only(Incomplete::MembershipUnknown, 2)
+    );
+    assert_eq!(after.sticky_vetoes.namespace_loss_age_s, Some(60));
+
+    // A new generation clears the vetoes and the attestations alike.
+    let mut next = index.clone();
+    next.traversal.as_mut().unwrap().context_fingerprint = "context-2".into();
+    let fresh = page(&next, &[], NOW + 300);
+    assert_eq!(fresh.sticky_vetoes, StickyAges::default());
+    assert_eq!(
+        fresh.families.incomplete,
+        only(Incomplete::EvidencePresenceOnly, 2)
+    );
+    let reattested = page(&next, &parsed, NOW + 360);
+    assert_eq!(reattested.families.complete, 2);
+}
+
+#[test]
+fn the_skipped_view_is_queue_plus_replay() {
+    let mut index = index();
+    let keys = add_family(&mut index, "dir-q", 1, 1);
+    queue(&mut index, &keys[0]);
+    index
+        .claude_stale_family_carry
+        .replay
+        .push(ScanTraversalPath {
+            scan_root: PathBuf::from(SCAN_ROOT),
+            path: PathBuf::from(&keys[1]),
+            census_member: false,
+            watcher_hint: false,
+        });
+    // A re-read hint is no census member, so it is not in the view.
+    index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_candidates
+        .push_back(ScanTraversalPath {
+            scan_root: PathBuf::from(SCAN_ROOT),
+            path: PathBuf::from(&keys[1]),
+            census_member: false,
+            watcher_hint: true,
+        });
+    let view = skipped_view(&index).collect::<Vec<_>>();
+    assert_eq!(view.len(), 2);
+    assert_eq!(view.iter().filter(|skipped| skipped.replay).count(), 1);
+    assert_eq!(skipped_census_members(&index).count(), 2);
+    let mut first_pending = FirstPending::default();
+    let (first, _) = first_pending.observe(skipped_view(&index), |_| false, NOW);
+    assert_eq!((first.count, first.replay, first.replay_repeat), (2, 1, 0));
+    // Still replayed a page later: repeated, and its age a lower bound.
+    let (again, _) = first_pending.observe(skipped_view(&index), |_| false, NOW + 60);
+    assert_eq!((again.replay, again.replay_repeat), (1, 1));
+    assert_eq!(again.oldest_age_s, 60);
+}
+
+#[test]
+fn no_consumer_reads_a_verdict_in_8a() {
+    for completion in [
+        Completion::Complete,
+        Completion::Incomplete(Incomplete::Evidence),
+    ] {
+        for consumer in [
+            FamilyConsumer::AccountWindowMark,
+            FamilyConsumer::CensusRecordAging,
+            FamilyConsumer::ScopedEvidenceLoad,
+            FamilyConsumer::FamilyRetrySchedule,
+        ] {
+            assert!(!completion.permits(consumer));
+        }
     }
 }
 
@@ -530,9 +863,22 @@ fn m4_shape_drains_3000_queued_members_at_100_per_page() {
         }
 
         let now = NOW + page as u64 * 60;
+        // The served members' parses attest their revisions.
+        let parsed = served
+            .iter()
+            .map(|path| (local_index_key(path), "source".to_string()))
+            .collect::<Vec<_>>();
         let before = serde_json::to_vec(&index).unwrap();
         let shadow = with_transcript_io_denied(|| {
-            evaluate_page(&mut runtime, &index, &touched, "scope", now).unwrap()
+            evaluate_page(
+                &mut runtime,
+                &index,
+                &touched,
+                as_parsed(&parsed),
+                "scope",
+                now,
+            )
+            .unwrap()
         });
         assert_eq!(serde_json::to_vec(&index).unwrap(), before);
         assert_partition(&shadow.families);
@@ -550,6 +896,13 @@ fn m4_shape_drains_3000_queued_members_at_100_per_page() {
             );
         }
         assert_eq!(shadow.pending_census_members.over_24h, 0);
+        // Served members are attested, so no stamp outlives the queue, and
+        // every family the page sees was attested or is still queued.
+        assert_eq!(shadow.pending_census_members.unqueued_unresolved, 0);
+        assert!(!shadow
+            .families
+            .incomplete
+            .contains_key(&Incomplete::EvidencePresenceOnly));
         assert!(no_census_bits(&index));
     }
     assert_eq!(completed.len(), FAMILIES);
@@ -586,23 +939,67 @@ fn a_restart_between_pages_rederives_identical_counts_with_zero_reads() {
         }
     }
     let touched = Touched::from_paths(touched_keys.iter().map(PathBuf::as_path));
+    let parsed = revisions(&index);
     let mut runtime = Runtime::default();
     let first = with_transcript_io_denied(|| {
-        evaluate_page(&mut runtime, &index, &touched, "scope", NOW).unwrap()
+        evaluate_page(
+            &mut runtime,
+            &index,
+            &touched,
+            as_parsed(&parsed),
+            "scope",
+            NOW,
+        )
+        .unwrap()
     });
-    // Restart: reload the persisted index and lose all runtime state.
+    // Restart: reload the persisted index and lose all runtime state,
+    // attestations included.
     let reloaded =
         serde_json::from_slice::<ScanIndex>(&serde_json::to_vec(&index).unwrap()).unwrap();
-    let mut restarted = Runtime::default();
-    let second = with_transcript_io_denied(|| {
-        evaluate_page(&mut restarted, &reloaded, &touched, "scope", NOW).unwrap()
-    });
-    assert_eq!(second.families, first.families);
-    assert_eq!(second.rotation_families, first.rotation_families);
-    assert_eq!(second.pending_census_members, first.pending_census_members);
-    assert_eq!(second.skipped_set.digest, first.skipped_set.digest);
+    let restart = || {
+        let mut restarted = Runtime::default();
+        with_transcript_io_denied(|| {
+            evaluate_page(
+                &mut restarted,
+                &reloaded,
+                &touched,
+                std::iter::empty(),
+                "scope",
+                NOW,
+            )
+            .unwrap()
+        })
+    };
+    let second = restart();
+    let again = restart();
+    assert_eq!(again.families, second.families, "deterministic");
+    assert_eq!(again.pending_census_members, second.pending_census_members);
     assert!(first.families.complete > 0);
     assert!(first.families.incomplete_total() > 0);
+    // What was covered only by attestation is presence again; nothing is
+    // inferred from the persisted index. Earlier reasons are unchanged.
+    let reason = |counts: &FamilyCounts, reason: Incomplete| {
+        counts.incomplete.get(&reason).copied().unwrap_or_default()
+    };
+    assert_eq!(second.families.complete, 0);
+    assert_eq!(
+        reason(&second.families, Incomplete::EvidencePresenceOnly),
+        first.families.complete
+            + first.families.deferred.quantum
+            + reason(&first.families, Incomplete::NotCurrentWindow)
+    );
+    for kept in [Incomplete::Queued, Incomplete::Residue] {
+        assert_eq!(
+            reason(&second.families, kept),
+            reason(&first.families, kept)
+        );
+    }
+    assert_eq!(second.families.evaluated, first.families.evaluated);
+    assert_eq!(
+        second.pending_census_members.count,
+        first.pending_census_members.count
+    );
+    assert_eq!(second.skipped_set.digest, first.skipped_set.digest);
     assert!(no_census_bits(&reloaded));
 }
 
@@ -614,11 +1011,17 @@ fn first_pending_at_is_bounded_and_counts_pace_evictions() {
         census_member: true,
         watcher_hint: false,
     };
+    fn queued(paths: &[ScanTraversalPath]) -> impl Iterator<Item = Skipped<'_>> + '_ {
+        paths.iter().map(|path| Skipped {
+            path,
+            replay: false,
+        })
+    }
     let mut first_pending = FirstPending::default();
     let early = (0..100).map(path).collect::<Vec<_>>();
-    first_pending.observe(early.iter(), NOW);
+    first_pending.observe(queued(&early), |_| false, NOW);
     let all = (0..MAX_FIRST_PENDING + 10).map(path).collect::<Vec<_>>();
-    let (pending, skipped) = first_pending.observe(all.iter(), NOW + 2 * OVER_DAY);
+    let (pending, skipped) = first_pending.observe(queued(&all), |_| false, NOW + 2 * OVER_DAY);
     assert_eq!(pending.count, (MAX_FIRST_PENDING + 10) as u64);
     assert_eq!(pending.tracked, MAX_FIRST_PENDING as u64);
     // The ten oldest stamps go; the remaining 90 early ones still age.
@@ -626,8 +1029,15 @@ fn first_pending_at_is_bounded_and_counts_pace_evictions() {
     assert_eq!(pending.over_24h, 90);
     assert_eq!(pending.oldest_age_s, 2 * OVER_DAY);
     assert_eq!(skipped.retained, 100);
-    // Members that left the queue drop out.
-    let (pending, _) = first_pending.observe(std::iter::empty(), NOW + 3 * OVER_DAY);
+    // Members that leave the queue unresolved keep their stamps; resolved
+    // ones drop out.
+    let (pending, _) = first_pending.observe(std::iter::empty(), |_| false, NOW + 3 * OVER_DAY);
+    assert_eq!(
+        (pending.count, pending.tracked),
+        (0, MAX_FIRST_PENDING as u64)
+    );
+    assert_eq!(pending.unqueued_unresolved, MAX_FIRST_PENDING as u64);
+    let (pending, _) = first_pending.observe(std::iter::empty(), |_| true, NOW + 3 * OVER_DAY);
     assert_eq!((pending.count, pending.tracked), (0, 0));
 }
 
@@ -719,4 +1129,86 @@ fn a_real_claude_page_emits_shadow_counts_and_keeps_the_census_bits() {
         assert!(no_census_bits(&index));
     }
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn the_root_index_rebuilds_when_membership_changes_at_equal_size() {
+    let mut index = index();
+    let keys = add_family(&mut index, "dir-a", 5, 0);
+    let elsewhere = root_key("dir-b", &root_id(5));
+    let unrelated = format!("{SCAN_ROOT}/dir-z/notes.txt");
+    index
+        .files
+        .insert(elsewhere.clone(), tests::manifest_index_entry(None));
+    index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .observed_index_keys
+        .insert(elsewhere.clone());
+    // The other directory's path holds nothing yet: not a member anywhere.
+    index.confirmed_empty_files.insert(elsewhere.clone());
+    let touched = Touched::from_paths([Path::new(&keys[0])]);
+    let parsed = revisions(&index);
+    let mut runtime = Runtime::default();
+    let first = evaluate_page(
+        &mut runtime,
+        &index,
+        &touched,
+        as_parsed(&parsed),
+        "scope",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(first.families.complete, 1);
+    // One page later it holds requests while an unrelated file turns empty:
+    // every set keeps its size, and the root is no longer unique.
+    index.confirmed_empty_files.remove(&elsewhere);
+    index.confirmed_empty_files.insert(unrelated);
+    let second = evaluate_page(
+        &mut runtime,
+        &index,
+        &touched,
+        as_parsed(&parsed),
+        "scope",
+        NOW + 60,
+    )
+    .unwrap();
+    assert!(second.cost.root_index_rebuilt);
+    assert_eq!(second.families.complete, 0);
+    assert!(second
+        .families
+        .incomplete
+        .contains_key(&Incomplete::PathNotUnique));
+}
+
+#[test]
+fn only_an_attestation_after_leaving_the_queue_resolves_a_stamp() {
+    let mut index = index();
+    let keys = add_family(&mut index, "dir-a", 6, 0);
+    let served = vec![(keys[0].clone(), "source".to_string())];
+    let mut runtime = Runtime::default();
+    let mut page = |index: &ScanIndex, parsed: &[(String, String)], now| {
+        evaluate_page(
+            &mut runtime,
+            index,
+            &Touched::default(),
+            as_parsed(parsed),
+            "scope",
+            now,
+        )
+        .unwrap()
+        .pending_census_members
+    };
+    let mut queued = index.clone();
+    queue(&mut queued, &keys[0]);
+    assert_eq!(page(&queued, &[], NOW).tracked, 1);
+    // Served and parsed: resolved.
+    assert_eq!(page(&index, &served, NOW + 60).tracked, 0);
+    // Queued again, then leaves the queue unserved (refused): the earlier
+    // attestation does not resolve the new stamp.
+    assert_eq!(page(&queued, &[], NOW + 120).tracked, 1);
+    let left = page(&index, &[], NOW + 180);
+    assert_eq!((left.tracked, left.unqueued_unresolved), (1, 1));
+    assert_eq!(page(&queued, &[], NOW + 240).oldest_age_s, 120);
 }
