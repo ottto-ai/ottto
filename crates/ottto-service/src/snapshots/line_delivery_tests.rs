@@ -1041,6 +1041,7 @@ fn walk_gate_counts_age_and_size_skips_without_changing_selection() {
                 index.traversal.as_mut().unwrap(),
                 30,
                 &index.files,
+                None,
             );
         }
         let counts = &index.traversal.as_ref().unwrap().counts;
@@ -1090,6 +1091,7 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
             index.traversal.as_mut().unwrap(),
             30,
             &index.files,
+            None,
         );
     }
     unselected_page("codex");

@@ -40,6 +40,7 @@ fn current_candidate(f: &ScanFixture, index: &ScanIndex) -> CandidateFile {
         None,
         BACKFILL_WINDOW_DAYS,
         &index.files,
+        None,
     )
     .unwrap();
     prepare_owned_scan_candidate(
@@ -56,6 +57,7 @@ fn current_candidate(f: &ScanFixture, index: &ScanIndex) -> CandidateFile {
         None,
         BACKFILL_WINDOW_DAYS,
         &index.files,
+        None,
     )
     .unwrap()
     .0

@@ -686,6 +686,10 @@ impl SharedCache {
         candidate: &CandidateFile,
         census: &mut ScanCensus,
     ) {
+        if source == SnapshotSource::ClaudeCode {
+            // The held file stays unread: source-wide fork-lineage mark.
+            index.usage_guard_mark_refused(&candidate.path);
+        }
         let kept = source == SnapshotSource::ClaudeCode
             && claude_request_census::retain_held(index, candidate);
         if reason == store::Refusal::Corrupt {

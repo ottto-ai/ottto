@@ -1613,6 +1613,19 @@ impl FileFold {
             })
     }
 
+    /// The index key of the original a `fork-context-ref` line names, while
+    /// the copy proof holds it: the fork lineage edge other owners reuse.
+    pub(in crate::snapshots) fn fork_parent_key(&self) -> Option<&str> {
+        match &self.proof {
+            Some(CopyProof::Holders(Some(parent))) => Some(parent),
+            _ => None,
+        }
+    }
+    #[cfg(test)]
+    pub(in crate::snapshots) fn set_fork_parent_for_test(&mut self, parent: String) {
+        self.proof = Some(CopyProof::Holders(Some(parent)));
+    }
+
     /// This fold's (effective birth, location): the total copy order.
     fn copy_order(&self) -> Option<(i128, LocationKey)> {
         let physical = self.physical?;
@@ -2189,6 +2202,13 @@ fn parent_proves(
 /// The walk deadline, a queued size change, a holder modified since its
 /// census read, and an unscanned other-session main file delay a decision.
 fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex) {
+    if !index.persistence_available() {
+        for at in folds {
+            hold_copies(&mut items[*at], "index_unavailable");
+        }
+        return;
+    }
+
     struct Wanted {
         at: usize,
         session: String,
@@ -2777,6 +2797,10 @@ pub(crate) fn side_calls_page(
     trace: &ClaudeTraceOwnershipLoadReport,
     index: &ScanIndex,
 ) -> BTreeSet<String> {
+    if !index.persistence_available() {
+        return items.iter().map(|i| i.source_session_id.clone()).collect();
+    }
+
     let _spent = PageSpent::start("page.side_calls");
     let mut unresolved = BTreeSet::new();
     if enabled() {
@@ -3176,6 +3200,12 @@ pub(crate) fn finish_page(
     index: &ScanIndex,
     telemetry: TelemetryRead,
 ) -> BTreeSet<String> {
+    if !index.persistence_available() {
+        let held = items.iter().map(|i| i.source_session_id.clone()).collect();
+        items.clear();
+        return held;
+    }
+
     let _spent = PageSpent::start("page.finish");
     struct Session {
         entity: ClaudeEntityBody,

@@ -243,7 +243,7 @@ impl LossyPrefixIdentity {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Checkpoint {
     stamp: FileStamp,
     scope: Scope,

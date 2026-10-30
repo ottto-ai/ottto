@@ -419,6 +419,7 @@ impl GroupBoot {
             &index.files,
             false,
             cache,
+            None,
         ) else {
             return Boot::Strict;
         };

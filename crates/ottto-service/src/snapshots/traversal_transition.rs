@@ -410,6 +410,7 @@ mod tests {
         index.claude_usage_family_pending.insert(
             "private-session".into(),
             super::super::ClaudeUsageFamilyPending {
+                derived_request_members: std::collections::BTreeSet::new(),
                 census_window_end: T0.into(),
                 member_request_id_hashes: Default::default(),
                 member_occurrences: Default::default(),
@@ -418,7 +419,7 @@ mod tests {
             },
         );
         index.bounded_sweep_had_unsettled_upload = true;
-        let (_, rows) = capture(|| {
+        let (_, all_rows) = capture(|| {
             ensure_bounded_traversal(
                 SnapshotSource::ClaudeCode,
                 &[],
@@ -427,12 +428,34 @@ mod tests {
                 BACKFILL_WINDOW_DAYS,
             )
         });
+        // B3 phase 1 adds its own held-family diagnostics rows beside the
+        // transition row; every emitted row stays content-free.
+        for row in &all_rows {
+            let serialized = row.to_string();
+            for forbidden in [key, "private-session", "private-body-witness"] {
+                assert!(!serialized.contains(forbidden));
+            }
+        }
+        let rows = all_rows
+            .into_iter()
+            .filter(|row| row["stage"] == "bounded_traversal_transition")
+            .collect::<Vec<_>>();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["source"], "claude_code");
         assert_eq!(rows[0]["counts"]["prior_unsettled_upload"], true);
         assert_eq!(rows[0]["counts"]["stale_pending_families"], 1);
-        assert_eq!(rows[0]["counts"]["rearmed_index_files"], 1);
-        assert!(index.files[key].source_file_fingerprint.is_empty());
+        // Lead B B3 phase 1 (approved: "Unknown hold instead of carry/re-arm",
+        // "missing-witness held not carried"): this witnessless stale family
+        // is held, so its file keeps its fingerprint and nothing is re-armed.
+        assert_eq!(
+            index.usage_guard_reason("private-session"),
+            Some(super::super::usage_pending_guard::Unknown::MissingWitness)
+        );
+        assert_eq!(rows[0]["counts"]["rearmed_index_files"], 0);
+        assert_eq!(
+            index.files[key].source_file_fingerprint,
+            "private-body-witness"
+        );
         assert!(!index.bounded_sweep_had_unsettled_upload);
         assert!(rows[0]["counts"]["previous"].is_null());
         assert_eq!(rows[0]["stage"], "bounded_traversal_transition");
@@ -785,6 +808,7 @@ mod tests {
             plain.claude_usage_family_pending.insert(
                 "private-session".into(),
                 super::super::ClaudeUsageFamilyPending {
+                    derived_request_members: std::collections::BTreeSet::new(),
                     census_window_end: T0.into(),
                     member_request_id_hashes: Default::default(),
                     member_occurrences: Default::default(),

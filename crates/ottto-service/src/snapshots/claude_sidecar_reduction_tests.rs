@@ -86,6 +86,7 @@ impl Fixture {
             None,
             BACKFILL_WINDOW_DAYS,
             &BTreeMap::new(),
+            None,
         )
         .unwrap()
     }

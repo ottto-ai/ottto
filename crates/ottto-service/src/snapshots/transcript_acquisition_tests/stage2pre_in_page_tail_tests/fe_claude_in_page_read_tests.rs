@@ -1098,8 +1098,11 @@ fn fe_claude_census_prefix_enters_pending() {
     let pending = &grown.index.claude_usage_family_pending[SESSION];
     assert!(!pending.invalid, "census pending: the family is valid");
     assert_eq!(
-        pending.member_request_id_hashes.get(SESSION),
-        Some(&pending_hashes(0..6)),
+        pending
+            .membership()
+            .get(SESSION)
+            .map(|hashes| hashes.iter().cloned().collect::<BTreeSet<_>>()),
+        Some(pending_hashes(0..6)),
         "census pending: the prefix's requests"
     );
 }
@@ -2186,6 +2189,7 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
             Some(due),
             BACKFILL_WINDOW_DAYS,
             &hold.index.files,
+            None,
         )
         .expect("retained while recent");
         File::open(&hold.fixture.file.0)
@@ -2200,6 +2204,7 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
                 Some(due),
                 BACKFILL_WINDOW_DAYS,
                 &hold.index.files,
+                None,
             )
             .is_none());
         } else {
@@ -2210,6 +2215,7 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
                 Some(due),
                 BACKFILL_WINDOW_DAYS,
                 &hold.index.files,
+                None
             )
             .is_none());
         }

@@ -307,8 +307,15 @@ impl NativeBodyBudget<'_> {
                 BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>,
             >(members.checked_add(1).ok_or(refusal)?, 1, &mut retained)
             .ok_or(refusal)?;
+            // Runtime derivation markers own one member name, including empty members.
+            restore_tree_insert_peak::<String, ()>(
+                members.checked_add(1).ok_or(refusal)?,
+                1,
+                &mut retained,
+            )
+            .ok_or(refusal)?;
             retained
-                .add(item.source_session_id.len().checked_mul(2).ok_or(refusal)?)
+                .add(item.source_session_id.len().checked_mul(3).ok_or(refusal)?)
                 .ok_or(refusal)?;
             // The unchanged canonical code keeps local maps while cloning its
             // installed maps. Its equality check creates one more temporary
@@ -358,6 +365,12 @@ impl Completion {
         scan: &SourceScanResult,
         index: &mut ScanIndex,
     ) -> Result<Option<ClaudeNativeObservations>, crate::source_rotation::LocalRefusal> {
+        if !index.persistence_available() {
+            return Err(crate::source_rotation::LocalRefusal(
+                "scan_index_map_unavailable",
+            ));
+        }
+
         let active = self.fallback.is_some()
             || !self.target_charges.revisions.is_empty()
             || self
@@ -394,12 +407,15 @@ impl Completion {
             paid,
             targets: &self.target_charges,
         };
+        // Same fold as the unpaid path: held stale families keep their proof.
+        index.refresh_usage_guard_holds_at(Some(scan.census_window_end.as_str()));
         let counts = accumulate_claude_usage_family_pending_with_credit(
             &scan.snapshots,
             &mut index.claude_usage_family_pending,
             &scan.census_window_end,
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
             Some(&mut budget),
+            Some(&mut index.usage_guard_holds),
         )?;
         Ok(Some(ClaudeNativeObservations {
             counts,
@@ -1216,6 +1232,11 @@ impl SelectedFallback {
         index: &mut ScanIndex,
         previous: &ScanIndex,
     ) -> Result<(), &'static str> {
+        if !index.persistence_available() || !previous.persistence_available() {
+            index.retain_persistence_baseline_from(previous);
+            return Err("scan_index_map_unavailable");
+        }
+
         let empty_advances = index.claude_empty_map_advances(previous);
         let mut affected_fingerprints = BTreeSet::new();
         for key in &self.withheld_keys {

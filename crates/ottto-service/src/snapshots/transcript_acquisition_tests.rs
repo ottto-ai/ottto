@@ -4709,3 +4709,223 @@ fn rearm_full_cause_counts_native_bytes_without_changing_selection_or_uploads() 
             .is_none());
     }
 }
+
+#[test]
+fn claude_unknown_continuation_keeps_custody_on_full_and_reads_held_growth_as_tail() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let scratch = crate::test_scratch::ScratchDir::new("usage-unknown-tail");
+    let root = "a1111111-1111-4111-8111-111111111111";
+    let original = Fixture::new(source);
+    let fixture = Fixture(scratch.join(format!("{root}.jsonl")));
+    fs::rename(&original.0, &fixture.0).unwrap();
+    fixture.append(&usage(source, 100, 1, "model-a"));
+    let (old, _, _, _) = acquire(&fixture, source, None, 100);
+    let old = old.unwrap();
+    let cache = sampled_scan::SharedCache::default();
+    let key = local_index_key(&fixture.0);
+    assert!(cache.retained().unwrap().insert(key.clone(), old));
+    let mut index = ScanIndex::default();
+    index.files.insert(key.clone(), serde_json::from_value(json!({
+        "size_bytes":fs::metadata(&fixture.0).unwrap().len(),
+        "modified_unix_seconds":1,"source_file_fingerprint":"kept","last_snapshot_fingerprint":null
+    })).unwrap());
+    index.claude_usage_family_pending.insert(
+        root.into(),
+        ClaudeUsageFamilyPending {
+            derived_request_members: BTreeSet::new(),
+            census_window_end: NOW.into(),
+            member_request_id_hashes: BTreeMap::from([(root.into(), BTreeSet::new())]),
+            member_occurrences: BTreeMap::from([(root.into(), BTreeMap::new())]),
+            invalid: false,
+            idless_revision: None,
+        },
+    );
+    index.refresh_usage_guard_holds();
+    assert!(index.usage_guard_holds.holds(root));
+
+    // Missing certificate never starts a native read.
+    let (mut missing, _, scope) = native_parser(&fixture, source);
+    assert!(!missing
+        .prepare_continuation_only(None, &scope, None, 101)
+        .unwrap());
+    assert!(missing.reader.acquisition.is_none());
+    // The recovered debt must be passed together with indexed debt. Refused
+    // Full leaves exact checkpoint/rank/native state in the cache.
+    let checkpoint = cache.claude_checkpoint(&key).unwrap().unwrap();
+    let (mut due, _, scope) = native_parser(&fixture, source);
+    assert!(!due
+        .prepare_continuation_only(
+            Some(&checkpoint),
+            &scope,
+            Some(crate::transcript_acquisition::AuditDebt {
+                due_unix_seconds: 101
+            }),
+            101
+        )
+        .unwrap());
+    assert_eq!(
+        cache.claude_checkpoint(&key).unwrap().as_ref(),
+        Some(&checkpoint)
+    );
+    let (mut changed_scope, _, _) = native_parser(&fixture, source);
+    assert!(!changed_scope
+        .prepare_continuation_only(Some(&checkpoint), &Scope("changed".into()), None, 101)
+        .unwrap());
+    assert_eq!(
+        cache.claude_checkpoint(&key).unwrap().as_ref(),
+        Some(&checkpoint)
+    );
+    for id in [2, 3] {
+        // Unknown-held append, then append after resolution.
+        if id == 3 {
+            index.claude_usage_family_witnesses.insert(
+                root.into(),
+                ClaudeUsageFamilyWitness {
+                    evidence_fingerprint: "a".repeat(64),
+                    member_request_id_fingerprints: BTreeMap::from([(
+                        root.into(),
+                        claude_request_id_set_fingerprint(&BTreeSet::new()),
+                    )]),
+                    member_occurrence_fingerprints: BTreeMap::from([(
+                        root.into(),
+                        claude_occurrence_map_fingerprint(&BTreeMap::new()),
+                    )]),
+                    assigned_request_id_fingerprints: BTreeMap::new(),
+                    legacy_excluded_request_id_hashes: BTreeMap::new(),
+                    legacy_exclusion_evidence_fingerprint: None,
+                    legacy_owner_roots: BTreeSet::new(),
+                },
+            );
+            index.refresh_usage_guard_holds();
+            assert!(!index.usage_guard_holds.holds(root));
+        }
+        fixture.append(&usage(source, 100, id, "model-a"));
+        let mut census = ScanCensus::default();
+        let candidate = candidate_from_traversal_path(
+            source,
+            ScanTraversalPath {
+                scan_root: fixture.0.parent().unwrap().to_path_buf(),
+                path: fixture.0.clone(),
+                census_member: true,
+                watcher_hint: false,
+            },
+            &mut census,
+            Some(2_000_000_000),
+            1,
+            &index.files,
+            Some(&index.usage_guard_holds),
+        )
+        .unwrap();
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            index.usage_guard_observe_growth(&candidate)
+        });
+        if id == 2 {
+            assert!(rows
+                .iter()
+                .any(|row| row["counts"]["unknown_growth_bytes_observed"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    > 0));
+        }
+        let checkpoint = cache.claude_checkpoint(&key).unwrap().unwrap();
+        let (mut parser, expected, scope) = native_parser(&fixture, source);
+        assert!(parser
+            .prepare_continuation_only(Some(&checkpoint), &scope, None, 100 + id as u64)
+            .unwrap());
+        assert_eq!(
+            parser
+                .reader
+                .acquisition
+                .as_ref()
+                .unwrap()
+                .metrics()
+                .native_bytes,
+            0
+        );
+        let guard_bytes = parser
+            .reader
+            .acquisition
+            .as_ref()
+            .unwrap()
+            .guard_bytes_read();
+        let taken = cache
+            .take_claude_checkpoint(&key, &checkpoint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parser
+                .prepare_acquisition(Some(taken.retained), &scope, None, 100 + id as u64)
+                .unwrap(),
+            ReadMode::Tail
+        );
+        assert_eq!(
+            parser
+                .reader
+                .acquisition
+                .as_ref()
+                .unwrap()
+                .guard_bytes_read(),
+            guard_bytes,
+            "plan reused, no duplicate guard read"
+        );
+        while !parser.step().unwrap() {}
+        assert!(
+            parser
+                .reader
+                .acquisition
+                .as_ref()
+                .unwrap()
+                .metrics()
+                .native_bytes
+                > 0
+        );
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            index.usage_guard_note_tail(&fixture.0, 1)
+        });
+        let bucket = if id == 2 {
+            "unknown_held_tail"
+        } else {
+            "retained_proof_catchup_tail"
+        };
+        assert!(rows.iter().any(|row| row["counts"][bucket] == 1));
+        assert_eq!(index.files[&key].source_file_fingerprint, "kept");
+        index.files.get_mut(&key).unwrap().size_bytes = candidate.size_bytes;
+        let completed = parser
+            .retain_reduction(
+                &scope,
+                100 + id as u64,
+                sampled_scan::RetainBudget::granted_unclassified(
+                    crate::transcript_cache::ENTRY_BYTES,
+                ),
+            )
+            .unwrap()
+            .unwrap();
+        let parsed = parser
+            .finish(
+                &expected,
+                &fixture.0,
+                NOW,
+                "native-fixture".into(),
+                Some(&CodexTitleMetadata::default()),
+                Some(&ClaudeTitleMetadata::default()),
+                None,
+            )
+            .unwrap();
+        let mut items = parsed.snapshots;
+        apply_upload_policy(source, &mut items, SnapshotUploadPolicy::default());
+        assert_eq!(
+            serde_json::to_value(items).unwrap(),
+            oracle(&fixture, source)
+        );
+        assert!(cache.retained().unwrap().insert(
+            key.clone(),
+            Retained {
+                checkpoint: completed.checkpoint,
+                state: completed.reduction.unwrap(),
+            }
+        ));
+    }
+}

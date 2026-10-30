@@ -23,6 +23,31 @@ impl From<super::ClaudeRetryAdmissionRefusal> for Rejection {
         }
     }
 }
+/// Overlapping observations, separate from the conserved rejection totals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(super) struct UnknownCounts {
+    unknown_missing_witness: u64,
+    unknown_incomplete_member: u64,
+    unknown_compacted_origin: u64,
+    unknown_decode: u64,
+    unknown_resource: u64,
+    unknown_dependency: u64,
+    unknown_global: u64,
+}
+impl UnknownCounts {
+    #[cfg(test)]
+    fn maximum() -> Self {
+        Self {
+            unknown_missing_witness: u64::MAX,
+            unknown_incomplete_member: u64::MAX,
+            unknown_compacted_origin: u64::MAX,
+            unknown_decode: u64::MAX,
+            unknown_resource: u64::MAX,
+            unknown_dependency: u64::MAX,
+            unknown_global: u64::MAX,
+        }
+    }
+}
 macro_rules! counts {
     ($($field:ident: $stage:ident),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -30,6 +55,8 @@ macro_rules! counts {
             $(pub(super) $field: u64,)+
             pub(super) eligible_before_funding: u64,
             pub(super) final_carried: u64,
+            #[serde(flatten)]
+            pub(super) unknown: UnknownCounts,
         }
         impl Counts {
             pub(super) fn reject(&mut self, stage: Rejection, roots: usize) {
@@ -41,7 +68,7 @@ macro_rules! counts {
             }
             #[cfg(test)]
             fn maximum() -> Self {
-                Self { $($field: u64::MAX,)+ eligible_before_funding: u64::MAX, final_carried: u64::MAX }
+                Self { $($field: u64::MAX,)+ eligible_before_funding: u64::MAX, final_carried: u64::MAX, unknown: UnknownCounts::maximum() }
             }
         }
     };
@@ -58,6 +85,33 @@ counts! {
     reserve_allocation: ReserveAllocation,
 }
 impl Counts {
+    pub(super) fn observe_unknown(
+        &mut self,
+        index: &super::ScanIndex,
+        roots: &std::collections::BTreeSet<String>,
+    ) {
+        use super::usage_pending_guard::Unknown;
+        self.unknown = UnknownCounts::default();
+        if index.usage_guard_holds.global() {
+            self.unknown.unknown_global = 1;
+            return;
+        }
+        for root in roots {
+            let counter = match index.usage_guard_reason(root) {
+                Some(Unknown::MissingWitness) => &mut self.unknown.unknown_missing_witness,
+                Some(Unknown::IncompleteMember) => &mut self.unknown.unknown_incomplete_member,
+                Some(Unknown::CompactedOrigin) => &mut self.unknown.unknown_compacted_origin,
+                Some(Unknown::Decode) => &mut self.unknown.unknown_decode,
+                Some(Unknown::Resource) => &mut self.unknown.unknown_resource,
+                Some(Unknown::Dependency) => &mut self.unknown.unknown_dependency,
+                None => continue,
+            };
+            *counter = counter.saturating_add(1);
+        }
+    }
+    pub(super) fn has_unknown(&self) -> bool {
+        self.unknown != UnknownCounts::default()
+    }
     pub(super) fn start_gate(index: &super::ScanIndex, same_context: bool) -> Rejection {
         if !same_context {
             Rejection::ProvenanceOrContext
@@ -135,10 +189,10 @@ mod tests {
         counts.reject(Rejection::ReserveAllocation, 1);
         assert_eq!(counts.reserve_allocation, u64::MAX);
         let encoded = counts.json();
-        assert!(encoded.len() < 640);
-        assert!(std::mem::size_of::<Counts>() <= 88);
+        assert!(encoded.len() < 1280);
+        assert!(std::mem::size_of::<Counts>() <= 144);
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 11);
+        assert_eq!(value.as_object().unwrap().len(), 18);
         assert!(value
             .as_object()
             .unwrap()

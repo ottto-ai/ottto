@@ -1137,7 +1137,12 @@ fn census_derivation_drift_tripwire_counts_changed_ids_at_one_revision() {
         .expect("entry")
         .source_file_fingerprint
         .clear();
-    census_scan(&root, &mut index, "2026-08-05T09:00:00Z");
+    // Lead B round 8: a pending-free tombstone makes the census-prefix index
+    // Unknown, which holds every Claude path (global B3), and a held file is
+    // reparsed only on growth. This step checks the census derivation rule
+    // for the reparse itself, so it reads as a reader without B3 would.
+    assert!(usage_census_prefix::CensusPrefixIndex::build(&index).unknown());
+    usage_pending_guard::replay_old(|| census_scan(&root, &mut index, "2026-08-05T09:00:00Z"));
     assert_eq!(
         index
             .claude_request_census_for_test()
@@ -2351,6 +2356,7 @@ fn held_original_keeps_dependent_copy_proof_only_while_committed_entry_unchanged
         None,
         365,
         &BTreeMap::new(),
+        None,
     )
     .unwrap();
     candidate.physical_identity = Some([metadata.dev(), metadata.ino()]);

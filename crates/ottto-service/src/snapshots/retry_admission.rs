@@ -18,6 +18,10 @@ fn claude_retry_record_due(
 }
 
 fn claude_retry_due_family_exists(index: &ScanIndex, collected_at: &str) -> bool {
+    if !index.persistence_available() {
+        return false;
+    }
+
     let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
     let served = index
         .traversal
@@ -94,6 +98,13 @@ fn claude_retry_admit_batch_observed(
             oversized_after_path: None,
             storage_deferred: false,
         });
+    if !index.persistence_available() {
+        state.complete = false;
+        state.roots_complete = false;
+        state.storage_deferred = true;
+        state.progressed = false;
+        return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state);
+    }
     state.progressed = false;
     let lower = state
         .after_root
@@ -195,6 +206,9 @@ fn claude_retry_singleton_storage_only_scoped(
     root: &str,
     debt_scope: Option<&BTreeSet<String>>,
 ) -> bool {
+    if index.usage_guard_reason(root).is_some() {
+        return true; // scoped custody only; never oversized re-arm service
+    }
     let Some(pending) = index.claude_usage_family_pending.get(root) else {
         return false;
     };
@@ -323,6 +337,10 @@ fn claude_retry_path_owed(
 }
 
 fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
+    if !index.persistence_available() {
+        return;
+    }
+
     let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
     let became_storage_only = index
         .claude_stale_family_carry
@@ -517,11 +535,11 @@ fn claude_retry_note_offered(
     if oversized_after.is_some() {
         for path in paths {
             let key = local_index_key(&path.path);
-            if claude_index_path_member_ref(&path.path)
-                .is_some_and(|m| oversized.as_deref() == Some(m.root))
-                && previous
-                    .as_deref()
-                    .map_or(true, |after| key.as_str() > after)
+            if claude_index_path_member_ref(&path.path).is_some_and(|m| {
+                oversized.as_deref() == Some(m.root) && !index.usage_guard_holds.holds(m.root)
+            }) && previous
+                .as_deref()
+                .map_or(true, |after| key.as_str() > after)
                 && oversized_after
                     .as_deref()
                     .is_some_and(|after| key.as_str() <= after)

@@ -644,7 +644,13 @@ fn storage_only_refusal_requires_complete_accepted_unique_evidence() {
         .unwrap()
         .member_request_id_hashes
         .insert(format!("{root}_agent-missing"), BTreeSet::new());
-    assert!(!claude_retry_singleton_storage_only(&fixture.index, &root));
+    // Production decides after rebuilding the hold projection (traversal
+    // start, fold start); this direct pending edit marks the cached one stale.
+    fixture.index.usage_guard_holds.invalidate();
+    assert!(
+        claude_retry_singleton_storage_only(&fixture.index, &root),
+        "Unknown keeps scoped custody instead of oversized re-arm"
+    );
     fixture.index = accepted.clone();
     fixture.index.files.insert(
         format!("/duplicate/{root}.jsonl"),
@@ -726,13 +732,30 @@ fn oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
             .file_snapshot_fingerprints
             .insert(key, BTreeSet::from([entity.clone()]));
         fixture.index.accepted_snapshot_fingerprints.insert(entity);
-        fixture
+        let member = format!("{family}_{stem}");
+        let pending = fixture
             .index
             .claude_usage_family_pending
             .get_mut(&family)
-            .unwrap()
+            .unwrap();
+        pending
             .member_request_id_hashes
-            .insert(format!("{family}_{stem}"), BTreeSet::new());
+            .insert(member.clone(), BTreeSet::new());
+        pending
+            .member_occurrences
+            .insert(member.clone(), BTreeMap::new());
+        let witness = fixture
+            .index
+            .claude_usage_family_witnesses
+            .get_mut(&family)
+            .unwrap();
+        witness.member_request_id_fingerprints.insert(
+            member.clone(),
+            claude_request_id_set_fingerprint(&BTreeSet::new()),
+        );
+        witness
+            .member_occurrence_fingerprints
+            .insert(member, claude_occurrence_map_fingerprint(&BTreeMap::new()));
     }
     let healthy = fixture.index.files.keys().cloned().collect::<Vec<_>>();
     let mut candidates = Vec::new();
@@ -753,6 +776,7 @@ fn oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
             rfc3339_unix_seconds(CARRY_RETRY),
             BACKFILL_WINDOW_DAYS,
             &fixture.index.files,
+            None,
         )
         .unwrap();
         prepare_owned_scan_candidate(
@@ -769,6 +793,7 @@ fn oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
             rfc3339_unix_seconds(CARRY_RETRY),
             BACKFILL_WINDOW_DAYS,
             &fixture.index.files,
+            None,
         )
         .unwrap();
         let entry = fixture.index.files.get_mut(key).unwrap();

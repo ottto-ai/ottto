@@ -4333,6 +4333,7 @@ fn oversized_idless_marker_strings_refuse_before_reader_token_allocation() {
     seed.claude_usage_family_pending.insert(
         "family".into(),
         ClaudeUsageFamilyPending {
+            derived_request_members: std::collections::BTreeSet::new(),
             census_window_end: "2026-10-25T00:00:00Z".into(),
             member_request_id_hashes: BTreeMap::new(),
             member_occurrences: BTreeMap::new(),
@@ -4413,6 +4414,7 @@ fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
         },
     );
     let pending = ClaudeUsageFamilyPending {
+        derived_request_members: std::collections::BTreeSet::new(),
         census_window_end: "2026-10-25T00:00:00Z".into(),
         member_request_id_hashes: BTreeMap::from([("family".into(), BTreeSet::new())]),
         member_occurrences: BTreeMap::new(),

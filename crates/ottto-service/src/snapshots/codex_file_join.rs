@@ -3845,6 +3845,7 @@ pub(super) mod tests {
                 None,
                 0,
                 &BTreeMap::new(),
+                None,
             )
             .unwrap();
             let parsed = parse_opened_jsonl_file(

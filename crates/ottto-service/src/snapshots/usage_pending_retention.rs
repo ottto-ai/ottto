@@ -1,0 +1,1143 @@
+//! Selected-checkpoint eligibility, never census or acceptance credit.
+use super::*;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Refusal {
+    Scratch,
+    Invalid,
+    DecodeHold,
+    Quarantine,
+    IdentityOrLedger,
+    Membership,
+    HeldMember,
+    DuplicateOwner,
+    HistoryOrReplay,
+    AuditOrCorrection,
+    AccountDebt,
+    Unaccepted,
+    UsageProof,
+    RetryCarryB3,
+    CarrierS4,
+}
+
+pub(super) enum Settlement<'a> {
+    Settled(&'a ClaudeUsageFamilyWitness),
+    Refused(Refusal),
+}
+
+#[derive(Clone, Copy)]
+struct MemberFile<'a> {
+    key: &'a str,
+    entry: &'a ScanIndexEntry,
+    duplicate: bool,
+}
+type Members<'a> = BTreeMap<ClaudeIndexPathMemberRef<'a>, MemberFile<'a>>;
+#[derive(Default)]
+struct FamilyFiles<'a> {
+    members: Members<'a>,
+    held: bool,
+}
+type Inventory<'a> = BTreeMap<&'a str, FamilyFiles<'a>>;
+
+// One borrowed node per indexed file, plus at most one node per file's root.
+// Refuse before allocation if the optional diagnostic scratch is not bounded.
+fn inventory(index: &ScanIndex) -> Option<Inventory<'_>> {
+    use crate::heap_layout_bound::{tree_nodes, Counter};
+    if !crate::heap_layout_bound::layout_supported() {
+        return None;
+    }
+    let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+    tree_nodes::<&str, FamilyFiles<'_>>(index.claude_usage_family_pending.len(), &mut cost)?;
+    tree_nodes::<ClaudeIndexPathMemberRef<'_>, MemberFile<'_>>(index.files.len(), &mut cost)?;
+    Some(build_inventory(index))
+}
+
+// The production caller admits this borrowed graph before allocation. Small
+// synthetic fixtures can exercise family semantics on non-native CI layouts.
+fn build_inventory(index: &ScanIndex) -> Inventory<'_> {
+    let mut inventory: Inventory<'_> = BTreeMap::new();
+    for (key, entry) in &index.files {
+        let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
+            continue;
+        };
+        if !index.claude_usage_family_pending.contains_key(member.root) {
+            continue;
+        }
+        inventory
+            .entry(member.root)
+            .or_default()
+            .members
+            .entry(member)
+            .and_modify(|file| file.duplicate = true)
+            .or_insert(MemberFile {
+                key,
+                entry,
+                duplicate: false,
+            });
+    }
+    // Holds may name a sibling omitted from the selected files map. They
+    // still hold the entire family; absence here cannot erase that debt.
+    for key in index
+        .claude_account_deferred_holds
+        .keys()
+        .map(String::as_str)
+        .chain(
+            index
+                .claude_history_emission
+                .files
+                .values()
+                .filter(|held| held.held.is_some() || held.literal_denied)
+                .map(|held| held.index_key.as_str()),
+        )
+    {
+        if let Some(member) = claude_index_path_member_ref(Path::new(key)) {
+            if index.claude_usage_family_pending.contains_key(member.root) {
+                inventory.entry(member.root).or_default().held = true;
+            }
+        }
+    }
+    inventory
+}
+
+fn known_refusal(
+    index: &ScanIndex,
+    root: &str,
+    pending: &ClaudeUsageFamilyPending,
+    files: Option<&FamilyFiles<'_>>,
+) -> Option<Refusal> {
+    if pending.invalid {
+        return Some(Refusal::Invalid);
+    }
+    if index.decode_holds_family(root) || index.decode_has_opaque_file_incidence() {
+        return Some(Refusal::DecodeHold);
+    }
+    if index.claude_usage_authority_quarantine.contains_key(root) {
+        return Some(Refusal::Quarantine);
+    }
+    if index.claude_account_family_pending.contains_key(root) {
+        return Some(Refusal::AccountDebt);
+    }
+    if files.is_some_and(|family| family.held) {
+        return Some(Refusal::HeldMember);
+    }
+    if index.claude_request_identity_contract_changed
+        || index.claude_request_identity_contract.is_none()
+        || !claude_accepted_ledger_is_current(index)
+    {
+        return Some(Refusal::IdentityOrLedger);
+    }
+    let Some(family) = files else {
+        return Some(Refusal::Membership);
+    };
+    let files = &family.members;
+    if pending.membership().is_empty()
+        || files.len() != pending.membership().keys().count()
+        || !files.contains_key(&ClaudeIndexPathMemberRef {
+            root,
+            subagent_stem: None,
+        })
+        || pending.membership().keys().any(|name| {
+            ClaudeIndexPathMemberRef::of_family_member(root, name)
+                .and_then(|member| files.get(&member))
+                .map_or(true, |file| file.duplicate)
+        })
+    {
+        return Some(Refusal::Membership);
+    }
+    if files.values().any(|file| {
+        index.decode_holds_file(file.key)
+            || index.claude_account_deferred_holds.contains_key(file.key)
+            || file.entry.source_file_fingerprint.is_empty()
+    }) {
+        return Some(Refusal::HeldMember);
+    }
+    if pending
+        .membership()
+        .values()
+        .flat_map(|hashes| hashes.iter())
+        .any(|hash| index.claude_duplicate_request_owners.contains_key(hash))
+    {
+        return Some(Refusal::DuplicateOwner);
+    }
+    if index.claude_reemission_exclusions.pauses_adoption()
+        || index.bounded_sweep_had_unsettled_upload
+        || files.values().any(|file| {
+            index.claude_family_listed(file.key)
+                || index.effective_upload_body_witness_revision_requires_adoption(file.key)
+                || index
+                    .claude_reemission_exclusions
+                    .holds_without_list_before(
+                        index
+                            .claude_request_census
+                            .get(file.key)
+                            .and_then(|record| record.birth())
+                            .map(|birth| birth.unix_seconds),
+                        claude_reemission_exclusions::NO_LIST_HOLD_BEFORE_UNIX_SECONDS,
+                    )
+        })
+    {
+        return Some(Refusal::HistoryOrReplay);
+    }
+    if files.values().any(|file| {
+        file.entry.has_unverified_source()
+            || index
+                .held_audit_progress
+                .as_ref()
+                .is_some_and(|held| held.key == file.key)
+    }) || pending
+        .membership()
+        .keys()
+        .any(|name| index.claude_owned_start_census.contains_key(name))
+    {
+        return Some(Refusal::AuditOrCorrection);
+    }
+    if files.values().any(|file| !file_body_accepted(index, file)) {
+        return Some(Refusal::Unaccepted);
+    }
+    let Some(witness) = index.claude_usage_family_witnesses.get(root) else {
+        return Some(Refusal::UsageProof);
+    };
+    if !claude_usage_family_witness_legacy_free(witness)
+        || !witness
+            .member_request_id_fingerprints
+            .keys()
+            .eq(pending.membership().keys())
+        || !witness
+            .member_occurrence_fingerprints
+            .keys()
+            .eq(pending.membership().keys())
+        || !pending
+            .member_occurrences
+            .keys()
+            .eq(pending.membership().keys())
+        || pending.membership().iter().any(|(name, hashes)| {
+            witness.member_request_id_fingerprints.get(name)
+                != Some(&claude_request_hashes_fingerprint(hashes.iter()))
+                || pending
+                    .member_occurrences
+                    .get(name)
+                    .map_or(true, |occurrences| {
+                        !hashes.iter().eq(occurrences.keys())
+                            || witness.member_occurrence_fingerprints.get(name)
+                                != Some(&claude_occurrence_map_fingerprint(occurrences))
+                    })
+        })
+    {
+        return Some(Refusal::UsageProof);
+    }
+    None
+}
+
+// The selected-index finalizer commits the body-set witness and entity set
+// together. The accepted ledger excludes not_stored and permanent refusals;
+// quarantine/decode checks also reject partial or held selected groups.
+fn file_body_accepted(index: &ScanIndex, file: &MemberFile<'_>) -> bool {
+    claude_index_file_body_accepted(index, file.key, file.entry)
+        && file
+            .entry
+            .last_upload_body_witness
+            .as_deref()
+            .and_then(codex_digest_from_hex)
+            .is_some()
+        && file
+            .entry
+            .last_snapshot_fingerprint
+            .as_deref()
+            .and_then(codex_digest_from_hex)
+            == index
+                .file_snapshot_fingerprints
+                .get(file.key)
+                .map(snapshot_file_entity_set_digest)
+}
+
+fn accepted_usage_body<'a>(
+    index: &'a ScanIndex,
+    root: &str,
+    pending: &ClaudeUsageFamilyPending,
+    files: Option<&FamilyFiles<'_>>,
+) -> Result<&'a ClaudeUsageFamilyWitness, Refusal> {
+    if let Some(reason) = known_refusal(index, root, pending, files) {
+        return Err(reason);
+    }
+    // Matching retained request/occurrence proof plus the existing authority
+    // demotion fence binds usage to the accepted selected body. An ACKed NULL
+    // body has no qualifying proof or retains authority quarantine. A digest
+    // alone says nothing about usage. No #901 receipt or active-context match
+    // is required: changing context cannot revoke an already accepted body.
+    index
+        .claude_usage_family_witnesses
+        .get(root)
+        .ok_or(Refusal::UsageProof)
+}
+
+fn retry_carry_replacement(_index: &ScanIndex, _root: &str) -> Result<(), Refusal> {
+    // TODO(E7 B3): Which bound commitment and overlap/debt carrier replace
+    // stale-window token comparisons without granting a reconstruction read?
+    Err(Refusal::RetryCarryB3)
+}
+
+fn settlement<'a>(
+    index: &'a ScanIndex,
+    root: &str,
+    pending: &ClaudeUsageFamilyPending,
+    files: Option<&FamilyFiles<'_>>,
+) -> Settlement<'a> {
+    match accepted_usage_body(index, root, pending, files).and_then(|commitment| {
+        retry_carry_replacement(index, root)?;
+        Ok(commitment)
+    }) {
+        Ok(commitment) => Settlement::Settled(commitment),
+        Err(reason) => Settlement::Refused(reason),
+    }
+}
+
+fn negative_scheduling_carrier_durable(_index: &ScanIndex, _root: &str) -> bool {
+    // TODO(E7 S4-carrier): Where is the durable L carrier preserving this
+    // family's negative scheduling fence and overlap/debt effects after removal?
+    // A usage/body digest (H) and first-seen status (N) cannot replace it.
+    false
+}
+
+/// Why a family that may otherwise settle keeps its pending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RetireRefusal {
+    /// Some Claude family's coverage is incomplete (Lead B round 8).
+    ForkLineageUnknown,
+}
+
+fn may_retire(
+    index: &ScanIndex,
+    root: &str,
+    result: &Settlement<'_>,
+    fork_lineage_unknown: bool,
+) -> bool {
+    matches!(result, Settlement::Settled(_))
+        && !fork_lineage_unknown
+        && negative_scheduling_carrier_durable(index, root)
+}
+
+#[derive(Default, Serialize)]
+pub(super) struct Weight {
+    pub(super) families: u64,
+    pub(super) pending_value_bytes: u64,
+}
+impl Weight {
+    fn add(&mut self, bytes: u64) {
+        self.families = self.families.saturating_add(1);
+        self.pending_value_bytes = self.pending_value_bytes.saturating_add(bytes);
+    }
+}
+#[derive(Default, Serialize)]
+pub(super) struct Counts {
+    pub(super) considered: Weight,
+    pub(super) settled: Weight,
+    pub(super) refused: BTreeMap<Refusal, Weight>,
+    pub(super) accepted_body: Weight,
+    // Independent unresolved B3/S4 observations overlap primary refusals.
+    // They are never added to the disjoint totals above.
+    pub(super) owner_gates: BTreeMap<Refusal, Weight>,
+    pub(super) byte_measurement_failed: u64,
+    pub(super) compacted: Weight,
+    pub(super) compaction_scratch_refused: Weight,
+    pub(super) retirement_carrier_refused: Weight,
+    // Every considered family a retirement gate holds back, overlapping the
+    // totals above (a settled family is refused retirement by it too).
+    pub(super) retire_refused: BTreeMap<RetireRefusal, Weight>,
+    pub(super) retired: Weight,
+}
+
+pub(super) fn pending_bytes(pending: &ClaudeUsageFamilyPending) -> Option<u64> {
+    struct Counter(u64);
+    impl Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| std::io::Error::other("diagnostic byte count overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, pending).ok()?;
+    Some(counter.0)
+}
+
+// Per selected save attempt after CAS checks, before publication; not a
+// cumulative count, successful-save receipt or frozen-copy measurement.
+fn classify_index(
+    index: &ScanIndex,
+    mut settled: impl FnMut(&str, &ClaudeUsageFamilyWitness, u64, bool),
+) -> Counts {
+    let mut counts = Counts::default();
+    if index.claude_usage_family_pending.is_empty() {
+        return counts;
+    }
+    let inventory = inventory(index);
+    let fork_lineage_unknown = usage_pending_guard::fork_lineage_incomplete(index);
+    for (root, pending) in &index.claude_usage_family_pending {
+        let bytes = pending_bytes(pending).unwrap_or_else(|| {
+            counts.byte_measurement_failed += 1;
+            0
+        });
+        counts.considered.add(bytes);
+        if let Err(reason) = retry_carry_replacement(index, root) {
+            counts.owner_gates.entry(reason).or_default().add(bytes);
+        }
+        if !negative_scheduling_carrier_durable(index, root) {
+            counts
+                .owner_gates
+                .entry(Refusal::CarrierS4)
+                .or_default()
+                .add(bytes);
+        }
+        if fork_lineage_unknown {
+            counts
+                .retire_refused
+                .entry(RetireRefusal::ForkLineageUnknown)
+                .or_default()
+                .add(bytes);
+        }
+        let result = match &inventory {
+            Some(inventory) => settlement(index, root, pending, inventory.get(root.as_str())),
+            None => Settlement::Refused(Refusal::Scratch),
+        };
+        if matches!(
+            result,
+            Settlement::Settled(_) | Settlement::Refused(Refusal::RetryCarryB3)
+        ) {
+            counts.accepted_body.add(bytes);
+        }
+        let retire = may_retire(index, root, &result, fork_lineage_unknown);
+        match result {
+            Settlement::Settled(commitment) => {
+                // H commitment exists only when the exact receipt gate earns it.
+                settled(root, commitment, bytes, retire);
+                counts.settled.add(bytes);
+                if !retire {
+                    counts.retirement_carrier_refused.add(bytes);
+                }
+            }
+            Settlement::Refused(reason) => counts.refused.entry(reason).or_default().add(bytes),
+        }
+    }
+    counts
+}
+
+// Own predecessors until the existing atomic index publication succeeds. No
+// token graphs are cloned; a failed save restores the same pending records.
+pub(super) struct Prepared {
+    previous: Vec<(String, ClaudeUsageFamilyPending)>,
+}
+impl Prepared {
+    fn compact(&mut self, index: &mut ScanIndex, root: String, retire: bool) -> u64 {
+        if retire {
+            let previous = index
+                .claude_usage_family_pending
+                .remove(&root)
+                .expect("classified root");
+            let bytes = pending_bytes(&previous).unwrap_or(0);
+            self.previous.push((root, previous));
+            return bytes;
+        }
+        let pending = index
+            .claude_usage_family_pending
+            .get_mut(&root)
+            .expect("classified root");
+        let bytes = pending_bytes(pending).unwrap_or(0);
+        let skeleton = compacted_skeleton(pending);
+        let previous = std::mem::replace(pending, skeleton);
+        self.previous.push((root, previous));
+        bytes
+    }
+    pub(super) fn finish(self, index: &mut ScanIndex, published: bool) {
+        if !published {
+            for (root, pending) in self.previous {
+                index.claude_usage_family_pending.insert(root, pending);
+            }
+        }
+    }
+}
+
+fn compacted_skeleton(pending: &ClaudeUsageFamilyPending) -> ClaudeUsageFamilyPending {
+    ClaudeUsageFamilyPending {
+        census_window_end: pending.census_window_end.clone(),
+        member_request_id_hashes: pending
+            .membership()
+            .iter()
+            .map(|(member, hashes)| (member.clone(), hashes.iter().cloned().collect()))
+            .collect(),
+        member_occurrences: BTreeMap::new(),
+        invalid: pending.invalid,
+        idless_revision: pending.idless_revision,
+        derived_request_members: BTreeSet::new(),
+    }
+}
+
+// Price the new exact keys and candidate/rollback slots before cloning. The
+// old occurrences move into Prepared until publication; no second token copy.
+fn price_compaction(
+    root: &str,
+    pending: &ClaudeUsageFamilyPending,
+    cost: &mut crate::heap_layout_bound::Counter,
+) -> Option<()> {
+    use crate::heap_layout_bound::tree_nodes;
+    cost.add(root.len().checked_mul(2)?)?;
+    cost.add(pending.census_window_end.len())?;
+    cost.add(std::mem::size_of::<(String, ClaudeUsageFamilyPending)>().checked_mul(4)?)?;
+    tree_nodes::<String, BTreeSet<String>>(pending.membership().keys().count(), cost)?;
+    for (member, hashes) in pending.membership().iter() {
+        cost.add(member.len())?;
+        tree_nodes::<String, ()>(hashes.len(), cost)?;
+        for hash in hashes.iter() {
+            cost.add(hash.len())?;
+        }
+    }
+    Some(())
+}
+
+impl ScanIndex {
+    pub(super) fn prepare_claude_usage_pending_settlement(&mut self) -> Prepared {
+        let mut candidates = Vec::new();
+        let mut scratch_refused = Weight::default();
+        let mut cost =
+            crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
+        let mut counts = classify_index(self, |root, _commitment, bytes, retire| {
+            let pending = &self.claude_usage_family_pending[root];
+            if price_compaction(root, pending, &mut cost).is_none()
+                || candidates.try_reserve(1).is_err()
+            {
+                scratch_refused.add(bytes);
+            } else {
+                candidates.push((root.to_owned(), retire));
+            }
+        });
+        counts.compaction_scratch_refused = scratch_refused;
+        let mut prepared = Prepared {
+            previous: Vec::new(),
+        };
+        // Reserve before mutation; allocation refusal keeps every occurrence.
+        if prepared
+            .previous
+            .try_reserve_exact(candidates.len())
+            .is_ok()
+        {
+            for (root, retire) in candidates {
+                let bytes = prepared.compact(self, root, retire);
+                if retire {
+                    counts.retired.add(bytes);
+                } else {
+                    counts.compacted.add(bytes);
+                }
+            }
+        } else {
+            for (root, _) in candidates {
+                counts
+                    .compaction_scratch_refused
+                    .add(pending_bytes(&self.claude_usage_family_pending[&root]).unwrap_or(0));
+            }
+        }
+        if counts.considered.families != 0 {
+            crate::local_resource_diagnostics::traversal_point(
+                "claude_usage_pending_settlement_attempt",
+                SnapshotSource::ClaudeCode.api_slug(),
+                &counts,
+            );
+        }
+        prepared
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const ROOT: &str = "a1111111-1111-4111-8111-111111111111";
+    const KEY: &str = "/synthetic/a1111111-1111-4111-8111-111111111111.jsonl";
+
+    fn fixture() -> ScanIndex {
+        let mut index = ScanIndex::default();
+        index.upload_context_fingerprint = Some("context".into());
+        index.active_upload_context_fingerprint = index.upload_context_fingerprint.clone();
+        index.claude_request_identity_contract = Some("contract".into());
+        index.claude_request_identity_contract_changed = false;
+        index.accepted_snapshot_fingerprint_ledger_version = SNAPSHOT_ACCEPTED_LEDGER_VERSION;
+        index.claude_reemission_exclusions =
+            ReemissionExclusions::with_state(claude_reemission_exclusions::ListState::Installed);
+        let hashes = BTreeSet::from(["a".repeat(64)]);
+        let occurrences = BTreeMap::from([(
+            "a".repeat(64),
+            ClaudeTranscriptUsageOccurrenceWitness {
+                sequence: 4,
+                input_tokens: 11,
+                output_tokens: 13,
+                cache_read_tokens: 2,
+                cache_creation_5m_tokens: 3,
+                cache_creation_1h_tokens: 5,
+                reasoning_output_tokens: 7,
+                model: Some("synthetic-model".into()),
+                speed_mode: None,
+                reasoning_effort: None,
+            },
+        )]);
+        index.claude_usage_family_witnesses.insert(
+            ROOT.into(),
+            ClaudeUsageFamilyWitness {
+                evidence_fingerprint: "e".repeat(64),
+                member_request_id_fingerprints: BTreeMap::from([(
+                    ROOT.into(),
+                    claude_request_id_set_fingerprint(&hashes),
+                )]),
+                member_occurrence_fingerprints: BTreeMap::from([(
+                    ROOT.into(),
+                    claude_occurrence_map_fingerprint(&occurrences),
+                )]),
+                assigned_request_id_fingerprints: BTreeMap::from([(
+                    ROOT.into(),
+                    claude_request_id_set_fingerprint(&hashes),
+                )]),
+                legacy_excluded_request_id_hashes: BTreeMap::new(),
+                legacy_owner_roots: BTreeSet::new(),
+                legacy_exclusion_evidence_fingerprint: None,
+            },
+        );
+        index.claude_usage_family_pending.insert(
+            ROOT.into(),
+            ClaudeUsageFamilyPending {
+                census_window_end: "2026-10-01T00:00:00Z".into(),
+                member_request_id_hashes: BTreeMap::from([(ROOT.into(), hashes)]),
+                member_occurrences: BTreeMap::from([(ROOT.into(), occurrences)]),
+                invalid: false,
+                idless_revision: None,
+                derived_request_members: BTreeSet::new(),
+            },
+        );
+        let entities = BTreeSet::from(["1".repeat(64), "2".repeat(64)]);
+        let mut entry = crate::snapshots::tests::manifest_index_entry(Some(&codex_digest_hex(
+            &snapshot_file_entity_set_digest(&entities),
+        )));
+        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+        entry.last_upload_body_witness =
+            Some(snapshot_file_upload_body_set_hex(["3".repeat(64).as_str()]));
+        index.files.insert(KEY.into(), entry);
+        index.accepted_snapshot_fingerprints = entities.clone();
+        index
+            .file_snapshot_fingerprints
+            .insert(KEY.into(), entities);
+        index
+    }
+    fn body_decision(index: &ScanIndex) -> Result<&ClaudeUsageFamilyWitness, Refusal> {
+        let inventory = build_inventory(index);
+        accepted_usage_body(
+            index,
+            ROOT,
+            &index.claude_usage_family_pending[ROOT],
+            inventory.get(ROOT),
+        )
+    }
+    fn decision(index: &ScanIndex) -> Settlement<'_> {
+        // Pure semantic qualification needs no native layout admission or I/O.
+        let inventory = build_inventory(index);
+        settlement(
+            index,
+            ROOT,
+            &index.claude_usage_family_pending[ROOT],
+            inventory.get(ROOT),
+        )
+    }
+    fn refused(index: &ScanIndex, expected: Refusal) {
+        match decision(index) {
+            Settlement::Refused(actual) => assert_eq!(actual, expected),
+            Settlement::Settled(_) => panic!("unexpected settlement"),
+        }
+    }
+    #[test]
+    fn exact_partial_lost_and_acked_null_never_substitute_for_usage_acceptance() {
+        let index = fixture();
+        assert!(claude_stale_member_independently_accepted(
+            &index,
+            KEY,
+            &index.files[KEY]
+        ));
+        refused(&index, Refusal::RetryCarryB3);
+        assert!(!negative_scheduling_carrier_durable(&index, ROOT));
+        assert!(!may_retire(&index, ROOT, &decision(&index), false));
+        assert!(!may_retire(
+            &index,
+            ROOT,
+            &Settlement::Settled(&index.claude_usage_family_witnesses[ROOT]),
+            false
+        ));
+        for accepted in [BTreeSet::from(["1".repeat(64)]), BTreeSet::new()] {
+            let mut changed = index.clone();
+            changed.accepted_snapshot_fingerprints = accepted;
+            refused(&changed, Refusal::Unaccepted);
+        }
+        let mut null = index.clone();
+        // A bound quarantine names well-formed (64-hex) member revisions.
+        null.files.get_mut(KEY).unwrap().source_file_fingerprint = "5".repeat(64);
+        // Production NULL demotion of a retained usage witness is quarantined.
+        // An arbitrary magic body-hash string is not evidence of NULL semantics.
+        null.files.get_mut(KEY).unwrap().last_upload_body_witness =
+            Some(snapshot_file_upload_body_set_hex(["4".repeat(64).as_str()]));
+        let proof =
+            claude_usage_family_witness_fingerprint(&null.claude_usage_family_witnesses[ROOT]);
+        null.claude_usage_authority_quarantine.insert(
+            ROOT.into(),
+            ClaudeUsageAuthorityQuarantineRecord {
+                contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.into(),
+                proven_witness_fingerprint: proof,
+                member_source_file_fingerprints: BTreeMap::from([(
+                    ROOT.into(),
+                    null.files[KEY].source_file_fingerprint.clone(),
+                )]),
+                failed_reconstruction_count: 1,
+                disposition: ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+                retry_after_unix_seconds: claude_usage_authority_retry_deadline(ROOT, "proof"),
+                proof_correction: None,
+            },
+        );
+        assert!(claude_index_file_body_accepted(
+            &null,
+            KEY,
+            &null.files[KEY]
+        ));
+        assert!(claude_usage_authority_preserves_pending(
+            &null.claude_usage_authority_quarantine[ROOT],
+            &null.claude_usage_family_witnesses[ROOT]
+        ));
+        assert_eq!(body_decision(&null).unwrap_err(), Refusal::Quarantine);
+        refused(&null, Refusal::Quarantine);
+        let mut old = index.clone();
+        old.files.get_mut(KEY).unwrap().last_snapshot_fingerprint = Some("stale-head".into());
+        refused(&old, Refusal::Unaccepted);
+        assert!(matches!(
+            retry_carry_replacement(&index, ROOT),
+            Err(Refusal::RetryCarryB3)
+        ));
+    }
+    #[test]
+    fn b1_accepted_body_survives_context_change_without_a_native_receipt() {
+        let mut index = fixture();
+        index.upload_context_fingerprint = Some("context-C".into());
+        index.activate_upload_context("context-C".into());
+        let expected = index.claude_usage_family_witnesses[ROOT].clone();
+        assert_eq!(body_decision(&index).unwrap(), &expected);
+        refused(&index, Refusal::RetryCarryB3);
+        // No #901 receipt is installed by this fixture. The real context setter
+        // changes active selection context, not the accepted body or its ACK.
+        index.activate_upload_context("context-D".into());
+        assert_ne!(
+            index.upload_context_fingerprint,
+            index.active_upload_context_fingerprint
+        );
+        assert_eq!(body_decision(&index).unwrap(), &expected);
+        refused(&index, Refusal::RetryCarryB3);
+        // Persisted accepted evidence remains sufficient after runtime-only
+        // context/receipt state disappears on a round trip.
+        let restored: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        let mut restored = restored;
+        restored.claude_reemission_exclusions =
+            ReemissionExclusions::with_state(ListState::Installed);
+        assert_eq!(body_decision(&restored).unwrap(), &expected);
+        refused(&restored, Refusal::RetryCarryB3);
+    }
+
+    fn b1_refuses(index: &ScanIndex, expected: Refusal) {
+        assert_eq!(body_decision(index).unwrap_err(), expected);
+        refused(index, expected);
+    }
+    fn quarantine_entity(index: &mut ScanIndex, disposition: SnapshotQuarantineDisposition) {
+        index.quarantined_snapshot_fingerprints.insert(
+            "1".repeat(64),
+            SnapshotQuarantineRecord {
+                reconstruction_contract: terminal_contract_retry::legacy_contract(),
+                contract_retry_claims: None,
+                witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+                retry_after_unix_seconds: 0,
+                upload_body_witness: Some("3".repeat(64)),
+                failed_reconstruction_count: 1,
+                disposition,
+            },
+        );
+    }
+    #[test]
+    fn b1_refuses_not_stored() {
+        // Transport hold_unstored_body excludes this entity from the accepted
+        // ledger, even if it was offered alongside stored ones.
+        let mut index = fixture();
+        index.accepted_snapshot_fingerprints.remove(&"2".repeat(64));
+        b1_refuses(&index, Refusal::Unaccepted);
+    }
+    #[test]
+    fn b1_refuses_partial_entity_set_digest_mismatch() {
+        // Every entity is stored and ACKed, but the committed head digest
+        // binds only part of the file's entity set.
+        let mut index = fixture();
+        index.files.get_mut(KEY).unwrap().last_snapshot_fingerprint = Some(codex_digest_hex(
+            &snapshot_file_entity_set_digest(BTreeSet::from(["1".repeat(64)])),
+        ));
+        assert!(index.file_snapshot_fingerprints[KEY]
+            .iter()
+            .all(|entity| index.accepted_snapshot_fingerprints.contains(entity)));
+        b1_refuses(&index, Refusal::Unaccepted);
+    }
+    #[test]
+    fn b1_refuses_lost() {
+        let mut index = fixture();
+        index.accepted_snapshot_fingerprints.clear();
+        b1_refuses(&index, Refusal::Unaccepted);
+    }
+    #[test]
+    fn b1_refuses_permanent_refusal() {
+        let mut index = fixture();
+        quarantine_entity(&mut index, SnapshotQuarantineDisposition::UnprovenTerminal);
+        b1_refuses(&index, Refusal::Unaccepted);
+    }
+    #[test]
+    fn b1_refuses_quarantined() {
+        let mut index = fixture();
+        quarantine_entity(&mut index, SnapshotQuarantineDisposition::RetryPending);
+        b1_refuses(&index, Refusal::Unaccepted);
+    }
+    #[test]
+    fn b1_refuses_unequal_entity_set() {
+        // Every new entity is ACKed, but the file's committed head binds the
+        // earlier set. ACK membership alone is insufficient.
+        let mut index = fixture();
+        index
+            .file_snapshot_fingerprints
+            .get_mut(KEY)
+            .unwrap()
+            .insert("5".repeat(64));
+        index.accepted_snapshot_fingerprints.insert("5".repeat(64));
+        b1_refuses(&index, Refusal::Unaccepted);
+    }
+    #[test]
+    fn b1_refuses_decode_held() {
+        // A family file slot that decoded only leniently is an opaque hold:
+        // nothing about that family's accepted body may be concluded.
+        let mut index = fixture();
+        // Fund the hold metadata with unrelated committed state, as the
+        // lenient decode tests do.
+        let funding = (0..128)
+            .map(|n| format!("{:064x}", 0x10000 + n))
+            .collect::<BTreeSet<_>>();
+        index.files.insert(
+            "/synthetic/funding.jsonl".into(),
+            crate::snapshots::tests::manifest_index_entry(Some(&codex_digest_hex(
+                &snapshot_file_entity_set_digest(&funding),
+            ))),
+        );
+        index
+            .accepted_snapshot_fingerprints
+            .extend(funding.iter().cloned());
+        index
+            .file_snapshot_fingerprints
+            .insert("/synthetic/funding.jsonl".into(), funding);
+        let mut wire = serde_json::to_value(&index).unwrap();
+        wire["files"][KEY]["size_bytes"] = json!([]);
+        let loaded =
+            crate::snapshots::lenient_decode::read_bounded(&serde_json::to_vec(&wire).unwrap())
+                .expect("lenient decode holds the damaged slot");
+        assert!(loaded.decode_holds_family(ROOT));
+        // The lenient reader keeps the held family's slots opaque, so its
+        // pending is not in the loaded map: classify the family's own
+        // pending against the loaded (decode-held) index.
+        assert!(!loaded.claude_usage_family_pending.contains_key(ROOT));
+        let inventory = build_inventory(&loaded);
+        assert!(matches!(
+            settlement(
+                &loaded,
+                ROOT,
+                &index.claude_usage_family_pending[ROOT],
+                inventory.get(ROOT)
+            ),
+            Settlement::Refused(Refusal::DecodeHold)
+        ));
+    }
+    #[test]
+    fn b1_refuses_no_body() {
+        let mut index = fixture();
+        index.files.get_mut(KEY).unwrap().last_upload_body_witness = None;
+        b1_refuses(&index, Refusal::Unaccepted);
+    }
+    #[test]
+    fn b1_refuses_malformed_body() {
+        let mut index = fixture();
+        index.files.get_mut(KEY).unwrap().last_upload_body_witness = Some("unbound".into());
+        b1_refuses(&index, Refusal::Unaccepted);
+    }
+    #[test]
+    fn b1_refuses_no_usage_proof() {
+        let mut index = fixture();
+        index.claude_usage_family_witnesses.clear();
+        b1_refuses(&index, Refusal::UsageProof);
+    }
+    #[test]
+    fn b1_refuses_changed_occurrence() {
+        let mut index = fixture();
+        index
+            .claude_usage_family_pending
+            .get_mut(ROOT)
+            .unwrap()
+            .member_occurrences
+            .get_mut(ROOT)
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap()
+            .output_tokens += 1;
+        b1_refuses(&index, Refusal::UsageProof);
+    }
+
+    #[test]
+    fn holds_duplicates_quarantine_and_missing_member_are_classified_before_owner_gates() {
+        let mut index = fixture();
+        index
+            .claude_account_deferred_holds
+            .insert(KEY.into(), "hold".into());
+        refused(&index, Refusal::HeldMember);
+        index.claude_account_deferred_holds.clear();
+        index.claude_duplicate_request_owners.insert(
+            "a".repeat(64),
+            BTreeSet::from([claude_duplicate_request_owner(ROOT, ROOT)]),
+        );
+        refused(&index, Refusal::DuplicateOwner);
+        index.claude_duplicate_request_owners.clear();
+        index.claude_usage_authority_quarantine.insert(
+            ROOT.into(),
+            ClaudeUsageAuthorityQuarantineRecord {
+                contract: "contract".into(),
+                proven_witness_fingerprint: "proof".into(),
+                member_source_file_fingerprints: BTreeMap::new(),
+                failed_reconstruction_count: 1,
+                disposition: ClaudeUsageAuthorityQuarantineDisposition::default(),
+                retry_after_unix_seconds: 1,
+                proof_correction: None,
+            },
+        );
+        refused(&index, Refusal::Quarantine);
+        index.claude_usage_authority_quarantine.clear();
+        index
+            .claude_usage_family_pending
+            .get_mut(ROOT)
+            .unwrap()
+            .member_request_id_hashes
+            .insert(format!("{ROOT}_missing"), BTreeSet::new());
+        refused(&index, Refusal::Membership);
+    }
+    #[test]
+    fn byte_counter_uses_existing_wire_bytes_and_both_gates_are_visible() {
+        let index = fixture();
+        let counts = classify_index(&index, |_, _, _, _| {});
+        let bytes = serde_json::to_vec(&index.claude_usage_family_pending[ROOT])
+            .unwrap()
+            .len() as u64;
+        assert_eq!(counts.considered.families, 1);
+        assert_eq!(counts.considered.pending_value_bytes, bytes);
+        assert_eq!(counts.settled.families, 0);
+        assert_eq!(
+            counts
+                .refused
+                .values()
+                .map(|weight| weight.families)
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            counts.accepted_body.families,
+            u64::from(crate::heap_layout_bound::layout_supported())
+        );
+        assert_eq!(
+            counts.owner_gates[&Refusal::RetryCarryB3].pending_value_bytes,
+            bytes
+        );
+        assert_eq!(
+            counts.owner_gates[&Refusal::CarrierS4].pending_value_bytes,
+            bytes
+        );
+        assert_eq!(counts.retired.families, 0);
+        assert_eq!(counts.byte_measurement_failed, 0);
+    }
+    #[test]
+    fn compacted_keys_and_commitment_survive_two_wire_restarts_and_failure_restores_values() {
+        let mut index = fixture();
+        let original = index.claude_usage_family_pending[ROOT].clone();
+        let witness = index.claude_usage_family_witnesses[ROOT].clone();
+        let mut prepared = Prepared {
+            previous: Vec::with_capacity(1),
+        };
+        prepared.compact(&mut index, ROOT.into(), false);
+        let compacted = &index.claude_usage_family_pending[ROOT];
+        assert!(compacted.member_occurrences.is_empty());
+        assert_eq!(
+            serde_json::to_value(compacted.membership()).unwrap(),
+            serde_json::to_value(original.membership()).unwrap()
+        );
+        assert_eq!(index.claude_usage_family_witnesses[ROOT], witness);
+        // Exercise the actual rollback used for any failed publication.
+        prepared.finish(&mut index, false);
+        assert_eq!(index.claude_usage_family_pending[ROOT], original);
+        let mut committed = Prepared {
+            previous: Vec::with_capacity(1),
+        };
+        committed.compact(&mut index, ROOT.into(), false);
+        committed.finish(&mut index, true);
+        let mut skeleton = index.claude_usage_family_pending[ROOT].clone();
+        for _ in 0..2 {
+            skeleton = serde_json::from_slice(&serde_json::to_vec(&skeleton).unwrap()).unwrap();
+            assert!(skeleton.member_occurrences.is_empty());
+            assert_eq!(
+                serde_json::to_value(skeleton.membership()).unwrap(),
+                serde_json::to_value(original.membership()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn production_owner_gates_preserve_pending_and_accepted_state_across_two_restarts() {
+        let mut index = fixture();
+        let pending = index.claude_usage_family_pending[ROOT].clone();
+        let accepted = index.accepted_snapshot_fingerprints.clone();
+        let file_heads = serde_json::to_value(&index.files).unwrap();
+        for _ in 0..2 {
+            let prepared = index.prepare_claude_usage_pending_settlement();
+            assert!(prepared.previous.is_empty());
+            prepared.finish(&mut index, true);
+            assert_eq!(index.claude_usage_family_pending[ROOT], pending);
+            assert_eq!(index.accepted_snapshot_fingerprints, accepted);
+            assert_eq!(serde_json::to_value(&index.files).unwrap(), file_heads);
+            let restored = serde_json::from_slice(
+                &serde_json::to_vec(&index.claude_usage_family_pending[ROOT]).unwrap(),
+            )
+            .unwrap();
+            index
+                .claude_usage_family_pending
+                .insert(ROOT.into(), restored);
+        }
+    }
+    #[test]
+    fn carrier_crash_before_publication_preserves_pending_on_disk() {
+        const CHILD_DIR: &str = "OTTTO_E7_USAGE_CRASH_FIXTURE_DIR";
+        if let Some(directory) = std::env::var_os(CHILD_DIR) {
+            let directory = PathBuf::from(directory);
+            let mut index = ScanIndex::load(&directory.join("index.json")).unwrap();
+            assert!(index.claude_usage_family_pending.contains_key(ROOT));
+            let prepared = index.prepare_claude_usage_pending_settlement();
+            assert!(
+                prepared.previous.is_empty(),
+                "closed gates preserve the predecessor"
+            );
+            assert!(!negative_scheduling_carrier_durable(&index, ROOT));
+            fs::write(directory.join("reached-before-publication"), b"reached").unwrap();
+            // Abrupt process death skips Prepared::finish and all destructors.
+            std::process::exit(73);
+        }
+        struct FixtureDir(PathBuf);
+        impl Drop for FixtureDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = FixtureDir(std::env::temp_dir().join(format!(
+                "ottto-usage-carrier-crash-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )));
+        fs::create_dir_all(&directory.0).unwrap();
+        let path = directory.0.join("index.json");
+        let mut index = fixture();
+        index.save(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+        let original = index.claude_usage_family_pending[ROOT].clone();
+        let accepted = index.accepted_snapshot_fingerprints.clone();
+        let file_heads = serde_json::to_value(&index.files).unwrap();
+        let test_name = format!(
+            "{}::carrier_crash_before_publication_preserves_pending_on_disk",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env(CHILD_DIR, &directory.0)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(73),
+            "child did not reach crash edge: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(directory.0.join("reached-before-publication").exists());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        for _ in 0..2 {
+            let restored = ScanIndex::load(&path).unwrap();
+            assert!(restored.persistence_available());
+            assert_eq!(restored.claude_usage_family_pending[ROOT], original);
+            assert_eq!(restored.accepted_snapshot_fingerprints, accepted);
+            assert_eq!(serde_json::to_value(&restored.files).unwrap(), file_heads);
+            assert!(!negative_scheduling_carrier_durable(&restored, ROOT));
+        }
+    }
+    #[test]
+    fn remaining_account_debt_and_omitted_held_siblings_refuse_settlement() {
+        let mut index = fixture();
+        index.claude_account_family_pending.insert(ROOT.into(), serde_json::from_value(json!({
+            "census_window_end":"2026-10-01T00:00:00Z", "account_identifier_hash":"account", "evidence_request_count":1, "invalid":false
+        })).unwrap());
+        refused(&index, Refusal::AccountDebt);
+        for kind in ["deferred", "history"] {
+            let mut index = fixture();
+            let child = format!("/synthetic/{ROOT}/subagents/agent-hidden.jsonl");
+            assert!(!index.files.contains_key(&child));
+            if kind == "deferred" {
+                index
+                    .claude_account_deferred_holds
+                    .insert(child, "hold".into());
+            } else {
+                index.claude_history_emission.files.insert(
+                    "held-revision".into(),
+                    claude_history_upgrade::GatedHistory {
+                        index_key: child,
+                        held: Some(claude_history_upgrade::HistoryHold::TelemetryUnread),
+                        ..Default::default()
+                    },
+                );
+            }
+            let inventory = build_inventory(&index);
+            assert!(inventory[ROOT].held);
+            assert!(matches!(
+                settlement(
+                    &index,
+                    ROOT,
+                    &index.claude_usage_family_pending[ROOT],
+                    inventory.get(ROOT)
+                ),
+                Settlement::Refused(Refusal::HeldMember)
+            ));
+        }
+    }
+
+    #[test]
+    fn production_measurement_emits_claude_code_source_and_attempt_counts() {
+        let mut index = fixture();
+        let (prepared, records) = crate::local_resource_diagnostics::capture(|| {
+            index.prepare_claude_usage_pending_settlement()
+        });
+        prepared.finish(&mut index, true);
+        let records = records
+            .iter()
+            .filter(|record| record["stage"] == "claude_usage_pending_settlement_attempt")
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["source"], "claude_code");
+    }
+}

@@ -52,6 +52,7 @@ fn synthetic_index(families: usize) -> ScanIndex {
         index.claude_usage_family_pending.insert(
             root.clone(),
             ClaudeUsageFamilyPending {
+                derived_request_members: std::collections::BTreeSet::new(),
                 census_window_end: WINDOW_END.into(),
                 member_request_id_hashes: BTreeMap::from([(root.clone(), hashes.clone())]),
                 member_occurrences: BTreeMap::from([(root.clone(), occurrences)]),
