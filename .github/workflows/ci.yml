@@ -64,7 +64,8 @@ permissions:
 
 jobs:
   rust:
-    name: Rust contracts
+    # A partial dispatch must never produce the full required-check name.
+    name: ${{ (github.event_name == 'workflow_dispatch' && inputs.rust_test_filter != '' && !(inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin)) && 'Rust contracts (partial pre-check)' || 'Rust contracts' }}
     # macOS runs only in the merge queue, on dispatch and on the daily main
     # cache-refresh schedule: GitHub Free allows five hosted Macs org-wide.
     # Main pushes skip the repeat because the queue already tests the exact
