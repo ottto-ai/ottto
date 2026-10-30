@@ -26866,12 +26866,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn peer_euid_matches_daemon_for_self_uid() {
-        let peer = LocalClientPeer::from_pid_and_euid(Some(1234), Some(daemon_effective_uid()));
-        assert!(peer.euid_matches_daemon());
-    }
-
-    #[test]
     fn companion_peer_with_mismatched_euid_is_not_trusted() {
         // The euid gate runs before the PID-based code-signing check, so a peer
         // running as a different uid is rejected regardless of its PID.

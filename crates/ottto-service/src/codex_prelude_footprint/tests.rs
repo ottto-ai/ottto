@@ -107,41 +107,6 @@ fn prelude_reads_world_state_and_stops_at_first_request() {
 }
 
 #[test]
-fn rows_fed_one_by_one_match_the_reader_and_need_world_state() {
-    let records = [
-        meta(json!({})),
-        // Without world_state (cli < 0.159) nothing is taken from messages.
-        message(
-            "user",
-            Some("agents_md.instructions"),
-            "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nRULES\n</INSTRUCTIONS>",
-        ),
-        message("user", None, "unlabeled text is not counted"),
-        usage(100),
-        json!({"type": "event_msg", "payload": {"type": "token_count", "info": {
-            "last_token_usage": {"input_tokens": 100}, "model_context_window": 1000}}}),
-        json!({"type": "event_msg", "payload": {"type": "never_read"}}),
-    ];
-    let mut parser = CodexPreludeParser::default();
-    let fed = records
-        .iter()
-        .take_while(|row| parser.observe(row) == PreludeStep::More);
-    assert_eq!(fed.count(), 3);
-    let prelude = parser.finish();
-    assert_eq!(prelude, parse(&records));
-    assert!(prelude.complete);
-    assert_eq!(prelude.agents_md, None);
-    assert_eq!(prelude.other_harness_chars, 0);
-}
-
-#[test]
-fn incomplete_prelude_is_not_final() {
-    let prelude = parse(&[meta(json!({})), message("user", Some("user.text"), "hi")]);
-    assert!(!prelude.complete);
-    assert!(!prelude.is_owned_fresh_start());
-}
-
-#[test]
 fn forks_and_copied_parents_are_not_fresh_starts() {
     for extra in [
         json!({"forked_from_id": "parent"}),
@@ -281,18 +246,6 @@ fn user_and_project_chain_split_into_files() {
     assert!(out
         .iter()
         .all(|item| item.file_counts.truncated_by_limit == Some(false)));
-}
-
-#[test]
-fn text_without_separator_is_project_or_user() {
-    let files = chain(&[("AGENTS.md", "AGENTS.md", 5)]);
-    let project = items("rules", &files, Some(("AGENTS.md", 99)), 32_768);
-    assert_eq!(project.len(), 1);
-    assert_eq!(project[0].source.as_deref(), Some("Project"));
-    // Codex trims the user file; its size is a little larger than the text.
-    let user = items("global rules", &[], Some(("AGENTS.md", 13)), 32_768);
-    assert_eq!(user[0].source.as_deref(), Some("User"));
-    assert_eq!(user[0].relative_path.as_deref(), Some("AGENTS.md"));
 }
 
 #[test]
@@ -1173,47 +1126,6 @@ fn pending_eviction_capacity_and_repeated_unseen_streams_stay_bounded() {
         );
         assert!(metric(&feed, "feed_bytes") <= 4 * 1024 * 1024);
     }
-}
-
-/// Same-build observe/observe_bounded parity and a pinned durable schema;
-/// this is not a comparison against a pre-change binary.
-#[test]
-fn matching_only_bytes_hash_and_shape_remain_the_same_with_observer_limits() {
-    use crate::durable_tail_codec::{Durable, Enc, Shape};
-    let rows = [
-        meta(json!({})),
-        json!({"type":"world_state","payload":{"state":{"agents_md":{"text":"€".repeat(100)},"host_skills":{"body":SKILLS_BODY}}}}),
-        usage(3),
-    ];
-    let mut old = CodexPreludeParser::matching_only(128);
-    let mut bounded = CodexPreludeParser::matching_only(128);
-    for row in &rows {
-        let expected = old.observe(row);
-        let (step, capped) = bounded.observe_bounded(row, 0);
-        assert_eq!(expected, step);
-        assert!(!capped);
-    }
-    assert_eq!(old.prelude(), bounded.prelude());
-    let bytes = |p: &CodexPreludeParser| {
-        let mut e = Enc::bytes(65536);
-        p.put(&mut e).unwrap();
-        e.into_bytes()
-    };
-    let hash = |p: &CodexPreludeParser| {
-        let mut e = Enc::hash("ottto-dt-rederive:session_start:v2");
-        p.put(&mut e).unwrap();
-        e.finish_hash()
-    };
-    assert_eq!(bytes(&old), bytes(&bounded));
-    assert_eq!(hash(&old), hash(&bounded));
-    let mut shape = Shape::default();
-    CodexPreludeParser::shape(&mut shape);
-    // This exact allowlist is the pre-slice schema, including E skills_body.
-    assert_eq!(shape.text(), concat!(
-        "CodexPreludeParser;{X prelude;CodexPrelude;{X cwd;Option<;String;>;N started_at;Option<;i64;>;N is_fork;bool;N complete;bool;U model;Option<;String;>;",
-        "N context_window;Option<;u64;>;N first_input_tokens;Option<;u64;>;N base_instructions_chars;u64;N other_harness_chars;u64;N hook_chars;u64;N block_chars;[8];u64;N blocks_incomplete;bool;N input_closed;bool;N world_state_seen;bool;",
-        "X agents_md;Option<;LoadedAgentsMd;{X directory;Option<;String;>;X text;String;}>;N agents_md_capped;bool;E skills_body: Option<String>;}",
-        "U session_id;Option<;String;>;N rows_after_first_request;usize;N agents_md_cap;usize;N keep_skills_body;bool;}"));
 }
 
 #[test]

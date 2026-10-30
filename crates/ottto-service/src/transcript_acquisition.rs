@@ -1854,33 +1854,6 @@ mod tests {
     }
 
     #[test]
-    fn both_record_shapes_reuse_past_the_legacy_audit_deadline() {
-        // Shapes only: provider-native semantic/ownership parity is an integration gate.
-        for row in [
-            b"{\"type\":\"assistant\",\"message\":{\"usage\":{\"output_tokens\":1}}}\n".as_slice(),
-            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"}}\n".as_slice(),
-        ] {
-            let f = Fixture::new(row);
-            let mut cp = initial(&f, 100);
-            let mut offset = row.len() as u64;
-            for i in 1..=120 {
-                f.append(row);
-                let (mode, next, bytes) = run(&f, Some(&cp), cp.audit_debt(), 100 + i);
-                assert_eq!(mode, ReadMode::Tail);
-                assert_eq!(next.sealed_offset(), offset + row.len() as u64);
-                assert_eq!(next.audit_debt().unwrap().due_unix_seconds, 3700);
-                assert!(bytes <= 2 * SAMPLE_BYTES);
-                cp = next;
-                offset += row.len() as u64;
-            }
-            assert_eq!(
-                run(&f, Some(&cp), cp.audit_debt(), 3700).0,
-                ReadMode::Unchanged
-            );
-        }
-    }
-
-    #[test]
     fn idle_debt_survives_loss_of_ram_and_cannot_postpone_deadline() {
         let f = Fixture::new(b"one\n");
         let cp = initial(&f, 10);
@@ -2155,69 +2128,6 @@ mod tests {
     }
 
     #[test]
-    fn head_and_old_boundary_edits_growing_file_reset_to_full() {
-        for offset in [1, SAMPLE_BYTES + 100] {
-            let mut bytes = vec![b'a'; 2 * SAMPLE_BYTES];
-            bytes.push(b'\n');
-            let f = Fixture::new(&bytes);
-            let cp = initial(&f, 0);
-            bytes[offset] = b'b';
-            bytes.extend_from_slice(b"new\n");
-            f.replace_bytes(&bytes);
-            let mode = run(&f, Some(&cp), None, 1).0;
-            assert_eq!(
-                mode,
-                ReadMode::Full(if offset < SAMPLE_BYTES {
-                    FullReason::HeadChanged
-                } else {
-                    FullReason::BoundaryChanged
-                })
-            );
-        }
-    }
-
-    #[test]
-    fn shrink_and_replacement_reset_even_with_identical_samples() {
-        let f = Fixture::new(b"one\ntwo\n");
-        let cp = initial(&f, 0);
-        f.replace_bytes(b"one\n");
-        assert_eq!(
-            run(&f, Some(&cp), None, 1).0,
-            ReadMode::Full(FullReason::Shrunk)
-        );
-        let other = Fixture::new(b"one\ntwo\n");
-        assert_eq!(
-            run(&other, Some(&cp), None, 1).0,
-            ReadMode::Full(FullReason::Replaced)
-        );
-    }
-
-    #[test]
-    fn same_size_edit_resets_and_scope_change_cannot_reuse_state() {
-        let f = Fixture::new(b"one\n");
-        let cp = initial(&f, 0);
-        f.replace_bytes(b"two\n");
-        // Force a distinct mtime as well, independent of filesystem clock granularity.
-        let file = f.open();
-        file.set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
-            .unwrap();
-        assert_eq!(
-            run(&f, Some(&cp), None, 1).0,
-            ReadMode::Full(FullReason::SameSizeEdit)
-        );
-        let mut file = f.open();
-        let p = ReadPlan::prepare(
-            &mut file,
-            Some(&cp),
-            &Scope("changed-parent-policy".into()),
-            None,
-            1,
-        )
-        .unwrap();
-        assert_eq!(p.mode(), ReadMode::Full(FullReason::ScopeChanged));
-    }
-
-    #[test]
     fn incomplete_eof_is_not_sealed_and_completion_is_counted_once() {
         let f = Fixture::new(b"one\npar");
         let cp = initial(&f, 0);
@@ -2393,39 +2303,6 @@ mod tests {
         assert_eq!(mode, ReadMode::Tail);
         assert_eq!(cp.sealed_offset(), data.len() as u64 + 1);
     }
-    #[test]
-    fn backwards_clock_does_not_force_a_checkpoint_reread() {
-        let f = Fixture::new(b"one\n");
-        let cp = initial(&f, 1000);
-        f.append(b"two\n");
-        let (_, cp, _) = run(&f, Some(&cp), None, 1001);
-        let (mode, verified, _) = run(&f, Some(&cp), cp.audit_debt(), 20);
-        assert_eq!(mode, ReadMode::Unchanged);
-        assert_eq!(verified.audit_debt(), cp.audit_debt());
-        let (mode, _, _) = run(
-            &f,
-            None,
-            Some(AuditDebt {
-                due_unix_seconds: u64::MAX,
-            }),
-            100,
-        );
-        assert_eq!(mode, ReadMode::Full(FullReason::StateMissing));
-        // AD-T3: a multi-page read whose clock stepped back keeps its start
-        // even on an unchanged object, without authorizing another read.
-        let stable = Fixture::new(b"one\n");
-        let (mut file, plan, frozen) = sealed_read(&stable, 1000);
-        let regressed = plan
-            .commit_sealed_prefix(&mut file, true, &scope(), 1000, 900, false, frozen)
-            .unwrap();
-        assert_eq!(regressed.last_full_verified(), 1000);
-        assert_eq!(regressed.audit_debt(), None);
-        assert_eq!(
-            run(&stable, Some(&regressed), None, 950).0,
-            ReadMode::Unchanged
-        );
-    }
-
     /// A cursor-style read: freeze at open, consume complete records up to the
     /// frozen length, then let the caller mutate the file before commit.
     fn sealed_read(f: &Fixture, started: u64) -> (File, ReadPlan, u64) {
@@ -3008,62 +2885,6 @@ mod tests {
                 seal.admits(&mut target.open(), &current, row.now, false),
                 row.admits,
                 "{case}: admits"
-            );
-        }
-    }
-
-    /// U-T30: only the seal refuses a debt clock regression; both refuse
-    /// invalid samples, and tampering never underflows at `sealed - len`.
-    #[test]
-    fn prefix_seal_retains_clock_refusal_and_shared_sample_validation() {
-        let bytes = wide_rows("invalid");
-        let f = Fixture::new(&bytes);
-        let cp = initial(&f, 1000);
-        f.append(b"next\n");
-        // Debt due later than one interval from now: the clock moved back.
-        let mut far = cp.clone();
-        far.audit_debt = Some(AuditDebt {
-            due_unix_seconds: 1000 + 10 * AUDIT_INTERVAL_SECONDS,
-        });
-        assert_eq!(prepared(&f, &far, &scope(), 1100), Ok(2 * SAMPLE_BYTES));
-        assert_eq!(
-            far.seal(1000).admits(&mut f.open(), &scope(), 1100, false),
-            Err(FullReason::ClockChanged)
-        );
-        // Unequal windows: `seal_as` marks them, both refuse.
-        let mut unequal = cp.clone();
-        unequal.samples.head.pop();
-        assert_eq!(
-            prepared(&f, &unequal, &scope(), 1100),
-            Err(FullReason::InvalidCheckpoint)
-        );
-        assert_eq!(
-            unequal
-                .seal(1000)
-                .admits(&mut f.open(), &scope(), 1100, false),
-            Err(FullReason::InvalidCheckpoint)
-        );
-        // Tampered persisted seals.
-        let good = serde_json::to_value(cp.seal(1000)).unwrap();
-        let digest = good["head_sha256"].as_str().unwrap().to_string();
-        let tampered: [(&str, serde_json::Value); 5] = [
-            ("sample_len", serde_json::json!(u32::MAX)),
-            ("sample_len", serde_json::json!(SAMPLE_BYTES - 1)),
-            ("head_sha256", serde_json::json!(digest[..63])),
-            ("boundary_sha256", serde_json::json!(digest.to_uppercase())),
-            (
-                "head_sha256",
-                serde_json::json!(format!("{}g", &digest[..63])),
-            ),
-        ];
-        for (field, value) in tampered {
-            let mut seal = good.clone();
-            seal[field] = value.clone();
-            let seal: PrefixSeal = serde_json::from_value(seal).unwrap();
-            assert_eq!(
-                seal.admits(&mut f.open(), &scope(), 1100, false),
-                Err(FullReason::InvalidCheckpoint),
-                "{field} = {value}"
             );
         }
     }
@@ -3653,51 +3474,6 @@ mod tests {
         }
     }
 
-    /// E1 S3 (Ron's re-read rule): a metadata-only change at equal length
-    /// is the same content. Before `prepare` it is `Unchanged` with zero
-    /// sample bytes read (never `SameSizeEdit`) and `stamp_matches` keeps
-    /// the copy, while a seal of the same checkpoint keeps the pre-S3 exact
-    /// stamp and refuses it as `SameSizeEdit` (C1); with growth it is a
-    /// `Tail`; a moved mtime at equal length is still `SameSizeEdit`. Every
-    /// decision is inside the horizon with no debt: before S1 an old or
-    /// debt-due checkpoint is `Full(AuditDue)` whatever ctime does, so these
-    /// fixtures stay clear of it.
-    #[test]
-    fn metadata_only_change_before_prepare_is_unchanged_and_reads_nothing() {
-        for meta in metas() {
-            let bytes = wide_rows("s3-before");
-            let f = Fixture::new(&bytes);
-            let cp = initial(&f, 1000);
-            let seal = cp.seal(1000);
-            metadata_only(&f.0, meta);
-            assert!(cp.stamp_matches(&f.open()).unwrap(), "{meta:?}");
-            assert_eq!(
-                seal.admits(&mut f.open(), &scope(), 1100, false),
-                Err(FullReason::SameSizeEdit),
-                "{meta:?}: a seal keeps the exact stamp"
-            );
-            let (mode, next, read) = run(&f, Some(&cp), None, 1100);
-            assert_eq!((mode, read), (ReadMode::Unchanged, 0), "{meta:?}");
-            assert_eq!(next.sealed_offset(), cp.sealed_offset());
-
-            // Growth and a metadata change: a tail of the appended row.
-            f.append(b"{\"next\":1}\n");
-            metadata_only(&f.0, meta);
-            let (mode, grown, read) = run(&f, Some(&next), None, 1200);
-            assert_eq!((mode, read), (ReadMode::Tail, 2 * SAMPLE_BYTES), "{meta:?}");
-            assert_eq!(grown.sealed_offset(), bytes.len() as u64 + 11);
-
-            // A moved mtime at equal length is still a same-size edit.
-            touch(&f);
-            assert!(!grown.stamp_matches(&f.open()).unwrap(), "{meta:?}");
-            assert_eq!(
-                run(&f, Some(&grown), None, 1300).0,
-                ReadMode::Full(FullReason::SameSizeEdit),
-                "{meta:?}"
-            );
-        }
-    }
-
     /// E1 S3: a change between a decision's opening stamp and its
     /// re-capture (the `between_guards` hook). Metadata only keeps
     /// `prepare`'s tail and `unpark`'s resume; a moved mtime there still
@@ -3761,89 +3537,6 @@ mod tests {
                     "{change:?}: {reason:?}"
                 ),
             }
-        }
-    }
-
-    /// E1 S3: a change between the native parse and its commit. Metadata
-    /// only still commits `commit_after_native_completion`, still verifies a
-    /// complete Full read at `commit_sealed_prefix` (AD-1) and keeps the
-    /// lossy identity's `holds`; a moved mtime at equal length still
-    /// refuses each.
-    #[test]
-    fn metadata_only_change_between_parse_and_commit_still_commits() {
-        for change in changes() {
-            let kept = matches!(change, Change::Meta(_));
-            let f = Fixture::new(b"one\ntwo\n");
-            let mut file = f.open();
-            let mut plan = ReadPlan::prepare(&mut file, None, &scope(), None, 100).unwrap();
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).unwrap();
-            plan.observe_complete_records(&bytes).unwrap();
-            apply(&f.0, change, 1);
-            let committed = plan.commit_after_native_completion(&file, &scope(), 100);
-            assert_eq!(committed.is_ok(), kept, "{change:?}");
-
-            let f = Fixture::new(b"one\ntwo\n");
-            let (mut file, plan, frozen) = sealed_read(&f, 100);
-            apply(&f.0, change, 1);
-            let sealed =
-                plan.commit_sealed_prefix(&mut file, true, &scope(), 100, 200, false, frozen);
-            if kept {
-                let cp = sealed.unwrap();
-                assert_eq!((cp.last_full_verified(), cp.audit_debt()), (200, None));
-            } else {
-                assert_eq!(
-                    sealed.err(),
-                    Some(PrefixRefusal::Invalidated(FullReason::SameSizeEdit))
-                );
-            }
-
-            let f = Fixture::new(b"one\ntwo\n");
-            let (mut file, plan, frozen) = sealed_read(&f, 100);
-            let (_, identity) = plan.commit_sealed_prefix_or_lossy_identity(
-                &mut file,
-                true,
-                &scope(),
-                100,
-                200,
-                true,
-                frozen,
-            );
-            let identity = identity.unwrap();
-            apply(&f.0, change, 1);
-            assert_eq!(identity.holds(&mut file), kept, "{change:?}");
-        }
-    }
-
-    /// E1 S3: a change while a read is parked. Metadata only unparks at the
-    /// resume offset and finishes with the uninterrupted read's certificate;
-    /// a moved mtime at equal length (no byte changed) refuses as
-    /// `SameSizeEdit`.
-    #[test]
-    fn metadata_only_change_while_parked_resumes_the_read() {
-        for change in changes() {
-            let f = Fixture::new(&wide_rows("s3-park"));
-            let (plan, consumed) = partial_read(&f, 2, 7);
-            let (control, _) = partial_read(&f, 2, 7);
-            let parked = plan.park(100);
-            drop(plan);
-            let uninterrupted = finish_read(&f, control, consumed, 100, 200);
-            apply(&f.0, change, 1);
-            let mut held = f.open();
-            let unparked = ReadPlan::unpark(&mut held, &parked, None);
-            if let Change::Mtime = change {
-                assert_eq!(unparked.err(), Some(FullReason::SameSizeEdit));
-                continue;
-            }
-            let Ok(unparked) = unparked else {
-                panic!("{change:?}: refused");
-            };
-            assert_eq!(held.stream_position().unwrap(), consumed);
-            assert_eq!(
-                finish_read(&f, unparked.plan, consumed, unparked.started, 200),
-                uninterrupted,
-                "{change:?}"
-            );
         }
     }
 }

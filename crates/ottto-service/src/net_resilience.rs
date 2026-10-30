@@ -1368,6 +1368,16 @@ mod tests {
     }
 
     #[test]
+    fn dns_probe_subprocess_is_killed_at_its_deadline() {
+        let started = Instant::now();
+        let output =
+            bounded_command_output("/bin/sh", &["-c", "sleep 2"], Duration::from_millis(30))
+                .expect("spawn bounded test child");
+        assert!(output.is_none());
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
     fn resolution_success_caches_and_resets_the_failure_streak() {
         let attempts = Arc::new(AtomicU32::new(0));
         let counted = attempts.clone();

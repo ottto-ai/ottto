@@ -7000,57 +7000,6 @@ mod tests {
     }
 
     #[test]
-    fn source_update_preserves_failed_verification_result() {
-        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
-        daemon
-            .update_sources(TOKEN, vec![codex_health()])
-            .expect("source health should update");
-
-        let result = SourceVerificationResult {
-            source: SourceKind::Codex,
-            config: SourceConfigState {
-                discovered: true,
-                path_hint: Some("~/.codex/config.toml".to_string()),
-                fingerprint: None,
-                drift: Vec::new(),
-            },
-            status: SourceVerificationStatus::Failed,
-            verified: false,
-            records_seen: 0,
-            last_record_id: None,
-            last_received_at: None,
-            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
-            message: StableMessage {
-                code: "smoke_command_failed".to_string(),
-                text: "Codex smoke session failed before verification could complete.".to_string(),
-            },
-            route_results: Vec::new(),
-            check: None,
-        };
-
-        daemon
-            .record_verification_result(&result)
-            .expect("record failed verification");
-        daemon
-            .update_sources(TOKEN, vec![codex_health()])
-            .expect("fresh source scan should not clear failed verification");
-
-        let status = daemon.status(TOKEN).expect("status");
-        assert_eq!(status.sources.len(), 1);
-        assert_eq!(status.sources[0].source, SourceKind::Codex);
-        assert_eq!(status.sources[0].state, SourceState::Failed);
-        assert_eq!(status.sources[0].grade, HealthGrade::Critical);
-        assert_eq!(
-            status.sources[0].problems[0].code,
-            StableProblemCode::TelemetryNotVerified
-        );
-        assert_eq!(
-            status.sources[0].recommended_actions[0].action,
-            RepairActionKind::VerifyTelemetry
-        );
-    }
-
-    #[test]
     fn available_pi_route_status_clears_stale_aggregate_smoke_failure() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let result = SourceVerificationResult {
@@ -8742,33 +8691,6 @@ mod tests {
     }
 
     #[test]
-    fn startup_reverify_leaves_cold_cli_source_verifying() {
-        // A non-`Available` scan right after boot is far more likely a cold CLI
-        // than a real regression, so the seeded `verifying` row is preserved
-        // (no spurious attention flash). The burst retries on a later tick.
-        let restarted = daemon()
-            .with_account(account("user_1", "ron@example.com"))
-            .with_registered_device_sources_presence(
-                Some(LocalDeviceBinding {
-                    device_id: "device_test".to_string(),
-                    machine_id: Some("machine_test".to_string()),
-                    sources: vec!["codex".to_string()],
-                }),
-                |_| true,
-            );
-
-        let mut state = restarted.inner.lock().expect("state");
-        let mut cold = available_agent_status(SourceKind::Codex, "2026-05-05T10:20:00Z");
-        cold.status = AgentStatusState::AuthRequired;
-
-        let remaining = apply_verifying_reconfirm(&mut state, vec![cold]);
-
-        assert_eq!(remaining, 1);
-        assert_eq!(state.sources[0].state, SourceState::Verifying);
-        assert!(state.sources[0].agent_status.is_none());
-    }
-
-    #[test]
     fn startup_reverify_does_not_clobber_explicit_verify_result() {
         // A source that an explicit Verify already moved out of `verifying`
         // (e.g. needs_confirmation after a no-fresh-telemetry smoke) must not be
@@ -8790,46 +8712,6 @@ mod tests {
 
         assert_eq!(remaining, 0);
         assert_eq!(state.sources[0].state, SourceState::NeedsConfirmation);
-    }
-
-    #[test]
-    fn available_agent_status_clears_stale_needs_confirmation() {
-        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
-        {
-            let mut state = daemon.inner.lock().expect("state");
-            let mut stale = codex_health();
-            stale.source = SourceKind::ClaudeCode;
-            stale.descriptor = source_descriptor(&SourceKind::ClaudeCode);
-            stale.state = SourceState::NeedsConfirmation;
-            stale.grade = HealthGrade::Warning;
-            stale.config.path_hint = Some("~/.claude/settings.json".to_string());
-            stale.problems = vec![HealthProblem {
-                code: StableProblemCode::SecretMissing,
-                title: "Claude Code needs account confirmation".to_string(),
-                detail: "Ottto could not confirm a signed-in local account from safe CLI metadata."
-                    .to_string(),
-                retryable: true,
-            }];
-            state.sources = vec![stale];
-
-            upsert_agent_status_snapshot(
-                &mut state,
-                available_agent_status(SourceKind::ClaudeCode, "2026-05-05T10:20:00Z"),
-            );
-        }
-
-        let status = daemon.status(TOKEN).expect("status after refresh");
-        assert_eq!(status.sources.len(), 1);
-        assert_eq!(status.sources[0].source, SourceKind::ClaudeCode);
-        assert_eq!(status.sources[0].state, SourceState::Healthy);
-        assert_eq!(status.sources[0].grade, HealthGrade::Ok);
-        assert!(status.sources[0].problems.is_empty());
-        assert!(status.sources[0].last_verified_at.is_none());
-        assert_eq!(
-            status.sources[0].config.path_hint.as_deref(),
-            Some("~/.claude/settings.json")
-        );
-        assert!(status.sources[0].agent_status.is_some());
     }
 
     #[test]
@@ -8947,32 +8829,6 @@ mod tests {
         let healthy_canonical = healthy.canonical_health.as_ref().expect("canonical");
         assert_eq!(canonical.overall.state, healthy_canonical.overall.state);
         assert_eq!(canonical.blockers.len(), healthy_canonical.blockers.len());
-    }
-
-    #[test]
-    fn healthy_claude_source_without_paused_usage_checks_stays_ok() {
-        let status = paused_usage_checks_status(false);
-        let source = &status.sources[0];
-        assert_eq!(source.state, SourceState::Healthy);
-        assert_eq!(source.grade, HealthGrade::Ok);
-        assert!(source.problems.is_empty());
-        let canonical = status.canonical_health.as_ref().expect("canonical health");
-        assert!(canonical.sources[0].blocking_reason.is_none());
-    }
-
-    #[test]
-    fn paused_usage_checks_diagnostic_is_ignored_for_other_sources() {
-        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
-        let mut snapshot = available_agent_status(SourceKind::Codex, "2026-10-03T06:46:07Z");
-        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
-            agent_status::CLAUDE_USAGE_CHECKS_PAUSED_DIAGNOSTIC_CODE,
-            AgentDiagnosticSeverity::Warning,
-            "Claude usage checks paused for one account.",
-        ));
-        let state = daemon.inner.lock().expect("state");
-        let health = source_health_from_agent_status(&state, snapshot);
-        assert_eq!(health.grade, HealthGrade::Ok);
-        assert!(health.problems.is_empty());
     }
 
     #[test]

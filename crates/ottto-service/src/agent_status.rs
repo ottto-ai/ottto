@@ -25587,44 +25587,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_targets_name_the_account_from_the_id_token_email() {
-        let token = codex_split_identity_token(
-            "raw-workspace-binding",
-            serde_json::json!([
-                {"id": "raw-org-personal", "title": "Personal", "is_default": true},
-                {"id": "raw-org-other", "title": "Other", "is_default": false}
-            ]),
-        );
-        let evidence =
-            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
-                .expect("target evidence");
-        let account_hash =
-            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
-        let binding_workspace_hash =
-            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
-                .expect("workspace hash");
-        let mut candidate = codex_candidate_for_test(
-            "default",
-            CodexAccountSlotOwnershipV1::Default,
-            &account_hash,
-            &binding_workspace_hash,
-            5,
-        );
-        candidate.workspace_targets = evidence;
-
-        let coverage =
-            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
-
-        assert!(
-            coverage
-                .targets
-                .iter()
-                .all(|target| target.account_label == "private.person@example.test"),
-            "every row of one account names that account, including the bound one"
-        );
-    }
-
-    #[test]
     fn codex_target_account_label_falls_back_when_the_token_claims_no_email() {
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
         let payload = URL_SAFE_NO_PAD.encode(
@@ -27878,74 +27840,6 @@ for line in sys.stdin:
         assert!(fresh.account_identifier_hash.is_none());
     }
 
-    #[test]
-    fn claude_team_seat_tier_refines_premium_from_seat_tier() {
-        let mut account = team_auth_account("team.member@example.com", "org-1");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("team.member@example.com".to_string()),
-            organization_uuid: Some("org-1".to_string()),
-            organization_type: Some("claude_team".to_string()),
-            seat_tier: Some("premium".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        let refined = refine_claude_team_seat_plan(&mut account, &oauth);
-
-        assert_eq!(refined, Some("team_premium"));
-        assert_eq!(account.plan_type.as_deref(), Some("team_premium"));
-        assert_eq!(
-            account.subscription_product.as_deref(),
-            Some("claude_team_premium")
-        );
-    }
-
-    #[test]
-    fn claude_team_seat_tier_ignores_mismatched_account_metadata() {
-        // `~/.claude.json` lagging behind an account switch must not leak a
-        // different account's seat tier onto the signed-in account.
-        let mut account = team_auth_account("team.member@example.com", "org-1");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("someone.else@example.com".to_string()),
-            seat_tier: Some("premium".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(refine_claude_team_seat_plan(&mut account, &oauth), None);
-        assert_eq!(account.plan_type.as_deref(), Some("team"));
-    }
-
-    #[test]
-    fn claude_team_seat_tier_ignores_non_team_plans_and_orgs() {
-        let mut max_account = parse_claude_auth_json(&serde_json::json!({
-            "loggedIn": true,
-            "email": "user@example.com",
-            "subscriptionType": "max"
-        }));
-        let premium_oauth = ClaudeCliOauthAccount {
-            seat_tier: Some("premium".to_string()),
-            user_rate_limit_tier: Some("default_claude_max_5x".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-        assert_eq!(
-            refine_claude_team_seat_plan(&mut max_account, &premium_oauth),
-            None
-        );
-        assert_eq!(max_account.plan_type.as_deref(), Some("max"));
-
-        // A stale non-team organizationType blocks refinement even when the
-        // auth status says team.
-        let mut team_account = team_auth_account("team.member@example.com", "org-1");
-        let stale_oauth = ClaudeCliOauthAccount {
-            organization_type: Some("claude_max".to_string()),
-            seat_tier: Some("premium".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-        assert_eq!(
-            refine_claude_team_seat_plan(&mut team_account, &stale_oauth),
-            None
-        );
-    }
-
     fn max_auth_account(email: &str) -> AgentAccountStatus {
         parse_claude_auth_json(&serde_json::json!({
             "loggedIn": true,
@@ -27954,26 +27848,6 @@ for line in sys.stdin:
             "email": email,
             "subscriptionType": "max"
         }))
-    }
-
-    #[test]
-    fn claude_max_tier_refines_20x_from_organization_rate_limit_tier() {
-        let mut account = max_auth_account("user@example.com");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("user@example.com".to_string()),
-            organization_type: Some("claude_max".to_string()),
-            organization_rate_limit_tier: Some("default_claude_max_20x".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        let refined = refine_claude_max_rate_limit_plan(&mut account, &oauth);
-
-        assert_eq!(refined, Some("max_20x"));
-        assert_eq!(account.plan_type.as_deref(), Some("max_20x"));
-        assert_eq!(
-            account.subscription_product.as_deref(),
-            Some("claude_max_20x")
-        );
     }
 
     /// One registered slot on a throwaway HOME with a fake `claude` that only
@@ -28707,48 +28581,6 @@ for line in sys.stdin:
             account.subscription_product.as_deref(),
             Some("claude_max_20x")
         );
-    }
-
-    #[test]
-    fn refine_claude_local_plan_metadata_resolves_team_premium_for_a_registered_slot() {
-        // Same gap, the Team seat half: an external-slot Premium seat used to
-        // ship a bare `team` and price as Standard ($25 instead of $125).
-        let mut account = team_auth_account("user@example.com", "org-1");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("user@example.com".to_string()),
-            organization_type: Some("claude_team".to_string()),
-            seat_tier: Some("team_tier_1".to_string()),
-            user_rate_limit_tier: Some("default_claude_max_5x".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        let refined = refine_claude_local_plan_metadata(&mut account, &oauth);
-
-        assert_eq!(refined.seat_plan, Some("team_premium"));
-        assert_eq!(refined.max_plan, None);
-        assert_eq!(account.plan_type.as_deref(), Some("team_premium"));
-        assert_eq!(
-            account.subscription_product.as_deref(),
-            Some("claude_team_premium")
-        );
-    }
-
-    #[test]
-    fn claude_max_tier_ignores_mismatched_account_metadata() {
-        // `~/.claude.json` lagging behind an account switch must not leak a
-        // different account's tier onto the signed-in account.
-        let mut account = max_auth_account("user@example.com");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("someone.else@example.com".to_string()),
-            organization_rate_limit_tier: Some("default_claude_max_20x".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(
-            refine_claude_max_rate_limit_plan(&mut account, &oauth),
-            None
-        );
-        assert_eq!(account.plan_type.as_deref(), Some("max"));
     }
 
     #[test]

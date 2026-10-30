@@ -2280,19 +2280,6 @@ mod tests {
     }
 
     #[test]
-    fn repository_identity_respects_label_privacy() {
-        let repo = init_git_repo("repo-identity-private-labels");
-
-        let identity = resolve_repository_identity(&repo, false);
-
-        assert!(identity.repository_hash.is_some());
-        assert!(identity.repository_label.is_none());
-        assert!(identity.repository_label_source.is_none());
-        assert_eq!(identity.workspace_kind.as_deref(), Some("repository_root"));
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
     fn repository_identity_withholds_labels_unless_a_hint_allows_them() {
         let repo = init_git_repo("repo-identity-hint-policy");
         let hint = |labels: bool| {

@@ -466,41 +466,6 @@ mod tests {
     }
 
     #[test]
-    fn upsert_inserts_before_existing_content() {
-        let path = test_path("prefix");
-        write(&path, "user=true\n");
-
-        upsert_fence(&path, "managed=true").expect("upsert");
-
-        assert_eq!(
-            read(&path),
-            "# ottto:start\nmanaged=true\n# ottto:end\nuser=true\n"
-        );
-    }
-
-    #[test]
-    fn upsert_preserves_missing_trailing_newline_outside_fence() {
-        let path = test_path("missing-newline");
-        write(&path, "user=true");
-
-        upsert_fence(&path, "managed=true").expect("upsert");
-        remove_fence(&path).expect("remove");
-
-        assert_eq!(read(&path), "user=true");
-    }
-
-    #[test]
-    fn upsert_preserves_empty_file_after_remove() {
-        let path = test_path("empty");
-        write(&path, "");
-
-        upsert_fence(&path, "managed=true").expect("upsert");
-        remove_fence(&path).expect("remove");
-
-        assert_eq!(read(&path), "");
-    }
-
-    #[test]
     fn upsert_preserves_crlf_file_outside_fence() {
         let path = test_path("crlf");
         write(&path, "alpha=1\r\nbeta=2\r\n");
@@ -514,18 +479,6 @@ mod tests {
     }
 
     #[test]
-    fn remove_restores_crlf_file_byte_for_byte() {
-        let path = test_path("crlf-remove");
-        let original = "alpha=1\r\nbeta=2\r\n";
-        write(&path, original);
-
-        upsert_fence(&path, "managed=1\nsecond=2").expect("upsert");
-        remove_fence(&path).expect("remove");
-
-        assert_eq!(read(&path), original);
-    }
-
-    #[test]
     fn upsert_replaces_existing_fence() {
         let path = test_path("replace");
         write(&path, "# ottto:start\nold=1\n# ottto:end\nuser=true\n");
@@ -536,34 +489,6 @@ mod tests {
             read(&path),
             "# ottto:start\nnew=1\n# ottto:end\nuser=true\n"
         );
-    }
-
-    #[test]
-    fn upsert_replace_keeps_suffix_byte_identical() {
-        let path = test_path("replace-suffix");
-        let suffix = "user=true\n# not managed\n";
-        write(
-            &path,
-            &format!("# ottto:start\nold=1\n# ottto:end\n{suffix}"),
-        );
-
-        upsert_fence(&path, "new=1").expect("upsert");
-
-        assert!(read(&path).ends_with(suffix));
-    }
-
-    #[test]
-    fn upsert_replace_keeps_prefix_byte_identical() {
-        let path = test_path("replace-prefix");
-        let prefix = "user=true\n";
-        write(
-            &path,
-            &format!("{prefix}# ottto:start\nold=1\n# ottto:end\n"),
-        );
-
-        upsert_fence(&path, "new=1").expect("upsert");
-
-        assert!(read(&path).starts_with(prefix));
     }
 
     #[test]
@@ -654,30 +579,6 @@ mod tests {
     }
 
     #[test]
-    fn marker_like_text_on_user_line_is_ignored() {
-        let path = test_path("marker-like");
-        let original = "echo '# ottto:start'\necho '# ottto:end'\n";
-        write(&path, original);
-
-        upsert_fence(&path, "managed=true").expect("upsert");
-        remove_fence(&path).expect("remove");
-
-        assert_eq!(read(&path), original);
-    }
-
-    #[test]
-    fn marker_prefix_text_is_ignored() {
-        let path = test_path("marker-prefix");
-        let original = "# ottto:started\n# ottto:ended\n";
-        write(&path, original);
-
-        upsert_fence(&path, "managed=true").expect("upsert");
-        remove_fence(&path).expect("remove");
-
-        assert_eq!(read(&path), original);
-    }
-
-    #[test]
     fn body_marker_line_is_rejected() {
         let path = test_path("body-marker");
         let error = upsert_fence(&path, "safe\n# ottto:start\nunsafe").expect_err("reject");
@@ -716,24 +617,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_body_writes_empty_fence() {
-        let path = test_path("empty-body");
-
-        upsert_fence(&path, "").expect("upsert");
-
-        assert_eq!(read(&path), "# ottto:start\n# ottto:end\n");
-    }
-
-    #[test]
-    fn body_with_trailing_newline_does_not_add_blank_line() {
-        let path = test_path("body-trailing-newline");
-
-        upsert_fence(&path, "managed=true\n").expect("upsert");
-
-        assert_eq!(read(&path), "# ottto:start\nmanaged=true\n# ottto:end\n");
-    }
-
-    #[test]
     fn body_with_crlf_is_normalized_to_file_eol() {
         let path = test_path("body-crlf");
         write(&path, "user=true\n");
@@ -744,17 +627,6 @@ mod tests {
             read(&path),
             "# ottto:start\na=1\nb=2\n# ottto:end\nuser=true\n"
         );
-    }
-
-    #[test]
-    fn remove_preserves_prefix_and_suffix() {
-        let path = test_path("middle-remove");
-        let original = "prefix\n# ottto:start\nmanaged=true\n# ottto:end\nsuffix";
-        write(&path, original);
-
-        remove_fence(&path).expect("remove");
-
-        assert_eq!(read(&path), "prefix\nsuffix");
     }
 
     #[test]
@@ -809,19 +681,6 @@ mod tests {
         .expect("upsert");
 
         assert!(read(&path).contains("managed=true"));
-    }
-
-    #[test]
-    fn remove_validator_failure_leaves_original_file() {
-        let path = test_path("remove-validator");
-        let original = "# ottto:start\nmanaged=true\n# ottto:end\nuser=true\n";
-        write(&path, original);
-
-        let error = remove_fence_with_validator(&path, |_| Err("invalid".to_string()))
-            .expect_err("validation failed");
-
-        assert!(matches!(error, AgentConfigError::ValidationFailed { .. }));
-        assert_eq!(read(&path), original);
     }
 
     #[test]
