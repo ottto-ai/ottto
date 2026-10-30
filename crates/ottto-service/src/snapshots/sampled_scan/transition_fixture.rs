@@ -58,6 +58,11 @@ pub(crate) fn structural_active_budget(key: &str) -> u64 {
         + (crate::durable_tail_store::RECORD_BYTES + super::AUDIT_AND_SCRATCH_BYTES) as u64
         + 4 * key.len() as u64
 }
+/// This thread's RAM cache admission refuses every graph as over the entry
+/// bound (`insert_taken`); `false` restores real admission.
+pub(crate) fn refuse_cache_admission(refuse: bool) {
+    super::super::sampled_jsonl::preparation_tests::refuse_heap(refuse);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Mode {

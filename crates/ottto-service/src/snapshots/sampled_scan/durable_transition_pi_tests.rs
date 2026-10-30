@@ -256,6 +256,23 @@ impl PiDriver {
         let (counts, _) = self.pages[&mode].cache.durable_counters(SOURCE).unwrap();
         counts.active_bound[2]
     }
+
+    /// This route's cache-admission refusals: (the Pi `cache_transit` Full
+    /// count, pending delays, Pi slot paced recovery [Full, delay]).
+    fn cache_transit(&self, mode: Mode) -> (u64, u64, [u64; 2]) {
+        let (counts, _) = self.pages[&mode].cache.durable_counters(SOURCE).unwrap();
+        let count = |map: &BTreeMap<&'static str, u64>, class: &str| map.get(class).copied();
+        assert_eq!(
+            count(&counts.resource_full, "cache_transit"),
+            count(&counts.resource_full, "cache_transit.pi"),
+            "a Pi-only owner: the existing cause and its Pi label agree"
+        );
+        (
+            count(&counts.resource_full, "cache_transit.pi").unwrap_or(0),
+            count(&counts.ineligible, "cache_transit").unwrap_or(0),
+            [counts.retail_full[0], counts.retail_full[1]],
+        )
+    }
 }
 impl TransitionDriver for PiDriver {
     fn emit_bodies(&mut self, mode: Mode) -> RouteResult {
@@ -835,6 +852,65 @@ fn pi_active_bound_is_one_paced_no_record_full_and_keeps_the_record() {
     assert_eq!(f.active_bound(Mode::Restart), [0, 0]);
     money_oracle::assert_equivalent(&cold, &restored);
     whole_body(&cold, &restored);
+}
+
+// P-CACHE-COPY (E1 ruling (b)): the decoded Pi graph is over the RAM cache's
+// entry bound, so its restore is refused at cache admission and takes the
+// existing `cache_transit` resource path: ONE paced, counted Full equal to
+// cold Full (the Pi count, `resource_full{cache_transit.pi}`, goes to 1);
+// growth inside the pace window is then a counted delay with 0 Full that
+// holds the accepted body. No new Full cause and no new pace key.
+// Revisit trigger: if the Pi cache_transit count is ever > 0 on M4 or the
+// fleet, a cache-less restore -> Tail path becomes next-release work.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "Pi restore requires qualified native heap layout"
+)]
+fn pi_cache_copy_refusal_is_one_paced_counted_full_then_a_delay() {
+    if !supported("pi_transition_cache_copy") {
+        return;
+    }
+    let _reset = Reset(|| fixture::refuse_cache_admission(false));
+    let mut f = PiDriver::warm("transition-pi-cache-copy", &pi_seed());
+    f.restart();
+    f.grow(&[pi_turn(
+        "message",
+        Some("over-entry-one"),
+        20,
+        "2026-10-27T06:01:00Z",
+    )]);
+    let cold = f.emit_bodies(Mode::ColdFull);
+    fixture::refuse_cache_admission(true);
+    let full = f.emit_bodies(Mode::Ram);
+    assert_eq!((full.modes, full.restored), ((1, 0, 0), 0));
+    assert_eq!(
+        f.cache_transit(Mode::Ram),
+        (1, 0, [1, 0]),
+        "ONE paced Full, counted for Pi"
+    );
+    assert_eq!(f.active_bound(Mode::Ram), [0, 0], "not structural");
+    money_oracle::assert_equivalent(&cold, &full);
+    whole_body(&cold, &full);
+    f.save_gc(Mode::Ram);
+    let accepted = stored_bodies(&f.prior);
+    f.grow(&[pi_turn(
+        "message",
+        Some("over-entry-two"),
+        30,
+        "2026-10-27T06:02:00Z",
+    )]);
+    let cold = f.emit_bodies(Mode::ColdFull);
+    let delayed = f.emit_bodies(Mode::Ram);
+    assert_eq!((delayed.modes, delayed.restored), ((0, 0, 0), 0));
+    assert_eq!(
+        f.cache_transit(Mode::Ram),
+        (1, 1, [1, 1]),
+        "0 Full inside the pace window: a counted delay"
+    );
+    money_oracle::assert_held(&f.entity, &cold, &delayed, &cold);
+    assert!(delayed.batches.is_empty());
+    assert_eq!(stored_bodies(&f.pages[&Mode::Ram].index), accepted);
 }
 
 // LA-1: a Pi file appended while the daemon was down for over an hour (or

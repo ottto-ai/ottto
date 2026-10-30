@@ -3098,6 +3098,11 @@ impl SharedCache {
         if let Some(mut stores) = self.durable() {
             if full && source != SnapshotSource::Codex {
                 Counters::bump(&mut stores.counters.resource_full, phase);
+                // The map is shared by every source: Pi's cache-admission
+                // Full (P-CACHE-COPY) also carries its own source label.
+                if source == SnapshotSource::Pi && phase == "cache_transit" {
+                    Counters::bump(&mut stores.counters.resource_full, "cache_transit.pi");
+                }
             } else if !full {
                 stores.counters.budget_refused += 1;
                 Counters::bump(&mut stores.counters.ineligible, phase);

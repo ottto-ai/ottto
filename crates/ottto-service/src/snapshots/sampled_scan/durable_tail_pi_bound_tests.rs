@@ -422,3 +422,91 @@ fn pi_lease_busy_is_a_counted_fair_delay_then_restore_tail() {
     assert_eq!(tail.snapshots[0].request_count, 2);
     assert_eq!(cache.durable().unwrap().counters.restored, 1);
 }
+
+// P-CACHE-COPY (E1 ruling (b)): a decoded Pi graph over the RAM cache entry
+// bound is refused at cache admission (`insert_taken`), so the restore takes
+// `restore_resource_pending("cache_transit")`: exactly ONE paced, counted
+// Full under that existing cause and the shared pace, counted for Pi as
+// `resource_full{cache_transit.pi}`. Growth inside the pace window is a
+// counted delay with 0 Full; past it, the next paced Full reads it.
+// Revisit trigger: if the Pi cache_transit count is ever > 0 on M4 or the
+// fleet, a cache-less restore -> Tail path becomes next-release work.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
+fn pi_over_entry_graph_is_one_paced_counted_cache_transit_full() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _clear = ClearPreparationFault;
+    let f = PiBound::new("pi-cache-copy");
+    let (cache, index) = f.warm();
+    cache.retained().unwrap().clear();
+    let end = f.grow("over-entry-1", 20);
+    let now = std::time::SystemTime::now();
+    cache.durable().unwrap().retail_full_now = Some(now);
+    let records_read = cache.durable_counters(SOURCE).unwrap().1.records_read;
+    let counts = |cache: &SharedCache| {
+        let (counters, _) = cache.durable_counters(SOURCE).unwrap();
+        (
+            counters.resource_full.get("cache_transit.pi").copied(),
+            counters.resource_full.get("cache_transit").copied(),
+            counters.ineligible.get("cache_transit").copied(),
+            [counters.retail_full[0], counters.retail_full[1]],
+            counters.active_bound[2],
+        )
+    };
+    sampled_jsonl::preparation_tests::refuse_heap(true);
+    let prior = index.clone();
+    let ((mut next, mut caught, modes), events) =
+        crate::local_resource_diagnostics::capture(|| f.run(cache.clone(), index));
+    assert_eq!(modes, (1, 0, end), "exactly one Full");
+    assert_eq!(
+        cache.durable_counters(SOURCE).unwrap().1.records_read - records_read,
+        1,
+        "the record was restored, then refused at cache admission"
+    );
+    assert_eq!(caught.snapshots[0].request_count, 2, "cumulative, once");
+    assert_eq!(next.files[&f.key].size_bytes, end);
+    assert_eq!(
+        counts(&cache),
+        (Some(1), Some(1), None, [1, 0], [0, 0]),
+        "the Pi count goes to 1 under the existing cause and pace, not structural"
+    );
+    assert!(
+        pi_events(&events, "/counts/restore_resource_full/cache_transit").any(|v| v == 1),
+        "existing alarm, source=pi"
+    );
+    let actual = pi_wire(&mut next, &mut caught);
+    assert_eq!(
+        actual,
+        f.cold_wire(prior, end),
+        "whole body equals cold Full"
+    );
+    f.commit(&cache, &mut next, &caught);
+    let index = next;
+
+    let grown = f.grow("over-entry-2", 30);
+    let entry = serde_json::to_value(&index.files[&f.key]).unwrap();
+    let ((held, output, modes), events) =
+        crate::local_resource_diagnostics::capture(|| f.run(cache.clone(), index));
+    assert!(output.snapshots.is_empty(), "delayed, not published");
+    assert_eq!((modes.0, modes.1), (0, 0), "0 Full inside the pace window");
+    assert_eq!(
+        serde_json::to_value(&held.files[&f.key]).unwrap(),
+        entry,
+        "entry kept with its old size, never pruned"
+    );
+    assert_eq!(
+        counts(&cache),
+        (Some(1), Some(1), Some(1), [1, 1], [0, 0]),
+        "a counted delay; the Pi Full count stays 1"
+    );
+    assert!(pi_events(&events, "/counts/restore_resource_pending/cache_transit").any(|v| v == 1));
+    cache.durable().unwrap().retail_full_now =
+        Some(now + std::time::Duration::from_secs(PACE_SECS));
+    let (_, caught, modes) = f.run(cache.clone(), held);
+    assert_eq!(modes, (1, 0, grown), "the next paced Full reads it");
+    assert_eq!(caught.snapshots[0].request_count, 3);
+    assert_eq!(counts(&cache).0, Some(2));
+}
