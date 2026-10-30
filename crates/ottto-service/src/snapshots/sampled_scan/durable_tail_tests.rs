@@ -551,7 +551,10 @@ fn open_call(call_id_bytes: usize) -> serde_json::Value {
 /// replacement. Arm `spent`: the first two bodies use the allowance exactly
 /// (`budget == 0`); arm `too_large`: the third body exceeds the remainder.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
     let source = SnapshotSource::Codex;
     let namespace = Scope("dt-budget".into());
@@ -1380,7 +1383,10 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
 /// N8: the allowance is spent even when the production write adapter never
 /// receives a replacement (retention or allowlist codec refusal).
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
     let source = SnapshotSource::ClaudeCode;
     for arm in ["retention", "codec"] {
@@ -1586,7 +1592,10 @@ fn known_corrupt_fixture_capture_and_audit_premises_match() {
 /// healthy peer publishes, and terminal census settlement retires an absent
 /// file despite the held key. The held key's accepted body is never replaced.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS retained layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS retained layout"
+)]
 fn known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy() {
     for fail_replacement in [false, true] {
         known_corrupt_replacement_case(fail_replacement);
@@ -3276,7 +3285,10 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
 /// Real inventory -> disk restore -> native Tail. The scaled cache keeps the
 /// same admission mechanism; optional facts must lose before a usable record.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
     use crate::heap_layout_bound::bound;
     use crate::snapshots::codex_file_join::header_cache_tests::{page, READ_CALLS};
