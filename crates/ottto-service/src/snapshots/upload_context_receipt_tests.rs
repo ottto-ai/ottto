@@ -387,6 +387,46 @@ fn upload_context_receipt_c_ack_after_switch_to_d_refused() {
     );
     assert!(f.entry().upload_context_receipt.is_none());
 }
+
+#[test]
+fn unaffected_base_receipt_still_refuses_ack_from_previous_retry_mode() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let base = "d".repeat(64);
+    f.index.copy_prefix_base_upload_context = Some(base.clone());
+    let (candidates, items) = f.pending();
+    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
+    f.index.activate_file_upload_context(
+        f.source,
+        crate::snapshot_sync::resumed_prefix_upload_context(base, true),
+    );
+    assert_eq!(
+        f.index
+            .accept_file_upload_context_acks(&candidates, &exact)
+            .files,
+        0
+    );
+    assert!(f.entry().upload_context_receipt.is_none());
+}
+
+#[test]
+fn acknowledged_unaffected_receipt_survives_resumed_prefix_mode_changes() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    assert_eq!(f.adopt().files, 1);
+    let receipt = f.entry().upload_context_receipt.clone();
+    assert!(receipt.is_some(), "real uploader ACK granted the receipt");
+    let base = "d".repeat(64);
+    f.index.copy_prefix_base_upload_context = Some(base.clone());
+    for (enabled, wire) in [(true, false), (true, true), (false, false)] {
+        let mode = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), enabled);
+        let mode = crate::snapshot_sync::copy_unproven_upload_context(mode, wire);
+        f.index.activate_file_upload_context(f.source, mode);
+        let (scan, bytes) = f.walk(true);
+        assert_eq!(bytes, 0);
+        assert_eq!(scan.scanned_file_count, 0);
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(f.entry().upload_context_receipt, receipt);
+    }
+}
 #[test]
 fn upload_context_receipt_stale_source_witness_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);

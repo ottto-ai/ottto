@@ -196,7 +196,17 @@ pub(crate) fn prepare(
             "scope outside source roots"
         );
         let key = local_index_key(&m.path);
-        ensure!(index.files.contains_key(&key), "scope is not indexed");
+        let entry = index
+            .files
+            .get(&key)
+            .ok_or_else(|| anyhow!("scope is not indexed"))?;
+        ensure!(
+            entry.size_bytes == m.bytes
+                && entry
+                    .modified_unix_nanos
+                    .is_some_and(|n| u128::from(n) == m.modified),
+            "scope differs from indexed extent"
+        );
         let session = claude_index_path_member_ref(&m.path)
             .expect("validated main")
             .root;

@@ -197,3 +197,36 @@ This is a per-page decision event, not a process-wide unique-family ledger;
 repeated reads can count a family again. Add the sum of this field to the
 same bounded cohort/pass evidence query alongside removed requests/dollars,
 unproven residuals, held/expired counts and unchanged own-turn counts.
+
+## Scoped context adoption
+
+Turning the local switch ON alone must not reacquire unchanged unrelated
+transcripts. Retry pages, quarantine witnesses and ACK candidates retain the
+source-wide mode-qualified context, so stale bodies and ACKs cannot cross a
+local-mode or wire-capability change. Acquisition receipts use a separate
+expected context: the exact requested files, marked by the one-shot bit, use
+the qualified context; every unrequested file uses the original base context.
+Unchanged unrelated receipts survive ON, capability ON and OFF transitions.
+Already settled legacy entries without per-file receipts recognize only mode
+variants of the same base. A real privacy-policy, destination or attribution
+context change still uses ordinary context adoption. Planning never creates
+an ACK receipt or accepted-upload credit.
+
+The estimate's explicit set is the exact set offered to that narrowed
+acquisition path. Preparation also requires its size and nanosecond mtime to
+match the indexed extent, so a changed file cannot enter this historical
+cohort under the guise of an unchanged scoped read. The existing native
+history gate may defer listed, fenced or over-budget members; estimate counts
+the requested workload, not guaranteed completions. Actual native scans in
+synthetic regressions open only the requested files, with equal file/byte
+counts to the estimate, while six unrelated files open and emit nothing.
+
+Release disclosure: missing or expired proof, lost removal metadata and later
+expiry of unrecorded removals can preserve the original overcount. These
+residuals are counted and disclosed; unknown usage is never silently zeroed.
+Removed and unproven dollars include only priced telemetry and are partial.
+The local switch remains default OFF, and the separate wire capability is OFF
+without the exact advertised token. Money-owner sign-off, an installed merged
+build and a same-cohort PLAN still precede any authorized operator enable or
+application of a re-read request. Implementation and review do not perform
+those runtime actions.

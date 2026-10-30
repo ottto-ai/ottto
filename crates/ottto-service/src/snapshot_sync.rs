@@ -5902,7 +5902,7 @@ fn cycle_upload_context(
 
 /// Bind persisted retry pages to the local money mode. OFF is the released
 /// context; an operator's next launch in another mode cannot replay old bodies.
-fn resumed_prefix_upload_context(context: String, enabled: bool) -> String {
+pub(crate) fn resumed_prefix_upload_context(context: String, enabled: bool) -> String {
     if enabled {
         format!(
             "{:x}",
@@ -5914,7 +5914,7 @@ fn resumed_prefix_upload_context(context: String, enabled: bool) -> String {
 }
 
 /// Keep capability-qualified ACK contexts in the loader's 64-hex domain.
-fn copy_unproven_upload_context(context: String, enabled: bool) -> String {
+pub(crate) fn copy_unproven_upload_context(context: String, enabled: bool) -> String {
     if enabled {
         format!(
             "{:x}",
@@ -6240,6 +6240,7 @@ fn prepare_sync_source_inner(
         checkpoint_namespace.as_deref(),
         cache_observations_enabled,
     );
+    let base_upload_context = upload_context.clone();
     let resumed_prefix_enabled = source == SnapshotSource::ClaudeCode
         && crate::snapshots::claude_request_money::e2::resumed_prefix_enabled();
     let copy_unproven_enabled = resumed_prefix_enabled
@@ -6330,6 +6331,8 @@ fn prepare_sync_source_inner(
     continuation::observe(source, &upload_context, upload_policy);
     activate_source_upload_context(source, upload_context, &mut index, &mut upload_progress);
     index.copy_unproven_enabled = copy_unproven_enabled;
+    index.copy_prefix_base_upload_context =
+        (source == SnapshotSource::ClaudeCode).then_some(base_upload_context);
     if !context_curve_enabled {
         // Stamp the off transition before taking the partial-commit baseline.
         // If an ordinary no-curve upload is partially accepted and then shed,
