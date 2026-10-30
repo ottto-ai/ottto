@@ -1,0 +1,25 @@
+{
+  "commit": "79488a7297817edfe1eb5cfc34b779408d511726",
+  "snippets": [
+    {
+      "file": "crates/ottto-service/src/snapshots/lenient_decode.rs",
+      "start_line": 435,
+      "text": "    pub(super) fn quarantines(&self) -> bool {\n        matches!(self, Self::Syntax(_) | Self::HoldBudget)\n    }"
+    },
+    {
+      "file": "crates/ottto-service/src/snapshots/lenient_decode.rs",
+      "start_line": 1039,
+      "text": "pub(super) fn controls(index: &ScanIndex, source: &'static str) -> std::result::Result<(), Error> {\n    if index.schema_version != SCAN_INDEX_SCHEMA_VERSION {\n        return Err(Error::Refused(\"schema_version\"));\n    }\n    if index.accepted_snapshot_fingerprint_ledger_version > SNAPSHOT_ACCEPTED_LEDGER_VERSION {\n        alarm_future_scan_index_ledger(source, index.accepted_snapshot_fingerprint_ledger_version);\n        return Err(Error::Refused(\"accepted-ledger version\"));\n    }\n    Ok(())\n}"
+    },
+    {
+      "file": "crates/ottto-service/src/snapshots/lenient_decode.rs",
+      "start_line": 924,
+      "text": "    let headers = decoder.index(Pass::Headers)?;\n    controls(&headers, source)?;\n    drop(headers);\n    decoder.reader.seek(SeekFrom::Start(0))?;\n    let result = decoder.index(Pass::Full);"
+    },
+    {
+      "file": "crates/ottto-service/src/snapshots/lenient_decode.rs",
+      "start_line": 1949,
+      "text": "        if !seen.contains(\"files\") {\n            return Err(Error::Refused(\"missing files\"));\n        }"
+    }
+  ]
+}
