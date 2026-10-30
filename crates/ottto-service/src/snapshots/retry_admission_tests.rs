@@ -644,6 +644,9 @@ fn storage_only_refusal_requires_complete_accepted_unique_evidence() {
         .unwrap()
         .member_request_id_hashes
         .insert(format!("{root}_agent-missing"), BTreeSet::new());
+    // Production decides after rebuilding the hold projection (traversal
+    // start, fold start); this direct pending edit marks the cached one stale.
+    fixture.index.usage_guard_holds.invalidate();
     assert!(
         claude_retry_singleton_storage_only(&fixture.index, &root),
         "Unknown keeps scoped custody instead of oversized re-arm"

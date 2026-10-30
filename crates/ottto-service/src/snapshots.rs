@@ -5325,8 +5325,8 @@ fn claude_usage_family_witness_legacy_free(witness: &ClaudeUsageFamilyWitness) -
 /// Tripwire, never evidence: stale pending is valid, names only current
 /// members, and every member it still holds occurrences for matches the
 /// retained witness exactly. A compacted entry holds no occurrences, so the
-/// comparison is vacuous on it.
-#[cfg(test)]
+/// comparison is vacuous on it. Still the decision for families under
+/// authority quarantine, which B3 never holds.
 fn claude_stale_pending_matches_witness(
     pending: &ClaudeUsageFamilyPending,
     witness: &ClaudeUsageFamilyWitness,
@@ -5861,6 +5861,10 @@ fn claude_stream_accepted_retry_carry_inner(
             .checked_add(family.len())
             .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
     }
+    // Lead B round 8: the census-prefix veto of the ordinary carry route
+    // applies to the streaming and batched routes too.
+    let census_prefix_shared = usage_census_prefix::vetoed_carries(index, carried.iter());
+    carried.retain(|root| !census_prefix_shared.contains(root));
     diagnostics.reject(
         if index.claude_request_identity_contract_changed {
             StaleCarryRejection::Contract
@@ -6117,21 +6121,7 @@ fn claude_fence_closed_retry_carry_observed(
     // live census record also holds (a retired family's copy, or its
     // original) is not carried; neither is any while the census-prefix
     // index is Unknown. Veto only, whatever the admission above.
-    let census_prefix = usage_census_prefix::current(index);
-    let census_prefix_shared = carried
-        .iter()
-        .filter(|root_session_id| {
-            census_prefix.verdict(
-                root_session_id,
-                index.claude_usage_family_pending[root_session_id.as_str()]
-                    .membership()
-                    .values()
-                    .flat_map(|hashes| hashes.iter())
-                    .filter_map(|hash| usage_census_prefix::pending_hash_prefix(hash)),
-            ) != usage_census_prefix::CensusPrefixVerdict::Clear
-        })
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let census_prefix_shared = usage_census_prefix::vetoed_carries(index, carried.iter());
     carried.retain(|root_session_id| {
         !census_prefix_shared.contains(root_session_id)
             && ((accepted_admitted
@@ -42297,6 +42287,12 @@ fn ensure_bounded_traversal(
         let mut covered_roots = None;
         // The new checkpoint does not exist yet; every pending older than
         // this start's window is stale proof.
+        if source == SnapshotSource::ClaudeCode {
+            // Lead B round 8: build this window's census-prefix index before
+            // any carry decision, so an overflow installs its global hold
+            // (fingerprints kept) instead of only refusing carries.
+            index.refresh_claude_census_prefix(collected_at, false);
+        }
         index.refresh_usage_guard_holds_at(Some(collected_at));
         let mut stale_carry_rejection_counts = StaleCarryRejectionCounts::default();
         let carry = if streaming_carry {
@@ -56219,6 +56215,22 @@ mod tests {
         exercise_claude_partial_census_recovery(true, true);
     }
 
+    /// The stable session's family holds stale (older-window) proof that B3
+    /// classifies Unknown at `window`.
+    fn claude_stable_family_held(index: &ScanIndex, window: &str) -> bool {
+        index
+            .claude_usage_family_pending
+            .iter()
+            .any(|(root_session_id, pending)| {
+                pending.membership().contains_key("a-stable")
+                    && pending.census_window_end != window
+                    && matches!(
+                        usage_pending_guard::verdict(index, root_session_id),
+                        usage_pending_guard::Verdict::Unknown(_)
+                    )
+            })
+    }
+
     fn exercise_claude_partial_census_recovery(duplicate: bool, future_quarantine: bool) {
         let root = temp_dir("claude-stable-owned-start-conflict-census");
         let stable = root.join("a-stable.jsonl");
@@ -56321,7 +56333,20 @@ mod tests {
                 first.census_complete,
                 &first.census_window_end,
             );
-            if generation == 2 {
+            // Lead B B3 phase 1 (approved: "Unknown hold instead of
+            // carry/re-arm", "missing-witness held not carried"): with no
+            // provider evidence the stable family never earns a witness, so
+            // from the start after its proof went stale it is held: neither
+            // re-armed nor re-read until it grows.
+            if generation == 2 && claude_stable_family_held(&previous, &started) {
+                assert!(
+                    first
+                        .snapshots
+                        .iter()
+                        .all(|item| item.source_session_id != "a-stable"),
+                    "a held stable family is not re-read whole"
+                );
+            } else if generation == 2 {
                 let stable_item = first
                     .snapshots
                     .iter()
@@ -56430,9 +56455,13 @@ mod tests {
                 .claude_owned_start_census
                 .get("a-stable")
                 .expect("stable owned-start marker retained");
+            // Lead B 4c (approved: "held family keeps its own duplicate
+            // fence closed (scoped)"): a held family's ownership is not
+            // verified while it stays held.
+            let held = claude_stable_family_held(&index, &last.census_window_end);
             assert_eq!(
                 witness.verified_source_file_fingerprint.is_some(),
-                generation >= 1 && !duplicate,
+                generation >= 1 && !duplicate && !held,
                 "a clean census recovers unique ownership, but never duplicate ownership"
             );
             index.save(&checkpoint).expect("persist terminal page");
@@ -66890,18 +66919,22 @@ mod tests {
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
             MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
         );
-        assert!(stale_after.claude_duplicate_request_witness_overflowed);
+        // Lead B 4c (approved: "held family keeps its own duplicate fence
+        // closed (scoped)"): this witnessless stale family is Unknown-held,
+        // so its retained proof is scoped like a bound quarantine. It keeps
+        // its pending and its members are its own residue; it no longer
+        // closes the duplicate census for unrelated families.
+        assert!(stale_after.usage_guard_reason("stale-root").is_some());
+        assert!(stale_after
+            .claude_usage_family_pending
+            .contains_key("stale-root"));
+        assert!(!stale_after.claude_duplicate_request_witness_overflowed);
         assert_eq!(
             counts,
             ClaudeDuplicateCensusCounts {
                 census_complete: true,
-                fence_after: true,
-                census_invalid: true,
                 pending_occurrence_count: 5,
-                coverage_missing_member_count: 1,
-                full_rearm: true,
-                rearm_attempt: 1,
-                full_rearm_deferred_until: next_full_rearm,
+                coverage_complete: true,
                 ..Default::default()
             }
         );
@@ -66934,8 +66967,12 @@ mod tests {
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
             MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
         );
-        assert!(stale_member_after.claude_duplicate_request_witness_overflowed);
-        assert!(counts.census_invalid);
+        // Lead B 4c, as above: the held stale member family is scoped.
+        assert!(stale_member_after
+            .usage_guard_reason("stale-root")
+            .is_some());
+        assert!(!stale_member_after.claude_duplicate_request_witness_overflowed);
+        assert!(!counts.census_invalid);
 
         // Owner bound: a valid census whose cross-family duplicates exceed
         // the owner limit sets the fence without any invalid cause.

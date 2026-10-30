@@ -677,6 +677,8 @@ mod tests {
             refused(&changed, Refusal::Unaccepted);
         }
         let mut null = index.clone();
+        // A bound quarantine names well-formed (64-hex) member revisions.
+        null.files.get_mut(KEY).unwrap().source_file_fingerprint = "5".repeat(64);
         // Production NULL demotion of a retained usage witness is quarantined.
         // An arbitrary magic body-hash string is not evidence of NULL semantics.
         null.files.get_mut(KEY).unwrap().last_upload_body_witness =
@@ -843,7 +845,20 @@ mod tests {
             crate::snapshots::lenient_decode::read_bounded(&serde_json::to_vec(&wire).unwrap())
                 .expect("lenient decode holds the damaged slot");
         assert!(loaded.decode_holds_family(ROOT));
-        refused(&loaded, Refusal::DecodeHold);
+        // The lenient reader keeps the held family's slots opaque, so its
+        // pending is not in the loaded map: classify the family's own
+        // pending against the loaded (decode-held) index.
+        assert!(!loaded.claude_usage_family_pending.contains_key(ROOT));
+        let inventory = build_inventory(&loaded);
+        assert!(matches!(
+            settlement(
+                &loaded,
+                ROOT,
+                &index.claude_usage_family_pending[ROOT],
+                inventory.get(ROOT)
+            ),
+            Settlement::Refused(Refusal::DecodeHold)
+        ));
     }
     #[test]
     fn b1_refuses_no_body() {

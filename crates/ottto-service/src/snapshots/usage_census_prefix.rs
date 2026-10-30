@@ -276,3 +276,27 @@ pub(super) fn duplicated_pending_hashes(
     }
     hits
 }
+
+/// Carried stale roots the census-prefix veto keeps from every carry route
+/// (ordinary, streaming, batched): a root whose pending requests a
+/// pending-free root's live census record also holds, or any root while the
+/// index is Unknown. Veto only.
+pub(super) fn vetoed_carries<'a>(
+    index: &ScanIndex,
+    roots: impl IntoIterator<Item = &'a String>,
+) -> BTreeSet<String> {
+    let prefixes = current(index);
+    roots
+        .into_iter()
+        .filter(|root| {
+            let hashes = index
+                .claude_usage_family_pending
+                .get(root.as_str())
+                .into_iter()
+                .flat_map(|pending| pending.membership().values())
+                .flat_map(|hashes| hashes.iter());
+            prefixes.verdict_hex(root, hashes) != CensusPrefixVerdict::Clear
+        })
+        .cloned()
+        .collect()
+}

@@ -110,9 +110,52 @@ pub(super) fn check(
     Verdict::Match
 }
 
+/// A family under authority quarantine keeps the pre-existing quarantine
+/// rules (bound: its pending is preserved and excused; unbound: it re-arms
+/// for fresh reconstruction; terminal: its members prune and rebind). B3
+/// never holds it: no Lead B ruling changed quarantine semantics.
+fn quarantine_governs(index: &ScanIndex, root: &str) -> bool {
+    index.claude_usage_authority_quarantine.contains_key(root)
+}
+
+/// The pre-B3 Match/Mismatch decision, for quarantine-governed families.
+fn quarantine_verdict(
+    index: &ScanIndex,
+    root: &str,
+    pending: &ClaudeUsageFamilyPending,
+) -> Verdict {
+    let members = pending
+        .membership()
+        .keys()
+        .filter(|member| {
+            ClaudeIndexPathMemberRef::of_family_member(root, member).is_some_and(|expected| {
+                index
+                    .files
+                    .keys()
+                    .any(|key| claude_index_path_member_ref(Path::new(key)) == Some(expected))
+            })
+        })
+        .cloned()
+        .collect();
+    if index
+        .claude_usage_family_witnesses
+        .get(root)
+        .is_some_and(|witness| claude_stale_pending_matches_witness(pending, witness, &members))
+    {
+        Verdict::Match
+    } else {
+        Verdict::Mismatch
+    }
+}
+
 pub(super) fn verdict(index: &ScanIndex, root: &str) -> Verdict {
     if index.decode_holds_family(root) || index.decode_has_opaque_file_incidence() {
         return Verdict::Unknown(Unknown::Decode);
+    }
+    if quarantine_governs(index, root) {
+        if let Some(pending) = index.claude_usage_family_pending.get(root) {
+            return quarantine_verdict(index, root, pending);
+        }
     }
     let Some(pending) = index.claude_usage_family_pending.get(root) else {
         return Verdict::Unknown(Unknown::IncompleteMember);
@@ -477,6 +520,11 @@ impl Holds {
         };
         for root in index.claude_usage_family_pending.keys() {
             if is_current(root) {
+                continue;
+            }
+            let decode =
+                index.decode_holds_family(root) || index.decode_has_opaque_file_incidence();
+            if !decode && quarantine_governs(index, root) {
                 continue;
             }
             let verdict =
