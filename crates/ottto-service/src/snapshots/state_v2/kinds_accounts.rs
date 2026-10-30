@@ -1680,10 +1680,14 @@ mod tests {
     }
     #[test]
     fn original_v1_fixture_populate_hydrate_subset_bytes() {
-        let a: ScanIndex = serde_json::from_str(include_str!(
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/scan_index/real-shaped-v1.json"
         ))
         .unwrap();
+        let a: ScanIndex = serde_json::from_value(fixture["logical"].clone()).unwrap();
+        assert!(a
+            .claude_account_family_pending
+            .contains_key("synthetic-family"));
         let (_scratch, mut db) = Scratch::store();
         save(&mut db, None, &a, &mut KindCxAccounts::default(), 0);
         let mut b = ScanIndex::default();
