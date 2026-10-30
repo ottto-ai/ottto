@@ -8155,6 +8155,8 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .unwrap_or_default();
         let final_group_fingerprint = (!final_fingerprints.is_empty())
             .then(|| snapshot_file_entity_set_hex(&final_fingerprints));
+        let reoffer_unacked_head =
+            claude_terminal_off_reoffers_unacked_head(index, source, &final_fingerprints);
         let final_upload_body_witness = by_source_file_body_witness
             .get(&pending.source_file_fingerprint)
             .filter(|witnesses| !witnesses.is_empty())
@@ -8328,6 +8330,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
             && !pending.codex_pending_recovery
             && !quarantine_retry_required
             && !context_rearm_required
+            && !reoffer_unacked_head
         {
             noop_source_files.insert(pending.source_file_fingerprint.clone());
             result.semantic_noop_count = result

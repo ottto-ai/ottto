@@ -205,15 +205,32 @@ fn claude_unacked_head_members(index: &ScanIndex, roots: &BTreeSet<String>) -> B
         .filter(|(key, head)| {
             claude_index_path_member_ref(Path::new(key.as_str()))
                 .is_some_and(|member| roots.contains(member.root))
-                && head.iter().any(|fingerprint| {
-                    !index.accepted_snapshot_fingerprints.contains(fingerprint)
-                        && !index
-                            .quarantined_snapshot_fingerprints
-                            .contains_key(fingerprint)
-                })
+                && claude_head_has_unacked_body(index, head)
         })
         .map(|(key, _)| key.clone())
         .collect()
+}
+
+fn claude_head_has_unacked_body(index: &ScanIndex, head: &BTreeSet<String>) -> bool {
+    head.iter().any(|fingerprint| {
+        !index.accepted_snapshot_fingerprints.contains(fingerprint)
+            && !index
+                .quarantined_snapshot_fingerprints
+                .contains_key(fingerprint)
+    })
+}
+
+/// B-P2: under containment a re-parse whose head still carries an unaccepted
+/// body is offered again rather than suppressed as a semantic no-op. Always
+/// false outside containment, where main's no-op rule applies unchanged.
+fn claude_terminal_off_reoffers_unacked_head(
+    index: &ScanIndex,
+    source: SnapshotSource,
+    head: &BTreeSet<String>,
+) -> bool {
+    source == SnapshotSource::ClaudeCode
+        && claude_terminal_off()
+        && claude_head_has_unacked_body(index, head)
 }
 
 // B-P5: under containment neither the identity-contract latch nor
