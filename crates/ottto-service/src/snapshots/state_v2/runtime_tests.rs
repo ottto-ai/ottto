@@ -1,7 +1,24 @@
 //! Table-agnostic F5–F7 fixtures. The fake mapper carries only generation;
 //! these tests make no condition-b/hydration parity claim.
 use super::*;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Option<ScanIndex>> {
+    load_with_custody(path, switched, mapper, published(path)?)
+}
+fn save_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Result<bool> {
+    save_with_mode(path, index, mapper, false, None)
+}
+fn save_with_mode<M: Mapper>(
+    path: &Path,
+    index: &mut ScanIndex,
+    mapper: &M,
+    claim_only: bool,
+    owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
+) -> Result<bool> {
+    save_with_custody(path, index, mapper, claim_only, owner, published(path)?)
+}
 
 struct Fixture {
     support: PathBuf,
@@ -49,6 +66,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        super::super::money_test_support::erase_published(&self.path);
         let _ = fs::remove_dir_all(&self.support);
     }
 }
@@ -215,22 +233,29 @@ fn f5_missing_v1_garbled_fences_never_authenticate_final_db() {
 /// [format] f7 publication failures keep latch and artifacts and restart recovers.
 #[test]
 fn f7_publication_failures_keep_latch_and_artifacts_and_restart_recovers() {
-    for point in [
-        fence::Boundary::FenceAttempt,
-        fence::Boundary::FenceRenamed,
-        fence::Boundary::FenceSynced,
-        fence::Boundary::DbRenamed,
-        fence::Boundary::FinalSynced,
-    ] {
+    // Reconstruct the actual on-disk crash states, without process-global failpoints.
+    for point in ["before_fence_rename", "before_db_rename", "after_db_rename"] {
         let f = Fixture::new();
         fs::write(&f.path, b"v1-before-publication").unwrap();
         f.imported();
-        let mut latch = false;
-        fence::fail_at(point);
-        assert!(fence::publish(&f.path, &f.identity(), &mut latch).is_err());
-        assert!(latch);
-        assert!(fence::cleanup_unpublished(&f.path, latch).is_err());
-        if point == fence::Boundary::FenceAttempt {
+        let temp = fence::sibling(&f.path, ".v2-fence.tmp");
+        ottto_core::write_owner_only_file_atomic(
+            &temp,
+            &serde_json::to_vec(&fence::Fence::new(&f.identity())).unwrap(),
+        )
+        .unwrap();
+        if point != "before_fence_rename" {
+            fs::rename(&temp, &f.path).unwrap();
+        }
+        if point == "after_db_rename" {
+            fs::rename(
+                fence::sibling(&f.path, ".v2.sqlite.import"),
+                fence::sibling(&f.path, ".v2.sqlite"),
+            )
+            .unwrap();
+        }
+        assert!(fence::cleanup_unpublished(&f.path, true).is_err());
+        if point == "before_fence_rename" {
             assert!(fence::reconcile(&f.path, &f.identity().binding, true).is_err());
             assert_eq!(fs::read(&f.path).unwrap(), b"v1-before-publication");
         } else {
@@ -269,7 +294,7 @@ fn f7_off_after_publication_and_ambiguous_commits_cannot_ack_or_fallback() {
     // Use a fresh route so the production mapper must decode those missing rows.
     let f = Fixture::new();
     f.published();
-    assert!(load_locked(&f.path, None).is_err()); // unmapped published custody holds
+    assert!(load_locked(&f.path, None, published(&f.path).unwrap()).is_err()); // unmapped published custody holds
 }
 /// [format] f6 explicit forget deletes all artifacts and invalidates stale clones.
 #[test]
@@ -476,7 +501,14 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
     index.upload_context_fingerprint = Some("synthetic-policy".into());
     index.active_upload_context_fingerprint = Some("active-synthetic-policy".into());
     index.file_upload_context_enabled = true;
-    assert!(save_locked(&f.path, &mut index, false, None).unwrap());
+    assert!(save_locked(
+        &f.path,
+        &mut index,
+        false,
+        None,
+        published(&f.path).unwrap()
+    )
+    .unwrap());
     assert_eq!(index.generation, 2);
     assert_eq!(
         index.active_upload_context_fingerprint.as_deref(),
@@ -719,7 +751,7 @@ mod hydrate_parity {
             let f = Fixture::new();
             publish(&f, &index);
             let before = fs::read(&f.path).unwrap();
-            let error = load_locked(&f.path, None).unwrap_err();
+            let error = load_locked(&f.path, None, published(&f.path).unwrap()).unwrap_err();
             assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
             assert_eq!(fs::read(&f.path).unwrap(), before);
         }
@@ -1151,8 +1183,18 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     let committed_context = current.upload_context_fingerprint.clone();
     current.upload_context_fingerprint = Some("uncommitted-context".into());
     sqlite::fail_commit_full_for_test();
-    assert!(save_locked(&f.path, &mut current, false, None).is_err());
-    let restored = load_locked(&f.path, None).unwrap().0.unwrap();
+    assert!(save_locked(
+        &f.path,
+        &mut current,
+        false,
+        None,
+        published(&f.path).unwrap()
+    )
+    .is_err());
+    let restored = load_locked(&f.path, None, published(&f.path).unwrap())
+        .unwrap()
+        .0
+        .unwrap();
     assert_eq!(restored.generation, committed_generation);
     assert_eq!(restored.upload_context_fingerprint, committed_context);
     assert_eq!(fs::read(&progress_path).unwrap(), progress);

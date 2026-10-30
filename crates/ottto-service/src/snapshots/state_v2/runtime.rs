@@ -183,13 +183,13 @@ pub(super) fn enabled(support: Option<&Path>) -> bool {
         .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         || support.join("snapshots/claude_state_v2").is_file()
 }
-fn route_needed(path: &Path, switched: bool) -> Result<bool> {
+fn route_needed(path: &Path, switched: bool, custody: bool) -> Result<bool> {
     Ok(switched
         || states()
             .lock()
             .map_err(|_| Hold::DbUnavailable)?
             .contains_key(path)
-        || held(fence::evidence(path))?)
+        || custody)
 }
 /// Probe custody without admitting a v1 path to the route registry or decoding
 /// its index. A paused, unpublished import does not change progress ordering.
@@ -258,21 +258,27 @@ fn held<T>(result: Result<T>) -> Result<T> {
 pub(in super::super) fn load_locked(
     path: &Path,
     support: Option<&Path>,
+    custody: bool,
 ) -> Result<(Option<ScanIndex>, bool)> {
     // Do not probe the Claude sentinel for Codex, Pi or unbound paths.
     if binding(path).is_none() {
         return Ok((None, false));
     }
     let switched = enabled(support);
-    let index = load_with(path, switched, &ClaudeMapper)?;
+    let index = load_with_custody(path, switched, &ClaudeMapper, custody)?;
     let sample_v1 = switched && index.is_none();
     Ok((index, sample_v1))
 }
-fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Option<ScanIndex>> {
+fn load_with_custody<M: Mapper>(
+    path: &Path,
+    switched: bool,
+    mapper: &M,
+    custody: bool,
+) -> Result<Option<ScanIndex>> {
     let Some(binding) = binding(path) else {
         return Ok(None);
     };
-    if !route_needed(path, switched)? {
+    if !route_needed(path, switched, custody)? {
         return Ok(None);
     }
     let result = held(with_state(path, |state| {
@@ -538,25 +544,30 @@ pub(in super::super) fn save_locked(
     index: &mut ScanIndex,
     claim_only: bool,
     progress_owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
+    custody: bool,
 ) -> Result<bool> {
-    save_with_mode(path, index, &ClaudeMapper, claim_only, progress_owner)
+    save_with_custody(
+        path,
+        index,
+        &ClaudeMapper,
+        claim_only,
+        progress_owner,
+        custody,
+    )
 }
-#[cfg(test)]
-fn save_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Result<bool> {
-    save_with_mode(path, index, mapper, false, None)
-}
-fn save_with_mode<M: Mapper>(
+fn save_with_custody<M: Mapper>(
     path: &Path,
     index: &mut ScanIndex,
     mapper: &M,
     claim_only: bool,
     progress_owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
+    custody: bool,
 ) -> Result<bool> {
     let Some(binding) = binding(path) else {
         ensure!(index.v2().persistence_v2.is_none(), Hold::ForeignBinding);
         return Ok(false);
     };
-    if index.v2().persistence_v2.is_none() && !route_needed(path, false)? {
+    if index.v2().persistence_v2.is_none() && !route_needed(path, false, custody)? {
         return Ok(false);
     }
     // This accessor authenticates the owner/session; call before route/session locks.
@@ -609,6 +620,17 @@ fn save_with_mode<M: Mapper>(
                 );
                 if save_result? {
                     session.stamp = session.db.stamp()?;
+                    // Only a freshly committed replacement/finish resolves the
+                    // failed key. Unrelated saves and elapsed backoff never do.
+                    state.resume_excluded.retain(|key, excluded| {
+                        session
+                            .cx
+                            .committed
+                            .get(key)
+                            .map_or(!excluded.had_ref, |checkpoint| {
+                                checkpoint.file_generation <= excluded.failed_generation
+                            })
+                    });
                     state.cached = Some(index.clone());
                     state.saved_page(session.db.save_over_target(), claim_only);
                     return Ok(true);
@@ -722,7 +744,7 @@ fn apply_outcome(
 }
 
 pub(in super::super) fn guard_containment_locked(path: &Path) -> Result<()> {
-    if binding(path).is_none() || !route_needed(path, false)? {
+    if binding(path).is_none() || !route_needed(path, false, published(path)?)? {
         return Ok(());
     }
     // A containment guard never promotes a DB. This also covers a parent/root

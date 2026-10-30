@@ -1759,16 +1759,7 @@ pub(super) struct GrowthRetention {
 }
 crate::heap_layout_bound::fields!(GrowthRetention; predecessor_size, uncertain_passes, checked_generation, last_growth_full_unix);
 
-#[cfg(test)]
-thread_local! {
-    static GROWTH_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 pub(super) fn growth_active(index: &ScanIndex) -> bool {
-    #[cfg(test)]
-    if GROWTH_ACTIVE.with(std::cell::Cell::get) {
-        return true;
-    }
     crate::snapshots::state_v2::state_v2_growth_retention_active(index)
 }
 
@@ -2020,12 +2011,7 @@ pub(super) struct GrowthClaimContext {
     path: PathBuf,
     base_generation: u64,
     v2_owner: Option<std::sync::Weak<state_v2::Runtime>>,
-    receipt: Mutex<Option<(u64, GrowthClaimStamp)>>,
-}
-#[derive(Debug, Clone)]
-enum GrowthClaimStamp {
-    V1(sampled_scan::codex_cursor::OpenStamp),
-    V2((u64, u64)),
+    receipt: Mutex<Option<(u64, (u64, u64))>>,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for GrowthClaimContext {
     // The only heap allocation is the immutable path; the mutable receipt
@@ -2051,18 +2037,9 @@ pub(super) fn renew_growth_claims(index: &mut ScanIndex, path: &Path) {
 pub(super) fn own_growth_claim_generation(index: &ScanIndex, path: &Path) -> Option<u64> {
     let context = index.v2().growth_claim_context.as_ref()?;
     let (generation, stamp) = context.receipt.lock().ok()?.clone()?;
-    let matches = match stamp {
-        GrowthClaimStamp::V1(stamp) => {
-            index.v2().persistence_v2.is_none()
-                && context.v2_owner.is_none()
-                && sampled_scan::codex_cursor::OpenStamp::of_path(path).as_ref() == Some(&stamp)
-        }
-        GrowthClaimStamp::V2(stamp) => {
-            growth_owner_matches(index, context)
-                && state_v2::confirmed_growth_stamp(index, path).ok() == Some(stamp)
-                && stamp.0 == generation
-        }
-    };
+    let matches = growth_owner_matches(index, context)
+        && state_v2::confirmed_growth_stamp(index, path).ok() == Some(stamp)
+        && stamp.0 == generation;
     (context.path == path
         && index.generation == context.base_generation
         && generation > context.base_generation
@@ -2075,7 +2052,6 @@ fn growth_owner_matches(index: &ScanIndex, context: &GrowthClaimContext) -> bool
         (Some(runtime), Some(owner)) => owner
             .upgrade()
             .is_some_and(|owner| Arc::ptr_eq(runtime, &owner)),
-        (None, None) => true,
         _ => false,
     }
 }
@@ -2107,24 +2083,15 @@ pub(super) fn publish_growth_claim_receipt(index: &ScanIndex, path: &Path) -> Re
         .as_ref()
         .context("growth claim context missing")?;
     anyhow::ensure!(context.path == path, "growth claim path changed");
-    let stamp = if index.v2().persistence_v2.is_some() {
-        anyhow::ensure!(
-            growth_owner_matches(index, context),
-            "growth claim owner changed"
-        );
-        let stamp = state_v2::confirmed_growth_stamp(index, path)?;
-        anyhow::ensure!(
-            stamp.0 == index.generation,
-            "growth claim publication changed"
-        );
-        GrowthClaimStamp::V2(stamp)
-    } else {
-        anyhow::ensure!(context.v2_owner.is_none(), "growth claim owner changed");
-        GrowthClaimStamp::V1(
-            sampled_scan::codex_cursor::OpenStamp::of_path(path)
-                .context("growth claim publication missing")?,
-        )
-    };
+    anyhow::ensure!(
+        growth_owner_matches(index, context),
+        "growth claim owner changed"
+    );
+    let stamp = state_v2::confirmed_growth_stamp(index, path)?;
+    anyhow::ensure!(
+        stamp.0 == index.generation,
+        "growth claim publication changed"
+    );
     *context
         .receipt
         .lock()
@@ -2166,19 +2133,13 @@ fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool>
         .context("growth Full needs a committed scan index")?;
     // Decode the committed index, not the working page: persisting a claim
     // must never publish unaccepted bodies, progress or census changes.
-    let v2 = index.v2().persistence_v2.is_some();
-    let mut committed = if v2 {
-        authenticate_growth_generation(index, &context.path)?;
-        let committed = ScanIndex::load(&context.path)?;
-        anyhow::ensure!(
-            growth_owner_matches(&committed, &context),
-            "growth claim owner changed"
-        );
-        authenticate_growth_generation(index, &context.path)?;
-        committed
-    } else {
-        read_scan_index_representation(&context.path, "growth_claim", "claude_code", None)?
-    };
+    authenticate_growth_generation(index, &context.path)?;
+    let mut committed = ScanIndex::load(&context.path)?;
+    anyhow::ensure!(
+        growth_owner_matches(&committed, &context),
+        "growth claim owner changed"
+    );
+    authenticate_growth_generation(index, &context.path)?;
     let expected = own_growth_claim_generation(index, &context.path).unwrap_or(index.generation);
     anyhow::ensure!(
         committed.generation == expected,
@@ -2209,10 +2170,8 @@ fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool>
     // fails (including ambiguous publication), no acquisition is authorized.
     committed.v2_mut().growth_claim_context = Some(context.clone());
     committed.save_growth_claim(&context.path)?;
-    if v2 {
-        let _lock = CheckpointLock::acquire(&context.path)?;
-        publish_growth_claim_receipt(&committed, &context.path)?;
-    }
+    let _lock = CheckpointLock::acquire(&context.path)?;
+    publish_growth_claim_receipt(&committed, &context.path)?;
     merge_growth_claims(
         &mut index.v2_mut().growth_retention,
         &committed.v2().growth_retention,
@@ -2316,17 +2275,6 @@ mod growth_tests {
 
     const ACCEPTED: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
-    struct Active(bool);
-    impl Active {
-        fn on() -> Self {
-            Self(GROWTH_ACTIVE.with(|active| active.replace(true)))
-        }
-    }
-    impl Drop for Active {
-        fn drop(&mut self) {
-            GROWTH_ACTIVE.with(|active| active.set(self.0));
-        }
-    }
     struct Fixture {
         root: PathBuf,
         path: PathBuf,
@@ -2349,6 +2297,11 @@ mod growth_tests {
             Self { root, path, key }
         }
         fn index(&self) -> ScanIndex {
+            let index = self.legacy_index();
+            self.persist(&index);
+            ScanIndex::load(&self.storage_path()).unwrap()
+        }
+        fn legacy_index(&self) -> ScanIndex {
             let mut index = ScanIndex::default();
             let entry = serde_json::from_value(serde_json::json!({
                 "size_bytes": 4, "modified_unix_seconds": 1, "modified_unix_nanos": 1,
@@ -2397,7 +2350,11 @@ mod growth_tests {
                 "destination_namespace_hash": "a".repeat(64),
             }))
             .unwrap();
-            state_v2::money_test_support::publish(index, &path, &progress);
+            if index.v2().persistence_v2.is_some() {
+                index.clone().save(&path).unwrap();
+            } else {
+                state_v2::money_test_support::publish(index, &path, &progress);
+            }
         }
         fn grow(&self) {
             fs::write(&self.path, b"old\nappend\n").unwrap();
@@ -2413,6 +2370,10 @@ mod growth_tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
+            let path = self.storage_path();
+            if path.parent().is_some_and(Path::exists) {
+                state_v2::money_test_support::erase_published(&path);
+            }
             let _ = fs::remove_dir_all(&self.root);
         }
     }
@@ -2428,6 +2389,7 @@ mod growth_tests {
             )
             .unwrap();
             fs::remove_dir_all(root).unwrap();
+            restored.v2_mut().persistence_v2 = index.v2().persistence_v2.clone();
             restored
         } else {
             let mut bytes = Vec::new();
@@ -2452,13 +2414,11 @@ mod growth_tests {
     /// [money] f1 resumed reconciliation keeps growth after hold and restart.
     #[test]
     fn f1_resumed_reconciliation_keeps_growth_after_hold_and_restart() {
-        let _active = Active::on();
         for age_days in [31, 40] {
             let fixture = Fixture::new();
             let held = fixture.index();
-            let saved = serde_json::to_vec(&held).unwrap();
             fixture.grow();
-            let mut resumed: ScanIndex = serde_json::from_slice(&saved).unwrap();
+            let mut resumed = restart(&held);
             let ((done, ()), rows) = crate::local_resource_diagnostics::capture(|| {
                 let done = reconcile_missing_index_entries_with_limit(&mut resumed, 1);
                 (done, ())
@@ -2520,7 +2480,6 @@ mod growth_tests {
     /// [money] f2 progress restart terminal excludes debt until native settlement.
     #[test]
     fn f2_progress_restart_terminal_excludes_debt_until_native_settlement() {
-        let _active = Active::on();
         let fixture = Fixture::new();
         let mut index = fixture.index();
         fixture.grow();
@@ -2564,7 +2523,6 @@ mod growth_tests {
     /// [money] f2 admission pressure keeps retained hashes and defers new record.
     #[test]
     fn f2_admission_pressure_keeps_retained_hashes_and_defers_new_record() {
-        let _active = Active::on();
         let fixture = Fixture::new();
         let mut index = fixture.index();
         fixture.grow();
@@ -2621,7 +2579,6 @@ mod growth_tests {
     /// [regress] retained same key rollback restores exact custody inside tombstone reserve.
     #[test]
     fn retained_same_key_rollback_restores_exact_custody_inside_tombstone_reserve() {
-        let _active = Active::on();
         let fixture = Fixture::new();
         let mut index = fixture.index();
         fixture.grow();
@@ -2691,7 +2648,7 @@ mod growth_tests {
     #[test]
     fn f3_off_preserves_v1_age_and_bytes() {
         let fixture = Fixture::new();
-        let mut index = fixture.index();
+        let mut index = fixture.legacy_index();
         fixture.grow();
         let before = serde_json::to_vec(&index).unwrap();
         assert!(!growth_active(&index));
@@ -2735,7 +2692,6 @@ mod growth_tests {
     /// [money] f9 uncertainty alarms on fourth consecutive saved pass without dropping.
     #[test]
     fn f9_uncertainty_alarms_on_fourth_consecutive_saved_pass_without_dropping() {
-        let _active = Active::on();
         let fixture = Fixture::new();
         let mut index = fixture.index();
         let missing_root = fixture.root.join("not-configured");
@@ -2780,7 +2736,6 @@ mod growth_tests {
     #[test]
     fn f3_identity_causes_are_not_reclassified_as_retained_growth() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
-        let _active = Active::on();
         let fixture = Fixture::new();
         let mut index = fixture.index();
         fixture.grow();
@@ -2837,7 +2792,6 @@ mod growth_tests {
     /// [money] f2 growth subset restores debt for unsettled file only.
     #[test]
     fn f2_growth_subset_restores_debt_for_unsettled_file_only() {
-        let _active = Active::on();
         let fixture = Fixture::new();
         let mut previous = fixture.index();
         fixture.grow();
@@ -2888,7 +2842,6 @@ mod growth_tests {
     #[test]
     fn f3_growth_full_claim_survives_restart_failure_and_subset_save() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
-        let _active = Active::on();
         for reason in [
             FullReason::StateMissing,
             FullReason::InvalidCheckpoint,
@@ -2993,7 +2946,6 @@ mod growth_tests {
     #[test]
     fn f3_growth_full_without_durable_index_never_reads() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
-        let _active = Active::on();
         let fixture = Fixture::new();
         let mut index = fixture.index();
         fixture.grow();
@@ -3003,6 +2955,8 @@ mod growth_tests {
             std::slice::from_ref(&fixture.root),
         );
         let candidate = identified(&fixture, &index);
+        // A graph without a load-lineage receipt cannot authorize acquisition.
+        index.v2_mut().growth_claim_context = None;
         assert!(!growth_read_admitted_at(
             &mut index,
             &candidate,
@@ -3040,7 +2994,6 @@ mod growth_tests {
     #[test]
     fn f3_malformed_growth_claim_stays_held_across_codec_round_trips() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
-        let _active = Active::on();
         let fixture = Fixture::new();
         let initial = fixture.index();
         let candidate = identified(&fixture, &initial);
@@ -3086,7 +3039,6 @@ mod growth_tests {
     #[test]
     fn f3_failed_claim_save_never_authorizes_full_or_spends_memory_only() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
-        let _active = Active::on();
         let fixture = Fixture::new();
         let path = fixture.storage_path();
         let mut index = fixture.index();
@@ -3121,7 +3073,6 @@ mod growth_tests {
     #[test]
     fn f3_claim_receipt_rejects_same_generation_checkpoint_replacement() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
-        let _active = Active::on();
         let fixture = Fixture::new();
         let path = fixture.storage_path();
         let mut initial = fixture.index();

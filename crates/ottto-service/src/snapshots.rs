@@ -44711,6 +44711,7 @@ struct CheckpointLock {
     file: File,
     priority_path: Option<PathBuf>,
     maintenance: bool,
+    custody: bool,
 }
 
 impl CheckpointLock {
@@ -44718,6 +44719,9 @@ impl CheckpointLock {
         Self::acquire_mode(path, false)
     }
     fn acquire_mode(path: &Path, maintenance: bool) -> Result<Self> {
+        Self::acquire_with_custody(path, maintenance, None)
+    }
+    fn acquire_with_custody(path: &Path, maintenance: bool, custody: Option<bool>) -> Result<Self> {
         let lock_path = path.with_extension("lock");
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent)
@@ -44735,7 +44739,11 @@ impl CheckpointLock {
         // including when the v2 checkpoint-owner registry is poisoned.
         // Maintenance already owns a reservation even if its runtime was
         // invalidated while it waited for the previous checkpoint owner.
-        let priority = maintenance || state_v2::published(path)?;
+        let custody = match custody {
+            Some(value) => value,
+            None => state_v2::published(path)?,
+        };
+        let priority = maintenance || custody;
         let mut owners = if priority {
             Some(
                 checkpoint_owners()
@@ -44768,6 +44776,7 @@ impl CheckpointLock {
             file,
             priority_path: priority.then(|| path.to_owned()),
             maintenance,
+            custody,
         })
     }
 }
@@ -47854,8 +47863,29 @@ impl ScanIndex {
         source: SnapshotSource,
         support_dir: &Path,
     ) -> Result<(Self, ScanIndexLoadOrigin)> {
-        let loaded =
-            Self::load_inner_with_support(path, Some(source), Some(support_dir), SystemTime::now());
+        Self::load_source_with_probe(path, source, support_dir, None)
+    }
+    pub(crate) fn load_for_snapshot_source_with_custody(
+        path: &Path,
+        source: SnapshotSource,
+        support_dir: &Path,
+        custody: bool,
+    ) -> Result<(Self, ScanIndexLoadOrigin)> {
+        Self::load_source_with_probe(path, source, support_dir, Some(custody))
+    }
+    fn load_source_with_probe(
+        path: &Path,
+        source: SnapshotSource,
+        support_dir: &Path,
+        custody: Option<bool>,
+    ) -> Result<(Self, ScanIndexLoadOrigin)> {
+        let loaded = Self::load_inner_with_probe(
+            path,
+            Some(source),
+            Some(support_dir),
+            SystemTime::now(),
+            custody,
+        );
         scan_index_health::observe(source, &loaded);
         let (mut index, origin) = match loaded {
             Ok(loaded) => {
@@ -47950,11 +47980,21 @@ impl ScanIndex {
         support_dir: Option<&Path>,
         now: SystemTime,
     ) -> Result<(Self, LoadOrigin)> {
+        Self::load_inner_with_probe(path, source, support_dir, now, None)
+    }
+    fn load_inner_with_probe(
+        path: &Path,
+        source: Option<SnapshotSource>,
+        support_dir: Option<&Path>,
+        now: SystemTime,
+        custody: Option<bool>,
+    ) -> Result<(Self, LoadOrigin)> {
         if !path.exists() {
             let persistence_root = scan_index_integration::check_missing(
                 path,
                 scan_index_source_label(source),
                 support_dir,
+                custody,
             )?;
             return Ok((
                 Self {
@@ -47964,8 +48004,8 @@ impl ScanIndex {
                 LoadOrigin::Missing,
             ));
         }
-        let _lock = CheckpointLock::acquire(path)?;
-        let (v2_index, sample_v1) = state_v2::load_locked(path, support_dir)?;
+        let _lock = CheckpointLock::acquire_with_custody(path, false, custody)?;
+        let (v2_index, sample_v1) = state_v2::load_locked(path, support_dir, _lock.custody)?;
         if let Some(mut index) = v2_index {
             let file = File::open(path)?;
             let opened = sampled_scan::codex_cursor::OpenStamp::capture(&file)?;
@@ -48376,16 +48416,11 @@ impl ScanIndex {
         let _lock = CheckpointLock::acquire(path)?;
         #[cfg(test)]
         pause_scan_index_cas_if_requested_for_test();
-        if state_v2::save_locked(path, self, claim_only, progress_owner)? {
+        if state_v2::save_locked(path, self, claim_only, progress_owner, _lock.custody)? {
             return Ok(());
         }
         if path.exists() {
-            let claim_generation = sampled_audit::own_growth_claim_generation(self, path);
-            if let Some((binding, root)) = &self
-                .persistence_root
-                .as_ref()
-                .filter(|_| claim_generation.is_none())
-            {
+            if let Some((binding, root)) = &self.persistence_root {
                 scan_index_persistence::LockedStore::new(
                     path,
                     binding.clone(),
@@ -48400,8 +48435,7 @@ impl ScanIndex {
                 read_limit,
             )
             .context("parse current local snapshot scan index for compare-and-swap")?;
-            if claim_generation.is_none()
-                && self.persistence_root.is_none()
+            if self.persistence_root.is_none()
                 && current
                     .persistence_root
                     .as_ref()
@@ -48411,16 +48445,11 @@ impl ScanIndex {
             }
             current.require_persistence_available()?;
             if current.schema_version != SCAN_INDEX_SCHEMA_VERSION
-                || current.generation != claim_generation.unwrap_or(self.generation)
+                || current.generation != self.generation
             {
                 return Err(anyhow::anyhow!(
                     "local snapshot scan index changed concurrently"
                 ));
-            }
-            if claim_generation.is_some() {
-                // Only this load lineage's claim-only commits may advance CAS.
-                self.generation = current.generation;
-                self.persistence_root = current.persistence_root.clone();
             }
             terminal_contract_retry::merge_maps(
                 &mut self.quarantined_snapshot_fingerprints,
@@ -48438,9 +48467,6 @@ impl ScanIndex {
         }
         if !claim_only {
             self.retire_committed_claude_account_pending_windows();
-            if sampled_audit::growth_active(self) {
-                sampled_audit::prune_growth_retention(self, sampled_scan::now_seconds());
-            }
         }
         let previous_generation = self.generation;
         self.schema_version = SCAN_INDEX_SCHEMA_VERSION;
@@ -48456,11 +48482,6 @@ impl ScanIndex {
             Ok(Some(state)) => {
                 self.persistence_root = Some(state);
                 self.persistence_legacy_recovery = None;
-                if claim_only {
-                    sampled_audit::publish_growth_claim_receipt(self, path)?;
-                } else {
-                    sampled_audit::renew_growth_claims(self, path);
-                }
                 return Ok(());
             }
             Ok(None) => {} // Standalone legacy files retain their existing path.
@@ -48500,13 +48521,6 @@ impl ScanIndex {
         if result.is_err() {
             self.generation = previous_generation;
             let _ = fs::remove_file(&temp_path);
-        }
-        if result.is_ok() {
-            if claim_only {
-                sampled_audit::publish_growth_claim_receipt(self, path)?;
-            } else {
-                sampled_audit::renew_growth_claims(self, path);
-            }
         }
         result
     }
@@ -93407,19 +93421,7 @@ struct CheckpointOwners {
     owned: BTreeSet<PathBuf>,
     maintenance: BTreeSet<PathBuf>,
 }
-#[cfg(test)]
-thread_local! {
-    static CHECKPOINT_OWNERS_FOR_TEST: std::cell::Cell<Option<&'static (Mutex<CheckpointOwners>, std::sync::Condvar)>> = const { std::cell::Cell::new(None) };
-    static CHECKPOINT_OWNER_ACCESSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
 fn checkpoint_owners() -> &'static (Mutex<CheckpointOwners>, std::sync::Condvar) {
-    #[cfg(test)]
-    {
-        CHECKPOINT_OWNER_ACCESSES.with(|count| count.set(count.get() + 1));
-        if let Some(registry) = CHECKPOINT_OWNERS_FOR_TEST.with(|registry| registry.get()) {
-            return registry;
-        }
-    }
     static OWNERS: std::sync::OnceLock<(Mutex<CheckpointOwners>, std::sync::Condvar)> =
         std::sync::OnceLock::new();
     OWNERS.get_or_init(|| {
@@ -93479,64 +93481,26 @@ impl CheckpointLock {
 mod state_v2_maintenance_lock_tests {
     use super::*;
 
-    /// [off=main] off sources never consult checkpoint owners even when poisoned.
+    /// [off=main] ordinary sources retain nonblocking checkpoint contention.
     #[test]
-    fn off_sources_never_consult_checkpoint_owners_even_when_poisoned() {
-        let root = std::env::temp_dir().join(format!(
-            "ottto-off-checkpoint-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn off_sources_keep_nonblocking_checkpoint_contention() {
+        let root = crate::test_scratch::private_dir("off-checkpoint");
         let parent = root.join("b".repeat(64));
-        let paths = ["claude_code-test", "codex-test", "pi-test"]
-            .map(|source| parent.join(format!("{source}-scan-index.json")));
-        let registry = Box::leak(Box::new((
-            Mutex::new(CheckpointOwners::default()),
-            std::sync::Condvar::new(),
-        )));
-        // Thread-local isolation avoids poisoning the registry used by parallel
-        // v2 fixtures. Restore the override even if a regression panics.
-        struct Restore;
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                CHECKPOINT_OWNERS_FOR_TEST.with(|slot| slot.set(None));
-            }
-        }
-        CHECKPOINT_OWNERS_FOR_TEST.with(|slot| slot.set(Some(registry)));
-        let _restore = Restore;
-        registry.0.lock().unwrap().maintenance.extend(paths.clone());
-        for poisoned in [false, true] {
-            if poisoned {
-                assert!(std::panic::catch_unwind(|| {
-                    let _guard = registry.0.lock().unwrap();
-                    panic!("synthetic checkpoint-owner poison");
-                })
-                .is_err());
-                assert!(registry.0.is_poisoned());
-            }
-            for path in &paths {
-                CHECKPOINT_OWNER_ACCESSES.with(|count| count.set(0));
-                assert!(!state_v2::published(path).unwrap());
-                let lock = CheckpointLock::acquire(path).unwrap();
-                #[cfg(unix)]
-                {
-                    let error = CheckpointLock::acquire(path).err().unwrap();
-                    assert_eq!(
-                        error.to_string(),
-                        "local snapshot checkpoint is owned by another daemon"
-                    );
-                    assert_eq!(
-                        error.downcast_ref::<std::io::Error>().unwrap().kind(),
-                        std::io::ErrorKind::WouldBlock
-                    );
-                }
-                drop(lock);
-                drop(CheckpointLock::acquire(path).unwrap());
-                CHECKPOINT_OWNER_ACCESSES.with(|count| assert_eq!(count.get(), 0));
-            }
+        for source in ["claude_code-test", "codex-test", "pi-test"] {
+            let path = parent.join(format!("{source}-scan-index.json"));
+            assert!(!state_v2::published(&path).unwrap());
+            let lock = CheckpointLock::acquire(&path).unwrap();
+            let error = CheckpointLock::acquire(&path).err().unwrap();
+            assert_eq!(
+                error.to_string(),
+                "local snapshot checkpoint is owned by another daemon"
+            );
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            drop(lock);
+            drop(CheckpointLock::acquire(&path).unwrap());
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -93557,9 +93521,7 @@ mod state_v2_maintenance_lock_tests {
             .join("a".repeat(64))
             .join("claude_code-test-scan-index.json");
         state_v2::checkpoint_priority_fixture(&path, true);
-        CHECKPOINT_OWNER_ACCESSES.with(|count| count.set(0));
         let normal = CheckpointLock::acquire(&path).unwrap();
-        CHECKPOINT_OWNER_ACCESSES.with(|count| assert!(count.get() > 0));
         let (entered, acquired) = std::sync::mpsc::channel();
         let (release, finish) = std::sync::mpsc::channel();
         let worker_path = path.clone();

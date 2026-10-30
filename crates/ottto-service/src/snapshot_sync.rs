@@ -6151,7 +6151,7 @@ fn load_source_checkpoints(
         )?)
     };
     let (index, origin) =
-        ScanIndex::load_for_snapshot_source_with_origin(index_path, source, support_dir)?;
+        ScanIndex::load_for_snapshot_source_with_custody(index_path, source, support_dir, custody)?;
     crate::snapshots::state_v2_before_collection(&index)?;
     index.require_persistence_available()?;
     // A first import may publish during this load. Recover/attach its receipt
@@ -24360,7 +24360,7 @@ mod tests {
                 f.baseline.generation,
             );
             recovery.admit_progress_bytes(bytes.len() as u64).unwrap();
-            f.progress.ack_recovery = Some(recovery);
+            f.progress.ack_recovery = Some(Box::new(recovery));
             let before = f.progress.clone();
             let mut posts = 0;
             let error = if bootstrap {

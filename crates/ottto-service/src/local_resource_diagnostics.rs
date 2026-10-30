@@ -2906,44 +2906,30 @@ pub(crate) fn scan_index_repair_required(
 /// can contribute. Peaks are 50-ms observations, not hard memory bounds.
 pub(crate) struct StateV2Probe {
     footprint: Option<footprint::Stage>,
-    physical: Option<footprint::Stage>,
     cpu: Option<ProcessSample>,
 }
 impl StateV2Probe {
     pub(crate) fn begin() -> Self {
         Self {
-            footprint: footprint::Stage::begin_rss(),
-            physical: footprint::Stage::begin_phys_footprint(),
+            footprint: footprint::Stage::begin(),
             cpu: process_sample(),
         }
     }
     pub(crate) fn memory(&self) -> (StateV2Memory, StateV2Memory) {
-        let rss = self
-            .footprint
+        self.footprint
             .as_ref()
-            .map(|s| s.finish().resident_bytes())
-            .unwrap_or_default();
-        let physical = self
-            .physical
-            .as_ref()
-            .map(|s| s.finish().resident_bytes())
-            .unwrap_or_default();
-        (
-            StateV2Memory {
-                rss_bytes: rss.0,
-                phys_footprint_bytes: physical.0,
-            },
-            StateV2Memory {
-                rss_bytes: rss.1,
-                phys_footprint_bytes: physical.1,
-            },
-        )
+            .map(|s| s.finish().memory())
+            .unwrap_or_default()
     }
+
     pub(crate) fn finish(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
         let (steady, peak) = self
             .footprint
             .as_ref()
-            .map(|s| s.finish().resident_bytes())
+            .map(|s| {
+                let (end, peak) = s.finish().memory();
+                (end.rss_bytes, peak.rss_bytes)
+            })
             .unwrap_or_default();
         (
             self.cpu
@@ -2976,62 +2962,13 @@ pub(crate) fn census_retire_skipped_grown() {
 }
 
 /// Current process memory, not lifetime ru_maxrss. Unavailable is never zero.
-#[derive(Clone, Copy, Default, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Serialize)]
 pub(crate) struct StateV2Memory {
     pub(crate) rss_bytes: Option<u64>,
     pub(crate) phys_footprint_bytes: Option<u64>,
 }
 pub(crate) fn state_v2_memory() -> StateV2Memory {
-    #[cfg(target_os = "macos")]
-    {
-        // TASK_VM_INFO revision-1 prefix through phys_footprint. Do not use
-        // the sampler's RSS fallback as a physical-footprint measurement.
-        #[repr(C)]
-        #[derive(Default)]
-        struct VmInfo {
-            virtual_size: u64,
-            region_count: i32,
-            page_size: i32,
-            resident_size: u64,
-            remaining: [u64; 15],
-            phys_footprint: u64,
-        }
-        extern "C" {
-            static mach_task_self_: libc::mach_port_t;
-        }
-        let mut vm = VmInfo::default();
-        let words = (std::mem::size_of::<VmInfo>() / 4) as u32;
-        let mut count = words;
-        let rc = unsafe {
-            libc::task_info(
-                mach_task_self_,
-                22,
-                (&mut vm as *mut VmInfo).cast(),
-                &mut count,
-            )
-        };
-        StateV2Memory {
-            rss_bytes: (rc == 0 && count >= 6).then_some(vm.resident_size),
-            phys_footprint_bytes: (rc == 0 && count >= words).then_some(vm.phys_footprint),
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let rss_bytes = (|| {
-            let stat = std::fs::read_to_string("/proc/self/statm").ok()?;
-            let pages: u64 = stat.split_whitespace().nth(1)?.parse().ok()?;
-            let size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-            pages.checked_mul(size).filter(|_| size > 0)
-        })();
-        StateV2Memory {
-            rss_bytes,
-            phys_footprint_bytes: None,
-        }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        StateV2Memory::default()
-    }
+    footprint::current()
 }
 pub(crate) fn state_v2_cpu_us() -> Option<u64> {
     process_sample().map(|p| p.cpu_us)
