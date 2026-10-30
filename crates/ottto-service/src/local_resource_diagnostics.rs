@@ -895,8 +895,9 @@ struct CensusRetireKeptOverlap {
 /// fits. `census_retire_kept_overflow` counts both reasons, `_occupancy`
 /// and `_admission` each one. `census_record_limit_refused` counts new keys
 /// refused at the live record bound. The row's counts and saturating process totals; a positive
-/// overflow also emits `claude_census_retire_kept_overlap_alarm`. Counts
-/// only; no path, id or wire event.
+/// overflow or refusal (each loses money proof) also emits
+/// `claude_census_retire_kept_overlap_alarm`. Counts only; no path, id or
+/// wire event.
 pub(crate) fn claude_census_retire_kept_overlap(counts: CensusRetireKeptOverlapCounts) {
     let add = |slot: usize, count: u64| {
         CENSUS_RETIRE_KEPT_OVERLAP_TOTAL[slot]
@@ -927,7 +928,7 @@ pub(crate) fn claude_census_retire_kept_overlap(counts: CensusRetireKeptOverlapC
         census_record_limit_refused_total: add(5, counts.record_limit_refused),
     };
     traversal_point("claude_census_retire_kept_overlap", "claude_code", &row);
-    if overflow > 0 {
+    if overflow > 0 || counts.record_limit_refused > 0 {
         traversal_point(
             "claude_census_retire_kept_overlap_alarm",
             "claude_code",

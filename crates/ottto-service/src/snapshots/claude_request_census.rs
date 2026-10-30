@@ -788,18 +788,24 @@ pub(crate) struct ClaudeRequestCensus {
 }
 crate::heap_layout_bound::fields!(ClaudeRequestCensus; records, hash_total, serialized_total, release_memo);
 
-/// E7 #920: a derive scan (`release_aged`) at `cutoff` found nothing to
-/// release. Every record that may age at that cutoff (`may_age`) is in
+/// E7 #920: an admission derive scan (`release_aged`) at `cutoff` released
+/// nothing: no record was releasable, or releasing every one (`freeable`
+/// hashes and serialized bytes) would still not have admitted the record.
+/// Every other record that may age at that cutoff (`may_age`) is in
 /// `suspects`: those the scan saw, and every later insert of one. Only a
-/// record that may age can be released, and whether a suspect can depends
-/// on the index entry, so re-checking the suspects against the current
-/// index decides exactly whether a scan would release anything.
+/// record that may age can be released, whether a suspect can depends on
+/// the index entry, and the releasable records the scan saw can only stay
+/// releasable or stop (a replacement that may age is a suspect, and a
+/// removed one frees less than `freeable` says). So re-checking
+/// the suspects against the current index, and `freeable` against the
+/// current totals, decides exactly whether a scan would release anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReleaseMemo {
     cutoff: u64,
+    freeable: (usize, usize),
     suspects: Vec<String>,
 }
-crate::heap_layout_bound::fields!(ReleaseMemo; cutoff, suspects);
+crate::heap_layout_bound::fields!(ReleaseMemo; cutoff, freeable, suspects);
 
 /// Most suspects a release memo keeps; past it no memo is kept.
 const MAX_RELEASE_MEMO_SUSPECTS: usize = 4_096;
@@ -1242,6 +1248,12 @@ impl ClaudeRequestCensus {
     /// release, with `fits` the 90% bound. Returns the records and hashes it
     /// retired.
     ///
+    /// With `all_or_none` (admission), a record that would not fit even
+    /// after every releasable record retired releases none: kept proofs are
+    /// never spent on a record that tombstones anyway. Without it (the
+    /// terminal's occupancy release), all retire, as the pre-stopgap rule
+    /// retired every aged record.
+    ///
     /// A release is an ordinary aged retirement (`retire`), never a refusal:
     /// it must never set a census-lost or refusal mark on the released key
     /// (#915's lost marks must keep this when they merge).
@@ -1250,11 +1262,17 @@ impl ClaudeRequestCensus {
         files: &BTreeMap<String, ScanIndexEntry>,
         cutoff: u64,
         fits: &dyn Fn(usize, usize) -> bool,
+        all_or_none: bool,
     ) -> (u64, u64) {
-        // A scan at this cutoff found nothing; only a suspect can have become
-        // releasable since, and none has.
-        if let Some(memo) = &self.release_memo {
+        // A scan at this cutoff released nothing; only a suspect can have
+        // become releasable since, and none has, and releasing all it saw
+        // would still not admit this record.
+        if let Some(memo) = self.release_memo.as_ref().filter(|_| all_or_none) {
             if memo.cutoff == cutoff
+                && !fits(
+                    self.hash_total.saturating_sub(memo.freeable.0),
+                    self.serialized_total.saturating_sub(memo.freeable.1),
+                )
                 && memo.suspects.iter().all(|key| {
                     self.records.get(key).map_or(true, |record| {
                         transcript_retirement_age(files, cutoff, key, record).is_none()
@@ -1292,10 +1310,6 @@ impl ClaudeRequestCensus {
                 .saturating_sub(entry_serialized_bytes(key, &retired));
             aged.push((modified, position, record.hash_count(), freed));
         }
-        if aged.is_empty() {
-            self.release_memo = suspects.map(|suspects| ReleaseMemo { cutoff, suspects });
-            return (0, 0);
-        }
         aged.sort_unstable();
         let (mut hash_total, mut serialized_total) = (self.hash_total, self.serialized_total);
         let mut release = 0;
@@ -1306,6 +1320,20 @@ impl ClaudeRequestCensus {
             hash_total -= hashes;
             serialized_total = serialized_total.saturating_sub(freed);
             release += 1;
+        }
+        // Sum first: a hopeless admission (or nothing releasable) retires
+        // none, and remembers what releasing all would have freed.
+        if aged.is_empty() || (all_or_none && !fits(hash_total, serialized_total)) {
+            let freeable = (
+                self.hash_total - hash_total,
+                self.serialized_total - serialized_total,
+            );
+            self.release_memo = suspects.map(|suspects| ReleaseMemo {
+                cutoff,
+                freeable,
+                suspects,
+            });
+            return (0, 0);
         }
         aged.truncate(release);
         aged.sort_unstable_by_key(|&(_, position, _, _)| position);
@@ -2948,7 +2976,7 @@ fn insert_transcript_record(
             .insert_releasing(key.to_owned(), record, |census, fits| {
                 // A release retires; it never marks the key lost or refused.
                 if window > 0 {
-                    released = census.release_aged(files, cutoff, fits).0;
+                    released = census.release_aged(files, cutoff, fits, true).0;
                 }
             });
     note_kept_overlap_admission(released);
@@ -3237,7 +3265,7 @@ fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> Trans
     if retirement.kept_overlap_records > 0
         && !within_keep_occupancy(census.hash_total, census.serialized_total)
     {
-        let (records, hashes) = census.release_aged(files, cutoff, &within_keep_occupancy);
+        let (records, hashes) = census.release_aged(files, cutoff, &within_keep_occupancy, false);
         retirement.overflow_occupancy = records;
         retirement.kept_overlap_records -= records;
         retirement.kept_overlap_hashes -= hashes;

@@ -850,6 +850,8 @@ fn census_admission_without_releasable_records_is_unchanged() {
 /// The round 3 invariant: every record the pre-stopgap terminal (which
 /// retired every aged record) would admit whole, the stopgap admits whole
 /// too, and nothing else. `h` and `c` hold 4 hashes; `y` grows by 1 to 5.
+/// Round 7: at growth 5 not even releasing both admits `y`, so neither is
+/// released (sum first) and `y` is tombstoned as before.
 #[test]
 fn census_admission_admits_what_pre_stopgap_retirement_admitted() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
@@ -869,10 +871,19 @@ fn census_admission_admits_what_pre_stopgap_retirement_admitted() {
             .claude_request_census_mut_for_test()
             .insert_for_test(&young, young_parse(hashes.clone()));
         let mut after = kept.clone();
-        let (outcome, _) = crate::local_resource_diagnostics::capture(|| {
+        let (outcome, rows) = crate::local_resource_diagnostics::capture(|| {
             after.insert_transcript_record_for_test(&young, young_parse(hashes.clone()), window)
         });
         assert_eq!(outcome, expected, "growth {growth}");
+        if growth == 5 {
+            assert!(rows.is_empty(), "a hopeless release releases nothing");
+            let census = after.claude_request_census_for_test();
+            for (key, hashes) in [(&holder, [1, 2]), (&copy, [2, 3])] {
+                let record = census.record_for_test(key).unwrap();
+                assert_eq!(record.retired_for_test(), None, "growth 5");
+                assert_eq!(record.request_hashes_for_test(), &hashes, "growth 5");
+            }
+        }
         assert_eq!(
             outcome == ClaudeRequestCensusInsert::Stored,
             growth <= 4,
@@ -916,6 +927,152 @@ fn census_admission_with_room_releases_nothing() {
         assert_eq!(record.request_hashes_for_test(), &hashes);
     }
     assert_eq!(census.hash_total_for_test(), KEEP_OCCUPANCY + 1);
+}
+
+/// Round 7: a hopeless release is remembered with what releasing every
+/// candidate would free. Another record that still would not fit runs no
+/// scan and releases nothing; a smaller one that would fit scans again and
+/// releases both kept records.
+#[test]
+fn census_admission_hopeless_release_is_remembered_by_size() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
+    let (mut index, [holder, copy, young]) = admission_index(60, false, true);
+    let scans = derive_scans_for_test();
+    let insert = |index: &mut ScanIndex, hashes: u64| {
+        crate::local_resource_diagnostics::capture(|| {
+            index.insert_transcript_record_for_test(
+                &young,
+                young_parse((100..100 + hashes).collect()),
+                window,
+            )
+        })
+    };
+    // Room 1 (y's own id) plus 4 releasable: 6 ids never fit.
+    for _ in 0..2 {
+        let (outcome, rows) = insert(&mut index, 6);
+        assert_eq!(outcome, ClaudeRequestCensusInsert::Tombstone);
+        assert!(rows.is_empty(), "nothing released");
+    }
+    assert_eq!(derive_scans_for_test(), scans + 1, "one scan for both");
+    let census = index.claude_request_census_for_test();
+    for key in [&holder, &copy] {
+        assert_eq!(
+            census.record_for_test(key).unwrap().retired_for_test(),
+            None
+        );
+    }
+    // The tombstone holds no id: room 1 again, plus 4, admits 5.
+    let (outcome, rows) = insert(&mut index, 5);
+    assert_eq!(outcome, ClaudeRequestCensusInsert::Stored);
+    assert_eq!(derive_scans_for_test(), scans + 2);
+    assert_eq!(
+        admission_overflow(&rows, "claude_census_retire_kept_overlap"),
+        2
+    );
+    let census = index.claude_request_census_for_test();
+    assert_eq!(census.totals_for_test(), census.recounted_for_test());
+}
+
+/// 90% of the census serialized budget: the byte occupancy up to which a
+/// terminal keeps aged records that share a request id.
+const KEEP_OCCUPANCY_BYTES: usize = MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES * 9 / 10;
+
+/// Indexes a young filler (a day old, one id) whose long key makes the
+/// census serialize to exactly `total` bytes. Called once per index.
+fn fill_serialized_to(index: &mut ScanIndex, total: usize) {
+    let filler = |index: &mut ScanIndex, name: &str| {
+        indexed_census(index, name, 'e', 1, vec![1 << 42]);
+        index
+            .claude_request_census_for_test()
+            .serialized_total_for_test()
+    };
+    let before = index
+        .claude_request_census_for_test()
+        .serialized_total_for_test();
+    let shortest = filler(&mut index.clone(), "s") - before;
+    let name = format!("s{}", "k".repeat(total - before - shortest));
+    assert_eq!(filler(index, &name), total);
+}
+
+/// An overlapping pair, `h` (60 days old, ids 0..1000) and `c` (40 days,
+/// ids 999..2000), on an otherwise empty index.
+fn serialized_pair() -> (ScanIndex, String, String) {
+    let mut index = ScanIndex::default();
+    let holder = indexed_census(&mut index, "h", 'a', 60, (0..1_000).collect());
+    let copy = indexed_census(&mut index, "c", 'b', 40, (999..2_000).collect());
+    (index, holder, copy)
+}
+
+/// Round 7, Lead B condition 3: occupancy is bounded by the serialized
+/// budget too. With the census serialized just past 90% and its hashes far
+/// below, the terminal retires the oldest kept record until it is back at
+/// 90% (occupancy overflow, with the alarm).
+#[test]
+fn census_retirement_serialized_occupancy_overflow_retires_the_oldest() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    assert_eq!(KEEP_OCCUPANCY_BYTES, 45_298_483);
+    let (mut index, holder, copy) = serialized_pair();
+    fill_serialized_to(&mut index, KEEP_OCCUPANCY_BYTES + 100);
+    let rows = retirement_terminal(&mut index);
+    let kept = Some((1, 1_001, 1));
+    assert_eq!(
+        kept_overlap(&rows, "claude_census_retire_kept_overlap"),
+        kept
+    );
+    assert_eq!(
+        kept_overlap(&rows, "claude_census_retire_kept_overlap_alarm"),
+        kept
+    );
+    let census = index.claude_request_census_for_test();
+    let retired = |key: &str| census.record_for_test(key).unwrap().retired_for_test();
+    assert_eq!(retired(&holder), Some(1_000));
+    assert_eq!(retired(&copy), None);
+    assert!(census.serialized_total_for_test() <= KEEP_OCCUPANCY_BYTES);
+    assert_eq!(census.hash_total_for_test(), 1_002, "hashes never bound");
+}
+
+/// Round 7, Lead B condition 3: admission release driven by the serialized
+/// budget alone. After a terminal keeps the pair, the census is filled to
+/// 50 bytes short of the full-record limit with almost all hashes free; a
+/// young record 20 ids long would be tombstoned by a plain insert, and
+/// instead releases the oldest kept record and is stored whole.
+#[test]
+fn census_admission_release_driven_by_the_serialized_budget() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
+    let (mut index, holder, copy) = serialized_pair();
+    let young = indexed_census(&mut index, "y", 'c', 5, vec![500_000]);
+    let rows = retirement_terminal(&mut index);
+    assert_eq!(
+        kept_overlap(&rows, "claude_census_retire_kept_overlap"),
+        Some((2, 2_001, 0))
+    );
+    let census = index.claude_request_census_for_test();
+    let limit = census.serialized_total_for_test() + census.serialized_headroom();
+    fill_serialized_to(&mut index, limit - 50);
+    let parse = || young_parse((500_000..500_020).collect());
+    let mut plain = index.claude_request_census_for_test().clone();
+    assert_eq!(
+        plain.insert_for_test(&young, parse()),
+        ClaudeRequestCensusInsert::Tombstone,
+        "without a release the bytes do not fit"
+    );
+    assert!(plain.hash_headroom() > MAX_CLAUDE_REQUEST_CENSUS_HASHES / 2);
+    let (outcome, rows) = crate::local_resource_diagnostics::capture(|| {
+        index.insert_transcript_record_for_test(&young, parse(), window)
+    });
+    assert_eq!(outcome, ClaudeRequestCensusInsert::Stored);
+    assert_eq!(
+        admission_overflow(&rows, "claude_census_retire_kept_overlap_alarm"),
+        1
+    );
+    let census = index.claude_request_census_for_test();
+    let record = |key: &str| census.record_for_test(key).unwrap();
+    assert_eq!(record(&holder).retired_for_test(), Some(1_000));
+    assert_eq!(record(&copy).retired_for_test(), None);
+    assert_eq!(record(&young).request_hashes_for_test().len(), 20);
+    assert_eq!(census.totals_for_test(), census.recounted_for_test());
 }
 
 /// Round 5 condition 3: the release needs no state from the terminal's
@@ -1141,10 +1298,15 @@ fn census_live_insert_mirrors_the_decoder_record_bound() {
         index.insert_transcript_record_for_test(new, money_record('b', vec![7]), window)
     });
     assert_eq!(outcome, ClaudeRequestCensusInsert::Refused);
-    let [row] = rows.as_slice() else {
-        panic!("one refusal row: {rows:?}");
+    let [row, alarm] = rows.as_slice() else {
+        panic!("one refusal row and its alarm: {rows:?}");
     };
     assert_eq!(row["stage"], "claude_census_retire_kept_overlap");
+    assert_eq!(alarm["stage"], "claude_census_retire_kept_overlap_alarm");
+    assert_eq!(
+        alarm["counts"], row["counts"],
+        "a refusal loses money proof"
+    );
     let counts = row["counts"].as_object().expect("counts");
     let mut names = counts.keys().map(String::as_str).collect::<Vec<_>>();
     names.sort_unstable();
@@ -1156,7 +1318,7 @@ fn census_live_insert_mirrors_the_decoder_record_bound() {
             .unwrap()
             >= 1
     );
-    assert_eq!(counts["census_retire_kept_overflow"], 0, "no alarm");
+    assert_eq!(counts["census_retire_kept_overflow"], 0);
     let held = "/money/projects/r0.jsonl";
     let (outcome, rows) = crate::local_resource_diagnostics::capture(|| {
         index.insert_transcript_record_for_test(held, money_record('b', vec![7]), window)
