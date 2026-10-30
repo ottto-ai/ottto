@@ -43,6 +43,22 @@ pub(crate) fn allowlist_digest(source: SnapshotSource) -> [u8; 32] {
     super::super::sampled_jsonl::durable::allowlist_digest(source)
 }
 
+// Pure forwarders for the Pi rows (E5), which live outside `snapshots`.
+/// Pins this thread's scan clock; `None` restores real time.
+pub(crate) fn set_now(now: Option<u64>) {
+    super::set_test_now(now);
+}
+pub(crate) fn set_unverified_deadline(entry: &mut crate::snapshots::ScanIndexEntry, due: u64) {
+    entry.set_unverified_deadline(due);
+}
+/// The b4 structural active budget for `key`: restore input, the transferred
+/// graph reserve and the key are funded, a typed decode never is.
+pub(crate) fn structural_active_budget(key: &str) -> u64 {
+    crate::durable_tail_store::RESTORE_INPUT_BYTES
+        + (crate::durable_tail_store::RECORD_BYTES + super::AUDIT_AND_SCRATCH_BYTES) as u64
+        + 4 * key.len() as u64
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Mode {
     ColdFull,

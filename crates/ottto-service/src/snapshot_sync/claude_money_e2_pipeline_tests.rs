@@ -2604,6 +2604,10 @@ mod money_equivalence_tests {
     mod durable_transition_tests {
         include!("../snapshots/sampled_scan/durable_transition_tests.rs");
     }
+    #[cfg(unix)]
+    mod durable_transition_pi_tests {
+        include!("../snapshots/sampled_scan/durable_transition_pi_tests.rs");
+    }
 }
 
 #[test]
