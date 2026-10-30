@@ -23,6 +23,7 @@ mod interning;
 mod kinds_accounts;
 mod kinds_census;
 mod kinds_files;
+mod kinds_misc;
 mod packed;
 mod shape;
 mod sqlite;
@@ -760,6 +761,7 @@ fn control_name(name: &str) -> bool {
     matches!(
         name,
         "identity"
+            | "schema_version"
             | "generation"
             | "phase"
             | "erasure_success"

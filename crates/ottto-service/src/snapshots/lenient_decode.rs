@@ -80,6 +80,83 @@ impl crate::heap_layout_bound::HeapLayoutBound for HeldRaw {
     }
 }
 impl Holds {
+    // S1 MISC: exact immutable custody access, without serializing HeldRaw.
+    pub(super) fn v2_provenance(&self) -> (u128, u64) {
+        (self.1.sum, self.1.count)
+    }
+    pub(super) fn v2_entries(
+        &self,
+    ) -> impl Iterator<Item = (&str, &str, &[u8], Option<std::ops::Range<usize>>, u64)> {
+        self.0.iter().flat_map(|(field, slots)| {
+            slots.iter().map(move |(key, raw)| {
+                (
+                    *field,
+                    key.as_str(),
+                    raw.get().as_bytes(),
+                    raw.1.clone(),
+                    raw.2,
+                )
+            })
+        })
+    }
+    pub(super) fn v2_insert(
+        &mut self,
+        field: &str,
+        key: String,
+        bytes: Vec<u8>,
+        owner: Option<std::ops::Range<usize>>,
+        charge: u64,
+    ) -> anyhow::Result<()> {
+        let field = FIELDS
+            .iter()
+            .copied()
+            .find(|f| *f == field)
+            .ok_or_else(|| anyhow::anyhow!("state_v2_unknown_hold"))?;
+        anyhow::ensure!(
+            matches!(
+                field,
+                "files"
+                    | "claude_account_family_witnesses"
+                    | "claude_account_family_pending"
+                    | "claude_usage_family_witnesses"
+                    | "claude_usage_family_pending"
+                    | "claude_usage_authority_quarantine"
+                    | "quarantined_snapshot_fingerprints"
+            ),
+            "state_v2_unknown_hold"
+        );
+        anyhow::ensure!(
+            !key.is_empty() && bytes.len() as u64 <= HOLD_BYTES_MAX && charge >= bytes.len() as u64,
+            "state_v2_hold_admission"
+        );
+        anyhow::ensure!(
+            self.held_bytes()
+                .checked_add(charge)
+                .is_some_and(|n| n <= HOLD_BYTES_MAX)
+                && self.0.values().map(BTreeMap::len).sum::<usize>() < HOLD_COUNT_MAX,
+            "state_v2_hold_admission"
+        );
+        let text = String::from_utf8(bytes)?;
+        let len = text.len();
+        let raw = RawValue::from_string(text)?;
+        anyhow::ensure!(raw.get().len() == len, "state_v2_hold_lexeme_changed");
+        let expected_owner = (field == "files").then(|| held_file_owner(&raw)).flatten();
+        anyhow::ensure!(owner == expected_owner, "state_v2_hold_owner_changed");
+        let previous = self
+            .0
+            .entry(field)
+            .or_default()
+            .insert(key, Arc::new(HeldRaw(raw, owner, charge)));
+        anyhow::ensure!(previous.is_none(), "state_v2_duplicate_hold");
+        Ok(())
+    }
+    pub(super) fn v2_finish(&mut self, provenance: (u128, u64)) {
+        self.1 = RepairProvenance {
+            sum: provenance.0,
+            count: provenance.1,
+        };
+        self.rebuild_scopes();
+    }
     pub(super) fn contains_field(&self, field: &str) -> bool {
         self.0.get(field).is_some_and(|slots| !slots.is_empty())
     }
