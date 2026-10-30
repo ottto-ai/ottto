@@ -255,6 +255,7 @@ fn sticky_assert_reconciled(item: &SnapshotItem) {
         references,
         (0..item.request_evidence.len() as u16).collect()
     );
+    sticky_assert_parts_priced(item);
     assert!(identity::item_bytes(item) <= identity::MAX_ITEM_BYTES);
     // Exercise the real upload wrapper, including semantic_envelope. A bare
     // SnapshotItem at 640 KiB is not an uploadable wire item.
@@ -1354,6 +1355,11 @@ fn sticky_current_bucket_tries_a_smaller_alternative_money_witness() {
         total: Some(1_000_000),
         ..Default::default()
     };
+    // The untagged 09:00 share is priced too. Otherwise the final "max" top
+    // row's untagged part would lack the cost its row carries, which the
+    // receiver rejects and the allocator now sends untagged.
+    item.usage_buckets[0].model_usage[0].cost_usd = Some("0.000001".into());
+    proof[3].usage.costs = proof[2].usage.costs.clone();
     let mut accepted = identity::AcceptedBuckets::for_test();
     sticky_apply(&mut item, &proof, &accepted).unwrap();
     accepted.record(&serde_json::to_value(&item).unwrap());
@@ -1722,6 +1728,37 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
     assert!(!sticky_any_tagged(&unpriced));
     sticky_assert_reconciled(&unpriced);
     cases.insert("unpriced_part_untagged", sticky_wire(unpriced));
+    // Reported zero is known money: the same retag with hour 0's costs
+    // reported as zero keeps its parts, the untagged share carrying "0".
+    let (mut zero, mut proof) = sticky_session(4);
+    sticky_price_fixture(&mut zero, &mut proof);
+    let row = &mut zero.usage_buckets[0].model_usage[0];
+    row.cost_usd = Some("0".into());
+    row.cache_creation_cost_usd = Some("0".into());
+    for c in &mut proof[..3] {
+        c.usage.costs.total = Some(0);
+        c.usage.costs.cache_creation = Some(0);
+    }
+    let mut first = zero.clone();
+    let mut accepted = identity::AcceptedBuckets::for_test();
+    sticky_apply(&mut first, &proof, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(first).unwrap());
+    proof[1].identity = login_key(D64);
+    assert_eq!(
+        sticky_apply(&mut zero, &proof, &accepted).unwrap(),
+        Tagged::Sent { refusals: 1 }
+    );
+    let untagged = zero.model_usage[0]
+        .identity_parts
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|part| part.evidence_ref.is_none())
+        .unwrap();
+    assert_eq!(untagged.cost_usd.as_deref(), Some("0"));
+    assert_eq!(untagged.cache_creation_cost_usd.as_deref(), Some("0"));
+    sticky_assert_reconciled(&zero);
+    cases.insert("zero_priced_part_kept", sticky_wire(zero));
     let actual = serde_json::to_value(cases).unwrap();
     let fixture = include_str!("fixtures/claude_identity_cap_emitted.json");
     let expected: Value = serde_json::from_str(fixture).unwrap();
@@ -1850,6 +1887,39 @@ fn sticky_missing_presence_resolves_to_the_same_accepted_tagged_set_without_repe
         assert_eq!(counts["identity_cap"]["accepted_share_changed"], 0);
         sticky_assert_reconciled(&current);
         accepted.record(&serde_json::to_value(current).unwrap());
+    }
+}
+
+/// Receiver `_validate_identity_parts` presence: per cost field, a part has
+/// it exactly when its row (top rollup or bucket row) has it.
+fn sticky_assert_parts_priced(item: &SnapshotItem) {
+    let costs = |values: [&Option<String>; 5]| values.map(Option::is_some);
+    for row in item
+        .model_usage
+        .iter()
+        .chain(item.usage_buckets.iter().flat_map(|b| &b.model_usage))
+    {
+        let row_costs = costs([
+            &row.cost_usd,
+            &row.input_cost_usd,
+            &row.output_cost_usd,
+            &row.cache_read_cost_usd,
+            &row.cache_creation_cost_usd,
+        ]);
+        for part in row.identity_parts.iter().flatten() {
+            assert_eq!(
+                costs([
+                    &part.cost_usd,
+                    &part.input_cost_usd,
+                    &part.output_cost_usd,
+                    &part.cache_read_cost_usd,
+                    &part.cache_creation_cost_usd,
+                ]),
+                row_costs,
+                "identity part cost presence differs from its row: {}",
+                row.model
+            );
+        }
     }
 }
 
@@ -2157,4 +2227,88 @@ fn sticky_frozen_row_moved_to_a_new_row_key_counts_vanished_without_changing_the
         assert_eq!(left, right);
     }
     sticky_assert_reconciled(&moved);
+}
+
+#[test]
+fn sticky_no_emitted_rollup_or_bucket_part_omits_a_cost_its_row_carries() {
+    // C9: with share protection off (no key), without hints and with
+    // hints, no top rollup or bucket row may carry a part lacking a cost its
+    // row carries. Presence is absent, reported zero or positive per field.
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let (mut stripped_cases, mut kept_parts_cases) = (0, 0);
+    for case in 0..96 {
+        let (mut item, mut proof) = sticky_session(4);
+        let presence = next();
+        for (hour, bucket) in item.usage_buckets.iter_mut().enumerate() {
+            let money = std::array::from_fn::<_, 5, _>(|field| {
+                match (presence >> ((hour * 5 + field) * 2)) & 3 {
+                    0 => None,
+                    1 => Some(0),
+                    _ => Some((field as u128 + 1) * 1_000_000),
+                }
+            });
+            let row = &mut bucket.model_usage[0];
+            for (slot, value) in [
+                &mut row.cost_usd,
+                &mut row.input_cost_usd,
+                &mut row.output_cost_usd,
+                &mut row.cache_read_cost_usd,
+                &mut row.cache_creation_cost_usd,
+            ]
+            .into_iter()
+            .zip(money)
+            {
+                *slot = value.map(|value| usd_picos_string(3 * value));
+            }
+            for c in &mut proof[hour * 3..hour * 3 + 3] {
+                c.usage.costs = UsageCosts {
+                    observed: true,
+                    reported: money.iter().any(Option::is_some),
+                    total: money[0],
+                    input: money[1],
+                    output: money[2],
+                    cache_read: money[3],
+                    cache_creation: money[4],
+                };
+            }
+        }
+        let mut ledger = identity::AcceptedBuckets::for_test();
+        match case % 3 {
+            0 => ledger.bind_test_key(None),
+            1 => {}
+            _ => {
+                let mut first = item.clone();
+                sticky_apply(&mut first, &proof, &ledger).unwrap();
+                ledger.record(&serde_json::to_value(first).unwrap());
+            }
+        }
+        let mutation = next();
+        if case % 8 != 0 {
+            for (index, c) in proof.iter_mut().enumerate() {
+                match (mutation >> (index * 3)) & 7 {
+                    0 => c.identity = RequestIdentity::Missing,
+                    1 => c.identity = login_key(D64),
+                    _ => {}
+                }
+            }
+        }
+        let mut baseline = item.clone();
+        sticky_receiver_totals(&mut baseline);
+        identity::take_identity_counts();
+        sticky_apply(&mut item, &proof, &ledger)
+            .unwrap_or_else(|error| panic!("case {case}: {error:?}"));
+        let counts =
+            serde_json::to_value(identity::take_identity_counts()).unwrap()["identity_cap"].clone();
+        stripped_cases += usize::from(counts["unpriced_part_untagged"].as_u64() == Some(1));
+        kept_parts_cases += usize::from(item.model_usage[0].identity_parts.is_some());
+        sticky_assert_reconciled(&item);
+        assert_eq!(sticky_money(&item), sticky_money(&baseline), "case {case}");
+    }
+    assert!(stripped_cases > 0 && kept_parts_cases > 0);
 }
