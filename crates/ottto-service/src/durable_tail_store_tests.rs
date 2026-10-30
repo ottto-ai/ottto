@@ -4943,7 +4943,10 @@ fn m1_reader_ceiling_keeps_consent_erasure_for_known_v3_private_labels() {
     let scratch = Scratch::new();
     let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let path = scratch.transcript("source.jsonl", b"{}\n");
-    let b = binding("account", "scope", ("fp-a", None));
+    let mut b = binding("account", "scope", ("fp-a", None));
+    // V3 acquisition records use the replay binding's zero entry digest.
+    // A legacy entry digest makes write_after_save skip the record.
+    b.entry = [0; 32];
     let mut record = pending(b.clone(), certificate(&path), 1);
     record.acquisition = Some(AcquisitionFields {
         acquired_revision: 3,
@@ -4959,6 +4962,7 @@ fn m1_reader_ceiling_keeps_consent_erasure_for_known_v3_private_labels() {
         1
     );
     let record_path = writer.record_path(&b.key);
+    assert_eq!(found(writer.read(&b.key)).format, FORMAT_V3);
     drop(writer);
     let mut reader = scratch.store();
     reader.restrict_reads_to_v1();
