@@ -1126,6 +1126,34 @@ Fallback Drop release counts `codex_zst_owner.counts.leaked_release`; it is a
 cancellation/unwind safety net. Stores-held debug assertions guard admission and
 explicit release, including real durable I/O paths.
 
+Pi fork files exclude copied usage entries whose envelope timestamp is strictly
+before their session header time. If the envelope time is absent, the provider
+time can establish the cutoff. Entries at or after the header time retain normal
+identity and deduplication. Missing or invalid cutoff evidence never proves a
+copy; ordinary timestamp validation still applies. A fork's durable Pi section
+stores only `has_parent` and the header timestamp alongside its usage ledger.
+The `parentSession` value stays in RAM for the read and never enters records,
+logs, diagnostics or uploads.
+
+The fixed cache lifecycle counters `pi_fork_copies_skipped_entries` and
+`pi_fork_copies_skipped_tokens` count physical usage-bearing entries excluded
+and their tokens. A copied message/message_end pair contributes two skipped
+entries, even though normal pairing would count one request. Counts accumulate
+per process and in the existing per-page observer; repeated Full reads count
+again. `pi_fork_parent_unseen` counts skipped entries whose parent path is absent
+from the Pi index at the end of a Full read. Tail restores retain the cutoff
+without the parent path, so this unseen-parent count is unavailable for Tail
+skips, rather than evidence that their parent is known.
+
+Historical parent spend is excluded even if its file was never uploaded. Copies
+from a machine whose clock ran ahead can have timestamps at or after the fork
+header and still count; detecting them needs parent history, which this reader
+does not acquire. There is no clock-skew counter. Correcting an earlier inflated
+Pi session produces a normal lower-usage revision, without a Claude usage-decrease
+marker or an additional history read. A complete fork containing only copied
+usage publishes a zero-usage revision; copied usage does not make that read
+incomplete. Malformed owned evidence retains normal loss handling.
+
 Pi joins the shared sampled RAM reader. Its `native_collection_page` acquisition
 counts report Full, Tail and Unchanged decisions with the actual planner reasons.
 Pi inherits the accepted sampled residual: an interior same-length rewrite plus

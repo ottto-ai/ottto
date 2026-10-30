@@ -91,6 +91,12 @@ counters! {
     // SOURCE (B): fixed content-free totals, never per-file history.
     prefix_excluded_bodies: PrefixExcludedBody,
     prefix_tag_clears: PrefixTagCleared,
+    // M-2 Pi fork copies (SOURCE option (a)): fixed content-free totals.
+    // Skipped copied usage entries and their tokens, and the skipped entries
+    // whose parent is not a known Pi session (Full reads only).
+    pi_fork_copies_skipped_entries: PiForkCopiesSkippedEntries,
+    pi_fork_copies_skipped_tokens: PiForkCopiesSkippedTokens,
+    pi_fork_parent_unseen: PiForkParentUnseen,
 }
 
 pub(crate) fn add(event: Event, amount: u64) {

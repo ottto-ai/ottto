@@ -20741,6 +20741,7 @@ impl SnapshotAccumulator {
             source_file_fingerprint,
             attribution_context,
             None,
+            false,
         )
     }
 
@@ -20751,6 +20752,7 @@ impl SnapshotAccumulator {
         source_file_fingerprint: String,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
         measured_repository_identity: Option<crate::context_footprint::RepositoryIdentity>,
+        emit_empty_pi_fork: bool,
     ) -> Vec<SnapshotItem> {
         // Defence in depth: the scan already refuses to collect the Workflow
         // journal, but the parse entry points are public, so nothing downstream
@@ -21088,7 +21090,13 @@ impl SnapshotAccumulator {
                 .claude_money
                 .as_deref()
                 .is_some_and(|money| money.entity.resolver_conflicts > 0);
-        if session_rows.is_empty() && !conflict_carrier {
+        // A fully read Pi fork whose positive usage was all copied must
+        // publish zero too: an earlier accepted revision can be inflated.
+        let empty_pi_fork = emit_empty_pi_fork
+            && self.source == SnapshotSource::Pi
+            && self.seen_pi_usage_keys.fork_parts().0
+            && self.seen_pi_usage_keys.fork_parts().1.is_some();
+        if session_rows.is_empty() && !conflict_carrier && !empty_pi_fork {
             return Vec::new();
         }
         let mut model_usage: Vec<SnapshotModelUsage> = session_rows
@@ -29543,6 +29551,13 @@ impl OwnedSourceScan {
                     std::mem::take(&mut group.recovered)
                 });
                 let mut parser = parser;
+                if parser.accumulator.source == SnapshotSource::Pi {
+                    // M-2: RAM-only membership of the fork's parent; counts only.
+                    parser
+                        .accumulator
+                        .seen_pi_usage_keys
+                        .finish_fork_read(|parent| index.files.contains_key(parent));
+                }
                 // The repository identity X_out measured, if any (#665 U3).
                 let mut measured_repository_identity = None;
                 if let Some(replay) = parser.accumulator.codex_tier_replay.take() {
@@ -35754,8 +35769,11 @@ impl OwnedJsonlParser {
             if let Some(replay) = accumulator.codex_tier_replay.as_mut() {
                 replay.observe(value);
             }
-            let inherited = source == SnapshotSource::ClaudeCode
-                && claude_fork_line_provenance(value) == ClaudeForkLineProvenance::Inherited;
+            let inherited = (source == SnapshotSource::ClaudeCode
+                && claude_fork_line_provenance(value) == ClaudeForkLineProvenance::Inherited)
+                || (source == SnapshotSource::Pi
+                    && pi_usage_event(value)
+                    && accumulator.seen_pi_usage_keys.is_fork_copy(value));
             if !inherited && recognized_usage_shape_was_dropped(source, value) {
                 *recognized_usage_drop_count += 1;
             }
@@ -36151,6 +36169,11 @@ impl OwnedJsonlParser {
                     && observation.pair_key.is_none()
             })
             .count();
+        let emit_empty_pi_fork = source == SnapshotSource::Pi
+            && report.complete()
+            && recognized_usage_drop_count == 0
+            && accumulator_dropped_usage_record_count == 0
+            && !positive_usage_evidence;
         let snapshots = claude_request_money::e2::timed("native.into_items", || {
             accumulator.into_items_with_repository_identity(
                 path,
@@ -36158,6 +36181,7 @@ impl OwnedJsonlParser {
                 source_file_fingerprint,
                 attribution_context,
                 repository_identity,
+                emit_empty_pi_fork,
             )
         });
         // A syntactically valid, positive provider usage record that yields no
@@ -40853,6 +40877,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
         }
         Some("session") => {
             if accumulator.source_session_id.is_none() {
+                accumulator.seen_pi_usage_keys.note_header(value);
                 accumulator.source_session_id = string_at(value, &["id"])
                     .or_else(|| string_at(value, &["session_id"]))
                     .or_else(|| string_at(value, &["sessionId"]));
@@ -40870,6 +40895,10 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             }
             let timestamp = pi_message_timestamp(value);
             if role.as_deref() == Some("assistant")
+                && accumulator.seen_pi_usage_keys.skip_fork_copy(value)
+            {
+                accumulator.set_model(string_at(value, &["message", "model"]));
+            } else if role.as_deref() == Some("assistant")
                 && (timestamp.is_some() || !pi_message_timestamp_is_present(value))
             {
                 apply_pi_usage_line(
@@ -40887,7 +40916,9 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
         }
         Some("message_end") => {
             let timestamp = pi_message_end_timestamp(value);
-            if timestamp.is_some() || !pi_message_timestamp_is_present(value) {
+            if accumulator.seen_pi_usage_keys.skip_fork_copy(value) {
+                accumulator.set_model(string_at(value, &["message", "model"]));
+            } else if timestamp.is_some() || !pi_message_timestamp_is_present(value) {
                 apply_pi_usage_line(
                     value,
                     accumulator,
@@ -40920,6 +40951,12 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
 /// `usage` entries name their model; summaries run on the session's current
 /// model, which `place_usage` falls back to when `model` is None.
 fn apply_pi_entry_usage(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    if accumulator.seen_pi_usage_keys.skip_fork_copy(value) {
+        // Copied spend is excluded, but its model remains the context for
+        // owned summary entries that do not repeat a model name.
+        accumulator.set_model(string_at(value, &["model"]));
+        return;
+    }
     let Some(usage) = pi_message_usage(value) else {
         return;
     };
@@ -41111,6 +41148,12 @@ fn pi_timestamp_value(value: Option<&Value>) -> Option<String> {
     pi_ms_timestamp(Some(value))
 }
 
+fn pi_timestamp_nanos(value: &str) -> Option<i128> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .ok()
+        .map(OffsetDateTime::unix_timestamp_nanos)
+}
+
 fn pi_usage_timestamp_identity(value: &str) -> Option<String> {
     OffsetDateTime::parse(value, &Rfc3339)
         .ok()
@@ -41192,17 +41235,162 @@ impl PiUsageDedupState {
     }
 }
 
-/// The accumulator's Pi-only state: the usage dedup ledger. A labelled `E`
-/// field (`durable_tail_codec::PI_ONLY_E_LABELS`): Claude and Codex leave it
-/// empty and never persist it; Pi persists it only in the Pi record section.
+/// The accumulator's Pi-only state: the usage dedup ledger and the fork
+/// state (M-2). A labelled `E` field (`durable_tail_codec::PI_ONLY_E_LABELS`):
+/// Claude and Codex leave it empty and never persist it; Pi persists it only
+/// in the Pi record section.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PiLedger {
     usage_keys: BTreeMap<String, PiUsageDedupState>,
+    /// Set only for a file whose header names a parent; boxed so other
+    /// accumulators pay one pointer.
+    fork: Option<Box<PiFork>>,
+}
+
+/// M-2 (SOURCE ruling, Pi fork copies option (a)): Pi `--fork` and `/fork`
+/// copy the parent's entries, with their ids and timestamps, after a header
+/// that names `parentSession` at the fork time. The fork owns only what
+/// happened at or after its header time.
+#[derive(Default, PartialEq, Eq)]
+pub(crate) struct PiFork {
+    /// Persisted (N): the header named a parent.
+    has_parent: bool,
+    /// Persisted (N): the header time, unix nanos; `None` when the header
+    /// time is missing or invalid, which counts every entry.
+    header_nanos: Option<i128>,
+    /// RAM only, never encoded, cloned or logged: the header's
+    /// `parentSession`, for the membership check after a Full read.
+    parent_ref: Option<String>,
+    /// RAM only: copies skipped since `parent_ref` was read.
+    copies_this_read: u64,
+}
+
+/// Never prints `parentSession`.
+impl std::fmt::Debug for PiFork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PiFork")
+            .field("has_parent", &self.has_parent)
+            .field("header_nanos", &self.header_nanos)
+            .field("parent_ref", &self.parent_ref.is_some())
+            .field("copies_this_read", &self.copies_this_read)
+            .finish()
+    }
+}
+
+/// The RAM cache keeps a clone, so the RAM-only fields end with the read.
+impl Clone for PiFork {
+    fn clone(&self) -> Self {
+        Self {
+            has_parent: self.has_parent,
+            header_nanos: self.header_nanos,
+            parent_ref: None,
+            copies_this_read: 0,
+        }
+    }
 }
 
 impl PiLedger {
     pub(crate) fn usage_keys(&self) -> &BTreeMap<String, PiUsageDedupState> {
         &self.usage_keys
+    }
+
+    /// The persisted fork values: (`has_parent`, header time).
+    pub(crate) fn fork_parts(&self) -> (bool, Option<i128>) {
+        self.fork
+            .as_deref()
+            .map_or((false, None), |fork| (fork.has_parent, fork.header_nanos))
+    }
+
+    /// Refills the ledger from a Pi record section.
+    pub(crate) fn from_parts(
+        usage_keys: BTreeMap<String, PiUsageDedupState>,
+        has_parent: bool,
+        header_nanos: Option<i128>,
+    ) -> Self {
+        Self {
+            usage_keys,
+            fork: has_parent.then(|| {
+                Box::new(PiFork {
+                    has_parent,
+                    header_nanos,
+                    ..PiFork::default()
+                })
+            }),
+        }
+    }
+
+    /// The first header that names a parent marks the file a fork. Pi writes
+    /// one header, as the first line.
+    fn note_header(&mut self, value: &Value) {
+        if self.fork.is_some() {
+            return;
+        }
+        let Some(parent) = string_at(value, &["parentSession"]).filter(|p| !p.is_empty()) else {
+            return;
+        };
+        self.fork = Some(Box::new(PiFork {
+            has_parent: true,
+            header_nanos: pi_timestamp_value(value.get("timestamp"))
+                .as_deref()
+                .and_then(pi_timestamp_nanos),
+            parent_ref: Some(parent),
+            copies_this_read: 0,
+        }));
+    }
+
+    /// Usage on an entry stamped strictly before the fork header time is the
+    /// parent's copied spend: skip it, counted. An entry without a valid
+    /// time counts normally. The envelope time comes first, as Pi copies it.
+    fn is_fork_copy(&self, value: &Value) -> bool {
+        let Some(header) = self.fork.as_deref().and_then(|fork| fork.header_nanos) else {
+            return false;
+        };
+        // A present invalid envelope is not evidence for skipping. Only an
+        // absent envelope falls back to the provider clock.
+        pi_timestamp_value(
+            value
+                .get("timestamp")
+                .or_else(|| value.pointer("/message/timestamp")),
+        )
+        .as_deref()
+        .and_then(pi_timestamp_nanos)
+        .is_some_and(|at| at < header)
+            && pi_message_usage(value).is_some()
+    }
+
+    fn skip_fork_copy(&mut self, value: &Value) -> bool {
+        if !self.is_fork_copy(value) {
+            return false;
+        }
+        let usage = pi_message_usage(value).expect("copy classifier required usage");
+        let fork = self
+            .fork
+            .as_deref_mut()
+            .expect("copy classifier required a fork");
+        use crate::local_resource_diagnostics::cache_lifecycle::{add, Event};
+        fork.copies_this_read = fork.copies_this_read.saturating_add(1);
+        add(Event::PiForkCopiesSkippedEntries, 1);
+        add(Event::PiForkCopiesSkippedTokens, usage.total_tokens());
+        true
+    }
+
+    /// After a read: counts this read's skipped copies as
+    /// `pi_fork_parent_unseen` when the header's parent is not a known Pi
+    /// session, then drops `parentSession`. A Tail never sees the header, so
+    /// only Full reads count.
+    pub(crate) fn finish_fork_read(&mut self, known: impl FnOnce(&str) -> bool) {
+        let Some(fork) = self.fork.as_deref_mut() else {
+            return;
+        };
+        let copies = std::mem::take(&mut fork.copies_this_read);
+        if let Some(parent) = fork.parent_ref.take() {
+            if copies > 0 && !known(&parent) {
+                crate::local_resource_diagnostics::cache_lifecycle::add(
+                    crate::local_resource_diagnostics::cache_lifecycle::Event::PiForkParentUnseen,
+                    copies,
+                );
+            }
+        }
     }
 }
 
@@ -41220,8 +41408,14 @@ impl std::ops::DerefMut for PiLedger {
 }
 
 impl crate::durable_tail_codec::DurableEmpty for PiLedger {
+    /// Claude and Codex: a fork state is as non-empty as a ledger key, so a
+    /// non-default one refuses the record (counted), never drops silently.
     fn durable_empty(&self) -> bool {
         self.usage_keys.is_empty()
+            && self
+                .fork
+                .as_deref()
+                .is_none_or(|fork| *fork == PiFork::default())
     }
 }
 
@@ -94962,7 +95156,8 @@ crate::heap_layout_bound::fields!(OwnedJsonlParser; pending_taken, pending_retur
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_publication, native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
-crate::heap_layout_bound::fields!(PiLedger; usage_keys);
+crate::heap_layout_bound::fields!(PiLedger; usage_keys, fork);
+crate::heap_layout_bound::fields!(PiFork; has_parent, header_nanos, parent_ref, copies_this_read);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {
     U model: String,

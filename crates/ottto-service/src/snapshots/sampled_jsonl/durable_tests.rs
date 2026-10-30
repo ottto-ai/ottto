@@ -2347,3 +2347,150 @@ pre_m2_encoder! { seen_pi_usage_keys;
     D session_start: Box<session_start::SessionStartState>,
     D durable_marks: crate::durable_tail_codec::DurableMarks,
 }
+
+/// The codec/Tail rule runs on Linux too; the transition matrix additionally
+/// checks native disk receipts, eviction and the shared money oracle on macOS.
+#[test]
+fn pi_fork_restore_tail_matches_cold_at_every_physical_line_cut() {
+    let source = SnapshotSource::Pi;
+    let header = json!({"type":"session","id":"synthetic-m2-cut",
+        "timestamp":"2026-10-20T10:00:00Z","parentSession":"CANARY_M2_PARENT"})
+    .to_string();
+    let mut lines = vec![header];
+    for (id, at) in [
+        ("copied", "2026-10-20T09:59:59Z"),
+        ("at", "2026-10-20T10:00:00Z"),
+        ("after", "2026-10-20T10:00:01Z"),
+    ] {
+        for kind in ["message", "message_end"] {
+            lines.push(
+                json!({"type":kind,"timestamp":at,
+                "message":{"role":"assistant","responseId":id,"timestamp":at,"model":"gpt-5.4",
+                    "usage":{"input":100,"output":10}}})
+                .to_string(),
+            );
+        }
+        lines.push(
+            json!({"type":"usage","id":id,"timestamp":at,"model":"gpt-5.4",
+            "usage":{"input":20,"output":5}})
+            .to_string(),
+        );
+    }
+    for cut in 1..lines.len() {
+        let scratch = Scratch::new("m2-cut");
+        let path = scratch.write("fork.jsonl", &lines[..cut]);
+        let (reduction, checkpoint) = full_read(&path, source);
+        let bytes = encode(&reduction, 1 << 20, line_cap()).unwrap();
+        let certificate = checkpoint
+            .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
+            .unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        for line in &lines[cut..] {
+            writeln!(file, "{line}").unwrap();
+        }
+        drop(file);
+        let (checkpoint, _) = certificate
+            .restore(&mut File::open(&path).unwrap(), scope())
+            .unwrap();
+        let (restored, _) = restore(&path, &bytes, source).unwrap();
+        assert!(restored.accumulator.seen_pi_usage_keys.fork_parts().0);
+        let mut tail = parser(&path, source);
+        assert_eq!(
+            tail.prepare_acquisition(
+                Some(Retained {
+                    checkpoint,
+                    state: restored
+                }),
+                &scope(),
+                None,
+                NOW
+            )
+            .unwrap(),
+            ReadMode::Tail
+        );
+        while !tail.step().unwrap() {}
+        assert_eq!(tail.accumulator.accepted_usage_totals.input_tokens, 240);
+        assert_eq!(
+            items(tail, &path, source),
+            cold_items(&path, source),
+            "cut {cut}"
+        );
+    }
+}
+
+#[test]
+fn copied_only_pi_fork_is_complete_emits_zero_and_restores_tail() {
+    let scratch = Scratch::new("m2-only-copies");
+    let at = "2026-10-20T09:59:59Z";
+    let copy = json!({"type":"message","timestamp":at,"message":{"role":"assistant",
+        "responseId":"copy","timestamp":at,"model":"gpt-5.4","usage":{"input":100,"output":10}}})
+    .to_string();
+    let path = scratch.write(
+        "fork.jsonl",
+        &[
+            json!({"type":"session","id":"synthetic-copy-only","timestamp":"2026-10-20T10:00:00Z",
+            "parentSession":"CANARY_M2_PARENT"})
+            .to_string(),
+            copy.clone(),
+        ],
+    );
+    let source = SnapshotSource::Pi;
+    let (reduction, checkpoint) = full_read(&path, source);
+    assert_eq!(reduction.positive_recognized_usage_count, 0);
+    assert!(
+        !reduction.positive_usage_evidence,
+        "known copied usage is not unexplained loss"
+    );
+    let bytes = encode(&reduction, 1 << 20, line_cap()).unwrap();
+    let certificate = checkpoint
+        .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
+        .unwrap();
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    writeln!(file, "{copy}").unwrap();
+    drop(file);
+    let (checkpoint, _) = certificate
+        .restore(&mut File::open(&path).unwrap(), scope())
+        .unwrap();
+    let (restored, _) = restore(&path, &bytes, source).unwrap();
+    let mut tail = parser(&path, source);
+    assert_eq!(
+        tail.prepare_acquisition(
+            Some(Retained {
+                checkpoint,
+                state: restored
+            }),
+            &scope(),
+            None,
+            NOW
+        )
+        .unwrap(),
+        ReadMode::Tail
+    );
+    while !tail.step().unwrap() {}
+    let identity = tail.opened_object_identity().unwrap();
+    let parsed = tail
+        .finish(&identity, &path, COLLECTED, "fp".into(), None, None, None)
+        .unwrap();
+    assert!(parsed.complete(), "copied-only forks can be checkpointed");
+    assert_eq!(
+        parsed.snapshots.len(),
+        1,
+        "a zero correction must be publishable"
+    );
+    assert_eq!(parsed.snapshots[0].input_tokens, 0);
+    assert_eq!(parsed.snapshots[0].request_count, 0);
+    let cold = cold_items(&path, source);
+    assert_eq!(
+        serde_json::to_value(&parsed.snapshots).unwrap(),
+        cold["items"]
+    );
+    // Unknown positive evidence or malformed owned usage still fails closed.
+    fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(
+        b"{\"type\":\"message\",\"timestamp\":\"bad\",\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":50}}}\n"
+    ).unwrap();
+    let bad = cold_items(&path, source);
+    assert!(
+        bad["items"].as_array().unwrap().is_empty(),
+        "invalid owned evidence cannot manufacture a zero carrier"
+    );
+}

@@ -311,7 +311,8 @@ impl<'a> Dec<'a> {
         self.refused |= !granted;
         granted.then_some(()).ok_or(Corrupt)
     }
-    fn slots<T>(&mut self, len: usize) -> Result<(), Corrupt> {
+    // Typed Pi-section reconstruction also charges its RAM-only wrapper.
+    pub(crate) fn slots<T>(&mut self, len: usize) -> Result<(), Corrupt> {
         self.reserve(len.checked_mul(std::mem::size_of::<T>()))
     }
     fn tree<K, V>(&mut self, len: usize) -> Result<(), Corrupt> {
