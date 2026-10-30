@@ -8203,6 +8203,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
             // Use the pre-replay fact: record() writes provisional new entries.
             && !pending.codex_pending_recovery
             && !quarantine_retry_required
+            && !desktop_identity::recovery_must_send(pending, &result.snapshots)
         {
             noop_source_files.insert(pending.source_file_fingerprint.clone());
             result.semantic_noop_count = result

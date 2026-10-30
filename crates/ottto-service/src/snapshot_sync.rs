@@ -7514,6 +7514,11 @@ fn finish_sync_source(
             &upload_progress.accepted_fingerprints,
             &upload_progress.accepted_body_witnesses,
         );
+        index.settle_desktop_identity_reoffers(
+            &scan_result,
+            &upload_progress.accepted_body_witnesses,
+            &upload_progress.quarantined_fingerprints,
+        );
     }
 
     index.log_claude_proof_correction_debt();

@@ -48,15 +48,18 @@ impl<V> BoundedMemo<V> {
             cap,
         }
     }
-    fn record(&mut self, key: [u8; 32], value: V) {
+    /// True when the cap evicted the oldest entry.
+    fn record(&mut self, key: [u8; 32], value: V) -> bool {
         if self.values.insert(key, value).is_none() {
             self.order.push_back(key);
         }
-        if self.order.len() > self.cap {
-            if let Some(oldest) = self.order.pop_front() {
-                self.values.remove(&oldest);
-            }
+        if self.order.len() <= self.cap {
+            return false;
         }
+        if let Some(oldest) = self.order.pop_front() {
+            self.values.remove(&oldest);
+        }
+        true
     }
     fn take(&mut self, key: &[u8; 32]) -> Option<V> {
         let value = self.values.remove(key)?;
@@ -71,16 +74,19 @@ impl BoundedMemo<[u8; 32]> {
 }
 /// `posted` holds a re-offer on its way to the backend, keyed by SHA-256 of
 /// its body's fingerprint, until a response names that body. An eviction or a
-/// new process loses at most that count.
+/// new process loses at most that count. `unstored` holds a body answered
+/// unchanged with nothing stored, which leaves no ACK in the upload ledger.
 struct ReofferMemos {
     refused: BoundedMemo<[u8; 32]>,
     posted: BoundedMemo<(IdentityReoffer, u64)>,
+    unstored: BoundedMemo<()>,
 }
 impl ReofferMemos {
     const fn new() -> Self {
         Self {
             refused: BoundedMemo::new(REFUSED_MEMO_CAP),
             posted: BoundedMemo::new(REFUSED_MEMO_CAP),
+            unstored: BoundedMemo::new(REFUSED_MEMO_CAP),
         }
     }
 }
@@ -106,19 +112,26 @@ fn memo_key(key: &str) -> [u8; 32] {
     Sha256::digest(key.as_bytes()).into()
 }
 fn remember_refused(key: &str, evidence: [u8; 32]) {
-    with_reoffer_memos(|memos| memos.refused.record(memo_key(key), evidence));
+    if with_reoffer_memos(|memos| memos.refused.record(memo_key(key), evidence)) {
+        crate::local_resource_diagnostics::claude_reread::desktop_identity_reoffer_memo_evicted();
+    }
 }
 /// A new process: the memos are RAM only.
 #[cfg(test)]
 pub(super) fn reset_refused_memo_for_test() {
     with_reoffer_memos(|memos| *memos = ReofferMemos::new());
 }
-/// Real cap eviction of everything older.
+/// Real cap eviction of everything older, then `extra` more.
 #[cfg(test)]
-pub(super) fn fill_refused_memo_for_test() {
-    for n in 0..REFUSED_MEMO_CAP {
+pub(super) fn fill_refused_memo_for_test(extra: usize) {
+    for n in 0..REFUSED_MEMO_CAP + extra {
         remember_refused(&format!("/synthetic/memo/{n}"), [0; 32]);
     }
+}
+/// Evidence no live digest can match, on an unchanged source fingerprint.
+#[cfg(test)]
+pub(super) fn remember_other_evidence_for_test(key: &str) {
+    remember_refused(key, [7; 32]);
 }
 
 /// Digest of the child's own live evidence, only while it resolves complete.
@@ -217,8 +230,9 @@ fn edge_bytes(edges: &BTreeMap<String, String>) -> usize {
 }
 
 /// Counts each posted re-offer from the backend's per-entity lists, once. Never
-/// from `response.accepted`, which sums accepted and unchanged. A conflict stays
-/// owed to the retry; a count-only ACK names no entity, so it counts nothing.
+/// from `response.accepted`, which sums accepted and unchanged. A conflict
+/// settles with the upload ledger; a count-only ACK names no entity and counts
+/// nothing.
 pub(crate) fn classify_desktop_identity_reoffers(
     response: &crate::snapshot_client::SnapshotBatchResponse,
 ) {
@@ -242,6 +256,14 @@ pub(crate) fn classify_desktop_identity_reoffers(
         if let Some((kind, bytes)) = with_reoffer_memos(|memos| memos.posted.take(&key)) {
             desktop_identity_reoffer(kind == IdentityReoffer::Adoption, outcome, bytes);
         }
+    }
+    let unstored = response
+        .unchanged_entities
+        .iter()
+        .filter(|entity| entity.unchanged_basis.is_some());
+    for entity in unstored {
+        let key = memo_key(&entity.snapshot_fingerprint);
+        with_reoffer_memos(|memos| memos.unstored.record(key, ()));
     }
 }
 
@@ -282,6 +304,29 @@ fn emitted_disposition(
         };
     }
     (disposition, pair)
+}
+
+fn emitted_complete(pending: &PendingIndexFinalization, items: &[SnapshotItem]) -> bool {
+    let session = Path::new(&pending.index_key)
+        .file_stem()
+        .and_then(|value| value.to_str());
+    session.is_some_and(|session| {
+        emitted_disposition(items, &pending.source_file_fingerprint, session).0 == Some("complete")
+    })
+}
+
+/// A pending child has no ACK for its complete body, even when the working
+/// entry already names that body: its fingerprint can outlive the missing one
+/// in the upload ledger, so an unACKed upload can advance the entry. The
+/// backend answers an exact repeat with unchanged.
+pub(super) fn recovery_must_send(
+    pending: &PendingIndexFinalization,
+    items: &[SnapshotItem],
+) -> bool {
+    matches!(
+        pending.desktop_identity_reoffer,
+        Some((IdentityReoffer::Recovered, _))
+    ) && emitted_complete(pending, items)
 }
 
 impl ScanIndex {
@@ -336,7 +381,8 @@ impl ScanIndex {
     }
 
     /// Working-index update at finalization, committed only for ACK-settled
-    /// keys. The latch settles on a complete emission only (E1). A refused
+    /// keys. The latch settles on a complete emission only (E1), and a sent
+    /// re-offer settles only in `settle_desktop_identity_reoffers`. A refused
     /// attempt or a natural downgrade of an already complete own disposition
     /// goes to the RAM memo, so the same evidence is not offered again and a
     /// later complete disposition still recovers. An unsettled upload retries.
@@ -383,9 +429,23 @@ impl ScanIndex {
                 }),
                 (None, None) => {}
             }
-            complete.then_some(IdentityLatch::Settled)
+            if complete && unchanged {
+                Some(IdentityLatch::Settled)
+            } else if local.is_none() && kind == IdentityReoffer::Adoption {
+                // If an unACKed upload advances the entry, the retry must send.
+                Some(IdentityLatch::Pending)
+            } else {
+                None
+            }
         } else {
             match emitted {
+                // A pending child settles only on this body's own ACK.
+                Some("complete")
+                    if self.claude_desktop_identity_latches.get(&pending.index_key)
+                        == Some(&IdentityLatch::Pending) =>
+                {
+                    None
+                }
                 // After the creation-proof, ownership and request downgrades.
                 Some("complete") => Some(IdentityLatch::Settled),
                 // Only a Desktop child carrying its own pair can later
@@ -410,6 +470,71 @@ impl ScanIndex {
         }
         if let Some(latch) = next {
             self.record_desktop_identity_latch(&pending.index_key, latch);
+        }
+    }
+
+    /// The only way a sent body settles: every own body is ACKed with these
+    /// exact bytes, never by a fingerprint an older body left in the ledger.
+    /// A body the upload holds in quarantine got a verdict that is no ACK, so
+    /// it stays pending and its evidence is not offered again in this process.
+    /// Anything else (no response, no attempt) retries.
+    pub(crate) fn settle_desktop_identity_reoffers(
+        &mut self,
+        scan: &SourceScanResult,
+        accepted_bodies: &BTreeMap<String, String>,
+        quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
+    ) {
+        for pending in &scan.pending_finalization {
+            let latch = self.claude_desktop_identity_latches.get(&pending.index_key);
+            if latch == Some(&IdentityLatch::Settled)
+                || (pending.desktop_identity_reoffer.is_none()
+                    && latch != Some(&IdentityLatch::Pending))
+                || !emitted_complete(pending, &scan.snapshots)
+            {
+                continue;
+            }
+            let Some(session) = Path::new(&pending.index_key)
+                .file_stem()
+                .and_then(|value| value.to_str())
+            else {
+                continue;
+            };
+            let own = own_bodies(&scan.snapshots, &pending.source_file_fingerprint, session)
+                .map(|item| {
+                    (
+                        &item.snapshot_fingerprint,
+                        snapshot_upload_body_witness(item),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if own.iter().all(|(fingerprint, witness)| {
+                accepted_bodies.get(*fingerprint) == Some(witness)
+                    || with_reoffer_memos(|memos| {
+                        memos.unstored.take(&memo_key(fingerprint)).is_some()
+                    })
+            }) {
+                self.record_desktop_identity_latch(&pending.index_key, IdentityLatch::Settled);
+                continue;
+            }
+            let held = own.iter().find(|(fingerprint, witness)| {
+                quarantined.get(*fingerprint).is_some_and(|record| {
+                    record.upload_body_witness.as_deref() == Some(witness.as_str())
+                })
+            });
+            let Some((fingerprint, _)) = held else {
+                continue;
+            };
+            let key = memo_key(fingerprint);
+            if let Some((kind, bytes)) = with_reoffer_memos(|memos| memos.posted.take(&key)) {
+                crate::local_resource_diagnostics::claude_reread::desktop_identity_reoffer(
+                    kind == IdentityReoffer::Adoption,
+                    crate::local_resource_diagnostics::claude_reread::IdentityReoffered::Refused,
+                    bytes,
+                );
+            }
+            if let Some(evidence) = pending.desktop_identity_evidence {
+                remember_refused(&pending.index_key, evidence);
+            }
         }
     }
 

@@ -10,14 +10,39 @@ const ORG: &str = "123e4567-e89b-12d3-a456-426614174001";
 const CREATED: &str = "2026-08-01T00:00:00Z";
 // After collection: the creation-proof downgrade always applies.
 const CREATED_LATE: &str = "2026-08-02T08:00:00Z";
+const CREATED_LATER: &str = "2026-08-02T08:30:00Z";
 
 /// `recovered` = [posted, unchanged, refused, bytes]; `adoption` = [sent, ...];
-/// `refused` = the flat `desktop_identity_reoffer_refused` total.
+/// `refused` = the flat `desktop_identity_reoffer_refused` total; `evicted` =
+/// `desktop_identity_reoffer_memo_evicted`.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Reoffers {
     recovered: [u64; 4],
     adoption: [u64; 4],
     refused: u64,
+    evicted: u64,
+}
+impl Reoffers {
+    fn of(rows: &[Value]) -> Self {
+        let sum = |counter: &str, field: &str| {
+            rows.iter()
+                .filter_map(|row| row["counts"]["desktop_metadata"][counter][field].as_u64())
+                .sum::<u64>()
+        };
+        let flat = |counter: &str| {
+            rows.iter()
+                .filter_map(|row| row["counts"]["desktop_metadata"][counter].as_u64())
+                .sum::<u64>()
+        };
+        let recovered = "desktop_identity_recovered_reoffer";
+        let adoption = "desktop_identity_adoption_reoffer";
+        Self {
+            recovered: ["posted", "unchanged", "refused", "bytes"].map(|f| sum(recovered, f)),
+            adoption: ["sent", "unchanged", "refused", "bytes"].map(|f| sum(adoption, f)),
+            refused: flat("desktop_identity_reoffer_refused"),
+            evicted: flat("desktop_identity_reoffer_memo_evicted"),
+        }
+    }
 }
 
 /// What the backend said about the bodies a pass put on the wire.
@@ -25,6 +50,8 @@ struct Reoffers {
 enum Backend {
     Accepted,
     Unchanged,
+    /// Unchanged, with `unchanged_basis`: the server stored nothing.
+    Unstored,
     Rejected,
     Conflict,
     /// The legacy ACK: a count and no entity lists.
@@ -51,7 +78,8 @@ impl Backend {
                 .collect::<Vec<_>>()
         };
         let list = |wanted: Self| if self == wanted { refs() } else { Vec::new() };
-        let counted = matches!(self, Self::Accepted | Self::Unchanged | Self::CountOnly);
+        let unchanged = matches!(self, Self::Unchanged | Self::Unstored);
+        let counted = unchanged || matches!(self, Self::Accepted | Self::CountOnly);
         (self != Self::Silent).then(|| SnapshotBatchResponse {
             accepted: if counted { items.len() as u64 } else { 0 },
             sessions_reconciled: 0,
@@ -61,7 +89,16 @@ impl Backend {
             entity_ack_contract: (self != Self::CountOnly)
                 .then(|| SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
             accepted_entities: list(Self::Accepted),
-            unchanged_entities: list(Self::Unchanged),
+            unchanged_entities: if unchanged {
+                let mut refs = refs();
+                for entity in &mut refs {
+                    entity.unchanged_basis =
+                        (self == Self::Unstored).then(|| "head_covers_usage".to_string());
+                }
+                refs
+            } else {
+                Vec::new()
+            },
             conflict_entities: list(Self::Conflict),
             rejected_entities: list(Self::Rejected)
                 .into_iter()
@@ -167,24 +204,7 @@ impl IdentityFixture {
             !diagnostics.contains(&self.key()),
             "latch keys never reach diagnostics"
         );
-        let sum = |counter: &str, field: &str| {
-            rows.iter()
-                .filter_map(|row| row["counts"]["desktop_metadata"][counter][field].as_u64())
-                .sum::<u64>()
-        };
-        let recovered = "desktop_identity_recovered_reoffer";
-        let adoption = "desktop_identity_adoption_reoffer";
-        let counts = Reoffers {
-            recovered: ["posted", "unchanged", "refused", "bytes"].map(|f| sum(recovered, f)),
-            adoption: ["sent", "unchanged", "refused", "bytes"].map(|f| sum(adoption, f)),
-            refused: rows
-                .iter()
-                .filter_map(|row| {
-                    row["counts"]["desktop_metadata"]["desktop_identity_reoffer_refused"].as_u64()
-                })
-                .sum(),
-        };
-        (run, counts)
+        (run, Reoffers::of(&rows))
     }
     fn child<'a>(&self, run: &'a Run) -> &'a SnapshotItem {
         assert_eq!(run.result.snapshots.len(), 1, "only this child is offered");
@@ -239,8 +259,24 @@ fn accept(run: Run) -> ScanIndex {
         .map(|s| s.snapshot_fingerprint.clone())
         .collect();
     let mut index = run.index;
+    // One ledger per body: a raw path-twin pair shares its fingerprint.
+    for item in &run.result.snapshots {
+        settle(&mut index, &run.result, &ledger(item));
+    }
     index.record_accepted_snapshot_fingerprints(&accepted);
     index
+}
+
+/// What the upload ledger holds after this exact body's ACK.
+fn ledger(item: &SnapshotItem) -> BTreeMap<String, String> {
+    BTreeMap::from([(
+        item.snapshot_fingerprint.clone(),
+        snapshot_upload_body_witness(item),
+    )])
+}
+
+fn settle(index: &mut ScanIndex, result: &SourceScanResult, ledger: &BTreeMap<String, String>) {
+    index.settle_desktop_identity_reoffers(result, ledger, &BTreeMap::new());
 }
 
 /// Everything but the disposition: the re-offer is the FULL current body.
@@ -393,6 +429,131 @@ fn desktop_identity_adoption_counters_read_the_response_lists() {
 }
 
 #[test]
+fn desktop_identity_settles_on_this_bodys_ack_never_on_an_older_bodys_fingerprint() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let f = IdentityFixture::new(CREATED);
+    let (first, _) = f.run(f.loaded_incomplete("2026-08-02T07:11:00Z"), COLLECTED);
+    let missing = f.child(&first).clone();
+    let committed = f.restart(ack(first));
+    assert_eq!(f.latch(&committed), Some(Pending));
+    let cache = || Arc::new(SharedCache::default());
+
+    // The re-offer fails while the upload ledger still ACKs the missing body.
+    let old = ledger(&missing);
+    let at = "2026-08-02T07:12:00Z";
+    let (failed, counts) = f.run_answered(committed.clone(), cache(), at, Backend::Silent);
+    assert_eq!(counts, Reoffers::default());
+    let complete = f.child(&failed).clone();
+    assert_eq!(complete.snapshot_fingerprint, missing.snapshot_fingerprint);
+    assert_ne!(ledger(&complete), old, "same fingerprint, new body");
+    let mut working = failed.index;
+    settle(&mut working, &failed.result, &old);
+    assert_eq!(f.latch(&working), Some(Pending), "the whole-index save");
+    let accepted = old.keys().cloned().collect();
+    let partial = working.committable_subset(&committed, &accepted, &BTreeMap::new());
+    assert_eq!(
+        f.latch(&partial),
+        Some(Pending),
+        "the fingerprint-safe subset"
+    );
+
+    // That subset advanced the entry to the unACKed body: the retry still sends.
+    let at = "2026-08-02T07:13:00Z";
+    let (retried, counts) = f.run_answered(f.restart(partial), cache(), at, Backend::Accepted);
+    assert_eq!(disposition(f.child(&retried)), Some("complete"));
+    assert_eq!(counts.recovered[..3], [1, 0, 0]);
+    let index = ack(retried);
+    assert_eq!(f.latch(&index), Some(Settled));
+    f.quiet(f.restart(index), &["2026-08-02T07:14:00Z"]);
+
+    // An unchanged answer settles, even one that stored nothing.
+    let at = "2026-08-02T07:12:00Z";
+    let (unstored, _) = f.run_answered(committed.clone(), cache(), at, Backend::Unstored);
+    let mut working = unstored.index;
+    settle(&mut working, &unstored.result, &BTreeMap::new());
+    assert_eq!(f.latch(&working), Some(Settled));
+
+    // A refusal is no ACK: pending, and this evidence is not offered again.
+    let (rejected, counts) = f.run_answered(committed, cache(), at, Backend::Rejected);
+    assert_eq!(counts.recovered[2], 1);
+    let body = f.child(&rejected).clone();
+    let held = BTreeMap::from([(
+        body.snapshot_fingerprint.clone(),
+        SnapshotQuarantineRecord {
+            contract_retry_claims: None,
+            reconstruction_contract: crate::snapshots::terminal_contract_retry::current_contract(),
+            witness: crate::snapshots::snapshot_quarantine_witness(SOURCE),
+            retry_after_unix_seconds: 0,
+            upload_body_witness: Some(snapshot_upload_body_witness(&body)),
+            failed_reconstruction_count: crate::snapshots::MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
+            disposition: crate::snapshots::SnapshotQuarantineDisposition::UnprovenTerminal,
+        },
+    )]);
+    let mut working = rejected.index;
+    working.settle_desktop_identity_reoffers(&rejected.result, &BTreeMap::new(), &held);
+    assert_eq!(f.latch(&working), Some(Pending));
+    let (quiet, counts) = f.run(working, "2026-08-02T07:15:00Z");
+    assert!(quiet.result.snapshots.is_empty());
+    assert_eq!((quiet.native_bytes, counts), (0, Reoffers::default()));
+}
+
+#[test]
+fn desktop_identity_memo_eviction_counter_equals_evictions_past_the_cap() {
+    let evicted = |extra| {
+        let ((), rows) = crate::local_resource_diagnostics::capture(|| {
+            desktop_identity::fill_refused_memo_for_test(extra);
+        });
+        Reoffers::of(&rows)
+    };
+    assert_eq!(evicted(0), Reoffers::default(), "at the cap nothing evicts");
+    let counts = evicted(7);
+    assert_eq!(counts.evicted, 7);
+    assert_eq!(counts.refused, 0, "an eviction is not a refusal");
+}
+
+#[test]
+fn desktop_identity_same_digest_offers_nothing_and_a_changed_digest_offers_once() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let f = IdentityFixture::new(CREATED_LATE);
+    let (first, _) = f.run(f.loaded_incomplete("2026-08-02T07:11:00Z"), COLLECTED);
+    let index = ack(first);
+    assert_eq!(f.latch(&index), Some(Pending));
+    let offer_once = |index: ScanIndex, at: &str| {
+        let (offer, counts) = f.run(f.restart(index), at);
+        assert!(offer.result.snapshots.is_empty(), "{at}");
+        assert_eq!(offer.native_bytes, f.len(), "{at}");
+        let refused = Reoffers {
+            recovered: [0, 0, 1, f.len()],
+            refused: 1,
+            ..Reoffers::default()
+        };
+        assert_eq!(counts, refused, "{at}");
+        ack(offer)
+    };
+
+    // The same digest: one counted offer, then nothing in this process.
+    let index = offer_once(index, "2026-08-02T07:12:00Z");
+    let index = f.quiet(index, &["2026-08-02T07:13:00Z", "2026-08-02T07:14:00Z"]);
+
+    // The selector compares the digest itself. Every digest input also moves
+    // the source fingerprint today, so only a seeded memo reaches this branch.
+    desktop_identity::remember_other_evidence_for_test(&f.key());
+    let index = offer_once(index, "2026-08-02T07:15:00Z");
+    let index = f.quiet(index, &["2026-08-02T07:16:00Z"]);
+
+    // Real new evidence, still downgraded: one read, then quiet again.
+    f.write_store(CREATED_LATER, "new evidence");
+    let (offer, counts) = f.run(index, "2026-08-02T07:17:00Z");
+    assert_eq!((offer.native_bytes, counts), (f.len(), Reoffers::default()));
+    let index = ack(offer);
+    assert_eq!(f.latch(&index), Some(Pending));
+    f.quiet(
+        f.restart(index),
+        &["2026-08-02T07:18:00Z", "2026-08-02T07:19:00Z"],
+    );
+}
+
+#[test]
 fn desktop_identity_complete_flaps_and_restarts_never_reoffer() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let f = IdentityFixture::new(CREATED);
@@ -479,7 +640,7 @@ fn desktop_identity_refused_reoffer_once_per_process_then_complete_evidence_reco
     assert_eq!(disposition(f.child(&first)), Some("missing"));
     let index = ack(first);
     assert_eq!(f.latch(&index), Some(Pending));
-    let refused_once = |index: ScanIndex, at: &str| {
+    let refused_once = |index: ScanIndex, at: &str, evicted: u64| {
         let (refused, counts) = f.run(f.restart(index), at);
         assert!(
             refused.result.snapshots.is_empty(),
@@ -490,6 +651,7 @@ fn desktop_identity_refused_reoffer_once_per_process_then_complete_evidence_reco
             Reoffers {
                 recovered: [0, 0, 1, f.len()],
                 refused: 1,
+                evicted,
                 ..Reoffers::default()
             },
             "{at}"
@@ -499,7 +661,7 @@ fn desktop_identity_refused_reoffer_once_per_process_then_complete_evidence_reco
         index
     };
     // Exactly one refused re-offer, then quiet for N passes and a save/load.
-    let index = refused_once(index, "2026-08-02T07:12:00Z");
+    let index = refused_once(index, "2026-08-02T07:12:00Z", 0);
     let index = f.quiet(
         f.restart(index),
         &[
@@ -509,12 +671,12 @@ fn desktop_identity_refused_reoffer_once_per_process_then_complete_evidence_reco
         ],
     );
     // The real cap evicts this child: at most one extra counted refusal.
-    desktop_identity::fill_refused_memo_for_test();
-    let index = refused_once(index, "2026-08-02T07:16:00Z");
+    desktop_identity::fill_refused_memo_for_test(0);
+    let index = refused_once(index, "2026-08-02T07:16:00Z", 1);
     let index = f.quiet(index, &["2026-08-02T07:17:00Z", "2026-08-02T07:18:00Z"]);
     // A new process: at most one per process, and no unbounded loop.
     desktop_identity::reset_refused_memo_for_test();
-    let index = refused_once(index, "2026-08-02T07:19:00Z");
+    let index = refused_once(index, "2026-08-02T07:19:00Z", 0);
     let index = f.quiet(index, &["2026-08-02T07:20:00Z"]);
     // The evidence becomes complete: exactly one body, latched complete.
     f.write_store(CREATED, "creation proof recovered");

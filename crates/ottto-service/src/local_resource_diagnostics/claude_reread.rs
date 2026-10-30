@@ -247,6 +247,10 @@ pub(crate) struct DesktopMetadata {
     /// `desktop_identity_adoption_reoffer.refused`.
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) desktop_identity_reoffer_refused: u64,
+    /// Lead B: refused-memo evictions, oldest first at the cap. Each one can
+    /// cost that child one more counted refused re-offer.
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) desktop_identity_reoffer_memo_evicted: u64,
 }
 /// One finalized identity re-offer. `posted`/`sent` is a new body carrying the
 /// child's own complete disposition; `unchanged` matched the stored body;
@@ -325,6 +329,17 @@ pub(crate) fn desktop_identity_reoffer(adoption: bool, outcome: IdentityReoffere
         super::rearm_collection(counts);
     }
 }
+pub(crate) fn desktop_identity_reoffer_memo_evicted() {
+    let mut counts = Counts::default();
+    counts
+        .desktop_metadata
+        .desktop_identity_reoffer_memo_evicted = 1;
+    if active() {
+        update(|current| current.desktop_metadata.merge(counts.desktop_metadata));
+    } else {
+        super::rearm_collection(counts);
+    }
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct LineageEdgeReoffer {
     pub(crate) files: u64,
@@ -376,6 +391,9 @@ impl DesktopMetadata {
         self.desktop_identity_reoffer_refused = self
             .desktop_identity_reoffer_refused
             .saturating_add(other.desktop_identity_reoffer_refused);
+        self.desktop_identity_reoffer_memo_evicted = self
+            .desktop_identity_reoffer_memo_evicted
+            .saturating_add(other.desktop_identity_reoffer_memo_evicted);
         self.lineage_selector_drops = self
             .lineage_selector_drops
             .saturating_add(other.lineage_selector_drops);
