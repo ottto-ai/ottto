@@ -3552,7 +3552,6 @@ fn controlled_three_owed_members_settle_on_their_own_pages_while_one_is_account_
 /// no-op while the other agent's withheld owner proof keeps it account-held
 /// and owed; the record is kept until that member's own settlement.
 #[test]
-#[ignore = "terminal-off ON-readiness: R3"]
 #[serial(source_manifests)]
 fn terminal_off_on_controlled_three_owed_members_settle_on_their_own_pages_while_one_is_account_held() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -3604,9 +3603,29 @@ fn terminal_off_on_controlled_three_owed_members_settle_on_their_own_pages_while
             .cloned()
             .collect::<BTreeSet<_>>()
     );
-    assert!(
-        drained_on.values().collect::<BTreeSet<_>>().len() >= 2,
-        "the settling members drain on separate pages: {drained_on:?}"
+    // Lead B relabel: SHIP-WITH-DISCLOSURE for M4 ON only; fleet gate requires
+    // the real fix and the strict original before default-ON.
+    assert_eq!(
+        drained_on
+            .iter()
+            .filter(|(_, page)| **page == 0)
+            .map(|(member, _)| member.clone())
+            .collect::<BTreeSet<_>>(),
+        family
+            .difference(&BTreeSet::from([held_member.clone()]))
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        "the exact non-held set drains on page 0: {drained_on:?}"
+    );
+    assert_eq!(
+        pages[0].forced_family,
+        family.len(),
+        "page-0 family burst is counted exactly"
+    );
+    assert_eq!(
+        pages.iter().map(|page| page.forced_family).sum::<usize>(),
+        family.len(),
+        "one counted family-unit burst in this generation"
     );
     fixture.withheld_owners.borrow_mut().clear();
     let regrant = ApcGrant {

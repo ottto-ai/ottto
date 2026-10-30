@@ -3,13 +3,14 @@
 //! Turning containment ON anywhere, and flipping its default, needs this list
 //! EMPTY plus Lead B's sign-off. An entry leaves only with its cluster's fix,
 //! never with an assertion edit (docs/notes/2026-10-30-claude-terminal-off-switch.md).
+//! Lead B's explicit R3 relabel is tracked separately in FLEET_GATE; a bounded
+//! M4-only twin leaving this ignore list does not make it fleet-ready.
 
 /// (source file under `src/`, test function, cluster), sorted.
 const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_account_held_member_stays_owed_while_owed_siblings_drain_across_passes", "proof-grant"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_changed_proof_after_terminal_authority_owes_one_exact_correction", "proof-grant"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_complete_cutoff_drains_without_upload_or_repeated_grant_parse", "C6"),
-    ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_controlled_three_owed_members_settle_on_their_own_pages_while_one_is_account_held", "R3"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_controlled_unbound_record_rearms_its_family_and_reforms_bound", "proof-grant"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_e2_pre_flip_correction_settles_on_the_first_request_owned_bodies", "C6"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone", "proof-grant"),
@@ -84,6 +85,12 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshots/upload_context_receipt_tests.rs", "terminal_off_on_real_uploader_not_stored_backs_off_but_growth_earns_receipt", "C5"),
 ];
 
+/// Disclosed M4-only bounds. Separate from the ignore count: before a fleet
+/// default-ON flip, fix each cluster and restore its strict original assertion.
+const FLEET_GATE: &[(&str, &str, &str)] = &[
+    ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_controlled_three_owed_members_settle_on_their_own_pages_while_one_is_account_held", "R3"),
+];
+
 fn ignored_for_readiness() -> Vec<(String, String, String)> {
     // Built in two parts so this file's own text never matches.
     let needle = concat!("#[ignore = \"terminal-off ", "ON-readiness: ");
@@ -130,7 +137,8 @@ fn terminal_off_on_readiness_ignores_equal_the_checked_in_manifest() {
     assert_eq!(expected, sorted, "keep the manifest sorted");
     assert_eq!(ignored_for_readiness(), expected);
     // The count is the ON gate: it must reach 0 before ON anywhere.
-    assert_eq!(READINESS_MANIFEST.len(), 76);
+    assert_eq!(READINESS_MANIFEST.len(), 75);
+    eprintln!("terminal-off default-ON fleet gates: {FLEET_GATE:?}");
 }
 
 #[test]
