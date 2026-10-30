@@ -2252,3 +2252,278 @@ fn terminal_off_stale_clear_memo_is_bounded_and_eviction_fails_toward_another_cl
     reloaded.traversal = None;
     assert!(terminal_off_stale_clear_served(&reloaded, "context", &roots).is_empty());
 }
+
+#[test]
+fn terminal_off_on_progress_replacement_retains_actual_root_retry() {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+    };
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(claude_terminal_off());
+    let scratch = crate::test_scratch::ScratchDir::new("progress-root-replacement");
+    let outer = scratch.join("projects");
+    let nested = outer.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let path = nested.join(format!("{OFF_ROOT}.jsonl"));
+    fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
+    let key = local_index_key(&path);
+    let mut index = off_index();
+    off_scan(&mut index, &outer, W1, 10);
+    index.claude_request_census_mut_for_test().insert_for_test(
+        &key,
+        ClaudeRequestCensusRecord::synthetic_for_test(
+            &"ab".repeat(32),
+            0,
+            ClaudeRequestCensusShape::IdentityIncomplete,
+            vec![1],
+        )
+        .with_unverified_for_test(true),
+    );
+    let now = rfc3339_unix_seconds(W2).unwrap();
+    index.held_audit_progress = Some(sampled_audit::HeldAuditProgress {
+        key: key.clone(),
+        due: now,
+        attempted: false,
+    });
+    let previous = index.clone();
+    let mut page = with_terminal_off_audit_now_for_test(now, || {
+        OwnedSourceScan::new(
+            SnapshotSource::ClaudeCode,
+            &[outer.clone(), nested.clone()],
+            index,
+            W2,
+            BACKFILL_WINDOW_DAYS,
+            1,
+            true,
+            None,
+            std::slice::from_ref(&path),
+            false,
+            false,
+        )
+    });
+    // The constructor's producer has the same path under the nested root.
+    // Real progress preparation must replace it using FIRST matching root.
+    let candidate = page
+        .identified_candidates
+        .iter_mut()
+        .find(|c| c.path == path)
+        .expect("constructor candidate");
+    candidate.scan_root = nested.clone();
+    page.index.claude_full_rearm_progress.terminal_off_admitted = vec![ScanTraversalPath {
+        scan_root: nested,
+        path: path.clone(),
+        census_member: false,
+        watcher_hint: true,
+    }];
+    page.prepare_held_audit_progress(now);
+    assert_eq!(page.identified_candidates[0].scan_root, outer);
+    let (index, scan) = loop {
+        assert!(claude_terminal_off());
+        match page.step(None) {
+            OwnedSourceScanStep::Pending(next) => page = next,
+            OwnedSourceScanStep::Complete { index, scan, .. } => break (index, scan),
+        }
+    };
+    assert_eq!(scan.scanned_file_count, 1);
+    assert!(index.accepted_snapshot_fingerprints.is_empty());
+    let admitted = &index.claude_full_rearm_progress.terminal_off_admitted;
+    assert_eq!(admitted.len(), 1);
+    assert_eq!((&admitted[0].path, &admitted[0].scan_root), (&path, &outer));
+    let saved = index.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+    let loaded: ScanIndex = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+    let queued = loaded
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .iter()
+        .filter(|p| p.path == path)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        queued.len(),
+        1,
+        "one actual-root retry survives the unACKed save"
+    );
+    assert_eq!(queued[0].scan_root, outer);
+    assert!(loaded.accepted_snapshot_fingerprints.is_empty());
+}
+
+#[test]
+fn terminal_off_on_carry_refund_and_family_replay_reoffer_unacked_head() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(claude_terminal_off());
+    for refund in [true, false] {
+        let _preview = TerminalOffDiscoveryPreviewForTest::begin();
+        let scratch = crate::test_scratch::ScratchDir::new("carry-unacked-reoffer");
+        let root = scratch.join("projects");
+        let agents = root.join(OFF_ROOT).join("subagents");
+        fs::create_dir_all(&agents).unwrap();
+        let unacked = root.join(format!("{OFF_ROOT}.jsonl"));
+        let acked = agents.join(format!("{OFF_CHILD}.jsonl"));
+        fs::write(&unacked, off_line(OFF_ROOT, "X")).unwrap();
+        fs::write(&acked, off_line(&format!("{OFF_ROOT}_{OFF_CHILD}"), "Y")).unwrap();
+        let mut index = off_index();
+        let first = off_scan(&mut index, &root, W1, 10);
+        let unacked_key = local_index_key(&unacked);
+        let acked_key = local_index_key(&acked);
+        let bodies = first
+            .snapshots
+            .iter()
+            .filter(|i| i.source_session_id == format!("{OFF_ROOT}_{OFF_CHILD}"))
+            .map(|i| i.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(!bodies.is_empty());
+        index.record_accepted_snapshot_fingerprints(&bodies);
+        let acked_entry = serde_json::to_value(&index.files[&acked_key]).unwrap();
+        let accepted = index.accepted_snapshot_fingerprints.clone();
+        let previous = index.clone();
+        index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .observed_index_keys
+            .extend([unacked_key.clone(), acked_key.clone()]);
+        index
+            .claude_stale_family_carry
+            .roots
+            .insert(OFF_ROOT.into());
+        off_suppression_preconditions(&index);
+        assert!(claude_terminal_off());
+        if refund {
+            let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
+            assert!(refund_claude_stale_family_carry(&mut index));
+        } else {
+            let (cleared, _) = replay_and_rearm_claude_family(
+                &mut index,
+                OFF_ROOT,
+                "other-page-key",
+                &VecDeque::new(),
+                false,
+            );
+            assert_eq!(cleared, 1);
+        }
+        assert!(index.files[&unacked_key].source_file_fingerprint.is_empty());
+        assert!(index.files[&unacked_key].last_upload_body_witness.is_none());
+        assert_eq!(
+            serde_json::to_value(&index.files[&acked_key]).unwrap(),
+            acked_entry
+        );
+        let saved = index.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+        let mut loaded: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        loaded.activate_upload_context("settled-destination".into());
+        assert!(loaded.files[&unacked_key]
+            .source_file_fingerprint
+            .is_empty());
+        assert!(loaded.files[&unacked_key]
+            .last_upload_body_witness
+            .is_none());
+        assert_eq!(loaded.accepted_snapshot_fingerprints, accepted);
+        loaded
+            .claude_full_rearm_progress
+            .terminal_off_rediscovery_after = 0;
+        let reads = TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get);
+        let offered = off_scan(&mut loaded, &root, W2, 10);
+        assert_eq!(offered.scanned_file_count, 1);
+        assert_eq!(
+            offered
+                .snapshots
+                .iter()
+                .map(|i| i.source_session_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([OFF_ROOT])
+        );
+        assert_eq!(
+            offered
+                .snapshots
+                .iter()
+                .map(|i| i.input_tokens)
+                .sum::<u64>(),
+            10
+        );
+        assert_eq!(
+            TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get) - reads,
+            fs::metadata(&unacked).unwrap().len()
+        );
+        assert_eq!(
+            serde_json::to_value(&loaded.files[&acked_key]).unwrap(),
+            acked_entry
+        );
+        assert_eq!(
+            loaded.accepted_snapshot_fingerprints, accepted,
+            "offering grants no ACK"
+        );
+        off_accept(&mut loaded, &offered);
+        let quiet = off_scan(&mut loaded, &root, W2, 10);
+        assert_eq!((quiet.scanned_file_count, quiet.snapshots.len()), (0, 0));
+    }
+}
+
+impl ScanIndex {
+    // Kept beside the scanner fixtures so the adapter can change the effective
+    // in-memory closure without changing the raw installed list or transcript.
+    pub(crate) fn assert_terminal_off_held_list_closure_for_test() {
+        assert!(claude_terminal_off());
+        let scratch = crate::test_scratch::ScratchDir::new("held-list-closure");
+        let root = scratch.join("projects");
+        let support = scratch.join("support");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(support.join("snapshots")).unwrap();
+        let path = root.join(format!("{OFF_ROOT}.jsonl"));
+        fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
+        let key = local_index_key(&path);
+        let mut index = off_index();
+        index
+            .activate_file_upload_context(SnapshotSource::ClaudeCode, "settled-destination".into());
+        index.activate_effective_upload_body_witness_revision(1);
+        let baseline = off_scan(&mut index, &root, W1, 10);
+        off_accept(&mut index, &baseline);
+        let body = index.files[&key].last_upload_body_witness.clone();
+        let accepted = index.accepted_snapshot_fingerprints.clone();
+        let root_digest = format!("{:x}", Sha256::digest(OFF_ROOT.as_bytes()));
+        let member_digest = format!("{:x}", Sha256::digest(b"closure-root_agent-a"));
+        let raw = format!("{root_digest}\n{member_digest}\n");
+        let list = support.join("snapshots/claude_code-reemission-exclusions.txt");
+        fs::write(&list, &raw).unwrap();
+        index.load_claude_reemission_exclusions(&support);
+        index.activate_effective_upload_body_witness_revision(2);
+        index
+            .activate_file_upload_context(SnapshotSource::ClaudeCode, "closure-destination".into());
+        let transcript = fs::read(&path).unwrap();
+        for change in ["initial", "closure", "explicit"] {
+            match change {
+                "closure" => index
+                    .claude_reemission_exclusions
+                    .close_over_roots(std::iter::once(("closure-root", "agent-a"))),
+                "explicit" => index
+                    .claude_reemission_exclusions
+                    .list_root("another-absent-root"),
+                _ => {}
+            }
+            let receipt = serde_json::to_value(&index).unwrap()["files"][&key]
+                ["upload_context_receipt"]
+                .clone();
+            for pass in 0..3 {
+                let now = rfc3339_unix_seconds(W2).unwrap() + 301 * pass;
+                expire_terminal_off_discovery_for_test(&index);
+                let held = with_terminal_off_audit_now_for_test(now, || {
+                    off_scan(&mut index, &root, W2, 10)
+                });
+                assert_eq!(
+                    held.scanned_file_count,
+                    usize::from(pass == 0),
+                    "{change}/{pass}"
+                );
+                assert!(held.snapshots.is_empty(), "held money never reaches POST");
+                assert_eq!(index.files[&key].last_upload_body_witness, body);
+                assert_eq!(index.accepted_snapshot_fingerprints, accepted);
+                assert_eq!(
+                    serde_json::to_value(&index).unwrap()["files"][&key]["upload_context_receipt"],
+                    receipt
+                );
+            }
+            assert_eq!(fs::read(&path).unwrap(), transcript);
+            assert_eq!(fs::read_to_string(&list).unwrap(), raw);
+        }
+    }
+}
