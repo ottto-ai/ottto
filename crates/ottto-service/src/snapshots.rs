@@ -32312,6 +32312,7 @@ impl OwnedSourceScan {
             if comparison_target {
                 decision = CandidateDecision::Parse;
             }
+            let mut history_read = false;
             // History-upgrade gate (SOURCE P1), whatever selected the file:
             // unchanged Claude history that would carry a new body-witness
             // revision passes the list, the no-list birth hold, the family
@@ -32405,13 +32406,10 @@ impl OwnedSourceScan {
                     }
                     HistoryDecision::NotOwed => {}
                 }
-                if source == SnapshotSource::ClaudeCode
+                history_read = source == SnapshotSource::ClaudeCode
                     && claude_terminal_off()
                     && decision == CandidateDecision::Parse
-                    && matches!(history, HistoryDecision::Owed | HistoryDecision::Held(_))
-                {
-                    history_upgrade.note_history_read();
-                }
+                    && matches!(history, HistoryDecision::Owed | HistoryDecision::Held(_));
             }
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {
                 if let Some(reason) = parse_reason {
@@ -32920,6 +32918,9 @@ impl OwnedSourceScan {
             if side_plan.is_none() {
                 scanned_file_count += 1;
                 if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+                    if history_read {
+                        history_upgrade.note_history_read();
+                    }
                     terminal_off_discovery::served(index, &candidate, audit_now);
                 }
             }
