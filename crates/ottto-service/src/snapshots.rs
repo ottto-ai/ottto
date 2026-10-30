@@ -6538,6 +6538,9 @@ fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
                 continue;
             }
             rearm_cause::clear(index_key, entry, rearm_cause::Cause::CarryInvalidation);
+            if unacked.contains(index_key) {
+                claude_reoffer_unacked_head(entry);
+            }
             rearmed += 1;
         }
     }
@@ -6850,6 +6853,9 @@ fn replay_and_rearm_claude_family(
                 continue;
             }
             rearm_cause::clear(index_key, entry, rearm_cause::Cause::CarryInvalidation);
+            if unacked.contains(index_key) {
+                claude_reoffer_unacked_head(entry);
+            }
             rearmed += 1;
         }
     }
@@ -8155,8 +8161,6 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .unwrap_or_default();
         let final_group_fingerprint = (!final_fingerprints.is_empty())
             .then(|| snapshot_file_entity_set_hex(&final_fingerprints));
-        let reoffer_unacked_head =
-            claude_terminal_off_reoffers_unacked_head(index, source, &final_fingerprints);
         let final_upload_body_witness = by_source_file_body_witness
             .get(&pending.source_file_fingerprint)
             .filter(|witnesses| !witnesses.is_empty())
@@ -8330,7 +8334,6 @@ pub fn finalize_scan_after_policy_with_body_witness(
             && !pending.codex_pending_recovery
             && !quarantine_retry_required
             && !context_rearm_required
-            && !reoffer_unacked_head
         {
             noop_source_files.insert(pending.source_file_fingerprint.clone());
             result.semantic_noop_count = result
@@ -42226,6 +42229,9 @@ fn ensure_bounded_traversal(
                     transition.rearmed_index_files +=
                         usize::from(!entry.source_file_fingerprint.is_empty());
                     rearm_cause::clear(key, entry, transition.rearm_cause());
+                    if unacked.contains(key) {
+                        claude_reoffer_unacked_head(entry);
+                    }
                 }
             }
         }

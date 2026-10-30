@@ -220,17 +220,13 @@ fn claude_head_has_unacked_body(index: &ScanIndex, head: &BTreeSet<String>) -> b
     })
 }
 
-/// B-P2: under containment a re-parse whose head still carries an unaccepted
-/// body is offered again rather than suppressed as a semantic no-op. Always
-/// false outside containment, where main's no-op rule applies unchanged.
-fn claude_terminal_off_reoffers_unacked_head(
-    index: &ScanIndex,
-    source: SnapshotSource,
-    head: &BTreeSet<String>,
-) -> bool {
-    source == SnapshotSource::ClaudeCode
-        && claude_terminal_off()
-        && claude_head_has_unacked_body(index, head)
+/// B-P2: the re-armed unACKed head is offered again. Forgetting its upload
+/// body witness (as main does for a placeholder) keeps the re-parse from
+/// being suppressed as a semantic no-op; the persisted shape is unchanged.
+/// Reached only for members `claude_unacked_head_members` returned, which is
+/// empty outside containment.
+fn claude_reoffer_unacked_head(entry: &mut ScanIndexEntry) {
+    entry.last_upload_body_witness = None;
 }
 
 // B-P5: under containment neither the identity-contract latch nor
