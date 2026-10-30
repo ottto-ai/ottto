@@ -1,12 +1,12 @@
 {
   "producer_repository": "ottto-ai/ottto",
-  "generated_by_ci_commit": "3f00758064798de815e0255cee704456f2efe950",
+  "generated_by_ci_commit": "c12469f58bf926a086e5981798b9ca2a0444793a",
   "producer_test": "sticky_emitted_wire_goldens_match_receiver_contract_cases",
   "producer_path": "crates/ottto-service/src/snapshots/fixtures/claude_identity_cap_emitted.json",
-  "sha256": "fea5e3abfd25d3b95d3ce703bd424ce403eaf837591ef4a31a41478c458bb8f3",
+  "sha256": "57b9567f6ac4162902fbd5216570fe4f2ca54b2b713fedd52dee3277a286cdbe",
   "item_bytes": {
     "accepted_overflow": 655355,
-    "accepted_share_changed": 12184,
+    "accepted_share_changed": 12132,
     "mixed_presence": 12211,
     "restore_from_held_proof": 48628,
     "window": 654896
