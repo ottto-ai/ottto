@@ -3,6 +3,12 @@
 //! Turning containment ON anywhere, and flipping its default, needs this list
 //! EMPTY plus Lead B's sign-off. An entry leaves only with its cluster's fix,
 //! never with an assertion edit (docs/notes/2026-10-30-claude-terminal-off-switch.md).
+//!
+//! The checks read Rust tokens, not lines: comments are dropped, literals are
+//! kept whole and attributes are balanced, so blank lines, comments, layout
+//! or `cfg_attr` cannot hide an ignore. Every effective ignore on an ON test is
+//! either readiness debt listed here or one of the exact main ignores pinned in
+//! `INHERITED_MAIN_IGNORES` / `INHERITED_MACOS_GATES`.
 
 /// (source file under `src/`, test function, cluster), sorted.
 const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
@@ -94,34 +100,423 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshots/upload_context_receipt_tests.rs", "terminal_off_on_real_uploader_not_stored_backs_off_but_growth_earns_receipt", "C5"),
 ];
 
+/// Ignores an ON test keeps because its main original carries the identical
+/// attribute on main c440307e6 (historical main debt, not ON readiness):
+/// (source file under `src/`, inline module path, test, exact reason), sorted.
+const INHERITED_MAIN_IGNORES: &[(&str, &str, &str, &str)] = &[
+    ("snapshot_sync/p12_pipeline_original_tests.rs", "", "terminal_off_on_native_comparison_original_novel_import_oracle", "UNMET historical strict-fence aspiration; superseded by explicit native_comparison_novel_import_base_parity"),
+    ("snapshot_sync/p12_pipeline_original_tests.rs", "", "terminal_off_on_novel_import_recovers_after_owner_coverage_then_stops_reading", "P12: needs full qualified two-phase driver; original expectations preserved"),
+    ("snapshots/p12_usage_original_tests.rs", "", "terminal_off_on_member_change_after_unchanged_proof_fails_closed_until_family_reparse", "P12: needs full qualified two-phase driver; original expectations preserved"),
+    ("snapshots/transcript_acquisition_tests.rs", "", "terminal_off_on_sampled_production_allocation_baseline_and_tail", "explicit native allocation probe; process scope requires serial isolation"),
+    ("snapshots/transcript_acquisition_tests.rs", "", "terminal_off_on_sampled_production_performance_32mib", "run explicitly for native synthetic throughput measurements"),
+];
+
+/// Main's macOS-only layout probes, `cfg_attr(not(target_os = "macos"),
+/// ignore = reason)`, identical to the original on main c440307e6. They run on
+/// the macOS `Rust contracts` job, so they are not readiness debt.
+const INHERITED_MACOS_GATES: &[(&str, &str, &str, &str)] = &[
+    ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "", "terminal_off_on_retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_quarantine", "needs macOS heap layout"),
+    ("snapshot_sync/census_convergence_pipeline_tests.rs", "", "terminal_off_on_restored_stale_member_after_a_lost_tombstone_set_is_held_not_new", "needs macOS heap layout"),
+    ("snapshot_sync/census_convergence_pipeline_tests.rs", "", "terminal_off_on_returning_member_after_a_lost_tombstone_set_is_held_not_new", "needs macOS heap layout"),
+    ("snapshots/authority_proof_correction_tests.rs", "", "terminal_off_on_contained_unbound_authority_record_does_not_latch_claude_reemission_stop", "needs macOS heap layout"),
+    ("snapshots/authority_proof_correction_tests.rs", "", "terminal_off_on_load_drops_unbound_authority_record_and_keeps_index", "needs macOS heap layout"),
+    ("snapshots/census_convergence_tests.rs", "", "terminal_off_on_a_downgrade_that_drops_the_marker_and_set_fails_closed", "needs macOS heap layout"),
+    ("snapshots/census_convergence_tests.rs", "", "terminal_off_on_a_lost_tombstone_set_never_restores_new_file_eligibility", "needs macOS heap layout"),
+    ("snapshots/census_convergence_tests.rs", "", "terminal_off_on_an_indexed_member_never_waives_a_lost_tombstone", "needs macOS heap layout"),
+    ("snapshots/census_convergence_tests.rs", "", "terminal_off_on_an_unplaceable_tombstone_loss_keeps_a_durable_fence", "needs macOS heap layout"),
+    ("snapshots/census_convergence_tests.rs", "", "terminal_off_on_malformed_tombstones_never_fail_the_index_decode", "needs macOS heap layout"),
+    ("snapshots/census_convergence_tests.rs", "", "terminal_off_on_source_aware_loads_share_history_freshness_and_repair_tombstones", "needs macOS heap layout"),
+    ("snapshots/full_rearm_progress_tests.rs", "", "terminal_off_on_full_rearm_window_keeps_the_origin_after_scanner_checkpoint_retirement", "needs macOS heap layout"),
+    ("snapshots/sampled_scan/durable_tail_store_write_tests.rs", "", "terminal_off_on_failed_write_after_save_costs_one_counted_full_after_restart", "needs macOS retained layout"),
+    ("snapshots/sampled_scan/durable_tail_tests.rs", "", "terminal_off_on_byte_budget_deferral_keeps_selection_provenance_for_the_next_save", "needs macOS heap layout"),
+    ("snapshots/sampled_scan/durable_tail_tests.rs", "", "terminal_off_on_header_facts_yield_to_real_durable_restore_but_not_hopeless_admission", "needs macOS heap layout"),
+    ("snapshots/sampled_scan/durable_tail_tests.rs", "", "terminal_off_on_known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy", "needs macOS retained layout"),
+    ("snapshots/sampled_scan/durable_tail_tests.rs", "", "terminal_off_on_t14_without_retention_or_encodable_reduction_holds_on_later_passes", "needs macOS heap layout"),
+    ("snapshots/stale_family_carry_tests.rs", "", "terminal_off_on_fix2_restart_before_the_first_window_start_is_base", "needs macOS heap layout"),
+    ("snapshots/stale_family_carry_tests.rs", "", "terminal_off_on_new_carry_writer_exposes_only_c1b_roots_to_old_shape_reader", "needs macOS heap layout"),
+];
+
+const READINESS: &str = concat!("terminal-off ", "ON-readiness: ");
+const MACOS_ONLY: &str = "not(target_os=\"macos\")";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Token<'a> {
+    Ident(&'a str),
+    /// A string literal's source text between its quotes.
+    Str(&'a str),
+    Punct(u8),
+    /// Numbers, chars, lifetimes and labels.
+    Other,
+}
+
+/// Bytes before the opening `#`s of `r"…"`, `r#"…"#`, `br…` or `cr…`.
+fn raw_string_prefix(rest: &[u8]) -> Option<usize> {
+    let prefix = match rest {
+        [b'r', b'"' | b'#', ..] => 1,
+        [b'b' | b'c', b'r', b'"' | b'#', ..] => 2,
+        _ => return None,
+    };
+    let hashes = rest[prefix..].iter().take_while(|&&b| b == b'#').count();
+    (rest.get(prefix + hashes) == Some(&b'"')).then_some(prefix)
+}
+
+/// Rust tokens with comments dropped. Enough of the lexical grammar to keep
+/// strings, raw strings, chars and lifetimes apart from code.
+fn tokenize(text: &str) -> Vec<Token<'_>> {
+    let bytes = text.as_bytes();
+    let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80;
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let rest = &bytes[at..];
+        let byte = rest[0];
+        if byte.is_ascii_whitespace() {
+            at += 1;
+        } else if rest.starts_with(b"//") {
+            at += rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+        } else if rest.starts_with(b"/*") {
+            let mut depth = 0;
+            while at < bytes.len() {
+                if bytes[at..].starts_with(b"/*") {
+                    depth += 1;
+                    at += 2;
+                } else if bytes[at..].starts_with(b"*/") {
+                    depth -= 1;
+                    at += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    at += 1;
+                }
+            }
+        } else if let Some(prefix) = raw_string_prefix(rest) {
+            let hashes = rest[prefix..].iter().take_while(|&&b| b == b'#').count();
+            let start = at + prefix + hashes + 1;
+            let close = format!("\"{}", "#".repeat(hashes));
+            let end = start + text[start..].find(&close).expect("closed raw string");
+            tokens.push(Token::Str(&text[start..end]));
+            at = end + close.len();
+        } else if let Some(prefix) = match rest {
+            [b'"', ..] => Some(1),
+            [b'b' | b'c', b'"', ..] => Some(2),
+            _ => None,
+        } {
+            let start = at + prefix;
+            let mut end = start;
+            while bytes[end] != b'"' {
+                end += if bytes[end] == b'\\' { 2 } else { 1 };
+            }
+            tokens.push(Token::Str(&text[start..end]));
+            at = end + 1;
+        } else if byte == b'\'' {
+            let width = text[at + 1..].chars().next().map_or(1, char::len_utf8);
+            if rest.get(1) == Some(&b'\\') {
+                at += 3 + text[at + 3..].find('\'').expect("closed char literal") + 1;
+            } else if rest.get(1 + width) == Some(&b'\'') {
+                at += 2 + width;
+            } else {
+                at += 1;
+                while at < bytes.len() && word(bytes[at]) {
+                    at += 1;
+                }
+            }
+            tokens.push(Token::Other);
+        } else if byte.is_ascii_digit() {
+            while at < bytes.len() && word(bytes[at]) {
+                at += 1;
+            }
+            tokens.push(Token::Other);
+        } else if word(byte) {
+            let mut start = at;
+            while at < bytes.len() && word(bytes[at]) {
+                at += 1;
+            }
+            if &text[start..at] == "r"
+                && bytes.get(at) == Some(&b'#')
+                && bytes
+                    .get(at + 1)
+                    .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+            {
+                start = at + 1;
+                at = start;
+                while at < bytes.len() && word(bytes[at]) {
+                    at += 1;
+                }
+            }
+            tokens.push(Token::Ident(&text[start..at]));
+        } else {
+            tokens.push(Token::Punct(byte));
+            at += 1;
+        }
+    }
+    tokens
+}
+
+/// One past the delimiter matching the opener at `open`.
+fn group_end(tokens: &[Token<'_>], open: usize) -> usize {
+    let mut depth = 0_usize;
+    for (at, token) in tokens.iter().enumerate().skip(open) {
+        match token {
+            Token::Punct(b'(' | b'[' | b'{') => depth += 1,
+            Token::Punct(b')' | b']' | b'}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return at + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced delimiters");
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Ignore {
+    /// The `cfg_attr` predicate, rendered without layout; `None` is unconditional.
+    condition: Option<String>,
+    reason: Option<String>,
+}
+
+struct Item {
+    module: String,
+    name: String,
+    ignores: Vec<Ignore>,
+    test: bool,
+    body: std::ops::Range<usize>,
+}
+
+/// A module-level `fn` (inline modules included; impl/trait methods and
+/// macro bodies are not items here).
+struct SourceFn {
+    file: String,
+    module: String,
+    name: String,
+    test: bool,
+    ignores: Vec<Ignore>,
+    on_guard: bool,
+}
+
+impl SourceFn {
+    fn on(&self) -> bool {
+        self.test && (self.name.starts_with("terminal_off_on_") || self.on_guard)
+    }
+}
+
+fn render(tokens: &[Token<'_>]) -> String {
+    let mut text = String::new();
+    let mut previous_word = false;
+    for token in tokens {
+        let (piece, is_word) = match token {
+            Token::Ident(ident) => ((*ident).to_string(), true),
+            Token::Str(literal) => (format!("\"{literal}\""), true),
+            Token::Punct(byte) => ((*byte as char).to_string(), false),
+            Token::Other => ("?".to_string(), true),
+        };
+        if previous_word && is_word {
+            text.push(' ');
+        }
+        text.push_str(&piece);
+        previous_word = is_word;
+    }
+    text
+}
+
+fn attribute_ignores(attribute: &[Token<'_>], condition: Option<&str>, found: &mut Vec<Ignore>) {
+    let condition = condition.map(str::to_string);
+    match attribute {
+        [Token::Ident("ignore")] => found.push(Ignore {
+            condition,
+            reason: None,
+        }),
+        [Token::Ident("ignore"), Token::Punct(b'='), Token::Str(reason)] => found.push(Ignore {
+            condition,
+            reason: Some((*reason).to_string()),
+        }),
+        [Token::Ident("ignore"), ..] => {
+            panic!("unrecognised ignore attribute {}", render(attribute))
+        }
+        [Token::Ident("cfg_attr"), Token::Punct(b'('), inner @ .., Token::Punct(b')')] => {
+            let mut parts = Vec::new();
+            let (mut depth, mut start) = (0_usize, 0);
+            for (at, token) in inner.iter().enumerate() {
+                match token {
+                    Token::Punct(b'(' | b'[' | b'{') => depth += 1,
+                    Token::Punct(b')' | b']' | b'}') => depth -= 1,
+                    Token::Punct(b',') if depth == 0 => {
+                        parts.push(&inner[start..at]);
+                        start = at + 1;
+                    }
+                    _ => {}
+                }
+            }
+            parts.push(&inner[start..]);
+            let (predicate, nested) = parts.split_first().expect("cfg_attr predicate");
+            let predicate = match condition {
+                Some(outer) => format!("all({outer},{})", render(predicate)),
+                None => render(predicate),
+            };
+            for nested in nested.iter().filter(|nested| !nested.is_empty()) {
+                attribute_ignores(nested, Some(&predicate), found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Item `fn`s of one module body; `base` offsets ranges into the file's tokens.
+fn items(tokens: &[Token<'_>], module: &str, base: usize, out: &mut Vec<Item>) {
+    let mut attributes: Vec<&[Token<'_>]> = Vec::new();
+    let mut at = 0;
+    while at < tokens.len() {
+        match (tokens[at], tokens.get(at + 1), tokens.get(at + 2)) {
+            (Token::Punct(b'#'), Some(Token::Punct(b'!')), _) => at = group_end(tokens, at + 2),
+            (Token::Punct(b'#'), Some(Token::Punct(b'[')), _) => {
+                let end = group_end(tokens, at + 1);
+                attributes.push(&tokens[at + 2..end - 1]);
+                at = end;
+            }
+            (Token::Ident("mod"), Some(Token::Ident(name)), Some(Token::Punct(b'{'))) => {
+                let end = group_end(tokens, at + 2);
+                let path = if module.is_empty() {
+                    (*name).to_string()
+                } else {
+                    format!("{module}::{name}")
+                };
+                items(&tokens[at + 3..end - 1], &path, base + at + 3, out);
+                attributes.clear();
+                at = end;
+            }
+            (Token::Ident("fn"), Some(Token::Ident(name)), _) => {
+                let mut end = at + 2;
+                while !matches!(tokens[end], Token::Punct(b'{' | b';')) {
+                    end = match tokens[end] {
+                        Token::Punct(b'(' | b'[') => group_end(tokens, end),
+                        _ => end + 1,
+                    };
+                }
+                let body = if tokens[end] == Token::Punct(b'{') {
+                    let close = group_end(tokens, end);
+                    let body = base + end + 1..base + close - 1;
+                    end = close;
+                    body
+                } else {
+                    end += 1;
+                    base + end..base + end
+                };
+                let mut ignores = Vec::new();
+                for attribute in &attributes {
+                    attribute_ignores(attribute, None, &mut ignores);
+                }
+                let test = attributes
+                    .iter()
+                    .any(|attribute| *attribute == [Token::Ident("test")]);
+                out.push(Item {
+                    module: module.to_string(),
+                    name: (*name).to_string(),
+                    ignores,
+                    test,
+                    body,
+                });
+                attributes.clear();
+                at = end;
+            }
+            (Token::Punct(b'(' | b'['), ..) => at = group_end(tokens, at),
+            (Token::Punct(b'{'), ..) => {
+                at = group_end(tokens, at);
+                attributes.clear();
+            }
+            (Token::Punct(b';'), ..) => {
+                attributes.clear();
+                at += 1;
+            }
+            _ => at += 1,
+        }
+    }
+}
+
+/// Every module-level fn under `src/`, parsed once per test binary.
+fn source() -> &'static [SourceFn] {
+    static SOURCE: std::sync::OnceLock<Vec<SourceFn>> = std::sync::OnceLock::new();
+    SOURCE.get_or_init(|| {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut pending = vec![src.clone()];
+        let mut found = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read source directory") {
+                let path = entry.expect("source entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("read source file");
+                let file = path
+                    .strip_prefix(&src)
+                    .expect("under src")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let tokens = tokenize(&text);
+                let mut parsed = Vec::new();
+                items(&tokens, "", 0, &mut parsed);
+                for Item {
+                    module,
+                    name,
+                    ignores,
+                    test,
+                    body,
+                } in parsed
+                {
+                    let body = &tokens[body];
+                    let on_guard = body.windows(4).any(|window| {
+                        window
+                            == [
+                                Token::Ident("ClaudeTerminalOffForTest"),
+                                Token::Punct(b':'),
+                                Token::Punct(b':'),
+                                Token::Ident("enabled"),
+                            ]
+                    });
+                    found.push(SourceFn {
+                        file: file.clone(),
+                        module,
+                        name,
+                        test,
+                        ignores,
+                        on_guard,
+                    });
+                }
+            }
+        }
+        found.sort_by(|a, b| (&a.file, &a.module, &a.name).cmp(&(&b.file, &b.module, &b.name)));
+        found
+    })
+}
+
 fn ignored_for_readiness() -> Vec<(String, String, String)> {
-    // Built in two parts so this file's own text never matches.
-    let needle = concat!("#[ignore = \"terminal-off ", "ON-readiness: ");
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut pending = vec![src.clone()];
     let mut found = Vec::new();
-    while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(&dir).expect("read source directory") {
-            let path = entry.expect("source entry").path();
-            if path.is_dir() {
-                pending.push(path);
+    for item in source() {
+        for ignore in &item.ignores {
+            let Some(reason) = ignore.reason.as_deref() else {
                 continue;
-            }
-            if path.extension().is_none_or(|ext| ext != "rs") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("read source file");
-            let relative = path
-                .strip_prefix(&src)
-                .expect("under src")
-                .to_string_lossy()
-                .replace('\\', "/");
-            for (at, _) in text.match_indices(needle) {
-                let rest = &text[at + needle.len()..];
-                let cluster = &rest[..rest.find("\"]").expect("closed ignore reason")];
-                let after = &rest[rest.find("fn ").expect("ignored test function") + 3..];
-                let name = &after[..after.find('(').expect("function name")];
-                found.push((relative.clone(), name.to_string(), cluster.to_string()));
+            };
+            if let Some(cluster) = reason.strip_prefix(READINESS) {
+                assert!(
+                    ignore.condition.is_none() && item.on(),
+                    "{}: {} readiness ignores are unconditional and on ON tests only",
+                    item.file,
+                    item.name
+                );
+                found.push((item.file.clone(), item.name.clone(), cluster.to_string()));
+            } else {
+                assert!(
+                    !reason.contains("ON-readiness"),
+                    "{}: {} has a malformed readiness reason {reason:?}",
+                    item.file,
+                    item.name
+                );
             }
         }
     }
@@ -143,60 +538,59 @@ fn terminal_off_on_readiness_ignores_equal_the_checked_in_manifest() {
     assert_eq!(READINESS_MANIFEST.len(), 86);
 }
 
+/// F4: an ON test's ignore is readiness debt (manifest above) unless it is
+/// one of the exact main ignores pinned by file, module, test and reason.
 #[test]
 fn every_ignored_terminal_off_on_twin_names_its_readiness_cluster() {
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut pending = vec![src];
-    while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(&dir).expect("read source directory") {
-            let path = entry.expect("source entry").path();
-            if path.is_dir() {
-                pending.push(path);
-                continue;
+    let (mut main_ignores, mut macos_gates) = (Vec::new(), Vec::new());
+    for item in source().iter().filter(|item| item.on()) {
+        for ignore in &item.ignores {
+            let identity = (item.file.as_str(), item.module.as_str(), item.name.as_str());
+            match (ignore.condition.as_deref(), ignore.reason.as_deref()) {
+                (None, Some(reason)) if reason.starts_with(READINESS) => {}
+                (None, Some(reason)) => main_ignores.push((identity, reason)),
+                (Some(MACOS_ONLY), Some(reason)) => macos_gates.push((identity, reason)),
+                _ => panic!(
+                    "{}: {} carries {ignore:?}; inventory it as readiness debt",
+                    item.file, item.name
+                ),
             }
-            if path.extension().is_none_or(|ext| ext != "rs") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("read source file");
-            let lines: Vec<_> = text.lines().collect();
-            for (index, line) in lines.iter().enumerate() {
-                let Some(name) = line.trim_start().strip_prefix("fn terminal_off_on_") else {
-                    continue;
-                };
-                let attributes = |index: usize| {
-                    lines[..index]
-                        .iter()
-                        .rev()
-                        .take_while(|line| {
-                            let line = line.trim_start();
-                            line.starts_with("#[") || line.starts_with("//")
-                        })
-                        .map(|line| line.trim())
-                        .collect::<Vec<_>>()
-                };
-                // A twin may keep the ignore its main original carries on main.
-                let base = name.split('(').next().unwrap_or(name);
-                let base_ignore = lines
-                    .iter()
-                    .position(|line| line.trim_start().starts_with(&format!("fn {base}(")))
-                    .and_then(|at| {
-                        attributes(at)
-                            .into_iter()
-                            .find(|attribute| attribute.starts_with("#[ignore"))
-                    });
-                for attribute in attributes(index) {
-                    if attribute.starts_with("#[ignore") {
-                        assert!(
-                            attribute.contains("terminal-off ON-readiness: ")
-                                || base_ignore == Some(attribute),
-                            "{}: terminal_off_on_{name} is ignored without a readiness cluster",
-                            path.display()
-                        );
-                    }
-                }
+            // The pin also needs the paired main original to carry it.
+            let original = item.name.strip_prefix("terminal_off_on_").and_then(|base| {
+                source().iter().find(|other| {
+                    other.test
+                        && other.file == item.file
+                        && other.module == item.module
+                        && other.name == base
+                })
+            });
+            if !ignore
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(READINESS))
+            {
+                assert!(
+                    original.is_some_and(|original| original.ignores.contains(ignore)),
+                    "{}: {} inherits {ignore:?} that its main original lacks",
+                    item.file,
+                    item.name
+                );
             }
         }
     }
+    let pinned = |rows: &[(&'static str, &'static str, &'static str, &'static str)]| {
+        rows.iter()
+            .map(|(file, module, name, reason)| ((*file, *module, *name), *reason))
+            .collect::<Vec<_>>()
+    };
+    main_ignores.sort();
+    macos_gates.sort();
+    assert_eq!(
+        main_ignores,
+        pinned(INHERITED_MAIN_IGNORES),
+        "every other ON-test ignore is readiness debt"
+    );
+    assert_eq!(macos_gates, pinned(INHERITED_MACOS_GATES));
 }
 
 /// Lead B Q5: an ON wrapper that calls an ignored twin body (the p12 base-exit
