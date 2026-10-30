@@ -985,3 +985,55 @@ fn restoring_held_marker_preserves_same_stat_park_and_original_due() {
     assert_eq!(failed_open_debt(&key, D + 3 * CAP), Some(D));
     assert!(index.files[&key].has_unverified_source());
 }
+
+#[test]
+fn terminal_off_on_verified_full_audit_discharges_open_debt_once() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    reset_open_backoff_for_test();
+    let root = Root::new("full-discharges");
+    let key = root.key("missing.jsonl");
+    let mut index = held_index(&root, &[&key]);
+    index.held_audit_progress = Some(HeldAuditProgress {
+        key: key.clone(),
+        due: D,
+        attempted: false,
+    });
+    for n in 0..OPEN_PARK_FAILURES {
+        progress_open_failed(&mut index, &key, D + u64::from(n) * CAP);
+    }
+    assert_eq!(failed_open_debt(&key, D), Some(D));
+    assert!(open_blocked(&key, D + 100 * CAP));
+    let before = serde_json::to_value(&index.files[&key]).unwrap();
+    let accepted = index.accepted_snapshot_fingerprints.clone();
+    for source in ["stale-source", ""] {
+        assert!(!index.complete_full_audit(&key, source));
+        assert_eq!(failed_open_debt(&key, D), Some(D));
+        assert!(open_blocked(&key, D + 100 * CAP));
+        assert_eq!(serde_json::to_value(&index.files[&key]).unwrap(), before);
+        assert_eq!(index.accepted_snapshot_fingerprints, accepted);
+    }
+    assert!(!index.complete_full_audit("absent-key", "source"));
+    assert!(crate::snapshots::claude_terminal_off());
+    assert!(index.complete_full_audit(&key, "source"));
+    assert_eq!(failed_open_debt(&key, D), None);
+    assert!(!open_blocked(&key, D));
+    assert_eq!(held_audit_open_failed(D), (0, 0));
+    assert_eq!(index.accepted_snapshot_fingerprints, accepted);
+    let once = serde_json::to_value(&index).unwrap();
+    assert!(index.complete_full_audit(&key, "source"));
+    assert_eq!(
+        serde_json::to_value(&index).unwrap(),
+        once,
+        "second completion is idempotent"
+    );
+    let path = root.0.join("audited-index.json");
+    index.save(&path).unwrap();
+    let loaded = ScanIndex::load(&path).unwrap();
+    assert_eq!(
+        serde_json::to_value(&loaded.files[&key]).unwrap(),
+        serde_json::to_value(&index.files[&key]).unwrap()
+    );
+    assert_eq!(loaded.accepted_snapshot_fingerprints, accepted);
+    assert_eq!(failed_open_debt(&key, D), None);
+}
