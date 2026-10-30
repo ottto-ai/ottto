@@ -198,6 +198,8 @@ impl Page {
                     None,
                     None,
                     Some((&self.cache, &self.committed)),
+                    None,
+                    None,
                 )
                 .unwrap()
             });
@@ -2453,6 +2455,291 @@ fn e2_pipeline_branch_naming_an_unindexed_session_counts_and_discloses() {
     );
 }
 
+/// E7 stopgap, demo chain: the copy-only resume `COPY` repeats requests its
+/// original `ROOT` still holds. When both records are past 35 days, a
+/// complete terminal keeps both (they share ids), so a later re-read of the
+/// copy still proves its copies against the original instead of counting
+/// them again (as a retired original would:
+/// `e2_pipeline_branch_of_a_retired_original_without_a_fork_line_counts_and_discloses`).
+#[test]
+fn e2_pipeline_aged_original_sharing_ids_with_its_copy_keeps_the_copy_proven() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-aged-original-kept");
+        let second = "2026-08-02T07:00:20Z";
+        c.root(
+            ROOT,
+            &(line(ROOT, "first", AT, 10) + &line(ROOT, "second", second, 10)),
+        );
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let old = ScanIndex::default();
+        let original = ready(&c, &scanner, old.clone(), 100, false);
+        assert_eq!(total(&original), 2, "the original counts its requests");
+        let prior = settle(&c, &old, original, &mut progress);
+        let copy = c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line(COPY, "first", AT, 10),
+            "2026-08-02T07:03:00Z",
+        );
+        let branch = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        literal(&branch);
+        let found = body(&branch, COPY).expect("the copy publishes its body");
+        assert_eq!(
+            (found.request_count, found.removed_request_count),
+            (0, Some(1))
+        );
+        let mut prior = settle(&c, &prior, branch, &mut progress);
+
+        // A complete terminal 36 days after both files were last written.
+        let window = (OffsetDateTime::now_utc() + TimeDuration::days(36))
+            .format(&Rfc3339)
+            .unwrap();
+        let keys = prior.files.keys().cloned().collect::<BTreeSet<_>>();
+        // The retirement decision reads 0 transcript bytes: transcript I/O
+        // is denied and no transcript is opened.
+        let opens = crate::snapshots::all_transcript_opens_for_test();
+        let (_, rows) = crate::snapshots::with_transcript_io_denied(|| {
+            crate::local_resource_diagnostics::capture(|| {
+                crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+                    &mut prior,
+                    &keys,
+                    &BTreeSet::new(),
+                    &window,
+                )
+            })
+        });
+        assert_eq!(crate::snapshots::all_transcript_opens_for_test(), opens);
+        let kept = rows
+            .iter()
+            .find(|row| row["stage"] == "claude_census_retire_kept_overlap")
+            .expect("the terminal reports the kept records");
+        assert_eq!(kept["counts"]["census_retire_kept_overlap_records"], 2);
+        assert_eq!(kept["counts"]["census_retire_kept_overlap_hashes"], 3);
+        assert_eq!(kept["counts"]["census_retire_kept_overflow"], 0);
+        let census = prior.claude_request_census_for_test();
+        let record = |session: &str| {
+            let name = format!("{session}.jsonl");
+            let key = keys
+                .iter()
+                .find(|key| key.ends_with(&name))
+                .expect("an indexed file");
+            census.record_for_test(key).expect("a census record")
+        };
+        assert_eq!(
+            record(ROOT).retired_for_test(),
+            None,
+            "the original keeps its ids"
+        );
+        assert_eq!(record(ROOT).request_hashes_for_test().len(), 2);
+        assert!(record(ROOT).proves_scan());
+        assert_eq!(
+            record(COPY).retired_for_test(),
+            None,
+            "the copy keeps its id"
+        );
+
+        // The copy is re-read with a second copied request: both stay proven.
+        std::fs::write(
+            &copy,
+            line(COPY, "first", AT, 10) + &line(COPY, "second", second, 10),
+        )
+        .unwrap();
+        let reread = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        literal(&reread);
+        let found = body(&reread, COPY).expect("the re-read copy publishes its body");
+        assert_eq!(
+            (found.request_count, found.removed_request_count),
+            (0, Some(2)),
+            "the kept original still proves every copied request"
+        );
+        assert_eq!(
+            e2::pipeline_test_observer::disclosed(&reread.scan.snapshots),
+            0
+        );
+    });
+}
+
+/// #920 round 3, finding 1, through the production pipeline: kept stock
+/// never costs a young holder its proof. A terminal keeps the aged pair
+/// `ROOT` and `COPY` (they share a request id; below 90% occupancy, no
+/// overflow).
+/// The census is then full when the young holder `GROWING` grows by one
+/// request: the kept `ROOT` retires so it fits (admission overflow, with the
+/// alarm) and `GROWING` is stored whole, not as a hashless tombstone. A
+/// later re-read of its copy `GROWING_COPY`, on its own page, still proves
+/// every copied request: none is counted again.
+#[test]
+fn e2_pipeline_kept_stock_yields_to_a_growing_holder() {
+    const GROWING: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+    const GROWING_COPY: &str = "5338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+    const FILLER: &str = "6338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+    // The scan fixture's census window.
+    const WINDOW: &str = "2026-08-02T08:00:00Z";
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-kept-stock-admission");
+        // Last written more than 35 days before the window: aged.
+        let aged = |path: &Path, at: &str| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_nanos(nanos(at) as u64),
+                )
+                .unwrap();
+        };
+        let second = "2026-08-02T07:00:20Z";
+        // The aged pair is read on one page, so no terminal sees either alone.
+        let root = c.root(
+            ROOT,
+            &(line(ROOT, "first", AT, 10) + &line(ROOT, "second", second, 10)),
+        );
+        let copy = c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line(COPY, "first", AT, 10),
+            "2026-08-02T07:03:00Z",
+        );
+        aged(&root, "2026-06-01T00:00:00Z");
+        aged(&copy, "2026-06-02T00:00:00Z");
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let old = ScanIndex::default();
+        let pair = ready(&c, &scanner, old.clone(), 100, false);
+        let prior = settle(&c, &old, pair, &mut progress);
+        let growing = c.write_at(
+            &format!("{GROWING}.jsonl"),
+            &line(GROWING, "g1", AT, 10),
+            "2026-08-02T07:05:00Z",
+        );
+        c.write_at(
+            &format!("{FILLER}.jsonl"),
+            &line(FILLER, "f1", AT, 10),
+            "2026-08-02T07:05:00Z",
+        );
+        let young = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        let prior = settle(&c, &prior, young, &mut progress);
+        let growing_copy = c.write_at(
+            &format!("{GROWING_COPY}.jsonl"),
+            &line(GROWING_COPY, "g1", AT, 10),
+            "2026-08-02T07:08:00Z",
+        );
+        let branch = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        literal(&branch);
+        let found = body(&branch, GROWING_COPY).expect("the copy publishes its body");
+        assert_eq!(
+            (found.request_count, found.removed_request_count),
+            (0, Some(1))
+        );
+        let mut prior = settle(&c, &prior, branch, &mut progress);
+        let key = |session: &str| {
+            let name = format!("{session}.jsonl");
+            prior
+                .files
+                .keys()
+                .find(|key| key.ends_with(&name))
+                .expect("an indexed file")
+                .clone()
+        };
+        let (root_key, copy_key, growing_key, filler_key) =
+            (key(ROOT), key(COPY), key(GROWING), key(FILLER));
+
+        // 1. A complete terminal at the window keeps the aged pair.
+        let keys = prior.files.keys().cloned().collect::<BTreeSet<_>>();
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+                &mut prior,
+                &keys,
+                &BTreeSet::new(),
+                WINDOW,
+            )
+        });
+        let kept = rows
+            .iter()
+            .find(|row| row["stage"] == "claude_census_retire_kept_overlap")
+            .expect("the terminal reports the kept records");
+        assert_eq!(kept["counts"]["census_retire_kept_overlap_records"], 2);
+        assert_eq!(kept["counts"]["census_retire_kept_overlap_hashes"], 3);
+        assert_eq!(kept["counts"]["census_retire_kept_overflow"], 0);
+        assert_eq!(kept["counts"]["census_missing_over_budget"], 0);
+
+        // The young filler takes the rest of the hash budget.
+        let census = prior.claude_request_census_mut_for_test();
+        let filler = census.record_for_test(&filler_key).unwrap().clone();
+        let room = (census.hash_headroom() + filler.request_hashes_for_test().len()) as u64;
+        let stored = census.insert_for_test(
+            &filler_key,
+            filler.with_request_hashes_for_test((1..=room).collect()),
+        );
+        assert_eq!(
+            stored,
+            crate::snapshots::claude_request_census::ClaudeRequestCensusInsert::Stored
+        );
+        assert_eq!(
+            census.hash_total_for_test(),
+            crate::snapshots::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_HASHES
+        );
+        // The next page loads the saved index from disk, as production does:
+        // nothing the terminal derived survives in memory.
+        let prior = c.reload(&mut prior);
+
+        // 2. and 3. The young holder grows by one request: the oldest kept
+        // record retires so its record fits whole.
+        append(&growing, &line(GROWING, "g2", second, 10));
+        let (grown, rows) = crate::local_resource_diagnostics::capture(|| {
+            ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false)
+        });
+        for stage in [
+            "claude_census_retire_kept_overlap",
+            "claude_census_retire_kept_overlap_alarm",
+        ] {
+            let admission = rows
+                .iter()
+                .filter(|row| {
+                    row["stage"] == stage
+                        && row["counts"]["census_retire_kept_overflow_admission"] != 0
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(admission.len(), 1, "{stage}");
+            assert_eq!(
+                admission[0]["counts"]["census_retire_kept_overflow_admission"],
+                1
+            );
+        }
+        let census = grown.index.claude_request_census_for_test();
+        let record = |key: &str| census.record_for_test(key).expect("a census record");
+        assert_ne!(
+            record(&growing_key).shape_for_test(),
+            crate::snapshots::claude_request_census::ClaudeRequestCensusShape::OverBudget,
+            "the growing holder is not tombstoned"
+        );
+        assert_eq!(record(&growing_key).request_hashes_for_test().len(), 2);
+        assert!(record(&growing_key).proves_scan());
+        assert_eq!(
+            record(&root_key).retired_for_test(),
+            Some(2),
+            "the oldest kept record"
+        );
+        assert!(census.record_for_test(&copy_key).is_some());
+        let prior = settle(&c, &prior, grown, &mut progress);
+
+        // 4. The copy is re-read on its own page with a second copied
+        // request: the holder proves both, nothing is restored.
+        append(&growing_copy, &line(GROWING_COPY, "g2", second, 10));
+        let reread = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        literal(&reread);
+        let found = body(&reread, GROWING_COPY).expect("the re-read copy publishes its body");
+        assert_eq!(
+            (found.request_count, found.removed_request_count),
+            (0, Some(2)),
+            "the stored holder still proves every copied request"
+        );
+        assert_eq!(
+            e2::pipeline_test_observer::disclosed(&reread.scan.snapshots),
+            0
+        );
+    });
+}
+
 /// PR C (c) and (d): the copy is read while its holder `LATE`, changed
 /// since its last read, is still queued by the traversal. `stale_record`:
 /// the holder keeps a census record of its old content (rewritten in place
@@ -2600,6 +2887,10 @@ fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
 // Shared helpers above remain the real scan/evidence/finish/upload callers.
 mod money_equivalence_tests {
     include!("money_equivalence_tests.rs");
+    #[cfg(unix)]
+    mod durable_transition_tests {
+        include!("../snapshots/sampled_scan/durable_transition_tests.rs");
+    }
 }
 
 #[test]

@@ -1721,15 +1721,22 @@ fn lock_managed_claude_settings() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-pub(crate) fn approved_managed_claude_relay_endpoint() -> Result<Option<String>, LocalApiError> {
+pub(crate) enum ManagedClaudeRelaySettings {
+    Revoked,
+    Missing,
+    Body(String),
+}
+
+pub(crate) fn read_managed_claude_relay_settings(
+) -> Result<ManagedClaudeRelaySettings, LocalApiError> {
     if source_patch_disabled(&SourceKind::ClaudeCode) {
-        return Ok(None);
+        return Ok(ManagedClaudeRelaySettings::Revoked);
     }
     let device = FileDeviceStore::default().load().map_err(|_| {
         LocalApiError::LocalOperationFailed("read managed Claude source approval".into())
     })?;
     if !device.is_some_and(|device| device.sources.iter().any(|source| source == "claude_code")) {
-        return Ok(None);
+        return Ok(ManagedClaudeRelaySettings::Revoked);
     }
     let Some(body) = crate::agent_configs::claude_managed_settings::read_settings(&home_path(
         ".claude/settings.json",
@@ -1738,7 +1745,17 @@ pub(crate) fn approved_managed_claude_relay_endpoint() -> Result<Option<String>,
         LocalApiError::LocalOperationFailed("read approved Claude relay settings".into())
     })?
     else {
-        return Ok(None);
+        return Ok(ManagedClaudeRelaySettings::Missing);
+    };
+    Ok(ManagedClaudeRelaySettings::Body(body))
+}
+
+pub(crate) fn approved_managed_claude_relay_endpoint() -> Result<Option<String>, LocalApiError> {
+    let body = match read_managed_claude_relay_settings()? {
+        ManagedClaudeRelaySettings::Body(body) => body,
+        ManagedClaudeRelaySettings::Revoked | ManagedClaudeRelaySettings::Missing => {
+            return Ok(None)
+        }
     };
     if crate::agent_configs::claude_managed_settings::approved_relay_port(&body).is_none() {
         return Ok(None);
@@ -1821,6 +1838,7 @@ fn validate_managed_claude_settings_root(config_dir: &str) -> Result<(), LocalAp
 }
 
 fn disable_managed_claude_relay_settings() -> Result<bool, LocalApiError> {
+    crate::otlp_relay::legacy::revoke_now();
     let _settings_guard = lock_managed_claude_settings();
     use crate::agent_configs::claude_managed_settings::{disable_settings, Outcome};
     let default_root = home_path(".claude");
@@ -9559,6 +9577,9 @@ fn setup_answer(
         }
     };
     let detail = save_setup_answer(&api_base_url, &mut credentials, &source, &answer_type)?;
+    if source == SourceKind::ClaudeCode {
+        crate::otlp_relay::legacy::revoke_now();
+    }
     setup_result_from_detail(&credentials.connection, detail, false, Vec::new())
 }
 
@@ -28709,9 +28730,19 @@ for line in sys.stdin:
             );
             thread::yield_now();
         }
-        let lifecycle_lock = SETUP_RUN_BINDING_LOCK
-            .try_lock()
-            .expect("provider-idle wait must not retain lifecycle lock");
+        // Revoke saves the Revoked status under the lock and releases it just
+        // after, so poll briefly. The worker then waits up to 15 s for collector
+        // I/O, which stays active here, so a lock held across that wait still
+        // fails this 2 s deadline.
+        let lock_deadline = Instant::now() + Duration::from_secs(2);
+        let lifecycle_lock = loop {
+            match SETUP_RUN_BINDING_LOCK.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < lock_deadline => {
+                    thread::yield_now()
+                }
+                result => break result.expect("provider-idle wait must not retain lifecycle lock"),
+            }
+        };
         // Simulate a raced/out-of-contract identity write while Revoke waits.
         // The post-wait transaction must reject it before returning a DELETE
         // target, even though ordinary production writers use this same lock.
@@ -32649,6 +32680,38 @@ X-API-Key = "otel_redacted"
         assert_eq!(provisional["env"], json!({}));
         assert!(!provision_managed_claude_relay_settings(&roots[0]).unwrap());
         crate::claude_browser_auth::release_ceremony(operation_id);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn secondary_claude_removal_preserves_legacy_listeners_but_disable_retires_them() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let prepared = store
+            .prepare_managed_account_target(
+                1,
+                "claude_setup_99999999999999999999999999999999".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let slot = &prepared.managed_slots[0];
+        provision_managed_claude_relay_settings(slot.config_dir.as_ref().unwrap()).unwrap();
+        let default_settings = root.join(".claude/settings.json");
+        let approval = fs::read(&default_settings).unwrap();
+        let (open, retired) = crate::otlp_relay::legacy::with_running_listener_for_test(|| {
+            remove_claude_registration_with_relay_cleanup(1, &slot.slot_id).unwrap();
+        });
+        assert_eq!((open, retired), (1, 0));
+        assert_eq!(fs::read(&default_settings).unwrap(), approval);
+        let (open, retired) = crate::otlp_relay::legacy::with_running_listener_for_test(|| {
+            assert!(disable_managed_claude_relay_settings().unwrap());
+        });
+        assert_eq!((open, retired), (0, 1));
+        assert_ne!(fs::read(&default_settings).unwrap(), approval);
         fs::remove_dir_all(root).unwrap();
     }
 

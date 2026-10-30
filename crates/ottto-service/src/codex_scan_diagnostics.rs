@@ -167,6 +167,13 @@ impl UnreadableCauses {
             *slot = slot.saturating_add(incoming);
         }
     }
+    /// The walk lost namespace: an unlistable path or directory, or an
+    /// unreadable remainder no cause attributes (which may be either).
+    pub(crate) fn walk_loss(&self, total: u64) -> bool {
+        self.counts[UnreadableCause::Metadata as usize] > 0
+            || self.counts[UnreadableCause::Directory as usize] > 0
+            || !matches!(self.projection(total).unattributed, Some(0))
+    }
     pub(crate) fn projection(self, total: u64) -> UnreadableBreakdown {
         let known = self
             .counts

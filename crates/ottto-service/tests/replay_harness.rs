@@ -369,6 +369,9 @@ const LIFECYCLE_COUNTERS: &[(&str, CounterClass)] = &[
     ("prefix_excluded_bodies", CounterClass::Observation),
     // snapshots/sampled_audit.rs::complete_native_recomposition: prefix tag cleared.
     ("prefix_tag_clears", CounterClass::Observation),
+    // snapshots.rs::apply_pi_line: cost parsing, never a retention decision.
+    ("pi_cost_refused_overflow", CounterClass::Observation),
+    ("pi_cost_precision_rounded", CounterClass::Observation),
 ];
 
 // CachePage flattens the registry above and adds these sparse scalars.

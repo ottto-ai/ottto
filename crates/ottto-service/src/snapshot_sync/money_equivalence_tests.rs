@@ -675,15 +675,15 @@ fn other_page(
     source: SnapshotSource,
     prior: ScanIndex,
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
-    other_page_observing(c, scanner, source, prior, |_| {})
+    other_page_observing_raw(c, scanner, source, prior, |_| {})
 }
 
-fn other_page_observing(
+fn other_page_observing_raw(
     c: &Corpus,
     scanner: &E2ScanFixture,
     source: SnapshotSource,
     prior: ScanIndex,
-    observe: impl FnOnce(&[SnapshotItem]),
+    before_finalize: impl FnOnce(&[SnapshotItem]),
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
     let (mut index, mut scan, modes) = scanner.scan_other(
         source,
@@ -694,7 +694,7 @@ fn other_page_observing(
     );
     index.bind_session_accounts(source, "e2-synthetic-machine", &mut scan.snapshots, &[]);
     apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
-    observe(&scan.snapshots);
+    before_finalize(&scan.snapshots);
     finalize_scan_after_policy(source, &mut scan, &mut index);
     scan.finish_codex_capture_boundary(&mut index);
     (index, scan, modes)
@@ -1176,7 +1176,7 @@ impl PiLedgerCheck<'_> {
         let previous_entities = prior.file_snapshot_fingerprints.clone();
         let mut candidates = Vec::new();
         let (index, scan, modes) =
-            other_page_observing(c, scanner, SnapshotSource::Pi, prior, |items| {
+            other_page_observing_raw(c, scanner, SnapshotSource::Pi, prior, |items| {
                 candidates = items.to_vec();
             });
         match self.step {
