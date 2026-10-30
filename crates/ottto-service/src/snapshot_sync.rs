@@ -5893,6 +5893,18 @@ fn cycle_upload_context(
     }
 }
 
+/// Keep capability-qualified ACK contexts in the loader's 64-hex domain.
+fn copy_unproven_upload_context(context: String, enabled: bool) -> String {
+    if enabled {
+        format!(
+            "{:x}",
+            Sha256::digest(format!("{context}:copy_unproven:v1"))
+        )
+    } else {
+        context
+    }
+}
+
 /// The replay generation of a cycle over `index` (pure; shared as above).
 fn cycle_replay_generation(
     source: SnapshotSource,
@@ -6203,7 +6215,7 @@ fn prepare_sync_source_inner(
     let checkpoint_namespace = attribution_context
         .as_ref()
         .map(SessionAttributionContext::checkpoint_namespace);
-    let mut upload_context = cycle_upload_context(
+    let upload_context = cycle_upload_context(
         upload_policy,
         checkpoint_namespace.as_deref(),
         cache_observations_enabled,
@@ -6212,9 +6224,7 @@ fn prepare_sync_source_inner(
         && activity_hint.copy_unproven_contract.as_deref() == Some("copy_unproven:v1");
     // Context adoption invalidates stale pending pages on capability downgrade.
     // OFF preserves the exact released context and body bytes.
-    if copy_unproven_enabled {
-        upload_context.push_str(":copy_unproven:v1");
-    }
+    let upload_context = copy_unproven_upload_context(upload_context, copy_unproven_enabled);
     let legacy_policy_index_path = legacy_policy_scoped_snapshot_index_path(
         support_dir,
         source,
@@ -18745,6 +18755,34 @@ mod tests {
                 "/support/snapshots/codex-scan-index-attribution-pending-attribution-labels.json"
             )
         );
+    }
+
+    #[test]
+    fn copy_capability_context_preserves_partial_ack_progress_after_restart() {
+        let base = cycle_upload_context(SnapshotUploadPolicy::default(), None, false);
+        assert_eq!(copy_unproven_upload_context(base.clone(), false), base);
+        let context = copy_unproven_upload_context(base.clone(), true);
+        assert_ne!(context, base);
+        assert!(is_snapshot_fingerprint(&context));
+        let root = test_dir("copy-capability-ack-context");
+        let path = root.join("progress.json");
+        let destination = "d".repeat(64);
+        let entity = "e".repeat(64);
+        let mut progress =
+            SnapshotUploadProgress::new(destination.clone(), test_quarantine_witness());
+        progress.accepted_fingerprints.insert(entity.clone());
+        progress
+            .accepted_body_witnesses
+            .insert(entity.clone(), "b".repeat(64));
+        progress
+            .accepted_body_contexts
+            .insert(entity.clone(), context.clone());
+        progress.save(&path).unwrap();
+        let loaded =
+            SnapshotUploadProgress::load(&path, &destination, test_quarantine_witness()).unwrap();
+        assert_eq!(loaded.accepted_body_contexts.get(&entity), Some(&context));
+        assert!(loaded.accepted_fingerprints.contains(&entity));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

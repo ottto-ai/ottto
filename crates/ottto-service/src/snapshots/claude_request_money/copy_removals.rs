@@ -141,12 +141,16 @@ impl CopyRemovals {
         if *old == *groups {
             return Stored::default();
         }
-        let held = |hash: &u64| old.iter().any(|(_, h)| h.binary_search(hash).is_ok());
         let added = groups
             .iter()
-            .flat_map(|(_, h)| h.iter())
-            .filter(|hash| !held(hash))
-            .count() as u64;
+            .map(|(holder, hashes)| {
+                let prior = old.iter().find(|(known, _)| known == holder);
+                hashes
+                    .iter()
+                    .filter(|hash| !prior.is_some_and(|(_, held)| held.binary_search(hash).is_ok()))
+                    .count() as u64
+            })
+            .sum::<u64>();
         let attempts = self
             .files
             .binary_search_by_key(&file, |f| f.0)
@@ -154,18 +158,39 @@ impl CopyRemovals {
         let old_bytes = charge(old).max(if attempts > 0 { FILE_BYTES } else { 0 });
         let new_bytes = charge(&groups).max(if attempts > 0 { FILE_BYTES } else { 0 });
         if self.bytes - old_bytes + new_bytes > MAX_BYTES {
+            // Disproof is not admission: persist deletions even if the new
+            // proofs cannot fit. Keep only exact validated holder/hash pairs,
+            // so a transferred hash never keeps its obsolete holder as proof.
+            let kept: Groups = old
+                .iter()
+                .filter_map(|(holder, hashes)| {
+                    let desired = groups.iter().find(|(known, _)| known == holder)?;
+                    let kept = hashes
+                        .iter()
+                        .copied()
+                        .filter(|hash| desired.1.binary_search(hash).is_ok())
+                        .collect::<Box<[u64]>>();
+                    (!kept.is_empty()).then_some((*holder, kept))
+                })
+                .collect();
+            self.replace(file, attempts, kept);
             return Stored {
                 added: 0,
                 overflow: added,
             };
         }
+        self.replace(file, attempts, groups);
+        Stored { added, overflow: 0 }
+    }
+
+    fn replace(&mut self, file: LocationKey, attempts: u64, groups: Groups) {
+        let bytes = charge(&groups).max(if attempts > 0 { FILE_BYTES } else { 0 });
         self.forget(file);
         if !groups.is_empty() || attempts > 0 {
             let at = self.files.binary_search_by_key(&file, |f| f.0).unwrap_err();
             self.files.insert(at, (file, attempts, groups));
-            self.bytes += new_bytes;
+            self.bytes += bytes;
         }
-        Stored { added, overflow: 0 }
     }
 
     /// The file is no longer indexed: its removals go with it.
@@ -421,6 +446,35 @@ mod tests {
         removals.retain_files(|file| file == kept);
         assert!(removals.get(gone).is_empty());
         assert_eq!(removals.bytes(), FILE_BYTES + GROUP_BYTES + HASH_BYTES);
+    }
+
+    #[test]
+    fn capacity_refusal_never_preserves_a_disproven_removal() {
+        let mut state = CopyRemovals::default();
+        let file = location_key("copy");
+        state.store(file, groups(&[("holder", &[1])]));
+        let filler =
+            (0..((MAX_BYTES - (FILE_BYTES + GROUP_BYTES + HASH_BYTES) - FILE_BYTES - GROUP_BYTES)
+                / HASH_BYTES) as u64)
+                .collect::<Vec<_>>();
+        state.store(
+            location_key("other-file"),
+            groups(&[("other-holder", &filler)]),
+        );
+        assert_eq!(state.bytes(), MAX_BYTES);
+        let refused = state.store(file, groups(&[("holder", &[2, 3])]));
+        assert_eq!(
+            refused,
+            Stored {
+                added: 0,
+                overflow: 2
+            }
+        );
+        // 1 was disproven; 2/3 are removed without record. Neither the failed
+        // admission nor a later restart may restore 1's obsolete decision.
+        let state: CopyRemovals =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert!(state.get(file).is_empty());
     }
 
     #[test]

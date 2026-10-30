@@ -18,6 +18,8 @@ still removes newly proven copies without recording them, counted by
 `copy_removed_unrecorded` and `copy_removal_store_overflow`, with a local alarm.
 If proof later disappears, those unrecorded decisions cannot be recovered and
 the prefix emits flagged. Own turns never wait for storage capacity.
+Disproven old removals are deleted even when new proof cannot fit; capacity
+refusal cannot preserve a decision invalidated by an answering holder.
 
 A transient proof wait (unscanned or changed holder, walk deadline) holds only
 the unresolved copied prefix. Own turns emit. Retry debt remains in the index
@@ -45,6 +47,8 @@ hour, model and account coincide. The mark changes no identity classification,
 tokens or costs. It participates in the semantic hash. A capability change
 uses existing upload-context adoption to prevent stale marked retry pages from
 crossing a downgrade; the OFF context is byte-identical to the released one.
+The capability-qualified context stays a 64-hex fingerprint so partial ACK
+progress survives restart through the ordinary progress loader.
 No request ids, digests, paths, file keys or source-session links are added.
 
 `copy_prefix_unproven_rows` counts emitted marked bucket rows. Existing local
@@ -58,7 +62,8 @@ rule. No production re-read, money-rule revision bump or release is included.
 Synthetic pipeline fixtures cover older-writer families, retirement, missing and
 damaged metadata, Lossy positive and negative evidence, capacity refusal, and
 three-pass prefix expiry with own-turn ACK and restart; capability-off byte/hash
-identity and capability-on mixed-grain flags/counts (Full and sampled/cache). Tests run in Linux CI,
-never locally. Before release, measure local files, holder groups, copied
+identity and capability-on mixed-grain flags/counts (Full and sampled/cache),
+partial-ACK restart and deletion of disproven removals at capacity. Tests run
+in Linux CI, never locally. Before release, measure local files, holder groups, copied
 requests, longest resume chain and charged bytes; occupancy above 50% needs
 review before release.
