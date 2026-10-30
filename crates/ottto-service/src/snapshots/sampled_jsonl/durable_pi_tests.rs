@@ -417,7 +417,8 @@ fn pi_registered_body_rows_preserve_populated_round_one_bytes() {
     let pin = row.allowlist();
     assert_eq!(
         row.representation(3, &pin).unwrap().allowlist_pin,
-        "bd43c3d6197e6a6dfe339a486b0bbf4aaa121fc40022fcc8418f9d900baac4f7"
+        // PROVISIONAL shared E→PL pin; final A_P awaits M-2 and SOURCE review.
+        "2b5c22e9aaa50964dba5ea7e4f148a826a246fffa9efc4925895dd0a6d654260"
     );
     for format in [0, 1, 2, 4] {
         assert!(row.representation(format, &pin).is_none());

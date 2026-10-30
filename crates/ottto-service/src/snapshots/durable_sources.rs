@@ -94,7 +94,10 @@ pub(crate) const SOURCES: &[Properties] = &[
         write_format: 3,
         representations: &[Representation {
             format: 3,
-            allowlist_pin: "bd43c3d6197e6a6dfe339a486b0bbf4aaa121fc40022fcc8418f9d900baac4f7",
+            // PROVISIONAL: covers the shared E→PL shape. Do not merge this value.
+            // The single shipped A_P repin follows Lead B's M-2 Pi fields merging
+            // into this branch and must be reviewed by SOURCE.
+            allowlist_pin: "2b5c22e9aaa50964dba5ea7e4f148a826a246fffa9efc4925895dd0a6d654260",
             header_bytes: crate::durable_tail_store::HEADER_V3_BYTES,
         }],
         #[cfg(test)]
