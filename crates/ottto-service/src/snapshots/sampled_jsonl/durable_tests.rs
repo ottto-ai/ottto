@@ -897,6 +897,7 @@ fn pi_decoded(path: &Path) -> (CachedJsonlReduction, Decoded) {
     (reduction, decoded)
 }
 
+/// [format] Pi native accounting and restore contract.
 /// Bounded replay restores Pi workspace, first prompt and fallback title.
 /// These content steps are portable; durable bounded decode is layout-gated.
 #[test]
@@ -916,6 +917,7 @@ fn pi_cwd_and_first_prompt_body_is_admitted_for_restore() {
     assert_eq!(restored.first_prompt_title, cold.first_prompt_title);
 }
 
+/// [format] Pi native accounting and restore contract.
 /// A physical first prompt after 1 MiB cannot obtain a bounded durable proof.
 #[test]
 fn pi_first_prompt_beyond_head_bound_refuses_persistence() {
@@ -1085,17 +1087,20 @@ fn pi_restore_tail_case(cwd: bool) {
     assert!(text.contains(PI_MARKER), "the title and the label carry it");
 }
 
+/// [format] Pi native accounting and restore contract.
 #[test]
 fn pi_restored_tail_publishes_the_cold_first_prompt_and_title() {
     pi_restore_tail_case(false);
 }
 
+/// [format] Pi native accounting and restore contract.
 /// The same with a header `cwd`, rederived from its marked header row.
 #[test]
 fn pi_restored_tail_with_header_cwd_publishes_the_cold_body() {
     pi_restore_tail_case(true);
 }
 
+/// [format] Pi native accounting and restore contract.
 /// The title stays last-wins across a restore: a later title replaces the
 /// first-prompt title, and the first-prompt grouping facts stay.
 #[test]
@@ -2351,6 +2356,7 @@ fn m3_seam_never_runs_before_the_held_object_is_revalidated() {
     assert_eq!(calls, 0);
 }
 
+/// [format] Pi native accounting and restore contract.
 /// Compare Pi header precedence with the native replay oracle.
 #[test]
 fn bounded_pi_workspace_matches_native_header_only_precedence() {
@@ -2440,6 +2446,7 @@ fn bounded_pi_workspace_matches_native_header_only_precedence() {
     }
 }
 
+/// [format] Pi native accounting and restore contract.
 #[test]
 fn bounded_pi_workspace_enforces_cap_and_refuses_nonheader_cwd() {
     let scratch = Scratch::new("pi-workspace-caps");
@@ -2666,6 +2673,7 @@ fn pl_scope_is_closed_and_every_other_e_field_stays_refusing() {
     );
 }
 
+/// [format] Pi native accounting and restore contract.
 /// Exercise the registered Pi body through production decode and content replay.
 #[test]
 fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
@@ -3065,6 +3073,7 @@ fn bounded_replay_errors_logs_and_panics_are_content_free() {
     );
 }
 
+/// [format] Pi native accounting and restore contract.
 /// Exercise the production codec/acquisition/native-finish/finalizer interface with
 /// actual A < C < B extents and a real complete native body (no hand-built item).
 #[test]
@@ -3229,6 +3238,7 @@ fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
 /// The label text the shape keeps for `SnapshotAccumulator.seen_pi_usage_keys`.
 const PI_LEDGER_LABEL: &str = "BTreeMap<String, PiUsageDedupState>";
 
+/// [format] Pi native accounting and restore contract.
 /// E1 (c): the recorded label, the shape line it prints, and the real types
 /// behind it. Fails if the label changes or the ledger's type drifts.
 #[test]
@@ -3300,6 +3310,7 @@ fn twin_bytes<T: Durable>(value: &T) -> Result<Vec<u8>, Refuse> {
     Ok(e.into_bytes())
 }
 
+/// [format] Pi native accounting and restore contract.
 /// E1 (d), mechanism: the labelled arm is the unlabelled arm for its label
 /// type. Same shape text and digest, same bytes, same refusal; bytes the old
 /// type wrote decode into the new type and re-encode byte-identically.
@@ -3367,6 +3378,7 @@ fn claude_and_codex_bodies_round_trip_byte_identical_through_the_pi_ledger() {
     }
 }
 
+/// [format] Pi native accounting and restore contract.
 /// The codec/Tail rule runs on Linux too; the transition matrix additionally
 /// checks native disk receipts, eviction and the shared money oracle on macOS.
 #[test]
@@ -3437,6 +3449,7 @@ fn pi_fork_restore_tail_matches_cold_at_every_physical_line_cut() {
     }
 }
 
+/// [format] Pi native accounting and restore contract.
 #[test]
 fn copied_only_pi_fork_is_complete_emits_zero_and_restores_tail() {
     let scratch = Scratch::new("m2-only-copies");

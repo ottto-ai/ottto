@@ -396,6 +396,7 @@ impl<F: FnMut()> Drop for Reset<F> {
 
 // P-Q x2: two consecutive quiet restarts read no transcript bytes, emit
 // nothing and rewrite no record.
+/// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -443,6 +444,7 @@ fn pi_quiet_restart_twice_reads_nothing_and_posts_nothing() {
 // and equals cold Full. A message before restart one is paired by its
 // message_end after it, so a lost usage-key ledger double counts. The pages
 // carry a compaction and a branch summary with their own usage.
+/// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -508,6 +510,7 @@ fn pi_append_then_restart_twice_reads_only_tail_and_keeps_the_ledger() {
 }
 
 // P-E: evict RAM, retry from the record, save, restart: zero Full throughout.
+/// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -558,6 +561,7 @@ fn pi_evict_retry_save_restart_reads_no_full() {
 // index. `restored_behind_accepted.published` counts exactly this offer. An
 // equal-or-larger extent POSTs normally and leaves it at 0. The RAM-resident
 // cut is the in-process control below.
+/// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -639,6 +643,7 @@ fn pi_restored_tail_behind_accepted_extent_publishes_the_cold_body() {
     whole_body(&cold, &restored);
 }
 
+/// [format] Pi native accounting and restore contract.
 /// An unchanged survivor below the accepted extent still finalizes its older
 /// body. Count the offer and the downward accepted/index transition explicitly.
 #[test]
@@ -698,6 +703,7 @@ fn pi_restored_unchanged_below_accepted_counts_its_smaller_offer() {
 // accepted extent with the same head, its entry still in RAM, is classified
 // Shrunk by the certificate/ReadPlan and takes one A2 Full
 // `real_edit.<check>` outside the restore seam.
+/// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -760,6 +766,7 @@ fn pi_ram_resident_same_head_cut_reads_one_real_edit_full() {
 // survivor. "ram" resumes the owed RAM completion past new growth; "restart"
 // lost it, so the survivor restores and its Tail reads the held growth too.
 // Neither arm reads Full, and a later quiet restart POSTs nothing.
+/// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -847,6 +854,7 @@ fn pi_stale_survivor_holds_then_resolves_with_a_counted_tail() {
 // record and Tails, so no second Full follows. Neither later stage refuses a
 // certificate: that count belongs to the rewrite alone. The shrink arm's Full
 // ends below accepted, but it is not a restored Tail.
+/// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -941,6 +949,7 @@ fn pi_version_rewrite_after_restart_reads_one_real_edit_full() {
 // restores. Both arms break the trailer, so store framing refuses them. The
 // Pi-section framing arms (stripped/duplicated/trailing/over-cap/short H)
 // are the codec's own refusals (`corrupt_truncated_or_misframed_sections_are_refused`).
+/// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1012,6 +1021,7 @@ fn pi_corrupt_or_truncated_record_rebuilds_once_then_replaces_it() {
 // byte-identical through five passes with GC, then a restart: no Full, no
 // POST, the accepted body kept. Arms: a newer format, and `(1, Pi, A_P)`
 // (no Pi format 1 exists; the Pi row registers format 3 only) -> U.
+/// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1067,6 +1077,7 @@ fn pi_unknown_record_holds_without_full_or_post_and_survives_gc() {
 // that holds the accepted body. A restart forgets the RAM-only pace and may
 // spend at most one more structural Full (E1, transitional). With the bound
 // fitting again, the kept record restores and Tails.
+/// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1171,6 +1182,7 @@ fn pi_active_bound_is_one_paced_no_record_full_and_keeps_the_record() {
 // `durable_tail_pi_bound_tests.rs` (`pi_cache_copy`).
 // Revisit trigger: if the Pi cache_transit count is ever > 0 on M4 or the
 // fleet, a cache-less restore -> Tail path becomes next-release work.
+/// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1272,6 +1284,7 @@ fn pi_cache_copy_refusal_is_one_paced_counted_full_then_a_delay() {
 // LA-1: a Pi file appended while the daemon was down for over an hour (or
 // across a clock step back, or with more pending audits than slots) restores
 // and reads the Tail: no Full(AuditDue) on restore and no audit-slot gate.
+/// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1332,6 +1345,7 @@ fn pi_appended_while_down_over_an_hour_restores_and_tails() {
 // format-3 record untouched. On re-upgrade that record's valid prefix
 // restores and the Tail catches up past the accepted extent; its own receipt
 // then restores again after the next restart.
+/// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1402,6 +1416,7 @@ fn pi_downgrade_then_reupgrade_restores_the_kept_record() {
 // P-X: Pi beside a Claude row in one state directory and one process owner.
 // A held Pi record leaves the Claude sibling equal to its cold Full, and each
 // source's save/GC leaves the other's record; then both restore together.
+/// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1589,6 +1604,7 @@ fn assert_store_private(f: &PiDriver, mode: Mode) {
 // table: an unknown key is dropped identically in cold Full and restore + Tail
 // while a known key publishes. (#852's value-format rejection and its
 // `selector_key_rejected` gauge are not on this base.)
+/// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1654,6 +1670,7 @@ fn pi_canaries_never_reach_persisted_records_and_the_selector_is_validated() {
     }
 }
 
+/// [format] Pi native accounting and restore contract.
 /// restore→Tail on a body with a header cwd and a first prompt: one Tail and
 /// the whole body equal to a cold Full, first-prompt title and money included.
 /// The record stores only its H fence; bounded replay rebuilds the prompt.
@@ -1688,6 +1705,7 @@ fn pi_restored_tail_publishes_the_first_prompt_title_of_a_cold_full() {
     whole_body(&cold, &restored);
 }
 
+/// [format] Pi native accounting and restore contract.
 /// A first prompt beyond the head bound cannot create a durable content proof.
 /// The next growing restart therefore takes a counted native Full.
 #[test]
@@ -1748,6 +1766,7 @@ fn pi_prompt_beyond_head_bound_uses_counted_growth_full() {
     whole_body(&cold, &grown);
 }
 
+/// [format] Pi native accounting and restore contract.
 /// Rewrite only unsampled head bytes, with unchanged length, then append.
 /// Certificate samples still match; the first-prompt H fence denies the record.
 #[test]
@@ -1820,12 +1839,14 @@ fn m2_turn(kind: &str, id: &str, at: &str, input: u64) -> Value {
     }
 }
 
+/// [regress] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_fork_tail_restart_and_eviction_equal_cold_full_at_each_cut() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_m2_fork") {
         return;
     }
@@ -1892,12 +1913,14 @@ fn pi_fork_tail_restart_and_eviction_equal_cold_full_at_each_cut() {
     }
 }
 
+/// [regress] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "Pi restore requires qualified native heap layout"
 )]
 fn pi_fork_unknown_parent_counts_skips_without_uploading_parent_and_lower_money_publishes() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_m2_lower") {
         return;
     }
@@ -1955,5 +1978,71 @@ fn pi_fork_unknown_parent_counts_skips_without_uploading_parent_and_lower_money_
             "a copied-only fork is complete, with no repeated Full"
         );
         assert_eq!(quiet.io.consumed, 0);
+    }
+}
+
+/// [regress] Copied Pi usage with a realistic envelope time before the fork header is skipped.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "Pi restore requires qualified native heap layout"
+)]
+fn pi_fork_pre_header_copies_reduce_double_counted_money() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !supported("pi_m2_pre_header") {
+        return;
+    }
+    let mut f = PiDriver::warm("pi-fork-pre-header", &pi_seed());
+    let fork = f.c.root.join("fork.jsonl");
+    let mut copied = String::new();
+    for line in pi_seed().lines().skip(1) {
+        let mut line: Value = serde_json::from_str(line).unwrap();
+        line["timestamp"] = json!("2026-10-27T06:00:01Z");
+        copied += &pi_json(line);
+    }
+    let mut header: Value = serde_json::from_str(&pi_header(
+        "synthetic-fork-session",
+        3,
+        Some("synthetic-parent.jsonl"),
+    ))
+    .unwrap();
+    header["timestamp"] = json!("2026-10-27T07:00:00Z");
+    std::fs::write(&fork, pi_json(header) + &copied).unwrap();
+    input_clock(&fork);
+    f.grow(&[pi_turn(
+        "message",
+        Some("parent-growth"),
+        20,
+        "2026-10-27T06:02:00Z",
+    )]);
+    let cold = f.emit_bodies(Mode::ColdFull);
+    // Parent: seed 10 + growth 20 = 30 input, two requests, cost 0.002.
+    // Fork's copied seed: 10 input, one request, cost 0.001, all excluded.
+    // Old double-counted totals (3, 40, 0.003) become (2, 30, 0.002).
+    assert_eq!(cold.snapshots.len(), 2);
+    assert_eq!(
+        cold.snapshots
+            .values()
+            .map(|s| s["request_count"].as_u64().unwrap())
+            .sum::<u64>(),
+        2
+    );
+    assert_eq!(
+        cold.snapshots
+            .values()
+            .map(|s| s["input_tokens"].as_u64().unwrap())
+            .sum::<u64>(),
+        30
+    );
+    let cost = cold
+        .snapshots
+        .values()
+        .map(|s| s["cost"].as_f64().unwrap_or(0.0))
+        .sum::<f64>();
+    assert!((cost - 0.002).abs() < 1e-12);
+    for mode in [Mode::Ram, Mode::Restart, Mode::EvictRetry] {
+        let route = f.emit_bodies(mode);
+        money_oracle::assert_equivalent(&cold, &route);
+        whole_body(&cold, &route);
     }
 }

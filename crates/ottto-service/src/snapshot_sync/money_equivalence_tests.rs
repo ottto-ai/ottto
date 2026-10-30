@@ -1784,6 +1784,7 @@ fn pi_error_zero_requests() {
     pi_usage_case("pi_error_zero_requests");
 }
 
+/// [money] Pinned residual: copied lines timestamped at or after the fork header stay counted.
 #[test]
 fn pi_cli_fork_preserves_double_count() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();

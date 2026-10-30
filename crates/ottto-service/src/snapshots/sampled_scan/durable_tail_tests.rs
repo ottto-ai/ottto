@@ -16139,6 +16139,7 @@ pub(in crate::snapshots) fn advance_scanner_clock_past_eviction_fillers(cache: &
     stores.retail_full_now = Some(latest + std::time::Duration::from_secs(1));
 }
 
+/// [format] Pi native accounting and restore contract.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn non_pi_fork_live_encode_refusal_is_counted_and_writes_nothing() {
