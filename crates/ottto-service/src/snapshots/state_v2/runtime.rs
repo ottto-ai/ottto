@@ -932,6 +932,7 @@ fn invalidate_locked(path: &Path) -> Result<()> {
 }
 /// Uninstall retains its existing OS/ownership/cleanup ordering. Close native
 /// handles first; its established cleanup owner performs all file deletion.
+#[cfg(target_os = "macos")]
 pub(in super::super) fn invalidate_tree(support: &Path) -> Result<()> {
     let root = support.join("snapshots");
     let paths: Vec<_> = states()
