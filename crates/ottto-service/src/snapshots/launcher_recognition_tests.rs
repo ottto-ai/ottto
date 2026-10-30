@@ -138,6 +138,8 @@ fn run_with_limit(
 
 #[test]
 fn native_batches_cross_512_workers_without_a_store_sweep_per_file() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let home = Home::new();
         let empty_home = Home::new();
@@ -207,6 +209,8 @@ fn native_batches_cross_512_workers_without_a_store_sweep_per_file() {
 
 #[test]
 fn claude_quarantine_preflight_with_launch_keeps_the_physical_identity_fence() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let home = Home::new();
     let root = home.0.join(".claude/projects");
     fs::create_dir_all(&root).unwrap();
@@ -290,6 +294,8 @@ fn claude_quarantine_preflight_with_launch_keeps_the_physical_identity_fence() {
 
 #[test]
 fn native_launcher_first_import_then_idle_edit_conflict_and_removal_use_one_path() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let home = Home::new();
@@ -457,6 +463,8 @@ fn native_launcher_first_import_then_idle_edit_conflict_and_removal_use_one_path
 
 #[test]
 fn joined_native_owner_drives_launch_demand_and_preserves_exact_settlement() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let source = SnapshotSource::Codex;
     let home = Home::new();
     let root = native_join_fixture_root(false);
@@ -528,6 +536,8 @@ fn joined_native_owner_drives_launch_demand_and_preserves_exact_settlement() {
 
 #[test]
 fn held_claude_launcher_revision_keeps_retry_cadence_after_restart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let home = Home::new();
     let root = home.0.join(".claude/projects");
     fs::create_dir_all(&root).unwrap();
@@ -620,6 +630,8 @@ fn held_claude_launcher_revision_keeps_retry_cadence_after_restart() {
 
 #[test]
 fn launch_family_reconciliation_preserves_deadline_witness_revision_and_membership_checks() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let home = Home::new();
     home.event(WORKER, CONTROLLER);
     let context = home.context(SnapshotSource::ClaudeCode);

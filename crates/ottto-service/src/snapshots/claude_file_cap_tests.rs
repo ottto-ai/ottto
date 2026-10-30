@@ -101,6 +101,8 @@ fn assert_native(scan: &SourceScanResult, requests: u64) {
 
 #[test]
 fn oversized_claude_shrink_then_grow_keeps_unread_content_unproven() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let fixture = Fixture::new();
     let path = fixture.path();
@@ -160,6 +162,8 @@ fn oversized_claude_shrink_then_grow_keeps_unread_content_unproven() {
 
 #[test]
 fn each_source_admits_its_exact_file_cap_and_refuses_one_more_byte() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for (source, limit) in [
         (SnapshotSource::ClaudeCode, 512 * MIB),
         (SnapshotSource::Pi, 256 * MIB),
@@ -198,6 +202,8 @@ fn each_source_admits_its_exact_file_cap_and_refuses_one_more_byte() {
 
 #[test]
 fn three_hundred_mib_admission_is_claude_only() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = Fixture::new();
     File::create(fixture.path())
         .unwrap()
@@ -331,6 +337,8 @@ fn measured_child(root: PathBuf, requests: u64, bytes: u64) {
 #[cfg(target_os = "macos")]
 #[test]
 fn large_claude_native_memory() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if let Some(root) = std::env::var_os(CHILD) {
         measured_child(
             root.into(),

@@ -173,6 +173,8 @@ fn set_test_xattr(path: &Path) -> bool {
 
 #[test]
 fn metadata_only_changes_never_trigger_a_reread() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for (source, name, body) in sources() {
         let mut fixture = Fixture::settled(source, name, &body);
         let stored = fixture.fingerprint();
@@ -225,6 +227,8 @@ fn metadata_only_changes_never_trigger_a_reread() {
 /// and then settles. Never a loop.
 #[test]
 fn same_bytes_under_a_new_inode_read_once_for_its_object_inputs() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for (source, name, body) in sources() {
         for preserve_mtime in [false, true] {
@@ -275,6 +279,8 @@ fn same_bytes_under_a_new_inode_read_once_for_its_object_inputs() {
 
 #[test]
 fn real_content_changes_are_reread() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for (source, name, body) in sources() {
         // Append: size moves.
@@ -332,6 +338,8 @@ fn real_content_changes_are_reread() {
 /// see `opened_object_identity_moves_on_middle_rewrite_with_size_and_mtime_restored`).
 #[test]
 fn ctime_mismatch_revalidates_samples_without_a_full_read() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for (source, name, head) in sources() {
         let padding_line = format!(
             "{{\"type\":\"ottto_reread_padding\",\"pad\":\"{}\"}}\n",
@@ -371,6 +379,8 @@ fn ctime_mismatch_revalidates_samples_without_a_full_read() {
 /// with its natural mtime: the samples cannot see it, mtime does. Re-read.
 #[test]
 fn truncate_regrow_with_unchanged_samples_is_reread_by_mtime() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for (source, name, _) in sources() {
         let padding = format!(
@@ -515,6 +525,8 @@ fn codex_fork_child_usage(root: &Path, index: &mut ScanIndex, hour: u32) -> (u64
 /// ledger would hold the child's fresh usage with nothing to repair it.
 #[test]
 fn codex_parent_ctime_only_change_keeps_its_ledger_for_a_changed_child() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let home = temp_dir("reread-codex-parent-ledger");
     let root = home.join("transcripts");
     fs::create_dir_all(&root).expect("create root");
@@ -640,6 +652,8 @@ fn chmod_flip(path: &Path) {
 /// (chmod) must read B, never adopt A's ctime.
 #[test]
 fn reused_inode_with_an_unequal_birth_is_read() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for (source, name, body) in sources() {
         for earlier in [true, false] {
@@ -684,6 +698,8 @@ fn reused_inode_with_an_unequal_birth_is_read() {
 /// or live, never adopts a stored ctime: the normal path reads.
 #[test]
 fn unavailable_birth_never_adopts_a_stored_ctime() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for (source, name, body) in sources() {
         // Stored birth unavailable.
@@ -774,6 +790,8 @@ fn unavailable_birth_never_adopts_a_stored_ctime() {
 /// the appended child's ownership and output match a fresh full read.
 #[test]
 fn codex_parent_with_an_unequal_birth_refuses_its_ledger() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let home = temp_dir("reread-codex-parent-birth");
     let root = home.join("transcripts");
     fs::create_dir_all(&root).expect("create root");

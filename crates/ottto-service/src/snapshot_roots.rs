@@ -170,6 +170,8 @@ mod tests {
 
     #[test]
     fn transcript_folder_keys_match_registered_descriptor_spellings() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         use crate::claude_status_coverage::{home_key, transcript_home_key};
         let home = Path::new("/synthetic/user");
         // Scan roots and status descriptors both read the registry's own
@@ -206,6 +208,8 @@ mod tests {
 
     #[test]
     fn registered_claude_folders_include_default_once_without_account_inputs() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let home = Path::new("/synthetic/user");
         let slots = [
             home.join(".claude"),
@@ -229,6 +233,8 @@ mod tests {
 
     #[test]
     fn registered_roots_use_normal_import_and_restart_without_account_assignment() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let scratch = ScratchDir::new("claude-registered-import");
         let home = scratch.join("home");
         let store = FileClaudeConfigSlotSettingsStore::new(scratch.join("slots.json"));
@@ -305,6 +311,8 @@ mod tests {
 
     #[test]
     fn registration_add_remove_repoint_and_order_change_update_shared_roots() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let scratch = ScratchDir::new("claude-registration-lifecycle");
         let home = scratch.join("home");
         let path = scratch.join("slots.json");
@@ -354,6 +362,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unreadable_registered_folder_does_not_hide_healthy_sessions_or_claim_complete() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         use std::os::unix::fs::PermissionsExt;
         let scratch = ScratchDir::new("claude-root-permissions");
         let home = scratch.join("home");
@@ -393,6 +403,8 @@ mod tests {
 
     #[test]
     fn duplicate_root_keeps_existing_native_entity_and_ack_identity() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let scratch = ScratchDir::new("claude-root-alias");
         let home = scratch.join("home");
         let root = home.join(".claude/projects");
@@ -420,6 +432,8 @@ mod tests {
 
     #[test]
     fn same_id_files_keep_existing_logical_identity_without_summing_or_selecting() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let scratch = ScratchDir::new("claude-existing-copy-boundary");
         let home = scratch.join("home");
         let roots = compose_roots(SnapshotSource::ClaudeCode, &home, &[], &[home.join("slot")]);

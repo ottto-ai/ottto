@@ -95,6 +95,8 @@ fn off_accept(index: &mut ScanIndex, result: &SourceScanResult) {
 
 #[test]
 fn terminal_off_w1_w2_open_fence_skipped_duplicate_never_verifies() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for initially_closed in [false, true] {
         let scratch = crate::test_scratch::ScratchDir::new("terminal-off-open-fence");
         let root = scratch.join("projects");
@@ -272,6 +274,8 @@ fn terminal_off_w1_w2_open_fence_skipped_duplicate_never_verifies() {
 
 #[test]
 fn terminal_off_hard_reenable_requires_reconstruction_even_after_reload() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut index = off_index();
     assert!(!claude_terminal_reconstructed(&index, W2));
     assert!(!claude_terminal_authority(&index, true, W2));
@@ -287,6 +291,8 @@ fn terminal_off_hard_reenable_requires_reconstruction_even_after_reload() {
 
 #[test]
 fn terminal_off_fresh_start_zero_parses_and_bounded_identity_samples() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     const N: usize = 4;
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-samples");
     for n in 0..N {
@@ -344,6 +350,8 @@ fn terminal_off_fresh_start_zero_parses_and_bounded_identity_samples() {
 
 #[test]
 fn terminal_off_sample_mismatch_uses_ordinary_changed_file_path() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-mismatch");
     let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
     fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
@@ -379,6 +387,8 @@ fn terminal_off_sample_mismatch_uses_ordinary_changed_file_path() {
 
 #[test]
 fn terminal_off_offline_create_overflow_and_cadence_discover_without_restart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-discovery");
     fs::write(
         scratch.join(format!("{OFF_ROOT}.jsonl")),
@@ -411,6 +421,8 @@ fn terminal_off_offline_create_overflow_and_cadence_discover_without_restart() {
 
 #[test]
 fn terminal_off_selected_save_requeues_earlier_failed_page_and_keeps_clear_debt() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-requeue");
     fs::write(
         scratch.join(format!("{OFF_ROOT}.jsonl")),
@@ -459,6 +471,8 @@ fn terminal_off_selected_save_requeues_earlier_failed_page_and_keeps_clear_debt(
 
 #[test]
 fn terminal_off_delete_defers_all_raw_effects_and_full_rearm() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-delete");
     let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
     fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
@@ -504,6 +518,8 @@ fn terminal_off_delete_defers_all_raw_effects_and_full_rearm() {
 
 #[test]
 fn terminal_off_context_change_and_contract_debt_still_select() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-context");
     let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
     fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
@@ -538,6 +554,8 @@ fn terminal_off_context_change_and_contract_debt_still_select() {
 
 #[test]
 fn terminal_off_process_state_preserves_old_decoder_shape() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut index = off_index();
     let before = serde_json::to_value(&index.claude_full_rearm_progress).unwrap();
     index
@@ -559,6 +577,8 @@ fn terminal_off_process_state_preserves_old_decoder_shape() {
 
 #[test]
 fn terminal_off_held_selected_save_reload_preserves_unaccepted_retry() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-held");
     let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
     fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
@@ -596,6 +616,8 @@ fn terminal_off_held_selected_save_reload_preserves_unaccepted_retry() {
 #[cfg(unix)]
 #[test]
 fn terminal_off_rediscovery_reauthorizes_only_current_symlink_target() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-retarget");
     let a = scratch.join("a");
     let b = scratch.join("b");
@@ -657,6 +679,8 @@ fn terminal_off_rediscovery_reauthorizes_only_current_symlink_target() {
 
 #[test]
 fn terminal_off_fresh_context_reselection_is_disclosed_until_adoption() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // TODO R1: provided by the source-general upload-context receipt PR
     // (e1/upload-context-receipt); consume it here after merge.
 
@@ -687,6 +711,8 @@ fn terminal_off_fresh_context_reselection_is_disclosed_until_adoption() {
 
 #[test]
 fn terminal_off_save_preserves_persisted_fence_and_closes_effective_fence() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for closed in [false, true] {
         let scratch = crate::test_scratch::ScratchDir::new("terminal-off-fence-save");
         fs::write(
@@ -712,6 +738,8 @@ fn terminal_off_save_preserves_persisted_fence_and_closes_effective_fence() {
 
 #[test]
 fn terminal_off_old_reader_owned_start_correction_quiesces_with_custody() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-owed-start");
     let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
     fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
@@ -766,6 +794,8 @@ fn terminal_off_old_reader_owned_start_correction_quiesces_with_custody() {
 #[cfg(unix)]
 #[test]
 fn terminal_off_ctime_only_counts_one_file_two_observations_per_walk() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use std::os::unix::fs::PermissionsExt;
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-ctime");
     let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
@@ -816,6 +846,8 @@ fn terminal_off_ctime_only_counts_one_file_two_observations_per_walk() {
 
 #[test]
 fn terminal_off_retention_gauges_never_grant_custody_credit() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut index = off_index();
     let clock = rfc3339_unix_seconds(W1).unwrap();
     index
@@ -839,6 +871,8 @@ fn terminal_off_retention_gauges_never_grant_custody_credit() {
 
 #[test]
 fn terminal_off_unproven_pending_is_counted_without_settlement_or_proof() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-pending-gauge");
     let root = scratch.join("projects");
     fs::create_dir_all(&root).unwrap();
@@ -869,6 +903,8 @@ fn terminal_off_unproven_pending_is_counted_without_settlement_or_proof() {
 
 #[test]
 fn terminal_off_pending_behind_old_witness_is_still_counted_and_unproven() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-old-proof-gauge");
     let root = scratch.join("projects");
     fs::create_dir_all(&root).unwrap();
@@ -900,6 +936,8 @@ fn terminal_off_pending_behind_old_witness_is_still_counted_and_unproven() {
 
 #[test]
 fn terminal_off_cancellation_replay_precedes_repeated_held_fifo_on_one_file_pages() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let path = |name: &str| ScanTraversalPath {
         scan_root: PathBuf::from("synthetic"),
         path: PathBuf::from(name),
@@ -939,6 +977,8 @@ fn terminal_off_cancellation_replay_precedes_repeated_held_fifo_on_one_file_page
 
 #[test]
 fn terminal_off_rediscovery_deadline_survives_two_save_load_cycles() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-reload-cadence");
     fs::write(
         scratch.join(format!("{OFF_ROOT}.jsonl")),
@@ -1044,6 +1084,8 @@ fn terminal_off_rediscovery_deadline_survives_two_save_load_cycles() {
 
 #[test]
 fn terminal_off_rediscovery_memo_is_bounded_and_eviction_fails_toward_rewalk() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     TERMINAL_OFF_REDISCOVERY.with(|memo| memo.borrow_mut().clear());
     for n in 0..TERMINAL_OFF_REDISCOVERY_SCOPES + 1 {
         assert!(terminal_off_rediscovery_due(
@@ -1061,6 +1103,8 @@ fn terminal_off_rediscovery_memo_is_bounded_and_eviction_fails_toward_rewalk() {
 
 #[test]
 fn terminal_off_service_round_preserves_failed_page_retry_without_minting_completion() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-service-frontier");
     let other = "b1111111-1111-4111-8111-111111111111";
     for session in [OFF_ROOT, other] {
@@ -1111,6 +1155,8 @@ fn terminal_off_service_round_preserves_failed_page_retry_without_minting_comple
 
 #[test]
 fn terminal_off_idle_cadence_never_parks_already_owed_read_work() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-cadence-owed");
     let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
     fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
@@ -1212,6 +1258,8 @@ fn terminal_off_idle_cadence_never_parks_already_owed_read_work() {
 
 #[test]
 fn terminal_off_counterfactual_preview_preserves_the_actual_discovery_turn() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-preview-turn");
     let mut index = off_index();
     ensure_bounded_traversal(
@@ -1236,6 +1284,8 @@ fn terminal_off_counterfactual_preview_preserves_the_actual_discovery_turn() {
 
 #[test]
 fn terminal_off_unhinted_append_waits_for_real_cadence_then_is_discovered() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-unhinted-cadence");
     let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
     fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
@@ -1275,6 +1325,8 @@ fn terminal_off_unhinted_append_waits_for_real_cadence_then_is_discovered() {
 
 #[test]
 fn terminal_off_captured_audit_clock_survives_yields_and_owns_rediscovery_deadline() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-page-clock");
     let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
     fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
@@ -1354,6 +1406,8 @@ fn terminal_off_captured_audit_clock_survives_yields_and_owns_rediscovery_deadli
 
 #[test]
 fn terminal_off_empty_context_memo_is_bounded_counts_eviction_and_never_grants_credit() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut memo = TerminalOffEmptyContexts::default();
     let first = [0u8; 32];
     memo.remember(first);
@@ -1393,6 +1447,8 @@ fn freshness_at(seconds: u64) -> String {
 /// cleared-fingerprint debt. No ACK/receipt or completion is synthesized.
 #[test]
 fn terminal_off_saturated_drain_ceiling_picks_up_unhinted_create_and_rename_over() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-saturated-ceiling");
     let debt = scratch.join(format!("{OFF_ROOT}.jsonl"));
     fs::write(&debt, freshness_line(OFF_ROOT, "X")).unwrap();
@@ -1422,6 +1478,8 @@ fn terminal_off_saturated_drain_ceiling_picks_up_unhinted_create_and_rename_over
     let newcomer = scratch.join("f1111111-1111-4111-8111-111111111111.jsonl");
     let mut replaced = None;
     let mut new_seen = None;
+    let mut new_discovered = None;
+    let mut replaced_discovered = None;
     let mut replaced_seen = None;
     let mut ended = false;
     for pass in 0..40 {
@@ -1464,6 +1522,28 @@ fn terminal_off_saturated_drain_ceiling_picks_up_unhinted_create_and_rename_over
             if replaced.as_ref() == Some(&path) && pass >= 2 {
                 replaced_seen.get_or_insert(now);
             }
+        }
+        if index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .observed_index_keys
+            .contains(&local_index_key(&newcomer))
+        {
+            new_discovered.get_or_insert(now);
+        }
+        if replaced_seen.is_some()
+            || replaced.as_ref().is_some_and(|path| {
+                index
+                    .traversal
+                    .as_ref()
+                    .unwrap()
+                    .pending_candidates
+                    .iter()
+                    .any(|p| &p.path == path)
+            })
+        {
+            replaced_discovered.get_or_insert(now);
         }
         for pending in &index.traversal.as_ref().unwrap().pending_candidates {
             if consumed.contains_key(&pending.path)
@@ -1518,8 +1598,8 @@ fn terminal_off_saturated_drain_ceiling_picks_up_unhinted_create_and_rename_over
     assert!(coalesced > 0);
     assert!(forced > 0);
     let ceiling = terminal_off_discovery::TERMINAL_OFF_FRESHNESS_WALK_CEILING_SECONDS;
-    assert!(new_seen.unwrap() - (start + 600) <= ceiling);
-    assert!(replaced_seen.unwrap() - (start + 600) <= ceiling);
+    assert!(new_discovered.unwrap() - (start + 600) <= ceiling);
+    assert!(replaced_discovered.unwrap() - (start + 600) <= ceiling);
     for (path, count) in consumed {
         if path == debt {
             assert!(count <= 2, "once-only clear debt per admitted round");
@@ -1536,6 +1616,8 @@ fn terminal_off_saturated_drain_ceiling_picks_up_unhinted_create_and_rename_over
 
 #[test]
 fn terminal_off_targeted_adoption_is_page_bounded_deduplicated_and_never_census() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-targeted-cohort");
     for n in 0..9 {
         let session = format!("{n:08x}-2222-4222-8222-222222222222");
@@ -1640,6 +1722,8 @@ fn terminal_off_targeted_adoption_is_page_bounded_deduplicated_and_never_census(
 
 #[test]
 fn terminal_off_watcher_hint_keeps_same_stat_park_then_stat_change_reads_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use super::claude_request_census::{ClaudeRequestCensusRecord, ClaudeRequestCensusShape};
     sampled_audit::reset_open_backoff_for_test();
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-watcher-park");
@@ -1710,6 +1794,8 @@ fn terminal_off_watcher_hint_keeps_same_stat_park_then_stat_change_reads_once() 
 
 #[test]
 fn terminal_off_two_blocking_held_keys_wait_for_the_existing_six_hour_floor() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-held-pair-floor");
     let roots = [OFF_ROOT, "b2222222-2222-4222-8222-222222222222"];
     for root in roots {
@@ -1750,6 +1836,8 @@ fn terminal_off_two_blocking_held_keys_wait_for_the_existing_six_hour_floor() {
 
 #[test]
 fn terminal_off_new_round_observes_targeted_pending_and_floor_blocked_presence() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-new-round-presence");
     let held = "b2222222-2222-4222-8222-222222222222";
     for root in [OFF_ROOT, held] {
@@ -1806,7 +1894,12 @@ fn terminal_off_new_round_observes_targeted_pending_and_floor_blocked_presence()
         .pending_candidates
         .iter()
         .any(|p| local_index_key(&p.path) == held_key));
-    let discovered = index.traversal.as_ref().unwrap().counts.discovered_file_count;
+    let discovered = index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .counts
+        .discovered_file_count;
     advance_bounded_directory_traversal(
         SnapshotSource::ClaudeCode,
         index.traversal.as_mut().unwrap(),
@@ -1827,7 +1920,8 @@ fn terminal_off_new_round_observes_targeted_pending_and_floor_blocked_presence()
             .as_ref()
             .unwrap()
             .counts
-            .discovered_file_count,
+            .discovered_file_count
+            - discovered,
         2
     );
     assert!(
@@ -1840,7 +1934,7 @@ fn terminal_off_new_round_observes_targeted_pending_and_floor_blocked_presence()
             .any(|p| local_index_key(&p.path) == held_key),
         "presence does not bypass floor"
     );
-    let before = index.files.clone();
+    let before = serde_json::to_value(&index.files).unwrap();
     {
         let _completion = ClaudeCompletionPathsForTest::enable();
         index.traversal.as_mut().unwrap().reconciliation_upper_bound =
@@ -1848,8 +1942,163 @@ fn terminal_off_new_round_observes_targeted_pending_and_floor_blocked_presence()
         while !reconcile_missing_index_entries_with_limit(&mut index, 10) {}
     }
     assert_eq!(
-        index.files, before,
+        serde_json::to_value(&index.files).unwrap(),
+        before,
         "real reconcile must retain both observed on-disk files"
     );
     assert!(index.accepted_snapshot_fingerprints.is_empty());
+}
+
+#[test]
+fn terminal_off_hint_preserves_quarantined_presence_without_forced_family_reads() {
+    let _on = ClaudeTerminalOffForTest::enabled();
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-hint-presence");
+    let roots = [
+        OFF_ROOT,
+        "b2222222-2222-4222-8222-222222222222",
+        "c3333333-3333-4333-8333-333333333333",
+    ];
+    for root in roots {
+        fs::write(
+            scratch.join(format!("{root}.jsonl")),
+            freshness_line(root, "X"),
+        )
+        .unwrap();
+    }
+    let mut index = off_index();
+    let baseline = off_scan(&mut index, &scratch, W1, 10);
+    off_accept(&mut index, &baseline);
+    let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
+    let key = local_index_key(&path);
+    let revision = index.files[&key].source_file_fingerprint.clone();
+    index.insert_retry_pending_claude_authority_at_revision_for_test(OFF_ROOT, &revision);
+    // Retained new-round candidate work keeps roots coalesced. Only the real
+    // stat-confirmed hint supplies R's presence before family membership.
+    index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .observed_index_keys
+        .clear();
+    for root in &roots[1..] {
+        index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .pending_candidates
+            .push_back(ScanTraversalPath {
+                scan_root: scratch.to_path_buf(),
+                path: scratch.join(format!("{root}.jsonl")),
+                census_member: false,
+                watcher_hint: false,
+            });
+    }
+    for pass in 0..3 {
+        let hints = if pass == 0 {
+            vec![path.clone()]
+        } else {
+            vec![]
+        };
+        let (_, reads) = terminal_contract_retry::source_acquisitions(|| {
+            sampled_scan::with_test_now(rfc3339_unix_seconds(W1).unwrap() + 1 + pass, || {
+                scan_source_roots_with_test_limit_and_hints(
+                    SnapshotSource::ClaudeCode,
+                    &[scratch.to_path_buf()],
+                    &mut index,
+                    W1,
+                    183,
+                    1,
+                    true,
+                    &hints,
+                )
+                .unwrap()
+            })
+        });
+        assert!(index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .observed_index_keys
+            .contains(&key));
+        assert_eq!(
+            reads.get(&path).copied().unwrap_or(0),
+            0,
+            "no ForcedFamily body read on a hinted unchanged quarantined root"
+        );
+        assert_eq!(index.files[&key].source_file_fingerprint, revision);
+        assert!(index
+            .claude_usage_authority_quarantine
+            .contains_key(OFF_ROOT));
+    }
+}
+
+#[test]
+fn terminal_off_to_default_off_discards_retained_checkpoint_before_reconciliation() {
+    assert!(!claude_terminal_off());
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-mode-transition");
+    for root in [OFF_ROOT, "b2222222-2222-4222-8222-222222222222"] {
+        fs::write(
+            scratch.join(format!("{root}.jsonl")),
+            freshness_line(root, "X"),
+        )
+        .unwrap();
+    }
+    let (mut index, on_context) = {
+        let _on = ClaudeTerminalOffForTest::enabled();
+        let mut index = off_index();
+        off_scan(&mut index, &scratch, W1, 10);
+        let context = index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .context_fingerprint
+            .clone();
+        (index, context)
+    };
+    assert!(!claude_terminal_off());
+    // A real save/reload drops no policy field: the existing context digest
+    // alone rejects the ON checkpoint in a new OFF process.
+    index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+    let keys = index.files.keys().cloned().collect::<BTreeSet<_>>();
+    index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .observed_index_keys
+        .clear();
+    let progress = ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[scratch.to_path_buf()],
+        &mut index,
+        W2,
+        183,
+    );
+    assert_eq!(progress, TraversalProgress::Started);
+    assert_ne!(
+        index.traversal.as_ref().unwrap().context_fingerprint,
+        on_context
+    );
+    assert!(
+        !index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_directories
+            .is_empty(),
+        "main starts a new walk instead of reconciling ON presence"
+    );
+    scan_source_roots_with_limit(
+        SnapshotSource::ClaudeCode,
+        &[scratch.to_path_buf()],
+        &mut index,
+        W2,
+        183,
+        1,
+        true,
+    )
+    .unwrap();
+    assert!(
+        keys.iter().all(|key| index.files.contains_key(key)),
+        "OFF cannot remove files from the retained ON traversal"
+    );
 }

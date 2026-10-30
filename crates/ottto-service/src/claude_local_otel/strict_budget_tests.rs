@@ -1,6 +1,8 @@
 use super::*;
 #[test]
 fn terminal_off_strict_growing_trace_obeys_actual_reader_allowance() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("strict-growing-trace");
     let root = "growing".to_string();
     let path = trace_evidence_path(&scratch, &root);

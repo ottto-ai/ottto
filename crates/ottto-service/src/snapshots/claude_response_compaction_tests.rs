@@ -223,6 +223,8 @@ fn charge<T: HeapLayoutBound>(value: &T) -> Option<usize> {
 
 #[test]
 fn claude_realistic_records_meet_the_per_response_charge_target() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -253,6 +255,8 @@ fn claude_realistic_records_meet_the_per_response_charge_target() {
 
 #[test]
 fn claude_realistic_record_charge_covers_requested_allocations() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -275,6 +279,8 @@ fn claude_realistic_record_charge_covers_requested_allocations() {
 
 #[test]
 fn claude_tool_heavy_seen_tool_use_walk_stays_under_the_visit_limit() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -448,6 +454,8 @@ fn speed_record(timestamp: Option<&str>, top_level: bool) -> Value {
 /// time. A "same as previous" dedupe would change the uploaded source.
 #[test]
 fn claude_equal_context_differing_sources_keep_parity_at_every_split() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let user = json!({"type": "user", "sessionId": SESSION, "timestamp": "2026-10-06T10:00:00Z", "message": {"role": "user", "content": "work"}});
     // Provider order r2, r1, r3: the terminal source is r3's top-level `speed`.
     let stamped = vec![
@@ -489,6 +497,8 @@ fn claude_equal_context_differing_sources_keep_parity_at_every_split() {
 /// response spans the retained boundary.
 #[test]
 fn claude_out_of_order_and_late_selector_responses_keep_parity_at_every_split() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let out_of_order: Vec<Value> = [
         r#"{"timestamp":"2026-09-11T08:31:20Z","sessionId":"claude-progressive-order","type":"user","message":{"role":"user","content":"work"}}"#,
         r#"{"timestamp":"2026-09-11T08:31:22.985Z","sessionId":"claude-progressive-order","type":"assistant","requestId":"req_progressive_order","speed":"standard","message":{"id":"msg_progressive_order","model":"claude-fable-5-1","usage":{"input_tokens":32,"output_tokens":1026,"cache_read_input_tokens":960010,"cache_creation":{"ephemeral_1h_input_tokens":6006}}}}"#,
@@ -533,6 +543,8 @@ fn claude_out_of_order_and_late_selector_responses_keep_parity_at_every_split() 
 /// short realistic session: every retained boundary tails to the full output.
 #[test]
 fn claude_realistic_session_keeps_parity_at_every_split() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let rows = realistic_rows(0..9, &[SHELL, CHROME[1]]);
     let item = full_item(&rows);
     assert_eq!(item.request_count, 9);
@@ -616,6 +628,8 @@ fn production_body(mut scan: SourceScanResult) -> Value {
 /// retained boundary falls inside response 600.
 #[test]
 fn claude_realistic_600_response_session_tails_with_full_read_parity() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -670,6 +684,8 @@ fn selector(fields: &[(&str, &str, &str)]) -> SelectorCapture {
 /// sources, malformed or equal timestamps and tool-use maps.
 #[test]
 fn claude_compact_records_decode_exactly() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
     let mut next = move |bound: usize| {
         state ^= state << 13;
@@ -838,6 +854,8 @@ fn decoded_baseline_charge(book: ClaudeResponseBook) -> usize {
 
 #[test]
 fn claude_near_cap_decode_is_reserved_before_retention_without_changing_output() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -938,6 +956,8 @@ fn claude_near_cap_decode_is_reserved_before_retention_without_changing_output()
 
 #[test]
 fn claude_decode_preflight_reserves_only_the_largest_response() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -969,6 +989,8 @@ fn claude_decode_preflight_reserves_only_the_largest_response() {
 
 #[test]
 fn claude_native_finish_peak_covers_decode_output_and_retained_copy() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1029,6 +1051,8 @@ fn claude_native_finish_peak_covers_decode_output_and_retained_copy() {
 
 #[test]
 fn claude_decode_bound_covers_inline_selectors_explicit_slots_and_tools() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1101,6 +1125,8 @@ fn claude_decode_bound_covers_inline_selectors_explicit_slots_and_tools() {
 
 #[test]
 fn claude_hourly_capability_buckets_remain_a_shared_visit_limit_residual() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1203,6 +1229,8 @@ fn raw_records_80() -> (
 /// are the same `None`.
 #[test]
 fn x_out_t3_decode_peak_and_copy_budget_match_main() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use super::claude_response_records::main_reference;
     let mut two = parser_for(&progressive_rows(128));
     for row in progressive_response(128, "2") {
@@ -1299,6 +1327,8 @@ fn x_out_t3_decode_peak_and_copy_budget_match_main() {
 /// `Some(peak)` with `output: None`; the peak never moves.
 #[test]
 fn x_out_t3_output_past_the_limit_keeps_the_peak() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1332,6 +1362,8 @@ fn x_out_t3_output_past_the_limit_keeps_the_peak() {
 /// nothing to the output term.
 #[test]
 fn x_out_t3_record_limit_exceeded_response_adds_no_output() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1701,6 +1733,8 @@ fn assert_x_out_covers_finish_with(
 /// T1 (adversarial sweep, R1a R8 union cases), with T4-T6 per case.
 #[test]
 fn x_out_t1_bounds_the_finished_claude_file() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1852,6 +1886,8 @@ fn x_out_t1_bounds_the_finished_claude_file() {
 /// bound or a larger cache budget.
 #[test]
 fn x_out_dark_covers_sparse_hours_and_copy_restoration() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Dark (gate-off) output bound by design: the test asserts !e2::enabled().
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
@@ -1904,6 +1940,8 @@ fn x_out_dark_covers_sparse_hours_and_copy_restoration() {
 /// against E, and everything born in finish against X_out (T6).
 #[test]
 fn x_out_e2_fold_worst_shapes_stay_within_e() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2021,6 +2059,8 @@ fn x_out_e2_fold_worst_shapes_stay_within_e() {
 /// proof releases nothing; the same file with a warm identity has one.
 #[test]
 fn x_out_refuses_a_cold_workspace_and_a_subagent() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2051,6 +2091,8 @@ fn x_out_refuses_a_cold_workspace_and_a_subagent() {
 /// hash, evidence strings and sets).
 #[test]
 fn x_out_t1_bounds_a_finish_with_attribution_and_identity_evidence() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2139,6 +2181,8 @@ fn x_out_t1_bounds_a_finish_with_attribution_and_identity_evidence() {
 /// any row.
 #[test]
 fn x_out_t6_covers_tiny_file_rows_with_attribution() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2209,6 +2253,8 @@ fn x_out_t6_covers_tiny_file_rows_with_attribution() {
 /// the term inside `finish_output_bound`.
 #[test]
 fn x_out_fact_limit_scratch_covers_adversarial_facts() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::session_attribution::{
         SessionAttributionFact, SessionFieldEvidence, MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES,
         MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES,
@@ -2325,6 +2371,8 @@ fn itemless_rows(responses: &[usize]) -> Vec<Value> {
 /// within X_out plus the decode peak.
 #[test]
 fn x_out_charges_buffered_request_hashes_of_an_itemless_file() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2453,6 +2501,8 @@ fn x_out_charges_buffered_request_hashes_of_an_itemless_file() {
 /// the kept title; then end to end, born within X_out plus the decode peak.
 #[test]
 fn x_out_u1_charges_desktop_title_normalization() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }

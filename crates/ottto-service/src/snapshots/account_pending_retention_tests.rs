@@ -41,6 +41,8 @@ fn retention_decision(mut index: ScanIndex, root: &str) -> (bool, serde_json::Va
 
 #[test]
 fn account_window_collapse_replays_real_retirement_and_holds() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let (dir, root, base) = retention_fixture();
     for blocker in [
@@ -95,6 +97,8 @@ fn account_window_collapse_replays_real_retirement_and_holds() {
 
 #[test]
 fn account_window_runs_preserve_a_b_a_and_revision_only_changes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (dir, root, base) = retention_fixture();
     for change in [
         "account",
@@ -177,6 +181,8 @@ fn account_window_runs_preserve_a_b_a_and_revision_only_changes() {
 
 #[test]
 fn account_window_unsafe_boundaries_are_untouched() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (dir, root, base) = retention_fixture();
     for boundary in [
         "unparsable",
@@ -202,6 +208,8 @@ fn account_window_unsafe_boundaries_are_untouched() {
 
 #[test]
 fn account_window_push_keeps_endpoints_and_change_points() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (dir, root, base) = retention_fixture();
     let mut pending = base.claude_account_family_pending[&root].clone();
     let original = pending.previous_windows.clone();
@@ -234,6 +242,8 @@ fn account_window_push_keeps_endpoints_and_change_points() {
 
 #[test]
 fn account_window_load_crash_retry_normal_save_and_old_decoder() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (dir, root, mut original) = retention_fixture();
     // Hold the family so normal save cannot retire it before the load fixture.
     original
@@ -286,6 +296,8 @@ fn account_window_load_crash_retry_normal_save_and_old_decoder() {
 
 #[test]
 fn account_window_consumer_fields_are_projection_fields() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Read the actual consumer's code, not a second hand-maintained field list.
     // Historical Window access is confined to retirement_observations; all
     // subsequent evidence reads have ConsumerProjection's type. Strict run
@@ -325,6 +337,8 @@ fn account_window_consumer_fields_are_projection_fields() {
 
 #[test]
 fn account_window_collapse_preserves_every_other_index_field_and_scan_identity() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (dir, root, mut index) = retention_fixture();
     let mut before = serde_json::to_value(&index).unwrap();
     // Drop the transcript fixture directory BEFORE collapsing. Collapse has
@@ -348,6 +362,8 @@ fn account_window_collapse_preserves_every_other_index_field_and_scan_identity()
 
 #[test]
 fn account_window_strict_comparison_covers_every_window_field() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Compilation itself is the coverage gate: strict_evidence exhaustively
     // destructures Window without `..`. Derive-based window equality below
     // independently checks that only the boundary may be excluded.
@@ -380,6 +396,8 @@ fn account_window_strict_comparison_covers_every_window_field() {
 
 #[test]
 fn account_window_retention_counts_use_existing_diagnostics_carrier() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (dir, _, mut index) = retention_fixture();
     index.collapse_account_pending_windows();
     let carrier =
@@ -398,6 +416,8 @@ fn account_window_retention_counts_use_existing_diagnostics_carrier() {
 
 #[test]
 fn account_window_opaque_holds_preserve_history_and_its_save_budget() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (dir, root, index) = retention_fixture();
     let mut wire = serde_json::to_value(&index).unwrap();
     wire["files"]["/synthetic/opaque.jsonl"] = json!({"size_bytes": []});

@@ -86,6 +86,8 @@ fn child_page(
 
 #[test]
 fn e2_body_of_previously_proven_family_is_not_a_demotion() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for healthy in [true, false] {
         // Today (gate off): an unreconstructable revision is a demotion and
@@ -166,6 +168,8 @@ fn e2_body_of_previously_proven_family_is_not_a_demotion() {
 
 #[test]
 fn money_cache_creation_normalizer_has_one_reading_for_every_caller() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::snapshots::claude_request_money::{claude_cache_creation, CacheCreation::*};
     for (total, five_m, one_h, expected) in [
         (0, 0, 0, Unattributed(0)),

@@ -101,6 +101,8 @@ mod tests {
     use super::*;
     #[test]
     fn terminal_off_strict_cohort_bounds_many_offpage_roots_and_continues() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let scratch = crate::test_scratch::ScratchDir::new("strict-cohort-service");
         let roots = (0..ROOTS_PER_PASS + 3)
             .map(|n| format!("root-{n:04}"))

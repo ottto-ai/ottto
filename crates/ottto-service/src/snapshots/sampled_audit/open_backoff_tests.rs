@@ -92,6 +92,8 @@ fn parked_alarms(records: &[serde_json::Value]) -> usize {
 
 #[test]
 fn held_open_failure_backs_off_parks_once_and_keeps_due_owed() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     reset_open_backoff_for_test();
     let root = Root::new("park");
     let failing = root.key("000-unavailable.jsonl");
@@ -205,6 +207,8 @@ fn held_open_failure_backs_off_parks_once_and_keeps_due_owed() {
 /// the original D, and the backoff entry is dropped.
 #[test]
 fn held_open_parked_key_stat_change_retries_at_owed_due() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     reset_open_backoff_for_test();
     let root = Root::new("stat");
     let failing = root.key("held.jsonl");
@@ -238,6 +242,8 @@ fn held_open_parked_key_stat_change_retries_at_owed_due() {
 /// converting a backing-off key carries its owed due.
 #[test]
 fn held_open_backoff_due_carries_into_rotation_and_restoration() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     reset_open_backoff_for_test();
     let root = Root::new("carry");
     let failing = root.key("a.jsonl");
@@ -266,6 +272,8 @@ fn held_open_backoff_due_carries_into_rotation_and_restoration() {
 /// turn with its owed due, never later, across a save/reload.
 #[test]
 fn held_open_backoff_overflow_evicts_oldest_and_keeps_its_due_owed() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     reset_open_backoff_for_test();
     let root = Root::new("overflow");
     let keys = (0..=OPEN_BACKOFF_KEYS)
@@ -321,6 +329,8 @@ fn held_open_backoff_overflow_evicts_oldest_and_keeps_its_due_owed() {
 
 #[test]
 fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_wakes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     reset_open_backoff_for_test();
     let root = Root::new("common-boundary");
     let path = root.0.join("a1111111-1111-4111-8111-111111111111.jsonl");
@@ -566,15 +576,21 @@ fn ordinary_open_keeps_other_slots_due(grown: bool) {
 
 #[test]
 fn ordinary_unchanged_open_keeps_due_with_another_slot_owner_and_saturated_markers() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     ordinary_open_keeps_other_slots_due(false);
 }
 #[test]
 fn ordinary_grown_open_keeps_due_with_another_slot_owner_and_saturated_markers() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     ordinary_open_keeps_other_slots_due(true);
 }
 
 #[test]
 fn blocked_due_debt_does_not_resample_neighbours_and_stat_change_wakes_recovery() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Drive real constructors/pages, not only the queueing helper. A secure
     // open denial is recorded with a readable stat, without chmod privileges.
     for failures in [1, OPEN_PARK_FAILURES] {
@@ -703,6 +719,8 @@ fn blocked_due_debt_does_not_resample_neighbours_and_stat_change_wakes_recovery(
 
 #[test]
 fn restoring_held_marker_preserves_same_stat_park_and_original_due() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     reset_open_backoff_for_test();
     let root = Root::new("marker-restoration-park");
     let path = root.0.join("parked.jsonl");

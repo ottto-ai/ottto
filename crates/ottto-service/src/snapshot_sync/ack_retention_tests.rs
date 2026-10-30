@@ -170,6 +170,8 @@ fn exact_ack(items: Vec<SnapshotItem>) -> Result<crate::snapshot_client::Snapsho
 
 #[test]
 fn committed_ack_survives_unrelated_empty_and_failed_pages_after_reload() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for mode in ["unrelated", "empty", "failed"] {
         let f = AckFixture::new(true);
         let (index, mut progress) = f.load();
@@ -219,6 +221,8 @@ fn committed_ack_survives_unrelated_empty_and_failed_pages_after_reload() {
 
 #[test]
 fn committed_ack_survives_bootstrap_only_input() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = AckFixture::new(true);
     let (_, mut progress) = f.load();
     let probe = crate::snapshots::cache_adapter_tests::cache_fixture_item();
@@ -242,6 +246,8 @@ fn committed_ack_survives_bootstrap_only_input() {
 
 #[test]
 fn ack_saved_before_index_crash_survives_real_empty_and_unrelated_deltas() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Same persistence seam as the contract-retry repro, using main's existing
     // paced RetryPending gate. No dependency on the separate contract-retry PR.
     for unrelated in [false, true] {
@@ -318,6 +324,8 @@ fn ack_saved_before_index_crash_survives_real_empty_and_unrelated_deltas() {
 
 #[test]
 fn changed_body_replaces_only_its_own_ack() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = AckFixture::new(true);
     let (_, mut progress) = f.load();
     let sibling = "d".repeat(64);
@@ -359,6 +367,8 @@ fn changed_body_replaces_only_its_own_ack() {
 
 #[test]
 fn retirement_requires_committed_scope_and_preserves_unindexed_carried_unknown_and_shared_acks() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for mode in [
         "retired",
         "carried",
@@ -434,6 +444,8 @@ fn retirement_requires_committed_scope_and_preserves_unindexed_carried_unknown_a
 
 #[test]
 fn ack_capacity_stops_admission_without_evicting_evidence_and_settlement_releases_it() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = AckFixture::new(true);
     let (mut index, mut progress) = f.load();
     // A small deterministic capacity drives the exact production admission seam.
@@ -487,6 +499,8 @@ fn ack_capacity_stops_admission_without_evicting_evidence_and_settlement_release
 
 #[test]
 fn default_unsettled_ack_budget_has_bounded_persisted_and_heap_size() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("ack-debt-bound");
     let path = scratch.join("progress.json");
     let mut progress = test_upload_progress();
@@ -520,6 +534,8 @@ fn default_unsettled_ack_budget_has_bounded_persisted_and_heap_size() {
 
 #[test]
 fn semantic_index_acceptance_cannot_dispose_a_newer_exact_body_ack() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = AckFixture::new(true);
     let (mut index, mut progress) = f.load();
     let newer_body = "f".repeat(64);
@@ -568,6 +584,8 @@ fn one_body_set_witness(body: &str) -> String {
 
 #[test]
 fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("bootstrap-ack-capacity");
     let index_path = scratch.join("index.json");
     let progress_path = scratch.join("progress.json");
@@ -702,6 +720,8 @@ fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
 
 #[test]
 fn partial_index_replacement_retires_only_proven_state_only_ack() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = AckFixture::new(true);
     let (index, mut progress) = f.load();
     let old = "d".repeat(64);
@@ -759,6 +779,8 @@ fn partial_index_replacement_retires_only_proven_state_only_ack() {
 
 #[test]
 fn vanished_files_retire_acks_at_the_next_committed_complete_census_without_growth() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = AckFixture::new(true);
     let mut owed = BTreeMap::from([(
         f.item.snapshot_fingerprint.clone(),
@@ -842,6 +864,8 @@ fn vanished_files_retire_acks_at_the_next_committed_complete_census_without_grow
 
 #[test]
 fn retirement_handoff_recovers_5000_acks_after_index_commit_and_cleanup_save_failures() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for failure in ["crash", "progress_cas", "index_cas"] {
         let scratch = crate::test_scratch::ScratchDir::new("ack-retirement-crash");
         let index_path = scratch.join("index.json");
@@ -996,6 +1020,8 @@ fn retirement_handoff_recovers_5000_acks_after_index_commit_and_cleanup_save_fai
 
 #[test]
 fn retirement_handoff_is_bound_to_destination_generation_body_and_saved_protections() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for mode in [
         "retire",
         "destination",
@@ -1075,6 +1101,8 @@ fn retirement_handoff_is_bound_to_destination_generation_body_and_saved_protecti
 
 #[test]
 fn unindexed_debt_cannot_borrow_unused_live_incidence_slots() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = AckFixture::new(false);
     let (mut index, mut progress) = f.load();
     for entity in 0..5000 {
@@ -1097,6 +1125,8 @@ fn unindexed_debt_cannot_borrow_unused_live_incidence_slots() {
 #[test]
 #[serial_test::serial(client_report)]
 fn capacity_outcome_reports_deferred_entities_without_counting_network_loss() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::client_report::{observe, reset_for_test, ClientReportReason};
     reset_for_test();
     for has_http_attempt in [true, false] {
@@ -1179,6 +1209,8 @@ fn capacity_outcome_reports_deferred_entities_without_counting_network_loss() {
 
 #[test]
 fn full_unindexed_debt_still_allows_a_live_entity_without_lending_slots_to_unrelated_input() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = AckFixture::new(false);
     let (index, mut progress) = f.load();
     for entity in 0..4096 {
@@ -1217,6 +1249,8 @@ fn full_unindexed_debt_still_allows_a_live_entity_without_lending_slots_to_unrel
 
 #[test]
 fn retirement_obligations_survive_opaque_decode_and_local_hold_cycles() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for mode in ["opaque", "entity_hold", "local_hold"] {
         let f = AckFixture::new(true);
         let (committed, progress) = f.load();
@@ -1302,6 +1336,8 @@ fn retirement_obligations_survive_opaque_decode_and_local_hold_cycles() {
 
 #[test]
 fn complete_census_retires_never_committed_vanished_acks_after_partial_error() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = AckFixture::new(false);
     let (committed, mut progress) = f.load();
     // F has two unsettled siblings. Only one was accepted before an error;
@@ -1385,6 +1421,8 @@ fn complete_census_retires_never_committed_vanished_acks_after_partial_error() {
 
 #[test]
 fn complete_census_recovers_a_stale_full_cap_and_allows_new_unrelated_upload() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = AckFixture::new(false);
     let (previous, mut progress) = f.load();
     for entity in 0..5000 {
@@ -1441,6 +1479,8 @@ fn complete_census_recovers_a_stale_full_cap_and_allows_new_unrelated_upload() {
 
 #[test]
 fn first_install_current_live_incidence_admits_more_than_4096_without_a_stop() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = AckFixture::new(false);
     let (mut scanned, mut progress) = f.load();
     let mut items = (0..4100)
@@ -1486,6 +1526,8 @@ fn first_install_current_live_incidence_admits_more_than_4096_without_a_stop() {
 
 #[test]
 fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = AckFixture::new(false);
     let (committed, mut progress) = f.load();
     let mut item = f.item.clone();
@@ -1582,6 +1624,8 @@ fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
 // still references it, so the obligation stays pending and the ACK stays.
 #[test]
 fn partial_save_keeps_a_pending_obligation_live_in_an_unsettled_new_file() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = AckFixture::new(true);
     let (committed, progress) = f.load();
     let entry = committed.files.values().next().unwrap().clone();
@@ -1743,6 +1787,8 @@ fn partial_save_keeps_a_pending_obligation_live_in_an_unsettled_new_file() {
 // subset names E, but the full scan still references it.
 #[test]
 fn partial_save_never_retires_a_committed_entity_moved_into_an_unsettled_new_file() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = AckFixture::new(true);
     let (committed, mut progress) = f.load();
     let key = committed.files.keys().next().unwrap().clone();
@@ -1886,6 +1932,8 @@ fn body_set_witness(bodies: &[String]) -> String {
 // Admission is per entity and settlement per file; the file must still settle.
 #[test]
 fn one_file_larger_than_the_unsettled_limit_converges_after_a_mid_file_page_failure() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     const DEBT: usize = 4096;
     const ENTITIES: usize = 5000;
     let f = AckFixture::new(false);
@@ -2034,6 +2082,8 @@ fn one_file_larger_than_the_unsettled_limit_converges_after_a_mid_file_page_fail
 #[test]
 #[serial_test::serial(source_cadences)]
 fn incomplete_census_capacity_stops_count_consecutively_and_reset() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let source = SnapshotSource::Pi;
     assert_eq!(
         ack_retention::note_capacity_stop_census(source, false, true),
@@ -2075,6 +2125,8 @@ fn incomplete_census_capacity_stops_count_consecutively_and_reset() {
 // its exact ACK suppressed until a valid absence proof (or adoption).
 #[test]
 fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_references() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for outcome in ["completed", "deferred", "rejected"] {
         let f = AckFixture::new(true);
         let (committed, progress) = f.load();
@@ -2203,6 +2255,8 @@ fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_
 // raw-set bypass.
 #[test]
 fn production_ack_retirement_cannot_apply_a_plain_set() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let module = include_str!("ack_retention.rs");
     let parent = include_str!("../snapshot_sync.rs");
     let production = &parent[..parent

@@ -244,6 +244,8 @@ fn drive(
 /// money only.
 #[test]
 fn reader_lends_every_complete_line_its_one_parse_before_money() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let first = json!({"cwd": "/w/a", "n": 1});
     let crlf = json!({"cwd": "/w/b", "n": 2});
     let last = json!({"cwd": "/w/c", "n": 3});
@@ -305,6 +307,8 @@ fn reader_lends_every_complete_line_its_one_parse_before_money() {
 /// receives the salvaged Codex envelope.
 #[test]
 fn overlong_line_is_empty_and_valueless_while_money_keeps_salvage() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let short = json!({"timestamp": "2026-10-01T00:00:00Z", "ordinal": 6});
     let after = json!({"timestamp": "2026-10-01T00:00:02Z", "ordinal": 8});
     let overlong = format!(
@@ -373,6 +377,8 @@ fn overlong_line_is_empty_and_valueless_while_money_keeps_salvage() {
 /// read from the sealed offset delivers it exactly once.
 #[test]
 fn sealed_fragment_is_delivered_only_after_its_newline() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let done = json!({"cwd": "/w/a"});
     let pending = json!({"cwd": "/w/late"});
     let mut bytes = [raw(&done), b"\n".to_vec()].concat();
@@ -422,6 +428,8 @@ fn sealed_fragment_is_delivered_only_after_its_newline() {
 /// that line exactly once.
 #[test]
 fn unplanned_claude_read_delivers_all_lines_from_zero_and_counts_them() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = Root::new("ld-unplanned");
     let path = root.file(SESSION);
     let first = row("/w/one", "u1");
@@ -488,6 +496,8 @@ fn unplanned_claude_read_delivers_all_lines_from_zero_and_counts_them() {
 /// pass selects, its results, nor its step (page) boundaries.
 #[test]
 fn registration_changes_no_selection_result_or_step_boundary() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = Root::new("ld-identity");
     for (session, cwd) in [
         ("5e551011-0000-4000-8000-00000000d1da", "/w/a"),
@@ -537,6 +547,8 @@ fn registration_changes_no_selection_result_or_step_boundary() {
 /// page counts no lines or bytes.
 #[test]
 fn skip_delivers_no_lines_and_ends_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = Root::new("ld-skip");
     append(
         &root.file(SESSION),
@@ -564,6 +576,8 @@ fn skip_delivers_no_lines_and_ends_once() {
 /// role is final before the first dispatch.
 #[test]
 fn comparison_target_read_calls_no_observer() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = Root::new("ld-comparison");
     append(
         &root.file(SESSION),
@@ -584,6 +598,8 @@ fn comparison_target_read_calls_no_observer() {
 /// D4/R5: a side read is rejected by the same begin predicate.
 #[test]
 fn side_read_calls_no_observer() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = Root::new("ld-side");
     append(
         &root.file(SESSION),
@@ -614,6 +630,8 @@ fn side_read_calls_no_observer() {
 /// no observer.
 #[test]
 fn codex_group_member_reads_call_no_observer() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (root, _) = super::codex_file_join::tests::fixture();
     let recorder = Recorder::default();
     let mut scan = OwnedSourceScan::new(
@@ -667,6 +685,8 @@ fn two_lines_delivered(recorder: &Recorder) -> impl Fn(&OwnedSourceScan) -> bool
 /// the page completes in that same step.
 #[test]
 fn file_removed_mid_read_ends_incomplete() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = Root::new("ld-held");
     three_line_file(&root);
     let recorder = Recorder::default();
@@ -683,6 +703,8 @@ fn file_removed_mid_read_ends_incomplete() {
 /// D6: a failed read ends once `Incomplete` and is counted.
 #[test]
 fn failed_read_ends_incomplete_and_is_counted() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = Root::new("ld-failed");
     three_line_file(&root);
     let recorder = Recorder::default();
@@ -705,6 +727,8 @@ fn failed_read_ends_incomplete_and_is_counted() {
 /// D6: a pass dropped mid-file still ends its open file once `Incomplete`.
 #[test]
 fn dropped_pass_ends_open_file_once_incomplete() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = Root::new("ld-dropped");
     three_line_file(&root);
     let recorder = Recorder::default();
@@ -721,6 +745,8 @@ fn dropped_pass_ends_open_file_once_incomplete() {
 /// and physical-line delivery preserve its nonzero absolute byte origin.
 #[test]
 fn planned_tail_delivers_absolute_offsets_on_linux() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::transcript_acquisition::{ReadMode, ReadPlan, Scope};
     use std::io::Read as _;
 
@@ -801,6 +827,8 @@ fn planned_tail_delivers_absolute_offsets_on_linux() {
 /// file delivers nothing; a rewrite is a Full from 0 again.
 #[test]
 fn sampled_full_tail_unchanged_and_reset_deliver_by_mode() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -876,6 +904,8 @@ fn sampled_full_tail_unchanged_and_reset_deliver_by_mode() {
 /// fresh Full from 0: every line once, the Tail's line not repeated.
 #[test]
 fn in_place_full_fallback_after_tail_is_one_fresh_full_delivery() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1009,6 +1039,8 @@ fn candidates(index: &ScanIndex) -> Vec<PathBuf> {
 /// exactly as before, and counter state is no gate input.
 #[test]
 fn walk_gate_counts_age_and_size_skips_without_changing_selection() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = Root::new("ld-walk-gate");
     let project = root.projects().join("p");
     fs::create_dir_all(&project).unwrap();
@@ -1069,6 +1101,8 @@ fn walk_gate_counts_age_and_size_skips_without_changing_selection() {
 /// appearing in an already-walked directory.
 #[test]
 fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = Root::new("ld-roster-gate");
     let day = root.projects().join("2026/10/01");
     fs::create_dir_all(&day).unwrap();
@@ -1138,6 +1172,8 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
 /// bytes in its absolute ends. Unterminated bytes remain undelivered.
 #[test]
 fn physical_ends_include_skipped_bytes_across_reader_yields() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let data = [
         b"\n{bad\n\xff\n".to_vec(),
         format!("{}\n", "x".repeat(400)).into_bytes(),
@@ -1173,6 +1209,8 @@ fn physical_ends_include_skipped_bytes_across_reader_yields() {
 
 #[test]
 fn codex_prelude_registration_preserves_money_receipts_proofs_and_body_with_salvage() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = Root::new("prelude-money");
     let sessions = root.0.join("sessions");
     fs::create_dir(&sessions).unwrap();
@@ -1275,6 +1313,8 @@ fn codex_prelude_registration_preserves_money_receipts_proofs_and_body_with_salv
 
 #[test]
 fn codex_scan_destruction_counts_nonterminal_prelude_gap() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = Root::new("prelude-drop");
     let sessions = root.0.join("sessions");
     fs::create_dir(&sessions).unwrap();
@@ -1322,6 +1362,8 @@ fn codex_scan_destruction_counts_nonterminal_prelude_gap() {
 
 #[test]
 fn codex_cursor_yield_drops_prefix_before_late_token_record() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1383,6 +1425,8 @@ fn codex_cursor_yield_drops_prefix_before_late_token_record() {
 /// or disk restore is exercised.
 #[test]
 fn codex_warm_acquisition_after_feed_restart_is_unseen_not_a_new_prelude() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1446,6 +1490,8 @@ fn codex_warm_acquisition_after_feed_restart_is_unseen_not_a_new_prelude() {
 #[cfg(unix)]
 #[test]
 fn codex_symlinked_root_leaf_resolves_home_and_delivers_lines() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = Root::new("prelude-symlink-root");
     let home = root.0.join("home");
     let real = root.0.join("relocated");
@@ -1497,6 +1543,8 @@ fn codex_symlinked_root_leaf_resolves_home_and_delivers_lines() {
 /// this checks delivery, not acquisition's sealed-fragment restart policy.
 #[test]
 fn codex_live_observer_waits_for_the_physical_newline_then_observes_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use std::io::{Seek, SeekFrom};
     let root = Root::new("prelude-live-newline");
     let path = root.file("fixture");
@@ -1606,6 +1654,8 @@ fn codex_live_observer_waits_for_the_physical_newline_then_observes_once() {
 
 #[test]
 fn codex_live_observer_skips_an_actual_overlong_row_before_terminal_usage() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = Root::new("prelude-live-overlong");
     let path = root.file("fixture");
     let meta = raw(

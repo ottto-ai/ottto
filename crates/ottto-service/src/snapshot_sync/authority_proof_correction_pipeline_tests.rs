@@ -1534,6 +1534,8 @@ impl Drop for ApcFixture {
 #[test]
 #[serial(source_manifests)]
 fn changed_proof_after_terminal_authority_owes_one_exact_correction() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
@@ -1569,6 +1571,8 @@ fn changed_proof_after_terminal_authority_owes_one_exact_correction() {
 #[test]
 #[serial(source_manifests)]
 fn account_held_member_stays_owed_while_owed_siblings_drain_across_passes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
@@ -1856,6 +1860,8 @@ fn superseded_revision_ack_never_drains_the_current_revision() {
 #[test]
 #[serial(source_manifests)]
 fn unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
@@ -1912,6 +1918,8 @@ fn unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant() {
 #[test]
 #[serial(source_manifests)]
 fn new_request_after_the_grant_fails_then_one_new_proof_regrants_all_members() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
@@ -2013,6 +2021,8 @@ fn new_request_after_the_grant_fails_then_one_new_proof_regrants_all_members() {
 #[test]
 #[serial(source_manifests)]
 fn natural_owed_members_drain_on_separate_bounded_pages() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
@@ -2123,6 +2133,8 @@ fn natural_owed_members_drain_on_separate_bounded_pages() {
 #[test]
 #[serial(source_manifests)]
 fn controlled_three_owed_members_settle_on_their_own_pages_while_one_is_account_held() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
@@ -2467,18 +2479,24 @@ fn apc_checkpoint_last_owed_empty_agent(prior: bool, census_complete: bool) {
 
 #[test]
 fn controlled_last_owed_empty_member_with_a_prior_entity_rolls_back_on_a_partial_checkpoint() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     apc_checkpoint_last_owed_empty_agent(true, false);
     apc_checkpoint_last_owed_empty_agent(true, true);
 }
 
 #[test]
 fn controlled_last_owed_empty_member_without_a_prior_entity_carries_its_pair_and_drains() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     apc_checkpoint_last_owed_empty_agent(false, false);
     apc_checkpoint_last_owed_empty_agent(false, true);
 }
 
 #[test]
 fn last_empty_correction_completes_replay_in_its_drain_cycle() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for complete in [false, true] {
         for (outcome, held, expected_transport) in [
             ("completed", false, true),
@@ -2609,6 +2627,8 @@ fn exact_permanent_refusal_drains_correction_and_keeps_refusal_witness() {
 #[test]
 #[serial(source_manifests)]
 fn retryable_refusal_keeps_its_member_owed_across_restart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _manifests = SourceManifestTestGuard::new();
@@ -2630,6 +2650,8 @@ fn retryable_refusal_keeps_its_member_owed_across_restart() {
 #[test]
 #[serial(source_manifests)]
 fn complete_cutoff_drains_without_upload_or_repeated_grant_parse() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _manifests = SourceManifestTestGuard::new();
@@ -2659,6 +2681,8 @@ fn complete_cutoff_drains_without_upload_or_repeated_grant_parse() {
 /// allocation-request accounting, not RSS.
 #[test]
 fn locked_partial_checkpoint_requested_bytes_receipt() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scan = apc_m2_scan(false);
     let variants: [(&str, usize, bool, bool); 4] = [
         ("v1", 0, false, true),
@@ -2744,6 +2768,8 @@ fn locked_partial_checkpoint_requested_bytes_receipt() {
 #[serial(source_manifests)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_quarantine() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     assert!(
@@ -2827,6 +2853,8 @@ fn retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_qua
 #[test]
 #[serial(source_manifests)]
 fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _manifests = SourceManifestTestGuard::new();
@@ -2940,6 +2968,8 @@ fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
 #[test]
 #[serial(source_manifests)]
 fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _manifests = SourceManifestTestGuard::new();
@@ -3099,6 +3129,8 @@ fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() 
 #[test]
 #[serial(source_manifests)]
 fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-e2-flip", false);
     let grant = {
@@ -3164,6 +3196,8 @@ fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
 #[test]
 #[serial(source_manifests)]
 fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("e2-tombstone-returns", false);
     let family = apc_family_sessions();
@@ -3287,6 +3321,8 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
 #[test]
 #[serial(source_manifests)]
 fn terminal_off_new_cohort_correction_evidence_waits_durably_for_reconstruction() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("terminal-off-delayed-proof-custody", false);

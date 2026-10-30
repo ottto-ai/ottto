@@ -3,6 +3,8 @@ use crate::snapshots::terminal_contract_retry::with_contract;
 
 #[test]
 fn terminal_contract_v1_to_v2_one_paced_attempt_then_terminal_on_failure() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-contract-progress");
     let path = scratch.join("progress.json");
     let fingerprint = "a".repeat(64);
@@ -77,6 +79,8 @@ fn terminal_contract_v1_to_v2_one_paced_attempt_then_terminal_on_failure() {
 
 #[test]
 fn terminal_contract_current_and_future_versions_and_superseded_never_rearm() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut progress = test_upload_progress();
     let fingerprint = "a".repeat(64);
     for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
@@ -114,6 +118,8 @@ fn terminal_contract_current_and_future_versions_and_superseded_never_rearm() {
 
 #[test]
 fn terminal_contract_newer_index_assessment_dominates_stale_progress() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut progress = test_upload_progress();
     let fingerprint = "a".repeat(64);
     for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
@@ -136,6 +142,8 @@ fn terminal_contract_newer_index_assessment_dominates_stale_progress() {
 
 #[test]
 fn terminal_contract_permanent_refusal_keeps_its_existing_gate() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-contract-permanent");
     let path = scratch.join("progress.json");
     let fingerprint = "a".repeat(64);
@@ -336,6 +344,8 @@ impl RetainedRetryFixture {
 
 #[test]
 fn terminal_contract_malformed_values_keep_both_checkpoints_and_one_paced_debt() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let malformed = [
         serde_json::Value::Null,
         serde_json::json!("2"),
@@ -594,11 +604,15 @@ fn successful_contract_retry(restart_after_selection: bool) {
 
 #[test]
 fn terminal_contract_bump_successful_ack_settles_once_with_stale_index() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     successful_contract_retry(false);
 }
 
 #[test]
 fn terminal_contract_restart_after_saved_lease_keeps_owed_attempt_and_identity() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     successful_contract_retry(true);
 }
 
@@ -887,19 +901,27 @@ fn contract_read_cap(outcome: InterruptedOutcome, unbound_body: bool) {
 
 #[test]
 fn terminal_contract_restart_before_outcome_allows_one_more_paced_source_read() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     contract_read_cap(InterruptedOutcome::Restart, false);
 }
 #[test]
 fn terminal_contract_repeated_conflicts_cap_actual_source_reads_at_two() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     contract_read_cap(InterruptedOutcome::Conflict, false);
 }
 #[test]
 fn terminal_contract_failed_outcome_save_caps_actual_source_reads_at_two() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     contract_read_cap(InterruptedOutcome::SaveFailure, false);
 }
 
 #[test]
 fn terminal_contract_stale_index_and_same_generation_cas_keep_maximum_claim() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = ReadBudgetFixture::new();
     with_contract(2, || {
         let (_, progress) = fixture.due_claim();
@@ -947,6 +969,8 @@ fn terminal_contract_stale_index_and_same_generation_cas_keep_maximum_claim() {
 
 #[test]
 fn terminal_contract_malformed_claims_exhaust_without_reset_or_opaque_hold() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for bad in [
         serde_json::Value::Null,
         serde_json::json!("1"),
@@ -1002,6 +1026,8 @@ fn terminal_contract_malformed_claims_exhaust_without_reset_or_opaque_hold() {
 
 #[test]
 fn terminal_contract_next_version_starts_a_distinct_paced_budget() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut progress = test_upload_progress();
     let fp = "a".repeat(64);
     for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
@@ -1042,6 +1068,8 @@ fn terminal_contract_next_version_starts_a_distinct_paced_budget() {
 
 #[test]
 fn terminal_contract_legacy_unknown_body_conflicts_keep_the_two_source_read_cap() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     contract_read_cap(InterruptedOutcome::Conflict, true);
 }
 
@@ -1219,9 +1247,13 @@ fn contract_ack_saved_before_index_restart(unrelated: bool) {
 
 #[test]
 fn terminal_contract_ack_saved_before_index_restart_survives_empty_delta() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     contract_ack_saved_before_index_restart(false);
 }
 #[test]
 fn terminal_contract_ack_saved_before_index_restart_survives_unrelated_only_delta() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     contract_ack_saved_before_index_restart(true);
 }

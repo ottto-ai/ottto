@@ -502,6 +502,8 @@ const HISTORY_REVISION_2: HistoryCycle<'static> = HistoryCycle {
 /// with its census record, and the next two cycles do not re-read anything.
 #[test]
 fn quarantined_index_after_bootstrap_holds_all_history_without_a_list() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-quarantine");
     fixture.baseline();
     fixture.corrupt_backfill_state();
@@ -567,6 +569,8 @@ fn quarantined_index_after_bootstrap_holds_all_history_without_a_list() {
 /// re-sent at once (StateMissing N1).
 #[test]
 fn historical_replay_after_bootstrap_paces_history_without_a_list() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-replay");
     let baseline = fixture.baseline();
     assert!(baseline.generation > 0);
@@ -600,6 +604,8 @@ fn historical_replay_after_bootstrap_paces_history_without_a_list() {
 /// rebuilt history is paced through the budget, not held for good.
 #[test]
 fn quarantined_index_without_an_intended_list_paces_history() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-quarantine-paced");
     fixture.baseline();
     assert_eq!(
@@ -634,6 +640,8 @@ fn quarantined_index_without_an_intended_list_paces_history() {
 /// settles: the next cycle reads nothing.
 #[test]
 fn upload_context_change_does_not_carry_history_past_the_gate() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-upload-context");
     let baseline = fixture.baseline();
     // Held where no list is intended only on an unverified Mac (N1).
@@ -677,6 +685,8 @@ fn upload_context_change_does_not_carry_history_past_the_gate() {
 /// mtime equal) is unchanged history: held, never emitted, and settled.
 #[test]
 fn rearmed_unchanged_history_is_held_and_settles() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-rearmed");
     let mut baseline = fixture.baseline();
     for entry in baseline.files.values_mut() {
@@ -703,6 +713,8 @@ fn rearmed_unchanged_history_is_held_and_settles() {
 /// after a quarantine is paced and a listed family is never emitted.
 #[test]
 fn installed_list_paces_rebuilt_history_and_denies_listed_families() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-list-budget");
     fixture.baseline();
     fixture.install_list(&[HISTORY_SESSIONS[0]]);
@@ -732,6 +744,8 @@ fn installed_list_paces_rebuilt_history_and_denies_listed_families() {
 /// fixture no longer starts from one.
 #[test]
 fn fresh_install_without_a_prior_bootstrap_ingests_new_files() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-fresh");
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
         let fresh = fixture.cycle(
@@ -754,6 +768,8 @@ fn fresh_install_without_a_prior_bootstrap_ingests_new_files() {
 /// ordinary sync, and they settle at the active revision.
 #[test]
 fn only_files_that_grew_after_a_rebuild_emit() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-growth");
     fixture.baseline();
     fixture.corrupt_backfill_state();
@@ -782,6 +798,8 @@ fn only_files_that_grew_after_a_rebuild_emit() {
 /// and the override witness re-arms the seven-day guard.
 #[test]
 fn user_repair_override_rebuild_keeps_history_held() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::snapshots::ScanIndexRebuildOverride;
     let fixture = HistoryFixture::new("history-upgrade-user-repair-override");
     fixture.baseline();
@@ -840,6 +858,8 @@ fn user_repair_override_rebuild_keeps_history_held() {
 /// settlement), and held history still uploads nothing.
 #[test]
 fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::snapshots::ScanIndexRebuildOverride;
     let fixture = HistoryFixture::new("history-upgrade-override-identity");
     fixture.baseline();
@@ -921,6 +941,8 @@ fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
 /// release must reconstruct those files with zero re-offer of accepted history.
 #[test]
 fn user_repair_override_carries_accepted_history_through_census_and_release() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::snapshots::ScanIndexRebuildOverride;
     let fixture = HistoryFixture::new("history-override-carried-ack-release");
     let baseline = fixture.baseline();
@@ -1036,6 +1058,8 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
 /// SOURCE N1 third half: vanished history releases only on a healthy complete terminal.
 #[test]
 fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::snapshots::ScanIndexRebuildOverride;
     let fixture = HistoryFixture::new("history-override-carried-ack-gone");
     let baseline = fixture.baseline();
@@ -1150,6 +1174,8 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
 /// root is owed and held, never settled as revision-3 history.
 #[test]
 fn revision_three_listed_change_emits_its_ordinary_body_without_the_literal() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     crate::snapshots::with_max_gated_claude_revision(3, || {
         use crate::snapshots::{history_local_count, HistoryLocalCount};
         let fixture = HistoryFixture::new("history-upgrade-revision-three");
@@ -1210,6 +1236,8 @@ fn revision_three_listed_change_emits_its_ordinary_body_without_the_literal() {
 /// and a stored 3 is never downgraded by revision 2.
 #[test]
 fn revision_two_syncs_listed_changes_and_never_downgrades_three() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-revision-two-listed");
     fixture.baseline();
     fixture.install_list(&[HISTORY_SESSIONS[0]]);
@@ -1245,6 +1273,8 @@ fn revision_two_syncs_listed_changes_and_never_downgrades_three() {
 /// one is held and keeps 2, an unlisted one upgrades back to 3.
 #[test]
 fn a_re_owed_file_goes_back_through_the_gate() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     crate::snapshots::with_max_gated_claude_revision(3, || {
         use crate::snapshots::{history_local_count, HistoryLocalCount};
         let fixture = HistoryFixture::new("history-upgrade-reowe");
@@ -1290,6 +1320,8 @@ fn a_re_owed_file_goes_back_through_the_gate() {
 /// file born after the cutoff still ingests.
 #[test]
 fn seen_marker_rebuild_latch_and_cutoff_feed_one_decision() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-latch");
     fixture.baseline();
     fixture.install_list(&[]);
@@ -1361,6 +1393,8 @@ fn seen_marker_rebuild_latch_and_cutoff_feed_one_decision() {
 /// revision; the next completed page holds it again.
 #[test]
 fn held_history_never_settles_as_accepted_on_a_deferred_page() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-deferred");
     fixture.baseline();
     fixture.corrupt_backfill_state();
@@ -1405,6 +1439,8 @@ fn held_history_never_settles_as_accepted_on_a_deferred_page() {
 /// hold reaches the later of the two.
 #[test]
 fn quarantined_index_holds_history_born_after_the_no_list_cutoff() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-quarantine-real-cutoff");
     fixture.baseline();
     fixture.corrupt_backfill_state();
@@ -1423,6 +1459,8 @@ fn quarantined_index_holds_history_born_after_the_no_list_cutoff() {
 /// paced through the budget (one per page here), not re-sent as new.
 #[test]
 fn quarantined_index_sibling_alone_is_prior_history() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-sibling");
     fixture.baseline();
     fixture.corrupt_index();
@@ -1444,6 +1482,8 @@ fn quarantined_index_sibling_alone_is_prior_history() {
 /// marker and arms no bootstrap.
 #[test]
 fn unreadable_backfill_state_emits_no_history_from_a_rebuilt_index() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for (name, quarantine) in [
         ("history-upgrade-unreadable-quarantined", true),
         ("history-upgrade-unreadable-missing", false),
@@ -1486,6 +1526,8 @@ fn unreadable_backfill_state_emits_no_history_from_a_rebuilt_index() {
 /// history. The entries' births are old (the no-list cutoff seam).
 #[test]
 fn unreadable_backfill_state_arms_no_replay_over_a_populated_index() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-unreadable-populated");
     let baseline = fixture.baseline();
     fixture.corrupt_backfill_state();
@@ -1520,6 +1562,8 @@ fn unreadable_backfill_state_arms_no_replay_over_a_populated_index() {
 /// (`move_not_full`), also after the new destination's own bootstrap.
 #[test]
 fn new_destination_holds_history_born_before_the_claim() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-new-destination");
     fixture.baseline();
     // The first destination's bootstrap completes after its first cycle.
@@ -1549,6 +1593,8 @@ fn new_destination_holds_history_born_before_the_claim() {
 /// because the last claim was an explicit `full`.
 #[test]
 fn explicit_full_move_paces_history_born_before_the_claim() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-full-move");
     fixture.baseline();
     fixture.cycle(
@@ -1595,6 +1641,8 @@ fn explicit_full_move_paces_history_born_before_the_claim() {
 /// before any bootstrap completes.
 #[test]
 fn different_user_cutoff_excludes_history_without_the_gate() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-different-user");
     let mut state = crate::backfill::BackfillState::default();
     crate::backfill::mark_backfill_complete_for_destination(
@@ -1639,11 +1687,15 @@ fn different_user_cutoff_excludes_history_without_the_gate() {
 /// ungated.
 #[test]
 fn same_user_reclaim_keeps_the_cutoff_but_gates_the_new_destination() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     same_user_reclaim_is_gated(true);
 }
 
 #[test]
 fn same_user_reclaim_before_bootstrap_is_still_gated() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     same_user_reclaim_is_gated(false);
 }
 
@@ -1742,6 +1794,8 @@ fn same_user_reclaim_is_gated(complete_bootstrap: bool) {
 /// not grant the different-user exception, even after bootstrap completion.
 #[test]
 fn an_unbound_legacy_cutoff_does_not_exempt_a_new_destination() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::snapshots::PriorHistory;
     let fixture = HistoryFixture::new("history-upgrade-unbound-cutoff");
     let mut state = crate::backfill::BackfillState {
@@ -1772,6 +1826,8 @@ fn an_unbound_legacy_cutoff_does_not_exempt_a_new_destination() {
 /// closed); a clean support state is not.
 #[test]
 fn quarantined_ledger_and_unreadable_marker_are_prior_history() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::snapshots::PriorHistory;
     let fixture = HistoryFixture::new("history-upgrade-probes");
     let backfill = crate::backfill::BackfillState::default();
@@ -1826,6 +1882,8 @@ fn quarantined_ledger_and_unreadable_marker_are_prior_history() {
 /// before its first index save would otherwise hold its own history.
 #[test]
 fn only_server_attested_ledger_records_are_prior_history() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-ledger");
     let backfill = crate::backfill::BackfillState::default();
     let mut progress = test_upload_progress();
@@ -1863,6 +1921,8 @@ fn only_server_attested_ledger_records_are_prior_history() {
 /// the indexed history stays held (a move without a `full` claim).
 #[test]
 fn resumed_pre_gate_index_on_a_new_destination_records_the_cutoff() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-resumed-pre-gate");
     let destination_b = Some("history-upgrade-destination-b");
     let partial = fixture.cycle(
@@ -1934,6 +1994,8 @@ fn resumed_pre_gate_index_on_a_new_destination_records_the_cutoff() {
 /// for the new destination; the new destination's own files are not.
 #[test]
 fn another_destinations_claude_state_is_prior_history() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-other-destination");
     let backfill = crate::backfill::BackfillState::default();
     let progress = test_upload_progress();
@@ -1995,6 +2057,8 @@ fn another_destinations_claude_state_is_prior_history() {
 /// even with no history budget; the indexed history is paced, not held.
 #[test]
 fn session_created_after_a_pre_gate_index_last_receipt_is_uploaded() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-downtime");
     fixture.baseline();
     let mut saved: serde_json::Value =
@@ -2037,6 +2101,8 @@ fn session_created_after_a_pre_gate_index_last_receipt_is_uploaded() {
 /// rest is paced through the budget.
 #[test]
 fn intended_list_holds_listed_families_and_paces_the_rest_after_a_quarantine() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-intended-list");
     fixture.baseline();
     fixture.install_list(&[HISTORY_SESSIONS[0]]);
@@ -2072,6 +2138,8 @@ fn intended_list_holds_listed_families_and_paces_the_rest_after_a_quarantine() {
 /// budget, after a quarantine as on an intact index.
 #[test]
 fn seen_marker_without_the_list_pauses_all_history() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("history-upgrade-list-missing");
     fixture.baseline();
     fixture.install_list(&[]);
@@ -2099,6 +2167,8 @@ fn seen_marker_without_the_list_pauses_all_history() {
 /// paths; the allowed unlisted history is still paced at revision <= 2.
 #[test]
 fn over_budget_rebuild_preserves_history_holds_list_latch_and_pacing() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // No intended list plus unreadable prior evidence: fail closed, not fresh.
     let fixture = HistoryFixture::new("history-budget-unverified");
     fixture.baseline();
@@ -2269,6 +2339,8 @@ fn assert_rootless_family_held(outcome: &HistoryOutcome) {
 /// listed by its own line and is not counted.
 #[test]
 fn listed_member_holds_its_siblings_through_the_pipeline_without_the_root_file() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for (sibling, name) in [
         ("agent-b", "history-upgrade-rootless-after"),
         ("agent-0", "history-upgrade-rootless-before"),
@@ -2285,6 +2357,8 @@ fn listed_member_holds_its_siblings_through_the_pipeline_without_the_root_file()
 /// as held through the absent root.
 #[test]
 fn listed_root_holds_every_subagent_through_the_pipeline_without_the_root_file() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (outcome, lines) = rootless_family_rebuild(
         "history-upgrade-rootless-listed-root",
         &["agent-a", "agent-b"],
@@ -2415,6 +2489,8 @@ fn e2_history_assert_prior_tuple(before: &ScanIndex, after: &ScanIndex, key: &st
 
 #[test]
 fn e2_refused_twins_keep_prior_tuple_and_stay_owed_while_siblings_settle() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("e2-refused-history-twins");
     let refused = HISTORY_SESSIONS[0];
     let copy = fixture.root.join("other-project");
@@ -2473,6 +2549,8 @@ fn e2_refused_twins_keep_prior_tuple_and_stay_owed_while_siblings_settle() {
 
 #[test]
 fn e2_ok_unhealthy_root_holds_history_then_healthy_read_settles_reported_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for failure in [
         "api-malformed",
         "trace-malformed",
@@ -2562,6 +2640,8 @@ fn e2_ok_unhealthy_root_holds_history_then_healthy_read_settles_reported_once() 
 
 #[test]
 fn e2_no_sidecar_old_history_settles_with_incomplete_token_estimates() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("e2-history-no-sidecar");
     fixture.baseline();
     with_e2_history(&fixture, || {
@@ -2610,6 +2690,8 @@ fn e2_history_pages(
 /// once, under the same budget.
 #[test]
 fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_files() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::snapshots::claude_money_birth_store::location_key;
     use crate::snapshots::claude_request_money::e2::{money_mark, with_money_rules};
     use crate::snapshots::{history_local_count, HistoryLocalCount};
@@ -2722,6 +2804,8 @@ fn e2_assert_ordinary_body(outcome: &HistoryOutcome, session: &str) {
 /// listed file is never stamped 3 nor re-read by revision 3.
 #[test]
 fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("e2-listed-ordinary");
     fixture.baseline();
     fixture.cycle("2026-08-02T08:30:00Z", HISTORY_REVISION_2);
@@ -2769,6 +2853,8 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
 /// while the list pauses adoption), never the literal and never withheld.
 #[test]
 fn e2_missing_list_pauses_history_and_keeps_changes_on_ordinary_money() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("e2-list-missing-ordinary");
     fixture.baseline();
     fixture.install_list(&[]);
@@ -2807,6 +2893,8 @@ fn e2_missing_list_pauses_history_and_keeps_changes_on_ordinary_money() {
 
 #[test]
 fn e2_live_trace_read_failure_keeps_body_but_never_claims_complete() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("e2-live-bad-trace");
     e2_history_reported(&fixture, HISTORY_SESSIONS[0], 0);
     std::fs::write(
@@ -2839,6 +2927,8 @@ fn e2_live_trace_read_failure_keeps_body_but_never_claims_complete() {
 
 #[test]
 fn e2_unhealthy_root_holds_owed_agent_history_too() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("e2-history-agent-health");
     let root = HISTORY_SESSIONS[0];
     let agent = "a4d1585d310070d0f";
@@ -2914,6 +3004,8 @@ fn e2_unhealthy_root_holds_owed_agent_history_too() {
 
 #[test]
 fn e2_repaired_between_attachment_and_strict_read_stays_owed_until_next_page() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("e2-history-repair-during-read");
     let baseline = fixture.baseline();
     let root = HISTORY_SESSIONS[0];
@@ -2960,6 +3052,8 @@ fn e2_repaired_between_attachment_and_strict_read_stays_owed_until_next_page() {
 
 #[test]
 fn e2_side_call_census_deadline_holds_root_history_then_counts_side_call_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("e2-history-side-call-deadline");
     let baseline = fixture.baseline();
     let root = HISTORY_SESSIONS[0];
@@ -3029,6 +3123,8 @@ fn e2_side_call_census_deadline_holds_root_history_then_counts_side_call_once() 
 
 #[test]
 fn e2_production_contract_and_revision_share_one_paced_reread_behind_closed_fence() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::snapshots::claude_request_identity::{with_cycle_contract_for_test, E2_GROUPING};
     let fixture = HistoryFixture::new("e2-contract-one-paced-pass");
     fixture.install_list(&[HISTORY_SESSIONS[0]]);
@@ -3089,6 +3185,8 @@ fn e2_production_contract_and_revision_share_one_paced_reread_behind_closed_fenc
 
 #[test]
 fn e2_unlisting_replays_the_legacy_money_mark_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::snapshots::claude_money_birth_store::location_key;
     use crate::snapshots::claude_request_money::e2::money_mark;
     let fixture = HistoryFixture::new("e2-unlist-money-mark");
@@ -3129,6 +3227,8 @@ fn e2_unlisting_replays_the_legacy_money_mark_once() {
 
 #[test]
 fn e2_stem_listed_before_root_indexing_counts_each_session_request_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = HistoryFixture::new("e2-stem-first-cycle");
     let root = HISTORY_SESSIONS[0];
     let agent = "a4d1585d310070d0f";
@@ -3205,6 +3305,8 @@ fn e2_stem_listed_before_root_indexing_counts_each_session_request_once() {
 /// `e2_late_identity_permit_reowes_nothing_and_discloses_unpermitted_stamps`.
 #[test]
 fn e2_always_on_contract_reowes_no_uncaptured_history() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::snapshots::claude_money_birth_store::location_key;
     use crate::snapshots::claude_request_identity::{with_cycle_contract_for_test, E2_GROUPING};
     use crate::snapshots::{history_local_count, HistoryLocalCount};
@@ -3291,6 +3393,8 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
 /// only if the restamp ran.
 #[test]
 fn e2_restamp_carries_the_retired_permit_bit() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::snapshots::claude_money_birth_store::location_key;
     use crate::snapshots::claude_request_identity::{with_cycle_contract_for_test, E2_GROUPING};
     const RETIRED_PERMIT_MARK: u8 = 64;

@@ -19,6 +19,8 @@ use super::*;
 #[test]
 #[serial(source_manifests)]
 fn accepted_retry_no_otel_change_ack_then_carry_again() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("accepted_body_retry") {
         return;
     }
@@ -375,6 +377,8 @@ fn c1b_without_full_rearm_window(fixture: &RearmFixture) {
 #[test]
 #[serial(source_manifests)]
 fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("c1b_unrelated_red_window") {
         return;
     }
@@ -444,6 +448,8 @@ fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
 #[test]
 #[serial(source_manifests)]
 fn c1b_invalid_pending_keeps_base_rearm() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("c1b_invalid_pending") {
         return;
     }
@@ -476,6 +482,8 @@ fn c1b_invalid_pending_keeps_base_rearm() {
 #[test]
 #[serial(source_manifests)]
 fn c1b_sidecar_changed_family_is_reread_like_base() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("c1b_sidecar_changed") {
@@ -506,6 +514,8 @@ fn c1b_sidecar_changed_family_is_reread_like_base() {
 #[test]
 #[serial(source_manifests)]
 fn c1b_changed_member_after_carry_is_reparsed() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("c1b_changed_member") {
         return;
     }
@@ -530,6 +540,8 @@ fn c1b_changed_member_after_carry_is_reparsed() {
 #[test]
 #[serial(source_manifests)]
 fn c1b_identity_contract_change_keeps_base_rearm() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("c1b_identity_contract") {
         return;
     }
@@ -641,6 +653,8 @@ fn c1b_recoverable_change_arms(
 #[test]
 #[serial(source_manifests)]
 fn c1b_recoverable_member_change_cancels_the_carry_like_base() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("c1b_recoverable_member_change") {
         return;
     }
@@ -674,6 +688,8 @@ fn c1b_recoverable_member_change_cancels_the_carry_like_base() {
 #[test]
 #[serial(source_manifests)]
 fn c1b_member_change_on_the_walk_ending_page_keeps_the_held_path() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("c1b_terminal_page_member_change") {
@@ -704,6 +720,8 @@ fn c1b_member_change_on_the_walk_ending_page_keeps_the_held_path() {
 #[test]
 #[serial(source_manifests)]
 fn c1b_member_removed_after_carry_keeps_the_carry_in_the_window() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("c1b_member_removed") {
         return;
     }
@@ -753,6 +771,8 @@ fn c1b_member_removed_after_carry_keeps_the_carry_in_the_window() {
 #[test]
 #[serial(source_manifests)]
 fn c1b_unfunded_carry_takes_the_base_path_through_the_fold() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("c1b_unfunded_carry") {
         return;
     }
@@ -860,6 +880,8 @@ fn c1b_held_retry_chain(
 #[test]
 #[serial(source_manifests)]
 fn c1b_retry_pending_family_beside_witnessed_family_carries_only_the_witnessed_one() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("c1b_retry_pending_beside_witnessed") {
@@ -923,6 +945,8 @@ fn c1b_retry_pending_family_beside_witnessed_family_carries_only_the_witnessed_o
 #[test]
 #[serial(source_manifests)]
 fn c1b_retry_pending_family_is_never_carried() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("c1b_retry_pending_never_carried") {
         return;
     }
@@ -958,6 +982,8 @@ fn c1b_retry_pending_family_is_never_carried() {
 #[test]
 #[serial(source_manifests)]
 fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("c1b_retry_pending_existing_mark") {
@@ -1024,6 +1050,8 @@ fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
 #[test]
 #[serial(source_manifests)]
 fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("c1b_held_mark_full_rearm_window") {
@@ -1133,6 +1161,8 @@ fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry(
 #[test]
 #[serial(source_manifests)]
 fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("c1a_latch_retry_pending_debt") {
@@ -1214,6 +1244,8 @@ fn fix2_clean_followup(fixture: &RearmFixture) {
 #[test]
 #[serial(source_manifests)]
 fn fix2_clean_followup_after_full_rearm_carries_unchanged_family() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("fix2_clean_followup") {
         return;
     }
@@ -1279,6 +1311,8 @@ fn fix2_clean_followup_after_full_rearm_carries_unchanged_family() {
 #[test]
 #[serial(source_manifests)]
 fn fix2_late_api_row_rereads_the_family_like_base() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("fix2_late_api_row") {
@@ -1310,6 +1344,8 @@ fn fix2_late_api_row_rereads_the_family_like_base() {
 #[test]
 #[serial(source_manifests)]
 fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 tagging oracle; markerless single-account E2 bodies keep the D1 wire shape.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use sha2::{Digest, Sha256};
@@ -1427,6 +1463,8 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
 #[test]
 #[serial(source_manifests)]
 fn scoped_unhealthy_retry_beside_a_mark_and_authority_debt_carries_accepted_family() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("scoped_retry_mark_and_authority") {
@@ -1514,6 +1552,8 @@ fn source_latch_generation(
 #[test]
 #[serial(source_manifests)]
 fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("latch-contract-money") {
         return;
     }
@@ -1637,6 +1677,8 @@ fn source_latch_clear_count(rows: &[serde_json::Value]) -> u64 {
 #[test]
 #[serial(source_manifests)]
 fn source_t1_started_a_then_b_keeps_placeholder_through_terminal() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("source-t1-started-a-b") {
         return;
@@ -1694,6 +1736,8 @@ fn source_t1_started_a_then_b_keeps_placeholder_through_terminal() {
 #[test]
 #[serial(source_manifests)]
 fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("source-t2-owed-f-invariant-g") {
         return;
     }

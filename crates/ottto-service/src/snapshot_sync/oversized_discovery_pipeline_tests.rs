@@ -66,6 +66,8 @@ fn oversized_tick(fixture: &RearmFixture, now: u64) -> RearmPage {
 #[test]
 #[serial(source_manifests)]
 fn oversized_unchanged_has_no_clock_restarts_and_keeps_incomplete_disclosure() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("oversized-unchanged") {
         return;
     }
@@ -102,6 +104,8 @@ fn oversized_unchanged_has_no_clock_restarts_and_keeps_incomplete_disclosure() {
 #[test]
 #[serial(source_manifests)]
 fn oversized_growth_retries_only_its_discovery_then_shrink_admits_it() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("oversized-growth") {
         return;
     }
@@ -151,6 +155,8 @@ fn oversized_growth_retries_only_its_discovery_then_shrink_admits_it() {
 #[test]
 #[serial(source_manifests)]
 fn oversized_same_size_sample_edit_wakes_discovery() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("oversized-sample-edit") {
         return;
     }
@@ -175,6 +181,8 @@ fn oversized_same_size_sample_edit_wakes_discovery() {
 #[test]
 #[serial(source_manifests)]
 fn oversized_metadata_only_touches_give_zero_wakes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("oversized-metadata") {
         return;
     }
@@ -213,6 +221,8 @@ fn oversized_metadata_only_touches_give_zero_wakes() {
 #[test]
 #[serial(source_manifests)]
 fn oversized_minutely_growth_is_bounded_by_existing_exponential_cadence() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("oversized-cadence") {
         return;
     }
@@ -265,6 +275,8 @@ fn oversized_minutely_growth_is_bounded_by_existing_exponential_cadence() {
 #[test]
 #[serial(source_manifests)]
 fn oversized_does_not_suppress_another_retryable_problem() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("oversized-other-problem") {
         return;
     }
@@ -302,6 +314,8 @@ fn oversized_does_not_suppress_another_retryable_problem() {
 #[test]
 #[serial(source_manifests)]
 fn oversized_keeps_complete_families_empty_and_refuses_absence_retirement_sweep_wide() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("oversized-complete-families") {
         return;
     }
@@ -408,6 +422,8 @@ fn oversized_walk(
 #[test]
 #[serial(source_manifests)]
 fn oversized_shed_upload_is_reoffered_at_the_original_retry_deadline() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("oversized-shed-recovery") {
         return;
     }
@@ -461,6 +477,8 @@ fn oversized_shed_upload_is_reoffered_at_the_original_retry_deadline() {
 #[test]
 #[serial(source_manifests)]
 fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Legacy demotion hold; E2 literals bypass it. Gate-on local holds and the
     // same six-hour floor: oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -583,6 +601,8 @@ fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
 #[test]
 #[serial(source_manifests)]
 fn oversized_restart_discovers_and_uploads_a_new_file_without_hints_within_floor() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("oversized-restart-no-hints") {
         return;
     }
@@ -628,6 +648,8 @@ fn oversized_restart_discovers_and_uploads_a_new_file_without_hints_within_floor
 #[test]
 #[serial(source_manifests)]
 fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("oversized-two-files") {
         return;
     }
@@ -703,6 +725,8 @@ fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
 #[test]
 #[serial(source_manifests)]
 fn oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !c1a_layout_supported("oversized-e2-hold-floor") {
         return;
     }
@@ -777,5 +801,71 @@ fn oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor() {
         let next_floor = oversized_floor(&c1a_saved(&fixture));
         assert_eq!(next_floor, floor + 6 * 3600);
         floor = next_floor;
+    }
+}
+
+/// Real demotion classification and selected-save custody, without oversized
+/// debt restarting the frozen window: each served hold must renew its floor.
+#[test]
+#[serial(source_manifests)]
+fn terminal_off_real_hold_renews_floor_and_three_pages_do_not_requeue_it() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let _manifests = SourceManifestTestGuard::new();
+    let fixture = PipelineFixture::new("terminal-off-real-hold-renewal");
+    fixture.baseline();
+    let revision = fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
+    let cycle = PipelineCycle {
+        replay_generation: "terminal-off-held-replay",
+        proven_owner_session: Some(PIPELINE_HELD_SESSION),
+        historical_replay: true,
+        ..PIPELINE_HOLD_CYCLE
+    };
+    let at = time::OffsetDateTime::parse(
+        "2026-08-02T09:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap()
+    .unix_timestamp() as u64;
+    let pages_at = |now: u64, count: usize| {
+        (0..count)
+            .map(|_| {
+                crate::snapshots::with_terminal_off_audit_now_for_test(now, || {
+                    fixture.page(&oversized_clock(now), &cycle, PipelineUpload::Accept)
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let seed = pages_at(at, 3);
+    assert_eq!(
+        seed.iter().map(|p| p.held.len()).sum::<usize>(),
+        1,
+        "real hold classified once then parked across three pages"
+    );
+    for (now, expected) in [
+        (at + 6 * 3600, 1),
+        (at + 6 * 3600 + 300, 0),
+        (at + 12 * 3600, 1),
+    ] {
+        let pages = pages_at(now, 3);
+        assert_eq!(
+            pages.iter().map(|p| p.held.len()).sum::<usize>(),
+            expected,
+            "one renewing per-key six-hour floor"
+        );
+        assert!(
+            pages
+                .iter()
+                .all(|p| !p.scan.census_complete && p.uploaded.is_empty()),
+            "held bodies gain no upload/ACK/terminal credit"
+        );
+        assert_eq!(
+            pages
+                .last()
+                .unwrap()
+                .index
+                .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION),
+            Some(revision.clone())
+        );
     }
 }

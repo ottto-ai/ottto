@@ -272,6 +272,8 @@ mod tests {
 
     #[test]
     fn prior_held_family_digest_tracks_only_the_canonical_set() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let a = "a".repeat(32);
         let b = "b".repeat(32);
         let first = BTreeSet::from([a.clone(), b.clone()]);
@@ -312,6 +314,8 @@ mod tests {
 
     #[test]
     fn traversal_transition_real_start_resume_context_and_retry() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let mut index = ScanIndex {
             generation: 37,
             ..ScanIndex::default()
@@ -396,6 +400,8 @@ mod tests {
 
     #[test]
     fn traversal_transition_actual_stale_rearm_is_counted_without_content() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         // This is genuine semantic debt, not a redundant stale-start clear.
         let mut index = ScanIndex {
             claude_request_identity_contract_changed: true,
@@ -451,6 +457,8 @@ mod tests {
 
     #[test]
     fn traversal_transition_actual_retirement_and_clean_followup() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let mut index = ScanIndex::default();
         let (scan, rows) = capture(|| {
             scan_source_roots(
@@ -529,6 +537,8 @@ mod tests {
 
     #[test]
     fn unsettled_causes_persist_only_when_set_and_reset_with_the_flag() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         // Absent when empty: the persisted index is byte-identical to before.
         let empty = ScanIndex::default();
         let saved = serde_json::to_value(&empty).unwrap();
@@ -615,6 +625,8 @@ mod tests {
     /// mark cannot conceal it. Bits a newer daemon set stay unknown.
     #[test]
     fn plain_and_missing_attribution_are_named_unattributed() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let mut plain = ScanIndex::default();
         plain.mark_bounded_sweep_unsettled();
         assert!(plain.bounded_sweep_had_unsettled_upload);
@@ -715,6 +727,8 @@ mod tests {
     /// takes the same census, start, carry and epoch decisions.
     #[test]
     fn unsettled_causes_alone_change_no_gate() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         // Terminal: no clean follow-up is owed for causes without the flag.
         for (flag, reason) in [(false, "complete"), (true, "complete_needs_clean_followup")] {
             let mut plain = ScanIndex::default();
@@ -828,6 +842,8 @@ mod tests {
 
     #[test]
     fn process_snapshot_is_diagnostic_only_and_restored_counts_have_no_backfill() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let mut index = ScanIndex::default();
         start(&mut index, T0, BACKFILL_WINDOW_DAYS);
         index
@@ -960,6 +976,8 @@ mod tests {
 
     #[test]
     fn complete_transition_rows_serialize_with_maximum_integers_within_budget() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         for source in [
             SnapshotSource::Codex,
             SnapshotSource::ClaudeCode,
@@ -1040,6 +1058,8 @@ mod tests {
     // counts); other sources omit them all.
     #[test]
     fn claude_retiring_rows_publish_the_absence_totals_and_fence_state() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         const NAMES: [&str; 10] = [
             "absent_retry_pending_retired",
             "absent_family_tombstone_hits",
@@ -1107,6 +1127,8 @@ mod tests {
     /// keeps its bytes, and at maximum width the row stays within budget.
     #[test]
     fn full_rearm_window_start_counts_are_omitted_at_zero_and_bounded() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         const FIELDS: [&str; 6] = [
             "rearm_window_families",
             "rearm_window_carried_families",

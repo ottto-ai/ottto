@@ -416,6 +416,8 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_real_pipeline_preserves_earned_native_lease() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     permanent_finish_pipeline(FinishOutcome::Permanent, false);
 }
 
@@ -424,6 +426,8 @@ fn permanent_finish_real_pipeline_preserves_earned_native_lease() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_real_pipeline_keeps_ineligible_exits_revoked() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for outcome in [
         FinishOutcome::Retryable,
         FinishOutcome::PermanentStatusFailure,
@@ -438,6 +442,8 @@ fn permanent_finish_real_pipeline_keeps_ineligible_exits_revoked() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sidecars() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     permanent_finish_pipeline(FinishOutcome::PermanentWithoutSidecars, false);
 }
 
@@ -449,6 +455,8 @@ fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sideca
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_dominated_refusals_report_settled_residue_every_cycle() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for reason in [
         "usage_accounting_authority_downgrade",
         "accepted_log_stale_older_upload",
@@ -470,6 +478,8 @@ fn permanent_finish_dominated_refusals_report_settled_residue_every_cycle() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_dominated_refusals_never_send_unadmitted_census_residue() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     permanent_finish_pipeline(
         FinishOutcome::Dominated {
             reason: "usage_accounting_authority_downgrade",
@@ -490,6 +500,8 @@ fn permanent_finish_dominated_refusals_never_send_unadmitted_census_residue() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "permanent_finish_pending_newer_body: supported_positive=UNEXECUTED layout_supported=false").unwrap();
         return;
@@ -814,6 +826,8 @@ fn root_absent_family_closure_count(lines: &[serde_json::Value]) -> u64 {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn rootless_family_member_list_offers_no_sibling_through_the_real_pipeline() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for (sibling, name) in [
         ("agent-b", "rootless-member-after"),
         ("agent-0", "rootless-member-before"),
@@ -835,6 +849,8 @@ fn rootless_family_member_list_offers_no_sibling_through_the_real_pipeline() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn rootless_family_root_list_offers_no_subagent_through_the_real_pipeline() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let Some((_, lines)) =
         rootless_family_real_pipeline("rootless-root-listed", &["agent-a", "agent-b"], None)
     else {
@@ -1100,6 +1116,8 @@ fn ack_finish_pipeline_case(stage: &'static str) {
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn ack_retirement_survives_each_real_finish_post_index_error_exit() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for stage in [
         "native_receipt",
         "unverified_marker",
@@ -1114,6 +1132,8 @@ fn ack_retirement_survives_each_real_finish_post_index_error_exit() {
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn ack_capacity_real_finish_has_no_upload_loss_or_failure_backoff() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     ack_finish_pipeline_case("capacity");
 }
 
@@ -1121,6 +1141,8 @@ fn ack_capacity_real_finish_has_no_upload_loss_or_failure_backoff() {
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn ack_bootstrap_capacity_real_finish_commits_census_retirement() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     ack_finish_pipeline_case("bootstrap_capacity");
 }
 
@@ -1128,6 +1150,8 @@ fn ack_bootstrap_capacity_real_finish_commits_census_retirement() {
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn ack_first_install_real_finish_uploads_4100_live_entities_without_a_capacity_stop() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     ack_finish_pipeline_case("first_install");
 }
 
@@ -1433,6 +1457,8 @@ fn ack_followup_set_debt(preparation: &mut SourcePreparation, debt: &[String], p
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn ack_census_wait_count_resets_on_a_disabled_finish_between_capacity_stops() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let server = AckScriptedServer::new();
     let mut home = AckFinishHome::new(&server);
     let source = SnapshotSource::ClaudeCode;
@@ -1494,6 +1520,8 @@ fn ack_census_wait_count_resets_on_a_disabled_finish_between_capacity_stops() {
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     const ENTITIES: usize = 5000;
     let server = AckScriptedServer::new();
     let mut home = AckFinishHome::new(&server);
@@ -1638,6 +1666,8 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn terminal_off_real_finish_uploads_acks_and_settles_with_no_manifest() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let server = AckScriptedServer::new();
     let mut home = AckFinishHome::new(&server);
     let (preparation, index, scan) = home.prepare("terminal-off");

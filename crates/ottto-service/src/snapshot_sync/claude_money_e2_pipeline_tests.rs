@@ -552,6 +552,8 @@ fn ready(
 
 #[test]
 fn e2_pipeline_dark_matches_fold_absent_publication_and_selection() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     e2::with_disabled(e2_pipeline_dark_matches_fold_absent_publication_and_selection_body);
 }
 
@@ -612,6 +614,8 @@ fn e2_pipeline_dark_matches_fold_absent_publication_and_selection_body() {
 
 #[test]
 fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-modes");
         let path = c.root(ROOT, &line(ROOT, "copied", "2026-08-02T06:58:00Z", 10));
@@ -741,19 +745,27 @@ fn mutation_case(kind: &str) {
 }
 #[test]
 fn e2_pipeline_truncate_matches_full() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     mutation_case("truncate");
 }
 #[test]
 fn e2_pipeline_same_size_edit_matches_full() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     mutation_case("same-size");
 }
 #[test]
 fn e2_pipeline_inode_replacement_matches_full() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     mutation_case("inode");
 }
 
 #[test]
 fn e2_pipeline_page_boundary_matches_single_page_bodies() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-pages");
         c.root(ROOT, &line(ROOT, "root", AT, 10));
@@ -791,6 +803,8 @@ fn e2_pipeline_page_boundary_matches_single_page_bodies() {
 
 #[test]
 fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-move-copy");
         let original = c.root(ROOT, &line(ROOT, "r1", AT, 10));
@@ -883,10 +897,14 @@ fn twins(reverse: bool) {
 }
 #[test]
 fn e2_pipeline_twins_original_discovered_first() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     twins(false);
 }
 #[test]
 fn e2_pipeline_twins_copy_discovered_first() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     twins(true);
 }
 
@@ -895,6 +913,8 @@ fn e2_pipeline_twins_copy_discovered_first() {
 /// family is read again and one batch is sent on every walk.
 #[test]
 fn e2_pipeline_settled_twins_are_not_read_again() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-twins-settled");
         c.write_at(
@@ -942,6 +962,8 @@ fn e2_pipeline_settled_twins_are_not_read_again() {
 
 #[test]
 fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-twin-hold");
         let original = c.write_at(
@@ -994,6 +1016,8 @@ fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
 
 #[test]
 fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-twin-delete");
         let original = c.write_at(
@@ -1041,6 +1065,8 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
 
 #[test]
 fn e2_pipeline_one_branch_removes_copied_prefix_only() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-branch");
         c.root(ROOT, &line(ROOT, "r1", AT, 10));
@@ -1114,6 +1140,8 @@ fn e2_pipeline_one_branch_removes_copied_prefix_only() {
 
 #[test]
 fn e2_pipeline_side_call_uses_trace_named_agent_and_counts_root_fallback() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-side-calls");
         c.root(ROOT, &line(ROOT, "root", AT, 10));
@@ -1160,6 +1188,8 @@ fn e2_pipeline_side_call_uses_trace_named_agent_and_counts_root_fallback() {
 
 #[test]
 fn e2_pipeline_quiet_otel_only_change_replaces_estimate_without_count_growth() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-quiet-otel");
         let path = c.root(ROOT, &line(ROOT, "root", AT, 10));
@@ -1214,6 +1244,8 @@ fn e2_pipeline_quiet_otel_only_change_replaces_estimate_without_count_growth() {
 
 #[test]
 fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-side-other-page");
         let root = c.root(ROOT, &line(ROOT, "root", AT, 10));
@@ -1471,10 +1503,14 @@ fn retry_case(conflict: bool) {
 
 #[test]
 fn e2_pipeline_transport_restart_and_partial_ack_keep_exact_literal_fields() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     retry_case(true);
 }
 #[test]
 fn e2_pipeline_transport_restart_and_partial_ack_without_resolver_conflict() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     retry_case(false);
 }
 
@@ -1526,19 +1562,27 @@ fn family_count_case(count: usize) {
 }
 #[test]
 fn e2_pipeline_real_family_49() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     family_count_case(49);
 }
 #[test]
 fn e2_pipeline_real_family_50() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     family_count_case(50);
 }
 #[test]
 fn e2_pipeline_real_family_51() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     family_count_case(51);
 }
 
 #[test]
 fn e2_pipeline_real_family_crosses_two_mib_root_first() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-family-bytes");
         // Search input model length, never mutate an emitted body to pad it.
@@ -1596,6 +1640,8 @@ fn e2_pipeline_real_family_crosses_two_mib_root_first() {
 
 #[test]
 fn e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-branch-no-new-reply");
         c.root(ROOT, &line(ROOT, "original", AT, 10));
@@ -1668,6 +1714,8 @@ fn e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
 
 #[test]
 fn e2_pipeline_orphan_branch_copy_counts_once_and_discloses() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-branch-orphan");
         // The original was deleted before it was ever read: no indexed
@@ -1771,23 +1819,33 @@ fn restored_twins(reverse: bool, equal: bool) {
 }
 #[test]
 fn e2_pipeline_restored_twins_earlier_first() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     restored_twins(false, false);
 }
 #[test]
 fn e2_pipeline_restored_twins_later_first() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     restored_twins(true, false);
 }
 #[test]
 fn e2_pipeline_restored_twins_equal_birth_forward() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     restored_twins(false, true);
 }
 #[test]
 fn e2_pipeline_restored_twins_equal_birth_reverse() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     restored_twins(true, true);
 }
 
 #[test]
 fn e2_pipeline_deletion_reload_then_later_move_keeps_birth() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-delayed-move");
         let old = c.root(ROOT, &line(ROOT, "r1", AT, 10));
@@ -1819,6 +1877,8 @@ fn e2_pipeline_deletion_reload_then_later_move_keeps_birth() {
 
 #[test]
 fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-twin-byte-hold");
         c.write_at(
@@ -2035,10 +2095,14 @@ fn rewritten_original(reverse: bool) {
 }
 #[test]
 fn e2_pipeline_inplace_rewritten_original_cannot_remove_its_twin_copy() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     rewritten_original(false);
 }
 #[test]
 fn e2_pipeline_inplace_rewritten_original_cannot_remove_its_twin_copy_reverse() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     rewritten_original(true);
 }
 
@@ -2085,10 +2149,14 @@ fn overlapping_restored(reverse: bool) {
 }
 #[test]
 fn e2_pipeline_overlapping_restored_histories_count_their_union_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     overlapping_restored(false);
 }
 #[test]
 fn e2_pipeline_overlapping_restored_histories_count_their_union_once_reverse() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     overlapping_restored(true);
 }
 
@@ -2122,10 +2190,14 @@ fn branch_by(version: &str) {
 }
 #[test]
 fn e2_pipeline_branch_written_outside_the_writer_allowlist_is_skipped_by_request_ids() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     branch_by("2.0.99");
 }
 #[test]
 fn e2_pipeline_branch_written_by_the_current_m4_claude_code_is_skipped() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // `claude --version` on the M4 on 2026-10-26: 2.1.310 (Claude Code).
     branch_by("2.1.310");
 }
@@ -2190,10 +2262,14 @@ fn branch_before_original(copy_first: bool) {
 }
 #[test]
 fn e2_pipeline_branch_read_before_its_original_waits_instead_of_counting() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     branch_before_original(true);
 }
 #[test]
 fn e2_pipeline_branch_read_after_its_original_on_a_fresh_index_is_skipped() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     branch_before_original(false);
 }
 
@@ -2203,6 +2279,8 @@ fn e2_pipeline_branch_read_after_its_original_on_a_fresh_index_is_skipped() {
 /// read instead of skipping H. H then counts once, from the branch.
 #[test]
 fn e2_pipeline_branch_waits_for_an_original_modified_since_its_read() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-branch-stale-holder");
         let original = c.root(LATE, &line(LATE, "h", AT, 10));
@@ -2269,6 +2347,8 @@ fn e2_pipeline_branch_waits_for_an_original_modified_since_its_read() {
 /// nothing is re-read after.
 #[test]
 fn e2_pipeline_held_copies_never_wait_on_each_other() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         const A: &str = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
         const B: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
@@ -2374,6 +2454,8 @@ fn e2_pipeline_held_copies_never_wait_on_each_other() {
 /// held, then the next page's walk skips it.
 #[test]
 fn e2_pipeline_branch_census_deadline_holds_then_a_later_walk_skips() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-branch-deadline");
         c.root(ROOT, &line(ROOT, "original", AT, 10));
@@ -2410,6 +2492,8 @@ fn e2_pipeline_branch_census_deadline_holds_then_a_later_walk_skips() {
 /// that request removed exactly once and counts every other request once.
 #[test]
 fn e2_pipeline_legacy_fork_prefix_is_removed_exactly_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-legacy-fork-prefix");
         c.root(
@@ -2506,6 +2590,8 @@ fn branch_of_retired(name: &str, named: Option<&str>) -> ((u64, Option<u64>), u6
 }
 #[test]
 fn e2_pipeline_branch_of_a_retired_original_named_by_its_fork_line_is_skipped() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     assert_eq!(
         branch_of_retired("e2-pipeline-retired-named", Some(ROOT)),
         ((0, Some(1)), 0),
@@ -2514,6 +2600,8 @@ fn e2_pipeline_branch_of_a_retired_original_named_by_its_fork_line_is_skipped() 
 }
 #[test]
 fn e2_pipeline_branch_of_a_retired_original_without_a_fork_line_counts_and_discloses() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // No durable per-request store: without the name, the retired original
     // proves nothing, so the copy counts once more and is disclosed.
     assert_eq!(
@@ -2523,6 +2611,8 @@ fn e2_pipeline_branch_of_a_retired_original_without_a_fork_line_counts_and_discl
 }
 #[test]
 fn e2_pipeline_branch_naming_an_unindexed_session_counts_and_discloses() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // The fork line names a session that is not indexed: no proof.
     assert_eq!(
         branch_of_retired("e2-pipeline-retired-unindexed", Some(LATE)),
@@ -2601,10 +2691,14 @@ fn copy_waits_for_queued_holder(stale_record: bool) {
 }
 #[test]
 fn e2_pipeline_copy_waits_for_a_queued_stale_holder() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     copy_waits_for_queued_holder(true);
 }
 #[test]
 fn e2_pipeline_copy_waits_for_a_queued_indexed_holder_without_a_census_record() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     copy_waits_for_queued_holder(false);
 }
 
@@ -2667,10 +2761,14 @@ fn conflict_only(subagent: bool) {
 }
 #[test]
 fn e2_pipeline_root_conflict_only_file_publishes_its_disclosure() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     conflict_only(false);
 }
 #[test]
 fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     conflict_only(true);
 }
 
@@ -2681,6 +2779,8 @@ mod money_equivalence_tests {
 
 #[test]
 fn e2_page_never_creates_p1_ledger_or_diagnostics() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut corpus = Corpus::new("e2-without-p1");
         corpus.root(ROOT, &line(ROOT, "req-real", AT, 10));
@@ -2825,29 +2925,39 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
 
 #[test]
 fn e2_pipeline_withheld_new_file_retries_external_evidence_unchanged() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     withheld_new_file_retries_from_retained_read(false, false, 0);
 }
 
 #[test]
 fn e2_pipeline_withheld_new_file_retries_external_evidence_after_growth() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     withheld_new_file_retries_from_retained_read(true, false, 0);
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn e2_pipeline_withheld_new_file_unchanged_acquisition_is_unchanged() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     withheld_new_file_retries_from_retained_read(false, true, 0);
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn e2_pipeline_withheld_new_file_growth_acquisition_is_tail() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     withheld_new_file_retries_from_retained_read(true, true, 0);
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn e2_pipeline_held_new_file_cache_clear_eviction_restart_read_full() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for loss in 1..=3 {
         withheld_new_file_retries_from_retained_read(false, true, loss);
     }
@@ -2855,6 +2965,8 @@ fn e2_pipeline_held_new_file_cache_clear_eviction_restart_read_full() {
 
 #[test]
 fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for loss in 1..=3 {
         withheld_new_file_retries_from_retained_read(false, false, loss);
     }
@@ -2862,6 +2974,8 @@ fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
 
 #[test]
 fn terminal_off_unproven_cohort_uploads_full_tokens_and_cost_with_unknown_account() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("terminal-off-unproven-full-money");
         c.root(ROOT, &line(ROOT, "X", AT, 37));
@@ -2938,6 +3052,8 @@ fn terminal_off_unproven_cohort_uploads_full_tokens_and_cost_with_unknown_accoun
 
 #[test]
 fn terminal_off_two_member_new_copy_cohort_emits_shared_request_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_e2(|| {
         let mut c = Corpus::new("terminal-off-new-copy-shared-request");
         c.root(ROOT, &line(ROOT, "X", AT, 37));

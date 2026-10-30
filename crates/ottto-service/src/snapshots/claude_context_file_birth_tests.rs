@@ -242,6 +242,8 @@ fn allowed_difference() -> BTreeSet<String> {
 
 #[test]
 fn rewind_copy_counts_only_own_records() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-rewind");
     let now = OffsetDateTime::now_utc();
     let lines = [
@@ -357,6 +359,8 @@ fn compaction_summary(timestamp: &str, uuid: &str, parent: Option<&str>) -> Stri
 /// a copied half never lends an owned half its metrics or its partner.
 #[test]
 fn compaction_pairs_across_the_copy_line_count_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-pair-ambiguity");
     let path = dir.join(format!("{ROOT}.jsonl"));
     fs::write(&path, "").expect("create transcript fixture");
@@ -435,6 +439,8 @@ fn compaction_pairs_across_the_copy_line_count_once() {
 
 #[test]
 fn fresh_growing_file_has_numbers_on_its_first_upload() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-growing");
     let now = OffsetDateTime::now_utc();
     let first = assistant(ROOT, "req_a1", &stamp(now, -30), 100);
@@ -475,6 +481,8 @@ fn fresh_growing_file_has_numbers_on_its_first_upload() {
 
 #[test]
 fn late_born_subagent_file_is_not_tagged() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-subagent");
     let now = OffsetDateTime::now_utc();
     let agent = "a4d1585d310070d0f";
@@ -510,6 +518,8 @@ fn late_born_subagent_file_is_not_tagged() {
 /// The telemetry tripwire still applies wherever sidecars exist.
 #[test]
 fn subagent_file_is_not_exempt_from_the_tripwire() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-subagent-tripwire");
     let now = OffsetDateTime::now_utc();
     let agent = "a4d1585d310070d0f";
@@ -562,6 +572,8 @@ fn subagent_file_is_not_exempt_from_the_tripwire() {
 /// version only; the counter stays.
 #[test]
 fn same_session_id_in_two_folders_withholds_the_tuple() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-two-folders");
     let now = OffsetDateTime::now_utc();
     let (path_a, parsed) = root_session(
@@ -632,6 +644,8 @@ fn same_session_id_in_two_folders_withholds_the_tuple() {
 /// also present, F1's whole-tuple withhold wins.
 #[test]
 fn restored_file_that_grows_counts_post_birth_only_unless_the_original_is_present() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-restored-grows");
     let now = OffsetDateTime::now_utc();
     let (restored_path, restored) = root_session(
@@ -729,6 +743,8 @@ fn restored_file_that_grows_counts_post_birth_only_unless_the_original_is_presen
 /// reset clock) is not evidence, so the file withholds as unknown birth.
 #[test]
 fn birth_at_or_before_2020_counts_as_unknown() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-floor");
     let now = OffsetDateTime::now_utc();
     let (path, parsed) = root_session(
@@ -780,6 +796,8 @@ fn birth_at_or_before_2020_counts_as_unknown() {
 /// cannot be classified, so the file withholds (never "owned" by default).
 #[test]
 fn untimed_or_invalid_record_timestamp_withholds() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-untimed");
     let now = OffsetDateTime::now_utc();
     let own = assistant(ROOT, "req_a1", &stamp(now, -30), 100);
@@ -820,6 +838,8 @@ fn untimed_or_invalid_record_timestamp_withholds() {
 /// root on the same page is still admitted.
 #[test]
 fn evidence_bound_withholds_only_that_root() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-evidence-bound");
     let now = OffsetDateTime::now_utc();
     let (path_a, large) = root_session(
@@ -948,6 +968,8 @@ fn fold_with_bound(
 /// kept request telemetry reports under another root is still caught.
 #[test]
 fn roots_under_their_own_bound_are_all_admitted_on_a_page_over_it() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-per-root-bound");
     let now = OffsetDateTime::now_utc();
     let roots = [ROOT, SECOND, OTHER_ROOT, FOURTH];
@@ -996,6 +1018,8 @@ fn roots_under_their_own_bound_are_all_admitted_on_a_page_over_it() {
 /// roots whose total is far over the bound.
 #[test]
 fn admitted_session_is_not_blanked_by_a_big_page() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-big-page");
     let now = OffsetDateTime::now_utc();
     let roots = [ROOT, SECOND, OTHER_ROOT, FOURTH, FIFTH];
@@ -1044,6 +1068,8 @@ fn admitted_session_is_not_blanked_by_a_big_page() {
 /// slice's confirmation must not hide the later contradiction.
 #[test]
 fn contradiction_in_a_later_slice_vetoes_the_root() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-later-slice");
     let now = OffsetDateTime::now_utc();
     let bound = 6;
@@ -1124,6 +1150,8 @@ fn contradiction_in_a_later_slice_vetoes_the_root() {
 /// alarm fires on the first such pass only.
 #[test]
 fn evidence_bound_past_the_lowered_seam_is_counted_and_alarms_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-evidence-bound-seam");
     let now = OffsetDateTime::now_utc();
     let files = five_request_roots(&dir, now, &[ROOT]);
@@ -1182,6 +1210,8 @@ fn evidence_bound_past_the_lowered_seam_is_counted_and_alarms_once() {
 
 #[test]
 fn unknown_birth_withholds_and_is_counted() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-unknown");
     let now = OffsetDateTime::now_utc();
     let (path, mut unknown) = root_session(
@@ -1221,6 +1251,8 @@ fn unknown_birth_withholds_and_is_counted() {
 
 #[test]
 fn all_copied_file_withholds() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-all-copied");
     let now = OffsetDateTime::now_utc();
     let (path, parsed) = root_session(
@@ -1249,6 +1281,8 @@ fn all_copied_file_withholds() {
 
 #[test]
 fn telemetry_contradiction_withholds_and_is_counted() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-tripwire");
     let now = OffsetDateTime::now_utc();
     // A kept request that another root's telemetry owns.
@@ -1304,6 +1338,8 @@ fn telemetry_contradiction_withholds_and_is_counted() {
 /// Only a changed file (a new fingerprint) is checked afresh.
 #[test]
 fn telemetry_veto_stays_until_the_file_changes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-late-tripwire");
     let now = OffsetDateTime::now_utc();
     let (path, parsed) = root_session(
@@ -1365,6 +1401,8 @@ fn telemetry_veto_stays_until_the_file_changes() {
 /// later file withholds until the process restarts.
 #[test]
 fn remembered_tripwire_fails_closed_when_full() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-remembered-full");
     let now = OffsetDateTime::now_utc();
     let file = |session: &str| {
@@ -1440,6 +1478,8 @@ fn remembered_tripwire_fails_closed_when_full() {
 
 #[test]
 fn same_session_id_never_merges_across_accounts() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-two-accounts");
     let now = OffsetDateTime::now_utc();
     let (path_a, mut first) = root_session(
@@ -1483,6 +1523,8 @@ fn same_session_id_never_merges_across_accounts() {
 
 #[test]
 fn root_records_copied_under_a_subagent_path_are_not_exempt() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-subagent-alias");
     let now = OffsetDateTime::now_utc();
     let child_dir = dir.join(ROOT).join("subagents");
@@ -1517,6 +1559,8 @@ fn root_records_copied_under_a_subagent_path_are_not_exempt() {
 /// still withholds, through the real scan and local evidence pipeline.
 #[test]
 fn api_sidecar_without_trace_sidecar_still_vetoes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-api-only-pipeline");
     let now = OffsetDateTime::now_utc();
     root_session(
@@ -1603,6 +1647,8 @@ fn api_sidecar_without_trace_sidecar_still_vetoes() {
 
 #[test]
 fn api_row_without_trace_row_counts_as_owned() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-api-only");
     let now = OffsetDateTime::now_utc();
     let (path, parsed) = root_session(
@@ -1636,6 +1682,8 @@ fn api_row_without_trace_row_counts_as_owned() {
 
 #[test]
 fn telemetry_proven_session_keeps_todays_numbers() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -1697,6 +1745,8 @@ fn telemetry_proven_session_keeps_todays_numbers() {
 
 #[test]
 fn id_less_responses_share_the_one_scalar_source() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-id-less");
     let now = OffsetDateTime::now_utc();
     let (path, parsed) = root_session(
@@ -1724,6 +1774,8 @@ fn id_less_responses_share_the_one_scalar_source() {
 
 #[test]
 fn last_turn_alone_does_not_change_the_upload_fingerprint() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-fingerprint");
     let now = OffsetDateTime::now_utc();
     let (_, parsed) = root_session(
@@ -1753,6 +1805,8 @@ fn last_turn_alone_does_not_change_the_upload_fingerprint() {
 
 #[test]
 fn context_basis_counts_by_version_stay_bounded() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-version-bound");
     let now = OffsetDateTime::now_utc();
     let mut items = Vec::new();
@@ -1799,6 +1853,8 @@ fn context_basis_counts_by_version_stay_bounded() {
 /// contract 5 rows and account tags are byte-identical to the clear.
 #[test]
 fn capture_on_bodies_match_the_clear_outside_context_scalars() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::claude_request_identity as identity;
@@ -1932,6 +1988,8 @@ fn split_total(item: &SnapshotItem) -> Option<u64> {
 
 #[test]
 fn session_start_split_follows_the_scalar_classification() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-session-start");
     let now = OffsetDateTime::now_utc();
     let own = |session: &str, request: &str, offset: i64, tokens: u64| {
@@ -2062,6 +2120,8 @@ fn session_start_split_follows_the_scalar_classification() {
 /// start, a copied opening keeps the version only.
 #[test]
 fn start_verdict_matches_the_folded_session_start() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-start-verdict");
     let now = OffsetDateTime::now_utc();
     let fresh = "e1000000-0000-4000-8000-000000000001";
@@ -2191,6 +2251,8 @@ fn native_read(
 /// scalars and the split agree at every append boundary.
 #[test]
 fn tail_and_full_read_select_the_same_first_request() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2261,6 +2323,8 @@ fn tail_and_full_read_select_the_same_first_request() {
 /// uses the merged seam; the full remembered-veto table triggers it too.
 #[test]
 fn claude_backfill_stop_latches_until_restart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let dir = temp_dir("claude-file-birth-backfill-stop");
     let now = OffsetDateTime::now_utc();
@@ -2383,6 +2447,8 @@ fn claude_backfill_stop_latches_until_restart() {
 /// While latched, the alarm repeats at most once an hour, whatever the folds.
 #[test]
 fn claude_backfill_stop_reminder_is_at_most_hourly() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let withheld = ClaudeContextFileBirthCounts {
         remembered_veto_overflowed: true,
         ..Default::default()
@@ -2428,6 +2494,8 @@ fn claude_backfill_stop_reminder_is_at_most_hourly() {
 /// a different destination's existing history is stopped process-wide.
 #[test]
 fn claude_backfill_index_rebuild_load_latches_until_restart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for kind in ["absent", "corrupt", "empty"] {
         for missing_list in [false, true] {
@@ -2524,6 +2592,8 @@ fn claude_backfill_index_rebuild_load_latches_until_restart() {
 
 #[test]
 fn claude_backfill_index_load_without_seen_marker_does_not_latch() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let home = temp_dir("claude-index-rebuild-not-active");
     for corrupt in [false, true] {
         let path = home.join("scan-index.json");
@@ -2539,6 +2609,8 @@ fn claude_backfill_index_load_without_seen_marker_does_not_latch() {
 
 #[test]
 fn claude_backfill_index_load_preserves_other_sources_and_existing_indexes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (home, _, mut baseline) =
         claude_context_backfill_fixture("claude-index-rebuild-source-guard", 1);
     let marker = ReemissionExclusions::seen_marker_path(&home);
@@ -2572,6 +2644,8 @@ fn claude_backfill_index_load_preserves_other_sources_and_existing_indexes() {
 
 #[test]
 fn withheld_item_clears_sizes_and_points_with_the_tuple() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-sizes-withheld");
     let now = OffsetDateTime::now_utc();
     let (path, mut parsed) = root_session(
@@ -2610,6 +2684,8 @@ fn withheld_item_clears_sizes_and_points_with_the_tuple() {
 
 #[test]
 fn incomplete_identity_ships_sizes_from_the_own_set() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-sizes-id-less");
     let now = OffsetDateTime::now_utc();
     let (path, parsed) = root_session(
@@ -2658,6 +2734,8 @@ fn incomplete_identity_ships_sizes_from_the_own_set() {
 
 #[test]
 fn id_less_neighbours_of_a_compaction_are_counted_locally() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-sizes-id-less-neighbours");
     let now = OffsetDateTime::now_utc();
     let (path, parsed) = root_session(
@@ -2708,6 +2786,8 @@ fn id_less_neighbours_of_a_compaction_are_counted_locally() {
 
 #[test]
 fn id_less_neighbours_mark_every_matching_cut_only() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-id-less-repeated-cuts");
     let now = OffsetDateTime::now_utc();
     let (_, parsed) = root_session(
@@ -2753,6 +2833,8 @@ fn id_less_neighbours_mark_every_matching_cut_only() {
 
 #[test]
 fn folded_sizes_and_points_leave_every_identity_unchanged() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-sizes-identity");
     let now = OffsetDateTime::now_utc();
     let (path, parsed) = root_session(
@@ -2812,6 +2894,8 @@ fn folded_sizes_and_points_leave_every_identity_unchanged() {
 /// identity, so the server takes the start scalars from the same body.
 #[test]
 fn claude_scan_identity_stays_at_or_above_the_server_posture_minimum() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     const WHY: &str = "the server pairs start scalars with first_own_request_at only for \
         Claude scan identity >= v28 (session_posture_semantics.\
         CLAUDE_AUTHORITATIVE_POSTURE_SCAN_MIN); lowering it breaks the start-changes rule";
@@ -2834,6 +2918,8 @@ fn claude_scan_identity_stays_at_or_above_the_server_posture_minimum() {
 /// records with older timestamps (which set `source_started_at`) follow it.
 #[test]
 fn measured_file_carries_its_first_own_request_time() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-first-own");
     let now = OffsetDateTime::now_utc();
     let (path, parsed) = root_session(
@@ -2873,6 +2959,8 @@ fn measured_file_carries_its_first_own_request_time() {
 /// stale value is cleared, never kept.
 #[test]
 fn first_own_request_time_is_absent_unless_the_birth_is_measured() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-first-own-absent");
     let now = OffsetDateTime::now_utc();
     let stale = Some(stamp(now, -3_600));
@@ -2974,6 +3062,8 @@ fn first_own_request_time_is_absent_unless_the_birth_is_measured() {
 /// for the same file the birth rule measures.
 #[test]
 fn strict_path_has_no_first_own_request_time() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -3010,6 +3100,8 @@ fn strict_path_has_no_first_own_request_time() {
 /// the revision or revision v2 input, the envelope or the body witness.
 #[test]
 fn first_own_request_time_leaves_every_identity_unchanged() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-first-own-identity");
     let now = OffsetDateTime::now_utc();
     let (path, parsed) = root_session(
@@ -3062,6 +3154,8 @@ fn first_own_request_time_leaves_every_identity_unchanged() {
 /// every append boundary.
 #[test]
 fn tail_and_full_read_give_the_same_first_own_request_time() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3122,6 +3216,8 @@ fn tail_and_full_read_give_the_same_first_own_request_time() {
 
 #[test]
 fn points_work_refusal_preserves_every_other_snapshot_field() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use super::local_context_points::{
         LOCAL_CONTEXT_POINT_ORDER_PASSES, LOCAL_CONTEXT_POINT_ORDER_WINDOW,
     };
@@ -3216,6 +3312,8 @@ fn points_work_refusal_preserves_every_other_snapshot_field() {
 /// unresolved posture, while the curve itself remains strictly unavailable.
 #[test]
 fn file_birth_only_curve_coverage_keeps_admitted_scalars_on_batch_wire() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-curve-coverage");
     let now = OffsetDateTime::now_utc();
     let lines = [
@@ -3339,6 +3437,8 @@ fn file_birth_only_curve_coverage_keeps_admitted_scalars_on_batch_wire() {
 
 #[test]
 fn copied_and_unknown_birth_curves_keep_ownership_unresolved() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-file-birth-curve-unresolved");
     let now = OffsetDateTime::now_utc();
     let (path, parsed) = root_session(
@@ -3390,6 +3490,8 @@ fn copied_and_unknown_birth_curves_keep_ownership_unresolved() {
 
 #[test]
 fn scalars_file_birth_only_curve_rejects_nonzero_evidence() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut curve = unavailable_context_curve(
         CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
         CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,

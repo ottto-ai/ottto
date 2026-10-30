@@ -357,6 +357,8 @@ fn assert_refused(
 /// independent; FE changes the formerly pinned Claude D1 failure.
 #[test]
 fn sp11_claude_in_page_tail_with_append_publishes_uncertified_prefix() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }

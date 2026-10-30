@@ -128,6 +128,8 @@ fn revisions(index: &ScanIndex) -> Vec<u64> {
 /// no budget, while the unlisted family upgrades.
 #[test]
 fn listed_family_selected_for_another_reason_emits_nothing() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (home, root, mut index) = families("history-gate-listed", 2);
     let support = support("history-gate-listed-support");
     let listed_member = index
@@ -178,6 +180,8 @@ fn listed_family_selected_for_another_reason_emits_nothing() {
 /// verified Mac without a list, old history is paced instead (N1).
 #[test]
 fn no_list_and_paused_list_states_hold_history_selected_for_another_reason() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (home, root, index) = families("history-gate-no-list", 2);
     let held_under = |policy: NoListPolicy, support: &Path, cutoff: u64| {
         let mut index = index.clone();
@@ -253,6 +257,8 @@ fn no_list_and_paused_list_states_hold_history_selected_for_another_reason() {
 /// births are held.
 #[test]
 fn installed_empty_list_paces_history_and_differs_from_a_missing_list() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (home, root, mut index) = families("history-gate-empty-list", 2);
     let empty = support("history-gate-empty");
     fs::write(ReemissionExclusions::path(&empty), "").unwrap();
@@ -316,6 +322,8 @@ fn installed_empty_list_paces_history_and_differs_from_a_missing_list() {
 /// fully accepted page without holds does (the upload context is adopted).
 #[test]
 fn revision_bump_rereads_every_stamped_file_paced_then_stops() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     const FAMILIES: usize = 20;
     const EMPTY_FILES: usize = 3;
     const FILE_BYTES: usize = 2_048;
@@ -484,6 +492,8 @@ fn revision_bump_rereads_every_stamped_file_paced_then_stops() {
 /// upgrade blocks its emission at the seam.
 #[test]
 fn a_latch_set_after_the_candidate_loop_blocks_permitted_history() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (home, root, mut index) = families("history-gate-late-latch", 1);
     let empty = support("history-gate-late-latch-support");
     fs::write(ReemissionExclusions::path(&empty), "").unwrap();
@@ -508,6 +518,8 @@ fn a_latch_set_after_the_candidate_loop_blocks_permitted_history() {
 /// the gate holds; Codex and Pi keep the exact stamp.
 #[test]
 fn the_shared_stamp_never_downgrades_and_refuses_held_files() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (home, root, mut index) = families("history-gate-stamp", 1);
     let key = index.files.keys().next().unwrap().clone();
     let fingerprint = index.files[&key].source_file_fingerprint.clone();
@@ -554,6 +566,8 @@ fn the_shared_stamp_never_downgrades_and_refuses_held_files() {
 /// gate itself holds every upgrade (`ungated_revision`).
 #[test]
 fn active_claude_revision_has_a_history_policy_row() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let active =
         crate::snapshot_sync::effective_upload_body_witness_revision(SnapshotSource::ClaudeCode);
     assert!(active <= MAX_GATED_CLAUDE_REVISION, "active {active}");
@@ -577,6 +591,8 @@ fn listed_member(index: &ScanIndex, family: &str) -> String {
 /// upgrades.
 #[test]
 fn member_only_line_protects_its_root_on_a_fresh_index() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (home, root, index) = families("history-gate-member-only", 2);
     let support = support("history-gate-member-only-support");
     fs::write(
@@ -611,6 +627,8 @@ fn member_only_line_protects_its_root_on_a_fresh_index() {
 #[cfg(unix)]
 #[test]
 fn unreadable_member_directory_holds_its_root() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use std::os::unix::fs::PermissionsExt;
     let (home, root, index) = families("history-gate-member-unreadable", 2);
     let support = support("history-gate-member-unreadable-support");
@@ -730,6 +748,8 @@ fn age_directory(directory: &Path) {
 /// as unlisted (`Owed`) in both orders.
 #[test]
 fn listed_member_holds_its_sibling_when_the_root_file_is_absent() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for order in [["agent-b", "agent-a"], ["agent-a", "agent-b"]] {
         let home = crate::test_scratch::unique_path("ottto-history-gate-rootless");
         let project = home.join("project");
@@ -765,6 +785,8 @@ fn listed_member_holds_its_sibling_when_the_root_file_is_absent() {
 /// emitted; the unlisted rootless family still emits.
 #[test]
 fn rootless_listed_family_emits_no_sibling_through_the_scan() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (home, root, index) = families("history-gate-rootless-scan", 2);
     let listed = listed_member(&index, &session(1));
     for slot in 0..2 {
@@ -811,6 +833,8 @@ fn rootless_listed_family_emits_no_sibling_through_the_scan() {
 /// member are held as before, and the family is walked once.
 #[test]
 fn listed_member_with_its_root_present_holds_the_whole_family() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let home = crate::test_scratch::unique_path("ottto-history-gate-rooted");
     let project = home.join("project");
     let family = session(1);
@@ -836,6 +860,8 @@ fn listed_member_with_its_root_present_holds_the_whole_family() {
 /// entries than the walk's bound.
 #[test]
 fn rootless_family_walk_that_cannot_finish_holds_the_root() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -886,6 +912,8 @@ fn rootless_family_walk_that_cannot_finish_holds_the_root() {
 /// An installed list with no line (most Macs) walks no member directory.
 #[test]
 fn empty_list_walks_no_member_directory() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let home = crate::test_scratch::unique_path("ottto-history-gate-empty-walk");
     let project = home.join("project");
     let members = family_on_disk(&project, &session(1), &["agent-a", "agent-b"], true);
@@ -907,6 +935,8 @@ fn empty_list_walks_no_member_directory() {
 /// walks again.
 #[test]
 fn member_walk_is_remembered_per_pass_until_the_directory_changes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let home = crate::test_scratch::unique_path("ottto-history-gate-walk-memo");
     let project = home.join("project");
     let family = session(1);
@@ -978,6 +1008,8 @@ fn member_walk_is_remembered_per_pass_until_the_directory_changes() {
 /// instead of blocking a fully settled upload.
 #[test]
 fn held_member_owed_a_proof_correction_is_skipped_and_deferred() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (home, root, mut index) = families("history-gate-correction", 2);
     let support = support("history-gate-correction-support");
     let family = session(1);
@@ -1074,6 +1106,8 @@ fn held_member_owed_a_proof_correction_is_skipped_and_deferred() {
 /// now, and only prior history records one.
 #[test]
 fn history_cutoff_is_bounded_by_the_clock() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let now = || {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1110,6 +1144,8 @@ fn history_cutoff_is_bounded_by_the_clock() {
 /// activity records now.
 #[test]
 fn history_cutoff_is_the_last_received_activity() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -1159,6 +1195,8 @@ fn history_cutoff_is_the_last_received_activity() {
 /// bootstrap until a `full` claim; everything else is paced.
 #[test]
 fn no_list_policy_follows_the_prior_history_evidence() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let policy = |prior: PriorHistory, full: bool, index: &mut ScanIndex| {
         index.note_claude_history_cutoff(prior, full, true);
         index.claude_no_list_policy
@@ -1252,6 +1290,8 @@ fn no_list_policy_follows_the_prior_history_evidence() {
 /// drop together, so the next gated load re-derives them (fail closed).
 #[test]
 fn malformed_history_gate_fields_decode_leniently() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("history-gate-lenient");
     let path = scratch.join("index.json");
     let mut gated = ScanIndex::default();
@@ -1296,6 +1336,8 @@ fn malformed_history_gate_fields_decode_leniently() {
 /// Keep an intact cutoff and gate marker, so nothing can re-derive the hold.
 #[test]
 fn malformed_move_hold_stays_held_with_an_intact_cutoff_after_bootstrap() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("history-move-hold-malformed");
     let path = scratch.join("index.json");
     let mut index = ScanIndex::default();
@@ -1324,6 +1366,8 @@ fn malformed_move_hold_stays_held_with_an_intact_cutoff_after_bootstrap() {
 /// a row it activates. The static release check above stays the second line.
 #[test]
 fn activation_without_a_policy_row_keeps_the_previous_revision_and_alarms() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_max_gated_claude_revision(3, || {
         let mut index = ScanIndex::default();
         index.activate_effective_upload_body_witness_revision(2);
@@ -1391,6 +1435,8 @@ fn activation_without_a_policy_row_keeps_the_previous_revision_and_alarms() {
 /// listed re-owed file is held, an unlisted one upgrades again.
 #[test]
 fn re_owe_lowers_a_stamp_and_the_file_is_owed_and_gated_again() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_max_gated_claude_revision(3, || {
         let (home, root, mut index) = families("history-gate-reowe", 2);
         let empty = support("history-gate-reowe-empty");
@@ -1502,6 +1548,8 @@ fn mint_request_owned_copies(snapshots: &mut Vec<SnapshotItem>) {
 /// Its unchanged member stays held history.
 #[test]
 fn listed_genuine_change_under_revision_three_loses_only_its_literal() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_max_gated_claude_revision(3, || {
         let (home, root, mut index) = families("history-gate-literal", 2);
         let support = support("history-gate-literal-support");
@@ -1584,6 +1632,8 @@ fn listed_genuine_change_under_revision_three_loses_only_its_literal() {
 /// emits and its tuple and stamp stay.
 #[test]
 fn a_touched_listed_file_is_held_history_not_a_genuine_change() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_max_gated_claude_revision(3, || {
         let (home, root, mut index) = families("history-gate-touched", 1);
         let support = support("history-gate-touched-support");
@@ -1631,6 +1681,8 @@ fn a_touched_listed_file_is_held_history_not_a_genuine_change() {
 /// revision-3 stamp.
 #[test]
 fn a_listed_root_outside_this_cycle_gets_no_literal_and_no_revision_three() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     with_max_gated_claude_revision(3, || {
         let (home, root, mut index) = families("history-gate-c2", 2);
         // Items with the indexed source files, as a resend would carry them.
@@ -1730,6 +1782,8 @@ fn a_listed_root_outside_this_cycle_gets_no_literal_and_no_revision_three() {
 /// keep every ordinary body the gate does not hold.
 #[test]
 fn revision_two_drops_every_request_owned_literal_on_both_upload_paths() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (home, root, mut index) = families("history-gate-s726", 2);
     // Items with the indexed source files, both families.
     let mut probe = index.clone();
@@ -1812,6 +1866,8 @@ fn revision_two_drops_every_request_owned_literal_on_both_upload_paths() {
 /// reload. Walks span two pages.
 #[test]
 fn copies_read_under_a_closed_duplicate_fence_settle_after_one_walk() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use std::cell::{Cell, RefCell};
     use std::io::Write as _;
     /// The appended request's input tokens: the rest of the corpus sums to

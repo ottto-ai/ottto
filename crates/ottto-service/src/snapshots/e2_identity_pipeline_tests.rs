@@ -140,6 +140,8 @@ fn e2_assert_identity_consistent(item: &SnapshotItem, label: &str) {
 
 #[test]
 fn e2_pipeline_tags_the_final_root_and_agent_rows() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (dir, root, _) = claude_account_family_fixture();
     let support = dir.join("support");
     let (api, trace) = e2_family_evidence(&root);
@@ -183,6 +185,8 @@ fn e2_pipeline_tags_the_final_root_and_agent_rows() {
 
 #[test]
 fn e2_pipeline_tags_a_copied_transcript_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (dir, root, _) = claude_account_family_fixture();
     let support = dir.join("support");
     let (api, trace) = e2_family_evidence(&root);
@@ -262,6 +266,8 @@ fn e2_pipeline_tags_a_copied_transcript_once() {
 
 #[test]
 fn e2_pipeline_telemetry_read_failure_is_never_complete_and_withholds_nothing() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (dir, root, _) = claude_account_family_fixture();
     let support = dir.join("support");
     let (_, trace) = e2_family_evidence(&root);
@@ -336,6 +342,8 @@ fn e2_login_counts(item: &SnapshotItem) -> BTreeMap<Option<String>, u64> {
 
 #[test]
 fn e2_pipeline_root_and_child_keep_independent_own_telemetry_logins() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (dir, root, _) = claude_account_family_fixture();
     let support = dir.join("support");
     let (mut api, trace) = e2_family_evidence(&root);
@@ -373,6 +381,8 @@ fn e2_pipeline_root_and_child_keep_independent_own_telemetry_logins() {
 
 #[test]
 fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for (bound, partial) in [(false, false), (true, false), (false, true), (true, true)] {
         let (dir, root, _) = claude_account_family_fixture();
         let support = dir.join("support");
@@ -440,6 +450,8 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
 
 #[test]
 fn e2_pipeline_exact_telemetry_over_cap_uses_the_existing_counted_start_fallback() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("e2-identity-telemetry-cap");
     let root = "1449b91b-f36e-4cbc-a5bb-50fc66430ba5";
     let support = dir.join("support");

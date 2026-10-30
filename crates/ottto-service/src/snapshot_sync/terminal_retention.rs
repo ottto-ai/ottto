@@ -98,6 +98,8 @@ mod tests {
     use super::*;
     #[test]
     fn terminal_off_new_exact_ack_has_real_process_age_legacy_stays_unknown() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let (new, legacy) = (key("D", "new", "body"), key("D", "legacy", "body"));
         let mut memo = AckAges::default();
         assert_eq!(memo.gauge([legacy].into_iter(), 100), (None, 1));

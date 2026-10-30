@@ -72,6 +72,8 @@ pub(crate) fn exact_acks(
 
 #[test]
 fn upload_context_transport_resume_keeps_body_acks_without_receipt_authority() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut progress = SnapshotUploadProgress::new(
         "a".repeat(64),
         snapshot_quarantine_witness(SnapshotSource::Codex),
@@ -95,6 +97,8 @@ fn upload_context_transport_resume_keeps_body_acks_without_receipt_authority() {
 
 #[test]
 fn upload_context_prepare_preserves_resume_but_clears_prior_context_receipt_authority() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let mut index = ScanIndex::default();
         let mut progress = SnapshotUploadProgress::new(
@@ -129,6 +133,8 @@ fn upload_context_prepare_preserves_resume_but_clears_prior_context_receipt_auth
 
 #[test]
 fn upload_context_receipt_count_only_ack_refused() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let items = vec!["a".repeat(64)];
     let mut progress = SnapshotUploadProgress::new(
         "b".repeat(64),
@@ -229,6 +235,8 @@ pub(crate) fn reproject_context_refusal(
 
 #[test]
 fn upload_context_pending_refusal_preserves_cooldown_through_prepare_and_reprojection() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
     let entity = item.snapshot_fingerprint.clone();
     let body = snapshot_upload_body_witness(&item);
@@ -268,6 +276,8 @@ fn upload_context_pending_refusal_preserves_cooldown_through_prepare_and_reproje
 }
 #[test]
 fn upload_context_due_refusal_still_uses_existing_retry_lease() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
     let entity = item.snapshot_fingerprint.clone();
     let body = snapshot_upload_body_witness(&item);
@@ -294,6 +304,8 @@ fn upload_context_due_refusal_still_uses_existing_retry_lease() {
 }
 #[test]
 fn upload_context_changed_body_can_correct_pending_refusal() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
     let entity = item.snapshot_fingerprint.clone();
     let mut record = crate::snapshots::snapshot_quarantine_record(SnapshotSource::Codex);
@@ -620,6 +632,8 @@ impl Uploader {
 
 #[test]
 fn upload_context_progress_released_201_202_203_ignore_stamps_and_old_is_unknown() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("context-progress-codec");
     let mut progress = SnapshotUploadProgress::new(
         "a".repeat(64),

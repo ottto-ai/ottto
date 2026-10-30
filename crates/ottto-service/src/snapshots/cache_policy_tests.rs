@@ -621,6 +621,8 @@ fn tail_beside_full_cache(older_tail: bool, append: fn(&ScanFixture)) -> TailBes
 /// fillers resident 0.
 #[test]
 fn cache_policy_g3_older_candidate_never_evicts_newer_entries() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("G3_priority") {
         return;
     }
@@ -669,6 +671,8 @@ fn cache_policy_g3_older_candidate_never_evicts_newer_entries() {
 /// filler is gone.
 #[test]
 fn cache_policy_m1_full_cache_tail_at_zero_budget_releases_nothing() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M1_no_wipe") {
         return;
     }
@@ -713,6 +717,8 @@ fn cache_policy_m1_full_cache_tail_at_zero_budget_releases_nothing() {
 /// unchanged. Asserts only that nothing is wiped.
 #[test]
 fn cache_policy_r0_diagnostic_m1_full_cache_tail() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("R0_diag_M1_no_wipe") {
         return;
     }
@@ -767,6 +773,8 @@ fn append_growth(tailed: &ScanFixture) {
 /// which pinned two evictions: a release without benefit.
 #[test]
 fn cache_policy_m1_tail_growth_refuses_its_copy_without_eviction() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M1_tail_growth_refusal") {
         return;
     }
@@ -828,6 +836,8 @@ fn cache_policy_m1_tail_growth_refuses_its_copy_without_eviction() {
 /// only that nothing is wiped.
 #[test]
 fn cache_policy_r0_diagnostic_m1_tail_growth() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("R0_diag_M1_tail_growth") {
         return;
     }
@@ -939,6 +949,8 @@ fn measure(resident: Option<usize>, active: Option<usize>) -> sampled_scan::Step
 /// records `ClearOtherActive` and wipes every filler.
 #[test]
 fn cache_policy_m1_refusal_decision_matrix_evicts_the_minimum() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M1_decision_matrix") {
         return;
     }
@@ -1048,6 +1060,8 @@ fn cache_policy_m1_refusal_decision_matrix_evicts_the_minimum() {
 /// Lands with the fix: the counters do not exist on main.
 #[test]
 fn cache_policy_m1_counts_copy_refusal_releases_by_cause() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M1_counters") {
         return;
     }
@@ -1117,6 +1131,8 @@ fn cache_policy_m1_counts_copy_refusal_releases_by_cause() {
 /// No wipe-all clear; only older entries yield, at most two.
 #[test]
 fn cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M1_hot_tail") {
         return;
     }
@@ -1173,6 +1189,8 @@ fn cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full() {
 /// unchanged. Asserts only that nothing is wiped.
 #[test]
 fn cache_policy_r0_diagnostic_m1_hot_tail() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("R0_diag_M1_hot_tail") {
         return;
     }
@@ -1234,6 +1252,8 @@ fn cache_policy_r0_diagnostic_m1_hot_tail() {
 /// and cleared every filler.
 #[test]
 fn cache_policy_m1_visit_limited_active_evicts_at_most_what_it_needs() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M1_visit_limit") {
         return;
     }
@@ -1345,6 +1365,8 @@ fn cache_policy_m1_visit_limited_active_evicts_at_most_what_it_needs() {
 /// exemption never clears for want of a measurement.
 #[test]
 fn cache_policy_m1_exempt_unsampled_read_remeasures_an_unknown_resident() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M1_exempt_remeasure") {
         return;
     }
@@ -1417,6 +1439,8 @@ fn cache_policy_m1_exempt_unsampled_read_remeasures_an_unknown_resident() {
 ///   entry, and no evict-to-fit (`CopyRefusalEntriesEvicted` 0).
 #[test]
 fn cache_policy_m1_path_a_admits_a_non_f_tail_from_older_entries_only() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M1_path_a") {
         return;
     }
@@ -1644,6 +1668,8 @@ fn assert_regime_b_invariants(passes: &[RegimePass], label: &str) {
 /// `|P*| <= |P_C|` or `b_ins ≥ C`.
 #[test]
 fn cache_policy_r0_regime_b_claude_usage_tail_receipt() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("R0_regime_b_claude_usage") {
         return;
     }
@@ -1658,6 +1684,8 @@ fn cache_policy_r0_regime_b_claude_usage_tail_receipt() {
 /// pass.
 #[test]
 fn cache_policy_r0_regime_b_claude_ignored_tail_is_retained() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("R0_regime_b_claude_ignored") {
         return;
     }
@@ -1671,6 +1699,8 @@ fn cache_policy_r0_regime_b_claude_ignored_tail_is_retained() {
 /// ignored-line tail.
 #[test]
 fn cache_policy_r0_regime_b_codex_tail_is_retained() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("R0_regime_b_codex") {
         return;
     }
@@ -1936,6 +1966,8 @@ fn assert_no_victims(run: &MaRun, label: &str) {
 /// refused at its pre-release budget and every resident stays.
 #[test]
 fn cache_policy_m_a_unknown_or_overflowing_x_out_releases_nothing() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M_a_T2") {
         return;
     }
@@ -2099,6 +2131,8 @@ fn m_a_t8(x_out: Option<sampled_scan::XOut>) -> MaRun {
 /// copy is retained. An entry at the copy's rank and a newer one stay.
 #[test]
 fn cache_policy_m_a_provable_fit_releases_exactly_the_copy_only_prefix() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M_a_T8") {
         return;
     }
@@ -2112,6 +2146,8 @@ fn cache_policy_m_a_provable_fit_releases_exactly_the_copy_only_prefix() {
 /// headroom against `expected_victims`' `MARGIN` is about 54 KB (see there).
 #[test]
 fn cache_policy_m_a_measured_x_out_releases_exactly_the_copy_only_prefix() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M_a_T8_measured") {
         return;
     }
@@ -2134,6 +2170,8 @@ const CHURN_X_OUT: usize = 2_500_000;
 /// no suspended Codex proof), and the refusal is counted.
 #[test]
 fn cache_policy_m_a_churn_bound_refuses_a_finite_x_out() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M_a_churn") {
         return;
     }
@@ -2189,6 +2227,8 @@ fn cache_policy_m_a_churn_bound_refuses_a_finite_x_out() {
 /// rank are never victims, so a provable X_out still releases nothing.
 #[test]
 fn cache_policy_m_a_equal_rank_is_never_a_victim() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M_a_T9_equal") {
         return;
     }
@@ -2210,6 +2250,8 @@ fn cache_policy_m_a_equal_rank_is_never_a_victim() {
 /// rank its release ranked residents against.
 #[test]
 fn cache_policy_m_a_future_mtime_is_clipped_once_and_ranks_agree() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M_a_T9_future") {
         return;
     }
@@ -2250,6 +2292,8 @@ fn cache_policy_m_a_future_mtime_is_clipped_once_and_ranks_agree() {
 /// so the stamp gate declines and the deferred release never runs.
 #[test]
 fn cache_policy_m_a_failed_gate_releases_nothing() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M_a_T9_gate") {
         return;
     }
@@ -2279,6 +2323,8 @@ fn cache_policy_m_a_failed_gate_releases_nothing() {
 /// proof never runs for it.
 #[test]
 fn cache_policy_m_a_codex_keeps_the_legacy_release() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M_a_T10") {
         return;
     }
@@ -2333,6 +2379,8 @@ fn u3_identity(tag: &str) -> crate::context_footprint::RepositoryIdentity {
 /// at its rank, the refusal counted.
 #[test]
 fn cache_policy_m_a_cold_repository_identity_releases_nothing() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M_a_U3_cold") {
         return;
     }
@@ -2399,6 +2447,8 @@ fn cache_policy_m_a_cold_repository_identity_releases_nothing() {
 /// not a re-resolved or re-read one.
 #[test]
 fn cache_policy_m_a_warm_repository_identity_is_the_finished_one() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M_a_U3_warm") {
         return;
     }
@@ -2476,6 +2526,8 @@ fn cache_policy_m_a_warm_repository_identity_is_the_finished_one() {
 /// release. T10 keeps the positive row (`F_prev < C`).
 #[test]
 fn cache_policy_m_a_codex_finalization_guard_releases_nothing() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if unexecuted("M_a_T10_guard") {
         return;
     }

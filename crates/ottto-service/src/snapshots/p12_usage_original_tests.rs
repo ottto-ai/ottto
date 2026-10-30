@@ -416,6 +416,8 @@ impl Drop for Family {
 /// depending on two threads observing the same wall-clock timestamp.
 #[test]
 fn p12_family_fixtures_have_independent_checkpoint_custody() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let mut first = Family::new();
     let mut second = Family::new();
@@ -455,6 +457,8 @@ fn p12_family_fixtures_have_independent_checkpoint_custody() {
 #[test]
 #[ignore = "P12: needs full qualified two-phase driver; original expectations preserved"]
 fn member_change_after_unchanged_proof_fails_closed_until_family_reparse() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut family = Family::new();
     let first_witness = family.proven_and_corrected();
     let parent_key = family.parent_key.clone();
@@ -559,6 +563,8 @@ fn observe_base_prelude(experimental_base_exit: bool) {
 }
 #[test]
 fn p12_member_change_base_control_reveals_unmet_original_prelude() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -566,6 +572,8 @@ fn p12_member_change_base_control_reveals_unmet_original_prelude() {
 }
 #[test]
 fn p12_member_change_experiment_base_exit_reveals_unmet_original_prelude() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -574,6 +582,8 @@ fn p12_member_change_experiment_base_exit_reveals_unmet_original_prelude() {
 
 #[test]
 fn native_comparison_original_member_change_unit_oracle() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {

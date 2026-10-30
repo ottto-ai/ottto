@@ -31,6 +31,8 @@ pub(super) fn certificate(path: &Path, scope: &Scope) -> DurableCertificate {
 /// body, and drops the record whose key the index no longer holds.
 #[test]
 fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = crate::test_scratch::private_dir("ottto-dt-gc-large-index");
     let lock = test_locks::hold(&root);
     let index_path = root.join("index.json");
@@ -113,6 +115,8 @@ fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
 /// per-file marker change refuses even with unchanged scope, bytes and body.
 #[test]
 fn replay_revisions_and_applied_markers_bind_without_changing_the_allowlist() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let source = SnapshotSource::ClaudeCode;
     let key = "/synthetic/claude/fixture.jsonl";
     let scope = Scope("same-file-scope".into());
@@ -238,6 +242,8 @@ pub(super) fn native_fixture(path: &Path) {
 /// invalidates the existing record on the real post-save write path.
 #[test]
 fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _gate = claude_request_money::e2::GateForTest::set(true);
     let root = crate::test_scratch::private_dir("ottto-dt-owed");
     let lock = test_locks::hold(&root);
@@ -397,6 +403,8 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
 /// unaffected) and refuse the old record under the actual env setting.
 #[test]
 fn attribution_capture_toggle_refuses_the_previous_claude_record() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -553,6 +561,8 @@ fn open_call(call_id_bytes: usize) -> serde_json::Value {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let source = SnapshotSource::Codex;
     let namespace = Scope("dt-budget".into());
     let scope = Scope("dt-budget-file".into());
@@ -810,6 +820,8 @@ impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
 /// rebuilds reach the `local_resources` alarm for this source.
 #[test]
 fn common_hold_precedes_outer_gates_and_full_acquisition() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::PermissionsExt;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
@@ -1140,6 +1152,8 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
 /// record in it is neither held nor rebuilt (memory-only, pre-#806).
 #[test]
 fn foreign_owned_store_alarms_once_and_holds_nothing() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     struct OwnUid;
     impl Drop for OwnUid {
         fn drop(&mut self) {
@@ -1212,6 +1226,8 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
 /// F1 needs the real acquisition/publication seam, beyond store-only outcomes.
 #[test]
 fn store_io_failures_emit_cold_production_body_without_holds() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use std::os::unix::fs::PermissionsExt;
     struct Reset;
     impl Drop for Reset {
@@ -1382,6 +1398,8 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let source = SnapshotSource::ClaudeCode;
     for arm in ["retention", "codec"] {
         let root = crate::test_scratch::private_dir("ottto-dt-unreplaced");
@@ -1561,6 +1579,8 @@ pub(super) fn known_corrupt_scan(
 /// The fixture premise runs on Linux too, without requiring retained layout.
 #[test]
 fn known_corrupt_fixture_capture_and_audit_premises_match() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = crate::test_scratch::private_dir("ottto-known-corrupt-premises");
     let sessions = root.join("sessions");
     std::fs::create_dir(&sessions).unwrap();
@@ -1595,6 +1615,8 @@ fn known_corrupt_fixture_capture_and_audit_premises_match() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS retained layout")]
 fn known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for fail_replacement in [false, true] {
         known_corrupt_replacement_case(fail_replacement);
     }
@@ -1898,6 +1920,8 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
 /// only the absent key's record (the control proving GC ran).
 #[test]
 fn save_without_per_pass_setup_keeps_valid_records() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = crate::test_scratch::private_dir("ottto-dt-no-setup-save");
     let lock = test_locks::hold(&root);
     let source = SnapshotSource::ClaudeCode;
@@ -1966,6 +1990,8 @@ fn save_without_per_pass_setup_keeps_valid_records() {
 
 #[test]
 fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2145,6 +2171,8 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
 /// immutable header, not the current view, decides Legacy versus V2.
 #[test]
 fn v1_counting_provenance_comes_from_each_decoded_reduction() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use codex_counting_version::{AckEvidence, TestCutover};
     for (timestamp, evidence, version) in [
         ("1969-01-01T00:00:00Z", AckEvidence::None, 1),
@@ -2359,6 +2387,8 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
 
 #[test]
 fn restore_scope_attribution_is_typed_and_preserves_binding_formula() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let source = SnapshotSource::ClaudeCode;
     let namespace = Scope("diagnostic-namespace".into());
     let scope = Scope("diagnostic-scope".into());
@@ -2437,6 +2467,8 @@ fn restore_scope_attribution_is_typed_and_preserves_binding_formula() {
 
 #[test]
 fn restore_reports_each_early_exit_without_changing_old_totals() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = crate::test_scratch::private_dir("ottto-restore-provenance");
     let _lock = test_locks::hold(&root);
     let path = root.join("fixture.jsonl");
@@ -2507,6 +2539,8 @@ fn restore_reports_each_early_exit_without_changing_old_totals() {
 
 #[test]
 fn certificate_read_error_is_not_edit_evidence() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = crate::test_scratch::private_dir("ottto-certificate-read-error");
     let path = root.join("fixture.jsonl");
     std::fs::write(&path, b"{\"n\":1}\n").unwrap();
@@ -2557,6 +2591,8 @@ fn certificate_read_error_is_not_edit_evidence() {
 /// report unavailable rather than conflating the disable with a missing record.
 #[test]
 fn store_unavailable_after_t14_breaker_is_not_missing() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = crate::test_scratch::private_dir("ottto-restore-store-unavailable");
     let lock = test_locks::hold(&root);
     let path = root.join("fixture.jsonl");
@@ -2652,6 +2688,8 @@ fn store_unavailable_after_t14_breaker_is_not_missing() {
 
 #[test]
 fn certificate_sample_truncation_is_shrunk_for_both_windows() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::transcript_acquisition::set_between_guards;
     struct ClearHook;
     impl Drop for ClearHook {
@@ -2695,6 +2733,8 @@ fn certificate_sample_truncation_is_shrunk_for_both_windows() {
 
 #[test]
 fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = crate::test_scratch::private_dir("zst-record-refusal");
     let plain = root.join("plain.jsonl");
     std::fs::write(&plain, b"{\"n\":1}\n").unwrap();
@@ -2858,6 +2898,8 @@ pub(crate) fn seed_pinned_v1(
 /// every layout, including two process/index reloads and a later offered debt.
 #[test]
 fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::transcript_acquisition::{AuditDebt, ReadMode};
     let root = crate::test_scratch::private_dir("ottto-v1-debt-survival");
     let lock = test_locks::hold(&root);
@@ -3169,6 +3211,8 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
 /// and says so.
 #[test]
 fn a_permit_era_record_restores_under_the_always_on_capture() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let root = crate::test_scratch::private_dir("ottto-dt-contract5");
     let lock = test_locks::hold(&root);
     let source = SnapshotSource::ClaudeCode;
@@ -3285,6 +3329,8 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::heap_layout_bound::bound;
     use crate::snapshots::codex_file_join::header_cache_tests::{page, READ_CALLS};
     use crate::snapshots::sampled_scan::{codex_cursor, STATE_BYTES};

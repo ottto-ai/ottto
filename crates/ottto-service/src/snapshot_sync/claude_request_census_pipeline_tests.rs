@@ -19,6 +19,8 @@ fn census_pipeline_window(census_window_end: &str) -> u64 {
 #[test]
 #[serial(source_manifests)]
 fn census_records_keep_the_held_revision_and_cover_it_in_window() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
@@ -204,6 +206,8 @@ fn census_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Value>, usiz
 #[test]
 #[serial(source_manifests)]
 fn census_records_change_no_pipeline_decision() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (with_records, record_count) = census_parity_arm("claude-census-parity-records", true);
     let (control, control_record_count) = census_parity_arm("claude-census-parity-control", false);
     assert!(record_count > 0, "the records arm wrote records");
@@ -448,6 +452,8 @@ fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Val
 #[test]
 #[serial(source_manifests)]
 fn census_every_offered_and_held_body_matches_control() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Pre-E2 invariant: E2 reads census records as copy-holder evidence.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (records, records_held, records_reset_owed) =

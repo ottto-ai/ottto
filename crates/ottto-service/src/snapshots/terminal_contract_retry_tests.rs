@@ -12,6 +12,8 @@ fn terminal(source: SnapshotSource) -> SnapshotQuarantineRecord {
 
 #[test]
 fn terminal_contract_legacy_decode_and_lenient_repair_preserve_version() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-contract-decode");
     let fingerprint = "a".repeat(64);
     for version in [None, Some(2)] {
@@ -60,6 +62,8 @@ fn terminal_contract_legacy_decode_and_lenient_repair_preserve_version() {
 
 #[test]
 fn terminal_contract_load_is_paced_and_preserves_account_and_history_state() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-contract-load");
     let path = scratch.join("index.json");
     let fingerprint = "a".repeat(64);
@@ -128,6 +132,8 @@ fn terminal_contract_load_is_paced_and_preserves_account_and_history_state() {
 
 #[test]
 fn terminal_contract_retry_reads_only_the_owning_file() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let scratch = crate::test_scratch::ScratchDir::new("terminal-contract-file-read");
     let root = scratch.join("sources");
@@ -217,6 +223,8 @@ fn terminal_contract_retry_reads_only_the_owning_file() {
 
 #[test]
 fn terminal_contract_valid_values_are_not_coerced_by_tolerant_decode() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for version in [0, 1, 2, u16::MAX] {
         let mut wire = serde_json::to_value(terminal(SnapshotSource::ClaudeCode)).unwrap();
         wire["reconstruction_contract"] = json!(version);

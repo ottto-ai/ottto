@@ -15,6 +15,8 @@ fn assistant(usage: Value) -> Value {
 
 #[test]
 fn thinking_tokens_fill_reasoning_output_tokens() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let usage = claude_code_delta_usage(&assistant(json!({
         "input_tokens": 12,
         "output_tokens": 900,
@@ -28,6 +30,8 @@ fn thinking_tokens_fill_reasoning_output_tokens() {
 
 #[test]
 fn usage_without_thinking_tokens_keeps_zero_reasoning() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let usage = claude_code_delta_usage(&assistant(json!({
         "input_tokens": 12,
         "output_tokens": 900,
@@ -40,6 +44,8 @@ fn usage_without_thinking_tokens_keeps_zero_reasoning() {
 
 #[test]
 fn thinking_tokens_never_exceed_output_tokens() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let usage = claude_code_delta_usage(&assistant(json!({
         "input_tokens": 12,
         "output_tokens": 40,
@@ -51,6 +57,8 @@ fn thinking_tokens_never_exceed_output_tokens() {
 
 #[test]
 fn explicit_reasoning_output_tokens_wins_over_thinking_tokens() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let usage = claude_code_delta_usage(&assistant(json!({
         "input_tokens": 12,
         "output_tokens": 900,
@@ -63,6 +71,8 @@ fn explicit_reasoning_output_tokens_wins_over_thinking_tokens() {
 
 #[test]
 fn unreported_sidecar_reasoning_matches_transcript_thinking() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Claude Code's api_request event has no thinking count (sidecar 0).
     assert!(claude_api_reasoning_matches(0u64, 300u64));
     assert!(claude_api_reasoning_matches(0u64, 0u64));
@@ -112,6 +122,8 @@ fn parsed_session() -> SnapshotItem {
 
 #[test]
 fn aggregate_account_coverage_accepts_transcript_thinking_with_unreported_sidecar() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let item = parsed_session();
     assert_eq!(item.output_tokens, 1000);
     assert_eq!(item.reasoning_output_tokens, 300);
@@ -141,6 +153,8 @@ fn sidecar_request(
 
 #[test]
 fn per_request_match_accepts_transcript_thinking_with_unreported_sidecar() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let item = parsed_session();
     let occurrence =
         ClaudeTranscriptUsageOccurrenceWitness::from(&item.claude_usage_occurrences["req-1"]);
@@ -156,6 +170,8 @@ fn per_request_match_accepts_transcript_thinking_with_unreported_sidecar() {
 
 #[test]
 fn reported_usage_rows_keep_transcript_thinking_with_unreported_sidecar() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let item = parsed_session();
     let rows = [sidecar_request("req-1", 900), sidecar_request("req-2", 100)];
     let prepared = prepare_claude_reported_usage(&item, &rows, &BTreeSet::new(), None)
@@ -178,6 +194,8 @@ fn reported_usage_rows_keep_transcript_thinking_with_unreported_sidecar() {
 
 #[test]
 fn progressive_rows_of_one_response_keep_the_final_clamped_thinking() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // One response written as three rows under one message id. Thinking is
     // ahead of output in the first row (clamped to 50), then rises.
     let path = std::env::temp_dir().join(format!(
@@ -251,6 +269,8 @@ fn parse_member(path: &Path, fingerprint: &str) -> SnapshotItem {
 /// census re-proves the family and uploads it; it never ends terminal.
 #[test]
 fn family_proven_before_thinking_reader_reproves_after_upgrade() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use super::tests::{complete_api_row, complete_trace_row, manifest_index_entry};

@@ -361,6 +361,8 @@ fn same_input_finish_pair(outcome: FinishOutcome, conflict: bool, count: usize) 
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn prior_index_lifetime_real_finish_releases_before_cas_with_exact_conservation() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let [base, candidate] = same_input_finish_pair(FinishOutcome::Accept, false, 2048);
     assert_eq!(base.index, candidate.index);
     assert_eq!(base.progress, candidate.progress);
@@ -386,6 +388,8 @@ fn prior_index_lifetime_real_finish_releases_before_cas_with_exact_conservation(
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn prior_index_lifetime_real_finish_preserves_refusals_retry_and_failed_cas() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for (outcome, conflict) in [
         (FinishOutcome::Permanent, false),
         (FinishOutcome::Retryable, false),
@@ -404,6 +408,8 @@ fn prior_index_lifetime_real_finish_preserves_refusals_retry_and_failed_cas() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn prior_index_lifetime_retains_real_earned_receipt_path() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -464,6 +470,8 @@ fn money_unclocked(mut value: serde_json::Value) -> serde_json::Value {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn e2_real_caller_parity_at_tight_allowances() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     if !crate::heap_layout_bound::layout_supported() {
         return;

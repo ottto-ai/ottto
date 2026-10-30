@@ -215,6 +215,8 @@ fn insert_file(index: &mut ScanIndex, key: &str, source: &str, size_bytes: u64) 
 /// skips are disclosed on the evidence line.
 #[test]
 fn unchanged_structural_set_skips_repeated_full_rearms() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     const TERMINALS: usize = 5;
     let rearm = Rearm::new();
@@ -326,6 +328,8 @@ fn unchanged_structural_set_skips_repeated_full_rearms() {
 /// the same unchanged structural family; it skips too. BASE re-arms.
 #[test]
 fn coverage_only_terminal_skips_while_the_set_is_unchanged() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let rearm = Rearm::new();
     let mut fix = rearm.index();
@@ -346,6 +350,8 @@ fn coverage_only_terminal_skips_while_the_set_is_unchanged() {
 /// that window records the new set and the skip resumes, counted afresh.
 #[test]
 fn changed_member_revision_rearms_once_then_skips_again() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut rearm = Rearm::new();
     let mut index = rearm.index();
@@ -384,6 +390,8 @@ fn changed_member_revision_rearms_once_then_skips_again() {
 /// the two-family set skips.
 #[test]
 fn new_structural_family_rearms_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut rearm = Rearm::new();
     let mut index = rearm.index();
@@ -404,6 +412,8 @@ fn new_structural_family_rearms_once() {
 /// unchanged.
 #[test]
 fn non_structural_invalidation_rearms() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut rearm = Rearm::new();
     let mut index = rearm.index();
@@ -462,6 +472,8 @@ fn non_structural_invalidation_rearms() {
 /// counts as a skip.
 #[test]
 fn identity_contract_latch_or_unrecorded_contract_rearms() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     let rearm = Rearm::new();
@@ -491,6 +503,8 @@ fn identity_contract_latch_or_unrecorded_contract_rearms() {
 /// record version bump) re-arms once, then the current basis is recorded.
 #[test]
 fn record_basis_change_rearms_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let rearm = Rearm::new();
     let mut index = rearm.index();
@@ -524,6 +538,8 @@ fn record_basis_change_rearms_once() {
 /// it vetoes the skip until one runs.
 #[test]
 fn first_proof_hold_vetoes_the_skip_until_a_full_rearm() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let rearm = Rearm::new();
     let mut index = rearm.index();
@@ -550,6 +566,8 @@ fn first_proof_hold_vetoes_the_skip_until_a_full_rearm() {
 /// still loads (nothing is quarantined) and the next due terminal re-arms.
 #[test]
 fn malformed_persisted_progress_loads_and_rearms() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let rearm = Rearm::new();
     let mut index = rearm.index();
@@ -606,6 +624,8 @@ fn malformed_persisted_progress_loads_and_rearms() {
 /// ramps from the base delay as before.
 #[test]
 fn rebuilt_index_first_close_waits_the_capped_delay() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let rearm = Rearm::new();
     let support = temp_dir("claude-full-rearm-rebuild");
@@ -652,6 +672,8 @@ fn rebuilt_index_first_close_waits_the_capped_delay() {
 
 #[test]
 fn structural_classification_accepts_only_own_byte_count_failures() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let rearm = Rearm::new();
     let valid = &rearm.valid_parent;
@@ -672,6 +694,8 @@ fn structural_classification_accepts_only_own_byte_count_failures() {
 
 #[test]
 fn unknown_identity_failure_in_a_structural_family_keeps_the_rearm() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let rearm = Rearm::new();
     let mut index = rearm.index();
@@ -686,6 +710,8 @@ fn unknown_identity_failure_in_a_structural_family_keeps_the_rearm() {
 
 #[test]
 fn contract_rearm_remains_independent_of_the_full_rearm_deadline() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let rearm = Rearm::new();
     let mut index = rearm.index();
@@ -714,6 +740,8 @@ fn contract_rearm_remains_independent_of_the_full_rearm_deadline() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn full_rearm_window_keeps_the_origin_after_scanner_checkpoint_retirement() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let rearm = Rearm::new();
     let mut index = rearm.index();
@@ -762,6 +790,8 @@ fn full_rearm_window_keeps_the_origin_after_scanner_checkpoint_retirement() {
 /// An observation before the deadline cannot pay for the required full re-arm.
 #[test]
 fn non_due_changes_remain_owed_until_one_real_full_rearm() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for cause in ["member", "set", "basis", "missing", "malformed", "reverted"] {
         let mut rearm = Rearm::new();
@@ -854,6 +884,8 @@ fn non_due_changes_remain_owed_until_one_real_full_rearm() {
 /// Exercise each alone, including both withheld-account reasons.
 #[test]
 fn attribution_explanations_do_not_rearm_an_unchanged_structural_baseline() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for (reason, refusals) in [
         (Some(CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE), 0),
@@ -891,6 +923,8 @@ fn attribution_explanations_do_not_rearm_an_unchanged_structural_baseline() {
 /// evidence can suppress again without replacing the structural baseline.
 #[test]
 fn evidence_read_failure_rearms_but_a_healthy_retry_suppresses() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let rearm = Rearm::new();
     let mut index = rearm.index();
@@ -922,6 +956,8 @@ fn evidence_read_failure_rearms_but_a_healthy_retry_suppresses() {
 /// an otherwise unchanged, established structural baseline.
 #[test]
 fn non_own_byte_causes_veto_structural_suppression_at_the_terminal() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for cause in [
         "account",
@@ -997,6 +1033,8 @@ fn non_own_byte_causes_veto_structural_suppression_at_the_terminal() {
 
 #[test]
 fn unhealthy_earlier_page_keeps_a_healthy_terminal_rearm_enabled() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let rearm = Rearm::new();
     let mut index = rearm.index();
@@ -1022,6 +1060,8 @@ fn unhealthy_earlier_page_keeps_a_healthy_terminal_rearm_enabled() {
 
 #[test]
 fn occurrence_key_mismatch_in_an_already_invalid_family_still_vetoes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let rearm = Rearm::new();
     let mut index = rearm.index();
@@ -1048,6 +1088,8 @@ fn occurrence_key_mismatch_in_an_already_invalid_family_still_vetoes() {
 /// refusals cannot justify a whole-index transcript re-read.
 #[test]
 fn pipeline_sidecar_health_vetoes_but_fixed_evidence_refusals_do_not() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
@@ -1404,6 +1446,8 @@ fn always_on_veto_state(rearm: &Rearm, index: &ScanIndex, items: &[SnapshotItem]
 /// dark row is refused as invalid evidence, a non-structural veto.
 #[test]
 fn always_on_terminals_keep_the_structural_suppression() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for (contract, gate, causes) in [
         (
@@ -1498,6 +1542,8 @@ fn always_on_terminals_keep_the_structural_suppression() {
 /// first skips: no fingerprint is cleared, nothing reads Full.
 #[test]
 fn a_tagged_permitted_body_keeps_census_identity_and_the_suppression() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let contract = claude_request_identity::E2_GROUPING;
@@ -1575,6 +1621,8 @@ fn a_tagged_permitted_body_keeps_census_identity_and_the_suppression() {
 /// contract-5 body, and the pre-cutover arm has identical re-arm behavior.
 #[test]
 fn a_withheld_account_rearms_the_same_before_and_after_the_cutover() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     claude_request_identity::with_cycle_contract_for_test(
         claude_request_identity::E2_GROUPING,
@@ -1648,6 +1696,8 @@ fn a_withheld_account_rearms_the_same_before_and_after_the_cutover() {
 /// debt; below revision 3 see `a_never_permitted_cutover_rearms_once_and_is_counted`.
 #[test]
 fn a_contract_change_rearms_at_most_once_then_skips() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for (from, held) in [
         ("", false),
@@ -1769,6 +1819,8 @@ fn a_contract_change_rearms_at_most_once_then_skips() {
 /// the latch.
 #[test]
 fn a_never_permitted_cutover_rearms_once_and_is_counted() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     claude_request_identity::with_cycle_contract_for_test(
@@ -1883,6 +1935,8 @@ fn a_never_permitted_cutover_rearms_once_and_is_counted() {
 /// through another terminal and restart. An unknown contract is not this case.
 #[test]
 fn a_dropped_cutover_field_with_recorded_empty_spends_one_more_run() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     claude_request_identity::with_cycle_contract_for_test(
@@ -1985,6 +2039,8 @@ fn a_dropped_cutover_field_with_recorded_empty_spends_one_more_run() {
 /// canonical BadClock refusal stays visible without forcing whole-index Full.
 #[test]
 fn pipeline_auxiliary_bad_clock_preserves_refusal_without_whole_index_rearm() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -2190,6 +2246,8 @@ fn rebuild_reads(index: &ScanIndex) -> Vec<PendingIndexFinalization> {
 
 #[test]
 fn complete_rebuild_read_skips_only_the_first_close_and_discloses_it() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let rearm = Rearm::new();
     let mut index = rebuild_candidate(&rearm, ScanIndexLoadOrigin::Loaded);
@@ -2226,6 +2284,8 @@ fn complete_rebuild_read_skips_only_the_first_close_and_discloses_it() {
 
 #[test]
 fn incomplete_rebuild_read_keeps_rearm_for_every_refusal() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let rearm = Rearm::new();
     for cause in [
@@ -2317,6 +2377,8 @@ fn incomplete_rebuild_read_keeps_rearm_for_every_refusal() {
 
 #[test]
 fn fresh_load_origins_never_prove_a_complete_rebuild_even_after_replay_fills_files() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let rearm = Rearm::new();
     for origin in [
@@ -2342,6 +2404,8 @@ fn fresh_load_origins_never_prove_a_complete_rebuild_even_after_replay_fills_fil
 /// Real discovery/parser wiring, plus fail-closed reuse of unchanged files.
 #[test]
 fn scanner_seals_only_actual_complete_rebuild_reads() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let rearm = Rearm::new();
     let mut index = rebuild_candidate(&rearm, ScanIndexLoadOrigin::Loaded);
@@ -2409,6 +2473,8 @@ fn scanner_seals_only_actual_complete_rebuild_reads() {
 
 #[test]
 fn structural_family_masks_duplicate_ownership_but_native_copy_still_rearms() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     const THIRD_ROOT: &str = "d6666666-6666-4666-8666-666666666666";
     let mut rearm = Rearm::new();
@@ -2477,6 +2543,8 @@ fn structural_family_masks_duplicate_ownership_but_native_copy_still_rearms() {
 
 #[test]
 fn scanner_does_not_seal_capped_or_failed_rebuild_reads() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for failed in [false, true] {
         let rearm = Rearm::new();
@@ -2513,6 +2581,8 @@ fn scanner_does_not_seal_capped_or_failed_rebuild_reads() {
 /// sidecar fingerprint. An unrelated, structurally invalid family stays quiet.
 #[test]
 fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let _gate = claude_request_money::e2::GateForTest::off();
     claude_request_identity::with_cycle_contract_for_test("", || {
@@ -2725,6 +2795,8 @@ fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
 /// gap is fixed, the existing dormant-owner hold must veto suppression again.
 #[test]
 fn dormant_owner_hold_returns_when_unrelated_sidecar_gap_is_fixed() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     const DORMANT: &str = "d6666666-6666-4666-8666-666666666666";
     const GAP: &str = "b7777777-7777-4777-8777-777777777777";
@@ -2938,6 +3010,8 @@ fn fold_reports(
 /// this test does not certify those files healthy or weaken that boundary.
 #[test]
 fn each_canonical_telemetry_refusal_is_counted_without_whole_index_rearm() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for cause in [
         "invalid-api",
@@ -3046,6 +3120,8 @@ fn each_canonical_telemetry_refusal_is_counted_without_whole_index_rearm() {
 
 #[test]
 fn semantic_refusal_keys_follow_real_proof_reconstruction_inputs_and_rebuild_branches() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let _gate = claude_request_money::e2::GateForTest::off();
     for cause in [
@@ -3143,6 +3219,8 @@ fn semantic_refusal_keys_follow_real_proof_reconstruction_inputs_and_rebuild_bra
 
 #[test]
 fn attribution_keys_and_request_sink_refusal_are_diagnostic_only() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for kind in [
         IgnoredVeto::WithheldAccount,
@@ -3244,6 +3322,8 @@ fn attribution_keys_and_request_sink_refusal_are_diagnostic_only() {
 
 #[test]
 fn ignored_reasons_follow_window_scope_and_exclude_independent_or_empty_clears() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut rearm = Rearm::new();
     let mut index = rearm.index();
@@ -3291,6 +3371,8 @@ fn ignored_reasons_follow_window_scope_and_exclude_independent_or_empty_clears()
 
 #[test]
 fn bound_retry_pending_authority_survives_unrelated_suppression_and_offers_its_own_due_retry() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let _gate = claude_request_money::e2::GateForTest::off();
     let mut rearm = Rearm::new();
@@ -3364,6 +3446,8 @@ fn bound_retry_pending_authority_survives_unrelated_suppression_and_offers_its_o
 
 #[test]
 fn ignored_savings_exclude_independent_proof_clears_and_non_due_passes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let _gate = claude_request_money::e2::GateForTest::off();
     let mut rearm = Rearm::new();
@@ -3425,6 +3509,8 @@ fn reidentify_native(item: &mut SnapshotItem, session: &str, prefix: Option<&str
 
 #[test]
 fn native_cross_family_copy_keeps_vetoing_every_due_terminal_and_is_counted() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     const COPY: &str = "c8888888-8888-4888-8888-888888888888";
     let mut rearm = Rearm::new();
@@ -3477,6 +3563,8 @@ fn native_cross_family_copy_keeps_vetoing_every_due_terminal_and_is_counted() {
 
 #[test]
 fn unique_native_growth_and_retirement_do_not_rearm_through_removed_vetoes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     use claude_request_census::{ClaudeRequestCensusRecord, ClaudeRequestCensusShape};
     const NEXT: &str = "2026-08-03T07:10:00Z";

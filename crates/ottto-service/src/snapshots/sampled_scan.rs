@@ -2190,6 +2190,8 @@ mod cache_lifecycle_tests {
 
     #[test]
     fn cache_lifecycle_poisoned_lock_is_not_reported_as_absent() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let cache = SharedCache::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = cache.inner.lock().unwrap();

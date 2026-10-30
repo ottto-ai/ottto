@@ -1326,6 +1326,8 @@ fn assert_late_import_checks_settled_request_owners(copied: bool) {
 #[ignore = "P12: needs full qualified two-phase driver; original expectations preserved"]
 #[serial(source_manifests)]
 fn novel_import_recovers_after_owner_coverage_then_stops_reading() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _source_manifests = SourceManifestTestGuard::new();
     assert_late_import_checks_settled_request_owners(false);
 }
@@ -1372,6 +1374,8 @@ fn observe_base_prelude(experimental_base_exit: bool) {
 #[test]
 #[serial(source_manifests)]
 fn p12_novel_import_base_control_reveals_unmet_original_prelude() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     observe_base_prelude(false);
@@ -1379,6 +1383,8 @@ fn p12_novel_import_base_control_reveals_unmet_original_prelude() {
 #[test]
 #[serial(source_manifests)]
 fn p12_novel_import_experiment_base_exit_reveals_unmet_original_prelude() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     observe_base_prelude(true);
@@ -1387,6 +1393,8 @@ fn p12_novel_import_experiment_base_exit_reveals_unmet_original_prelude() {
 #[test]
 #[ignore = "UNMET historical strict-fence aspiration; superseded by explicit native_comparison_novel_import_base_parity"]
 fn native_comparison_original_novel_import_oracle() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "native_comparison_original_novel_import: supported_positive=UNEXECUTED original_body_ran=false original_passed=false").unwrap();
         return;
@@ -1489,6 +1497,8 @@ fn native_comparison_shed_corrective_parse_partial_save_and_terminal_use_base() 
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_pending_ack_corrective_parse_partial_save_and_terminal_use_base() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     native_comparison_interrupted_correction_is_terminal_base(RearmUpload::AckLost);
@@ -1590,6 +1600,8 @@ fn native_comparison_assert_old_bindings(before: &serde_json::Value, index: &Sca
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_novel_import_base_parity() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
@@ -1727,6 +1739,8 @@ fn native_comparison_novel_import_base_parity() {
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         eprintln!("native_comparison_deferred_no_target: supported_positive=UNEXECUTED");
         return;
@@ -1798,6 +1812,8 @@ fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use sha2::{Digest, Sha256};
@@ -2140,6 +2156,8 @@ fn native_comparison_copy_offer_shed_partial_save_recovers() {
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_copy_offer_ack_loss_partial_save_recovers() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     native_comparison_copy_offer_interruption(RearmUpload::AckLost, false);
@@ -2156,6 +2174,8 @@ fn native_comparison_copy_offer_shed_restart_recovers() {
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_copy_offer_ack_loss_restart_recovers() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     native_comparison_copy_offer_interruption(RearmUpload::AckLost, true);
@@ -2164,6 +2184,8 @@ fn native_comparison_copy_offer_ack_loss_restart_recovers() {
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use sha2::{Digest, Sha256};
@@ -2268,6 +2290,8 @@ fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_deferred_policy_resource_usefulness() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {

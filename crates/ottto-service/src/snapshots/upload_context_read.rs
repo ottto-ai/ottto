@@ -226,6 +226,8 @@ mod tests {
     use super::*;
     #[test]
     fn context_cursor_room_excludes_prior_ordinary_native_bytes() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let mut budget = Budget::new(SnapshotSource::Codex);
         budget.native_read = 1024;
         let mut page = sampled_scan::codex_cursor::PageBudget::default();

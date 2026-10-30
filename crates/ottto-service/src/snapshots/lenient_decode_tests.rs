@@ -67,6 +67,8 @@ fn assert_sibling(index: &ScanIndex) {
 
 #[test]
 fn lenient_positive_matrix_load_and_both_cas_readers() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for (field, key, bad) in [
         ("snapshot_activity_at", format!("{:064x}", 1), "17"),
         ("snapshot_activity_at", format!("{:064x}", 1), "1e400"),
@@ -124,6 +126,8 @@ fn lenient_positive_matrix_load_and_both_cas_readers() {
 
 #[test]
 fn lenient_opaque_holds_refuse_new_cas_then_round_trip_original_slot() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let cases = [
         (
             "files",
@@ -235,6 +239,8 @@ fn lenient_opaque_holds_refuse_new_cas_then_round_trip_original_slot() {
 
 #[test]
 fn lenient_control_matrix_refuses_without_quarantine_or_rewrite() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for field in [
         "schema_version",
         "generation",
@@ -298,6 +304,8 @@ fn lenient_control_matrix_refuses_without_quarantine_or_rewrite() {
 
 #[test]
 fn lenient_native_retry_and_terminal_scalar_repairs() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for disposition in ["retry_pending", "unproven_terminal", "superseded_terminal"] {
         for leaf in ["failed_reconstruction_count", "retry_after_unix_seconds"] {
             for bad in ["300", "{}", "null", "-1", "1e400"] {
@@ -364,6 +372,8 @@ fn lenient_native_retry_and_terminal_scalar_repairs() {
 
 #[test]
 fn lenient_original_syntax_in_optional_census_still_quarantines() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for bad in [
         "{\"files\":{},\"claude_request_census\":{\"bad\":1e+}}",
         "{\"files\":{},\"claude_request_census\":{",
@@ -385,6 +395,8 @@ fn lenient_original_syntax_in_optional_census_still_quarantines() {
 
 #[test]
 fn lenient_budget_overflow_uses_existing_load_and_cas_outcomes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("lenient-budget");
     let path = scratch.as_ref().join("index.json");
     let mut working = fixture();
@@ -405,6 +417,8 @@ fn lenient_budget_overflow_uses_existing_load_and_cas_outcomes() {
 
 #[test]
 fn lenient_held_entity_is_absent_from_emission_and_manifest() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("lenient-publication");
     let path = scratch.as_ref().join("index.json");
     let held = "e".repeat(64);
@@ -441,6 +455,8 @@ fn lenient_held_entity_is_absent_from_emission_and_manifest() {
 
 #[test]
 fn lenient_legacy_defaults_duplicate_headers_and_generation_refusals() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("lenient-defaults");
     let path = scratch.as_ref().join("index.json");
     fs::write(&path, b"{\"files\":{}}").unwrap();
@@ -481,6 +497,8 @@ fn lenient_legacy_defaults_duplicate_headers_and_generation_refusals() {
 
 #[test]
 fn lenient_authority_scalar_repair_and_held_family_correction_custody() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for terminal in [false, true] {
         let scratch = crate::test_scratch::ScratchDir::new("lenient-authority");
         let path = scratch.as_ref().join("index.json");
@@ -550,6 +568,8 @@ fn lenient_authority_scalar_repair_and_held_family_correction_custody() {
 
 #[test]
 fn lenient_shape_caps_and_hold_count_preserve_original_disk() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("lenient-limits");
     let path = scratch.as_ref().join("index.json");
     let mut index = fixture();
@@ -578,6 +598,8 @@ fn lenient_shape_caps_and_hold_count_preserve_original_disk() {
 
 #[test]
 fn lenient_load_and_selected_cas_allocation_receipt() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("lenient-allocations");
     let path = scratch.as_ref().join("index.json");
     let mut index = fixture();
@@ -615,6 +637,8 @@ fn lenient_load_and_selected_cas_allocation_receipt() {
 
 #[test]
 fn lenient_save_refuses_to_write_holds_that_would_exceed_restart_admission() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for bounded in [false, true] {
         let scratch = crate::test_scratch::ScratchDir::new("lenient-output-admission");
         let path = scratch.as_ref().join("index.json");
@@ -645,6 +669,8 @@ fn lenient_save_refuses_to_write_holds_that_would_exceed_restart_admission() {
 
 #[test]
 fn lenient_unkeyed_or_unaddressable_debt_refuses_without_rebuild() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for field in [
         "files",
         "accepted_snapshot_fingerprints",
@@ -681,6 +707,8 @@ fn lenient_unkeyed_or_unaddressable_debt_refuses_without_rebuild() {
 
 #[test]
 fn lenient_opaque_claude_file_also_freezes_family_correction() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("lenient-file-family");
     let path = scratch.as_ref().join("index.json");
     let mut index = fixture();
@@ -719,6 +747,8 @@ fn lenient_opaque_claude_file_also_freezes_family_correction() {
 
 #[test]
 fn repaired_records_can_advance_after_load_but_new_cas_damage_still_requires_reload() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for bounded in [false, true] {
         for changed_again in [false, true] {
             let scratch = crate::test_scratch::ScratchDir::new("lenient-repair-provenance");
@@ -799,6 +829,8 @@ fn repaired_records_can_advance_after_load_but_new_cas_damage_still_requires_rel
 
 #[test]
 fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("lenient-pending-membership");
     let path = scratch.as_ref().join("index.json");
     let mut snapshot = tests::sample_session_artifact_item();
@@ -861,6 +893,8 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
 
 #[test]
 fn held_scope_manifest_visits_are_linear_in_file_count() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("lenient-keyed-scope");
     let path = scratch.as_ref().join("index.json");
     let mut index = fixture();
@@ -900,6 +934,8 @@ fn held_scope_manifest_visits_are_linear_in_file_count() {
 
 #[test]
 fn controls_refuse_before_excess_damage_can_quarantine_the_index() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("lenient-control-priority");
     let path = scratch.as_ref().join("index.json");
     for (field, control) in [
@@ -920,6 +956,8 @@ fn controls_refuse_before_excess_damage_can_quarantine_the_index() {
 
 #[test]
 fn repair_provenance_is_constant_for_many_scalar_repairs_and_authority_drops() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut retained_bytes = None;
     for count in [16, 512] {
         let scratch = crate::test_scratch::ScratchDir::new("lenient-fixed-provenance");
@@ -1010,6 +1048,8 @@ fn repair_provenance_is_constant_for_many_scalar_repairs_and_authority_drops() {
 
 #[test]
 fn repair_only_published_holds_drop_without_heap_retirement() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("lenient-empty-hold-storage");
     let path = scratch.as_ref().join("index.json");
     let key = "b".repeat(64);
@@ -1061,6 +1101,8 @@ fn write_deep_optional(path: &Path, prefix: &[u8], depth: usize) -> usize {
 
 #[test]
 fn streamed_million_deep_census_is_resource_unknown_with_bounded_allocations() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("lenient-deep-census");
     let path = scratch.as_ref().join("index.json");
     let mut seed = fixture();
@@ -1110,6 +1152,8 @@ fn streamed_million_deep_census_is_resource_unknown_with_bounded_allocations() {
 
 #[test]
 fn main_depth_resource_refuses_but_admitted_bad_grammar_still_quarantines() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("lenient-depth-resource");
     let path = scratch.as_ref().join("index.json");
     let mut seed = fixture();
@@ -1152,6 +1196,8 @@ fn main_depth_resource_refuses_but_admitted_bad_grammar_still_quarantines() {
 
 #[test]
 fn populated_valid_wire_matches_the_retained_native_codec() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut index = fixture();
     index.insert_retry_pending_claude_authority_for_test("valid-family");
     index.legacy_settlement_reconcile_after_fingerprint = Some(format!("{:064x}", 0));
@@ -1166,6 +1212,8 @@ fn populated_valid_wire_matches_the_retained_native_codec() {
 
 #[test]
 fn unbound_type_repair_freezes_siblings_without_retaining_repair_keys() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("lenient-fixed-provenance-hold");
     let path = scratch.as_ref().join("index.json");
     let mut seed = fixture();
@@ -1198,6 +1246,8 @@ fn unbound_type_repair_freezes_siblings_without_retaining_repair_keys() {
 
 #[test]
 fn admitted_unknown_main_values_cross_serde_native_recursion_threshold() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("lenient-admitted-depth");
     let path = scratch.as_ref().join("index.json");
     let mut seed = fixture();
@@ -1226,6 +1276,8 @@ fn admitted_unknown_main_values_cross_serde_native_recursion_threshold() {
 
 #[test]
 fn optional_resource_classification_precedes_earlier_bad_numeric_token() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("lenient-resource-before-syntax");
     let path = scratch.as_ref().join("index.json");
     let mut seed = fixture();
@@ -1256,6 +1308,8 @@ fn optional_resource_classification_precedes_earlier_bad_numeric_token() {
 
 #[test]
 fn optional_raw_cap_counts_object_field_leading_whitespace() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use std::io::Write;
     let scratch = crate::test_scratch::ScratchDir::new("lenient-census-leading-whitespace");
     let path = scratch.as_ref().join("index.json");
@@ -1285,6 +1339,8 @@ fn optional_raw_cap_counts_object_field_leading_whitespace() {
 
 #[test]
 fn streamed_64_mib_record_key_refuses_before_key_allocation() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use std::io::{Read, Write};
     fn digest(path: &Path) -> [u8; 32] {
         let mut file = File::open(path).unwrap();
@@ -1366,6 +1422,8 @@ fn streamed_64_mib_record_key_refuses_before_key_allocation() {
 
 #[test]
 fn held_key_bytes_and_overhead_obey_running_and_restart_budgets() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for records in [1, 3] {
         let scratch = crate::test_scratch::ScratchDir::new("lenient-key-charge");
         let path = scratch.as_ref().join("index.json");
@@ -1412,6 +1470,8 @@ fn held_key_bytes_and_overhead_obey_running_and_restart_budgets() {
 
 #[test]
 fn opaque_file_incidence_preserves_existing_acks_through_both_pruners_and_restart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for exact_empty in [false, true] {
         for bounded in [false, true] {
             let scratch = crate::test_scratch::ScratchDir::new("lenient-opaque-incidence-ack");
@@ -1479,6 +1539,8 @@ fn opaque_file_incidence_preserves_existing_acks_through_both_pruners_and_restar
 
 #[test]
 fn opaque_file_incidence_blocks_both_legacy_seals_and_ack_reopening() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for version in [0, SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION] {
         let scratch = crate::test_scratch::ScratchDir::new("lenient-opaque-legacy-seal");
         let path = scratch.as_ref().join("index.json");
@@ -1534,6 +1596,8 @@ fn opaque_file_incidence_blocks_both_legacy_seals_and_ack_reopening() {
 
 #[test]
 fn held_owner_range_survives_clone_original_drop_and_restart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for valid in [false, true] {
         let scratch = crate::test_scratch::ScratchDir::new("lenient-shared-owner-range");
         let path = scratch.as_ref().join("index.json");
@@ -1582,6 +1646,8 @@ fn held_owner_range_survives_clone_original_drop_and_restart() {
 // SI R1: valid native empty/optional cells are explicit controls, not damage.
 #[test]
 fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fields = [
         "session_account_bindings",
         "claude_account_deferred_holds",
@@ -1721,6 +1787,8 @@ fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
 
 #[test]
 fn si_unknown_contract_latches_through_observation_save_and_restart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for bounded in [false, true] {
         let scratch = crate::test_scratch::ScratchDir::new("si-unknown-contract");
         let path = scratch.as_ref().join("index.json");
@@ -1767,6 +1835,8 @@ fn si_unknown_contract_latches_through_observation_save_and_restart() {
 
 #[test]
 fn hold_budget_floor_and_seven_day_rebuild_loop_guard() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Small damage below the floor is contained, not a whole-source rebuild.
     let scratch = crate::test_scratch::ScratchDir::new("lenient-budget-floor");
     let path = scratch.as_ref().join("index.json");
@@ -1827,6 +1897,8 @@ fn hold_budget_floor_and_seven_day_rebuild_loop_guard() {
 
 #[test]
 fn user_repair_override_passes_the_guard_once_and_rearms_it() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scratch = crate::test_scratch::ScratchDir::new("lenient-user-repair-override");
     let path = scratch.join("index.json");
     let source = SnapshotSource::Codex;
@@ -2106,6 +2178,8 @@ fn every_persisted_field_fixture() -> ScanIndex {
 
 #[test]
 fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let index = every_persisted_field_fixture();
     let bytes = serde_json::to_vec_pretty(&index).unwrap();
     let encoded: BTreeMap<String, &serde_json::value::RawValue> =
@@ -2126,6 +2200,8 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
 
 #[test]
 fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Main shipped audit progress first. The earlier E2 writer saved a named
     // map with birth storage but no audit progress. Neither may lose custody.
     let seed = every_persisted_field_fixture();
@@ -2183,6 +2259,8 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
 
 #[test]
 fn desktop_inventory_keeps_existing_positional_index_slots() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
     let mut legacy = current.clone();
     legacy
@@ -2207,6 +2285,8 @@ fn desktop_inventory_keeps_existing_positional_index_slots() {
 #[test]
 #[serial_test::serial(source_manifests)]
 fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         for family_slot in [false, true] {
             if source == SnapshotSource::Codex && family_slot {
@@ -2495,6 +2575,8 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
 /// must not hide a damaged move hold after this destination bootstraps.
 #[test]
 fn history_gate_damage_is_local_through_load_and_both_cas_readers() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for bad in [
         serde_json::json!("damaged"),
         serde_json::json!(-1),
@@ -2598,6 +2680,8 @@ fn whole_index_damage(kind: &str) -> Vec<u8> {
 
 #[test]
 fn every_whole_index_rebuild_cause_shares_the_seven_day_guard() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for previous in ["budget", "syntax", "collision"] {
         for current in ["budget", "syntax", "collision"] {
             let scratch = crate::test_scratch::ScratchDir::new("lenient-all-rebuild-causes");
@@ -2658,6 +2742,8 @@ fn every_whole_index_rebuild_cause_shares_the_seven_day_guard() {
 
 #[test]
 fn load_refuses_future_quarantine_stamp_and_rebuilds_after_seven_days() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let now = SystemTime::now();
     let now_nanos = now.duration_since(UNIX_EPOCH).unwrap().as_nanos();
     for current in ["budget", "syntax", "collision"] {
@@ -2837,6 +2923,8 @@ fn assert_identity_carried(index: &ScanIndex, seed: &ScanIndex, context: &str) {
 
 #[test]
 fn malformed_upload_ack_retirement_handoff_keeps_index_identity_without_pause() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for bounded in [false, true] {
         for (case, damaged) in [
             ("null", serde_json::json!(null)),
@@ -2916,6 +3004,8 @@ fn malformed_upload_ack_retirement_handoff_keeps_index_identity_without_pause() 
 
 #[test]
 fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut item = tests::valid_v6_batch_request().snapshots.remove(0);
     let session = item.source_session_id.clone();
     let owner_key = sha256_hex(&["session_owner:v1", "machine-a", &session]);
@@ -3063,6 +3153,8 @@ fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
 
 #[test]
 fn user_repair_override_refuses_when_identity_state_is_unrecoverable() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let source = SnapshotSource::ClaudeCode;
     for (case, damage) in [
         ("syntax", b"{ ".to_vec()),
@@ -3183,6 +3275,8 @@ fn user_repair_override_refuses_when_identity_state_is_unrecoverable() {
 
 #[test]
 fn user_repair_override_cooldown_is_source_wide_across_destinations() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     reset_override_state_for_restart();
     let scratch = crate::test_scratch::ScratchDir::new("lenient-override-source-wide");
     let support = scratch.join("support");
@@ -3280,6 +3374,8 @@ fn user_repair_override_cooldown_is_source_wide_across_destinations() {
 
 #[test]
 fn carried_ack_debt_is_fixed_while_new_sibling_revisions_prune() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let seed = fixture();
     let mut rebuilt = ScanIndex::default();
     rebuilt.carry_identity_from(seed.clone()).unwrap();
@@ -3322,6 +3418,8 @@ fn carried_ack_debt_is_fixed_while_new_sibling_revisions_prune() {
 
 #[test]
 fn carried_ack_debt_admission_refuses_before_writes_and_counts_by_code() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let source = SnapshotSource::ClaudeCode;
     for byte_exhaustion in [false, true] {
         reset_override_state_for_restart();
@@ -3396,6 +3494,8 @@ fn carried_ack_debt_admission_refuses_before_writes_and_counts_by_code() {
 
 #[test]
 fn override_persistence_refusal_leaves_cooldown_unspent() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     reset_override_state_for_restart();
     let source = SnapshotSource::ClaudeCode;
     let scratch = crate::test_scratch::ScratchDir::new("override-write-refusal");
@@ -3454,6 +3554,8 @@ fn override_persistence_refusal_leaves_cooldown_unspent() {
 
 #[test]
 fn override_does_not_carry_unproven_or_preledger_acks() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for version in [
         SNAPSHOT_ACCEPTED_LEDGER_PRE_LEDGER_VERSION,
         SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION,
@@ -3470,6 +3572,8 @@ fn override_does_not_carry_unproven_or_preledger_acks() {
 
 #[test]
 fn carried_ack_at_entry_cap_is_never_lost_or_reoffered() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let original = (0..CARRIED_ACK_ENTRIES_MAX - 1)
         .map(|n| format!("{n:064x}"))
         .collect::<BTreeSet<_>>();
@@ -3524,6 +3628,8 @@ fn carried_ack_at_entry_cap_is_never_lost_or_reoffered() {
 #[test]
 #[serial_test::serial(source_manifests)]
 fn carried_ack_for_unvisited_family_hold_survives_until_reconstruction() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let scratch = crate::test_scratch::ScratchDir::new("carried-unvisited-family-hold");
     let root = scratch.join("projects");
@@ -3625,6 +3731,8 @@ fn carried_ack_for_unvisited_family_hold_survives_until_reconstruction() {
 
 #[test]
 fn carried_ack_age_survives_restart_and_alarms_without_eviction_until_release() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     const START: u64 = 2_000_000_000;
     const WEEK: u64 = 7 * 24 * 60 * 60;
@@ -3769,6 +3877,8 @@ fn carried_ack_age_survives_restart_and_alarms_without_eviction_until_release() 
 
 #[test]
 fn carried_ack_clock_scalars_bound_malformed_spans_across_load_cas_and_override() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for field in [
         "accepted_rebuild_pending_since_unix_seconds",
         "accepted_rebuild_last_alarm_unix_seconds",
@@ -3864,6 +3974,8 @@ fn assert_retired_family_decode_identity(index: &ScanIndex, seed: &ScanIndex) {
 
 #[test]
 fn retired_family_damage_keeps_identity_and_fence_on_load_and_both_cas_readers() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for bounded in [false, true] {
         for case in [
             "container",
@@ -4003,6 +4115,8 @@ fn retired_family_damage_keeps_identity_and_fence_on_load_and_both_cas_readers()
 
 #[test]
 fn duplicate_retired_family_root_fields_refuse_load_and_both_cas_without_quarantine() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for field in [
         "claude_retired_family_tombstones",
         "claude_retired_family_tombstones_initialized",
@@ -4042,6 +4156,8 @@ fn duplicate_retired_family_root_fields_refuse_load_and_both_cas_without_quarant
 
 #[test]
 fn repair_identity_carry_keeps_retirement_evidence_with_its_own_decode_policy() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for damaged in [false, true] {
         let scratch = crate::test_scratch::ScratchDir::new("lenient-retired-carry");
         let path = scratch.join("index.json");
@@ -4087,6 +4203,8 @@ fn write_repair_collision(path: &Path, value: &mut Value) -> Vec<u8> {
 
 #[test]
 fn user_repair_tombstone_loss_carries_identity_without_refusal_and_keeps_the_fence() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let source = SnapshotSource::ClaudeCode;
     for case in [
         "intact",
@@ -4245,6 +4363,8 @@ fn user_repair_tombstone_loss_carries_identity_without_refusal_and_keeps_the_fen
 
 #[test]
 fn real_repair_override_marks_history_unverified_before_return_and_first_census() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     reset_override_state_for_restart();
     restart_claude_reemission_stop_for_test();
     let scratch = crate::test_scratch::ScratchDir::new("repair-first-census");
@@ -4331,6 +4451,8 @@ fn real_repair_override_marks_history_unverified_before_return_and_first_census(
 
 #[test]
 fn oversized_idless_marker_strings_refuse_before_reader_token_allocation() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut seed = fixture();
     seed.claude_usage_family_pending.insert(
         "family".into(),
@@ -4404,6 +4526,8 @@ fn oversized_idless_marker_strings_refuse_before_reader_token_allocation() {
 
 #[test]
 fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut seed = fixture();
     seed.claude_request_identity_contract = Some(claude_request_identity::COLLECTOR.to_owned());
     seed.claude_request_identity_contract_changed = true;
@@ -4491,6 +4615,8 @@ fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
 
 #[test]
 fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // The old short sequence meant discovered=7, not a guard admission.
     // Also exercise the full legacy sequence, including its structured slots.
     let legacy = [
@@ -4561,6 +4687,8 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
 /// Retired evidence cannot reset live census, move slots or select another read.
 #[test]
 fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let seed = every_persisted_field_fixture();
     let expected = serde_json::to_vec(&seed).unwrap();
     let census = serde_json::to_vec(&seed.claude_request_census).unwrap();
@@ -4710,6 +4838,8 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
 /// Pin the absent-field downgrade contract while preserving the census bytes.
 #[test]
 fn retired_reread_new_writer_keeps_previous_default_contract() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     #[derive(Default, serde::Deserialize)]
     #[serde(default)]
     struct PreviousCounts {
@@ -4755,6 +4885,8 @@ fn retired_reread_new_writer_keeps_previous_default_contract() {
 /// writes the existing plain identity, not an unknown field or marker shape.
 #[test]
 fn quiet_retired_index_loads_under_previous_entry_defaults() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     #[derive(Default, serde::Deserialize)]
     #[serde(default)]
     struct PreviousEntry {

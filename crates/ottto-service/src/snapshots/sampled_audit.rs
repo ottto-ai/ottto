@@ -964,6 +964,8 @@ mod tests {
     }
     #[test]
     fn cap_retry_keeps_durable_custody_without_a_traversal_or_marker() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let mut index = index();
         let candidate = candidate();
         let key = local_index_key(&candidate.path);
@@ -996,6 +998,8 @@ mod tests {
 
     #[test]
     fn marked_population_admission_and_quiet_retirement_share_the_cap() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let mut index = index();
         for n in 0..CACHE_ENTRIES {
             let key = format!("missing-{n}");
@@ -1051,6 +1055,8 @@ mod tests {
 
     #[test]
     fn sampled_audit_oldest_deadline_not_ack_or_tail_controls_idle_selection() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let mut index = index();
         let candidate = candidate();
         let key = local_index_key(&candidate.path);
@@ -1105,6 +1111,8 @@ mod tests {
     }
     #[test]
     fn sampled_audit_malformed_and_replay_markers_remain_due_without_resetting_index() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         for malformed in [
             json!(null),
             json!(0),
@@ -1135,6 +1143,8 @@ mod tests {
     }
     #[test]
     fn sampled_audit_shed_body_retains_newer_debt_with_previous_delivery_authority() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let mut previous = index();
         let key = local_index_key(&candidate().path);
         let old = "a".repeat(64);
@@ -1190,6 +1200,8 @@ mod tests {
     }
     #[test]
     fn sampled_audit_missing_source_and_existing_cas_cannot_erase_obligation() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let root = std::env::temp_dir().join(format!(
             "ottto-audit-index-{}-{}",
             std::process::id(),
@@ -1241,6 +1253,8 @@ mod tests {
     /// never into the last free audit slot.
     #[test]
     fn option_b_restores_only_erased_hold_deadlines_paced_by_audit_slots() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         use crate::snapshots::claude_request_census::{
             identity_incomplete_hold_deadlines_restored_total as restored_total,
             ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
@@ -1368,6 +1382,8 @@ mod provenance_tests {
     }
     #[test]
     fn prefix_provenance_survives_record_replay_and_deadline_carry() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let mut index = index();
         index
             .files
@@ -1400,6 +1416,8 @@ mod provenance_tests {
     }
     #[test]
     fn prefix_clear_requires_exact_fingerprint_and_keeps_tail_audit_debt() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let mut index = index();
         index
             .files
@@ -1420,6 +1438,8 @@ mod provenance_tests {
     }
     #[test]
     fn provenance_marker_stays_inside_existing_marker_budget() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         // Native comparison's unchanged charge rounds this legacy bound to 64.
         let budget = (UNVERIFIED_IDENTITY.len() + 1 + 20).next_power_of_two();
         for prefix in [false, true] {
@@ -1435,6 +1455,8 @@ mod provenance_tests {
     /// completion's FE mark still tags `p`.
     #[test]
     fn ordinary_record_never_mints_prefix_but_fe_mark_after_record_does() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let candidate = CandidateFile {
             physical_identity: None,
             scan_root: PathBuf::from("/synthetic"),
@@ -1699,6 +1721,8 @@ mod absence_tests {
 
     #[test]
     fn intermediate_symlink_cannot_prove_absence_in_another_tree() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let fixture = Fixture::new();
         let path = fixture.transcript();
         let saved = fixture.0.join("original-project");
@@ -1719,6 +1743,8 @@ mod absence_tests {
 
     #[test]
     fn real_deletion_beneath_readable_parent_proves_absence() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let fixture = Fixture::new();
         let path = fixture.transcript();
         assert!(!proven_absent(&path, &fixture.roots()));
@@ -1728,6 +1754,8 @@ mod absence_tests {
 
     #[test]
     fn missing_intermediate_directory_beneath_readable_root_proves_absence() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let fixture = Fixture::new();
         let path = fixture.transcript();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -1741,6 +1769,8 @@ mod absence_tests {
 
     #[test]
     fn missing_configured_root_cannot_prove_absence() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let fixture = Fixture::new();
         let path = fixture.transcript();
         fs::remove_dir_all(fixture.0.join("root")).unwrap();
@@ -1749,6 +1779,8 @@ mod absence_tests {
 
     #[test]
     fn dangling_symlink_or_non_directory_ancestor_cannot_prove_absence() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let fixture = Fixture::new();
         let path = fixture.transcript();
         let project = fixture.0.join("root/project");
@@ -1762,6 +1794,8 @@ mod absence_tests {
 
     #[test]
     fn unreadable_existing_ancestor_or_root_cannot_prove_absence() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         use std::os::unix::fs::PermissionsExt;
 
         // Root can bypass directory permissions; this control needs an
@@ -1784,6 +1818,8 @@ mod absence_tests {
 
     #[test]
     fn recreated_transcript_is_present_even_after_positive_absence() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let fixture = Fixture::new();
         let path = fixture.transcript();
         fs::remove_file(&path).unwrap();
@@ -1797,6 +1833,8 @@ mod absence_tests {
 
     #[test]
     fn uncertain_roots_and_non_normal_paths_cannot_prove_absence() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let fixture = Fixture::new();
         let path = fixture.transcript();
         fs::remove_file(&path).unwrap();
@@ -1824,6 +1862,8 @@ mod absence_tests {
 mod absence_non_unix_tests {
     #[test]
     fn absence_never_grants_authority_without_secure_directory_descriptors() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         assert!(!super::proven_absent(
             std::path::Path::new("missing/file.jsonl"),
             &[std::path::PathBuf::from("missing")]

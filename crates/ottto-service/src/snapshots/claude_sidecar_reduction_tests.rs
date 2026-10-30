@@ -402,6 +402,8 @@ fn assert_layout_mode(actual: (usize, usize, usize), reuse: (usize, usize, usize
 
 #[test]
 fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -440,6 +442,8 @@ fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
 
 #[test]
 fn transcript_and_sidecar_append_use_tail_without_changing_joined_body() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = Fixture::new(1);
     let cache = Arc::new(SharedCache::default());
     let prior = seed_predecessor(&f, &cache);
@@ -458,6 +462,8 @@ fn transcript_and_sidecar_append_use_tail_without_changing_joined_body() {
 
 #[test]
 fn root_telemetry_reselects_every_child_without_invalidating_reduction() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut f = Fixture::new(1);
     let children = ["a4d1585d310070d0f", "b4d1585d310070d0f"];
     let mut paths = vec![f.path.clone()];
@@ -498,6 +504,8 @@ fn root_telemetry_reselects_every_child_without_invalidating_reduction() {
 
 #[test]
 fn mid_acquisition_telemetry_is_joined_freshly_in_both_modes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
@@ -538,6 +546,8 @@ fn mid_acquisition_telemetry_is_joined_freshly_in_both_modes() {
 
 #[test]
 fn child_metadata_and_desktop_identity_still_invalidate_native_scope() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = Fixture::new(1);
     let child = f
         .dir
@@ -568,6 +578,8 @@ fn child_metadata_and_desktop_identity_still_invalidate_native_scope() {
 
 #[test]
 fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let f = Fixture::new(2);
@@ -600,6 +612,8 @@ fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
 
 #[test]
 fn restart_and_copy_budget_refusal_keep_full_fallback() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for retained_budget in [false, true] {
         let f = Fixture::new(1);
         let cache = Arc::new(SharedCache::default());
@@ -626,6 +640,8 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
 
 #[test]
 fn missing_index_cannot_be_replaced_by_warm_cache_authority() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = Fixture::new(1);
     let cache = Arc::new(SharedCache::default());
     seed_predecessor(&f, &cache);
@@ -637,6 +653,8 @@ fn missing_index_cannot_be_replaced_by_warm_cache_authority() {
 
 #[test]
 fn true_scope_change_at_completion_still_refuses_cached_publication() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = Fixture::new(1);
     let cache = Arc::new(SharedCache::default());
     let prior = seed_predecessor(&f, &cache);
@@ -650,6 +668,8 @@ fn true_scope_change_at_completion_still_refuses_cached_publication() {
 
 #[test]
 fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -678,6 +698,8 @@ fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
 
 #[test]
 fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let f = Fixture::new(1);
     let cache = Arc::new(SharedCache::default());
@@ -765,6 +787,8 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
 
 #[test]
 fn missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     for conflict in [false, true] {
@@ -797,6 +821,8 @@ fn missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
 
 #[test]
 fn cold_full_mid_read_sidecars_complete_but_true_scope_and_object_changes_refuse() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for change in ["sidecars", "context", "object"] {
         let f = Fixture::new(2);
@@ -855,6 +881,8 @@ fn cold_full_mid_read_sidecars_complete_but_true_scope_and_object_changes_refuse
 /// `durable_restart` covers a restart.
 #[test]
 fn constant_capture_tails_and_keeps_the_prefix_marker() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let f = Fixture::new(1);
     capture_marked(&f);
     let cache = Arc::new(SharedCache::default());
@@ -1039,6 +1067,8 @@ mod durable_restart {
     /// key's older record is invalidated, and a restart reads Full.
     #[test]
     fn a_held_reverted_selection_is_never_written_and_invalidates_the_old_record() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1072,6 +1102,8 @@ mod durable_restart {
     /// reads Full.
     #[test]
     fn a_cleared_fingerprint_never_restores_or_writes() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1128,6 +1160,8 @@ mod durable_restart {
     /// invalidated and a restart reads Full.
     #[test]
     fn a_reduction_ahead_of_the_saved_selection_is_never_written() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let f = Fixture::new(1);
         let state = State::new(&f);
@@ -1160,6 +1194,8 @@ mod durable_restart {
     /// mismatch, and the tailed body keeps the prefix's marker.
     #[test]
     fn a_constant_capture_restart_reads_no_full() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let f = Fixture::new(1);
         capture_marked(&f);
         let state = State::new(&f);
@@ -1181,6 +1217,8 @@ mod durable_restart {
 
     #[test]
     fn restart_restores_then_tails_and_matches_cold_full() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1239,6 +1277,8 @@ mod durable_restart {
 
     #[test]
     fn e2_restart_tail_and_quiet_late_sidecar_match_cold_full_emitted_body() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _gate = claude_request_money::e2::GateForTest::set(true);
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
             for append_native in [true, false] {
@@ -1330,6 +1370,8 @@ mod durable_restart {
 
     #[test]
     fn restart_after_a_metadata_only_touch_restores_unchanged() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let f = Fixture::new(2);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1353,6 +1395,8 @@ mod durable_restart {
 
     #[test]
     fn an_index_from_another_context_never_restores() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1438,6 +1482,8 @@ impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
 
 #[test]
 fn desktop_metadata_reemit_is_session_scoped_even_during_inventory_backoff() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let home = crate::test_scratch::ScratchDir::new("desktop-reemit-scope");
     let mut f = Fixture::new(1);
@@ -1570,6 +1616,8 @@ fn desktop_metadata_reemit_is_session_scoped_even_during_inventory_backoff() {
 
 #[test]
 fn desktop_fresh_import_retries_only_child_when_ambiguous_parents_become_indexed() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let home = crate::test_scratch::ScratchDir::new("desktop-fresh-lineage");
     let mut f = Fixture::new(1);
@@ -1669,6 +1717,8 @@ fn desktop_fresh_import_retries_only_child_when_ambiguous_parents_become_indexed
 
 #[test]
 fn desktop_completed_census_counts_existing_held_retry_reads() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let home = crate::test_scratch::ScratchDir::new("desktop-held-recovery");
     let mut f = Fixture::new(1);
@@ -1755,6 +1805,8 @@ fn desktop_completed_census_counts_existing_held_retry_reads() {
 
 #[test]
 fn desktop_inventory_backoff_keeps_growing_native_prefix_and_cold_body_parity() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let home = crate::test_scratch::ScratchDir::new("desktop-growing-backoff");
     let mut f = Fixture::new(1);

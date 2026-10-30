@@ -223,6 +223,8 @@ fn oracle(fixture: &Fixture, source: SnapshotSource) -> Value {
 }
 #[test]
 fn sampled_native_both_providers_match_full_snapshot_across_append_batches() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -267,6 +269,8 @@ fn sampled_native_both_providers_match_full_snapshot_across_append_batches() {
 }
 #[test]
 fn sampled_native_progressive_claude_response_and_codex_cumulative_reset() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -299,6 +303,8 @@ fn sampled_native_progressive_claude_response_and_codex_cumulative_reset() {
 }
 #[test]
 fn sampled_native_claude_compaction_pairs_across_tail_passes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -334,6 +340,8 @@ fn sampled_native_claude_compaction_pairs_across_tail_passes() {
 /// what a full re-read renders.
 #[test]
 fn sampled_native_codex_context_windows_match_full_read_across_tail_passes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -397,6 +405,8 @@ fn sampled_native_codex_context_windows_match_full_read_across_tail_passes() {
 /// sizes. Rebuilt here with every request owned, as for an exclusive root.
 #[test]
 fn sampled_native_claude_compaction_sizes_across_tail_passes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -461,6 +471,8 @@ fn sampled_native_claude_compaction_sizes_across_tail_passes() {
 }
 #[test]
 fn sampled_native_cache_eviction_and_active_state_accounting() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -506,6 +518,8 @@ fn sampled_native_cache_eviction_and_active_state_accounting() {
 
 #[test]
 fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -543,6 +557,8 @@ fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
 }
 #[test]
 fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -619,6 +635,8 @@ fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
 
 #[test]
 fn sampled_native_partial_eof_or_copy_refusal_keeps_audit_certificate() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -700,6 +718,8 @@ fn sampled_native_partial_eof_or_copy_refusal_keeps_audit_certificate() {
 }
 #[test]
 fn sampled_native_wrong_provider_cache_refuses_reuse() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -778,6 +798,8 @@ fn lineage_oracle(fixture: &Fixture, metadata: &CodexTitleMetadata) -> Value {
 }
 #[test]
 fn sampled_native_in_file_codex_forks_continue_tail_with_full_parse_parity() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -871,6 +893,8 @@ fn sampled_native_in_file_codex_forks_continue_tail_with_full_parse_parity() {
 }
 #[test]
 fn sampled_native_retained_ordinal_fork_with_an_ordinal_break_is_held_not_retained() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -911,6 +935,8 @@ fn sampled_native_retained_ordinal_fork_with_an_ordinal_break_is_held_not_retain
 }
 #[test]
 fn sampled_native_legacy_subagent_with_sidecar_parent_retains_until_family_changes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1211,6 +1237,8 @@ fn finish_production_scan_page(
 
 #[test]
 fn sampled_native_live_inputs_restored_after_charge_and_copy() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1269,6 +1297,8 @@ fn sampled_native_live_inputs_restored_after_charge_and_copy() {
 
 #[test]
 fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1373,6 +1403,8 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
 #[cfg(unix)]
 #[test]
 fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let source = SnapshotSource::Codex;
     let supported = crate::heap_layout_bound::layout_supported();
     let _cutover = codex_counting_version::TestCutover::set(0);
@@ -1695,6 +1727,8 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
 #[cfg(unix)]
 #[test]
 fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2051,6 +2085,8 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
 #[cfg(unix)]
 #[test]
 fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::durable_tail_store as store;
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -2393,6 +2429,8 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
 #[cfg(unix)]
 #[test]
 fn durable_inventory_overflow_keeps_tail_reuse_and_defers_new_keys() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let source = SnapshotSource::Codex;
     let supported = crate::heap_layout_bound::layout_supported();
@@ -2556,6 +2594,8 @@ fn production_body(source: SnapshotSource, mut scan: SourceScanResult) -> Value 
 #[test]
 #[cfg(all(target_os = "macos", target_pointer_width = "64"))]
 fn sampled_release_compiler_enables_native_tails_for_both_providers() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let compiler = env!("OTTTO_SCAN_LAYOUT_RUSTC");
     if !(compiler.starts_with("rustc 1.88.0 ") || compiler.starts_with("rustc 1.95.0 ")) {
         return;
@@ -2595,6 +2635,8 @@ fn sampled_release_compiler_enables_native_tails_for_both_providers() {
 
 #[test]
 fn sampled_production_large_session_append_reuses_bounded_history() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2646,6 +2688,8 @@ fn sampled_production_large_session_append_reuses_bounded_history() {
 
 #[test]
 fn sampled_native_large_history_has_constant_step_charge_and_conservative_clones() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::heap_layout_bound::{Counter, HeapLayoutBound};
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -2702,6 +2746,8 @@ fn sampled_native_large_history_has_constant_step_charge_and_conservative_clones
 
 #[test]
 fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_restart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2769,6 +2815,8 @@ fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_r
 }
 #[test]
 fn sampled_production_account_scope_change_and_new_priority_force_real_full_replay() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2818,6 +2866,8 @@ fn sampled_production_account_scope_change_and_new_priority_force_real_full_repl
 }
 #[test]
 fn sampled_production_old_idle_source_remains_eligible_for_due_audit() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use std::time::{Duration, UNIX_EPOCH};
     let source = SnapshotSource::ClaudeCode;
     let fixture = ScanFixture::new(source);
@@ -2847,6 +2897,8 @@ fn sampled_production_old_idle_source_remains_eligible_for_due_audit() {
 }
 #[test]
 fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2877,6 +2929,8 @@ fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
 
 #[test]
 fn sampled_production_unretainable_full_file_preserves_other_native_tails() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2954,6 +3008,8 @@ fn incomplete_sidecar_census(scan: &mut OwnedSourceScan) {
 /// reduction, and must not insert one of its own.
 #[test]
 fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3085,6 +3141,8 @@ fn step_until(
 /// (P1-RETAIN R0: no release unless it borrows more than its reduction).
 #[test]
 fn sampled_unsampled_native_refusal_guard_matrix() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3352,6 +3410,8 @@ mod retain_release_tests;
 
 #[test]
 fn sampled_production_large_baseline_index_does_not_disable_small_active_tail() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3395,6 +3455,8 @@ fn sampled_production_large_baseline_index_does_not_disable_small_active_tail() 
 
 #[test]
 fn sampled_production_long_owning_header_change_cannot_hide_outside_samples() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3445,6 +3507,8 @@ fn sampled_production_long_owning_header_change_cannot_hide_outside_samples() {
 #[test]
 #[ignore = "run explicitly for native synthetic throughput measurements"]
 fn sampled_production_performance_32mib() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     assert!(
         crate::heap_layout_bound::layout_supported(),
         "native pinned layout required"
@@ -3519,6 +3583,8 @@ fn sampled_production_performance_32mib() {
 #[test]
 #[ignore = "explicit native allocation probe; process scope requires serial isolation"]
 fn sampled_production_allocation_baseline_and_tail() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     assert!(crate::heap_layout_bound::layout_supported());
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
@@ -3584,6 +3650,8 @@ fn sampled_production_allocation_baseline_and_tail() {
 
 #[test]
 fn sampled_production_terminal_row_loss_preserves_first_tail_debt_after_restart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3745,6 +3813,8 @@ fn sampled_production_terminal_row_loss_preserves_first_tail_debt_after_restart(
 
 #[test]
 fn sampled_production_missing_index_entry_requires_full_even_with_warm_ram() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3777,6 +3847,8 @@ fn sampled_production_missing_index_entry_requires_full_even_with_warm_ram() {
 
 #[test]
 fn sampled_native_priority_witness_refusal_keeps_native_output_and_certificate() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3850,6 +3922,8 @@ fn sampled_native_priority_witness_refusal_keeps_native_output_and_certificate()
 
 #[test]
 fn resource_diagnostics_acquisition_absence_preserves_unknown_and_short_circuit() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for blocked in [false, true] {
         let f = ScanFixture::new(SnapshotSource::ClaudeCode);
         f.file
@@ -3915,6 +3989,8 @@ fn resource_diagnostics_acquisition_absence_preserves_unknown_and_short_circuit(
 
 #[test]
 fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4049,6 +4125,8 @@ fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
 
 #[test]
 fn sampled_production_recent_tail_survives_older_full_scan_pressure() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4114,6 +4192,8 @@ fn sampled_production_recent_tail_survives_older_full_scan_pressure() {
 /// `cache_lifecycle` event (U-T64(d)).
 #[test]
 fn side_certificate_reports_unsealed_without_cache_events() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::local_resource_diagnostics::cache_lifecycle::{observe, Counts};
     let fixture = Fixture::new(SnapshotSource::Codex);
     fixture.append(&usage(SnapshotSource::Codex, 100, 0, "gpt-5.5"));
@@ -4226,6 +4306,8 @@ fn local_points(item: &SnapshotItem) -> Vec<(String, u32)> {
 }
 #[test]
 fn codex_compaction_events_take_last_before_and_first_counted_after() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let fixture = Fixture::new(SnapshotSource::Codex);
     for line in codex_compaction_lines() {
         fixture.append(&line);
@@ -4281,6 +4363,8 @@ fn codex_compaction_events_take_last_before_and_first_counted_after() {
 }
 #[test]
 fn codex_compaction_events_and_points_match_full_read_at_every_tail_split() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4341,6 +4425,8 @@ fn codex_compaction_events_and_points_match_full_read_at_every_tail_split() {
 #[cfg(unix)]
 #[test]
 fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::durable_tail_store as store;
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -4497,6 +4583,8 @@ fn uploaded_cache_breaks(body: &Value) -> (Vec<String>, &Value) {
 /// parity, and every pass uploads the same first breaks with an exact count of the rest.
 #[test]
 fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4537,6 +4625,8 @@ mod audit_retirement_tests;
 #[cfg(unix)]
 #[test]
 fn no_record_keys_keep_existing_full_admission_after_restart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4582,6 +4672,8 @@ fn no_record_keys_keep_existing_full_admission_after_restart() {
 #[cfg(unix)]
 #[test]
 fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4725,6 +4817,8 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
 #[cfg(unix)]
 #[test]
 fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     use crate::durable_tail_store as store;
     use crate::transcript_acquisition::ReadPlan;
@@ -4990,6 +5084,8 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
 #[cfg(unix)]
 #[test]
 fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_both_sources() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     use crate::durable_tail_store as store;
     use crate::transcript_acquisition::ReadPlan;
@@ -5229,6 +5325,8 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
 #[cfg(unix)]
 #[test]
 fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::durable_tail_store as store;
     use crate::transcript_acquisition::ReadPlan;
     use std::io::Read;
@@ -5383,6 +5481,8 @@ mod codex_mcp_version_tests;
 
 #[test]
 fn rearm_full_cause_counts_native_bytes_without_changing_selection_or_uploads() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -5461,6 +5561,8 @@ fn rearm_full_cause_counts_native_bytes_without_changing_selection_or_uploads() 
 
 #[test]
 fn terminal_off_overlapping_root_retry_preserves_native_scope_and_reads_no_full() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -5564,6 +5666,8 @@ fn terminal_off_overlapping_root_retry_preserves_native_scope_and_reads_no_full(
 #[test]
 fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload_without_scope_full(
 ) {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }

@@ -201,6 +201,8 @@ fn carry_arms(
 /// BASE does. The row stays count-only.
 #[test]
 fn c1b_unchanged_witnessed_family_is_carried_and_compacted_at_red_retry() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -269,6 +271,8 @@ fn c1b_unchanged_witnessed_family_is_carried_and_compacted_at_red_retry() {
 /// (the tripwire is vacuous on it) with no re-arm of its family.
 #[test]
 fn c1b_compacted_family_is_carried_again_across_a_red_chain() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -310,6 +314,8 @@ fn c1b_compacted_family_is_carried_again_across_a_red_chain() {
 /// shared pending budget counts only the re-armed family's.
 #[test]
 fn c1b_compaction_releases_the_pending_occurrence_budget() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -333,6 +339,8 @@ fn c1b_compaction_releases_the_pending_occurrence_budget() {
 /// valid. With the unwitnessed family invalid, the witnessed one is carried.
 #[test]
 fn c1b_invalid_stale_family_cannot_reopen_so_the_witnessed_family_is_carried() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -645,6 +653,8 @@ fn carry_controls() -> Vec<CarryControl> {
 /// the index and the row identical to BASE.
 #[test]
 fn c1b_negative_controls_rearm_exactly_like_base() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for control in carry_controls() {
         let ((fix, row), (base, base_row)) = carry_arms(&*control.mutate, control.days);
@@ -677,6 +687,8 @@ fn c1b_negative_controls_rearm_exactly_like_base() {
 /// byte, row and transition counters included, and is counted once.
 #[test]
 fn c1b_refused_carry_scratch_admission_keeps_the_base_start() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -708,6 +720,8 @@ fn c1b_refused_carry_scratch_admission_keeps_the_base_start() {
 /// BASE's; the admitted one carries the witnessed family.
 #[test]
 fn c1b_carry_scratch_price_refuses_a_large_stale_window() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -753,6 +767,8 @@ fn c1b_carry_scratch_price_refuses_a_large_stale_window() {
 /// budget, so nothing is refused and the witnessed family is carried.
 #[test]
 fn c1b_admitted_carry_scratch_carries_the_witnessed_family() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -782,6 +798,8 @@ fn c1b_admitted_carry_scratch_carries_the_witnessed_family() {
 /// Elsewhere it refuses, so every red retry start is BASE's.
 #[test]
 fn c1b_carry_scratch_admission_follows_the_supported_layout() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let index = carry_index();
     let stale = index
         .claude_usage_family_pending
@@ -851,6 +869,8 @@ fn carry_cancel(index: &mut ScanIndex) {
 /// its revision.
 #[test]
 fn c1b_member_only_reemission_line_excludes_the_carried_family_root() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -883,6 +903,8 @@ fn c1b_member_only_reemission_line_excludes_the_carried_family_root() {
 /// keeps its revision for the caller; nothing is refused or held.
 #[test]
 fn c1b_admitted_carry_cancellation_rearms_and_queues_the_passed_member() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -952,6 +974,8 @@ fn carry_replayed(key: &str) -> ScanTraversalPath {
 /// one slot past it; an overflow is refused.
 #[test]
 fn c1b_carry_cancellation_price_admits_up_to_the_parked_budget() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1071,6 +1095,8 @@ fn carry_assert_cancel_uses_only_the_funded_buffer(index: &mut ScanIndex) {
 /// non-terminal page cancels the carry from the buffer the start funded.
 #[test]
 fn c1b_carry_cancellation_behind_a_large_backlog_uses_only_the_funded_buffer() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1085,6 +1111,8 @@ fn c1b_carry_cancellation_behind_a_large_backlog_uses_only_the_funded_buffer() {
 /// that buffer.
 #[test]
 fn c1b_carry_cancellation_after_a_reload_uses_only_the_refunded_buffer() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1122,6 +1150,8 @@ fn carry_worst_case(keys: &[String]) -> usize {
 /// and re-armed as BASE re-arms it.
 #[test]
 fn c1b_carry_funds_each_family_cancellation_up_to_the_budget() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1160,6 +1190,8 @@ fn c1b_carry_funds_each_family_cancellation_up_to_the_budget() {
 /// transition counters included, with each dropped family counted once.
 #[test]
 fn c1b_unfunded_carry_keeps_the_base_start() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1210,6 +1242,8 @@ fn carry_resumed_index(base: bool, passed: bool) -> ScanIndex {
 /// Exercise refund even where native carry funding is unavailable.
 #[test]
 fn unfunded_replay_clears_fingerprints_on_every_platform() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut fix = carry_index();
     fix.claude_stale_family_carry
@@ -1239,6 +1273,8 @@ fn unfunded_replay_clears_fingerprints_on_every_platform() {
 /// window's reads replace. Counted once.
 #[test]
 fn c1b_unfunded_replay_at_a_reload_uncarries_to_the_base_start() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1290,6 +1326,8 @@ fn c1b_unfunded_replay_at_a_reload_uncarries_to_the_base_start() {
 /// the uncarry precedes every pass of the new walk.
 #[test]
 fn c1b_unfunded_replay_after_a_passed_member_restarts_the_traversal() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1319,6 +1357,8 @@ fn c1b_unfunded_replay_after_a_passed_member_restarts_the_traversal() {
 /// family is then no longer carried, so a later parse cancels nothing.
 #[test]
 fn c1b_defensive_carry_reset_rearms_every_member_and_replays_the_passed_one() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1454,6 +1494,8 @@ fn assert_compacted_and_invalid(index: &ScanIndex, root: &str) {
 /// allows one more stale re-arm.
 #[test]
 fn fix2_clean_followup_carries_window_families_and_caps_stale_rearms() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1570,6 +1612,8 @@ fn fix2_clean_followup_carries_window_families_and_caps_stale_rearms() {
 /// at all takes BASE's whole re-arm at the clean follow-up.
 #[test]
 fn fix2_window_from_another_context_or_process_is_base() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1613,6 +1657,8 @@ fn fix2_window_from_another_context_or_process_is_base() {
 /// entry conditions intentionally changed by Fix 2 are omitted.
 #[test]
 fn fix2_clean_followup_preserves_c1b_family_refusals() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1645,6 +1691,8 @@ fn fix2_clean_followup_preserves_c1b_family_refusals() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn fix2_restart_before_the_first_window_start_is_base() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut index = window_index();
     index.claude_full_rearm_progress.full_rearm_window_next = true;
     index
@@ -1661,6 +1709,8 @@ fn fix2_restart_before_the_first_window_start_is_base() {
 
 #[test]
 fn fix2_capped_family_member_change_cancels_and_requeues_passed_member() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1742,6 +1792,8 @@ fn fix2_capped_family_member_change_cancels_and_requeues_passed_member() {
 
 #[test]
 fn fix2_restart_during_a_carried_window_restores_base_before_resuming() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1764,6 +1816,8 @@ fn fix2_restart_during_a_carried_window_restores_base_before_resuming() {
 
 #[test]
 fn fix2_unhealthy_retry_also_honors_the_same_deadline_cap() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1794,6 +1848,8 @@ fn fix2_unhealthy_retry_also_honors_the_same_deadline_cap() {
 /// BASE before the matching mid-walk checkpoint can select any candidate.
 #[test]
 fn fix2_persisted_carry_with_lost_progress_or_origin_restarts_as_base() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1938,6 +1994,8 @@ fn fix2_persisted_carry_with_lost_progress_or_origin_restarts_as_base() {
 
 #[test]
 fn fix2_cap_keeps_the_full_retry_that_can_reopen_the_fence() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1978,6 +2036,8 @@ fn fix2_cap_keeps_the_full_retry_that_can_reopen_the_fence() {
 
 #[test]
 fn fix2_budget_refusal_precedes_digest_and_cap_allocations() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2027,6 +2087,8 @@ fn fix2_budget_refusal_precedes_digest_and_cap_allocations() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn new_carry_writer_exposes_only_c1b_roots_to_old_shape_reader() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     #[derive(serde::Deserialize)]
     struct OldCarry {
         #[serde(default)]
@@ -2079,6 +2141,8 @@ fn new_carry_writer_exposes_only_c1b_roots_to_old_shape_reader() {
 /// independently of the durable ScanIndex. No provider state is read.
 #[test]
 fn unhealthy_retry_with_held_families_rearms_healthy_history_reproduction() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::transcript_acquisition::{FullReason, ReadMode, Scope};
 
     if !crate::heap_layout_bound::layout_supported() {
@@ -2419,6 +2483,8 @@ fn scoped_retry_full_reads(index: &ScanIndex, candidates: &[CandidateFile]) -> u
 /// heads and account bindings are byte-identical, including across reload.
 #[test]
 fn scoped_unhealthy_retry_reads_zero_of_32_healthy_files_and_keeps_evidence() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2470,6 +2536,8 @@ fn scoped_unhealthy_retry_reads_zero_of_32_healthy_files_and_keeps_evidence() {
 /// and retry a changed revision, without an early terminal conversion.
 #[test]
 fn scoped_unhealthy_retry_runs_overdue_holds_next_cycle_and_preserves_terminal_holds() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2600,6 +2668,8 @@ fn scoped_unhealthy_retry_runs_overdue_holds_next_cycle_and_preserves_terminal_h
 /// context change, mid-walk checkpoint or lost acceptance still keeps BASE.
 #[test]
 fn scoped_unhealthy_retry_restart_recomputes_terminal_carry_from_durable_state() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2745,6 +2815,8 @@ fn scoped_unhealthy_retry_restart_recomputes_terminal_carry_from_durable_state()
 /// of a sibling, even with a global unsettled sweep and plausible full retry.
 #[test]
 fn scoped_unhealthy_retry_refuses_missing_mismatched_or_incomplete_family_evidence() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2937,6 +3009,8 @@ fn scoped_unhealthy_retry_refuses_missing_mismatched_or_incomplete_family_eviden
 
 #[test]
 fn accepted_retry_carries_without_otel_census_or_fence_deadline() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2972,6 +3046,8 @@ fn accepted_retry_carries_without_otel_census_or_fence_deadline() {
 
 #[test]
 fn accepted_idless_retry_preserves_invalid_evidence_and_refuses_second_causes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3120,6 +3196,8 @@ fn accepted_idless_retry_preserves_invalid_evidence_and_refuses_second_causes() 
 /// replacement independently select a carried member at unchanged mtime.
 #[test]
 fn scoped_unhealthy_retry_changed_members_and_due_replays_keep_base() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3187,6 +3265,8 @@ fn scoped_unhealthy_retry_changed_members_and_due_replays_keep_base() {
 
 #[test]
 fn scoped_unhealthy_retry_changed_member_cancels_only_its_funded_family() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3244,6 +3324,8 @@ fn scoped_unhealthy_retry_changed_member_cancels_only_its_funded_family() {
 
 #[test]
 fn scoped_unhealthy_retry_preserves_member_protection_and_scratch_refusal() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3273,6 +3355,8 @@ fn scoped_unhealthy_retry_preserves_member_protection_and_scratch_refusal() {
 
 #[test]
 fn scoped_retry_preserves_actual_rearms_and_selection() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Portable CI exercises BASE fallback; macOS exercises the funded carry.
     let supported = crate::heap_layout_bound::layout_supported();
@@ -3374,6 +3458,8 @@ fn scoped_retry_preserves_actual_rearms_and_selection() {
 
 #[test]
 fn scaled_accepted_history_carries_6356_families_through_retry_deadline_expiry() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3517,6 +3603,8 @@ fn scaled_accepted_history_carries_6356_families_through_retry_deadline_expiry()
 
 #[test]
 fn streaming_accepted_carry_matches_the_existing_family_refusals() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3606,6 +3694,8 @@ fn streaming_accepted_carry_matches_the_existing_family_refusals() {
 
 #[test]
 fn accepted_carry_streams_when_request_graph_refuses_even_a_small_family_set() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3650,6 +3740,8 @@ fn accepted_carry_streams_when_request_graph_refuses_even_a_small_family_set() {
 
 #[test]
 fn admitted_legacy_carry_keeps_its_existing_path_at_512_families() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3681,6 +3773,8 @@ fn admitted_legacy_carry_keeps_its_existing_path_at_512_families() {
 
 #[test]
 fn scaled_retry_defers_without_clearing_when_cancellation_cannot_be_funded() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3721,6 +3815,8 @@ fn scaled_retry_defers_without_clearing_when_cancellation_cannot_be_funded() {
 
 #[test]
 fn deferred_retry_resumes_after_transient_funding_refusal() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3754,6 +3850,8 @@ include!("retry_admission_tests.rs");
 // walk, changing the actual carry, or adding fields to the old transition row.
 #[test]
 fn stale_carry_rejection_histogram_reports_first_start_gate() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for (stage, mutate) in [
         ("provenance_or_context", 0),
@@ -3791,6 +3889,8 @@ fn stale_carry_rejection_histogram_reports_first_start_gate() {
 
 #[test]
 fn stale_carry_rejection_histogram_separates_window_and_ordinary_scratch() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3813,6 +3913,8 @@ fn stale_carry_rejection_histogram_separates_window_and_ordinary_scratch() {
 
 #[test]
 fn stale_carry_rejection_histogram_separates_qualification_funding_and_reserve() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3859,6 +3961,8 @@ fn contract_debt_fixture(healthy: usize) -> ScopedRetryFixture {
 
 #[test]
 fn contract_debt_defers_exact_acks_on_ordinary_streaming_and_batch_routes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3916,6 +4020,8 @@ fn contract_debt_defers_exact_acks_on_ordinary_streaming_and_batch_routes() {
 
 #[test]
 fn contract_debt_refuses_every_other_obligation_on_all_carry_routes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4027,6 +4133,8 @@ fn contract_debt_refuses_every_other_obligation_on_all_carry_routes() {
 
 #[test]
 fn contract_debt_keeps_context_and_ledger_vetoes_and_changed_member_selection() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4118,6 +4226,8 @@ fn contract_debt_keeps_context_and_ledger_vetoes_and_changed_member_selection() 
 
 #[test]
 fn contract_start_status_preserves_resume_placeholder_and_reowes_only_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4234,6 +4344,8 @@ fn contract_start_status_preserves_resume_placeholder_and_reowes_only_once() {
 
 #[test]
 fn contract_debt_scoped_hold_carries_only_settled_siblings() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4253,6 +4365,8 @@ fn contract_debt_scoped_hold_carries_only_settled_siblings() {
 
 #[test]
 fn contract_debt_scratch_deferred_start_keeps_placeholder_and_old_window() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4296,6 +4410,8 @@ fn contract_debt_scratch_deferred_start_keeps_placeholder_and_old_window() {
 
 #[test]
 fn contract_observation_counts_empty_transitions_without_prepare_scan_duplicates() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     let mut index = ScanIndex {
         claude_request_identity_contract: Some(String::new()),
@@ -4314,6 +4430,8 @@ fn contract_observation_counts_empty_transitions_without_prepare_scan_duplicates
 
 #[test]
 fn contract_debt_storage_recheck_cannot_forget_prior_scoped_hold() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4388,6 +4506,8 @@ fn contract_debt_storage_recheck_cannot_forget_prior_scoped_hold() {
 
 #[test]
 fn scanner_records_actual_contract_only_when_its_traversal_starts() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4457,6 +4577,8 @@ mod terminal_off_admission_tests {
 
     #[test]
     fn terminal_off_four_batches_resume_across_mid_admission_restart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         // 385 roots = three full 128-root batches plus one; scaled from 8,500.
         if !crate::heap_layout_bound::layout_supported() {
             return;
@@ -4587,6 +4709,8 @@ mod terminal_off_admission_tests {
 
     #[test]
     fn terminal_off_rejected_with_holds_resumes_but_real_loss_retries() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let mut fixture = retry_durable_fixture(1, 2);
         let root = fixture._scratch.to_path_buf();
         retry_test_context(&mut fixture.index, &root);
@@ -4654,6 +4778,8 @@ mod terminal_off_admission_tests {
 
     #[test]
     fn terminal_off_cancel_refund_and_passed_rewind_never_overwrite_debt() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let mut index = carry_index();
         let [root, child] = carry_family_keys();
         let original = index.files[&child].source_file_fingerprint.clone();
@@ -4696,6 +4822,8 @@ mod terminal_off_admission_tests {
 
     #[test]
     fn terminal_off_hard_gate_rejects_partial_coverage_even_with_matching_certificate() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let mut index = carry_index();
         let member = carry_member(CARRY_ROOT, Some(CARRY_AGENT));
         let pending = index
@@ -4725,6 +4853,8 @@ mod terminal_off_admission_tests {
 
     #[test]
     fn terminal_off_completed_admission_still_services_a_new_due_horizon() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let mut fixture = retry_durable_fixture(1, 2);
         let root = fixture._scratch.to_path_buf();
         retry_test_context(&mut fixture.index, &root);
@@ -4787,6 +4917,8 @@ mod terminal_off_admission_tests {
 
     #[test]
     fn terminal_off_new_due_horizon_advances_64_missing_paths_then_next_after_reload() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         if !crate::heap_layout_bound::layout_supported() {
             return;
         }
@@ -4866,6 +4998,8 @@ mod terminal_off_admission_tests {
 
 #[test]
 fn stale_start_clear_cause_matches_the_actual_traversal_start_reason() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::transcript_acquisition::{FullReason, ReadMode};
     use rearm_cause::Cause;
     for (cause, days, no_traversal, label) in [

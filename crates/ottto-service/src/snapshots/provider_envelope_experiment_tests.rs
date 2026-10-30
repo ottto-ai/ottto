@@ -19,6 +19,8 @@ type Trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport;
 
 #[test]
 fn native_comparison_target_body_retention_pays_exact_peak_before_buffer_growth() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !crate::heap_layout_bound::layout_supported() {
         eprintln!("UNEXECUTED target body retention: unsupported layout");
@@ -120,6 +122,8 @@ fn native_comparison_target_body_retention_pays_exact_peak_before_buffer_growth(
 
 #[test]
 fn native_comparison_borrowed_membership_matches_complete_physical_universe() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut index = ScanIndex::default();
     for ordinal in 0..2043 {
@@ -191,6 +195,8 @@ fn native_comparison_borrowed_membership_matches_complete_physical_universe() {
 
 #[test]
 fn native_comparison_borrowed_index_identity_matches_owned_path_oracle_without_allocating() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     fn reference(path: &Path) -> Option<(String, String)> {
         if path.extension().and_then(|v| v.to_str()) != Some("jsonl")
@@ -253,6 +259,8 @@ fn native_comparison_borrowed_index_identity_matches_owned_path_oracle_without_a
 
 #[test]
 fn native_comparison_paid_import_reserves_before_membership_and_moves_only_once() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !crate::heap_layout_bound::layout_supported() {
         eprintln!("UNEXECUTED paid native window import: unsupported layout");
@@ -316,6 +324,8 @@ fn native_comparison_paid_import_reserves_before_membership_and_moves_only_once(
 
 #[test]
 fn native_comparison_paid_capture_population_reports_guard_viability_without_bypass() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !crate::heap_layout_bound::layout_supported() {
         eprintln!("UNEXECUTED native descriptor population: unsupported layout");
@@ -425,6 +435,8 @@ fn native_comparison_paid_capture_population_reports_guard_viability_without_byp
 
 #[test]
 fn native_comparison_selected_membership_sees_all_paths_without_unrelated_owned_graph() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut index = ScanIndex::default();
     for ordinal in 0..2048 {
@@ -476,6 +488,8 @@ fn native_comparison_selected_membership_sees_all_paths_without_unrelated_owned_
 
 #[test]
 fn native_comparison_selected_restore_membership_matches_canonical_without_global_set() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut index = ScanIndex::default();
     for ordinal in 0..2048 {
@@ -679,6 +693,8 @@ fn qualified_prior(
 
 #[test]
 fn envelope_experiment_frozen_old_proof_does_not_mask_new_native_request() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -766,6 +782,8 @@ impl ProcessPermit {
 
 #[test]
 fn envelope_experiment_native_save_bootstrap_restart_matches_base_owners() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -946,6 +964,8 @@ fn envelope_experiment_native_save_bootstrap_restart_matches_base_owners() {
 
 #[test]
 fn envelope_experiment_selected_restore_rearm_survives_reload_without_age_proof() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let scratch = crate::test_scratch::ScratchDir::new("envelope-deferral");
     let path = scratch.join("index.json");
@@ -1191,6 +1211,8 @@ impl SelectionFixture {
 
 #[test]
 fn envelope_experiment_target_priority_precedes_actual_audit_selection() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let fixture = SelectionFixture::new();
     let base = fixture.prepare(fixture.previous.clone(), 1);
@@ -1213,6 +1235,8 @@ fn envelope_experiment_target_priority_precedes_actual_audit_selection() {
 
 #[test]
 fn envelope_experiment_oversized_family_exits_immediately_without_cap_increase() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let fixture = SelectionFixture::new();
     let scope = envelope_selection_experiment::Scope::controlled();
@@ -1249,6 +1273,8 @@ fn envelope_experiment_oversized_family_exits_immediately_without_cap_increase()
 
 #[test]
 fn envelope_experiment_two_successful_deferrals_use_locked_shed_restore_then_disable() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let fixture = SelectionFixture::new();
     let scope = envelope_selection_experiment::Scope::controlled();
@@ -1342,6 +1368,8 @@ impl Drop for RestoreFileMode<'_> {
 #[cfg(unix)]
 #[test]
 fn envelope_experiment_failed_open_is_unavailable_not_success_and_keeps_durable_rearm() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     use std::os::unix::fs::PermissionsExt;
     assert_ne!(
@@ -1445,6 +1473,8 @@ fn comparison_owner_epoch(
 
 #[test]
 fn envelope_experiment_disabled_family_bypasses_actual_rearm_suppression_gate() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let (dir, parent, _) = claude_account_family_fixture();
     let roots = [dir.clone()];
@@ -1652,6 +1682,8 @@ impl Drop for NativePreparationFixture {
 
 #[test]
 fn native_comparison_actual_skip_freezes_retained_proof_before_body_fold() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_actual_skip_freezes_retained_proof_before_body_fold",
@@ -1681,6 +1713,8 @@ fn native_comparison_actual_skip_freezes_retained_proof_before_body_fold() {
 
 #[test]
 fn native_comparison_seeded_index_is_not_an_actual_skip_certificate() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let fixture = NativePreparationFixture::new();
     let mut phase = claude_native_comparison::NativePhase::default();
@@ -1701,6 +1735,8 @@ fn native_comparison_seeded_index_is_not_an_actual_skip_certificate() {
 
 #[test]
 fn native_comparison_current_nonreported_member_withdraws_whole_family() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -1808,18 +1844,24 @@ fn native_preparation_pair_roundtrip(replace: bool) {
 
 #[test]
 fn native_comparison_paired_rows_move_once_without_reloading_unchanged_files() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     native_preparation_pair_roundtrip(false);
 }
 
 #[test]
 fn native_comparison_paired_rows_replaced_after_preflight_use_fresh_strict_load() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     native_preparation_pair_roundtrip(true);
 }
 
 #[test]
 fn native_comparison_negative_rows_recheck_each_opened_pair_without_decoding() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let fixture = NativePreparationFixture::new();
     let required = BTreeSet::from([fixture.parent.clone()]);
@@ -1862,6 +1904,8 @@ fn native_comparison_negative_rows_recheck_each_opened_pair_without_decoding() {
 
 #[test]
 fn native_comparison_negative_rows_cannot_qualify_an_unloaded_predecessor() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let fixture = NativePreparationFixture::new();
     let support = crate::test_scratch::ScratchDir::new("native-negative-missing-root");
@@ -1904,6 +1948,8 @@ fn native_recovery_priority_scan(
 
 #[test]
 fn native_comparison_recovery_selection_precedes_real_audit_without_expanding_page() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let fixture = SelectionFixture::new();
     let mut rearmed = fixture.previous.clone();
@@ -1945,6 +1991,8 @@ fn native_comparison_recovery_selection_precedes_real_audit_without_expanding_pa
 
 #[test]
 fn native_comparison_recovery_priority_requires_scope_queued_debt_and_remaining_budget() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let fixture = SelectionFixture::new();
     let mut rearmed = fixture.previous.clone();
@@ -2000,6 +2048,8 @@ fn complete_native_with_terminal_owner(
 
 #[test]
 fn native_comparison_terminal_checkpoint_moves_outside_cloneable_scan_result() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let fixture = NativePreparationFixture::new();
     let base = OwnedSourceScan::new_with_identity_capture(
@@ -2055,6 +2105,8 @@ fn native_comparison_terminal_checkpoint_moves_outside_cloneable_scan_result() {
 
 #[test]
 fn native_comparison_terminal_owner_requires_complete_current_claude_census() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let fixture = SelectionFixture::new();
     let mut incomplete = fixture.prepare(fixture.previous.clone(), 1);
@@ -2090,6 +2142,8 @@ fn native_comparison_terminal_owner_requires_complete_current_claude_census() {
 
 #[test]
 fn native_comparison_lifecycle_requires_native_save_and_revokes_after_drop_context_or_restart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut fixture = NativePreparationFixture::new();
     let scratch = crate::test_scratch::ScratchDir::new("native-comparison-lifecycle");
@@ -2129,6 +2183,8 @@ fn native_comparison_lifecycle_requires_native_save_and_revokes_after_drop_conte
 
 #[test]
 fn native_comparison_lifecycle_failed_cas_never_mints_a_grant() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut fixture = NativePreparationFixture::new();
     let scratch = crate::test_scratch::ScratchDir::new("native-comparison-cas");
@@ -2188,6 +2244,8 @@ fn native_comparison_quiet_bounded_page(
 
 #[test]
 fn native_comparison_lifecycle_saved_bounded_page_retains_only_existing_grant() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut fixture = NativePreparationFixture::new();
     let scratch = crate::test_scratch::ScratchDir::new("native-comparison-page-save");
@@ -2238,6 +2296,8 @@ fn native_comparison_lifecycle_saved_bounded_page_retains_only_existing_grant() 
 
 #[test]
 fn native_comparison_lifecycle_page_loss_or_missing_selected_save_revokes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut fixture = NativePreparationFixture::new();
     let scratch = crate::test_scratch::ScratchDir::new("native-comparison-page-loss");
@@ -2324,6 +2384,8 @@ fn pause_native_comparison(mut state: OwnedSourceScan) -> OwnedSourceScan {
 
 #[test]
 fn native_comparison_q5_keeps_old_proof_and_checks_revision_and_occurrences() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_q5_keeps_old_proof_and_checks_revision_and_occurrences",
@@ -2420,6 +2482,8 @@ fn native_comparison_positive_hit_fixture() -> (
 
 #[test]
 fn native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold",
@@ -2483,6 +2547,8 @@ fn native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold()
 
 #[test]
 fn native_comparison_insufficient_remaining_budget_withdraws_and_reports_unresolved() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_insufficient_remaining_budget_withdraws_and_reports_unresolved",
@@ -2505,6 +2571,8 @@ fn native_comparison_insufficient_remaining_budget_withdraws_and_reports_unresol
 
 #[test]
 fn native_comparison_replaced_target_keeps_safe_open_failure_visible() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_replaced_target_keeps_safe_open_failure_visible",
@@ -2612,6 +2680,8 @@ fn native_observation_duplicate_fixture() -> (
 
 #[test]
 fn native_comparison_withheld_body_keeps_actual_duplicate_against_unaffected_body() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let (_dir, mut index, mut scan, b, d) = native_observation_duplicate_fixture();
     let mut base_index = index.clone();
@@ -2691,6 +2761,8 @@ fn native_comparison_withheld_body_keeps_actual_duplicate_against_unaffected_bod
 
 #[test]
 fn native_comparison_consumed_observations_preserve_unfiltered_base_fold() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let (_dir, mut index, mut scan, _, _) = native_observation_duplicate_fixture();
     let mut base_index = index.clone();
@@ -2730,6 +2802,8 @@ fn native_comparison_consumed_observations_preserve_unfiltered_base_fold() {
 
 #[test]
 fn native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior",
@@ -2876,6 +2950,8 @@ fn native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior() {
 
 #[test]
 fn native_comparison_acquisition_requires_actual_completed_target_reads() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_acquisition_requires_actual_completed_target_reads",
@@ -2916,6 +2992,8 @@ fn native_comparison_acquisition_requires_actual_completed_target_reads() {
 
 #[test]
 fn native_comparison_controller_moves_frozen_plan_across_native_target_yields() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_controller_moves_frozen_plan_across_native_target_yields",
@@ -2962,6 +3040,8 @@ fn native_comparison_controller_moves_frozen_plan_across_native_target_yields() 
 
 #[test]
 fn native_comparison_controller_generation_loss_or_insufficient_budget_uses_base() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_controller_generation_loss_or_insufficient_budget_uses_base",
@@ -3001,6 +3081,8 @@ fn native_comparison_controller_generation_loss_or_insufficient_budget_uses_base
 
 #[test]
 fn native_comparison_controller_replaced_target_cannot_complete_comparison() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_controller_replaced_target_cannot_complete_comparison",
@@ -3075,6 +3157,8 @@ fn native_comparison_controller_replaced_target_cannot_complete_comparison() {
 
 #[test]
 fn native_comparison_failed_target_keeps_dependent_source_unresolved() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_failed_target_keeps_dependent_source_unresolved",
@@ -3121,6 +3205,8 @@ fn native_comparison_failed_target_keeps_dependent_source_unresolved() {
 
 #[test]
 fn native_comparison_ambiguous_index_member_withdraws_frozen_family() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let fixture = NativePreparationFixture::new();
     let mut state = fixture.paused();
@@ -3149,6 +3235,8 @@ fn native_comparison_ambiguous_index_member_withdraws_frozen_family() {
 
 #[test]
 fn native_comparison_family_parse_withdraws_skips_before_and_after_attempt() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_family_parse_withdraws_skips_before_and_after_attempt",
@@ -3204,6 +3292,8 @@ fn native_comparison_family_parse_withdraws_skips_before_and_after_attempt() {
 
 #[test]
 fn native_comparison_empty_parse_withdraws_sibling_without_native_body() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let fixture = NativePreparationFixture::new();
     let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
@@ -3281,6 +3371,8 @@ fn native_window_page(fixture: &NativePreparationFixture) -> NativeWindowPage {
 
 #[test]
 fn native_comparison_window_saved_graph_obeys_real_layout_gate() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_window_saved_graph_obeys_real_layout_gate",
@@ -3363,6 +3455,8 @@ fn native_comparison_window_saved_graph_obeys_real_layout_gate() {
 
 #[test]
 fn native_comparison_window_component_reconstructs_same_census_current_rows() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_window_component_reconstructs_same_census_current_rows",
@@ -3393,6 +3487,8 @@ fn native_comparison_window_component_reconstructs_same_census_current_rows() {
 
 #[test]
 fn native_comparison_window_later_parse_withdraws_carried_sibling() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_window_later_parse_withdraws_carried_sibling",
@@ -3440,6 +3536,8 @@ fn native_comparison_window_later_parse_withdraws_carried_sibling() {
 
 #[test]
 fn native_comparison_window_proof_membership_empty_or_context_change_withdraws() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_window_proof_membership_empty_or_context_change_withdraws",
@@ -3480,6 +3578,8 @@ fn native_comparison_window_proof_membership_empty_or_context_change_withdraws()
 
 #[test]
 fn native_comparison_window_wrong_window_scope_restart_or_missing_save_is_base() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_window_wrong_window_scope_restart_or_missing_save_is_base",
@@ -3520,6 +3620,8 @@ fn native_comparison_window_wrong_window_scope_restart_or_missing_save_is_base()
 
 #[test]
 fn native_comparison_window_scope_change_revokes_a_valid_saved_grant() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut fixture = NativePreparationFixture::new();
     let scratch = crate::test_scratch::ScratchDir::new("native-window-valid-scope");
@@ -3551,6 +3653,8 @@ fn native_comparison_window_scope_change_revokes_a_valid_saved_grant() {
 
 #[test]
 fn native_comparison_window_unknown_lock_and_stale_generation_revoke() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_window_unknown_lock_and_stale_generation_revoke",
@@ -3593,6 +3697,8 @@ fn native_comparison_window_unknown_lock_and_stale_generation_revoke() {
 
 #[test]
 fn native_comparison_window_missing_current_rows_withdraws_until_window_end() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_window_missing_current_rows_withdraws_until_window_end",
@@ -3655,6 +3761,8 @@ fn native_comparison_window_missing_current_rows_withdraws_until_window_end() {
 
 #[test]
 fn native_comparison_window_any_authority_quarantine_withdraws() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_window_any_authority_quarantine_withdraws",
@@ -3831,6 +3939,8 @@ fn native_comparison_selected_fallback_fixture() -> (
 
 #[test]
 fn native_comparison_selected_fallback_preserves_prior_body_and_queues_native_before_copies() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_selected_fallback_preserves_prior_body_and_queues_native_before_copies",
@@ -3874,6 +3984,8 @@ fn native_comparison_selected_fallback_preserves_prior_body_and_queues_native_be
 /// also beside a named page cause and across a reload.
 #[test]
 fn native_comparison_fallback_marks_name_unattributed() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test("native_comparison_fallback_marks_name_unattributed") {
         return;
@@ -3908,6 +4020,8 @@ fn native_comparison_fallback_marks_name_unattributed() {
 /// withheld revision, and none restored from `previous`, survives.
 #[test]
 fn native_comparison_selected_restore_removes_the_withheld_census_record() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_selected_restore_removes_the_withheld_census_record",
@@ -3941,6 +4055,8 @@ fn native_comparison_selected_restore_removes_the_withheld_census_record() {
 
 #[test]
 fn native_comparison_selected_fallback_partial_locked_save_and_restart_keep_exact_debt() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_selected_fallback_partial_locked_save_and_restart_keep_exact_debt",
@@ -3987,6 +4103,8 @@ fn native_comparison_selected_fallback_partial_locked_save_and_restart_keep_exac
 
 #[test]
 fn native_comparison_selected_fallback_cas_loss_and_wrong_window_never_commit() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_selected_fallback_cas_loss_and_wrong_window_never_commit",
@@ -4248,6 +4366,8 @@ fn native_comparison_corrected_native_receipt_fixture(
 
 #[test]
 fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -4271,6 +4391,8 @@ fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_se
 
 #[test]
 fn native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -4339,6 +4461,8 @@ fn native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base(
 
 #[test]
 fn native_comparison_default_constructor_honors_durable_queue_debt_prefix_before_audits() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let fixture = SelectionFixture::new();
     let mut index = fixture.previous.clone();
@@ -4372,6 +4496,8 @@ fn native_comparison_default_constructor_honors_durable_queue_debt_prefix_before
 
 #[test]
 fn native_comparison_deferred_policy_unknown_native_is_base_without_new_debt() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_deferred_policy_unknown_native_is_base_without_new_debt",
@@ -4434,6 +4560,8 @@ fn native_comparison_deferred_policy_unknown_native_is_base_without_new_debt() {
 
 #[test]
 fn native_comparison_matching_prepays_hit_and_no_hit_before_scratch_allocation() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !native_positive_layout_for_test(
         "native_comparison_matching_prepays_hit_and_no_hit_before_scratch_allocation",
@@ -4543,6 +4671,8 @@ fn native_comparison_matching_prepays_hit_and_no_hit_before_scratch_allocation()
 
 #[test]
 fn account_audit_release_waits_for_cache_heads_and_native_selected_restore() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     if !native_positive_layout_for_test(
         "account_audit_release_waits_for_cache_heads_and_native_selected_restore",
     ) {
@@ -4635,6 +4765,8 @@ fn account_audit_release_waits_for_cache_heads_and_native_selected_restore() {
 
 #[test]
 fn ownership_diagnostics_preserve_real_claude_terminal_completed_heap_and_paid_completion() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let fixture = NativePreparationFixture::new();
     let (_, scan, terminal) = complete_native_with_terminal_owner(fixture.paused());

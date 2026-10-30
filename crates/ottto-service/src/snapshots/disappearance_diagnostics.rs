@@ -368,6 +368,8 @@ mod tests {
 
     #[test]
     fn real_pending_member_and_watcher_absence_have_distinct_outcomes() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let dir = crate::test_scratch::ScratchDir::new("disappearance-pending");
         let path = dir.join("missing.jsonl");
         // (source, member, watcher, disappeared, process NotFound, removed).
@@ -416,6 +418,8 @@ mod tests {
 
     #[test]
     fn real_queued_directory_absence_records_once_without_root_fallback() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let dir = crate::test_scratch::ScratchDir::new("disappearance-directory");
         let root = dir.join("root");
         fs::create_dir(&root).unwrap();
@@ -457,6 +461,8 @@ mod tests {
 
     #[test]
     fn real_unsuitable_known_root_is_unresolved_without_a_not_found_error() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let dir = crate::test_scratch::ScratchDir::new("disappearance-root-type");
         let root = dir.join("configured");
         fs::write(&root, b"synthetic non-directory root").unwrap();
@@ -485,6 +491,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn real_dangling_configured_symlink_does_not_double_record_fallback() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let dir = crate::test_scratch::ScratchDir::new("disappearance-symlink");
         let root = dir.join("configured");
         std::os::unix::fs::symlink(dir.join("missing"), &root).unwrap();
@@ -516,6 +524,8 @@ mod tests {
 
     #[test]
     fn real_selected_file_removed_before_open_records_only_not_found() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let dir = crate::test_scratch::ScratchDir::new("disappearance-open");
         let path = dir.join("session.jsonl");
         let key = local_index_key(&path);
@@ -580,6 +590,8 @@ mod tests {
 
     #[test]
     fn real_changed_quarantined_preflight_rejects_second_open_without_parsing() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let dir = crate::test_scratch::ScratchDir::new("disappearance-preflight");
         let session = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         let path = dir.join(format!("{session}.jsonl"));
@@ -651,6 +663,8 @@ mod tests {
     /// removal: no disappeared count, a complete census, the entry gone.
     #[test]
     fn claude_queued_member_deleted_while_its_remove_hint_is_deduped_retires_as_removal() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let dir = crate::test_scratch::ScratchDir::new("absence-deduped-hint");
         let first = "a1111111-1111-4111-8111-111111111111";
@@ -752,6 +766,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn claude_deleted_audit_debt_member_of_forced_quarantined_family_is_removal() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let fixture = ForcedFamilyFixture::new("absence-forced-family");
         let member_key = local_index_key(&fixture.member_path);
@@ -844,6 +860,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn claude_audit_debt_member_below_missing_parent_keeps_entry_and_marker_red() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let fixture = ForcedFamilyFixture::new("absence-forced-parent-gone");
         let member_key = local_index_key(&fixture.member_path);
         fs::remove_dir(fixture.member_path.parent().unwrap()).unwrap();
@@ -880,6 +898,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn claude_member_removal_matches_remove_hint_for_quarantined_family() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let fixture = ForcedFamilyFixture::new("absence-quarantine-control");
         let initial = fixture.index();
@@ -921,6 +941,8 @@ mod tests {
     /// removal goes with its entry, and that removal is counted.
     #[test]
     fn claude_vanished_member_drops_its_request_census_record_and_counts_it() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let dir = crate::test_scratch::ScratchDir::new("absence-request-census");
         let first = "a1111111-1111-4111-8111-111111111111";
@@ -962,6 +984,8 @@ mod tests {
     /// member's snapshot fingerprints stay (N3).
     #[test]
     fn claude_vanished_audit_debt_member_drops_its_request_census_record_and_counts_it() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let dir = crate::test_scratch::ScratchDir::new("absence-debt-request-census");
         let first = "a1111111-1111-4111-8111-111111111111";
@@ -1032,6 +1056,8 @@ mod tests {
     /// quiet.
     #[test]
     fn claude_selected_member_deleted_before_open_retires_through_the_page_merge() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let dir = crate::test_scratch::ScratchDir::new("absence-open-pipeline");
         let first = "a1111111-1111-4111-8111-111111111111";
@@ -1122,6 +1148,8 @@ mod tests {
     /// indexed in the same generation.
     #[test]
     fn claude_single_file_rename_retires_old_path_and_indexes_new_path() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let dir = crate::test_scratch::ScratchDir::new("absence-rename");
         let first = "a1111111-1111-4111-8111-111111111111";
@@ -1161,6 +1189,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn claude_absence_without_a_present_real_parent_stays_red() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let dir = crate::test_scratch::ScratchDir::new("absence-parent-gone");
         let real = dir.join("real");
         fs::create_dir(&real).unwrap();
@@ -1232,6 +1262,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn claude_absence_below_inaccessible_parent_stays_metadata_red() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         use std::os::unix::fs::PermissionsExt;
         assert_ne!(
             // SAFETY: geteuid() is always-successful and has no preconditions.
@@ -1270,6 +1302,8 @@ mod tests {
 
     #[test]
     fn real_not_found_sites_split_loss_and_removal() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let dir = crate::test_scratch::ScratchDir::new("disappearance-sites");
         let path = dir.join("session.jsonl");
         let pending = || ScanTraversalPath {
@@ -1346,6 +1380,8 @@ mod tests {
 
     #[test]
     fn isolated_sources_classes_order_and_sticky_wrap() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let totals = [const { Counters::new() }; 3];
         let causes = [
             Cause::NotFound,
@@ -1449,12 +1485,16 @@ mod tests {
 
     #[test]
     fn fixed_storage_bounds_are_target_layout_checks_not_rss_or_capacity_claims() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         assert!(std::mem::size_of_val(&TOTALS) <= 408);
         assert!(std::mem::size_of::<Totals>() <= 152);
     }
 
     #[test]
     fn all_eleven_producers_and_only_original_operational_increments() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let source = include_str!("../snapshots.rs");
         let calls = |name: &str| -> Vec<&str> {
             source
@@ -1603,6 +1643,8 @@ mod absence_parent_counts_tests {
 
     #[test]
     fn parent_probe_boolean_and_each_refusal_class_are_unchanged() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let dir = crate::test_scratch::ScratchDir::new("absence-classes");
         let real = dir.join("real");
         fs::create_dir(&real).unwrap();
@@ -1643,6 +1685,8 @@ mod absence_parent_counts_tests {
 
     #[test]
     fn candidate_sites_count_once_and_live_parent_still_removes() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let dir = crate::test_scratch::ScratchDir::new("absence-sites-counts");
         let real = dir.join("real");
         fs::create_dir(&real).unwrap();
@@ -1695,6 +1739,8 @@ mod absence_parent_counts_tests {
 
     #[test]
     fn parent_races_count_file_and_metadata_error_once_per_not_found() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         for site in [Site::CandidateWalk, Site::CandidateForcedIndex] {
             for metadata_error in [false, true] {
                 let dir = crate::test_scratch::ScratchDir::new("absence-parent-race");
@@ -1758,6 +1804,8 @@ mod absence_parent_counts_tests {
 
     #[test]
     fn open_subagent_counts_survive_steps_and_emit_on_existing_page() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let dir = crate::test_scratch::ScratchDir::new("absence-open-subagent");
         let parent = dir.join("subagents");
         fs::create_dir(&parent).unwrap();
@@ -1828,6 +1876,8 @@ mod absence_parent_counts_tests {
 
     #[test]
     fn other_sources_hints_and_nonmembers_add_no_parent_counts() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
         let dir = crate::test_scratch::ScratchDir::new("absence-excluded");
         for (source, census_member, watcher_hint) in [
             (SnapshotSource::Codex, true, false),

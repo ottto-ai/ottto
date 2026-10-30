@@ -27,6 +27,8 @@ pub(crate) fn output(name: &str, item: &SnapshotItem) {
 
 #[test]
 fn claude_p92_clock_qualification_and_all_bucket_coverage() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // D1 session-account qualification and binding; E2 keeps per-request account partitions.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, items) = claude_account_family_fixture();
@@ -314,6 +316,8 @@ pub(crate) fn claude_request_account_mixed_fixture(
 
 #[test]
 fn claude_p92_mixed_body_capability_and_restart_refusals() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // D1 session-account qualification and binding; E2 keeps per-request account partitions.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, mut mixed, api, trace) = claude_request_account_mixed_fixture(4, true);
@@ -632,6 +636,8 @@ fn h296_trace_refingerprint(row: &mut crate::claude_local_otel::ClaudeTraceOwner
 
 #[test]
 fn claude_h296_root_and_child_have_independent_exact_request_logins() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // D1 session-account qualification and binding; E2 keeps per-request account partitions.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, mut api, trace) = h296_root_evidence();
@@ -661,6 +667,8 @@ fn claude_h296_root_and_child_have_independent_exact_request_logins() {
 
 #[test]
 fn claude_h296_root_refuses_partial_no_otel_owners_and_collisions() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (dir, original, api, trace) = h296_root_evidence();
     for case in ["no_otel", "partial", "unhealthy", "duplicate_api", "duplicate_trace", "child_owner", "client_collision", "wrong_namespace", "malformed_root", "partial_index", "unknown_cached"] {
         let mut item = original.clone();
@@ -708,6 +716,8 @@ fn claude_h296_root_refuses_partial_no_otel_owners_and_collisions() {
 
 #[test]
 fn claude_h296_root_clocks_and_creator_conflicts_stay_separate() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // D1 session-account qualification and binding; E2 keeps per-request account partitions.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, original, api, trace) = h296_root_evidence();
@@ -740,6 +750,8 @@ fn claude_h296_root_clocks_and_creator_conflicts_stay_separate() {
 
 #[test]
 fn claude_h296_root_production_enrichment_keeps_child_separate() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     // D1 session-account qualification and binding; E2 keeps per-request account partitions.
@@ -861,6 +873,8 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
 /// tokenless and denied cycles kept today's (`COMPLETE`) bytes.
 #[test]
 fn claude_contract5_bodies_need_no_cohort_token() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // D1 session-account qualification and binding; E2 keeps per-request account partitions.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::claude_request_identity as identity;
@@ -890,6 +904,8 @@ fn claude_contract5_bodies_need_no_cohort_token() {
 
 #[test]
 fn claude_h296_root_requires_original_clocks_in_every_hour_before_fold() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // D1 session-account qualification and binding; E2 keeps per-request account partitions.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, _) = claude_account_family_fixture();

@@ -197,6 +197,8 @@ fn typed_item(value: &Value) -> SnapshotItem {
 
 #[test]
 fn w0_r5_fixture_digest_reproduces() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(W0_DIR);
     let mut lines = fs::read_dir(&dir)
         .unwrap()
@@ -223,6 +225,8 @@ fn w0_r5_fixture_digest_reproduces() {
 
 #[test]
 fn w0_r5_bounds_match_daemon_caps() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let bounds = &w0_index()["bounds"];
     assert_eq!(
         bounds["evidence_entries"],
@@ -245,6 +249,8 @@ fn w0_r5_bounds_match_daemon_caps() {
 /// bytes for old collectors, the identity leaf and coverage for the new one.
 #[test]
 fn w0_r5_usage_accounting_and_attribution_hash_parity() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let bodies = w0_bodies();
     assert_eq!(bodies.len(), 63);
     for (name, value, entry) in bodies {
@@ -271,6 +277,8 @@ fn w0_r5_usage_accounting_and_attribution_hash_parity() {
 /// Typed rows serialize to the exact W0 wire members (names, omission rules).
 #[test]
 fn w0_r5_wire_round_trip() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for (name, value, _) in w0_bodies() {
         let item = typed_item(&value);
         let rows = item.model_usage.iter().chain(
@@ -512,6 +520,8 @@ fn stripped(item: &SnapshotItem) -> SnapshotItem {
 /// the reordered ones (the server canonicalizes any order).
 #[test]
 fn w0_r5_builder_reproduces_tagged_bodies() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut checked = 0;
     for (name, value, _) in w0_bodies() {
         let mut expected = typed_item(&value);
@@ -573,6 +583,8 @@ fn w0_r5_builder_reproduces_tagged_bodies() {
 /// collector with refusals = bucket rows that lost identity (>= 1).
 #[test]
 fn w0_r5_cap_fallbacks_match_bodies() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for (tagged, fallback) in [
         ("new-cap-identities-16", "new-cap-identities-17-fallback"),
         ("new-cap-evidence-16", "new-cap-evidence-17-fallback"),
@@ -690,6 +702,8 @@ fn login_key(login: &str) -> RequestIdentity {
 /// characters, exactly as read.
 #[test]
 fn builder_tags_lowercase_hex_logins_at_the_length_bounds_verbatim() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let eight = "0123abcd".to_string();
     let max = "a".repeat(128);
     let digest = format!("{:x}", Sha256::digest(b"synthetic login"));
@@ -713,6 +727,8 @@ fn builder_tags_lowercase_hex_logins_at_the_length_bounds_verbatim() {
 /// never rewritten into another login, never poisoning a valid key beside it.
 #[test]
 fn builder_refuses_logins_that_are_not_lowercase_hex() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let valid = "b".repeat(64);
     for invalid in [
         "C".repeat(64),
@@ -754,6 +770,8 @@ fn builder_refuses_logins_that_are_not_lowercase_hex() {
 
 #[test]
 fn builder_refuses_rows_it_cannot_reproduce_and_leaves_them_untouched() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let item = one_row_item(&[(10, None), (20, None)]);
     let mut changed = item.clone();
     let wrong = vec![contribution(&item, 10, None, telemetry('a', 'd'))];
@@ -769,6 +787,8 @@ fn builder_refuses_rows_it_cannot_reproduce_and_leaves_them_untouched() {
 
 #[test]
 fn builder_never_emits_money_beyond_micro_dollars() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let item = one_row_item(&[(10, Some("0.0000001")), (20, Some("1"))]);
     let mut changed = item.clone();
     let contributions = vec![
@@ -784,6 +804,8 @@ fn builder_never_emits_money_beyond_micro_dollars() {
 
 #[test]
 fn builder_keeps_unsplittable_reported_money_untagged_and_refused() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Today's row folds only observed money: $1 from one request while the
     // other request has none. That total cannot be split per request.
     let mut item = one_row_item(&[(10, Some("1")), (20, None)]);
@@ -811,6 +833,8 @@ fn builder_keeps_unsplittable_reported_money_untagged_and_refused() {
 
 #[test]
 fn builder_hash_is_order_free_and_moves_with_the_login() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let item = one_row_item(&[(10, Some("1")), (20, Some("2"))]);
     let forward = vec![
         contribution(&item, 10, Some("1"), telemetry('a', 'd')),
@@ -842,6 +866,8 @@ fn builder_hash_is_order_free_and_moves_with_the_login() {
 
 #[test]
 fn builder_enforces_the_declared_parts_per_item_cap() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // 100 bucket rows x 2 hours of 11 parts each = 2,200 bucket parts plus top
     // rows: over the 2,048 declared bound, so the stateless fallback applies.
     let mut item = valid_v6_batch_request().snapshots.remove(0);
@@ -968,6 +994,8 @@ fn root_set() -> BTreeSet<String> {
 
 #[test]
 fn classify_follows_the_session_rulings() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let org_d = "d".repeat(64);
     let org_e = "e".repeat(64);
     let mut with_org = complete_api_row(ROOT, "req_org", 1, 10, 1, 0);
@@ -1110,6 +1138,8 @@ fn classify_follows_the_session_rulings() {
 
 #[test]
 fn classify_sole_login_needs_desktop_and_a_census_after_the_request() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let org = "d".repeat(64);
     let (api, trace) = reports(Vec::new(), Vec::new());
     let census = |at: u64, logins: &[&str]| DesktopCensus {
@@ -1189,6 +1219,8 @@ fn classify_sole_login_needs_desktop_and_a_census_after_the_request() {
 /// transcript's org or sole login, even where both would otherwise qualify.
 #[test]
 fn trace_owned_requests_refuse_before_any_transcript_basis() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let org = "d".repeat(64);
     let child = format!("{ROOT}_agent-child");
     let mut forged = complete_trace_row(ROOT, "req_forged", "");
@@ -1261,6 +1293,8 @@ fn trace_owned_requests_refuse_before_any_transcript_basis() {
 /// exact-token match are retired).
 #[test]
 fn contract5_capture_is_always_on_for_claude_code_only() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     assert!(identity::captures(SnapshotSource::ClaudeCode));
     assert!(!identity::captures(SnapshotSource::Codex));
     assert!(!identity::captures(SnapshotSource::Pi));
@@ -1272,6 +1306,8 @@ fn contract5_capture_is_always_on_for_claude_code_only() {
 
 #[test]
 fn desktop_census_witness_is_bound_to_completion_process_and_inventory() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut index = ScanIndex::default();
     assert_eq!(
         identity::desktop_census_at(&index, 100),
@@ -1358,6 +1394,8 @@ fn desktop_census_witness_is_bound_to_completion_process_and_inventory() {
 
 #[test]
 fn desktop_census_witness_follows_the_store_inventory_through_retry_backoff() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     const NOW: u64 = 1_800_000_000; // 2027-01-15T08:00:00Z
     let swept = BTreeSet::from([PathBuf::from("/synthetic/store-a")]);
     let backed_off = |store_dirs: &BTreeSet<PathBuf>| {
@@ -1425,6 +1463,8 @@ fn org_hash(uuid: &str) -> String {
 
 #[test]
 fn markers_govern_later_responses_and_distrust_unexplained_flips() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut markers = None;
     identity::note_marker_line(&mut markers, &context("one@example.invalid"), 0);
     identity::note_marker_line(&mut markers, &marker(ORG_1), 0);
@@ -1474,6 +1514,8 @@ fn markers_govern_later_responses_and_distrust_unexplained_flips() {
 
 #[test]
 fn parser_captures_owned_markers_and_never_inherited_ones() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("claude-request-identity-markers");
     let path = dir.join(format!("{ROOT}.jsonl"));
     let lines = [
@@ -1507,6 +1549,8 @@ fn parser_captures_owned_markers_and_never_inherited_ones() {
 
 #[test]
 fn transcript_path_tags_parsed_requests_from_their_own_telemetry() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, mut items) = claude_account_family_fixture();
@@ -1559,6 +1603,8 @@ fn transcript_path_tags_parsed_requests_from_their_own_telemetry() {
 /// lifecycle spelling D1 applies; the lifecycle component may not drift.
 #[test]
 fn contract5_lifecycle_matches_the_legacy_qualification_path() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, mut items) = claude_account_family_fixture();
@@ -1614,6 +1660,8 @@ fn contract5_lifecycle_matches_the_legacy_qualification_path() {
 
 #[test]
 fn reported_path_tags_from_rebuild_groupings() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, mut items) = claude_account_family_fixture();
@@ -1830,6 +1878,8 @@ fn assert_usage_conserved(tagged: &SnapshotItem, before: &SnapshotItem) {
 /// refused while the transcript requests keep their telemetry login.
 #[test]
 fn reported_rebuild_groups_requests_without_changing_its_output() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -1948,6 +1998,8 @@ fn reported_rebuild_groups_requests_without_changing_its_output() {
 /// unsettled census, with a fingerprint the upload no-op check cannot match.
 #[test]
 fn proven_reported_members_are_rearmed_and_reoffered_as_contract5() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -2171,6 +2223,8 @@ fn request_hash(request_id: &str) -> String {
 /// admits the child, so this repair takes no such item off contract 5.
 #[test]
 fn legacy_excluded_reported_fork_stays_contract5_by_owned_requests() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -2264,6 +2318,8 @@ fn legacy_excluded_reported_fork_stays_contract5_by_owned_requests() {
 /// it); every refused item keeps today's bytes.
 #[test]
 fn legacy_exclusion_skew_never_tags_or_borrows_the_parent() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -2389,6 +2445,8 @@ fn legacy_exclusion_skew_never_tags_or_borrows_the_parent() {
 
 #[test]
 fn unreadable_sidecars_refuse_and_unqualified_items_keep_todays_bytes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, _root, items) = claude_account_family_fixture();
@@ -2441,6 +2499,8 @@ fn unreadable_sidecars_refuse_and_unqualified_items_keep_todays_bytes() {
 /// builds run only the legacy path; marker capture is test-only until the flip.
 #[test]
 fn equal_input_resource_comparison() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::retry_allocation_probe::measure;
@@ -2603,6 +2663,8 @@ fn equal_input_resource_comparison() {
 /// outside the item's rows stops construction.
 #[test]
 fn grouping_retains_nothing_per_request() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::retry_allocation_probe::measure;
     let (row_key, _, _) = build_row_identity("claude-haiku-4-5", &SelectorCapture::default(), None);
     let usage = UsageTotals {
@@ -2673,6 +2735,8 @@ fn grouping_retains_nothing_per_request() {
 
 #[test]
 fn transcript_bases_need_the_original_clock() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (api, trace) = reports(Vec::new(), Vec::new());
     let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
     let mut carried = facts(
@@ -2698,6 +2762,8 @@ fn transcript_bases_need_the_original_clock() {
 
 #[test]
 fn only_intact_rows_establish_login_org_membership() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let org = "d".repeat(64);
     let mut forged = complete_api_row(ROOT, "req_forged", 1, 10, 1, 0);
     forged.request_identity = Some(org_identity(&org));
@@ -2731,6 +2797,8 @@ fn only_intact_rows_establish_login_org_membership() {
 
 #[test]
 fn sidecar_absence_is_distinguished_from_failure() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let support = temp_dir("claude-request-identity-sidecars");
     assert!(crate::claude_local_otel::claude_sidecars_absent(&support, ROOT));
     let digest = format!("{:x}", Sha256::digest(ROOT.as_bytes()));
@@ -2832,6 +2900,8 @@ fn bind_owner_a(
 
 #[test]
 fn unbound_contract5_requests_survive_conflicting_creator_profiles() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     for mixed in [false, true] {
         // Real request classification proves the rows independently of the
@@ -2859,6 +2929,8 @@ fn unbound_contract5_requests_survive_conflicting_creator_profiles() {
 /// nothing else obtains the exception.
 #[test]
 fn bound_sessions_admit_contract5_only_with_absent_or_matching_creator() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let login_b = "b".repeat(64);
@@ -2956,6 +3028,8 @@ const _: () = assert!(
 
 #[test]
 fn transcript_email_never_binds_and_refuses_unqualified_coverage() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     use crate::claude_status_coverage::{home_key, Ledger, Observation, CADENCE_SECONDS};
     let org_e: &'static str = "e".repeat(64).leak();
     let org_f: &'static str = "f".repeat(64).leak();
@@ -3145,6 +3219,8 @@ fn transcript_email_never_binds_and_refuses_unqualified_coverage() {
 
 #[test]
 fn status_pairings_establish_marker_org_membership_for_the_telemetry_login() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let org_e = "e".repeat(64);
     let home = crate::claude_status_coverage::home_key(Path::new("/synthetic/slot"));
     let login_only = complete_api_row(ROOT, "req_login", 2, 10, 1, 0);
@@ -3218,6 +3294,8 @@ fn parse_session(folder: &Path, lines: &[Value]) -> Vec<SnapshotItem> {
 
 #[test]
 fn unmatched_email_in_a_registered_folder_is_refused_end_to_end_with_usage_conserved() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("claude-request-identity-email");
@@ -3307,6 +3385,8 @@ fn unmatched_email_in_a_registered_folder_is_refused_end_to_end_with_usage_conse
 
 #[test]
 fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::claude_status_coverage::{home_key, Ledger, Registration, MAX_LOST};
@@ -3457,6 +3537,8 @@ const THIRD_ROOT: &str = "3558ca2c-b58e-4ede-87dd-72be88652dc7";
 /// still decide its own requests.
 #[test]
 fn rows_under_another_root_own_the_request() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
     let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
     for (root, request_ids) in [
@@ -3524,6 +3606,8 @@ fn rows_under_another_root_own_the_request() {
 /// Usage never moves and full telemetry remains authoritative.
 #[test]
 fn transcript_markers_are_withdrawn_even_when_a_settled_census_shows_unduplicated() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::ClaudeDuplicateCensusCounts;
@@ -3642,6 +3726,8 @@ fn transcript_markers_are_withdrawn_even_when_a_settled_census_shows_unduplicate
 /// D2 exists, on legacy/OFF and default state, and after index reload.
 #[test]
 fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::ClaudeDuplicateCensusCounts;
@@ -3846,6 +3932,8 @@ fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
 /// grouping and apply it directly, which a settled pass did on that head.
 #[test]
 fn capture_on_non_marker_body_matches_main_before_withdrawal() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("claude-i1b-non-marker-parity");
@@ -3974,6 +4062,8 @@ fn tagged_body(item: &SnapshotItem) -> (Value, Value, Value, u64) {
 /// request-id set keep today's behavior.
 #[test]
 fn zero_usage_api_error_with_request_id_keeps_contract5_and_claims_nothing() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("claude-request-identity-zero-usage");
@@ -4059,6 +4149,8 @@ fn zero_usage_api_error_with_request_id_keeps_contract5_and_claims_nothing() {
 /// early progressive record is all zero before its final usage.
 #[test]
 fn zero_usage_without_an_id_or_before_final_usage_keeps_todays_contract5() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("claude-request-identity-zero-usage-unchanged");
@@ -4097,6 +4189,8 @@ fn zero_usage_without_an_id_or_before_final_usage_keeps_todays_contract5() {
 /// plain request-id count coincide, which never admitted them either.
 #[test]
 fn zero_usage_record_never_admits_unowned_or_uncounted_usage() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("claude-request-identity-zero-usage-negatives");
@@ -4151,6 +4245,8 @@ fn zero_usage_record_never_admits_unowned_or_uncounted_usage() {
 /// and never lends that root's login, with or without a zero-usage record.
 #[test]
 fn zero_usage_record_keeps_a_foreign_owned_request_refused() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("claude-request-identity-zero-usage-foreign");
@@ -4206,6 +4302,8 @@ fn zero_usage_record_keeps_a_foreign_owned_request_refused() {
 // Recent activity is independent of session-first origin and billing identity.
 #[test]
 fn desktop_recent_follows_each_request_entrypoint_and_governing_org() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let dir = temp_dir("desktop-recent-transitions");
     let mut lines = vec![marker(ORG_1)];
     for (n, entrypoint) in ["claude-desktop", "cli", "claude-desktop", "cli"].iter().enumerate() {
@@ -4273,6 +4371,8 @@ fn desktop_recent_follows_each_request_entrypoint_and_governing_org() {
 
 #[test]
 fn desktop_recent_cli_to_desktop_and_missing_entrypoint_fail_closed() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
     accumulator.claude_request_identity_capture = true;
     apply_claude_code_line(&marker(ORG_1), &mut accumulator);
@@ -4316,6 +4416,8 @@ fn desktop_recent_cli_to_desktop_and_missing_entrypoint_fail_closed() {
 /// (including its billing veto), rebuild/place requests, then publish the fold.
 #[test]
 fn desktop_recent_survives_same_account_org_switch_through_enrichment_and_both_folds() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("desktop-recent-enrichment");
@@ -4391,6 +4493,8 @@ fn desktop_recent_survives_same_account_org_switch_through_enrichment_and_both_f
 
 #[test]
 fn desktop_recent_refuses_foreign_conflicting_and_other_account_requests_without_duplicate_index() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("desktop-recent-foreign");
@@ -4591,6 +4695,8 @@ fn owned(value: &str) -> Option<String> {
 /// time, in any input order; the history keeps both accounts exactly.
 #[test]
 fn current_account_follows_the_newest_request_not_its_hour_bucket() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let requests = || {
         vec![
             display_request(Some("max"), HOUR_10, 10, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:05:00.100Z")),
@@ -4638,6 +4744,8 @@ fn current_account_follows_the_newest_request_not_its_hour_bucket() {
 /// falls back to the previous or the most-used account. Totals stay whole.
 #[test]
 fn a_newer_unidentified_request_clears_the_current_account() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (item, display) = displayed(&[
         display_request(Some("max"), HOUR_10, 500, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:05:00Z")),
         display_request(Some("max"), HOUR_10, 7, RequestIdentity::Missing, Some("2026-09-01T10:06:00Z")),
@@ -4668,6 +4776,8 @@ fn a_newer_unidentified_request_clears_the_current_account() {
 /// workspace or plan leave the current account unknown; agreeing ones do not.
 #[test]
 fn equal_newest_times_with_different_triples_are_unknown() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     const AT: Option<&str> = Some("2026-09-01T10:30:00Z");
     for (case, second) in [
         ("account", display_request(Some("max"), HOUR_10, 2, login_org('b', Some('d'), identity::TELEMETRY), AT)),
@@ -4696,6 +4806,8 @@ fn equal_newest_times_with_different_triples_are_unknown() {
 /// storage reuses one of those ties. No old account/workspace/plan may survive.
 #[test]
 fn newer_request_replaces_conflicting_latest_ties() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     for (plan, identity) in [
         (Some("max"), login_org('b', Some('e'), identity::TELEMETRY)),
         (Some("pro"), login_org('c', None, identity::TELEMETRY_LOGIN)),
@@ -4718,6 +4830,8 @@ fn newer_request_replaces_conflicting_latest_ties() {
 /// and plan, never the first observation's.
 #[test]
 fn one_login_keeps_each_workspace_and_plan_apart() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (_, display) = displayed(&[
         display_request(Some("team"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:01:00Z")),
         display_request(Some("team"), HOUR_10, 2, login_org('a', Some('e'), identity::TELEMETRY), Some("2026-09-01T10:02:00Z")),
@@ -4744,6 +4858,8 @@ fn one_login_keeps_each_workspace_and_plan_apart() {
 /// or a last use, though its usage counts.
 #[test]
 fn missing_clocks_and_auxiliary_requests_never_decide_the_current_account() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (_, display) = displayed(&[
         display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:01:00Z")),
         display_request(Some("max"), HOUR_10, 2, login_org('a', Some('d'), identity::TELEMETRY), Some("")),
@@ -4781,6 +4897,8 @@ fn missing_clocks_and_auxiliary_requests_never_decide_the_current_account() {
 /// a marker org.
 #[test]
 fn withdrawn_transcript_tags_withdraw_from_the_display() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let (item, display) = displayed(&[
         display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY_LOGIN), Some("2026-09-01T10:01:00Z")),
         display_request(Some("max"), HOUR_10, 2, RequestIdentity::Tagged(AuthorityKey { login: None, org: Some(hex('e')), basis: identity::TRANSCRIPT_ORG }), Some("2026-09-01T10:02:00Z")),
@@ -4800,6 +4918,8 @@ fn withdrawn_transcript_tags_withdraw_from_the_display() {
 /// request names no account on the card either.
 #[test]
 fn an_unsplittable_row_untags_its_newest_request() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let mut item = one_row_item(&[(10, Some("1")), (20, None)]);
     let requests = vec![
         (contribution(&item, 10, Some("1"), login_key(OWNER_A)), Some("2026-09-01T10:01:00Z")),
@@ -4818,6 +4938,8 @@ fn an_unsplittable_row_untags_its_newest_request() {
 /// The display never changes the wire bytes or the fingerprint.
 #[test]
 fn fallback_withholds_and_ineligible_items_carry_no_display() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let requests = (0..17_u8)
         .map(|n| {
             DisplayRequest {
@@ -4871,6 +4993,8 @@ fn fallback_withholds_and_ineligible_items_carry_no_display() {
 /// current, and a response without a complete event clock proves no order.
 #[test]
 fn transcript_path_current_account_is_the_newest_parsed_request() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let (dir, root, mut items) = claude_account_family_fixture();
     items.truncate(1);
