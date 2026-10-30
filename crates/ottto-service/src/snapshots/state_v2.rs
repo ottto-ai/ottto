@@ -17,7 +17,7 @@ pub(super) use runtime::invalidate_tree;
 pub(super) use runtime::Hold;
 pub(super) use runtime::{
     after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
-    idle, load_locked, save_locked,
+    idle, load_locked, recovery_save_guard, save_locked,
 };
 mod codec;
 #[cfg(test)]
@@ -34,9 +34,6 @@ mod recovery_backup;
 pub(crate) mod resume;
 use codec as shape;
 mod sqlite;
-mod units;
-mod units_graph;
-mod units_spool;
 use kinds::KindCx;
 
 /// Runtime-only custody carrier. Only the verified v2 load route may install it.
@@ -90,8 +87,7 @@ impl RecordKind {
     fn parse(name: &str) -> Result<Self> {
         let known = matches!(
             name,
-            "unit.deferred"
-                | "file.progress"
+            "file.progress"
                 | "file.receipt"
                 | "file.terminal"
                 | "file.confirmed_empty"
@@ -331,7 +327,7 @@ fn value_cap(key: &RowKey) -> u64 {
     match key {
         RowKey::Meta(_) => CONTROL_BYTES,
         RowKey::Record { kind, .. }
-            if kind.name().starts_with("raw_hold.") || kind.name() == "unit.deferred" =>
+            if kind.name().starts_with("raw_hold.") =>
         {
             VALUE_BYTES
         }
@@ -380,10 +376,8 @@ fn admit_header(key: &RowKey, fixed: &Fixed) -> Result<()> {
     );
     Ok(())
 }
-fn value_version_supported(key: &RowKey, version: u32) -> bool {
+fn value_version_supported(_key: &RowKey, version: u32) -> bool {
     version == 1
-        || version == 2
-            && matches!(key, RowKey::Record { kind, .. } if kind.name() == "unit.deferred")
 }
 fn preflight(row: &RowInput<'_>) -> Result<Header> {
     admit_header(row.key, row.fixed)?;
@@ -525,7 +519,6 @@ fn control_name(name: &str) -> bool {
             | "baseline_bytes"
             | "baseline_digest"
             | "repair_commitment"
-            | "unit_schedule"
             | "field_presence"
             | "limits"
     )

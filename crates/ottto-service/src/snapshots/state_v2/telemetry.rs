@@ -11,6 +11,8 @@ struct Stats {
     labels: BTreeMap<&'static str, BTreeMap<String, u64>>,
     latest: BTreeMap<&'static str, serde_json::Value>,
     cpu_per_pass_us: Distribution,
+    save_dirty_rows: Distribution,
+    save_dirty_bytes: Distribution,
     rss_bytes: Rss,
     hydrate_count: u64,
     stage_memory: BTreeMap<&'static str, MemoryWindow>,
@@ -609,5 +611,15 @@ mod ops_tests {
         let json = serde_json::to_string(&observation).unwrap();
         assert!(!json.contains("synthetic-private"));
         assert!(json.contains("family.requests"));
+    }
+}
+
+/// One bounded sample per save attempt; rejected work is visible too. Gauges
+/// share the claude_state_v2 diagnostic row and contain counts/bytes only.
+pub(super) fn save_work(rows: u64, bytes: u64) {
+    if let Ok(mut stats) = stats().lock() {
+        stats.save_dirty_rows.observe(rows);
+        stats.save_dirty_bytes.observe(bytes);
+        crate::local_resource_diagnostics::claude_state_v2(&*stats);
     }
 }

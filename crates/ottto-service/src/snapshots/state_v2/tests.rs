@@ -1004,7 +1004,27 @@ fn changed_reference_diff_is_atomic_and_daily_drift_holds() {
 }
 
 #[test]
-fn save_admission_rolls_back_whole_burst_and_resident_headers_follow_commit() {
+fn one_save_commits_all_dirty_rows_above_soft_targets() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    db.prime_headers().unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    // Staging is charged alongside SQL work without allocating a huge fixture.
+    tx.charge_staging(33 * 1024 * 1024).unwrap();
+    for row in 0..5_001 {
+        put(&mut tx, &traversal(format!("dirty-{row}")), b"evidence");
+    }
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    assert!(db.save_over_target());
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    for row in 0..5_001 {
+        let key = traversal(format!("dirty-{row}"));
+        let header = tx.get(&key).unwrap().unwrap();
+        assert_eq!(value(&mut tx, &header), b"evidence");
+    }
+}
+#[test]
+fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     db.prime_headers().unwrap();
@@ -1014,39 +1034,56 @@ fn save_admission_rolls_back_whole_burst_and_resident_headers_follow_commit() {
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, b"new");
-    assert_eq!(value(&mut tx, &tx_header(&key, b"new")), b"new");
-    assert!(tx
-        .put(RowInput {
-            value_version: 1,
-            key: &traversal("too-large".into()),
-            fixed: &Fixed::None,
-            value: &Repeat(33 * 1024 * 1024)
-        })
-        .is_err());
+    let error = tx.charge_staging(256 * 1024 * 1024).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::NotPublished);
+    assert_eq!(db.save_failure(), Some(Hold::SaveCeiling));
+    assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(1));
     let mut tx = db.begin(TxnMode::Read).unwrap();
     let header = tx.get(&key).unwrap().unwrap();
     assert_eq!(value(&mut tx, &header), b"old");
 }
 #[test]
-fn page_admission_reserves_all_commit_markers_before_delta_returns() {
-    let tmp = Scratch::new();
-    let mut db = tmp.live_store();
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    // With the old 64-page reserve, the final user row passed, then four
-    // controls at 18 pages each failed in COMMIT as an opaque NotPublished.
-    sqlite::seed_page_estimate_for_test(&mut tx, 32 * 1024 - 64 - 18);
-    let error = tx
-        .put(RowInput {
-            value_version: 1,
-            key: &traversal("last-user-row".into()),
-            fixed: &Fixed::None,
-            value: &Bytes(b"small".to_vec()),
-        })
-        .unwrap_err();
-    assert_eq!(error.to_string(), "state_v2_save_admission");
-    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::NotPublished);
-    assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(0));
+fn sqlite_full_at_commit_or_chunk_write_rolls_back_the_complete_save() {
+    struct JsonChunk;
+    impl Value for JsonChunk {
+        fn write(&self, out: &mut dyn Write) -> Result<()> {
+            // serde_json may expose the native FFI error as its source while
+            // skipping both the I/O and rusqlite::Error wrappers.
+            serde_json::to_writer(out, &"x".repeat(PART_BYTES))?;
+            Ok(())
+        }
+    }
+    for chunk_write in [false, true] {
+        let tmp = Scratch::new();
+        let mut db = tmp.live_store();
+        let key = traversal("uncommitted".into());
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        put(&mut tx, &key, b"evidence");
+        if chunk_write {
+            sqlite::fail_part_full_for_test();
+            let error = tx
+                .put(RowInput {
+                    value_version: 1,
+                    key: &traversal("chunked".into()),
+                    fixed: &Fixed::None,
+                    value: &JsonChunk,
+                })
+                .unwrap_err();
+            assert!(sqlite::disk_full(&error));
+        } else {
+            sqlite::fail_commit_full_for_test();
+        }
+        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::NotPublished);
+        assert_eq!(db.save_failure(), Some(Hold::SaveFull));
+        assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(0));
+        assert!(db
+            .begin(TxnMode::Read)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_none());
+    }
 }
 
 fn traversal(key: String) -> RowKey {

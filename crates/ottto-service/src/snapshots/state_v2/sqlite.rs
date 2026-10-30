@@ -309,6 +309,7 @@ pub(super) struct Sqlite {
     owner: File,
     clean: bool,
     headers: Option<BTreeMap<RowKey, Header>>,
+    save_failure: Option<Hold>,
 }
 pub(super) struct Txn<'a> {
     store: &'a mut Sqlite,
@@ -322,11 +323,16 @@ pub(super) struct Txn<'a> {
     changed: BTreeMap<RowKey, Option<Header>>,
     dirty_bytes: u64,
     estimated_pages: u64,
-    admission: Option<units::Admission>,
+    dirty_rows: u64,
 }
 impl Drop for Txn<'_> {
     fn drop(&mut self) {
         if !self.finished {
+            if self.write && !self.store.import {
+                let bytes = self.store.wal_bytes();
+                self.store.stats.observe_wal(bytes);
+                telemetry::save_work(self.dirty_rows, self.dirty_bytes);
+            }
             // SQLite journal OFF cannot promise rollback. An aborted import
             // transaction invalidates the entire unpublished file.
             if self.write && self.store.import {
@@ -494,6 +500,7 @@ impl Sqlite {
             owner: file,
             clean: false,
             headers: None,
+            save_failure: None,
         };
         store.control("limits", &StorageLimits::current())?;
         super::telemetry::event("schema_layout", &"four_tables");
@@ -687,6 +694,7 @@ impl Sqlite {
             owner: file,
             clean: false,
             headers: None,
+            save_failure: None,
         };
         store.set_purge_policy(deadline, work)?;
         // Hydrate reads through read_value, which verifies each checksum once.
@@ -730,7 +738,7 @@ impl Sqlite {
                 changed: BTreeMap::new(),
                 dirty_bytes: 0,
                 estimated_pages: 0,
-                admission: None,
+                dirty_rows: 0,
             };
             tx.put(RowInput {
                 value_version: 1,
@@ -802,6 +810,7 @@ impl Store for Sqlite {
     type Txn<'a> = Txn<'a>;
     fn begin(&mut self, mode: TxnMode) -> Result<Txn<'_>> {
         if mode == TxnMode::Write {
+            self.save_failure = None;
             self.mark_dirty()?;
             self.stats.erasure_pending_marks = 0;
             self.stats.dirty_rows_per_save = 0;
@@ -813,6 +822,13 @@ impl Store for Sqlite {
         } else {
             self.conn()?.execute_batch("BEGIN")?;
         }
+        let dirty_bytes = 0;
+        #[cfg(test)]
+        let dirty_bytes = if mode == TxnMode::Write {
+            fixtures::next_save_bytes()
+        } else {
+            dirty_bytes
+        };
         Ok(Txn {
             store: self,
             write: mode == TxnMode::Write,
@@ -823,9 +839,9 @@ impl Store for Sqlite {
             shared_erasure: false,
             failed: false,
             changed: BTreeMap::new(),
-            dirty_bytes: 0,
+            dirty_bytes,
             estimated_pages: 0,
-            admission: None,
+            dirty_rows: 0,
         })
     }
     fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
@@ -1076,149 +1092,131 @@ impl Sqlite {
     }
 }
 impl Sqlite {
-    /// Durable inert payload staging under the existing owner. Generation and
-    /// semantic controls stay unchanged; the manifest is the activation point.
-    pub(super) fn stage_custody(
-        &mut self,
-        selection: units::Selection,
-        rows: &super::units_graph::RowPlan,
-    ) -> Result<()> {
-        ensure!(rows.inert(), "state_v2_inert_custody_only");
-        let generation = selection.generation;
-        self.validate_selection(&selection)?;
-        let mut tx = self.begin_selected_inner(selection, true)?;
-        rows.apply(&mut tx)?;
-        ensure!(
-            tx.commit_inner(generation, generation, true)
-                == DurableCommitOutcome::Committed(generation),
-            "state_v2_inert_custody_requires_reload"
-        );
-        telemetry::event("unit_custody_staged", &1);
-        Ok(())
-    }
-    pub(super) fn validate_selection(&mut self, selection: &units::Selection) -> Result<()> {
-        ensure!(
-            self.stamp()?.0 == selection.generation,
-            "state_v2_unit_stale_plan"
-        );
-        let mut tx = self.begin(TxnMode::Read)?;
+    /// Authenticate the exact committed generation before restart staging.
+    /// The caller retains source ownership through COMMIT.
+    pub(super) fn validate_save(&mut self, identity: &Identity, generation: u64) -> Result<()> {
+        ensure!(self.stamp()?.0 == generation, Hold::ReloadRequired);
+        let tx = self.begin(TxnMode::Read)?;
         migrations::check_current(tx.store.conn()?)?;
         migrations::writer_supported(tx.store.conn()?)?;
         ensure!(
-            tx.store.read_control::<Identity>("identity")?.as_ref() == Some(&selection.identity)
-                && tx.store.read_control::<u64>("generation")? == Some(selection.generation)
-                && units::Schedule::read(&mut tx)? == selection.prior_schedule,
-            "state_v2_unit_stale_plan"
+            tx.store.read_control::<Identity>("identity")?.as_ref() == Some(identity)
+                && tx.store.read_control::<u64>("generation")? == Some(generation),
+            Hold::ReloadRequired
         );
         Ok(())
     }
-    /// The caller holds source ownership, has selected the complete committable
-    /// subset, and has durably staged its R1 files BEFORE entering this method.
-    /// Ordinary callers keep their existing conservative transaction limits.
-    #[allow(dead_code)] // Complete mapper plans are required before enabling publication.
-    pub(super) fn begin_selected(&mut self, selection: units::Selection) -> Result<Txn<'_>> {
-        self.begin_selected_inner(selection, false)
+    pub(super) fn save_failure(&self) -> Option<Hold> {
+        self.save_failure
     }
-    fn begin_selected_inner(
-        &mut self,
-        selection: units::Selection,
-        inert: bool,
-    ) -> Result<Txn<'_>> {
-        ensure!(!self.import, "state_v2_unit_requires_live_store");
-        let mut tx = self.begin(TxnMode::Write)?;
-        ensure!(
-            tx.store.read_control::<Identity>("identity")?.as_ref() == Some(&selection.identity)
-                && tx.store.read_control::<u64>("generation")?.unwrap_or(0) == selection.generation,
-            "state_v2_unit_stale_plan"
-        );
-        ensure!(
-            units::Schedule::read(&mut tx)? == selection.prior_schedule,
-            "state_v2_unit_stale_schedule"
-        );
-        if inert {
-            telemetry::event(
-                "unit_custody_charge_rows_bytes_pages",
-                &selection.diagnostic_charge(),
-            );
-        } else {
-            telemetry::event("unit_selected", &selection.selected_units);
-            telemetry::event("unit_deferred", &selection.deferred());
-            telemetry::event(
-                "unit_charge_rows_bytes_pages",
-                &selection.diagnostic_charge(),
-            );
-            if selection.held != 0 {
-                telemetry::event("unit_oversize_alarm", &selection.held);
-            }
-            if selection.windows_alarm != 0 {
-                telemetry::event("account_windows_alarm", &selection.windows_alarm);
-            }
+    pub(super) fn save_over_target(&self) -> bool {
+        self.stats.dirty_rows_per_save > 5_000
+            || self.stats.encoded_bytes_per_save > SAVE_TARGET_BYTES
+    }
+    fn record_save_error(&mut self, error: &anyhow::Error) {
+        if self.save_failure.is_some() {
+            return;
         }
-        tx.admission = Some(selection.admission());
-        Ok(tx)
+        if disk_full(error) {
+            self.save_failure = Some(Hold::SaveFull);
+            telemetry::event("sqlite_full", &1);
+        } else if error.chain().any(|e| {
+            matches!(
+                e.to_string().as_str(),
+                "state_v2_save_ceiling" | "state_v2_path_diff_admission"
+            )
+        }) {
+            self.save_failure = Some(Hold::SaveCeiling);
+        }
     }
 }
-impl Txn<'_> {
-    fn admit_selected(
-        &mut self,
-        before: Option<&Header>,
-        after: Option<&Header>,
-        refs_only: bool,
-    ) -> Result<()> {
-        if let Some(admission) = &mut self.admission {
-            admission.record(before, after, refs_only)?;
+/// Values stream through std::io::Write. Keep native classification when a
+/// chunk INSERT's SQLite error is nested in an I/O wrapper by the encoder.
+pub(super) fn disk_full(error: &anyhow::Error) -> bool {
+    error.chain().any(|mut cause| loop {
+        if cause
+            .downcast_ref::<rusqlite::ffi::Error>()
+            .is_some_and(|e| e.code == rusqlite::ErrorCode::DiskFull)
+        {
+            return true;
         }
-        Ok(())
+        if cause
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(|e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull))
+        {
+            return true;
+        }
+        let Some(inner) = cause
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::get_ref)
+        else {
+            return false;
+        };
+        cause = inner;
+    })
+}
+const SAVE_TARGET_BYTES: u64 = 32 * 1024 * 1024;
+const SAVE_CEILING_BYTES: u64 = 256 * 1024 * 1024;
+impl Txn<'_> {
+    /// R1 files are staged before BEGIN; their bytes still belong to this save.
+    pub(super) fn charge_staging(&mut self, bytes: u64) -> Result<()> {
+        ensure!(self.write && !self.failed, "state_v2_transaction_refused");
+        let result = self.charge(bytes, 0, 0);
+        self.failed |= result.is_err();
+        result
     }
-    fn admit_change(&mut self, key: &RowKey, bytes: u64) -> Result<()> {
+    fn charge(&mut self, bytes: u64, rows: u64, pages: u64) -> Result<()> {
         if self.store.import {
             return Ok(());
         }
-        if self.admission.is_some() {
-            self.dirty_bytes = self
-                .dirty_bytes
-                .checked_add(bytes)
-                .context("state_v2_save_admission")?;
+        let previous_bytes = self.dirty_bytes;
+        self.dirty_rows = self.dirty_rows.saturating_add(rows);
+        self.dirty_bytes = self.dirty_bytes.saturating_add(bytes);
+        self.estimated_pages = self.estimated_pages.saturating_add(pages);
+        if previous_bytes <= SAVE_TARGET_BYTES && self.dirty_bytes > SAVE_TARGET_BYTES {
+            telemetry::event("save_payload_alarm", &self.dirty_bytes);
+        }
+        // Targets size the NEXT collection page; the complete dirty delta may
+        // exceed them. Only the hard charged-work ceiling refuses publication.
+        if self.dirty_bytes > SAVE_CEILING_BYTES {
+            self.store.save_failure = Some(Hold::SaveCeiling);
+            telemetry::event("save_ceiling_alarm", &self.dirty_bytes);
+            anyhow::bail!(Hold::SaveCeiling);
+        }
+        Ok(())
+    }
+    fn admit_change(
+        &mut self,
+        key: &RowKey,
+        bytes: u64,
+        parts: u16,
+        refs_only: bool,
+    ) -> Result<()> {
+        if self.store.import {
             return Ok(());
         }
-        let rows = self.changed.len() + usize::from(!self.changed.contains_key(key));
-        // Reserve admission for generation/capability and two erasure markers.
-        // Refuse data in delta, where the next collection page can shrink.
-        let commit_control = matches!(key, RowKey::Meta(name) if matches!(name.as_str(),
-            "generation" | "minimum_writer_capability" | "erasure_pending" | "erasure_since"));
-        let (row_limit, byte_limit, page_limit) = if commit_control {
-            (5_000, 32 * 1024 * 1024, 32 * 1024)
+        let old = self.get(key)?;
+        let old_bytes = if refs_only {
+            0
         } else {
-            // Each old control is <=16KiB; with replacement/key overhead its
-            // estimate is <=26 pages. Four markers fit within 128 pages.
-            (4_996, 32 * 1024 * 1024 - 4096, 32 * 1024 - 128)
+            old.as_ref().map_or(0, |h| h.len)
         };
-        self.dirty_bytes = self
-            .dirty_bytes
-            .checked_add(bytes)
-            .and_then(|n| n.checked_add(owner_key_bytes(key).ok()?.len() as u64 + 512))
-            .context("state_v2_save_admission")?;
-        ensure!(
-            rows <= row_limit && self.dirty_bytes <= byte_limit,
-            "state_v2_save_admission"
-        );
-        // Bound estimated pages as well as payload. Include old chunks,
-        // secure-delete, B-tree/index paths and replacement pages. Neither
-        // journal_size_limit nor the 64 MiB alarm is a live WAL cap.
-        let old_bytes = self.get(key)?.map_or(0, |h| h.len);
+        let old_parts = if refs_only {
+            0
+        } else {
+            old.as_ref().map_or(0, |h| u64::from(h.parts))
+        };
+        let rows = 1 + old_parts + u64::from(parts);
         let key_bytes = owner_key_bytes(key)?.len() as u64;
-        let pages = bytes
+        // Old/new values, chunk insertions/deletions, parent metadata,
+        // tombstones and reference updates are all charged, including rewrites
+        // of a key already touched in this transaction.
+        let charged = bytes
             .saturating_add(old_bytes)
-            .saturating_add(key_bytes * 2)
-            .div_ceil(4096)
-            .saturating_mul(2)
-            .saturating_add(16);
-        self.estimated_pages = self.estimated_pages.saturating_add(pages);
-        ensure!(
-            self.estimated_pages <= page_limit,
-            "state_v2_save_admission"
-        );
-        Ok(())
+            .saturating_add(key_bytes.saturating_mul(2))
+            .saturating_add(rows.saturating_mul(key_bytes + 512));
+        let pages = charged.div_ceil(4096).saturating_mul(2).saturating_add(16);
+        self.charge(charged, rows, pages)
     }
     fn remember_paths(&mut self, old: &Header) -> Result<()> {
         if matches!(old.key, RowKey::RequestSet(_)) {
@@ -1319,12 +1317,19 @@ impl PartWriter<'_> {
         if self.bytes.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        if fixtures::part_full() {
+            return Err(io::Error::other(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+                None,
+            )));
+        }
         self.conn
             .execute(
                 "INSERT INTO value_chunks(owner_table,owner_kind,owner_key,position,chunk_no,chunk) VALUES(?1,?2,?3,?4,?5,?6)",
                 params![self.owner.table,self.owner.kind,self.owner.key,self.owner.position,self.part,self.bytes],
             )
-            .map_err(|_| io::Error::other("state_v2_part_write"))?;
+            .map_err(io::Error::other)?;
         self.part += 1;
         self.bytes.clear();
         Ok(())
@@ -1405,8 +1410,12 @@ impl Transaction for Txn<'_> {
                 read_value(self.store.conn()?, old, &mut io::sink())?;
                 self.remember_paths(old)?;
             }
-            self.admit_selected(previous.as_ref(), Some(&h), false)?;
-            self.admit_change(row.key, h.len)?;
+            self.admit_change(
+                row.key,
+                h.len,
+                h.parts,
+                false,
+            )?;
             delete_chunks(self.store.conn()?, row.key)?;
             self.removed_keys.remove(row.key);
             let conn = self.store.conn()?;
@@ -1502,6 +1511,9 @@ impl Transaction for Txn<'_> {
             self.store.stats.value_size_alarm |= h.len > 4 * 1024 * 1024;
             Ok(h)
         })();
+        if let Err(error) = &result {
+            self.store.record_save_error(error);
+        }
         self.failed |= result.is_err();
         result
     }
@@ -1515,8 +1527,7 @@ impl Transaction for Txn<'_> {
                 "state_v2_identity_immutable"
             );
             if let Some(old) = self.get(key)? {
-                self.admit_selected(Some(&old), None, false)?;
-                self.admit_change(key, 0)?;
+                self.admit_change(key, 0, 0, false)?;
                 self.remember_paths(&old)?;
             }
             let conn = self.store.conn()?;
@@ -1534,6 +1545,9 @@ impl Transaction for Txn<'_> {
             }
             Ok(count != 0)
         })();
+        if let Err(error) = &result {
+            self.store.record_save_error(error);
+        }
         self.failed |= result.is_err();
         result
     }
@@ -1612,51 +1626,22 @@ impl Transaction for Txn<'_> {
         )
     }
     fn commit(self, expected: u64, next: u64) -> DurableCommitOutcome {
-        self.commit_inner(expected, next, false)
+        self.commit_inner(expected, next)
     }
 }
 
 impl Txn<'_> {
-    fn commit_inner(mut self, expected: u64, next: u64, inert: bool) -> DurableCommitOutcome {
+    fn commit_inner(mut self, expected: u64, next: u64) -> DurableCommitOutcome {
         let result = (|| -> Result<()> {
             ensure!(
                 self.write
                     && !self.failed
-                    && (inert && next == expected
-                        || next
-                            == expected
-                                .checked_add(1)
-                                .ok_or_else(|| anyhow::anyhow!("state_v2_generation_overflow"))?),
+                    && next
+                        == expected
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("state_v2_generation_overflow"))?,
                 "state_v2_generation_order"
             );
-            if inert {
-                ensure!(
-                    !self.changed.is_empty()
-                        && self
-                            .changed
-                            .iter()
-                            .all(|(key, after)| super::units_graph::is_payload(key)
-                                && after.is_some()),
-                    "state_v2_inert_custody_only"
-                );
-            }
-            if let Some(admission) = self.admission.take() {
-                ensure!(
-                    expected == admission.generation(),
-                    "state_v2_unit_stale_plan"
-                );
-                admission.complete(&mut self)?;
-                let schedule = admission.schedule().clone();
-                self.admission = Some(admission);
-                if !inert {
-                    self.put(RowInput {
-                        value_version: 1,
-                        key: &RowKey::Meta("unit_schedule".into()),
-                        fixed: &Fixed::None,
-                        value: &ControlJson(&schedule),
-                    })?;
-                }
-            }
             let actual = self.store.read_control::<u64>("generation")?.unwrap_or(0);
             ensure!(actual == expected, "state_v2_concurrent_change");
             let purge = self.paths_removed()?;
@@ -1689,41 +1674,56 @@ impl Txn<'_> {
                     value: &ControlJson(&next),
                 })?;
             }
-            if !inert {
-                self.put(RowInput {
-                    value_version: 1,
-                    key: &RowKey::Meta("minimum_writer_capability".into()),
-                    fixed: &Fixed::None,
-                    value: &ControlJson(&migrations::WRITER_CAPABILITY),
-                })?;
-                self.put(RowInput {
-                    value_version: 1,
-                    key: &RowKey::Meta("generation".into()),
-                    fixed: &Fixed::None,
-                    value: &ControlJson(&next),
-                })?;
-            }
+            self.put(RowInput {
+                value_version: 1,
+                key: &RowKey::Meta("minimum_writer_capability".into()),
+                fixed: &Fixed::None,
+                value: &ControlJson(&migrations::WRITER_CAPABILITY),
+            })?;
+            self.put(RowInput {
+                value_version: 1,
+                key: &RowKey::Meta("generation".into()),
+                fixed: &Fixed::None,
+                value: &ControlJson(&next),
+            })?;
             Ok(())
         })();
-        if result.is_err() {
+        if let Err(error) = &result {
+            self.store.record_save_error(error);
             self.store
                 .stats
                 .commit(&DurableCommitOutcome::NotPublished, None);
             return DurableCommitOutcome::NotPublished;
         }
+        if !self.store.import {
+            let bytes = self.store.wal_bytes();
+            self.store.stats.observe_wal(bytes);
+        }
         let started = Instant::now();
-        let result = self
-            .store
-            .conn()
-            .and_then(|c| Ok(c.execute_batch("COMMIT")?));
+        let result = (|| -> Result<()> {
+            #[cfg(test)]
+            if fixtures::commit_full() {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+                    None,
+                )
+                .into());
+            }
+            self.store.conn()?.execute_batch("COMMIT")?;
+            Ok(())
+        })();
         let latency = started.elapsed();
         if result.is_ok() {
             self.store
                 .stats
                 .commit(&DurableCommitOutcome::Committed(next), Some(latency));
             self.finished = true;
-            self.store.stats.dirty_rows_per_save = self.changed.len() as u64;
+            self.store.stats.dirty_rows_per_save = self.dirty_rows;
             self.store.stats.encoded_bytes_per_save = self.dirty_bytes;
+            if !self.store.import {
+                telemetry::save_work(self.dirty_rows, self.dirty_bytes);
+                telemetry::event("save_estimated_pages", &self.estimated_pages);
+            }
             if let Some(headers) = &mut self.store.headers {
                 for (key, header) in std::mem::take(&mut self.changed) {
                     let delta = i64::from(header.is_some()) - i64::from(headers.contains_key(&key));
@@ -1749,6 +1749,20 @@ impl Txn<'_> {
             let _ = self.store.maintenance(false);
             return DurableCommitOutcome::Committed(next);
         }
+        if let Err(error) = &result {
+            self.store.record_save_error(error);
+            if self.store.save_failure == Some(Hold::SaveFull) {
+                // FULL is retryable only after abandoning the complete save.
+                // SQLite may already have auto-rolled back the transaction.
+                let _ = self
+                    .store
+                    .conn()
+                    .and_then(|c| Ok(c.execute_batch("ROLLBACK")?));
+            }
+        }
+        if !self.store.import {
+            telemetry::save_work(self.dirty_rows, self.dirty_bytes);
+        }
         self.finished = true;
         // COMMIT errors may have published. Close and reopen before inspecting
         // the durable generation, still under the caller's checkpoint lock.
@@ -1768,10 +1782,6 @@ impl Txn<'_> {
             Ok(generation)
         })();
         let outcome = match generation {
-            _ if inert => {
-                store.reload = true;
-                DurableCommitOutcome::Ambiguous
-            }
             Ok(g) if g == expected => DurableCommitOutcome::NotPublished,
             Ok(g) if g == next => {
                 store.reload = true;

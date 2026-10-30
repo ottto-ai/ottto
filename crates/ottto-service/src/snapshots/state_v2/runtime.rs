@@ -20,7 +20,9 @@ pub(in super::super) enum Hold {
     MigrationFailed,
     ReloadRequired,
     IntegrityRetry,
-    SaveAdmission,
+    SaveCeiling,
+    SaveOversize,
+    SaveFull,
     ReferenceDrift,
 }
 impl std::fmt::Display for Hold {
@@ -31,7 +33,9 @@ impl std::fmt::Display for Hold {
             Self::ForeignBinding => "state_v2_foreign_binding",
             Self::NewerSchema => "state_v2_newer_schema_refused",
             Self::MigrationFailed => "state_v2_migration_failed",
-            Self::SaveAdmission => "state_v2_save_admission",
+            Self::SaveCeiling => "state_v2_save_ceiling",
+            Self::SaveOversize => "state_v2_save_oversize",
+            Self::SaveFull => "state_v2_sqlite_full",
             Self::IntegrityRetry => "state_v2_integrity_retry",
             Self::ReferenceDrift => "state_v2_reference_drift",
             Self::ReloadRequired => "current_index_requires_reload",
@@ -54,13 +58,16 @@ impl Hold {
             })
             .unwrap_or("integrity_or_io");
         telemetry::event("db_unavailable", &reason);
-        let hold = if error.chain().any(|e| {
+        let hold = if sqlite::disk_full(&error) {
+            telemetry::event("sqlite_full", &1);
+            Self::SaveFull
+        } else if error.chain().any(|e| {
             matches!(
                 e.to_string().as_str(),
-                "state_v2_save_admission" | "state_v2_path_diff_admission"
+                "state_v2_save_ceiling" | "state_v2_path_diff_admission"
             )
         }) {
-            Self::SaveAdmission
+            Self::SaveCeiling
         } else if error
             .chain()
             .any(|e| e.to_string() == "state_v2_foreign_binding")
@@ -93,7 +100,30 @@ struct RouteState {
     current: Option<Arc<Runtime>>,
     cached: Option<ScanIndex>,
     page_limit: usize,
+    requested_page: usize,
+    save_hold: Option<Hold>,
     pass_written_start: Option<u64>,
+}
+impl RouteState {
+    fn reduce_page(&mut self) {
+        let previous = self.page_limit;
+        self.page_limit = (self.page_limit / 2).max(1);
+        if self.page_limit < previous {
+            telemetry::event("save_page_reduced", &self.page_limit);
+        }
+    }
+    fn saved_page(&mut self, over_target: bool, claim_only: bool) {
+        // A small claim/CAS-only write cannot resolve an oversized collection
+        // delta. Only a normal or local recovery save may lift its fence.
+        if !claim_only {
+            self.save_hold = None;
+        }
+        if over_target {
+            self.reduce_page();
+        } else {
+            self.page_limit = self.page_limit.saturating_add(25).min(self.requested_page);
+        }
+    }
 }
 type RouteHandle = Arc<Mutex<RouteState>>;
 fn states() -> &'static Mutex<BTreeMap<PathBuf, RouteHandle>> {
@@ -121,6 +151,8 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     current: None,
                     cached: None,
                     page_limit: 250,
+                    requested_page: 250,
+                    save_hold: None,
                     pass_written_start: None,
                 }))
             })
@@ -226,18 +258,9 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
                         // on the same connection; never acquire another owner.
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
                         telemetry::event("hydrate_count", &1);
-                        let (mut index, mut cx) = mapper.hydrate_context(&mut session.db)?;
+                        let (mut index, cx) = mapper.hydrate_context(&mut session.db)?;
                         ensure!(index.generation == stamp.0, Hold::DbUnavailable);
                         normalize_hydrated(&mut index)?;
-                        if session
-                            .db
-                            .begin(TxnMode::Read)?
-                            .get(&RowKey::record("unit.deferred", Vec::new(), 0)?)?
-                            .is_some()
-                        {
-                            super::recovery_backup::roll(path, &mut session.db, &identity)?;
-                        }
-                        mapper.restore_selected(&mut session.db, &mut index, &mut cx)?;
                         super::recovery_backup::roll(path, &mut session.db, &identity)?;
                         session.stamp = session.db.stamp()?;
                         ensure!(index.generation == session.stamp.0, Hold::DbUnavailable);
@@ -262,16 +285,8 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
             db.reference_extractor(M::references);
             let stamp = db.stamp()?;
             super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
-            let (mut index, mut cx) = mapper.hydrate_context(&mut db)?;
+            let (mut index, cx) = mapper.hydrate_context(&mut db)?;
             normalize_hydrated(&mut index)?;
-            if db
-                .begin(TxnMode::Read)?
-                .get(&RowKey::record("unit.deferred", Vec::new(), 0)?)?
-                .is_some()
-            {
-                super::recovery_backup::roll(path, &mut db, &identity)?;
-            }
-            mapper.restore_selected(&mut db, &mut index, &mut cx)?;
             super::recovery_backup::roll(path, &mut db, &identity)?;
             let stamp = db.stamp()?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
@@ -549,7 +564,7 @@ fn save_with_mode<M: Mapper>(
     }
     // This accessor authenticates the owner/session; call before route/session locks.
     let claim_generation = super::super::sampled_audit::own_growth_claim_generation(index, path);
-    let result = held(with_state(path, |state| {
+    let mut result = held(with_state(path, |state| {
         let pair = fence::reconcile(path, &binding, state.latched)?;
         let Some(runtime) = index.persistence_v2.clone() else {
             ensure!(pair.is_none(), Hold::DbUnavailable);
@@ -574,71 +589,79 @@ fn save_with_mode<M: Mapper>(
         if claim_generation.is_some() {
             index.generation = previous.generation;
         }
-        crate::snapshot_sync::with_state_v2_progress_owner(path, progress_owner, |owner, _| {
-            super::ack::ProgressRecovery::recover_route_locked(
-                &identity,
-                session.stamp.0,
-                path,
-                owner,
-            )?;
-            super::recovery_backup::roll_locked(path, &mut session.db, &identity, owner)?;
-            let selected = if claim_only {
-                M::selected_claim_save
-            } else {
-                M::selected_save
-            };
-            let save_result = selected(
-                mapper,
-                &mut session.db,
-                &identity,
-                &previous,
-                index,
-                &mut session.cx,
-            );
-            // A subset save can commit and then return SaveAdmission. Protect that
-            // exact generation before propagating its collection hold.
-            if session.db.stamp()?.0 != previous.generation {
+        let save_result =
+            crate::snapshot_sync::with_state_v2_progress_owner(path, progress_owner, |owner, _| {
+                super::ack::ProgressRecovery::recover_route_locked(
+                    &identity,
+                    session.stamp.0,
+                    path,
+                    owner,
+                )?;
                 super::recovery_backup::roll_locked(path, &mut session.db, &identity, owner)?;
-            }
-            if save_result? {
+                let save = if claim_only {
+                    M::save_claim_delta
+                } else {
+                    M::save_delta
+                };
+                let save_result = save(
+                    mapper,
+                    &mut session.db,
+                    &identity,
+                    &previous,
+                    index,
+                    &mut session.cx,
+                );
+                // Protect the exact committed generation before releasing ACK custody.
+                // A save never publishes a subset of its dirty delta.
+                if session.db.stamp()?.0 != previous.generation {
+                    super::recovery_backup::roll_locked(path, &mut session.db, &identity, owner)?;
+                }
+                if save_result? {
+                    session.stamp = session.db.stamp()?;
+                    state.cached = Some(index.clone());
+                    state.saved_page(session.db.save_over_target(), claim_only);
+                    return Ok(true);
+                }
+                mapper.preflight(index).map_err(|_| Hold::DbUnavailable)?;
+                state.cached = None;
+                let mut tx = session.db.begin(TxnMode::Write)?;
+                // Identity is independently authenticated; generation is atomically
+                // compared again by commit. Hold comparisons remain mapper-owned.
+                mapper.merge_cas(&mut tx, index)?;
+                if !claim_only {
+                    index.retire_committed_claude_account_pending_windows();
+                }
+                lenient_check(index)?;
+                let previous = index.generation;
+                let next = previous.checked_add(1).ok_or(Hold::DbUnavailable)?;
+                mapper.delta(&mut tx, index)?;
+                apply_outcome(index, &mut session.reload, tx.commit(previous, next))?;
                 session.stamp = session.db.stamp()?;
+                // Publish only the complete, unambiguously committed graph.
                 state.cached = Some(index.clone());
-                return Ok(true);
+                state.saved_page(session.db.save_over_target(), claim_only);
+                Ok(true)
+            });
+        if save_result.is_err() {
+            if let Some(hold) = session.db.save_failure() {
+                return Err(hold.into());
             }
-            mapper.preflight(index).map_err(|_| Hold::DbUnavailable)?;
-            state.cached = None;
-            let mut tx = session.db.begin(TxnMode::Write)?;
-            // Identity is independently authenticated; generation is atomically
-            // compared again by commit. Hold comparisons remain mapper-owned.
-            mapper.merge_cas(&mut tx, index)?;
-            if !claim_only {
-                index.retire_committed_claude_account_pending_windows();
-            }
-            lenient_check(index)?;
-            let previous = index.generation;
-            let next = previous.checked_add(1).ok_or(Hold::DbUnavailable)?;
-            mapper.delta(&mut tx, index, None)?;
-            apply_outcome(index, &mut session.reload, tx.commit(previous, next))?;
-            session.stamp = session.db.stamp()?;
-            // Cache exactly the committed graph, including subset-save outcomes;
-            // never retain an end-of-cycle graph with unsaved semantic mutations.
-            state.cached = Some(index.clone());
-            Ok(true)
-        })
+        }
+        save_result
     }));
     if let Err(error) = &result {
         with_state(path, |state| {
             state.cached = None;
-            // A smaller next collection page retries one atomic save, never
-            // fragments a graph transaction or drops its custody rows.
-            if error.chain().any(|e| {
-                matches!(
-                    e.to_string().as_str(),
-                    "state_v2_save_admission" | "state_v2_path_diff_admission"
-                )
-            }) {
-                state.page_limit = (state.page_limit / 2).max(1);
-                telemetry::event("save_page_reduced", &state.page_limit);
+            if matches!(error.downcast_ref::<Hold>(), Some(Hold::SaveCeiling)) {
+                state.save_hold = Some(if state.page_limit == 1 {
+                    telemetry::event("save_oversize_alarm", &1);
+                    Hold::SaveOversize
+                } else {
+                    state.reduce_page();
+                    Hold::SaveCeiling
+                });
+            } else if matches!(error.downcast_ref::<Hold>(), Some(Hold::SaveFull)) {
+                state.save_hold = Some(Hold::SaveFull);
             }
             if let Some(runtime) = &state.current {
                 if let Some(session) = runtime
@@ -652,6 +675,12 @@ fn save_with_mode<M: Mapper>(
             }
             Ok(())
         })?;
+    }
+    if result.is_err() {
+        if let Some(hold) = with_state(path, |state| Ok(state.save_hold))? {
+            telemetry::event("hold", &hold);
+            result = Err(hold.into());
+        }
     }
     if result.as_ref().is_ok_and(|saved| *saved) && !claim_only {
         super::super::sampled_audit::renew_growth_claims(index, path);
@@ -710,11 +739,45 @@ pub(in super::super) fn guard_external(
     runtime: Option<&Arc<Runtime>>,
     graph_generation: u64,
 ) -> Result<()> {
+    guard_current(path, runtime, graph_generation, true)
+}
+
+/// Only the local checkpoint-retry path may ignore a save-pressure hold.
+/// Generation, owner, reload and capability fencing still apply.
+pub(in super::super) fn recovery_save_guard(
+    path: &Path,
+    index: &ScanIndex,
+) -> Result<Option<impl Fn() -> Result<()>>> {
+    let Some(runtime) = &index.persistence_v2 else {
+        return Ok(None);
+    };
+    if !with_state(path, |state| Ok(state.save_hold.is_some()))? {
+        return Ok(None);
+    }
+    let path = path.to_owned();
+    let runtime = runtime.clone();
+    let generation = index.generation;
+    Ok(Some(move || {
+        guard_current(&path, Some(&runtime), generation, false)
+    }))
+}
+
+fn guard_current(
+    path: &Path,
+    runtime: Option<&Arc<Runtime>>,
+    graph_generation: u64,
+    external: bool,
+) -> Result<()> {
     let Some(runtime) = runtime else {
         return Ok(());
     };
     let _lock = super::super::CheckpointLock::acquire(path)?;
     held(with_state(path, |state| {
+        if external {
+            if let Some(hold) = state.save_hold {
+                return Err(hold.into());
+            }
+        }
         let mut guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
         let session = guard.as_mut().ok_or(Hold::ReloadRequired)?;
         ensure!(
@@ -744,8 +807,15 @@ pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usiz
         .lock()
         .ok()
         .and_then(|g| g.as_ref().map(|s| s.path.clone()));
-    path.and_then(|p| with_state(&p, |s| Ok(s.page_limit.min(requested))).ok())
-        .unwrap_or(requested.min(250))
+    path.and_then(|p| {
+        with_state(&p, |s| {
+            s.requested_page = requested.max(1);
+            s.page_limit = s.page_limit.min(s.requested_page);
+            Ok(s.page_limit.min(requested))
+        })
+        .ok()
+    })
+    .unwrap_or(requested.min(250))
 }
 
 pub(super) fn purge_policy() -> (Duration, Duration) {

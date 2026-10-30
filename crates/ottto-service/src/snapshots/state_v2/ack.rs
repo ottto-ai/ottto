@@ -655,11 +655,9 @@ impl RecoverySet {
                     && <[u8; 32]>::from(Sha256::digest(&reference.encoded)) == reference.digest,
                 "backup_resume",
             )?;
-            let mut decoded = units_spool::Builder::new(MUTABLE_VALUE_BYTES)?;
+            let mut decoded = CheckpointBytes(Vec::new());
             codec::unpack(reference.encoded.as_slice(), &mut decoded)?;
-            let decoded = decoded.finish()?;
-            let checkpoint: kinds_files::ResumeCheckpoint =
-                serde_json::from_reader(decoded.reader())?;
+            let checkpoint: kinds_files::ResumeCheckpoint = serde_json::from_slice(&decoded.0)?;
             require(
                 checkpoint.binding == self.scope.identity.binding,
                 "backup_resume",
@@ -788,5 +786,20 @@ impl ProgressRecovery {
         };
         recovery.adopt(progress)?;
         Ok(recovery)
+    }
+}
+
+/// Decoded checkpoints are mutable values, capped before extending the buffer.
+struct CheckpointBytes(Vec<u8>);
+impl std::io::Write for CheckpointBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.0.len().saturating_add(bytes.len()) > MUTABLE_VALUE_BYTES as usize {
+            return Err(std::io::Error::other("state_v2_backup_resume_admission"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }

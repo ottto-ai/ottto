@@ -93474,3 +93474,12 @@ pub(crate) use state_v2::money_test_support::roundtrip as state_v2_money_roundtr
 
 #[cfg(test)]
 pub(crate) use state_v2::money_test_support::publish as publish_state_v2_for_test;
+
+/// Local-only recovery bypasses a save-pressure hold, never custody fencing.
+/// OFF returns before allocating a guard or consulting any route state.
+pub(crate) fn state_v2_recovery_save_guard(
+    path: &Path,
+    index: &ScanIndex,
+) -> Result<Option<impl Fn() -> Result<()>>> {
+    state_v2::recovery_save_guard(path, index)
+}

@@ -3,7 +3,7 @@
 //! Runtime publication stays gated until raw inventory, CAS and R1 are composed.
 #![allow(dead_code)] // Publication integration is a separate, fail-closed step.
 use super::*;
-use anyhow::{bail, ensure, Context};
+use anyhow::{bail, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
@@ -18,57 +18,6 @@ pub(super) struct KindCx {
     pub(super) presence: BTreeMap<String, bool>,
     pub(super) dirty_fields: Option<BTreeSet<String>>,
     valid: bool,
-}
-
-/// Copy only dirty encoder metadata, never the history-wide account/header map.
-/// The original remains the committed context until the selected transaction wins.
-pub(super) fn planning_context(
-    _prev: &ScanIndex,
-    _next: &ScanIndex,
-    committed: &KindCx,
-    dirty: &BTreeSet<String>,
-) -> Result<KindCx> {
-    ensure!(
-        committed.valid && !committed.ambiguous,
-        "state_v2_context_invalid"
-    );
-    let mut cx = KindCx {
-        binding: committed.binding.clone(),
-        committed: committed.committed.clone(),
-        presence: committed.presence.clone(),
-        require_preflight: committed.require_preflight,
-        valid: true,
-        ..Default::default()
-    };
-    let mut kinds: BTreeSet<_> = dirty
-        .iter()
-        .filter_map(|f| kinds_misc::field_kind(f))
-        .collect();
-    if dirty.contains("decode_holds") {
-        kinds.insert("v1_field.repair_provenance");
-        kinds.extend(
-            kinds_misc::KINDS
-                .iter()
-                .copied()
-                .filter(|k| k.starts_with("raw_hold.")),
-        );
-    }
-    let mut bytes = 0_usize;
-    for (key, row) in &committed.misc_rows {
-        let needed = match key {
-            RowKey::Meta(_) => true,
-            RowKey::Record { kind, .. } => kinds.contains(kind.name()),
-            _ => false,
-        };
-        if needed {
-            bytes = bytes
-                .checked_add(units_graph::metadata_cost(key))
-                .context("state_v2_save_admission")?;
-            ensure!(bytes <= 8 * 1024 * 1024, "state_v2_save_admission");
-            cx.misc_rows.insert(key.clone(), row.clone());
-        }
-    }
-    Ok(cx)
 }
 
 pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
@@ -139,10 +88,7 @@ pub(super) fn hydrate_txn_with_hooks(
             let RowKey::Record { kind, .. } = &header.key else {
                 bail!("state_v2_record_kind");
             };
-            ensure!(
-                units_graph::owns_header(header)? || owns_kind(kind.name()),
-                "state_v2_unmapped_kind"
-            );
+            ensure!(owns_kind(kind.name()), "state_v2_unmapped_kind");
         }
         after = page.last().map(|h| h.key.clone());
     }
@@ -173,8 +119,7 @@ fn owns_kind(kind: &str) -> bool {
         == 1
 }
 
-/// The owner supplies the complete MISC dirty-field plan for the selected
-/// logical unit. No history-wide encoding is used to guess that plan.
+/// The owner supplies the complete MISC dirty-field plan for the save. No history-wide encoding is used to guess that plan.
 pub(super) fn delta(
     prev: &ScanIndex,
     next: &ScanIndex,
@@ -195,111 +140,60 @@ pub(super) fn delta(
     result
 }
 
-/// Backend adversarial fixture seam; production uses the exact row-plan executor.
-#[cfg(test)]
-/// Execute one owner-selected graph under the caller's source/checkpoint lock.
-/// Selection must already include the exact planned resume rows. The backend
-/// rejects missing, stale, extra or undercharged mutations atomically. R1's real
-/// admission/staging/GC implementation belongs to the owner of ResumeHooks.
-pub(super) fn save_selected_graph(
+/// Execute the complete dirty delta under the source/checkpoint owner lock.
+/// The caller has already merged CAS state and applied any retirement decisions.
+/// R1 planning, preflight and durable staging all precede BEGIN IMMEDIATE.
+pub(super) fn save_graph(
     store: &mut sqlite::Sqlite,
+    identity: &Identity,
     prev: &ScanIndex,
     next: &mut ScanIndex,
     committed: &mut KindCx,
-    selection: units::Selection,
     hooks: &mut dyn kinds_files::ResumeHooks,
 ) -> Result<()> {
-    ensure!(committed.valid, "state_v2_context_invalid");
-    // Move, never clone, resident metadata. No pending header map can masquerade
-    // as committed state after rollback or an ambiguous external/COMMIT error.
-    let mut pending = std::mem::take(committed);
-    let mut publication_possible = false;
-    let result = (|| {
-        store.validate_selection(&selection)?;
-        {
-            let mut tx = store.begin(TxnMode::Read)?;
-            kinds_misc::merge_cas_at(&mut tx, next, prev.generation)?;
-            kinds_files::merge_growth_cas(&mut tx, next)?;
-        }
-        super::super::lenient_decode::check_held_output(next)?;
-        pending.preflight_selected(prev, next, &selection, hooks)?;
-        pending.retain_excluded(prev, next)?;
-        let dirty = kinds_misc::dirty_fields(prev, next)?;
-        let mut tx = store.begin_selected(selection)?;
-        delta(prev, next, &mut tx, &mut pending, dirty)?;
-        let outcome = tx.commit(prev.generation, next.generation);
-        publication_possible = !matches!(outcome, DurableCommitOutcome::NotPublished);
-        if let DurableCommitOutcome::Committed(generation) = outcome {
-            // COMMIT updates this control outside the semantic encoder. Keep
-            // the resident header aligned before installing the new context.
-            let key = RowKey::Meta("generation".into());
-            let header = preflight(&RowInput {
-                key: &key,
-                fixed: &Fixed::None,
-                value_version: 1,
-                value: &ControlJson(&generation),
-            })?;
-            pending.misc_rows.insert(key, (header, true));
-            pending.post_commit(&outcome, hooks)?;
-            Ok(())
-        } else {
-            // Published/Ambiguous suppress GC and require an exact-ref reopen.
-            // A definite rollback also discards speculative context metadata.
-            pending.post_commit(&outcome, hooks)?;
-            bail!("state_v2_selected_save_requires_reload")
-        }
-    })();
-    if result.is_ok() {
-        *committed = pending;
-    } else {
-        // Preserve the graph generation on published ambiguity; every error
-        // invalidates the context, so callers cannot ACK or retry it as current.
-        committed.ambiguous = true;
-        if !publication_possible {
-            next.generation = prev.generation;
-        }
-    }
-    result
-}
-
-/// Production selected-row executor. The graph projection and context were
-/// decoded from the same exact-ref plan; neither becomes current before COMMIT
-/// and the owner callback. Deferred custody is admitted in this transaction too.
-pub(super) fn save_selected(
-    store: &mut sqlite::Sqlite,
-    prev: &ScanIndex,
-    next: &mut ScanIndex,
-    committed: &mut KindCx,
-    plan: units_graph::Planned,
-    hooks: &mut dyn kinds_files::ResumeHooks,
-    mapper: &impl import::Mapper,
-) -> Result<()> {
-    let units_graph::Planned {
-        selection,
-        rows,
-        mut graph,
-        mut context,
-        deferred,
-    } = plan;
-    ensure!(committed.valid, "state_v2_context_invalid");
+    ensure!(
+        committed.valid && !committed.ambiguous,
+        "state_v2_context_invalid"
+    );
     let mut pending = std::mem::take(committed);
     let mut published = false;
     let result = (|| {
-        store.validate_selection(&selection)?;
-        pending.preflight_selected(prev, &graph, &selection, hooks)?;
-        pending.retain_excluded(prev, &mut graph)?;
-        pending.check_planned_checkpoints(Some(&context.committed))?;
-        let mut tx = store.begin_selected(selection)?;
-        mapper.delta(&mut tx, &graph, Some(&rows))?;
-        let outcome = tx.commit(prev.generation, graph.generation);
+        store.validate_save(identity, prev.generation)?;
+        ensure!(
+            pending.binding.as_ref() == Some(&identity.binding),
+            Hold::ForeignBinding
+        );
+        next.generation = prev.generation.checked_add(1).ok_or(Hold::DbUnavailable)?;
+        super::super::lenient_decode::check_held_output(next)?;
+        let reserved = pending.prepare_plan(prev, next, hooks)?;
+        ensure!(reserved <= 256 * 1024 * 1024, Hold::SaveCeiling);
+        let planned = pending.prepared_checkpoints().cloned();
+        pending.prepared = None;
+        let staging = hooks.preflight_selected(prev, next, &pending.committed)?;
+        ensure!(staging <= reserved, "state_v2_resume_staging_admission");
+        pending.preflight_reserved(prev, next, hooks, staging)?;
+        pending.check_planned_checkpoints(planned.as_ref())?;
+        pending.retain_excluded(prev, next)?;
+        let dirty = kinds_misc::dirty_fields(prev, next)?;
+        let mut tx = store.begin(TxnMode::Write)?;
+        tx.charge_staging(staging)?;
+        delta(prev, next, &mut tx, &mut pending, dirty)?;
+        let outcome = tx.commit(prev.generation, next.generation);
         published = !matches!(outcome, DurableCommitOutcome::NotPublished);
         match outcome {
-            DurableCommitOutcome::Committed(g) => {
-                next.generation = g;
-                pending.post_commit(&DurableCommitOutcome::Committed(g), hooks)?;
-                context.committed = pending.committed;
-                *committed = context;
-                units_graph::install(next, graph);
+            DurableCommitOutcome::Committed(generation) => {
+                next.generation = generation;
+                // The backend owns this control; retain its exact header in
+                // the context before publishing the next resident graph.
+                let key = RowKey::Meta("generation".into());
+                let header = preflight(&RowInput {
+                    key: &key,
+                    fixed: &Fixed::None,
+                    value_version: 1,
+                    value: &ControlJson(&generation),
+                })?;
+                pending.misc_rows.insert(key, (header, true));
+                pending.post_commit(&DurableCommitOutcome::Committed(generation), hooks)?;
                 let mut count = 0_u64;
                 let mut windows = 0_u64;
                 let mut max = 0_u64;
@@ -318,21 +212,23 @@ pub(super) fn save_selected(
                         "windows": windows, "max_per_family": max, "families_over_64": count
                     }),
                 );
-                if deferred {
-                    bail!(Hold::SaveAdmission);
-                }
                 Ok(())
             }
-            other => {
-                if let DurableCommitOutcome::Published(g) = &other {
-                    next.generation = *g;
-                }
-                pending.post_commit(&other, hooks)?;
-                bail!("current_index_requires_reload")
+            DurableCommitOutcome::Published(generation) => {
+                next.generation = generation;
+                bail!(Hold::ReloadRequired)
+            }
+            DurableCommitOutcome::Ambiguous => bail!(Hold::ReloadRequired),
+            DurableCommitOutcome::NotPublished => {
+                bail!(store.save_failure().unwrap_or(Hold::ReloadRequired))
             }
         }
     })();
-    if result.is_err() && !committed.valid {
+    if result.is_ok() {
+        *committed = pending;
+    } else {
+        // No callback or GC on definite rollback, Published or Ambiguous.
+        // No speculative encoder metadata survives any failed attempt.
         committed.ambiguous = true;
         if !published {
             next.generation = prev.generation;
@@ -353,9 +249,6 @@ pub(super) fn private_paths(
         }
         RowKey::RequestSet(_) => interning::private_paths(header, value, emit),
         RowKey::Record { kind, .. } => {
-            if kind.name() == "unit.deferred" {
-                return units_graph::private_paths(header, value, emit);
-            }
             let extract = if kinds_files::KINDS.contains(&kind.name()) {
                 kinds_files::private_paths
             } else if kinds_census::KINDS.contains(&kind.name()) {
@@ -383,10 +276,6 @@ pub(super) fn references(
         }
         RowKey::RequestSet(_) => Ok(()),
         RowKey::Record { kind, .. } => {
-            if kind.name() == "unit.deferred" {
-                // Deferred shared-value deltas are inert until restoration.
-                return Ok(());
-            }
             let extract = if kinds_files::KINDS.contains(&kind.name()) {
                 kinds_files::references
             } else if kinds_census::KINDS.contains(&kind.name()) {

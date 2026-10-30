@@ -87,9 +87,6 @@ pub(in super::super) fn future_writer_for_test(db: &mut Sqlite) {
     let checksum = control_checksum(name, 1, &bytes);
     db.conn().unwrap().execute("INSERT INTO control VALUES(?1,1,?2,?3) ON CONFLICT(name) DO UPDATE SET value=excluded.value,row_checksum=excluded.row_checksum",params![name,bytes,checksum.as_slice()]).unwrap();
 }
-pub(in super::super) fn seed_page_estimate_for_test(tx: &mut Txn<'_>, pages: u64) {
-    tx.estimated_pages = pages;
-}
 pub(in super::super) fn text_key_refused_for_test(db: &Sqlite) -> bool {
     db.conn().unwrap().execute("INSERT INTO records(kind,key_bytes,position,value_version,header,value_digest,row_checksum,value_bytes,chunk_count,inline_value) VALUES('file.entities','text',0,1,NULL,zeroblob(16),zeroblob(16),0,0,X'')",[]).is_err()
 }
@@ -106,4 +103,29 @@ pub(in super::super) fn add_extra_part_for_test(db: &Sqlite, key: &RowKey) {
 pub(in super::super) fn owner_for_test(key: &RowKey) -> (&'static str, String, Vec<u8>, u64) {
     let o = chunk_owner(key).unwrap();
     (o.table, o.kind, o.key, o.position)
+}
+
+thread_local! {
+    static NEXT_SAVE_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PART_FULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static COMMIT_FULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(in super::super) fn seed_next_save_bytes_for_test(bytes: u64) {
+    NEXT_SAVE_BYTES.with(|v| v.set(bytes));
+}
+pub(super) fn next_save_bytes() -> u64 {
+    NEXT_SAVE_BYTES.with(|v| v.replace(0))
+}
+pub(in super::super) fn fail_commit_full_for_test() {
+    COMMIT_FULL.with(|v| v.set(true));
+}
+pub(super) fn commit_full() -> bool {
+    COMMIT_FULL.with(|v| v.replace(false))
+}
+
+pub(in super::super) fn fail_part_full_for_test() {
+    PART_FULL.with(|v| v.set(true));
+}
+pub(super) fn part_full() -> bool {
+    PART_FULL.with(|v| v.replace(false))
 }
