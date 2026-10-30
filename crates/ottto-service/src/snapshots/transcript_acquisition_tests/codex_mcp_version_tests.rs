@@ -264,6 +264,7 @@ fn shared_role_gate_excludes_comparison_side_and_other_sources() {
 #[test]
 #[cfg(unix)]
 fn current_writer_disk_restore_tail_and_unchanged_restart_twice() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }

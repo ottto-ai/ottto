@@ -60,6 +60,7 @@ impl Drop for ClearPreparationFault {
 // an audit/clock Full. The write-only FD also makes any body read fail.
 #[test]
 fn empty_custody_scope_rejection_precedes_audit_clock_and_all_body_reads() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::transcript_acquisition::{AuditDebt, ReadMode};
     use std::io::Seek;
     let _clear = ClearPreparationFault;
@@ -119,6 +120,7 @@ fn empty_custody_scope_rejection_precedes_audit_clock_and_all_body_reads() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
 fn direct_return_keeps_attached_guard_on_heap_poison_and_self_eviction() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
     assert!(crate::heap_layout_bound::layout_supported());
     let _clear = ClearPreparationFault;
@@ -204,6 +206,7 @@ fn direct_return_keeps_attached_guard_on_heap_poison_and_self_eviction() {
 
 #[test]
 fn direct_completed_absence_and_heap_refusal_return_checkpoint_and_custody() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _clear = ClearPreparationFault;
     for absent in [true, false] {
         let root = crate::test_scratch::ScratchDir::new("completed-refusal");
@@ -298,6 +301,7 @@ impl Drop for ResetActiveBudget {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
 fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -494,6 +498,7 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
 fn rederive_refusal_precedes_certificate_io_and_keeps_integrity_separate() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -611,6 +616,7 @@ fn rederive_refusal_precedes_certificate_io_and_keeps_integrity_separate() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native cache layout")]
 fn atomic_cache_transit_returns_same_graph_and_custody_or_retains_original_refusal() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -725,6 +731,7 @@ fn atomic_cache_transit_returns_same_graph_and_custody_or_retains_original_refus
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
 fn bounded_snapshot_result_refuses_before_graph_allocation_and_then_decodes_both_sources() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -776,6 +783,7 @@ fn bounded_snapshot_result_refuses_before_graph_allocation_and_then_decodes_both
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
 fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -1260,6 +1268,7 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
 
 #[test]
 fn owned_prepare_rejects_with_original_box_graph_flags_and_unique_guard() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         for arm in [
             "capture",
@@ -1429,6 +1438,7 @@ fn owned_prepare_rejects_with_original_box_graph_flags_and_unique_guard() {
 
 #[test]
 fn owned_prepare_moves_guard_to_actual_native_owner_and_ends_it_at_completion() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let root = crate::test_scratch::ScratchDir::new("owned-prepare-success");
         let path = root.join("source.jsonl");
@@ -1497,6 +1507,7 @@ fn owned_prepare_moves_guard_to_actual_native_owner_and_ends_it_at_completion() 
     ignore = "needs native retained admission layout"
 )]
 fn rejected_ordinary_taken_returns_custody_rank_charge_and_held_flag_under_one_lock() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(crate::heap_layout_bound::layout_supported());
     let root = crate::test_scratch::ScratchDir::new("owned-return");
     let path = root.join("source.jsonl");
@@ -1558,6 +1569,7 @@ fn rejected_ordinary_taken_returns_custody_rank_charge_and_held_flag_under_one_l
 
 #[test]
 fn owned_fresh_none_and_unowned_real_edit_keep_native_full_semantics() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::ScratchDir::new("owned-full");
     let path = root.join("source.jsonl");
     let scope = Scope("owned-file".into());
@@ -1606,6 +1618,7 @@ fn owned_fresh_none_and_unowned_real_edit_keep_native_full_semantics() {
 
 #[test]
 fn admissible_codex_records_survive_above_the_retired_aggregate_disk_cap() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::ScratchDir::new("dt-aggregate-disk");
     let lock = crate::locked_state_dir::LockedStateDir::acquire(&root).unwrap();
     let path = root.join("source.jsonl");
@@ -1661,6 +1674,7 @@ fn admissible_codex_records_survive_above_the_retired_aggregate_disk_cap() {
 
 #[test]
 fn receipt_pending_guard_keeps_accepted_witness_and_census_without_unreadable() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::os::unix::fs::MetadataExt;
     let root = crate::test_scratch::ScratchDir::new("dt-pending-census");
     let lock = test_locks::hold(&root);
@@ -1809,6 +1823,7 @@ fn store_snapshot(dir: &Path) -> BTreeMap<PathBuf, (Vec<u8>, Vec<i128>)> {
 
 #[test]
 fn hold_active_retains_exact_completion_for_one_later_batch_receipt() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::ScratchDir::new("dt-hold-completion");
     let lock = test_locks::hold(&root);
     let _clear = ClearWriteFaults;
@@ -1899,6 +1914,7 @@ impl Drop for ClearWriteFaults {
     ignore = "needs native cache admission layout"
 )]
 fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mutation() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(crate::heap_layout_bound::layout_supported());
     let _gate = claude_request_money::e2::GateForTest::set(true);
     for cause in [
@@ -2130,6 +2146,7 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
     ignore = "needs native cache admission layout"
 )]
 fn m1_setup_inventory_and_statvfs_failures_are_counted_and_retry_with_original_provenance() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(crate::heap_layout_bound::layout_supported());
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         for (stage_index, stage) in ["setup", "inventory", "statvfs"].into_iter().enumerate() {
@@ -2246,6 +2263,7 @@ fn m1_setup_inventory_and_statvfs_failures_are_counted_and_retry_with_original_p
 
 #[test]
 fn oversized_active_request_refuses_without_waiting_or_opening_a_store() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let cache = SharedCache::default();
     let (result, events) = crate::local_resource_diagnostics::capture(|| {
         cache.acquire_active(SnapshotSource::Codex, store::ACTIVE_BYTES + 1)
@@ -2262,6 +2280,7 @@ fn oversized_active_request_refuses_without_waiting_or_opening_a_store() {
     ignore = "needs native cache admission layout"
 )]
 fn existing_m1_writer_uses_and_releases_active_credit_on_success_and_io_error() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::sync::{
         atomic::{AtomicBool, Ordering as AtomicOrdering},
         Arc,
@@ -2390,6 +2409,7 @@ pub(super) fn certificate(path: &Path, scope: &Scope) -> DurableCertificate {
 /// body, and drops the record whose key the index no longer holds.
 #[test]
 fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("ottto-dt-gc-large-index");
     let lock = test_locks::hold(&root);
     let index_path = root.join("index.json");
@@ -2473,6 +2493,7 @@ fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
 /// per-file marker change refuses even with unchanged scope, bytes and body.
 #[test]
 fn replay_revisions_and_applied_markers_bind_without_changing_the_allowlist() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let source = SnapshotSource::ClaudeCode;
     let key = "/synthetic/claude/fixture.jsonl";
     let scope = Scope("same-file-scope".into());
@@ -2544,7 +2565,7 @@ fn native_record(path: &Path, scope: &Scope) -> (CachedJsonlReduction, Checkpoin
     native_record_of(path, scope, SnapshotSource::ClaudeCode)
 }
 
-fn native_record_of(
+pub(super) fn native_record_of(
     path: &Path,
     scope: &Scope,
     source: SnapshotSource,
@@ -2598,6 +2619,7 @@ pub(super) fn native_fixture(path: &Path) {
 /// preserves the unadjudicable predecessor on the real post-save write path.
 #[test]
 fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _gate = claude_request_money::e2::GateForTest::set(true);
     let root = crate::test_scratch::private_dir("ottto-dt-owed");
     let lock = test_locks::hold(&root);
@@ -2763,6 +2785,7 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
 /// unaffected) and refuse the old record under the actual env setting.
 #[test]
 fn attribution_capture_toggle_refuses_the_previous_claude_record() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -2926,6 +2949,7 @@ fn open_call(call_id_bytes: usize) -> serde_json::Value {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let source = SnapshotSource::Codex;
     let namespace = Scope("dt-budget".into());
     let scope = Scope("dt-budget-file".into());
@@ -3166,6 +3190,7 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
 /// rebuilds reach the `local_resources` alarm for this source.
 #[test]
 fn common_hold_precedes_outer_gates_and_full_acquisition() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::PermissionsExt;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
@@ -3533,6 +3558,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
 /// record in it is neither held nor rebuilt (memory-only, pre-#806).
 #[test]
 fn foreign_owned_store_alarms_once_and_holds_nothing() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     struct OwnUid;
     impl Drop for OwnUid {
         fn drop(&mut self) {
@@ -3615,6 +3641,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
 /// F1 needs the real acquisition/publication seam, beyond store-only outcomes.
 #[test]
 fn store_io_failures_emit_cold_production_body_without_holds() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::os::unix::fs::PermissionsExt;
     struct Reset;
     impl Drop for Reset {
@@ -3796,6 +3823,7 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let source = SnapshotSource::ClaudeCode;
     for arm in ["retention", "codec"] {
         let root = crate::test_scratch::private_dir("ottto-dt-unreplaced");
@@ -3974,6 +4002,7 @@ pub(super) fn known_corrupt_scan(
 /// The fixture premise runs on Linux too, without requiring retained layout.
 #[test]
 fn known_corrupt_fixture_capture_and_audit_premises_match() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("ottto-known-corrupt-premises");
     let sessions = root.join("sessions");
     std::fs::create_dir(&sessions).unwrap();
@@ -4005,6 +4034,7 @@ fn known_corrupt_fixture_capture_and_audit_premises_match() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS retained layout")]
 fn known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for fail_replacement in [false, true] {
         known_corrupt_replacement_case(fail_replacement);
     }
@@ -4310,6 +4340,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
 /// unadjudicable absent records; the GC counters prove the walk ran.
 #[test]
 fn save_without_per_pass_setup_keeps_valid_records() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("ottto-dt-no-setup-save");
     let lock = test_locks::hold(&root);
     let source = SnapshotSource::ClaudeCode;
@@ -4384,6 +4415,7 @@ fn save_without_per_pass_setup_keeps_valid_records() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(crate::heap_layout_bound::layout_supported());
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         for arm in [
@@ -4615,6 +4647,7 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
 /// immutable header, not the current view, decides Legacy versus V2.
 #[test]
 fn v1_counting_provenance_comes_from_each_decoded_reduction() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use codex_counting_version::{AckEvidence, TestCutover};
     for (timestamp, evidence, version) in [
         ("1969-01-01T00:00:00Z", AckEvidence::None, 1),
@@ -4847,6 +4880,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
 
 #[test]
 fn restore_scope_attribution_is_typed_and_preserves_binding_formula() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let source = SnapshotSource::ClaudeCode;
     let namespace = Scope("diagnostic-namespace".into());
     let scope = Scope("diagnostic-scope".into());
@@ -4925,6 +4959,7 @@ fn restore_scope_attribution_is_typed_and_preserves_binding_formula() {
 
 #[test]
 fn restore_reports_each_early_exit_without_changing_old_totals() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("ottto-restore-provenance");
     let _lock = test_locks::hold(&root);
     let path = root.join("fixture.jsonl");
@@ -4996,6 +5031,7 @@ fn restore_reports_each_early_exit_without_changing_old_totals() {
 
 #[test]
 fn certificate_read_error_is_not_edit_evidence() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("ottto-certificate-read-error");
     let path = root.join("fixture.jsonl");
     std::fs::write(&path, b"{\"n\":1}\n").unwrap();
@@ -5046,6 +5082,7 @@ fn certificate_read_error_is_not_edit_evidence() {
 /// report unavailable rather than conflating the disable with a missing record.
 #[test]
 fn store_unavailable_after_t14_breaker_is_not_missing() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("ottto-restore-store-unavailable");
     let lock = test_locks::hold(&root);
     let path = root.join("fixture.jsonl");
@@ -5143,6 +5180,7 @@ fn store_unavailable_after_t14_breaker_is_not_missing() {
 
 #[test]
 fn certificate_sample_truncation_is_shrunk_for_both_windows() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::transcript_acquisition::set_between_guards;
     struct ClearHook;
     impl Drop for ClearHook {
@@ -5186,6 +5224,7 @@ fn certificate_sample_truncation_is_shrunk_for_both_windows() {
 
 #[test]
 fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("zst-record-refusal");
     let plain = root.join("plain.jsonl");
     std::fs::write(&plain, b"{\"n\":1}\n").unwrap();
@@ -5356,6 +5395,7 @@ pub(crate) fn seed_pinned_v1(
 /// every layout, including two process/index reloads and a later offered debt.
 #[test]
 fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::transcript_acquisition::{AuditDebt, ReadMode};
     let root = crate::test_scratch::private_dir("ottto-v1-debt-survival");
     let lock = test_locks::hold(&root);
@@ -5688,6 +5728,7 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
 /// and says so.
 #[test]
 fn a_permit_era_record_restores_under_the_always_on_capture() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("ottto-dt-contract5");
     let lock = test_locks::hold(&root);
     let source = SnapshotSource::ClaudeCode;
@@ -5815,6 +5856,7 @@ fn retail_reads() -> Vec<(u64, usize, u64)> {
 
 #[test]
 fn q11_custody_counts_prefetch_short_reads_and_failure_without_renewal() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::io::{BufRead, Seek, SeekFrom, Write};
     let root = crate::test_scratch::private_dir("ottto-q11-raw");
     let path = root.join("t.jsonl");
@@ -5905,6 +5947,7 @@ fn q11_custody_counts_prefetch_short_reads_and_failure_without_renewal() {
 
 #[test]
 fn q11_overflow_never_forgets_a_spent_key_and_pread_charges_actual_bytes() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::io::{Seek, SeekFrom, Write};
     let root = crate::test_scratch::private_dir("ottto-q11-overflow");
     let path = root.join("t.jsonl");
@@ -5994,6 +6037,7 @@ fn q11_overflow_never_forgets_a_spent_key_and_pread_charges_actual_bytes() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS retained layout")]
 fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::io::Write;
     let root = crate::test_scratch::private_dir("ottto-q11-strict-native");
     let lock = test_locks::hold(&root);
@@ -6125,6 +6169,7 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
 
 #[test]
 fn q11_complete_map_is_paid_before_the_first_key() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let nodes = custody_node_bytes().unwrap();
     let reserve = super::super::RETAIL_RESERVE_BYTES;
     let pace_nodes =
@@ -6135,7 +6180,7 @@ fn q11_complete_map_is_paid_before_the_first_key() {
         1_978_368 + STALE_PREDECESSOR_RESERVE_BYTES
     );
     assert_eq!(
-        super::super::STATE_BYTES
+        super::super::state_bytes()
             + super::super::KEY_RESERVE_BYTES
             + super::super::STALE_PREDECESSOR_RESERVE_BYTES
             + reserve
@@ -6154,6 +6199,7 @@ fn q11_complete_map_is_paid_before_the_first_key() {
     ignore = "requires the qualified native heap layout"
 )]
 fn receipt_retry_bound_reads_growth_after_quiet_window_and_restart_is_idle() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::io::Write;
     assert!(crate::heap_layout_bound::layout_supported());
     let _gate = claude_request_money::e2::GateForTest::set(true);
@@ -6463,6 +6509,7 @@ fn other_source_restore_after_return_release(
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
 fn production_returned_nontransient_original_reads_growth_once_then_quiet_restart_is_idle() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::io::Write;
     if !crate::test_isolation::run_here() {
         return;
@@ -6957,6 +7004,7 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
 
 #[test]
 fn q8_strict_v1_bridge_keeps_unknown_same_and_inode_reuse_conservative() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("ottto-q8-bridge");
     let path = root.join("t.jsonl");
     std::fs::write(&path, b"{}\n").unwrap();
@@ -7102,6 +7150,7 @@ fn a1a_scan_at(
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
     let _gate = claude_request_money::e2::GateForTest::set(true);
@@ -7349,6 +7398,7 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
 
 #[test]
 fn a1a_finite_named_revisions_do_not_enumerate_or_mutate_future_records() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("ottto-a1a-candidates");
     let lock = test_locks::hold(&root);
     let path = root.join("t.jsonl");
@@ -7509,6 +7559,7 @@ fn a1a_finite_named_revisions_do_not_enumerate_or_mutate_future_records() {
 
 #[test]
 fn a1a_frozen_floor_holds_before_certificate_even_after_working_entry_clear() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("ottto-a1a-floor");
     let lock = test_locks::hold(&root);
     let path = root.join("t.jsonl");
@@ -7612,6 +7663,7 @@ fn a1a_frozen_floor_holds_before_certificate_even_after_working_entry_clear() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_permission() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for arm in ["cleared", "reverted"] {
         let root = crate::test_scratch::private_dir("ottto-a1a-writer");
         let lock = test_locks::hold(&root);
@@ -7724,6 +7776,7 @@ fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_p
 
 #[test]
 fn a1a_supported_unprovable_migration_classifies_stale_on_growth_without_o3() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::io::Write;
     let root = crate::test_scratch::private_dir("ottto-a1a-unprovable");
     let lock = test_locks::hold(&root);
@@ -7846,6 +7899,7 @@ fn a1a_supported_unprovable_migration_classifies_stale_on_growth_without_o3() {
 
 #[test]
 fn b1_upgrade_diagnostics_separate_sources_and_observation_units() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("ottto-b1-counter-source");
     let cache = SharedCache::default();
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
@@ -7868,6 +7922,7 @@ fn b1_upgrade_diagnostics_separate_sources_and_observation_units() {
 
 #[test]
 fn b1_native_upgrade_observation_is_once_and_below_buffering() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::codex_compressed_input::OpenedInput;
     use std::io::{BufRead, Seek};
     let root = crate::test_scratch::private_dir("ottto-b1-observer");
@@ -7931,6 +7986,7 @@ fn b1_native_upgrade_observation_is_once_and_below_buffering() {
 
 #[test]
 fn b1_native_upgrade_counts_an_actual_failed_read_but_not_a_changed_fd() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("ottto-b1-read-error");
     let path = root.join("body.jsonl");
     std::fs::write(&path, b"{}\n").unwrap();
@@ -7978,6 +8034,7 @@ fn b1_native_upgrade_counts_an_actual_failed_read_but_not_a_changed_fd() {
 
 #[test]
 fn b1_funded_custody_does_not_evict_or_reset_spent_keys_at_overflow() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let cache = SharedCache::default();
     let mut stores = cache.durable().unwrap();
     let now = std::time::Instant::now();
@@ -7999,6 +8056,7 @@ fn b1_funded_custody_does_not_evict_or_reset_spent_keys_at_overflow() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "native retained layout")]
 fn b1_absent_o3_counts_native_start_then_writes_and_restores() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for (sidecar_census_complete, cancel_before_read) in
         [(true, false), (false, false), (false, true)]
     {
@@ -8230,6 +8288,7 @@ fn b1_absent_o3_fixture(sidecar_census_complete: bool, cancel_before_read: bool)
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "native retained layout")]
 fn b1_strict_tail_writer_retries_with_the_original_witness_after_memo_loss() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
     let _gate = claude_request_money::e2::GateForTest::set(true);
@@ -8365,6 +8424,7 @@ fn b1_strict_tail_writer_retries_with_the_original_witness_after_memo_loss() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "native retained layout")]
 fn c_strict_writer_retires_only_a_successfully_acknowledged_replacement() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for edge in ["ordinary", "pre_rename", "post_rename", "dir_sync"] {
         use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
         use std::io::Write;
@@ -8607,6 +8667,7 @@ fn c_strict_writer_retires_only_a_successfully_acknowledged_replacement() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_prefix_twice() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
     let _gate = claude_request_money::e2::GateForTest::set(true);
@@ -9015,6 +9076,7 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
 
 #[test]
 fn a1t_transitional_full_requires_known_current_floor_and_strict_growth() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("ottto-a1t-floor");
     let path = root.join("t.jsonl");
     std::fs::write(&path, b"{}\n").unwrap();
@@ -9129,6 +9191,7 @@ fn a0h_scan(
 
 #[test]
 fn a0h_pacing_is_funded_nonrenewing_and_evicts_oldest() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("a0h-pace");
     let path = root.join("t.jsonl");
     std::fs::write(&path, b"{}\n{}\n").unwrap();
@@ -9195,6 +9258,7 @@ fn a0h_pacing_is_funded_nonrenewing_and_evicts_oldest() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
     let _gate = claude_request_money::e2::GateForTest::set(true);
@@ -9566,6 +9630,7 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
 
 #[test]
 fn a0h_pace_evicted_alone_emits_one_alarm_without_a_full_delta() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("a0h-overflow-alarm");
     let cache = SharedCache::default();
     let source = SnapshotSource::ClaudeCode;
@@ -9621,6 +9686,7 @@ fn a0h_pace_evicted_alone_emits_one_alarm_without_a_full_delta() {
 
 #[test]
 fn stale_growth_gate_keeps_transient_and_future_floors_held_and_shares_pacing() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("stale-growth-gate");
     let path = root.join("t.jsonl");
     std::fs::write(&path, b"{}\n").unwrap();
@@ -9680,6 +9746,7 @@ fn stale_growth_gate_keeps_transient_and_future_floors_held_and_shares_pacing() 
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
     let _gate = claude_request_money::e2::GateForTest::set(true);
@@ -10002,6 +10069,7 @@ fn b1g_scan(
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
     let _gate = claude_request_money::e2::GateForTest::set(true);
@@ -10224,6 +10292,7 @@ fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
 
 #[test]
 fn stale_full_evicts_oldest_shared_stamp_and_paces_the_new_key() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("stale-eviction");
     let path = root.join("t.jsonl");
     std::fs::write(&path, b"{}\n{}\n").unwrap();
@@ -10327,6 +10396,7 @@ fn b1g_before_read(
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn b1_future_accepted_floor_blocks_fresh_cancelled_and_restarted_inputs_before_read() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
     let _gate = claude_request_money::e2::GateForTest::set(true);
@@ -10417,6 +10487,7 @@ fn b1_future_accepted_floor_blocks_fresh_cancelled_and_restarted_inputs_before_r
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
     let _gate = claude_request_money::e2::GateForTest::set(true);
@@ -10786,6 +10857,7 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn p2_restart_restore_tail_persists_successor_and_restarts_again() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
     let _gate = claude_request_money::e2::GateForTest::set(true);
@@ -11177,6 +11249,7 @@ fn pace_time(at: std::time::Instant) -> std::time::SystemTime {
 
 #[test]
 fn shared_pace_wall_clock_sleep_and_backwards_jumps_expire_toward_reading() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::time::{Duration, SystemTime};
     let root = crate::test_scratch::private_dir("shared-pace-clock");
     let path = root.join("t.jsonl");
@@ -11203,6 +11276,7 @@ fn shared_pace_wall_clock_sleep_and_backwards_jumps_expire_toward_reading() {
 
 #[test]
 fn shared_pace_near_cap_bypasses_cooldown_counts_and_alarms_without_tail_credit() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("shared-pace-near-cap");
     let path = root.join("t.jsonl");
     let file = File::create(&path).unwrap();
@@ -11249,6 +11323,7 @@ fn shared_pace_near_cap_bypasses_cooldown_counts_and_alarms_without_tail_credit(
 
 #[test]
 fn absent_upgrade_growth_is_a_counted_miss_and_shares_the_full_pace() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("upgrade-growth-pace");
     let path = root.join("t.jsonl");
     std::fs::write(&path, b"{}\n{}\n").unwrap();
@@ -11303,6 +11378,7 @@ fn absent_upgrade_growth_is_a_counted_miss_and_shares_the_full_pace() {
 /// smaller body just because this daemon lacks the old optional copy.
 #[test]
 fn accepted_floor_missing_record_is_neutral_and_freezes_before_mutation() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::ScratchDir::new("p3-s2-missing");
     let path = root.join("t.jsonl");
     std::fs::write(&path, b"{}\n").unwrap();
@@ -11367,6 +11443,7 @@ fn accepted_floor_missing_record_is_neutral_and_freezes_before_mutation() {
 
 #[test]
 fn shared_recovery_pace_uses_wall_clock_and_overflow_fails_toward_reading() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::ScratchDir::new("p3-wall-pace");
     let path = root.join("t.jsonl");
     std::fs::write(&path, b"{}\n{}\n").unwrap();
@@ -11443,6 +11520,7 @@ fn shared_recovery_pace_uses_wall_clock_and_overflow_fails_toward_reading() {
     ignore = "requires qualified native heap layout"
 )]
 fn growth_hold_wall_expiry_restart_recovers_exact_body_without_prefix_duplication() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -11606,6 +11684,7 @@ fn growth_hold_wall_expiry_restart_recovers_exact_body_without_prefix_duplicatio
 
 #[test]
 fn s2_unknown_is_same_and_only_independent_replacement_skips_floor() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::ScratchDir::new("p3-s2-proof");
     let path = root.join("t.jsonl");
     std::fs::write(&path, b"{}\n").unwrap();
@@ -11681,6 +11760,7 @@ fn s2_unknown_is_same_and_only_independent_replacement_skips_floor() {
     ignore = "requires qualified native heap layout"
 )]
 fn warm_shortened_old_file_keeps_accepted_body_floor_without_publication() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -12014,6 +12094,7 @@ impl Drop for O3Fixture {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_completion_replaces_no_match_idle_zero_restart_tail_and_money_equals_cold() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _gate = claude_request_money::e2::GateForTest::set(true);
     let f = O3Fixture::new();
     let source = SnapshotSource::ClaudeCode;
@@ -12193,6 +12274,7 @@ fn o3_completion_replaces_no_match_idle_zero_restart_tail_and_money_equals_cold(
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_save_failure_cancelled_claim_restart_preserves_option_i_and_survivor() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for cleared in [false, true] {
         let _gate = claude_request_money::e2::GateForTest::set(true);
         let f = O3Fixture::new();
@@ -12280,6 +12362,7 @@ fn o3_save_failure_cancelled_claim_restart_preserves_option_i_and_survivor() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_same_owner_shorter_growth_expires_pace_without_lowering_original_floor() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _gate = claude_request_money::e2::GateForTest::set(true);
     let f = O3Fixture::new();
     f.append("growth", 200);
@@ -12370,6 +12453,7 @@ fn o3_same_owner_shorter_growth_expires_pace_without_lowering_original_floor() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_failed_atomic_replacement_never_retires_original_without_its_receipt() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _gate = claude_request_money::e2::GateForTest::set(true);
     for edge in ["pre_rename", "dir_sync"] {
         let f = O3Fixture::new();
@@ -12447,6 +12531,7 @@ fn o3_failed_atomic_replacement_never_retires_original_without_its_receipt() {
 
 #[test]
 fn o3_observation_fits_the_prepaid_full_custody_node() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root_and_shared_counter =
         crate::heap_layout_bound::tree_node_bytes::<store::Digest32, Box<KeyCustody>>().unwrap()
             + arc_allocation_bytes::<AtomicU64>().unwrap();
@@ -12472,6 +12557,7 @@ fn o3_observation_fits_the_prepaid_full_custody_node() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_audit_selection_progresses_but_owed_adoption_never_borrows_migration_authority() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _gate = claude_request_money::e2::GateForTest::set(true);
     for arm in ["audit", "adoption"] {
         let f = O3Fixture::new();
@@ -12520,6 +12606,7 @@ fn o3_audit_selection_progresses_but_owed_adoption_never_borrows_migration_autho
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_custody_capacity_fails_toward_counted_read_without_mutating_survivor() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _gate = claude_request_money::e2::GateForTest::set(true);
     let f = O3Fixture::new();
     f.append("growth", 200);
@@ -12560,6 +12647,7 @@ fn o3_custody_capacity_fails_toward_counted_read_without_mutating_survivor() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_changed_object_and_scope_memo_capacity_read_without_replacement_authority() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _gate = claude_request_money::e2::GateForTest::set(true);
     for arm in ["object", "scope-capacity"] {
         let f = O3Fixture::new();
@@ -12629,6 +12717,7 @@ fn o3_changed_object_and_scope_memo_capacity_read_without_replacement_authority(
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_obsolete_long_record_after_shorter_replacement_and_failed_rename_cannot_mask_growth() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _gate = claude_request_money::e2::GateForTest::set(true);
     let rows = a1a_row("old-one", 1000) + &a1a_row("old-two", 2000) + &a1a_row("old-three", 3000);
     let mut f = O3Fixture::from_rows(&rows, false);
@@ -12708,6 +12797,7 @@ fn o3_obsolete_long_record_after_shorter_replacement_and_failed_rename_cannot_ma
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_generation_ahead_survivor_reads_growth_without_mutation_authority() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for overflow in [false, true] {
         let _gate = claude_request_money::e2::GateForTest::set(true);
         let mut f = O3Fixture::new();
@@ -12783,6 +12873,7 @@ fn o3_generation_ahead_survivor_reads_growth_without_mutation_authority() {
 #[test]
 #[ignore = "requires landed E3 generic growth discovery (#876)"]
 fn o3_paced_growth_survives_idle_past_window_until_real_native_catchup() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _gate = claude_request_money::e2::GateForTest::set(true);
     let mut f = O3Fixture::new();
     f.rewrite_survivor(|r| r.index_generation += 100_000); // forces option (i)
@@ -12869,6 +12960,7 @@ fn o3_paced_growth_survives_idle_past_window_until_real_native_catchup() {
 
 #[test]
 fn claude_unregistered_money_replay_keeps_typed_stale_and_shared_pace() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("unregistered-money-production-restore");
     let lock = test_locks::hold(&root);
     let path = root.join("11111111-2222-4333-8444-555555555555.jsonl");
@@ -12997,6 +13089,7 @@ fn claude_unregistered_money_replay_keeps_typed_stale_and_shared_pace() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn stale_binding_cannot_mask_equal_head_edit_or_shorter_replacement_across_restart() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _gate = claude_request_money::e2::GateForTest::set(true);
     for binding in ["context", "no_match"] {
         for edit in ["equal_head", "shorter_object"] {
@@ -13095,6 +13188,7 @@ fn stale_binding_cannot_mask_equal_head_edit_or_shorter_replacement_across_resta
 
 #[test]
 fn pace_clock_anomaly_is_separate_from_overflow_and_never_refunds_q11() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("pace-anomaly-spent");
     let path = root.join("t.jsonl");
     std::fs::write(&path, b"{}\n").unwrap();
@@ -13177,6 +13271,7 @@ pub(super) fn before_warm_transfer() {
 /// proved shrink behind its retained envelope debt or accepted-body floor.
 #[test]
 fn indexed_debt_carrier_preserves_proven_shrink_before_audit_rearm() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("ottto-indexed-carrier-edit");
     let lock = test_locks::hold(&root);
     let path = root.join("source.jsonl");
@@ -13270,6 +13365,7 @@ fn indexed_debt_carrier_preserves_proven_shrink_before_audit_rearm() {
     ignore = "requires qualified native heap layout"
 )]
 fn verified_warm_shrink_reads_exact_changed_body_once_and_preserves_ack() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -13389,6 +13485,7 @@ fn verified_warm_shrink_reads_exact_changed_body_once_and_preserves_ack() {
 /// settlement probe remains read-only and missing membership recovers due.
 #[test]
 fn member_settlement_and_final_full_probes_reserve_before_any_classifier_io() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _reset = ResetActiveBudget;
     let root = crate::test_scratch::ScratchDir::new("p3-probe-credit");
     let lock = test_locks::hold(&root);
@@ -13473,6 +13570,7 @@ fn member_settlement_and_final_full_probes_reserve_before_any_classifier_io() {
 /// cannot bypass another reason's grant. Spend custody is never evicted/refunded.
 #[test]
 fn resource_and_retail_recoveries_share_one_wall_clock_stamp() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::ScratchDir::new("p3-resource-pace");
     let path = root.join("t.jsonl");
     std::fs::write(&path, b"{}\n{}\n").unwrap();
@@ -13534,6 +13632,7 @@ fn resource_and_retail_recoveries_share_one_wall_clock_stamp() {
     ignore = "requires qualified native heap layout"
 )]
 fn content_v1_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -13730,6 +13829,7 @@ fn content_v1_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
 /// recovery must not wait for unrelated input credit or execute the batch.
 #[test]
 fn absent_and_disabled_member_batches_bypass_unavailable_input_credit() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _reset = ResetActiveBudget;
     let root = crate::test_scratch::ScratchDir::new("p3-disabled-probe");
     let cache = SharedCache::default();
@@ -13774,6 +13874,7 @@ fn absent_and_disabled_member_batches_bypass_unavailable_input_credit() {
 
 #[test]
 fn b4_shared_pace_cross_cause_clock_anomalies_and_single_eviction_owner() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::ScratchDir::new("b4-pace-owner");
     let cache = SharedCache::default();
     let claude = SnapshotSource::ClaudeCode;
@@ -13856,6 +13957,7 @@ fn b4_shared_pace_cross_cause_clock_anomalies_and_single_eviction_owner() {
 
 #[test]
 fn b4_near_cap_uses_each_existing_source_cap() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for source in [
         SnapshotSource::ClaudeCode,
         SnapshotSource::Codex,
@@ -13880,6 +13982,7 @@ fn b4_near_cap_uses_each_existing_source_cap() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
 fn b4_workspace_positive_restore_and_funding_before_read() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -13998,6 +14101,7 @@ fn b4_workspace_positive_restore_and_funding_before_read() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
 fn b4_structural_growth_paced_no_record_reselection_no_prune_and_restart() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     b4_structural_transition(false);
     b4_structural_transition(true);
 }
@@ -14246,6 +14350,7 @@ fn b4_structural_transition(near_cap: bool) {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native restore layout")]
 fn b4_structural_memo_does_not_hold_same_size_shrink_or_approved_replay() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -14312,6 +14417,7 @@ fn b4_structural_memo_does_not_hold_same_size_shrink_or_approved_replay() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native retained layout")]
 fn b4_warm_busy_keeps_aged_census_through_terminal_then_catches_up() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -14461,6 +14567,7 @@ fn b4_warm_busy_keeps_aged_census_through_terminal_then_catches_up() {
 
 #[test]
 fn migration_input_refusal_has_no_classifier_claim_or_pace_side_effects() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _reset = ResetActiveBudget;
     let root = crate::test_scratch::ScratchDir::new("integration-migration-funding");
     let path = root.join("t.jsonl");
@@ -14503,6 +14610,7 @@ fn migration_input_refusal_has_no_classifier_claim_or_pace_side_effects() {
 
 #[test]
 fn codex_resource_probe_deferral_does_not_spend_recovery_pace() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::ScratchDir::new("integration-resource-start");
     let path = root.join("t.jsonl");
     std::fs::write(&path, b"{}\n{}\n").unwrap();
@@ -14558,6 +14666,7 @@ fn codex_resource_probe_deferral_does_not_spend_recovery_pace() {
     ignore = "requires native cache admission layout"
 )]
 fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_full() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -14715,9 +14824,10 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::heap_layout_bound::bound;
     use crate::snapshots::codex_file_join::header_cache_tests::{page, READ_CALLS};
-    use crate::snapshots::sampled_scan::{codex_cursor, STATE_BYTES};
+    use crate::snapshots::sampled_scan::{codex_cursor, state_bytes};
     use crate::transcript_acquisition::ReadMode;
     use crate::transcript_cache::{FrozenCacheState, Retained, TranscriptCache};
     const INVENTORY_LIMIT: usize = 256 * 1024;
@@ -14852,14 +14962,14 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
             cache
                 .with_cursor(|cursor| {
                     let headers = std::mem::take(&mut cursor.headers);
-                    let cursor_bytes = bound(cursor, STATE_BYTES).unwrap();
+                    let cursor_bytes = bound(cursor, state_bytes()).unwrap();
                     let side = crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
-                    let empty_retained = bound(&*retained, STATE_BYTES).unwrap();
+                    let empty_retained = bound(&*retained, state_bytes()).unwrap();
                     // The empty retained root and the incoming entry's node
                     // are both charged; the incoming inline state lives in
                     // that node, and only its heap is added separately.
                     let minimum = cursor_bytes + side + empty_retained + incoming_slot + incoming_heap;
-                    assert!(minimum < STATE_BYTES);
+                    assert!(minimum < state_bytes());
                     let one_byte_short = TranscriptCache::with_byte_limit(minimum - 1);
                     assert!(!one_byte_short.insertion_fits(
                         &key,
@@ -14880,7 +14990,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
                         "derived minimum must discriminate the header-free arm"
                     );
                     cursor.headers = headers;
-                    let reserved = bound(cursor, STATE_BYTES).unwrap() + side;
+                    let reserved = bound(cursor, state_bytes()).unwrap() + side;
                     assert!(!retained.insertion_fits(&key, &incoming, reserved, rank, true));
                 })
                 .unwrap();
@@ -14963,6 +15073,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
 
 #[test]
 fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("skill-consent-save");
     let lock = test_locks::hold(&root);
     let source = SnapshotSource::ClaudeCode;

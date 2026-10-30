@@ -37,7 +37,6 @@ pub(crate) struct Properties {
     pub(crate) representations: &'static [Representation],
     #[cfg(test)]
     pub(super) encode: fn(&CachedJsonlReduction, usize, u64) -> Result<Vec<u8>, Refuse>,
-    #[cfg(test)]
     pub(super) decode: fn(&[u8], SnapshotSource) -> Result<durable::Decoded, Corrupt>,
     #[cfg(unix)]
     pub(super) decode_bounded:
@@ -47,7 +46,6 @@ pub(crate) struct Properties {
             &mut crate::durable_tail_store::ActiveLease,
         ) -> Result<durable::Decoded, crate::durable_tail_codec::DecodeFailure>,
     pub(super) verify: fn(&[u8]) -> Result<(), Corrupt>,
-    #[cfg(test)]
     pub(super) apply_line: fn(&Value, &mut SnapshotAccumulator),
 }
 
@@ -66,12 +64,10 @@ pub(crate) const SOURCES: &[Properties] = &[
         ),
         #[cfg(test)]
         encode: durable::encode_body,
-        #[cfg(test)]
         decode: durable::decode_body,
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
         verify: durable::verify,
-        #[cfg(test)]
         apply_line: apply_claude_code_line,
     },
     Properties {
@@ -85,12 +81,10 @@ pub(crate) const SOURCES: &[Properties] = &[
         ),
         #[cfg(test)]
         encode: durable::encode_body,
-        #[cfg(test)]
         decode: durable::decode_body,
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
         verify: durable::verify,
-        #[cfg(test)]
         apply_line: apply_codex_line,
     },
 ];

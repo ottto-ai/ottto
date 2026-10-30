@@ -237,6 +237,9 @@ fn checkpoint_bytes(checkpoint: &Checkpoint) -> Option<u64> {
 impl SharedCache {
     /// Queried before selector Skip/comparison/family/scoped retry logic.
     pub(crate) fn owed_before_skip(&self, source: SnapshotSource, key: &str) -> OwedQuery {
+        if !crate::snapshots::restart_restore::enabled() {
+            return OwedQuery::None;
+        }
         let Some(ds) = durable_source(source) else {
             return OwedQuery::None;
         };
@@ -538,6 +541,9 @@ impl SharedCache {
     /// Age-independent: debt, a pending receipt, a D3 hold or the source-wide
     /// conservative bit keeps the key discoverable.
     pub(in crate::snapshots) fn owes_discovery(&self, source: SnapshotSource, key: &str) -> bool {
+        if !crate::snapshots::restart_restore::enabled() {
+            return false;
+        }
         let overflow = durable_source(source).is_some_and(|ds| {
             self.durable()
                 .is_some_and(|stores| stores.owed_overflow[ds.slot()])

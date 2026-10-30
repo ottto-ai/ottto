@@ -19,7 +19,7 @@
 //! The cursor is a build property: when `layout_supported()` is false no
 //! job starts and every file reads in its page exactly as before.
 use super::super::*;
-use super::{SharedCache, STATE_BYTES};
+use super::{state_bytes, SharedCache};
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::transcript_acquisition::{
     AuditDebt, Checkpoint, FullReason, LossyPrefixIdentity, PrefixRefusal, Scope,
@@ -167,7 +167,7 @@ fn state_budget() -> usize {
     if let Some(bytes) = TEST_STATE_BUDGET.with(std::cell::Cell::get) {
         return bytes;
     }
-    STATE_BYTES
+    state_bytes()
 }
 
 /// F4b: the one checked budget every cursor admission measures against:
@@ -434,7 +434,7 @@ impl PageBudget {
 }
 
 /// U1a-2a (cc row 4, rev 5/6 §5.1, R2-B1): the most a running proof job
-/// may hold before a step: `STATE_BYTES − bound(context) −
+/// may hold before a step: `state_bytes() − bound(context) −
 /// PROOF_STEP_HEADROOM_BYTES`, the copy-budget computation
 /// (`copy_budget_parts`) with the running job in place of the active file.
 /// `bound(context)` includes the shared cache (cursor state, retained
@@ -442,8 +442,8 @@ impl PageBudget {
 /// are serialized under `SNAPSHOT_SYNC_LOCK`, so it sees every live main
 /// state. None: the context is unbounded or leaves no headroom.
 pub(in crate::snapshots) fn proof_room(context: &super::Context) -> Option<usize> {
-    crate::heap_layout_bound::bound(context, STATE_BYTES)
-        .and_then(|resident| STATE_BYTES.checked_sub(resident))
+    crate::heap_layout_bound::bound(context, state_bytes())
+        .and_then(|resident| state_bytes().checked_sub(resident))
         .and_then(|room| room.checked_sub(PROOF_STEP_HEADROOM_BYTES))
 }
 
@@ -699,7 +699,7 @@ impl SharedCache {
         }
         let witness = WakeIdentity(words);
         // Retained -> cursor is the shared-cache lock order. Optional admission
-        // stays within the existing STATE_BYTES admission; failure leaves
+        // stays within the existing state_bytes() admission; failure leaves
         // this path without a reusable witness.
         if let Ok(mut retained) = self.retained() {
             self.with_cursor(|cursor| {
@@ -1369,7 +1369,7 @@ impl ProofLease {
         if let Some(readers) = job.readers.as_deref_mut() {
             readers.shrink_buffers();
         }
-        let Some(charge) = crate::heap_layout_bound::bound(&*job, STATE_BYTES) else {
+        let Some(charge) = crate::heap_layout_bound::bound(&*job, state_bytes()) else {
             record_proof_drop();
             return false;
         };
@@ -1440,9 +1440,9 @@ pub(in crate::snapshots) enum Admitter {
 /// proof still reads main's own part.
 fn state_for_main(cursor: &CursorState) -> Option<usize> {
     let proof = cursor.proof.charge();
-    crate::heap_layout_bound::bound(cursor, STATE_BYTES.checked_add(proof)?)?
+    crate::heap_layout_bound::bound(cursor, state_bytes().checked_add(proof)?)?
         .checked_sub(proof)
-        .filter(|state| *state <= STATE_BYTES)
+        .filter(|state| *state <= state_bytes())
 }
 
 /// U1a-2a (cc row 2): `Admitter::Proof`'s test: `charge` fits beside the
@@ -1450,8 +1450,8 @@ fn state_for_main(cursor: &CursorState) -> Option<usize> {
 /// copies, inside `admission_budget`. Nothing is released or evicted.
 fn proof_free_room(retained: &super::RetainedCache, cursor: &CursorState, charge: usize) -> bool {
     use crate::heap_layout_bound::bound;
-    bound(cursor, STATE_BYTES)
-        .zip(bound(retained, STATE_BYTES))
+    bound(cursor, state_bytes())
+        .zip(bound(retained, state_bytes()))
         .and_then(|(state, resident)| {
             admission_budget()?
                 .checked_sub(state)?
@@ -1471,8 +1471,8 @@ fn decoder_fits_without_headers(
     use crate::heap_layout_bound::bound;
     (|| {
         let headers = cursor.headers.optional_bytes().filter(|bytes| *bytes > 0)?;
-        let state = bound(cursor, STATE_BYTES.checked_add(headers)?)?.checked_sub(headers)?;
-        let resident = bound(retained, STATE_BYTES)?;
+        let state = bound(cursor, state_bytes().checked_add(headers)?)?.checked_sub(headers)?;
+        let resident = bound(retained, state_bytes())?;
         admission_budget()?
             .checked_sub(state)?
             .checked_sub(resident)?
@@ -1510,8 +1510,8 @@ fn retire_suspended_proof_over(
     if matches!(cursor.proof, ProofHolder::None) {
         return false;
     }
-    let fits = bound(&*cursor, STATE_BYTES)
-        .zip(bound(retained, STATE_BYTES))
+    let fits = bound(&*cursor, state_bytes())
+        .zip(bound(retained, state_bytes()))
         .and_then(|(state, resident)| {
             budget?
                 .checked_sub(state)?
@@ -1626,7 +1626,7 @@ crate::heap_layout_bound::fields!(Counters; jobs_started, jobs_paused, jobs_resu
 
 /// A `JoinStateBound` file waits here until its object or reduction
 /// dependencies change. Its job ran out of a build constant
-/// (`STATE_BYTES`) while reading a prefix that only grows, so an append
+/// (`state_bytes()`) while reading a prefix that only grows, so an append
 /// cannot cure it: growth keeps it parked; replacement, shrink, an in-place
 /// edit or a dependency change wakes it. A capacity change is a new
 /// process, which starts with no parked record. A `ProbeBudgetOrder` group
@@ -2562,17 +2562,17 @@ pub(in crate::snapshots) enum JobEnd {
 /// The paused job's requested-layout charge (K1, N3): the whole job walked
 /// with `completed_bound` (live source-wide inputs already removed), so every
 /// collection element (turn-key witnesses, usage hours, capability buckets)
-/// gets its own visit budget and the job is limited by bytes (`STATE_BYTES`)
+/// gets its own visit budget and the job is limited by bytes (`state_bytes()`)
 /// alone, never by the walk's visit limit. A pause is a completion-only
 /// composition: it runs once per page, never per line. None when the witness
 /// map is absent (a job that could never revalidate) or the charge exceeds
-/// `STATE_BYTES`.
+/// `state_bytes()`.
 pub(in crate::snapshots) fn paused_charge(job: &OwnedActiveFile) -> Option<usize> {
     job.parser
         .accumulator
         .codex_observed_priority_turns
         .as_ref()?;
-    crate::heap_layout_bound::completed_bound(job, STATE_BYTES)
+    crate::heap_layout_bound::completed_bound(job, state_bytes())
 }
 
 /// The pause walk is the resumed page's starting copy-budget charge (E3):
@@ -3999,15 +3999,15 @@ fn admission_feasible(cursor: &CursorState, charge: usize, mandatory: bool) -> b
             return Some(state);
         }
         let empty = BTreeMap::<String, JoinProvenance>::new();
-        let forgettable =
-            bound(&cursor.join_owners, STATE_BYTES)?.checked_sub(bound(&empty, STATE_BYTES)?)?;
+        let forgettable = bound(&cursor.join_owners, state_bytes())?
+            .checked_sub(bound(&empty, state_bytes())?)?;
         // PR-P: parent witnesses are evictable for a mandatory charge only.
         let no_parents = BTreeMap::<String, NamespaceParents>::new();
-        let witnesses =
-            bound(&cursor.parents, STATE_BYTES)?.checked_sub(bound(&no_parents, STATE_BYTES)?)?;
+        let witnesses = bound(&cursor.parents, state_bytes())?
+            .checked_sub(bound(&no_parents, state_bytes())?)?;
         state.checked_sub(forgettable)?.checked_sub(witnesses)
     });
-    let floor = bound(&super::RetainedCache::default(), STATE_BYTES);
+    let floor = bound(&super::RetainedCache::default(), state_bytes());
     state
         .zip(floor)
         .and_then(|(state, floor)| {
@@ -4088,7 +4088,7 @@ fn admit_locked(
             continue;
         }
         let Some(floor) =
-            crate::heap_layout_bound::bound(&super::RetainedCache::default(), STATE_BYTES)
+            crate::heap_layout_bound::bound(&super::RetainedCache::default(), state_bytes())
         else {
             return false;
         };
@@ -4158,7 +4158,7 @@ impl SharedCache {
     ) -> usize {
         self.with_cursor(|cursor| {
             let reservation = |cursor: &CursorState| {
-                live.saturating_add(state_for_main(cursor).unwrap_or(STATE_BYTES))
+                live.saturating_add(state_for_main(cursor).unwrap_or(state_bytes()))
                     .saturating_add(super::side_ledger::SIDE_LEDGER_BYTES)
             };
             let needed = !cursor.headers.is_empty()
@@ -4168,7 +4168,7 @@ impl SharedCache {
             });
             reservation(cursor)
         })
-        .unwrap_or(STATE_BYTES)
+        .unwrap_or(state_bytes())
     }
     pub(in crate::snapshots) fn refresh_header(
         &self,
@@ -4286,9 +4286,9 @@ impl SharedCache {
     /// this whole-state measure is for tests.
     #[cfg(test)]
     pub(super) fn cursor_resident(&self) -> usize {
-        self.with_cursor(|cursor| crate::heap_layout_bound::bound(&*cursor, STATE_BYTES))
+        self.with_cursor(|cursor| crate::heap_layout_bound::bound(&*cursor, state_bytes()))
             .flatten()
-            .unwrap_or(STATE_BYTES)
+            .unwrap_or(state_bytes())
     }
 
     /// U1a-2a (cc row 3, rev 11 §5.4): `cursor_resident` as main measures
@@ -4299,14 +4299,14 @@ impl SharedCache {
     pub(super) fn cursor_resident_for_main(&self) -> usize {
         self.with_cursor(|cursor| state_for_main(cursor))
             .flatten()
-            .unwrap_or(STATE_BYTES)
+            .unwrap_or(state_bytes())
     }
 
     /// U1a-2a (cc row 3, ss-6): after a retained insert that reserved
     /// `cursor_resident_for_main()`, still under the insert's retained lock:
     /// drop the suspended proof (freeing its box) if `live_bytes_in`, the
     /// side ledger's fixed charge, the whole cursor state and the retained
-    /// copies no longer fit `STATE_BYTES`, the retained cache's own limit.
+    /// copies no longer fit `state_bytes()`, the retained cache's own limit.
     /// So the insert's choice never depended on the proof, and the proof is
     /// gone before the insert returns and anything else spends that room.
     pub(super) fn drop_suspended_proof_if_over(
@@ -4314,7 +4314,7 @@ impl SharedCache {
         retained: &super::RetainedCache,
         live_bytes_in: usize,
     ) {
-        let budget = STATE_BYTES
+        let budget = state_bytes()
             .checked_sub(live_bytes_in)
             .and_then(|room| room.checked_sub(super::side_ledger::SIDE_LEDGER_BYTES));
         self.with_cursor(|cursor| drop_suspended_proof_over(retained, cursor, 0, budget));
@@ -4367,12 +4367,12 @@ impl SharedCache {
 
     /// U1a-2a D6(e): M1's release room, under the caller's retained lock, in
     /// one cursor critical section (retained, then cursor; nothing relocks).
-    /// The room is main's: `STATE_BYTES` less `state_for_main` (no suspended
+    /// The room is main's: `state_bytes()` less `state_for_main` (no suspended
     /// proof) and `pinned`, which carries the side ledger's fixed charge
     /// once (`context_overhead`), as `heap_bound` and `admission_budget` do.
     /// Only where `reachable(room)` holds (the caller's fit can be met) is a
     /// suspended proof retired, and only when the whole state (the proof
-    /// included), the copies and `pinned` overflow `STATE_BYTES`; counted
+    /// included), the copies and `pinned` overflow `state_bytes()`; counted
     /// `side_proof_release_drops`, never a retained release cause. So the
     /// proof's bytes count toward the fit before any copy is evicted, and
     /// the room returned is the no-proof one. Nothing mandatory (main's
@@ -4386,13 +4386,13 @@ impl SharedCache {
         reachable: impl Fn(usize) -> bool,
     ) -> Option<usize> {
         self.with_cursor(|cursor| {
-            let room = |cursor: &CursorState| STATE_BYTES.checked_sub(state_for_main(cursor)?)?
+            let room = |cursor: &CursorState| state_bytes().checked_sub(state_for_main(cursor)?)?
                 .checked_sub(pinned);
-            let needed = !room(cursor).zip(crate::heap_layout_bound::bound(retained, STATE_BYTES))
+            let needed = !room(cursor).zip(crate::heap_layout_bound::bound(retained, state_bytes()))
                 .is_some_and(|(room, copies)| copies <= room);
             reclaim_headers(cursor, needed, |cursor| room(cursor).is_some_and(&reachable));
             let room = room(cursor).filter(|room| reachable(*room))?;
-            if retire_suspended_proof_over(retained, cursor, pinned, Some(STATE_BYTES)) {
+            if retire_suspended_proof_over(retained, cursor, pinned, Some(state_bytes())) {
                 crate::local_resource_diagnostics::codex_side_lifecycle::record(
                     crate::local_resource_diagnostics::codex_side_lifecycle::Event::ProofReleaseDrop,
                 );
@@ -6718,7 +6718,7 @@ impl SingletonMemo {
         self.clock = self.clock.wrapping_add(1);
         entry.used = self.clock;
         let Some(heap) =
-            crate::heap_layout_bound::bound(&(key.clone(), entry.clone()), STATE_BYTES)
+            crate::heap_layout_bound::bound(&(key.clone(), entry.clone()), state_bytes())
         else {
             // Unsupported layout or unbounded: hold no memo, keep re-reading.
             self.entries.remove(&key);

@@ -205,7 +205,7 @@ impl OwnedSourceScan {
         committed: &mut ScanIndex,
         path: &Path,
     ) -> Result<()> {
-        if !self.index.o3_replay.needs_save() {
+        if !super::restart_restore::enabled() || !self.index.o3_replay.needs_save() {
             return Ok(());
         }
         let previous = std::mem::replace(&mut committed.o3_replay, self.index.o3_replay.clone());
@@ -225,6 +225,7 @@ mod tests {
     use super::*;
     #[test]
     fn saved_upgrade_spend_survives_restart_and_index_copy_without_grant() {
+        let _restart_restore = super::super::restart_restore::RestartRestoreForTest::enabled();
         let root = crate::test_scratch::private_dir("o3-negative-reservation");
         let path = root.join("index.json");
         let mut index = ScanIndex::default();

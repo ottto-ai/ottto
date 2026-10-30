@@ -2443,6 +2443,7 @@ fn held_original_keeps_dependent_copy_proof_only_while_committed_entry_unchanged
 #[cfg(unix)]
 #[test]
 fn held_original_production_exit_conserves_copy_money_while_committed_entry_unchanged() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let scratch = crate::test_scratch::ScratchDir::new("held-census-production");
     let root = scratch.join("projects");

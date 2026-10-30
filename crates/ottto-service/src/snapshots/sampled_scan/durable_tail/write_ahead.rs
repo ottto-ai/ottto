@@ -331,6 +331,9 @@ impl SharedCache {
 
     /// The plain pass flush is owned so no filesystem write runs under Stores.
     pub(crate) fn durable_flush_pass(&self, source: SnapshotSource) -> std::io::Result<()> {
+        if !restart_restore::enabled() {
+            return Ok(());
+        }
         let Some(ds) = durable_source(source) else {
             return Ok(());
         };

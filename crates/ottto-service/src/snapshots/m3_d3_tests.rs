@@ -435,6 +435,7 @@ fn count_unlinks(record: PathBuf) -> Rc<Cell<u64>> {
 /// successful write releases it with a Tail catch-up equal to a cold Full.
 #[test]
 fn m3_d3_claude_double_fault_holds_only_that_key_until_its_next_write() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -546,6 +547,7 @@ fn m3_d3_claude_double_fault_holds_only_that_key_until_its_next_write() {
 /// the completion publishes degraded with no record and no hold.
 #[test]
 fn m3_d3_claude_cleanup_proving_a_absent_publishes_degraded() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -589,6 +591,7 @@ fn m3_d3_claude_cleanup_proving_a_absent_publishes_degraded() {
 /// and the key's next write releases it with a Tail equal to a cold Full.
 #[test]
 fn m3_d3_enospc_pauses_the_store_preserves_a_and_resumes_when_space_frees() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -672,6 +675,7 @@ fn m3_d3_enospc_pauses_the_store_preserves_a_and_resumes_when_space_frees() {
 /// is ever emitted for it.
 #[test]
 fn m3_d3_held_key_keeps_865_debt_membership_and_record_never_absent() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -752,6 +756,7 @@ impl Change {
 /// file afterwards, including after a restart.
 #[test]
 fn m3_d3_content_change_releases_a_held_key_while_writes_still_fail() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -806,6 +811,7 @@ fn m3_d3_content_change_releases_a_held_key_while_writes_still_fail() {
 /// is the file:line proof on `codex_strict_rebind`.
 #[test]
 fn m3_d3_codex_strict_rebind_survives_save_and_load_and_refuses_a_with_one_full() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -967,6 +973,7 @@ fn kill_child(root: PathBuf, point: OrderPoint) {
 /// read, and leaves no orphan temp.
 #[test]
 fn m3_d3_sigkill_at_native_order_points_recovers_exactly_once() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if let Some(root) = std::env::var_os(KILL_ROOT) {
         let point = OrderPoint::parse(&std::env::var(KILL_POINT).unwrap());
         return kill_child(PathBuf::from(root), point);
@@ -1040,6 +1047,7 @@ fn m3_d3_sigkill_at_native_order_points_recovers_exactly_once() {
 /// authorized. The barrier saves retained facts, never the newly parsed end.
 #[test]
 fn m3_codex_native_double_fault_commits_only_pre_binding_before_publish() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -1107,6 +1115,7 @@ fn m3_codex_native_double_fault_commits_only_pre_binding_before_publish() {
 /// refuses A. Kill an actual native double-fault process on both sides.
 #[test]
 fn m3_d3_sigkill_at_pre_ack_fault_barrier_preserves_pre_facts() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if let Some(root) = std::env::var_os(KILL_ROOT) {
         let after = std::env::var(KILL_POINT).unwrap() == "after_fault_barrier";
         let mut rig = Rig::open(SnapshotSource::Codex, PathBuf::from(root));
@@ -1232,6 +1241,7 @@ fn m3_d3_sigkill_at_pre_ack_fault_barrier_preserves_pre_facts() {
 
 #[test]
 fn m3_codex_native_pass_budget_is_counted_not_persisted_without_hold_or_debt() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -1267,6 +1277,7 @@ fn m3_codex_native_pass_budget_is_counted_not_persisted_without_hold_or_debt() {
 /// file to a grouped pair; old native bytes cannot enter the joined reduction.
 #[test]
 fn m3_codex_singleton_to_group_refuses_native_restore_and_retires_record() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let mut rig = Rig::new(SnapshotSource::Codex, "m3-singleton-group");
     rig.create(CODEX_SESSION, 2);
     assert_eq!(rig.pass().published(CODEX_SESSION), 1);
@@ -1325,6 +1336,7 @@ fn m3_codex_singleton_to_group_refuses_native_restore_and_retires_record() {
 /// receipt must refuse A across restart even when the first GC unlink fails.
 #[test]
 fn m3_codex_post_read_tier_transition_refuses_a_across_failed_gc_and_restart() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }

@@ -180,6 +180,7 @@ impl Fixture {
 
 #[test]
 fn unsupported_native_finish_keeps_legacy_path_without_a_v3_record() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -222,6 +223,7 @@ fn unsupported_native_finish_keeps_legacy_path_without_a_v3_record() {
 
 #[test]
 fn preexisting_v3_on_unsupported_layout_reads_only_selected_key_then_retires_after_settlement() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -298,6 +300,7 @@ fn preexisting_v3_on_unsupported_layout_reads_only_selected_key_then_retires_aft
 
 #[test]
 fn unsupported_layout_never_retires_a_newer_or_unknown_record() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -335,6 +338,7 @@ fn unsupported_layout_never_retires_a_newer_or_unknown_record() {
     ignore = "actual native retained-layout restore control"
 )]
 fn supported_native_layout_still_restores_a_grown_key() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -370,6 +374,7 @@ fn supported_native_layout_still_restores_a_grown_key() {
 
 #[test]
 fn unsupported_layout_budget_deferral_keeps_a_until_a_real_selected_read() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -445,6 +450,7 @@ fn unsupported_layout_budget_deferral_keeps_a_until_a_real_selected_read() {
 /// equal-or-earlier persisted carrier. GC counts successful unlink, not intent.
 #[test]
 fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -605,6 +611,7 @@ fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
 /// nor erase the already finalized positive body or its re-armed audit debt.
 #[test]
 fn unsupported_layout_retryable_loss_preserves_prior_body_and_debt_after_gc() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }

@@ -1157,7 +1157,7 @@ impl RestoreCounts {
     pub(crate) fn record(&mut self, outcome: &crate::snapshots::sampled_scan::RestoreOutcome) {
         use crate::snapshots::sampled_scan::RestoreOutcome;
         let count = match outcome {
-            RestoreOutcome::Restored(..) => &mut self.restored,
+            RestoreOutcome::Restored(..) | RestoreOutcome::M1Restored(..) => &mut self.restored,
             RestoreOutcome::Held(_) | RestoreOutcome::FloorHeld => &mut self.held,
             RestoreOutcome::Pending => &mut self.pending,
             RestoreOutcome::Miss(class) => self.miss.entry(class.label()).or_default(),

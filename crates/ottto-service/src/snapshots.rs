@@ -186,6 +186,9 @@ pub(crate) mod line_delivery;
 mod line_delivery_tests;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
+mod restart_restore;
+#[cfg(test)]
+pub(crate) use restart_restore::RestartRestoreForTest;
 mod sampled_audit;
 mod sampled_jsonl;
 #[cfg(unix)]
@@ -26875,7 +26878,7 @@ impl OwnedSourceScan {
             context_curve_enabled,
             claude_request_identity_capture,
             &[],
-            Some(cache),
+            restart_restore::enabled().then_some(cache),
         )
     }
 
@@ -27943,7 +27946,8 @@ impl OwnedSourceScan {
             macro_rules! migration_failure {
                 ($candidate:expr) => {
                     #[cfg(unix)]
-                    if source == SnapshotSource::ClaudeCode
+                    if restart_restore::enabled()
+                        && source == SnapshotSource::ClaudeCode
                         && sampling
                             .as_ref()
                             .is_some_and(|c| c.cache.migration_failure(index, $candidate))
@@ -28801,8 +28805,13 @@ impl OwnedSourceScan {
                         for member in &group_members {
                             let mut due = None;
                             let key = local_index_key(&member.path);
-                            let held = cache
-                                .durable_member_hold_active(source, &key, false, index, &mut due);
+                            let held = cache.durable_member_hold_active(
+                                source,
+                                &key,
+                                !restart_restore::enabled(),
+                                index,
+                                &mut due,
+                            );
                             if let Some(at) =
                                 group.members.iter().position(|m| m.path == member.path)
                             {
@@ -28811,9 +28820,12 @@ impl OwnedSourceScan {
                             if let Some(reason) = held {
                                 refused = true;
                                 cache.durable_hold_exit(source, reason, index, member, &mut census);
+                                if !restart_restore::enabled() {
+                                    break;
+                                }
                             }
                         }
-                        if !refused {
+                        if restart_restore::enabled() && !refused {
                             for member in &group_members {
                                 let key = local_index_key(&member.path);
                                 if let Some(reason) = cache.durable_member_hold_active(
@@ -29068,6 +29080,9 @@ impl OwnedSourceScan {
                                         member,
                                         &mut census,
                                     );
+                                    if !restart_restore::enabled() {
+                                        break;
+                                    }
                                 }
                                 Err(_) => {
                                     refused = true;
@@ -30440,7 +30455,8 @@ impl OwnedSourceScan {
                 // duplicated, never read, before the parser is consumed: the
                 // commit fences check it after a native Ok.
                 #[cfg(unix)]
-                let excluded_native_class = source == SnapshotSource::Codex
+                let excluded_native_class = restart_restore::enabled()
+                    && source == SnapshotSource::Codex
                     && !comparison_target
                     && side_origin.is_none()
                     && (!aliases.is_empty()
@@ -30455,7 +30471,8 @@ impl OwnedSourceScan {
                     .as_ref()
                     .zip(file_sampling.as_ref())
                     .filter(|_| {
-                        matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex)
+                        restart_restore::enabled()
+                            && matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex)
                             && !comparison_target
                             && side_origin.is_none()
                             && aliases.is_empty()
@@ -32885,7 +32902,8 @@ impl OwnedSourceScan {
             }
             // S2: preserve accepted facts before candidate/working-entry changes.
             #[cfg(unix)]
-            let accepted_floor = (source == SnapshotSource::ClaudeCode)
+            let accepted_floor = (restart_restore::enabled()
+                && source == SnapshotSource::ClaudeCode)
                 .then(|| {
                     sampled_scan::durable_tail::AcceptedFloor::of(
                         index,
@@ -33856,21 +33874,27 @@ impl OwnedSourceScan {
                     None
                 };
                 #[cfg(unix)]
-                let (mut taken, mut preparation_lease) =
-                    match context.cache.take_prepared(source, &key) {
-                        Ok(Some((taken, lease))) => (Some(taken), Some(lease)),
-                        Ok(None) => (None, None),
-                        Err(()) => {
-                            residue_index_keys.insert(key.clone());
-                            context.cache.durable_custody_hold(
-                                source,
-                                "prepared_funding_pending",
-                                index,
-                                &candidate,
-                            );
-                            pending!();
-                        }
-                    };
+                let (mut taken, mut preparation_lease) = match if restart_restore::enabled() {
+                    context
+                        .cache
+                        .take_prepared(source, &key)
+                        .map(|taken| taken.map(|(taken, lease)| (taken, Some(lease))))
+                } else {
+                    Ok(context.cache.take(&key).map(|taken| (taken, None)))
+                } {
+                    Ok(Some((taken, lease))) => (Some(taken), lease),
+                    Ok(None) => (None, None),
+                    Err(()) => {
+                        residue_index_keys.insert(key.clone());
+                        context.cache.durable_custody_hold(
+                            source,
+                            "prepared_funding_pending",
+                            index,
+                            &candidate,
+                        );
+                        pending!();
+                    }
+                };
                 #[cfg(unix)]
                 if let Some((taken, receipt)) = taken.as_mut().zip(receipt.as_ref()) {
                     if let Some(owed) = taken.durable.take_owed() {
@@ -33904,62 +33928,69 @@ impl OwnedSourceScan {
                     ($taken:expr, $reason:expr) => {{
                         let reason: Option<&'static str> = $reason;
                         let taken = $taken;
-                        let returned = if taken.durable.owed().is_some() {
-                            let live_bytes = taken.finalization_charge;
-                            match context
-                                .cache
-                                .return_owed_taken(key.clone(), taken, live_bytes)
-                            {
-                                sampled_scan::durable_tail::OwedAdmission::Admitted => Ok(()),
-                                sampled_scan::durable_tail::OwedAdmission::Refused(taken) => {
-                                    Err(taken)
+                        if restart_restore::enabled() {
+                            let returned = if taken.durable.owed().is_some() {
+                                let live_bytes = taken.finalization_charge;
+                                match context.cache.return_owed_taken(
+                                    key.clone(),
+                                    taken,
+                                    live_bytes,
+                                ) {
+                                    sampled_scan::durable_tail::OwedAdmission::Admitted => Ok(()),
+                                    sampled_scan::durable_tail::OwedAdmission::Refused(taken) => {
+                                        Err(taken)
+                                    }
                                 }
-                            }
-                        } else {
-                            context.cache.return_prepared_taken(key.clone(), taken)
-                        };
-                        match returned {
-                            Ok(()) =>
-                            {
-                                #[cfg(unix)]
-                                if let Some(lease) = preparation_lease.take() {
-                                    lease.release();
-                                }
-                            }
-                            Err(taken) => {
-                                parser.pending_taken = Some(taken);
-                                parser.pending_returns = 1;
-                                #[cfg(unix)]
+                            } else {
+                                context.cache.return_prepared_taken(key.clone(), taken)
+                            };
+                            match returned {
+                                Ok(()) =>
                                 {
-                                    parser.pending_funding = preparation_lease.take();
+                                    #[cfg(unix)]
+                                    if let Some(lease) = preparation_lease.take() {
+                                        lease.release();
+                                    }
                                 }
-                                active_file = Some(Box::new(OwnedActiveFile {
-                                    comparison_target,
-                                    sampling: None,
-                                    recovered_audit_due,
-                                    candidate,
-                                    decision,
-                                    previous_snapshot_fingerprint,
-                                    previous_upload_body_witness,
-                                    projection_adoption_required,
-                                    source_file_fingerprint,
-                                    parser,
-                                    aliases: Vec::new(),
-                                    applied_receipts: BTreeMap::new(),
-                                    cursor: None,
-                                    charged_bytes: 0,
-                                    hold_offset: None,
-                                    group: None,
-                                    side_origin,
-                                }));
+                                Err(taken) => {
+                                    parser.pending_taken = Some(taken);
+                                    parser.pending_returns = 1;
+                                    #[cfg(unix)]
+                                    {
+                                        parser.pending_funding = preparation_lease.take();
+                                    }
+                                    active_file = Some(Box::new(OwnedActiveFile {
+                                        comparison_target,
+                                        sampling: None,
+                                        recovered_audit_due,
+                                        candidate,
+                                        decision,
+                                        previous_snapshot_fingerprint,
+                                        previous_upload_body_witness,
+                                        projection_adoption_required,
+                                        source_file_fingerprint,
+                                        parser,
+                                        aliases: Vec::new(),
+                                        applied_receipts: BTreeMap::new(),
+                                        cursor: None,
+                                        charged_bytes: 0,
+                                        hold_offset: None,
+                                        group: None,
+                                        side_origin,
+                                    }));
+                                    pending!();
+                                }
+                            }
+                            if let Some(reason) = reason {
+                                returned_refusal = Some(reason);
+                                retained_offset = None;
+                            } else {
                                 pending!();
                             }
-                        }
-                        if let Some(reason) = reason {
-                            returned_refusal = Some(reason);
-                            retained_offset = None;
                         } else {
-                            pending!();
+                            // Main drops optional copies rejected by eligibility;
+                            // no M3 custody return/admission or retry while OFF.
+                            drop(taken);
                         }
                     }};
                 }
@@ -34021,7 +34052,8 @@ impl OwnedSourceScan {
                 // session, not admitting a new cold file to sampled acquisition.
                 // Without an index entry or its own held-new certificate, keep
                 // main's unsampled read and copy-refusal exemption.
-                let scoped_claude_metadata = source == SnapshotSource::ClaudeCode
+                let scoped_claude_metadata = restart_restore::enabled()
+                    && source == SnapshotSource::ClaudeCode
                     && !sidecar_census_complete
                     && (index.files.contains_key(&key) || e2_held_new_file);
                 if !(owning_header_is_current
@@ -34029,7 +34061,7 @@ impl OwnedSourceScan {
                     && (sidecar_census_complete || scoped_claude_metadata))
                 {
                     if let Some(taken) = retained.take() {
-                        if source == SnapshotSource::ClaudeCode {
+                        if restart_restore::enabled() && source == SnapshotSource::ClaudeCode {
                             claude_request_census::retain_held(index, &candidate);
                         }
                         return_original!(taken, Some("census"));
@@ -34054,7 +34086,7 @@ impl OwnedSourceScan {
                         .reduction_dependencies_available
                         .observe(reduction_sidecar.is_some());
                     if reduction_sidecar.is_none() && retained.is_some() {
-                        if source == SnapshotSource::ClaudeCode {
+                        if restart_restore::enabled() && source == SnapshotSource::ClaudeCode {
                             claude_request_census::retain_held(index, &candidate);
                         }
                         return_original!(retained.take().expect("present"), Some("dependency"));
@@ -34181,7 +34213,7 @@ impl OwnedSourceScan {
                                         lease,
                                     ) => {
                                         preparation_lease = Some(lease);
-                                        restored_claude = source == SnapshotSource::ClaudeCode;
+                                        restored_claude = restart_restore::enabled() && source == SnapshotSource::ClaudeCode;
                                         retained_offset =
                                             Some(taken.retained.checkpoint.sealed_offset());
                                         let admission = (
@@ -34189,6 +34221,11 @@ impl OwnedSourceScan {
                                             taken.finalization_charge,
                                             taken.retained.state.usage_witness(),
                                         );
+                                        (Some(taken), Some(admission), debt)
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::M1Restored(taken) => {
+                                        retained_offset = Some(taken.retained.checkpoint.sealed_offset());
+                                        let admission = (taken.modified_hint, taken.finalization_charge, taken.retained.state.usage_witness());
                                         (Some(taken), Some(admission), debt)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::FloorHeld => {
@@ -34364,7 +34401,9 @@ impl OwnedSourceScan {
                         // original back with its receipt debt and funding.
                         if !allow_sample {
                             if let Some(taken) = retained.take() {
-                                if source == SnapshotSource::ClaudeCode {
+                                if restart_restore::enabled()
+                                    && source == SnapshotSource::ClaudeCode
+                                {
                                     claude_request_census::retain_held(index, &candidate);
                                 }
                                 return_original!(
@@ -34385,7 +34424,7 @@ impl OwnedSourceScan {
                             sampled_scan::now_seconds(),
                             |checkpoint, file| {
                                 #[cfg(unix)]
-                                if restored_claude {
+                                if restart_restore::enabled() && restored_claude {
                                     let accepted_end = durable_accepted.expect("restored floor").end;
                                     match context.cache.begin_retail(
                                         source, &key, checkpoint, file, accepted_end, std::time::Instant::now(),
@@ -34429,7 +34468,7 @@ impl OwnedSourceScan {
                                     }
                                 };
                                 if let Some(taken) = rejected.taken {
-                                    if source == SnapshotSource::ClaudeCode {
+                                    if restart_restore::enabled() && source == SnapshotSource::ClaudeCode {
                                         claude_request_census::retain_held(index, &candidate);
                                     }
                                     return_original!(taken, refusal);
@@ -34894,6 +34933,7 @@ impl OwnedSourceScan {
             {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
                     if source == SnapshotSource::ClaudeCode
+                        && restart_restore::enabled()
                         && !paced_full_granted
                         && !active_bound_degraded
                         && migration_floor.is_none()
@@ -34976,7 +35016,7 @@ impl OwnedSourceScan {
             }
             if let Some(context) = sampling.as_mut() {
                 #[cfg(unix)]
-                if source == SnapshotSource::ClaudeCode
+                if restart_restore::enabled() && source == SnapshotSource::ClaudeCode
                     // No plan is the existing unsampled native Full path.
                     && planned_mode.map_or(true, |(mode, _)| {
                         matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
@@ -37197,7 +37237,10 @@ pub(crate) fn commit_store_fault_barrier(
     committed: &mut ScanIndex,
     index_path: &Path,
 ) -> Result<bool> {
-    if source != SnapshotSource::Codex || !cache.durable_store_faulted(source) {
+    if !restart_restore::enabled()
+        || source != SnapshotSource::Codex
+        || !cache.durable_store_faulted(source)
+    {
         return Ok(false);
     }
     let mut changed = false;

@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) mod acquired;
+mod m1;
 pub(crate) use acquired::{AcquiredChain, AcquisitionProtocol, ImmutableCounting};
 mod owed;
 pub(in crate::snapshots) use owed::OwedCompletionAdmission;
@@ -281,8 +282,14 @@ impl Counters {
             .each_ref()
             .map(|value| value.load(Ordering::Relaxed));
         let input_head = rederive_head_bytes_total(source);
+        let switch = if restart_restore::enabled() {
+            "on"
+        } else {
+            "off"
+        };
+        let on_refused = restart_restore::on_refused_discovery_dependency();
         format!(
-            "ottto-service: durable_tail source={} original_v1_mapped={} durable_restore_after_selection_clear={} objects[same,unknown,changed]={:?} s2_skipped_object_changed={} \
+            "ottto-service: durable_tail source={} restart_restore={switch} restart_restore_on_refused{{reason=discovery_dependency}}={on_refused} original_v1_mapped={} durable_restore_after_selection_clear={} objects[same,unknown,changed]={:?} s2_skipped_object_changed={} \
              retail_attempts={} retail_keys={} near_cap={} pace_anomaly={} upgrade_missing_full={} migration[held,await_save,claimed,replaced]={:?} retail_exhausted[full,paced,pace_evicted]={:?} tail_read_bytes={} retail_physical_bytes[process,daily]={:?} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} upgrade_state_missing={} \
              active_bound[claude,codex,pi]={:?} resource_full={{{}}} rederive_head_bytes={} rederive_named_lines={} rederive_line_bytes={} rederive_budget[refused,refused_bytes]={:?} not_persisted={{{}}} ineligible={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} store_write_failed[setup,inventory,statvfs]={:?} disk_records={} disk_bytes={} \
@@ -883,7 +890,7 @@ impl<'a> Interpretation<'a> {
             identity_contract.push_str(&format!("|attr={}", claude_attribution_capture_enabled()));
         }
         Self {
-            accepted: (source == SnapshotSource::ClaudeCode)
+            accepted: (restart_restore::enabled() && source == SnapshotSource::ClaudeCode)
                 .then(|| AcceptedFloor::of(index, key))
                 .flatten(),
             identity_contract,
@@ -2127,14 +2134,16 @@ impl SharedCache {
             return;
         };
         let dir = store::store_dir_for_index(index_path);
-        // P2 head budget is per pass; authorityless custody nodes are freed.
-        stores.rederive_spent[source.slot()] = 0;
-        // A native error may discard staging without a publication. Its empty
-        // reservation carries no authority and cannot pin next-pass capacity.
-        stores.key_debt.retain(|_, debt| !debt.is_empty());
-        stores
-            .retail_spent
-            .retain(|_, custody| custody.has_authority());
+        if restart_restore::enabled() {
+            // P2 head budget is per pass; authorityless custody nodes are freed.
+            stores.rederive_spent[source.slot()] = 0;
+            // A native error may discard staging without a publication. Its empty
+            // reservation carries no authority and cannot pin next-pass capacity.
+            stores.key_debt.retain(|_, debt| !debt.is_empty());
+            stores
+                .retail_spent
+                .retain(|_, custody| custody.has_authority());
+        }
         let changed = stores.slot(source).as_ref().map_or(true, |slot| {
             slot.dir != dir
                 || slot.namespace != *namespace
@@ -2155,7 +2164,10 @@ impl SharedCache {
             current.identity_capture = identity_capture;
             current.skill_labels_enabled = false;
         } else {
-            if let Some(old) = slot.as_mut().filter(|s| s.store.has_pending()) {
+            if let Some(old) = slot
+                .as_mut()
+                .filter(|s| restart_restore::enabled() && s.store.has_pending())
+            {
                 old.store.disable("namespace_pending");
                 return;
             }
@@ -2176,10 +2188,13 @@ impl SharedCache {
             });
         }
         if let Some(slot) = slot.as_mut() {
+            if !restart_restore::enabled() {
+                slot.store.restrict_reads_to_v1();
+            }
             slot.store.begin_pass();
             // At most one resource probe per pass; the store owns its back-off.
             // Held keys retry through their own next native write.
-            if slot.store.resource_paused() {
+            if restart_restore::enabled() && slot.store.resource_paused() {
                 if let Some(writer) = crate::locked_state_dir::held_for(&slot.dir) {
                     let index_len = std::fs::metadata(index_path).map_or(0, |m| m.len());
                     slot.store.check_resources(writer, index_len);
@@ -2198,7 +2213,8 @@ impl SharedCache {
         self.durable_guard(snapshot_source, key, false, index, recovered_audit_due)
             .or_else(|| {
                 // Downgrade exception: a newer accepted body revision is held, never re-read.
-                (snapshot_source == SnapshotSource::ClaudeCode
+                (restart_restore::enabled()
+                    && snapshot_source == SnapshotSource::ClaudeCode
                     && index.files.get(key).is_some_and(|e| {
                         e.effective_upload_body_witness_revision
                             > effective_revision(snapshot_source)
@@ -2307,6 +2323,9 @@ impl SharedCache {
         key: &str,
         index: &ScanIndex,
     ) -> Result<Option<u64>, store::ActiveOverBudget> {
+        if !restart_restore::enabled() {
+            return Ok(self.durable_carrier_reprobe_active(source, key, index));
+        }
         if !self.durable_classifier_enabled(source)? {
             return Ok(None);
         }
@@ -2401,6 +2420,9 @@ impl SharedCache {
         key: &str,
         guard: impl FnOnce(&Self) -> Option<store::Refusal>,
     ) -> Result<Option<store::Refusal>, store::ActiveOverBudget> {
+        if !restart_restore::enabled() {
+            return Ok(guard(self));
+        }
         if !self.durable_classifier_enabled(source)? {
             return Ok(None); // D-DISABLED/absent: no input allocation is needed.
         }
@@ -2431,6 +2453,9 @@ impl SharedCache {
         source: SnapshotSource,
         members: impl FnOnce(&Self) -> bool,
     ) -> Result<bool, store::ActiveOverBudget> {
+        if !restart_restore::enabled() {
+            return Ok(members(self));
+        }
         if !self.durable_classifier_enabled(source)? {
             return Ok(false); // No classifier/no T14 grant; native group proceeds.
         }
@@ -2442,6 +2467,9 @@ impl SharedCache {
         source: SnapshotSource,
         probe: impl FnOnce(&Self) -> T,
     ) -> Result<T, store::ActiveOverBudget> {
+        if !restart_restore::enabled() {
+            return Ok(probe(self));
+        }
         // Reserve BEFORE taking Stores; mutex serialization cannot fund a
         // classifier envelope while another worker decodes outside Stores.
         let store::LeaseWait::Granted(lease) =
@@ -2813,6 +2841,9 @@ impl SharedCache {
         index: &mut ScanIndex,
         candidate: &CandidateFile,
     ) -> bool {
+        if !restart_restore::enabled() {
+            return false;
+        }
         let key = local_index_key(&candidate.path);
         let hold = self.durable().is_some_and(|mut s| {
             s.retail_spent
@@ -2898,6 +2929,17 @@ impl SharedCache {
         index: &ScanIndex,
         interpretation: &Interpretation<'_>,
     ) -> RestoreOutcome {
+        if !restart_restore::enabled() {
+            return self.m1_restore(
+                snapshot_source,
+                key,
+                path,
+                scope,
+                held,
+                index,
+                interpretation,
+            );
+        }
         let floor_behind = interpretation
             .accepted
             .is_some_and(|a| held.metadata().map_or(true, |m| a.behind(m.len())));
@@ -4051,6 +4093,9 @@ impl SharedCache {
     /// A proved non-singleton class keeps its native owner. No mark or pending
     /// receipt is cleared by a class flag; outstanding debt stays counted/parked.
     pub(in crate::snapshots) fn durable_exclude_native_class(&self, key: &str) {
+        if !restart_restore::enabled() {
+            return;
+        }
         let Some(mut stores) = self.durable() else {
             return;
         };
@@ -4101,6 +4146,9 @@ impl SharedCache {
         index: &mut ScanIndex,
         verified: bool,
     ) {
+        if !restart_restore::enabled() {
+            return;
+        }
         if crate::heap_layout_bound::layout_supported() {
             return;
         }
@@ -4282,6 +4330,9 @@ impl SharedCache {
         key: &str,
         fingerprint: &str,
     ) -> bool {
+        if !restart_restore::enabled() {
+            return false;
+        }
         let Some(mut stores) = self.durable() else {
             return true;
         };
@@ -4316,6 +4367,9 @@ impl SharedCache {
         index: &mut ScanIndex,
         index_path: &Path,
     ) -> usize {
+        if !restart_restore::enabled() {
+            return 0;
+        }
         if !index_path.starts_with(writer.state_dir()) {
             return 0;
         }
@@ -4402,12 +4456,6 @@ impl SharedCache {
         index: &ScanIndex,
     ) -> Option<store::BatchReceipt> {
         durable_source(snapshot_source)?;
-        let store::LeaseWait::Granted(lease) = self.acquire_active(
-            snapshot_source,
-            (4 * store::RECORD_BYTES + WRITE_PASS_BYTES) as u64,
-        ) else {
-            return None;
-        };
         // The index save has already committed. Consent erasure neither
         // advances an ACK nor clears custody/owed metadata. A missing record
         // subsequently follows the native recovery path on natural growth.
@@ -4420,6 +4468,15 @@ impl SharedCache {
                     .map(|slot| !slot.skill_labels_enabled && !slot.skill_label_purge_complete)
             })
             .unwrap_or(false);
+        if !restart_restore::enabled() && !purge_needed {
+            return None;
+        }
+        let store::LeaseWait::Granted(lease) = self.acquire_active(
+            snapshot_source,
+            (4 * store::RECORD_BYTES + WRITE_PASS_BYTES) as u64,
+        ) else {
+            return None;
+        };
         if purge_needed {
             let mut stores = self.durable()?;
             let slot = stores.slot(durable_source(snapshot_source)?).as_mut()?;
@@ -4446,6 +4503,10 @@ impl SharedCache {
                     );
                 }
             }
+        }
+        if !restart_restore::enabled() {
+            lease.release();
+            return None;
         }
         let service = std::time::Instant::now();
         let result = self.write_after_save_active(writer, snapshot_source, index);
@@ -4758,6 +4819,9 @@ impl SharedCache {
         snapshot_source: SnapshotSource,
         index: &ScanIndex,
     ) -> std::io::Result<()> {
+        if !restart_restore::enabled() {
+            return Ok(());
+        }
         let Some(source) = durable_source(snapshot_source) else {
             return Ok(());
         };
@@ -5233,6 +5297,8 @@ pub(crate) enum MissClass {
     Failure(Failure),
     /// A non-transient resource refusal whose held file grew: ordinary Full.
     Resource(&'static str),
+    BudgetRefused,
+    TakeLost,
     Unregistered(Obligation),
 }
 
@@ -5301,6 +5367,8 @@ impl MissClass {
             Self::StaleSelection => "ineligible.selection_cleared.stale_record",
             Self::HistoryOwed => "ineligible.history_owed",
             Self::Missing => "missing",
+            Self::BudgetRefused => "budget_refused",
+            Self::TakeLost => "restore_take_lost",
             Self::Resource(phase) | Self::Failure(Failure::Resource(phase)) => prefixed!(
                 "resource_full.",
                 phase,
@@ -5377,6 +5445,7 @@ impl MissClass {
 
 pub(crate) enum RestoreOutcome {
     Restored(Box<Taken<CachedJsonlReduction>>, store::ActiveLease),
+    M1Restored(Box<Taken<CachedJsonlReduction>>),
     Pending,
     Miss(MissClass),
     /// Known correctness hold, census-neutral; never a Full fallback.
@@ -5473,6 +5542,10 @@ mod restore_test {
     impl RestoreOutcome {
         pub(in crate::snapshots) fn into_test_option(self) -> Option<RestoredForTest> {
             match self {
+                Self::M1Restored(taken) => Some(RestoredForTest {
+                    taken: Some(taken),
+                    lease: None,
+                }),
                 Self::Restored(taken, lease) => Some(RestoredForTest {
                     taken: Some(taken),
                     lease: Some(lease),
@@ -5532,3 +5605,7 @@ mod m3_owed_tests;
 
 #[cfg(test)]
 mod resources_tests;
+
+#[cfg(test)]
+#[path = "restart_restore_tests.rs"]
+mod restart_restore_tests;

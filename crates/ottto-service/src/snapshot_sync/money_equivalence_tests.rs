@@ -409,6 +409,7 @@ fn compare_claude_uploads(pages: &[Page; 3]) -> ReceiptBody {
 }
 
 fn claude_case(name: &str) {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported(name) {
         return;
     }
@@ -704,6 +705,7 @@ fn other_wire(source: SnapshotSource, scan: &SourceScanResult) -> Vec<u8> {
     canonical(&wire)
 }
 fn codex_case(legacy: bool) {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let name = if legacy {
         "codex_legacy_acked_sticky"
     } else {
@@ -793,10 +795,12 @@ fn codex_case(legacy: bool) {
 }
 #[test]
 fn codex_v2_sticky() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     codex_case(false);
 }
 #[test]
 fn codex_legacy_acked_sticky() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     codex_case(true);
 }
 
@@ -843,6 +847,7 @@ fn grow(path: &Path, request: &str, tokens: u64) {
 /// Full's bodies. Each arm continues from its own finished index.
 #[test]
 fn restart_between_pages() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let name = "restart_between_pages";
     if !supported(name) {
         return;
@@ -880,6 +885,7 @@ fn restart_between_pages() {
 /// buildable in one test binary.
 #[test]
 fn upgrade_without_semantic_revision() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let name = "upgrade_without_semantic_revision";
     if !supported(name) {
         return;
@@ -925,6 +931,7 @@ fn upgrade_without_semantic_revision() {
 /// reduction. Its own commit then restores again on the next restart.
 #[test]
 fn downgrade_then_reupgrade() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let name = "downgrade_then_reupgrade";
     if !supported(name) {
         return;

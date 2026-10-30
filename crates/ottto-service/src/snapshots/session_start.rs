@@ -698,7 +698,6 @@ impl SessionStartState {
     }
 
     /// Moves the re-derived opening content from a head re-parse.
-    #[cfg(test)]
     pub(super) fn adopt_durable_content(&mut self, from: &mut Self) {
         self.instructions = from.instructions.take();
         self.codex_prelude = from.codex_prelude.take();

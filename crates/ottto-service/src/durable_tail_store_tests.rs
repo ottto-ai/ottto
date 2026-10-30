@@ -4905,3 +4905,74 @@ fn private_label_purge_revokes_retained_completion_but_keeps_candidate_owed() {
     assert_eq!(store.counters().receipt_reconciled, before);
     assert!(store.disabled().is_none());
 }
+
+#[test]
+fn m1_reader_ceiling_refuses_newer_envelopes_before_any_body_read() {
+    for format in [2u16, FORMAT_V3, FORMAT_V3 + 1] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("source.jsonl", b"{}\n");
+        let b = binding("account", "scope", ("fp-a", None));
+        let mut writer = scratch.store();
+        assert_eq!(
+            writer
+                .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+                .unwrap()
+                .written,
+            1
+        );
+        let record_path = writer.record_path(&b.key);
+        let mut bytes = fs::read(&record_path).unwrap();
+        bytes[8..10].copy_from_slice(&format.to_le_bytes());
+        fs::write(&record_path, &bytes).unwrap();
+        let mut reader = scratch.store();
+        reader.restrict_reads_to_v1();
+        assert!(matches!(
+            reader.read(&b.key),
+            ReadOutcome::Refused(Refusal::NewerFormat)
+        ));
+        assert_eq!(reader.counters().guard_header_bytes, DISPATCH_BYTES as u64);
+        assert_eq!(reader.counters().guard_verify_bytes, 0);
+        assert_eq!(reader.counters().bytes_read, 0);
+        assert_eq!(fs::read(&record_path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn m1_reader_ceiling_keeps_consent_erasure_for_known_v3_private_labels() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp-a", None));
+    let mut record = pending(b.clone(), certificate(&path), 1);
+    record.acquisition = Some(AcquisitionFields {
+        acquired_revision: 3,
+        protocol: crate::snapshots::AcquisitionProtocol::WriteAhead,
+    });
+    record.body = crate::snapshots::durable_store_fixture_body_with_skill();
+    let mut writer = scratch.store();
+    assert_eq!(
+        writer
+            .write_after_save(&lock, 1, 0, vec![record])
+            .unwrap()
+            .written,
+        1
+    );
+    let record_path = writer.record_path(&b.key);
+    drop(writer);
+    let mut reader = scratch.store();
+    reader.restrict_reads_to_v1();
+    assert!(matches!(
+        reader.read(&b.key),
+        ReadOutcome::Refused(Refusal::NewerFormat)
+    ));
+    assert_eq!(reader.counters().guard_verify_bytes, 0);
+    let report = reader
+        .purge_private_labels(&lock, |body| {
+            body == crate::snapshots::durable_store_fixture_body_with_skill()
+        })
+        .unwrap();
+    assert_eq!((report.erased, report.refused), (1, 0));
+    assert!(!record_path.exists());
+    assert_eq!(reader.counters().records_written, 0);
+}

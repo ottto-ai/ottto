@@ -827,6 +827,7 @@ fn ordinary_durable_continuation_to_eof(
         &ScanIndex,
     ),
 ) {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(crate::heap_layout_bound::layout_supported());
     use crate::snapshots::{OwnedSourceScan, OwnedSourceScanStep};
     let fixture = ContinuationFixture::quiescent(name);

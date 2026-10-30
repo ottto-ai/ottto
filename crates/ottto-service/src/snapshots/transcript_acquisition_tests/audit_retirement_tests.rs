@@ -1506,6 +1506,7 @@ fn cap_pace_overflow_is_counted_and_alarms_on_the_production_full() {
 
 #[test]
 fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store as store;
     if !crate::heap_layout_bound::layout_supported() {
         return;

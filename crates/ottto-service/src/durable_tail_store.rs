@@ -664,6 +664,8 @@ pub(crate) struct DurableTailStore {
     disabled: Option<&'static str>,
     /// This pass: directory checked and [records loaded, T14 rebuilds].
     checked: bool,
+    /// M1's reader ceiling, selected by the source owner before a pass.
+    read_v1_only: bool,
     pass: [u64; 2],
     /// Process-lifetime attempts, removed only after a successful replacement.
     rebuilt: BTreeMap<Digest32, Rebuild>,
@@ -719,6 +721,7 @@ impl DurableTailStore {
             cleanup: Arc::new(TempCleanupCounts::default()),
             disabled: None,
             checked: false,
+            read_v1_only: false,
             pass: [0; 2],
             rebuilt: BTreeMap::new(),
             startup_synced: false,
@@ -732,6 +735,12 @@ impl DurableTailStore {
             resource_checked: false,
             resource_granted: false,
         }
+    }
+
+    /// Preserve main's envelope admission while restart restore is OFF.
+    /// Only explicit consent erasure may inspect newer known records.
+    pub(crate) fn restrict_reads_to_v1(&mut self) {
+        self.read_v1_only = true;
     }
 
     /// A new pass: the directory is checked again and the T14 breaker resets.
@@ -872,6 +881,7 @@ impl DurableTailStore {
         work: &str,
         writer: Option<&dyn SingleWriter>,
     ) -> Result<Option<Header>, Refusal> {
+        let restoring = matches!(work, "restore" | "privacy_restore");
         let writable = writer
             .or_else(|| {
                 crate::locked_state_dir::held_for(&self.dir).map(|w| w as &dyn SingleWriter)
@@ -937,6 +947,14 @@ impl DurableTailStore {
                 self.counters.guard_header_bytes += n as u64;
             }
             first.map_err(|e| self.read_failure(e, Refusal::Undecodable))?;
+            if self.read_v1_only
+                && work != "privacy_restore"
+                && header.len() >= 10
+                && header[..8] == MAGIC
+                && u16::from_le_bytes([header[8], header[9]]) > FORMAT_V1
+            {
+                return Err(Refusal::NewerFormat);
+            }
             let (_, _, _, size) = dispatch(&header)?;
             let rest = Read::by_ref(&mut file)
                 .take((size - n) as u64)
@@ -960,8 +978,7 @@ impl DurableTailStore {
                 return Err(Refusal::Corrupt);
             }
             if let Some((content, old, _)) = self.durable.get(key) {
-                if work != "restore" && *old == stamp && (work != "overwrite" || content.is_some())
-                {
+                if !restoring && *old == stamp && (work != "overwrite" || content.is_some()) {
                     binding.content = *content;
                     return Ok(Some(binding));
                 }
@@ -982,7 +999,7 @@ impl DurableTailStore {
             }
             self.note_codec(bytes.capacity());
             verify(&bytes, self.source)?;
-            if work == "overwrite" || work == "restore" {
+            if work == "overwrite" || restoring {
                 binding.content = Some(stored_digest(&bytes));
             }
             let content = stored_digest(&bytes);
@@ -990,7 +1007,7 @@ impl DurableTailStore {
                 *allowed && *saved == stamp && *old == Some(content)
             });
             self.memoize(*key, (Some(content), stamp, allowed));
-            if work == "restore" {
+            if restoring {
                 binding.verified = Some(bytes);
             }
             Ok(Some(binding))
@@ -1119,7 +1136,7 @@ impl DurableTailStore {
         if self.receipt_pending(key) {
             return ReadOutcome::Refused(Refusal::ReceiptPending);
         }
-        match self.read_known(key, None) {
+        match self.read_known(key, None, false) {
             Ok(Some(verified)) => ReadOutcome::Found(verified.record),
             Ok(None) => ReadOutcome::Missing,
             Err(reason) => ReadOutcome::Refused(reason),
@@ -1129,8 +1146,14 @@ impl DurableTailStore {
         &mut self,
         key: &Digest32,
         writer: Option<&dyn SingleWriter>,
+        privacy_erasure: bool,
     ) -> Result<Option<VerifiedRecord>, Refusal> {
-        let mut header = match self.classify(key, "restore", writer)? {
+        let work = if privacy_erasure {
+            "privacy_restore"
+        } else {
+            "restore"
+        };
+        let mut header = match self.classify(key, work, writer)? {
             Some(header) => header,
             None => {
                 self.counters.missing += 1;
@@ -1278,7 +1301,7 @@ impl DurableTailStore {
             };
         }
         self.durable.remove(key); // Reconcile fully verifies, even a memo hit.
-        let receipted = match self.read_known(key, Some(writer)) {
+        let receipted = match self.read_known(key, Some(writer), false) {
             Ok(Some(verified)) if before == stamp_at(&path)? => {
                 if verified.identity == candidate {
                     let file = OpenOptions::new()
@@ -2180,7 +2203,7 @@ impl DurableTailStore {
                     continue;
                 }
             };
-            let verified = match self.read_known(&key, Some(writer)) {
+            let verified = match self.read_known(&key, Some(writer), true) {
                 Ok(Some(verified)) => verified,
                 Ok(None) => continue,
                 Err(Refusal::Unknown | Refusal::NewerFormat) => continue,

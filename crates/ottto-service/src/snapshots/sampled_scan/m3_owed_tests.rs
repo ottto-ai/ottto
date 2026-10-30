@@ -84,6 +84,7 @@ impl Drop for Fixture {
 
 #[test]
 fn m3_p4b_q11_n10_physical_byte_budget() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let mut f = Fixture::new();
     let now = Instant::now();
     let suffix = f.file.metadata().unwrap().len() - f.checkpoint.sealed_offset();
@@ -135,6 +136,7 @@ fn m3_p4b_q11_n10_physical_byte_budget() {
 
 #[test]
 fn n10_interruption_pass_clear_and_five_relabels_do_not_refund() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let f = Fixture::new();
     let now = Instant::now();
     // Cancellation before the first read still spends the admitted process grant.
@@ -182,6 +184,7 @@ fn n10_interruption_pass_clear_and_five_relabels_do_not_refund() {
 
 #[test]
 fn n10_clock_rollback_and_custody_overflow_fail_before_any_read() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let f = Fixture::new();
     let now = Instant::now();
     f.begin(now).unwrap().finish();
@@ -223,6 +226,7 @@ fn n10_clock_rollback_and_custody_overflow_fail_before_any_read() {
     ignore = "pacing tree admission requires the qualified native heap layout"
 )]
 fn n10_pacing_eviction_allows_growth_without_evicting_spent_authority() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let f = Fixture::new();
     let now = Instant::now();
     f.begin(now).unwrap().finish();
@@ -271,6 +275,7 @@ fn n10_pacing_eviction_allows_growth_without_evicting_spent_authority() {
 
 #[test]
 fn n10_replaced_shorter_object_cannot_reduce_the_spent_high_water() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let f = Fixture::new();
     let now = Instant::now();
     f.begin(now).unwrap().finish();

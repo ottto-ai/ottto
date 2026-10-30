@@ -1373,6 +1373,7 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
 #[cfg(unix)]
 #[test]
 fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let source = SnapshotSource::Codex;
     let supported = crate::heap_layout_bound::layout_supported();
     let _cutover = codex_counting_version::TestCutover::set(0);
@@ -1695,6 +1696,7 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
 #[cfg(unix)]
 #[test]
 fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2051,6 +2053,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
 #[cfg(unix)]
 #[test]
 fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store as store;
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -2393,6 +2396,7 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
 #[cfg(unix)]
 #[test]
 fn durable_inventory_overflow_keeps_tail_reuse_and_defers_new_keys() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let source = SnapshotSource::Codex;
     let supported = crate::heap_layout_bound::layout_supported();
@@ -4346,6 +4350,7 @@ fn codex_compaction_events_and_points_match_full_read_at_every_tail_split() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store as store;
     assert!(crate::heap_layout_bound::layout_supported());
     // Match OwnedSourceScan::new capture mode for both sources.
@@ -4584,6 +4589,7 @@ fn no_record_keys_keep_existing_full_admission_after_restart() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(crate::heap_layout_bound::layout_supported());
     // Match OwnedSourceScan::new capture mode for both sources.
     let identity_capture = true;
@@ -4724,6 +4730,7 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
 #[cfg(unix)]
 #[test]
 fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store as store;
     use crate::transcript_acquisition::ReadPlan;
     use std::io::Read;
@@ -4990,6 +4997,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
 #[cfg(unix)]
 #[test]
 fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_both_sources() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store as store;
     use crate::transcript_acquisition::ReadPlan;
     use std::io::Read;
@@ -5230,6 +5238,7 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
 #[cfg(unix)]
 #[test]
 fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store as store;
     use crate::transcript_acquisition::ReadPlan;
     use std::io::Read;

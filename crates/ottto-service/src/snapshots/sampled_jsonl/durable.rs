@@ -8,12 +8,10 @@
 //! where in the file each was last assigned. Production restore funds the
 //! bounded typed workspace extractor before input. Other content obligations
 //! still refuse before input. Empty obligations move the paid decoded graph.
-//! The native parser remains a cfg(test) differential oracle only.
+//! The native parser also serves the default-OFF M1 warm-restore route.
 #![cfg_attr(not(test), allow(dead_code))]
 
-#[cfg(test)]
 use std::fs::File;
-#[cfg(test)]
 use std::io::{Read, Seek, SeekFrom};
 
 pub(crate) mod pl_text;
@@ -299,14 +297,12 @@ pub(crate) struct Decoded {
     rederive: Rederive,
 }
 
-#[cfg(test)]
 pub(crate) fn decode(body: &[u8], source: SnapshotSource) -> Result<Decoded, Corrupt> {
     let source = crate::durable_tail_store::DurableSource::from_snapshot(source).ok_or(Corrupt)?;
     let row = source.properties();
     (row.decode)(body, row.snapshot)
 }
 
-#[cfg(test)]
 pub(in crate::snapshots) fn decode_body(
     body: &[u8],
     source: SnapshotSource,
@@ -463,7 +459,6 @@ impl Decoded {
     }
 
     /// The title line to pread, when the head re-parse does not reach it.
-    #[cfg(test)]
     fn title_line(&self, head_end: u64) -> Result<Option<(u64, u64)>, Refuse> {
         if self.rederive.title.is_none() {
             return Ok(None);
@@ -482,7 +477,6 @@ impl Decoded {
     /// 0 (`rederive_parser`), and `file` for the named-line pread. Every value
     /// must hash-equal its digest. The decoded copy is consumed either way: a
     /// refusal leaves nothing behind.
-    #[cfg(test)]
     pub(crate) fn rederive(
         self,
         mut parser: OwnedJsonlParser,
@@ -566,7 +560,6 @@ impl Decoded {
 }
 
 /// Exactly one complete line: `len` bytes at `offset`, ending in a newline.
-#[cfg(test)]
 fn pread_line(file: &mut File, offset: u64, len: u64) -> std::io::Result<Vec<u8>> {
     let len = usize::try_from(len).map_err(|_| std::io::ErrorKind::InvalidInput)?;
     let mut line = vec![0; len];
@@ -581,7 +574,6 @@ fn pread_line(file: &mut File, offset: u64, len: u64) -> std::io::Result<Vec<u8>
 /// A fresh parser for re-derivation: the same source and options as the
 /// record's, no title metadata and no live inputs (no re-derived field reads
 /// them), and no reread binding (a bounded head read, not a Full).
-#[cfg(test)]
 pub(crate) fn rederive_parser(
     mut file: File,
     path: &Path,

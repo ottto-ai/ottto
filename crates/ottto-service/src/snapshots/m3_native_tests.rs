@@ -51,6 +51,7 @@ fn without_fingerprint(entry: &ScanIndexEntry) -> Value {
 
 #[test]
 fn m3_d3_codex_strict_rebind_keeps_entry_debt_and_membership() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let previous = committed(CODEX_KEY);
     let mut working = previous.clone();
     assert!(codex_strict_rebind(
@@ -92,6 +93,7 @@ fn m3_d3_codex_strict_rebind_keeps_entry_debt_and_membership() {
 
 #[test]
 fn m3_d3_claude_is_never_strictly_rebound() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     // Claude holds the key instead: its original-v1 adapter and account
     // identity inputs (source fingerprint included) stay unchanged.
     let mut index = committed(CLAUDE_KEY);
@@ -116,6 +118,7 @@ fn m3_d3_claude_is_never_strictly_rebound() {
 
 #[test]
 fn m3_d3_held_claude_key_stays_discoverable_past_the_window() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = std::env::temp_dir().join(format!(
         "ottto-m3-d3-discovery-{}",
         ottto_core::generate_control_token().unwrap()
@@ -176,6 +179,7 @@ fn m3_d3_held_claude_key_stays_discoverable_past_the_window() {
 /// the archive input into physical prefix authority or candidate-less debt.
 #[test]
 fn m3_compressed_archive_bypasses_staging_and_finishes_without_receipt_debt() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::ScratchDir::new("m3-archive-route");
     let path = root.join("rollout.jsonl");
     let archive = root.join("rollout.jsonl.zst");

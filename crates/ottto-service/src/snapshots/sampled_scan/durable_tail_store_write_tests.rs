@@ -51,6 +51,7 @@ impl Restarted {
             RestoreOutcome::StaleUnregistered(reason, _) => {
                 panic!("unexpected unregistered obligation: {reason}")
             }
+            RestoreOutcome::M1Restored(_) => panic!("M3 fixture must enable its switch"),
             RestoreOutcome::Held(_) => "held",
         }
     }
@@ -140,6 +141,7 @@ fn restart_over(name: &str, stale: Option<bool>) -> Restarted {
 /// bytes it read. Unrelated Fulls and a non-Full completion do not count.
 #[test]
 fn refused_predecessor_full_counts_its_native_bytes() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let run = restart_over("ottto-dt-restart-full", Some(true));
     assert_eq!(run.restore_label(), "ineligible.entry_changed");
     assert_eq!(run.counts().store_write_failed_restart_full, [0, 0]);
@@ -178,6 +180,7 @@ fn refused_predecessor_full_counts_its_native_bytes() {
 /// leaves both counters at 0 and never alarms.
 #[test]
 fn fault_free_restart_leaves_the_counters_at_zero() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for (name, record) in [
         ("ottto-dt-restart-none", None),
         ("ottto-dt-restart-current", Some(false)),
@@ -227,6 +230,7 @@ fn fault_free_restart_leaves_the_counters_at_zero() {
 /// within 24 h; a new process alarms again on its own first occurrence.
 #[test]
 fn restart_full_alarm_fires_on_the_first_file_once_per_process() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let run = restart_over("ottto-dt-restart-alarm", Some(true));
     let t0 = Instant::now();
     let second = Duration::from_secs(1);
@@ -294,6 +298,7 @@ fn restart_full_alarm_fires_on_the_first_file_once_per_process() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS retained layout")]
 fn failed_write_after_save_costs_one_counted_full_after_restart() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for fail in [true, false] {
         failed_write_case(fail);
     }
