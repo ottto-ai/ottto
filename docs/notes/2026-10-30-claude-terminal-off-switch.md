@@ -163,7 +163,11 @@ diagnostic, no persisted field) so the M4 trial shows their rate. When a held
 key's floor expires it is re-offered once through the targeted queue
 (`held_retry_due`): a walk that suppresses unchanged stats and the
 deduplicated targeted token would otherwise leave it unread, which is a
-custody break. The floor crosses traversal
+custody break. If the ordinary candidate decision would still skip it
+(unchanged, context settled), that one floor-expiry read is forced as an
+activity/quarantine retry (`terminal_off_held_retry_due_read` diagnostic); the
+key's settlement then holds it again (floored for six more hours) or settles
+it. The floor crosses traversal
 starts without changing sweep-held family roots, proof state or disk formats.
 Object/context changes and observation eviction fail toward another read.
 
