@@ -7228,6 +7228,8 @@ pub(super) fn exact_pipeline_accept(
 
 /// NBF measures actual body acquisitions, rather than scan selection. Both
 /// non-progressing hold forms keep their original accepted custody throughout.
+/// A fresh hold keeps its one immediate retry (the r26 held-retry contract), so
+/// the floor runs from the last initial page, which owns the last held read.
 #[test]
 #[serial(source_manifests)]
 fn terminal_off_nonblocking_held_keys_read_at_six_hours_not_every_page() {
@@ -7237,7 +7239,7 @@ fn terminal_off_nonblocking_held_keys_read_at_six_hours_not_every_page() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _manifests = SourceManifestTestGuard::new();
     for bound in [false, true] {
-        let (fixture, baseline, initial) = if bound {
+        let (fixture, baseline, initial, minute) = if bound {
             let (fixture, baseline, first, last) = terminal_bound_hold_traversal(
                 "nbf-bound-committed-member",
                 PipelineUpload::Accept,
@@ -7245,7 +7247,8 @@ fn terminal_off_nonblocking_held_keys_read_at_six_hours_not_every_page() {
             );
             assert!(!first.progress_blocking);
             assert_eq!(first.held.len(), 1);
-            (fixture, baseline, last)
+            // terminal_bound_hold_traversal's last page runs at 09:01.
+            (fixture, baseline, last, 1)
         } else {
             let fixture = PipelineFixture::new("nbf-account-deferred");
             let baseline = fixture.baseline();
@@ -7254,7 +7257,9 @@ fn terminal_off_nonblocking_held_keys_read_at_six_hours_not_every_page() {
             assert!(pages
                 .iter()
                 .any(|page| !page.held.is_empty() && !page.progress_blocking));
-            (fixture, baseline, pages.pop().unwrap())
+            // Pages run at 09:00, 09:01, ...; the last one is minute len - 1.
+            let minute = pages.len() - 1;
+            (fixture, baseline, pages.pop().unwrap(), minute)
         };
         let key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
         let old_entities = &baseline.file_snapshot_fingerprints[&key];
@@ -7284,7 +7289,9 @@ fn terminal_off_nonblocking_held_keys_read_at_six_hours_not_every_page() {
             }
         };
         assert_custody(&initial);
-        for (at, expected) in [("15:00:00", 1), ("15:05:00", 0), ("21:00:00", 1)] {
+        // +6 h, +6 h + 300 s and +12 h after the last initial page.
+        for (hour, offset, expected) in [(15, 0, 1), (15, 5, 0), (21, 0, 1)] {
+            let at = format!("{hour:02}:{:02}:00", minute + offset);
             let (page, reads) =
                 crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
                     fixture.page(&format!("2026-08-02T{at}Z"), &cycle, PipelineUpload::Accept)
