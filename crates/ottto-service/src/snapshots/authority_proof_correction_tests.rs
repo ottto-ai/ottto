@@ -4442,7 +4442,10 @@ fn apc_without_unbound_record(index: &ScanIndex) -> Value {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn load_drops_unbound_authority_record_and_keeps_index() {
     let scratch = crate::test_scratch::ScratchDir::new("authority-load-containment");
     let index = apc_unbound_fixture();
@@ -4509,7 +4512,10 @@ fn terminal_off_on_load_drops_unbound_authority_record_and_keeps_index() {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn contained_unbound_authority_record_does_not_latch_claude_reemission_stop() {
     let scratch = crate::test_scratch::ScratchDir::new("authority-load-no-rebuild-stop");
     let index = apc_unbound_fixture();

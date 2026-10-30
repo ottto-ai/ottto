@@ -717,7 +717,7 @@ fn terminal_off_on_e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_witho
 }
 
 #[test]
-fn e2_pipeline_exact_telemetry_over_cap_uses_the_existing_counted_start_fallback() {
+fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     let dir = temp_dir("e2-identity-telemetry-cap");
     let root = "1449b91b-f36e-4cbc-a5bb-50fc66430ba5";
     let support = dir.join("support");
@@ -757,19 +757,18 @@ fn e2_pipeline_exact_telemetry_over_cap_uses_the_existing_counted_start_fallback
     assert_eq!(item.request_count, 17);
     assert_eq!(
         e2_login_counts(item),
-        BTreeMap::from([(Some(format!("{:064x}", 1)), 17)]),
-        "bounded fallback uses the start, never the sixteenth login"
+        BTreeMap::from([(None, 17)]),
+        "SOURCE: lost seventeenth-key proof cannot borrow the starting or sixteenth login"
     );
     assert_eq!(
         item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
         Some("0.0017")
     );
     let display = item.claude_account_display.as_deref().unwrap();
-    assert_eq!(display.current.status, "known");
-    assert_eq!(
-        display.current.account_identifier_hash,
-        Some(format!("{:064x}", 1))
-    );
+    assert_eq!(display.current.status, "unknown");
+    assert_eq!(display.current.account_identifier_hash, None);
+    assert_eq!(display.current.unknown_reason.as_deref(), Some("identity_withheld"));
+    assert_eq!(item.request_identity_refusals, 1);
     assert_eq!(counts["claude_identity_conflict_fallbacks"], 1);
     assert_eq!(disposition.quarantined_entity_count(), 0);
     fs::remove_dir_all(dir).unwrap();

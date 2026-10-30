@@ -289,6 +289,7 @@ fn terminal_off_on_oversized_same_size_sample_edit_wakes_discovery() {
 
 #[test]
 #[serial(source_manifests)]
+#[cfg_attr(not(target_os = "macos"), ignore = "runs macOS /usr/bin/xattr")]
 fn oversized_metadata_only_touches_give_zero_wakes() {
     if !c1a_layout_supported("oversized-metadata") {
         return;

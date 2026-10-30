@@ -2929,6 +2929,22 @@ fn terminal_off_on_cap_pace_overflow_is_counted_and_alarms_on_the_production_ful
 
 #[test]
 fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
+    durable_quiet_retirement_faults(&[
+        "crash_before_writer",
+        "deferral",
+        "writer_error",
+        "receipt_before_index",
+        "scope_change",
+        "legacy_index_clear",
+    ]);
+}
+
+#[test]
+fn durable_debtless_record_index_save_failure_keeps_audit_due_on_restart() {
+    durable_quiet_retirement_faults(&["index_save_error"]);
+}
+
+fn durable_quiet_retirement_faults(faults: &[&str]) {
     use crate::durable_tail_store as store;
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -2943,14 +2959,7 @@ fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
     let _reset_writer = ResetWriter;
     let _clock = Clock::at(START);
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        for fault in [
-            "crash_before_writer",
-            "deferral",
-            "writer_error",
-            "receipt_before_index",
-            "scope_change",
-            "legacy_index_clear",
-        ] {
+        for &fault in faults {
             sampled_scan::set_test_now(Some(START));
             let fixture = ScanFixture::new(source);
             fixture.file.append(&usage(source, 100, 0, "fixture-model"));
@@ -3034,6 +3043,7 @@ fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
                 ScanIndex::load(&index_path).unwrap().files[&key].has_unverified_source(),
                 fault != "legacy_index_clear"
             );
+            let owed_due = index.files[&key].unverified_deadline();
             match fault {
                 "deferral" => {
                     sampled_scan::durable_tail::set_test_write_bytes(Some(0));
@@ -3068,7 +3078,7 @@ fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
                         0
                     );
                 }
-                "receipt_before_index" | "scope_change" => {
+                "receipt_before_index" | "scope_change" | "index_save_error" => {
                     assert_eq!(
                         cache
                             .durable_write_after_save(lock, source, &index)
@@ -3077,6 +3087,30 @@ fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
                         1
                     );
                     assert_eq!(fs::read(&record_path).unwrap()[311], 0);
+                    if fault == "index_save_error" {
+                        assert!(index.files[&key].audit_requires_full(START + 2 * 60 * 60));
+                        // Advance the real index CAS without changing its owed
+                        // marker. The retirement's second save must now fail.
+                        let mut advanced = ScanIndex::load(&index_path).unwrap();
+                        advanced.save(&index_path).unwrap();
+                        let committed = fs::read(&index_path).unwrap();
+                        assert_eq!(
+                            index.clone().save(&index_path).unwrap_err().to_string(),
+                            "local snapshot scan index changed concurrently"
+                        );
+                        assert_eq!(
+                            cache.durable_reconcile_retirements(
+                                lock,
+                                source,
+                                &mut index,
+                                &index_path
+                            ),
+                            0,
+                            "a durable receipt cannot authorize a failed index CAS"
+                        );
+                        assert_eq!(index.files[&key].unverified_deadline(), owed_due);
+                        assert_eq!(fs::read(&index_path).unwrap(), committed);
+                    }
                     if fault == "scope_change" {
                         cache.durable_begin_pass(
                             source,
@@ -3099,15 +3133,23 @@ fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
                 }
                 _ => {}
             }
-            if !matches!(fault, "receipt_before_index" | "scope_change") {
+            if !matches!(
+                fault,
+                "receipt_before_index" | "scope_change" | "index_save_error"
+            ) {
                 assert_eq!(fs::read(&record_path).unwrap(), predecessor);
             }
             drop(cache);
             let restart = begin();
+            let restart_index = ScanIndex::load(&index_path).unwrap();
+            if fault == "index_save_error" {
+                assert_eq!(restart_index.files[&key].unverified_deadline(), owed_due);
+                assert!(restart_index.files[&key].audit_requires_full(START + 2 * 60 * 60));
+            }
             let (mut loaded, _, modes) = production_scan(
                 &fixture,
                 source,
-                ScanIndex::load(&index_path).unwrap(),
+                restart_index,
                 Some(restart.clone()),
                 &scope.0,
             );
@@ -3121,6 +3163,19 @@ fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
             );
             if fault != "legacy_index_clear" {
                 assert!(loaded.files[&key].has_unverified_source());
+                if fault == "index_save_error" {
+                    assert_eq!(restart.durable_counters(source).unwrap().0.restored, 1);
+                    assert_eq!(loaded.files[&key].unverified_deadline(), owed_due);
+                    assert!(loaded.files[&key].audit_requires_full(START + 2 * 60 * 60));
+                    // None came from the real record, while the original index
+                    // deadline still selected this Unchanged quiet audit. The
+                    // successful reconcile below requires that audit to stage
+                    // a NEW retirement; restore alone cannot stage or clear it.
+                    assert_eq!(
+                        restart.retained_checkpoint(&key).unwrap().audit_debt(),
+                        None
+                    );
+                }
                 assert_eq!(
                     restart
                         .retained_checkpoint(&key)

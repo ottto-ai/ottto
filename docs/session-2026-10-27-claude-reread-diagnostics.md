@@ -44,3 +44,41 @@ through the existing decision carrier; leased error reporting stays unchanged.
 A real preparation regression loads an unbound record and forces progress
 generation overflow under both gate states, checking one reported clear and the
 unchanged failure and durable progress.
+
+Desktop metadata uses the existing page `local_resources` counts carrier under
+`desktop_metadata`. All fields are sparse, saturating integers, scoped to
+Claude work and merged across cooperative steps. There is no new emitter or
+wire field, and none of these counters selects a file:
+
+- `source_revision_body_rereads`: a `SourceChanged` selection or actual
+  `Full(ScopeChanged)` acquisition consumes its first transcript body bytes.
+  This includes Desktop/usage sidecar revisions and opened-object/interpretation
+  revisions; it is not exclusively Desktop attribution.
+- `legacy_identity_body_rereads`: the same actual-read event selected by the
+  separate legacy identity adoption path. Both body counters count files per
+  attempt, including attempts that later fail; selection or an unchanged native
+  reduction reuse alone counts zero.
+- `recovered_hold_body_rereads`: first body bytes read after the metadata census
+  recovers a complete, unique Desktop proof for an existing account-held file.
+  This observes existing account-held retries; it does not select or rearm any
+  file or invalidate accepted bodies.
+- `lineage_window_read_attempts`: a Claude transcript opened to resolve an
+  ambiguous Desktop id. Existing head/tail caps apply; a failed open counts zero.
+- `inventory_restarts` and `scoped_acquisition_attempts` have no production
+  caller yet, so they stay absent.
+
+`lineage_parentless_while_incomplete{files}` counts distinct source files in
+finalized offers whose cached Desktop metadata identifies a child, whose lineage
+census is incomplete, and whose emitted facts/origin have no parent reference.
+It runs after held-body and semantic no-op removal, using resident metadata only;
+no read, persisted field, selector or attribution decision is added. Scratch is
+bounded by emitted page items. Retries can count the same file again; this is
+offered work, not distinct lifetime sessions or stored-body ACKs.
+
+`claude_desktop_store_inventory` is decode-and-drop in `ScanIndex`. It is in the
+`FIELDS` registry so legacy and sharded indexes carrying it load, it steers
+nothing, and no save writes it, so a stale digest cannot vouch for a census that
+never saw its stores. A malformed value is dropped and adds to
+`tombstone_decode_drops`; it is never a refusal, and a duplicate key keeps the
+first value. `crate::claude_desktop` is compiled for tests only: sibling Desktop
+roots reach no status, census or selection path.

@@ -44,7 +44,9 @@ jobs:
 
   rust-linux:
     name: Rust tests (Linux)
-    timeout-minutes: 45
+    # Heap-layout tests run here too: the lib step took 15-27 min in trial
+    # runs against 7-12 before.
+    timeout-minutes: 60
     runs-on: ubuntu-latest
     env:
       RUSTUP_TOOLCHAIN: "1.95.0"
@@ -93,10 +95,27 @@ jobs:
       - name: Connector clippy
         run: cargo clippy --manifest-path crates/Cargo.toml --workspace --all-targets --locked -- -D warnings
 
+      # Build every test binary first, then let main save the cache even if a
+      # test fails, so one red main test does not leave PRs building cold. The
+      # switch flips only after a complete build, so a failed, cancelled or
+      # clippy-only build never stores a partial target dir under the key.
+      # CACHE_ON_FAILURE is what rust-cache's post-if reads (v2.9.3 action.yml).
+      # A build error here does not fail the step: the test steps below rebuild
+      # and report it exactly as before.
+      - name: Build tests
+        run: |
+          build_status=0
+          cargo test --workspace --locked --no-run || build_status=$?
+          cargo test --manifest-path crates/Cargo.toml --workspace --locked --no-run || build_status=$?
+          if [ "$build_status" -eq 0 ]; then
+            echo "CACHE_ON_FAILURE=true" >> "$GITHUB_ENV"
+          fi
+
       - name: Runtime tests
         # Print a failing assertion when it happens, not only after the suite.
         # Keep going past a failing test binary so one run lists every failure.
-        run: cargo test --workspace --locked --no-fail-fast -- --nocapture
+        # Same split as the macOS job (scripts/ci_runtime_tests.py).
+        run: python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1 --no-fail-fast
 
       - name: Connector tests
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked

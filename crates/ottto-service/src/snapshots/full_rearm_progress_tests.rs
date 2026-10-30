@@ -1225,7 +1225,10 @@ fn terminal_off_on_contract_rearm_remains_independent_of_the_full_rearm_deadline
 /// The production scanner retires a clean traversal before the fold. Its
 /// origin must survive so the re-arm can bind the next window, even then.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn full_rearm_window_keeps_the_origin_after_scanner_checkpoint_retirement() {
     let rearm = Rearm::new();
     let mut index = rearm.index();

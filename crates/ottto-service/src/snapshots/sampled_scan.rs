@@ -22,6 +22,8 @@ pub(crate) use durable_tail::MissClass;
 #[cfg(unix)]
 pub(crate) use durable_tail::RestoreOutcome;
 pub(super) mod side_ledger;
+#[cfg(all(test, unix))]
+pub(crate) mod transition_fixture;
 
 /// The retained-copy cache behind `SharedCache::retained`.
 pub(super) type RetainedCache = TranscriptCache<CachedJsonlReduction>;

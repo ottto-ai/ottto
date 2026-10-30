@@ -17,6 +17,7 @@ const CLAUDE_IDENTITY_CAPTURE: bool = false;
 pub(crate) struct E2ScanFixture {
     pub(crate) cache: Arc<sampled_scan::SharedCache>,
     observed: Mutex<Vec<PathBuf>>,
+    pub(crate) versions: Option<Arc<codex_version::CodexVersionFeed>>,
 }
 impl E2ScanFixture {
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
@@ -174,6 +175,9 @@ impl E2ScanFixture {
         if sampled {
             let (scope, _) = durable_binding(source);
             scan = scan.with_sampled_acquisition(self.cache.clone(), scope);
+        }
+        if let Some(versions) = self.versions.as_ref() {
+            scan = scan.with_codex_versions(versions.clone());
         }
         self.drive(scan, &BTreeMap::new())
     }

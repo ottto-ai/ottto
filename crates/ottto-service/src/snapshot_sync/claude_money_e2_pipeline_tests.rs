@@ -248,6 +248,8 @@ impl Page {
                     None,
                     None,
                     Some((&self.cache, &self.committed)),
+                    None,
+                    None,
                 )
                 .unwrap()
             });
@@ -5259,6 +5261,10 @@ fn terminal_off_on_e2_pipeline_subagent_conflict_only_file_publishes_its_disclos
 // Shared helpers above remain the real scan/evidence/finish/upload callers.
 mod money_equivalence_tests {
     include!("money_equivalence_tests.rs");
+    #[cfg(unix)]
+    mod durable_transition_tests {
+        include!("../snapshots/sampled_scan/durable_transition_tests.rs");
+    }
 }
 
 #[test]
