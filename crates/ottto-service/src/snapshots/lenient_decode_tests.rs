@@ -2110,7 +2110,6 @@ fn every_persisted_field_fixture() -> ScanIndex {
             "claude_desktop_census_witness" => {
                 serde_json::json!({"completed_at_unix_seconds":1,"process_id":1,"inventory":"inventory"})
             }
-            "claude_desktop_store_inventory" => serde_json::json!("a".repeat(64)),
             "accepted_rebuild_incidence" => {
                 serde_json::json!({"/synthetic/carried.jsonl":["a".repeat(64)]})
             }
@@ -2208,20 +2207,15 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
     let current = serde_json::to_value(&seed).unwrap();
     let fields = lenient_decode::FIELDS;
     assert_eq!(
-        &fields[fields.len() - 4..],
+        &fields[fields.len() - 3..],
         &[
             "upload_ack_retirement_handoff",
             "held_audit_progress",
             "claude_money_birth_store",
-            "claude_desktop_store_inventory",
         ]
     );
     for earlier_e2 in [false, true] {
         let mut legacy = current.clone();
-        legacy
-            .as_object_mut()
-            .unwrap()
-            .remove("claude_desktop_store_inventory");
         legacy.as_object_mut().unwrap().remove(if earlier_e2 {
             "held_audit_progress"
         } else {
@@ -2232,7 +2226,7 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
             // The main positional schema ends at audit progress; appending E2
             // must leave every already-shipped position intact.
             forms.push(Value::Array(
-                fields[..fields.len() - 2]
+                fields[..fields.len() - 1]
                     .iter()
                     .map(|name| legacy[*name].clone())
                     .collect(),
@@ -2253,31 +2247,6 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
                     "legacy writer earlier_e2={earlier_e2}"
                 );
             }
-        }
-    }
-}
-
-#[test]
-fn desktop_inventory_keeps_existing_positional_index_slots() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
-    let mut legacy = current.clone();
-    legacy
-        .as_object_mut()
-        .unwrap()
-        .remove("claude_desktop_store_inventory");
-    let fields = lenient_decode::FIELDS;
-    assert_eq!(fields.last(), Some(&"claude_desktop_store_inventory"));
-    for (expected, slots) in [(&legacy, &fields[..fields.len() - 1]), (&current, fields)] {
-        let array = Value::Array(slots.iter().map(|name| expected[*name].clone()).collect());
-        let bytes = serde_json::to_vec(&array).unwrap();
-        let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
-        let streaming =
-            lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
-        let bounded = lenient_decode::read_bounded(&bytes).unwrap();
-        for decoded in [native, streaming, bounded] {
-            assert_eq!(serde_json::to_value(decoded).unwrap(), *expected);
         }
     }
 }

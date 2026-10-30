@@ -91,13 +91,8 @@ fn sidecar_row(output_tokens: u64) -> crate::claude_local_otel::ClaudeLocalOtelE
 }
 
 fn parsed_session() -> SnapshotItem {
-    let path = std::env::temp_dir().join(format!(
-        "ottto-claude-thinking-{}-{}.jsonl",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos())
-    ));
+    let unique = crate::test_scratch::unique_name("ottto-claude-thinking");
+    let path = std::env::temp_dir().join(format!("{unique}.jsonl"));
     let lines = [
         json!({"timestamp":"2026-10-01T10:00:00Z","type":"assistant","sessionId":"claude-thinking","requestId":"req-1","message":{"id":"msg-1","model":"claude-opus-4-8","usage":{"input_tokens":12,"output_tokens":900,"output_tokens_details":{"thinking_tokens":300}}}}),
         json!({"timestamp":"2026-10-01T10:01:00Z","type":"assistant","sessionId":"claude-thinking","requestId":"req-2","message":{"id":"msg-2","model":"claude-opus-4-8","usage":{"input_tokens":12,"output_tokens":100}}}),

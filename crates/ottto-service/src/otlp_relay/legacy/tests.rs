@@ -1014,14 +1014,23 @@ fn empty_supervisor_waits_until_tick_and_live_socket_drains_sixteen_at_once() {
         supervisor.wait_duration(100, 160),
         Duration::from_millis(100)
     );
-    let clients: Vec<_> = (0..18)
+    // A handshake can finish after `connect` returns and one pass takes only
+    // what is queued, so the clients outnumber the pass bound by a margin and
+    // the rest are drained within a bounded moment.
+    let clients: Vec<_> = (0..32)
         .map(|_| TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap())
         .collect();
     let mut accepted = 0;
     supervisor.accept_ready(Instant::now(), |_, _| accepted += 1);
     assert_eq!(accepted, 16);
-    supervisor.accept_ready(Instant::now(), |_, _| accepted += 1);
-    assert_eq!(accepted, 18);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while accepted < clients.len() && Instant::now() < deadline {
+        let before = accepted;
+        supervisor.accept_ready(Instant::now(), |_, _| accepted += 1);
+        assert!(accepted - before <= 16);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(accepted, clients.len());
     drop(clients);
     supervisor.close_all();
     assert_eq!(supervisor.wait_duration(110, 160), Duration::from_secs(50));

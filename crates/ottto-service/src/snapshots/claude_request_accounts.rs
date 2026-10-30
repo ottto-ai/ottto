@@ -34,24 +34,11 @@ pub(crate) enum Coverage {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct MixedUploads {
     bodies: BTreeMap<String, (String, String)>,
-    /// Fresh single-account request proof, including proof without event clocks.
-    single_account_bodies: BTreeMap<String, (String, String)>,
     /// Contract-5 bodies tagged in this scan, bound the same way.
     request_identity: BTreeMap<String, (String, String)>,
 }
 
 impl MixedUploads {
-    pub(super) fn permits_single_account(&self, item: &SnapshotItem) -> bool {
-        self.single_account_bodies
-            .get(&item.source_session_id)
-            .is_some_and(|(semantic, body)| {
-                matches!(item.provenance.collector.as_str(), COMPLETE | UNKNOWN)
-                    && item.snapshot_fingerprint == *semantic
-                    && snapshot_fingerprint(SnapshotSource::ClaudeCode, item) == *semantic
-                    && super::snapshot_upload_body_witness(item) == *body
-            })
-    }
-
     pub(crate) fn admit_request_identity(&mut self, item: &SnapshotItem) {
         #[cfg(not(test))]
         let identity_collector = super::claude_request_identity::COLLECTOR;
@@ -263,18 +250,6 @@ fn qualify_all(
         result.coverage.push(disposition);
         if changed {
             item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
-        }
-        if matches!(
-            disposition,
-            Coverage::Complete | Coverage::UnprovedEventClock
-        ) {
-            result.mixed.single_account_bodies.insert(
-                item.source_session_id.clone(),
-                (
-                    item.snapshot_fingerprint.clone(),
-                    super::snapshot_upload_body_witness(item),
-                ),
-            );
         }
     }
     result
