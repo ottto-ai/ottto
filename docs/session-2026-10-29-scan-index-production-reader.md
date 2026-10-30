@@ -51,3 +51,29 @@ requirements are covered by compiled fixtures; no local tests were run. The
 writer inherits the reader and excludes these names from GC without pinning
 prior-only payloads. No repair behavior or release gate is enabled by reserving
 names; the round-10 source health and repair hold remain unchanged.
+
+## Mac recovery-fixture correction
+
+Reader Mac run40967578629 at89c653a8c passed the seven named native layout/heap
+tests but failed the old killed-first-cycle history fixture with
+`scan_index_prior_state_requires_repair`. Main merge-group40965613120 atf45c36fd5
+ran Rust contracts successfully and explicitly passed that same test; this is
+an intentional reader refusal-path difference, not established main flakiness.
+
+The fixture called a complete successful upload/finish cycle, then deleted its
+published index and backfill state and rewrote its ledger as a local claim.
+That is loss after publication: the reader's durable `.storage-prior` witness
+still exists. It cannot prove a kill before the first save. The corrected
+fixture asserts the successful publication and witness before deleting only the
+root, drops warm daemon custody, then requires prepare to refuse with zero
+transcript acquisitions, no replacement index, unchanged witness/ledger bytes
+and no re-upload. Production refusal, reserved names and UNKNOWN logic remain
+unchanged. The separate `only_server_attested_ledger_records_are_prior_history`
+fixture retains the distinction between a local replay claim and server history;
+the genuine no-store first-install control remains. A missing root with saved
+progress is still conservative prior state, even if that progress claims no ACK;
+this change does not introduce an unattended reset or reread exception.
+
+No local tests or macOS workflow dispatch. A later native run must qualify the
+corrected fixture; compiling it on this Mac and Linux CI do not substitute for
+that runtime receipt.
