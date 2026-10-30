@@ -276,6 +276,8 @@ fn absent_parent_containment_guard_never_promotes_a_database() {
 #[test]
 fn damaged_and_oversized_fence_claims_hold_before_v1_containment() {
     for bytes in [
+        b"{\"storage_format\":2,".to_vec(),
+        b"{\"storage_format\":3,".to_vec(),
         b"{\"schema_version\":4,".to_vec(),
         format!(
             "{{\"schema_version\":4,\"padding\":\"{}\"}}",
@@ -918,4 +920,19 @@ mod hydrate_parity {
             }
         }
     }
+}
+
+#[test]
+fn oversized_v1_storage_format_value_does_not_claim_v2_custody() {
+    let f = Fixture::new();
+    let bytes = format!(
+        "{{\"storage_format\":1,\"schema_version\":3,\"padding\":\"{}\"}}",
+        "x".repeat(8192)
+    );
+    fs::write(&f.path, &bytes).unwrap();
+    assert!(load_with(&f.path, false, &EmptyMapper).unwrap().is_none());
+    assert!(!save_with(&f.path, &mut ScanIndex::default(), &EmptyMapper).unwrap());
+    guard_containment_locked(&f.path).unwrap();
+    assert!(!states().lock().unwrap().contains_key(&f.path));
+    assert_eq!(fs::read(&f.path).unwrap(), bytes.as_bytes());
 }

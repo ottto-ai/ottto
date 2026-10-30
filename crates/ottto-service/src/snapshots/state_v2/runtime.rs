@@ -189,6 +189,10 @@ pub(in super::super) fn load_locked(
     path: &Path,
     support: Option<&Path>,
 ) -> Result<Option<ScanIndex>> {
+    // Do not probe the Claude sentinel for Codex, Pi or unbound paths.
+    if binding(path).is_none() {
+        return Ok(None);
+    }
     load_with(path, enabled(support), &ClaudeMapper)
 }
 fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Option<ScanIndex>> {
@@ -201,9 +205,11 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
     let result = held(with_state(path, |state| {
         state.inventory_ready = false;
         state.original = None;
-        state.pass_written_start = telemetry::process_written_bytes();
         state.sample_v1 = switched;
         let pair = fence::reconcile(path, &binding, state.latched)?;
+        state.pass_written_start = (switched || pair.is_some())
+            .then(telemetry::process_written_bytes)
+            .flatten();
         if let Some((identity, db_path)) = pair {
             state.latched = true;
             if !switched {

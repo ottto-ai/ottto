@@ -111,12 +111,9 @@ fn declares_v2(bytes: &[u8]) -> bool {
             mut map: M,
         ) -> std::result::Result<(), M::Error> {
             while let Some(key) = map.next_key::<String>()? {
-                if key == "storage_format" {
-                    self.0.set(true);
-                    return Ok(());
-                }
-                if key == "schema_version" {
-                    if map.next_value::<u64>()? >= 4 {
+                if key == "storage_format" || key == "schema_version" {
+                    let first_v2 = if key == "storage_format" { 2 } else { 4 };
+                    if map.next_value::<u64>()? >= first_v2 {
                         self.0.set(true);
                         return Ok(());
                     }
