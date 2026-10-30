@@ -59,8 +59,36 @@ permissions:
   contents: read
 
 jobs:
+  mac-reuse:
+    name: Look up exact-tree macOS pass
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reuse: ${{ steps.lookup.outputs.reuse }}
+      run_id: ${{ steps.lookup.outputs.run_id }}
+      job_id: ${{ steps.lookup.outputs.job_id }}
+      tree: ${{ steps.lookup.outputs.tree }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Verify previous Mac job and complete tree
+        id: lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/mac_contract_reuse.py
+
   rust:
     name: Rust contracts
+    needs: mac-reuse
+    # Queue entries reuse only a genuine recent Mac pass for the exact tree;
+    # dispatch/schedule always run Mac. !cancelled() allows the Mac fallback
+    # when the lookup fails or is skipped on a non-queue event.
     # macOS runs only in the merge queue, on dispatch and on the daily main
     # cache-refresh schedule: GitHub Free allows five hosted Macs org-wide.
     # Main pushes skip the repeat because the queue already tests the exact
@@ -69,12 +97,15 @@ jobs:
     # the queue. Rollback: revert step 3 (Mac on PRs) FIRST, then the queue
     # rule; never leave the PR skip without the queue. Step 4 (this main-push
     # skip) can be reverted on its own at any time.
-    if: ${{ github.event_name != 'pull_request' && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin)) }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin)) }}
     # Main's own queue run takes about 38 min (runs 40321546891, 40331916601,
     # 40348583388); 40 cancelled #791 (run 40378483829). Headroom, not a target.
     timeout-minutes: 55
-    runs-on: macos-15
+    # An API error, failed lookup, or absent proof uses the full Mac job.
+    # Only the receipt path uses Linux; the required check name stays identical.
+    runs-on: ${{ needs.mac-reuse.result == 'success' && needs.mac-reuse.outputs.reuse == 'true' && 'ubuntu-24.04' || 'macos-15' }}
     env:
+      REUSE_MAC_CONTRACTS: ${{ needs.mac-reuse.result == 'success' && needs.mac-reuse.outputs.reuse == 'true' }}
       RUSTUP_TOOLCHAIN: "1.95.0"
       OTTTO_REQUIRE_LAYOUT: "1"
       # Job-level so "Runtime tests" and "Layout coverage receipt" share one build.
@@ -85,8 +116,19 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Reuse verified exact-tree macOS pass
+        if: env.REUSE_MAC_CONTRACTS == 'true'
+        env:
+          PROOF_RUN: ${{ needs.mac-reuse.outputs.run_id }}
+          PROOF_JOB: ${{ needs.mac-reuse.outputs.job_id }}
+          PROOF_TREE: ${{ needs.mac-reuse.outputs.tree }}
+        run: |
+          printf 'Reused macOS Rust contracts for complete tree %s\n' "$PROOF_TREE" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'Proof: https://github.com/%s/actions/runs/%s/job/%s\n' "$GITHUB_REPOSITORY" "$PROOF_RUN" "$PROOF_JOB" | tee -a "$GITHUB_STEP_SUMMARY"
+
       # Keep layout-sensitive tests on the compiler validated by the runtime.
       - name: Install validated Rust toolchain
+        if: env.REUSE_MAC_CONTRACTS != 'true'
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
 
       # save-if stays refs/heads/main: only the schedule and manual main
@@ -94,6 +136,7 @@ jobs:
       # up to 24 h old. If queue builds slow down, add a second cron; do NOT
       # save from queue refs. Workspace crates are not cached.
       - name: Rust cache
+        if: env.REUSE_MAC_CONTRACTS != 'true'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
@@ -103,32 +146,40 @@ jobs:
           cache-bin: "false"
 
       - name: Compiler receipt
+        if: env.REUSE_MAC_CONTRACTS != 'true'
         run: rustc -Vv && cargo -V
 
       - name: macOS-native public surface checks
+        if: env.REUSE_MAC_CONTRACTS != 'true'
         # Real plutil/codesign/LaunchServices and macOS /bin/bash 3.2; the
         # portable remainder runs in "Public surface checks" on Linux.
         run: /bin/bash scripts/public_repo_surface_ci.sh --scope macos
 
       - name: Rust format
+        if: env.REUSE_MAC_CONTRACTS != 'true'
         run: cargo fmt --all --check
 
       - name: Connector format
+        if: env.REUSE_MAC_CONTRACTS != 'true'
         run: cargo fmt --manifest-path crates/Cargo.toml --all --check
 
       - name: Runtime clippy
+        if: env.REUSE_MAC_CONTRACTS != 'true'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Connector clippy
+        if: env.REUSE_MAC_CONTRACTS != 'true'
         run: cargo clippy --manifest-path crates/Cargo.toml --workspace --all-targets --locked -- -D warnings
 
       - name: Runtime tests
+        if: env.REUSE_MAC_CONTRACTS != 'true'
         # Print a failing assertion when it happens, not only after the suite.
         # Four threads on the 3-core runner: many tests wait on I/O or #[serial].
         # Six exposed shared-state races (control.rs notes some fail above 4).
         run: cargo test --workspace --locked -- --nocapture --test-threads=4
 
       - name: Layout coverage receipt
+        if: env.REUSE_MAC_CONTRACTS != 'true'
         run: |
           set -euo pipefail
           cargo test -p ottto-service --lib --locked heap_layout_bound::sampled_scalar_buffer_tests::layout_gate_coverage_receipt -- --exact --nocapture | tee "$RUNNER_TEMP/layout-coverage-receipt.log"
@@ -136,6 +187,7 @@ jobs:
           grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/layout-coverage-receipt.log"
 
       - name: Synthetic Codex counting peak memory
+        if: env.REUSE_MAC_CONTRACTS != 'true'
         timeout-minutes: 15
         run: |
           set -euo pipefail
@@ -144,9 +196,11 @@ jobs:
           test "$(grep -c '^codex_v2_rss_receipt: ' "$RUNNER_TEMP/codex-rss-receipt.log")" -eq 2
 
       - name: Connector tests
+        if: env.REUSE_MAC_CONTRACTS != 'true'
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked
 
       - name: Connector package tests
+        if: env.REUSE_MAC_CONTRACTS != 'true'
         run: cargo test --manifest-path crates/Cargo.toml --locked -p ottto-connector-testkit --test first_party_sources
 
   public-surface:
