@@ -397,6 +397,103 @@ fn hex_fingerprint(seed: char) -> String {
     seed.to_string().repeat(64)
 }
 
+/// Unchanged may carry authority, but it cannot create it or conceal a
+/// different census. The reader separately fences identity/scope and debt.
+#[test]
+fn census_unchanged_preserves_only_matching_verified_records() {
+    use crate::snapshots::claude_request_census::{
+        record_claude_request_census, ClaudeRequestCensusParse,
+    };
+    let path = Path::new("/census/projects/quiet.jsonl");
+    let key = local_index_key(path);
+    let fingerprint = hex_fingerprint('a');
+    let mut item = valid_v6_batch_request().snapshots.remove(0);
+    item.source_session_id = "quiet".to_string();
+    item.attribution_facts.clear();
+    item.claude_context_curve_identity_complete = true;
+    item.claude_usage_request_ids = BTreeSet::from(["req_quiet".to_string()]);
+    for exact in [false, true] {
+        for case in [
+            "same",
+            "full",
+            "fingerprint",
+            "derivation",
+            "contents",
+            "shape",
+            "unverified",
+            "retired",
+            "tail",
+            "debt",
+            "lossy",
+            "incomplete",
+        ] {
+            let mut index = ScanIndex::default();
+            let mut old = ClaudeRequestCensusRecord::synthetic_for_test(
+                &if case == "fingerprint" {
+                    hex_fingerprint('b')
+                } else {
+                    fingerprint.clone()
+                },
+                1,
+                if exact != (case == "shape") {
+                    ClaudeRequestCensusShape::Exact
+                } else {
+                    ClaudeRequestCensusShape::Empty
+                },
+                if case == "contents" {
+                    vec![1]
+                } else if exact {
+                    vec![claude_request_hash("req_quiet")]
+                } else {
+                    vec![]
+                },
+            )
+            .with_derivation_for_test(if case == "derivation" {
+                0
+            } else {
+                CLAUDE_REQUEST_CENSUS_DERIVATION
+            })
+            .with_unverified_for_test(matches!(case, "unverified" | "retired" | "full"));
+            if case == "retired" {
+                old.retire();
+            }
+            index
+                .claude_request_census_mut_for_test()
+                .insert_for_test(&key, old);
+            record_claude_request_census(
+                &mut index,
+                ClaudeRequestCensusParse {
+                    path,
+                    index_key: &key,
+                    source_file_fingerprint: &fingerprint,
+                    census_window_end: SECOND_WINDOW,
+                    complete: case != "incomplete",
+                    lossy: case == "lossy",
+                    source_verified: case == "full",
+                    unchanged_source: !matches!(case, "tail" | "debt" | "full"),
+                    itemless_request_hashes: vec![],
+                    opened_birth: None,
+                    modified_unix_seconds: 0,
+                },
+                if exact {
+                    std::slice::from_ref(&item)
+                } else {
+                    &[]
+                },
+            );
+            assert_eq!(
+                index
+                    .claude_request_census
+                    .get(&key)
+                    .unwrap()
+                    .unverified_for_test(),
+                !matches!(case, "same" | "full"),
+                "{case}"
+            );
+        }
+    }
+}
+
 /// TD1a: every finished Claude parse writes a record bound to the candidate
 /// fingerprint and the census window, shaped by Context rows G-J and loss.
 #[test]
