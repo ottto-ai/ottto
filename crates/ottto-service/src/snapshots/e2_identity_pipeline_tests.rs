@@ -1042,20 +1042,21 @@ fn e2_pipeline_bound_a_uniform_b_malformed_trace_is_unknown_not_a() {
 }
 
 // C2 (Lead B): rows that bypass final identity grouping lose the uniform
-// account the emission would carry, for every unhealthy reason.
+// account the emission would carry, for every unhealthy reason. One family
+// login B: with two, the account owner already withholds a D1-shaped body.
 #[test]
 fn e2_pipeline_bound_a_external_billing_malformed_trace_clears_wire_account() {
-    e2_unhealthy_root_billing_case("malformed", true, "external");
+    e2_unhealthy_root_billing_case("malformed", false, "external");
 }
 
 #[test]
 fn e2_pipeline_bound_a_mixed_billing_malformed_trace_clears_wire_account() {
-    e2_unhealthy_root_billing_case("malformed", true, "mixed");
+    e2_unhealthy_root_billing_case("malformed", false, "mixed");
 }
 
 #[test]
 fn e2_pipeline_bound_a_external_billing_oversized_trace_clears_wire_account() {
-    e2_unhealthy_root_billing_case("oversized", true, "external");
+    e2_unhealthy_root_billing_case("oversized", false, "external");
 }
 
 #[test]
