@@ -33284,7 +33284,7 @@ impl OwnedSourceScan {
             if side_plan.is_none() {
                 scanned_file_count += 1;
                 if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
-                    terminal_off_discovery::served(index, &candidate);
+                    terminal_off_discovery::served(index, &candidate, audit_now);
                 }
             }
             // U1a-2a G7 (row 15): the side read's charge and start line,

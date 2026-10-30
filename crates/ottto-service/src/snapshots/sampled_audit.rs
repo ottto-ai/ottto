@@ -580,6 +580,13 @@ fn open_blocked(key: &str, now: u64) -> bool {
 pub(super) fn candidate_open_blocked(key: &str, now: u64) -> bool {
     open_blocked(key, now)
 }
+/// Scheduling only: an existing failed-open obligation may retry when its
+/// own throttle expires; a successful ordinary open is not such a retry.
+pub(super) fn failed_open_retry_ready(key: &str, now: u64) -> bool {
+    with_open_backoff(|memo| {
+        memo.keys.get(key).is_some_and(|f| f.failures > 0) && !memo.blocked(key, now)
+    })
+}
 pub(super) fn failed_open_debt(key: &str, now: u64) -> Option<u64> {
     with_open_backoff(|backoff| backoff.owed(key)).filter(|due| now >= *due)
 }

@@ -55,19 +55,40 @@ struct Walk {
 thread_local! {
     static WALKS: std::cell::RefCell<BTreeMap<String, Walk>> = const { std::cell::RefCell::new(BTreeMap::new()) };
 }
+// Bound aggregate metadata too: a busy installation cannot multiply a
+// full cohort by all 64 context slots. Eviction permits extra stat work only.
+fn trim(memo: &mut BTreeMap<String, Walk>) {
+    while memo.values().map(|w| w.observations.len()).sum::<usize>() > 4 * OBSERVATIONS_PER_SCOPE {
+        let oldest = memo
+            .iter()
+            .min_by_key(|(_, w)| w.last_walk)
+            .map(|(k, _)| k.clone())
+            .unwrap();
+        memo.remove(&oldest);
+        eprintln!("terminal_off_observation_scope_evicted scopes=1");
+    }
+}
 fn with_walks<T>(f: impl FnOnce(&mut BTreeMap<String, Walk>) -> T) -> T {
     #[cfg(test)]
     {
-        WALKS.with(|v| f(&mut v.borrow_mut()))
+        WALKS.with(|v| {
+            let mut memo = v.borrow_mut();
+            let result = f(&mut memo);
+            trim(&mut memo);
+            result
+        })
     }
     #[cfg(not(test))]
     {
         static WALKS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Walk>>> =
             std::sync::OnceLock::new();
-        f(&mut WALKS
+        let mut memo = WALKS
             .get_or_init(Default::default)
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = f(&mut memo);
+        trim(&mut memo);
+        result
     }
 }
 fn digest(key: &str) -> [u8; 32] {
@@ -338,7 +359,6 @@ pub(super) fn walk_path(
         }
         if !watcher
             && walk.suppressing
-            && traversal.observed_index_keys.contains(&key)
             && stat.is_some_and(|s| s.identity.is_some())
             && walk
                 .observations
@@ -362,7 +382,7 @@ pub(super) fn walk_path(
     })
 }
 
-pub(super) fn served(index: &ScanIndex, candidate: &CandidateFile) {
+pub(super) fn served(index: &ScanIndex, candidate: &CandidateFile, now: u64) {
     let Some(scope) = terminal_off_rediscovery_scope(index) else {
         return;
     };
@@ -374,11 +394,18 @@ pub(super) fn served(index: &ScanIndex, candidate: &CandidateFile) {
         identity: candidate.physical_identity,
         birth: candidate.fingerprint_birth_nanos,
     });
+    let debt = sampled_audit::debt_for_key(index, &key, now);
+    let cause = cause(index, &key, now).unwrap_or("watcher_stat_change");
     with_walks(|memo| {
         if let Some(walk) = memo.get_mut(&scope) {
-            let debt = sampled_audit::debt_for_key(index, &key, walk.now);
-            let cause = cause(index, &key, walk.now).unwrap_or("watcher_stat_change");
+            let round = walk.round;
+            let now = walk.now;
             let o = observation(walk, &key);
+            if o.round != round {
+                o.first_seen = now;
+            }
+            o.stat = stat;
+            o.round = round;
             o.served = Some((stat, token));
             o.targeted = Some(service_token(token, debt, stat, cause));
         }
@@ -419,6 +446,7 @@ pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
         let stat = fs::symlink_metadata(key)
             .ok()
             .and_then(|m| Stat::capture(&m));
+        let retry_ready = sampled_audit::failed_open_retry_ready(key, now);
         let admitted = with_walks(|memo| {
             let Some(walk) = memo.get_mut(&scope) else {
                 return false;
@@ -428,7 +456,7 @@ pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
             }
             let token = service_token(token, debt, stat, cause);
             let o = observation(walk, key);
-            if o.targeted == Some(token) {
+            if o.targeted == Some(token) && !retry_ready {
                 return false;
             }
             o.targeted = Some(token);
