@@ -61,17 +61,29 @@ def serial_test_functions(src: Path) -> set[str]:
     for path in sorted(src.rglob("*.rs")):
         lines = path.read_text(encoding="utf-8").splitlines()
         pending: int | None = None
+        attr_depth = 0  # open brackets of a multi-line attribute after #[serial]
         for number, line in enumerate(lines, 1):
             where = f"{path}:{number}"
+            code = line.split("//", 1)[0]
+            if attr_depth:
+                if re.search(r"\b(?:serial|parallel)\b", code):
+                    raise SetupError(f"{where}: unrecognised serial_test usage: {line.strip()}")
+                attr_depth += code.count("[") - code.count("]")
+                continue
             if SERIAL_ATTR.match(line):
                 pending = pending or number
                 continue
-            code = line.split("//", 1)[0]
             if SERIAL_LIKE.search(code) and not SERIAL_USE.match(line):
                 raise SetupError(f"{where}: unrecognised serial_test usage: {line.strip()}")
             if pending is None:
                 continue
             found = TEST_FN.match(line)
+            if not found and code.lstrip().startswith("#["):
+                depth = code.count("[") - code.count("]")
+                if depth > 0:
+                    # e.g. #[cfg_attr(\n    not(...),\n    ignore = "..."\n)]
+                    attr_depth = depth
+                    continue
             if found:
                 names.add(found.group(1))
                 pending = None

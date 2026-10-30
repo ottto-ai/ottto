@@ -42,6 +42,18 @@ class SerialSourceTests(unittest.TestCase):
         self.write('nested/b.rs', '    #[serial_test::serial(source_cadences)]\n    #[test]\n    pub fn pathed() {}\n')
         self.assertEqual(runner.serial_test_functions(self.src), {'bare', 'stacked', 'pathed'})
 
+    def test_multi_line_attribute_after_serial(self):
+        self.write('a.rs', '\n'.join([
+            '#[test]',
+            '#[serial(source_manifests)]',
+            '#[cfg_attr(',
+            '    not(any(target_os = "macos", target_os = "linux")),',
+            '    ignore = "needs macOS heap layout"',
+            ')]',
+            'fn gated() {}',
+        ]) + '\n')
+        self.assertEqual(runner.serial_test_functions(self.src), {'gated'})
+
     def test_unknown_forms_fail_closed(self):
         cases = {
             'parallel': '#[parallel]\n#[test]\nfn a() {}\n',
@@ -51,6 +63,7 @@ class SerialSourceTests(unittest.TestCase):
             'cfg_attr': '#[cfg_attr(test, serial)]\nfn a() {}\n',
             'macro body': '#[serial]\n#[test]\nfn $name() {}\n',
             'dangling': '#[serial]\n',
+            'multi-line cfg_attr': '#[serial]\n#[cfg_attr(\n    test,\n    parallel\n)]\nfn a() {}\n',
         }
         for label, text in cases.items():
             with self.subTest(label):
