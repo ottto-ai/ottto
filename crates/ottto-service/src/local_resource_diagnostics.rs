@@ -2363,25 +2363,42 @@ mod tests {
 
     #[test]
     fn cache_lifecycle_record_is_bounded_and_explicitly_process_global() {
-        let (_, records) = capture(|| {
-            traversal_point(
+        for (stage, source, counts, actual) in [
+            (
                 "process_retained_cache_lifecycle_totals",
                 "unknown",
-                &cache_lifecycle::Counts::maximum(),
-            );
-        });
-        assert_eq!(records.len(), 1);
-        let record = &records[0];
-        assert_eq!(record["stage"], "process_retained_cache_lifecycle_totals");
-        assert_eq!(record["source"], "unknown");
-        assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
-        assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
-        assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        // The two Pi observation fields add 97 bytes at u64::MAX.
-        assert!(serde_json::to_string(record).unwrap().len() < 2304);
-        let (_, actual) = capture(cache_lifecycle_totals);
-        assert_eq!(actual.len(), 1);
-        assert_eq!(actual[0]["stage"], record["stage"]);
+                serde_json::to_value(cache_lifecycle::Counts::maximum()).unwrap(),
+                capture(cache_lifecycle_totals).1,
+            ),
+            (
+                "process_codex_memo_lifecycle_totals",
+                "codex",
+                serde_json::to_value(codex_memo_lifecycle::Record::maximum()).unwrap(),
+                capture(|| codex_memo_lifecycle_totals("codex")).1,
+            ),
+            (
+                "process_codex_side_lifecycle_totals",
+                "codex",
+                serde_json::to_value(codex_side_lifecycle::Record::maximum()).unwrap(),
+                capture(|| codex_side_lifecycle_totals("codex")).1,
+            ),
+        ] {
+            let (_, records) = capture(|| traversal_point(stage, source, &counts));
+            assert_eq!(records.len(), 1);
+            let record = &records[0];
+            assert_eq!(record["stage"], stage);
+            assert_eq!(record["source"], source);
+            assert!(record["counts"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|value| *value == u64::MAX));
+            assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
+            assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
+            assert!(serde_json::to_string(record).unwrap().len() < 2304);
+            assert_eq!(actual.len(), 1);
+            assert_eq!(actual[0]["stage"], stage);
+        }
     }
 
     #[test]
