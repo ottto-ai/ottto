@@ -39062,21 +39062,11 @@ fn apply_pi_usage_line(
     }
 }
 
-/// Domain and each part use a u64 little-endian byte length followed by
-/// UTF-8 bytes. NULs within provider ids or selector values stay unambiguous.
+/// Domain and parts share the length-prefixed snapshot hash convention.
 fn pi_usage_hash(domain: &str, parts: &[&str]) -> String {
-    #[cfg(test)]
-    if transcript_acquisition_tests::PI_LEGACY_HASH.with(std::cell::Cell::get) {
-        return if domain == "ottto-pi-usage-key:v1" {
-            parts[0].to_owned()
-        } else {
-            sha256_hex(parts)
-        };
-    }
     let mut hash = Sha256::new();
     for part in std::iter::once(domain).chain(parts.iter().copied()) {
-        hash.update((part.len() as u64).to_le_bytes());
-        hash.update(part.as_bytes());
+        update_length_prefixed(&mut hash, part.as_bytes());
     }
     format!("{:x}", hash.finalize())
 }
