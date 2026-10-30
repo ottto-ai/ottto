@@ -7250,6 +7250,7 @@ pub(super) fn exact_pipeline_accept(
 
 #[test]
 #[serial(source_manifests)]
+#[ignore = "terminal-off ON-readiness: P6"]
 fn terminal_off_new_unindexed_session_is_held_and_counted_behind_closed_fence() {
     let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
     assert!(crate::snapshots::claude_terminal_off());

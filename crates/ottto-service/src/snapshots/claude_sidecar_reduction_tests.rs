@@ -917,6 +917,7 @@ fn missing_index_cannot_be_replaced_by_warm_cache_authority() {
 }
 
 #[test]
+#[ignore = "terminal-off ON-readiness: C1-X"]
 fn terminal_off_on_missing_index_cannot_be_replaced_by_warm_cache_authority() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

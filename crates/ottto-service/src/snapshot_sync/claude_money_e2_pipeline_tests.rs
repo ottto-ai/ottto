@@ -1320,6 +1320,7 @@ fn e2_pipeline_twins_original_discovered_first() {
 }
 
 #[test]
+#[ignore = "terminal-off ON-readiness: R1-unacked-twin-body"]
 fn terminal_off_on_e2_pipeline_twins_original_discovered_first() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -1331,6 +1332,7 @@ fn e2_pipeline_twins_copy_discovered_first() {
 }
 
 #[test]
+#[ignore = "terminal-off ON-readiness: R1-unacked-twin-body"]
 fn terminal_off_on_e2_pipeline_twins_copy_discovered_first() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

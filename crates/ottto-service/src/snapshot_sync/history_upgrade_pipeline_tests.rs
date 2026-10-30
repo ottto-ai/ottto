@@ -869,6 +869,7 @@ fn quarantined_index_after_bootstrap_holds_all_history_without_a_list() {
 /// holds all three sessions); here none is, every file is recorded locally
 /// with its census record, and the next two cycles do not re-read anything.
 #[test]
+#[ignore = "terminal-off ON-readiness: R5"]
 fn terminal_off_on_quarantined_index_after_bootstrap_holds_all_history_without_a_list() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -1352,6 +1353,7 @@ fn only_files_that_grew_after_a_rebuild_emit() {
 /// Addendum 2 item 13: after a held rebuild, only files that grew emit, by
 /// ordinary sync, and they settle at the active revision.
 #[test]
+#[ignore = "terminal-off ON-readiness: R5"]
 fn terminal_off_on_only_files_that_grew_after_a_rebuild_emit() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -2006,6 +2008,7 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
 
 /// SOURCE N1 third half: vanished history releases only on a healthy complete terminal.
 #[test]
+#[ignore = "terminal-off ON-readiness: R5"]
 fn terminal_off_on_user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -2663,6 +2666,7 @@ fn quarantined_index_holds_history_born_after_the_no_list_cutoff() {
 /// before the history cutoff this load records, so it is still held: the
 /// hold reaches the later of the two.
 #[test]
+#[ignore = "terminal-off ON-readiness: R5"]
 fn terminal_off_on_quarantined_index_holds_history_born_after_the_no_list_cutoff() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

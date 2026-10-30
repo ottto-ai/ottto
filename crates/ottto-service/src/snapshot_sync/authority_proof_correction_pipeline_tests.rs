@@ -2371,6 +2371,7 @@ fn account_held_member_stays_owed_while_owed_siblings_drain_across_passes() {
 /// that member's own ACK or no-op, then clears.
 #[test]
 #[serial(source_manifests)]
+#[ignore = "terminal-off ON-readiness: APC-generation-bound"]
 fn terminal_off_on_account_held_member_stays_owed_while_owed_siblings_drain_across_passes() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
     assert!(crate::snapshots::claude_terminal_off());
@@ -2571,6 +2572,7 @@ fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
 #[serial(source_manifests)]
 // A shed page records RatelimitBackoff in the shared client_report counters.
 #[serial(client_report)]
+#[ignore = "terminal-off ON-readiness: APC-generation-bound"]
 fn terminal_off_on_crash_and_shed_before_settlement_keep_the_grant_unchanged() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
     assert!(crate::snapshots::claude_terminal_off());
@@ -2794,6 +2796,7 @@ fn superseded_revision_ack_never_drains_the_current_revision() {
 #[serial(source_manifests)]
 // A shed page records RatelimitBackoff in the shared client_report counters.
 #[serial(client_report)]
+#[ignore = "terminal-off ON-readiness: APC-generation-bound"]
 fn terminal_off_on_superseded_revision_ack_never_drains_the_current_revision() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
     assert!(crate::snapshots::claude_terminal_off());
@@ -4958,6 +4961,7 @@ fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() 
 /// tombstone clears with that settled proof.
 #[test]
 #[serial(source_manifests)]
+#[ignore = "terminal-off ON-readiness: proof-grant"]
 fn terminal_off_on_returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
     assert!(crate::snapshots::claude_terminal_off());

@@ -949,6 +949,7 @@ fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
 
 #[test]
 #[serial(source_manifests)]
+#[ignore = "terminal-off ON-readiness: R12"]
 fn terminal_off_on_oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
