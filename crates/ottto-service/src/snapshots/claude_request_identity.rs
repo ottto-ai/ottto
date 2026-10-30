@@ -1106,7 +1106,7 @@ fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::
                 .by_key
                 .iter()
                 .filter(|(_, amount)| amount.counts != [0; 8])
-                .map(|(key, _)| key.as_ref().map(accepted::authority_hash))
+                .map(|(key, _)| key.as_ref().map(|key| accepted.authority_hash(key)))
                 .collect::<BTreeSet<_>>();
             // An always-missing sibling remains untagged without a refusal.
             // New tagged shares in an accepted bucket were never accepted;
@@ -1121,7 +1121,7 @@ fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::
             grouping.accepted_share_changed.insert(bucket.clone());
             let mut kept = BTreeMap::<Option<AuthorityKey>, Amounts>::new();
             for (key, amount) in std::mem::take(&mut group.by_key) {
-                let key = key.filter(|key| prior.contains(&Some(accepted::authority_hash(key))));
+                let key = key.filter(|key| prior.contains(&Some(accepted.authority_hash(key))));
                 // Never reconstruct missing proof from the ledger.
                 kept.entry(key)
                     .or_default()

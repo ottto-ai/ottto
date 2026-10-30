@@ -6842,7 +6842,7 @@ fn finish_sync_source(
         context_curve_enabled,
         cache_observations_enabled,
         scan_agent_status_collection,
-        attribution_context: _,
+        attribution_context,
         upload_policy,
         upload_destination_namespace,
         receipt_client,
@@ -6857,6 +6857,9 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    upload_progress
+        .accepted_identity_buckets
+        .bind_context(attribution_context.as_ref());
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
     if let Some(lease) = native_comparison_lease.as_mut() {

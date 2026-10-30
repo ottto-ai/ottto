@@ -2,10 +2,14 @@ use super::*;
 use serde_json::{json, Value};
 
 fn progress() -> SnapshotUploadProgress {
-    SnapshotUploadProgress::new(
+    let mut progress = SnapshotUploadProgress::new(
         "a".repeat(64),
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-    )
+    );
+    progress
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x42; 32]));
+    progress
 }
 fn body() -> Value {
     json!({"source_session_id":"synthetic-sticky-session", "snapshot_fingerprint":"b".repeat(64),
@@ -19,7 +23,10 @@ fn acknowledged_bucket_keys_survive_progress_restart_and_older_decoder_drops_onl
     progress.record_body(&"b".repeat(64), &"c".repeat(64));
     progress.record_cache_state(&body(), false).unwrap();
     let bytes = serde_json::to_vec(&progress).unwrap();
-    let restored: SnapshotUploadProgress = serde_json::from_slice(&bytes).unwrap();
+    let mut restored: SnapshotUploadProgress = serde_json::from_slice(&bytes).unwrap();
+    restored
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x42; 32]));
     assert_eq!(
         restored.accepted_identity_buckets,
         progress.accepted_identity_buckets
