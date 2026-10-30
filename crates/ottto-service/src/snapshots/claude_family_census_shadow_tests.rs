@@ -1856,6 +1856,19 @@ fn each_child_finalize_cause_blocks_alone() {
         (cause, Box::new(mutate))
     }
     let cases = vec![
+        // A child-only family, otherwise valid: the root never had a file.
+        case(Blocked::RootAbsent, |index, root, keys| {
+            index.files.remove(&keys[0]);
+            let traversal = index.traversal.as_mut().unwrap();
+            traversal.observed_index_keys.remove(&keys[0]);
+            let pending = index.claude_account_family_pending.get_mut(root).unwrap();
+            pending.current.members.remove(root);
+            pending.current.member_requests.remove(root);
+        }),
+        // Its root is confirmed empty: indexed, bound, and no member.
+        case(Blocked::RootAbsent, |index, _, keys| {
+            index.confirmed_empty_files.insert(keys[0].clone());
+        }),
         case(Blocked::WitnessMissing, |index, root, _| {
             let member = member_name(root, Some(0));
             let pending = index.claude_account_family_pending.get_mut(root).unwrap();

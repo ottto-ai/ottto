@@ -55,7 +55,8 @@ const MAX_ROTATION_KEYS: usize = 4_096;
 /// before filters and dedup. Families it cannot finish are counted
 /// `families_unevaluated_member_budget`, not evaluated.
 pub(super) const MAX_MEMBER_KEYS_PER_PAGE: usize = 16_384;
-/// Keys one page's uniqueness pass may visit. A corpus larger than this is
+/// Range advances one page's uniqueness pass may consume; its lookahead may
+/// fetch up to 2 more keys it does not consume. A corpus larger than this is
 /// counted across pages, and uniqueness stays unknown until the pass ends.
 pub(super) const ROOT_PASS_KEYS_PER_PAGE: usize = 8_192;
 /// History gates the page lookup reads; past it every family counts `held`.
@@ -139,6 +140,9 @@ pub(super) enum Completion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ChildFinalizeBlocked {
+    /// The root member is absent or confirmed empty, so no bound root anchors
+    /// the children.
+    RootAbsent,
     /// A child has no account evidence: it is outside the pending proof's
     /// members or request sets, or has no source/entity/body tuple to bind.
     WitnessMissing,
@@ -1159,8 +1163,9 @@ impl<'a> View<'a> {
     /// `family`'s verdict for child finalization, or `None` unless it lacks
     /// only child revisions: every other member check passes, ignoring what E1's
     /// conditions themselves name (source-wide vetoes, holds, window, uniqueness),
-    /// the root is bound, no bound child is stale, and each member's current
-    /// revision is attested. Pure, like `classify`.
+    /// a live root is bound at its current tuple (a family with no live root is
+    /// `root_absent`), no bound child is stale, and each member's current revision
+    /// is attested. Pure, like `classify`.
     fn child_finalize(
         &self,
         family: &FamilyRef,
@@ -1184,10 +1189,11 @@ impl<'a> View<'a> {
             .members
             .keys()
             .chain(pending.member_requests.keys())
-            .any(|member| !name_set.contains(member.as_str()))
+            .any(|member| *member != family.root && !name_set.contains(member.as_str()))
         {
             return None;
         }
+        let mut root_present = false;
         let mut unfinalized = false;
         let mut unwitnessed = false;
         let mut revisions = Vec::with_capacity(members.len());
@@ -1214,6 +1220,7 @@ impl<'a> View<'a> {
                     unwitnessed |= unbound.is_none() || current.is_none();
                 }
             }
+            root_present |= *member == family.root;
             revisions.push(entry.source_file_fingerprint.as_str());
         }
         if !unfinalized
@@ -1225,6 +1232,9 @@ impl<'a> View<'a> {
                 .all(|(key, revision)| self.attested.covers(key, revision))
         {
             return None;
+        }
+        if !root_present {
+            return Some(ChildFinalize::Blocked(ChildFinalizeBlocked::RootAbsent));
         }
         let twin = name_set.len() != members.len();
         let cause = self.child_finalize_blocked(family, family_members, pending, unwitnessed, twin);
@@ -1633,13 +1643,14 @@ impl Runtime {
 pub(super) struct Cost {
     pub(super) predicate_cpu_us: u64,
     pub(super) families_evaluated: u64,
-    /// Keys this page really processed outside the member budget: the
-    /// uniqueness pass with its validation, the rotation, both queue passes.
+    /// Keys this page consumed in the uniqueness pass, with one check per
+    /// parse. Excludes the pass's lookahead of up to 2 keys.
     pub(super) root_index_keys_processed: u64,
     pub(super) rotation_keys_visited: u64,
     pub(super) queue_entries_visited: u64,
     pub(super) history_gates_visited: u64,
-    /// Cross-family records read, on a page with a child-finalize candidate.
+    /// Outer-map entries of the cross-family records, on a page with a
+    /// child-finalize candidate: not the owner references flattened from them.
     pub(super) cross_family_entries_visited: u64,
     pub(super) cross_family_overflowed: bool,
     pub(super) root_index_restarted: bool,
