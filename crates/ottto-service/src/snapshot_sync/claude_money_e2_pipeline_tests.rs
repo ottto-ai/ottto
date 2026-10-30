@@ -2956,7 +2956,7 @@ fn e2_pipeline_copy_removal_capacity_preserves_old_decisions_and_holds_new_ones(
         let old = ScanIndex::default();
         let original = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
         let mut prior = settle(&c, &old, original, &mut e2_progress());
-        let root = location_key(&local_index_key(&c.root.join(file(ROOT))));
+        let root = location_key(&c.root.join(file(ROOT)).to_string_lossy());
         // Saturate storage with an indexed file's already-recorded decisions.
         // A later decision must never evict them or publish without custody.
         let groups = BTreeMap::from([(
