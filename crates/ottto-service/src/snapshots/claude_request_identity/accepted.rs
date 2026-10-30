@@ -394,8 +394,9 @@ impl AcceptedSession {
             .map(|index| self.proved[index].proof)
             .filter(|proof| *proof != REPLACED_PROOF)
     }
-    /// A replacement's reply never settled, so the server may hold either
-    /// proof. Kept here because the share hints are evicted independently.
+    /// A replacement's reply never settled, or the server reported proof
+    /// other than ours, so it may hold either proof. Kept here because the
+    /// share hints are evicted independently.
     pub(super) fn replacement_unsettled(&self, bucket: i64, row: &RowKey) -> bool {
         let row = proved_row_hash(self.bound_key(), row);
         self.proved
@@ -689,8 +690,12 @@ impl AcceptedBuckets {
     /// Option (ii) settlement for one stored-body entity ACK. A row enters
     /// only when the ACK carries the exact local body witness and the row had
     /// a positive tag; later positive proof replaces it. Marker and untagged
-    /// rows keep the server-held proof. `retained_proof_missing` buckets lose
-    /// their marked rows, so a later revision re-tags them if proof remains.
+    /// rows keep the server-held proof. A `retained_proof_missing` bucket
+    /// means the server holds no proof equal to ours, including a carried
+    /// older proof this body's fresh tags did not replace (SOURCE Addendum 9):
+    /// none of its rows is admitted from this ACK, and every held row becomes
+    /// a proof-free tombstone, so later revisions re-tag fresh and never mark
+    /// over proof the server does not hold.
     /// Before an upload: a row this body freshly tags with a different proof
     /// may replace the server's retained proof even if the ACK is lost, so the
     /// superseded entry becomes a tombstone first; a later ACK replaces it.
@@ -770,8 +775,12 @@ impl AcceptedBuckets {
         let mut pending = std::mem::take(&mut entry.missing)
             .into_iter()
             .collect::<BTreeSet<_>>();
+        let listed = missing
+            .iter()
+            .filter_map(|start| bucket_key(start))
+            .collect::<BTreeSet<_>>();
         let mut present = BTreeSet::new();
-        let mut marked = BTreeSet::new();
+        let mut present_rows = BTreeSet::new();
         for bucket in buckets {
             let Some(start) = bucket["bucket_start"].as_str().and_then(bucket_key) else {
                 continue;
@@ -782,11 +791,9 @@ impl AcceptedBuckets {
                     continue;
                 };
                 let row_hash = proved_row_hash(&key, &row_key);
-                if row["identity_retained"] == json!(true) {
-                    marked.insert((start, row_hash));
-                    continue;
-                }
-                if !witnessed {
+                present_rows.insert((start, row_hash));
+                if row["identity_retained"] == json!(true) || !witnessed || listed.contains(&start)
+                {
                     continue;
                 }
                 if let Some(proof) = row_proof(&key, row, &body["request_evidence"]) {
@@ -802,16 +809,16 @@ impl AcceptedBuckets {
                 }
             }
         }
-        proved.retain(|(bucket, _), _| present.contains(bucket));
+        // Per row key, as the server prunes: a row that returns later re-tags.
+        proved.retain(|row, _| present_rows.contains(row));
         pending.retain(|bucket| present.contains(bucket));
-        let mut received = 0u64;
-        for start in missing.iter().filter_map(|start| bucket_key(start)) {
-            received += 1;
-            proved.retain(|row, _| row.0 != start || !marked.contains(row));
-            if marked.iter().any(|(bucket, _)| *bucket == start) {
-                pending.insert(start);
+        let received = missing.iter().filter_map(|start| bucket_key(start)).count() as u64;
+        for (row, held) in &mut proved {
+            if listed.contains(&row.0) {
+                *held = (REPLACED_PROOF, None);
             }
         }
+        pending.extend(listed.intersection(&present));
         let mut capped = 0u64;
         // Evict whole oldest buckets: a lost row only means fresh tags later.
         while proved.len() > MAX_PROVED_ROWS {
@@ -1390,20 +1397,51 @@ mod retained_tests {
             Some([0xaa; 32])
         );
         assert_eq!(restored.proved_rows_for_test("synthetic"), Some((1, 0)));
-        // retained_proof_missing removes only rows this body marked.
-        state.record_proved(&b, true, &["2026-09-01T10:00:00Z".into()]);
-        assert_eq!(proof(&state), Some(second));
+        // retained_proof_missing: the server holds no proof equal to ours,
+        // including an older proof it carried over this body's fresh tags
+        // (SOURCE Addendum 9). Nothing in a listed bucket is admitted or kept.
+        let listed = ["2026-09-01T10:00:00Z".to_string()];
+        let mut carried = state.clone();
+        carried.record_proved(&a, true, &listed);
+        assert_eq!(proof(&carried), None, "a carried ACK's proof never enters");
+        assert_eq!(carried.proved_rows_for_test("synthetic"), Some((0, 1)));
+        let held = &carried.get("synthetic").unwrap().proved;
+        assert_eq!((held[0].proof, held[0].account), (REPLACED_PROOF, None));
+        assert!(settled(&carried), "the carried proof may still be held");
+        let mut unmarked = state.clone();
+        unmarked.record_proved(
+            &body(json!({"model":"claude-synthetic","request_count":1})),
+            true,
+            &listed,
+        );
+        assert_eq!(proof(&unmarked), None, "listed rows drop even unmarked");
         let marked =
             body(json!({"model":"claude-synthetic","request_count":1,"identity_retained":true}));
-        state.record_proved(&marked, true, &["2026-09-01T10:00:00Z".into()]);
+        state.record_proved(&marked, true, &listed);
         assert_eq!(proof(&state), None);
         assert_eq!(state.proved_rows_for_test("synthetic"), Some((0, 1)));
         assert!(
-            state.get("synthetic").unwrap().proved.is_empty(),
+            state
+                .get("synthetic")
+                .unwrap()
+                .proved
+                .iter()
+                .all(|row| row.account.is_none()),
             "missing grain drops class H too"
         );
+        // A later unlisted witnessed ACK is a normal replacement again.
         state.record_proved(&b, true, &[]);
+        assert_eq!(proof(&state), Some(second));
         assert_eq!(state.proved_rows_for_test("synthetic"), Some((1, 0)));
+        // Rows prune per row key, as on the server: another row in the same
+        // bucket does not keep this one.
+        let mut moved = state.clone();
+        moved.record_proved(
+            &body(json!({"model":"claude-other","request_count":1})),
+            true,
+            &[],
+        );
+        assert_eq!(moved.proved_rows_for_test("synthetic"), Some((0, 0)));
         // A bucket the body no longer has leaves with it; legacy bodies never touch.
         let mut legacy = b.clone();
         legacy["provenance"]["collector"] = json!("legacy");

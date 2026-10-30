@@ -788,6 +788,30 @@ pub(crate) fn apply_with_accepted_for_test(
     apply_with_reserved_bytes_for_test(item, contributions, accepted, 0)
 }
 
+/// Marks every bucket row of `item` as deferred, to exercise the tag guard
+/// that `apply` never reaches.
+#[cfg(test)]
+pub(crate) fn mark_every_row_for_test(item: &mut SnapshotItem) -> u64 {
+    let rows = item
+        .usage_buckets
+        .iter()
+        .flat_map(|bucket| {
+            bucket.model_usage.iter().map(|row| DeferredRow {
+                bucket: bucket.bucket_start.clone(),
+                row: row_key_from_model_usage(row),
+                by_key: BTreeMap::new(),
+                refused: false,
+                account: None,
+            })
+        })
+        .collect();
+    Deferred {
+        rows,
+        missing: BTreeSet::new(),
+    }
+    .mark(item)
+}
+
 #[cfg(test)]
 pub(crate) fn apply_with_reserved_bytes_for_test(
     item: &mut SnapshotItem,
@@ -1154,8 +1178,10 @@ fn apply_grouped_with_accepted(
             .saturating_sub(deferred.marker_bytes());
         deferred.keep_newest(MAX_ITEM_BYTES.saturating_sub(unmarked))
     };
-    let refusals = refusals.saturating_add(dropped);
-    deferred.mark(item);
+    // Skipped markers are kept rows, so this stays within the measured count.
+    let refusals = refusals
+        .saturating_add(dropped)
+        .saturating_add(deferred.mark(item));
     deferred.count(item, retained, &mut counts);
     budget::record(&counts);
     item.request_identity_refusals = refusals;
@@ -1229,10 +1255,15 @@ impl Deferred {
             .saturating_add((before - self.rows.len()) as u64);
     }
 
-    fn mark(&self, item: &mut SnapshotItem) {
+    /// A row that still carries a tag is never marked; it goes out without
+    /// the marker and counts a refusal (SOURCE Q5), never refusals = 0.
+    /// Returns those refusals; a skipped marker frees more bytes than a
+    /// refusal digit adds, so the wire bound holds.
+    fn mark(&self, item: &mut SnapshotItem) -> u64 {
         if self.rows.is_empty() {
-            return;
+            return 0;
         }
+        let mut skipped = 0u64;
         let marked = self
             .rows
             .iter()
@@ -1244,6 +1275,7 @@ impl Deferred {
                     marked.get(&(bucket.bucket_start.as_str(), &row_key_from_model_usage(row)))
                 {
                     if row.evidence_ref.is_some() || row.identity_parts.is_some() {
+                        skipped += 1;
                         continue;
                     }
                     row.identity_retained = true;
@@ -1251,6 +1283,8 @@ impl Deferred {
                 }
             }
         }
+        item.request_identity_refusals = item.request_identity_refusals.saturating_add(skipped);
+        skipped
     }
 
     fn restore(&self, grouping: &mut Grouping) {

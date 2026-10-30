@@ -694,3 +694,123 @@ fn retained_lost_replacement_then_missing_proof_is_a_counted_refusal() {
     assert!(missing.request_identity_refusals > 0);
     sticky_assert_reconciled(&missing);
 }
+
+// SOURCE Addendum 9 / Lead B C1: the server carried an older proof over this
+// body's fresh tags (a backend-refused share) and lists the bucket in
+// `retained_proof_missing`; the daemon must never mark over that proof.
+#[test]
+fn retained_carried_parts_proof_re_tags_fresh_and_never_overlays() {
+    let (original, proof) = retained_session(4);
+    let mut state = retained_state();
+    let mut first = original.clone();
+    sticky_apply(&mut first, &proof, &state).unwrap();
+    retained_ack(&mut state, &first, &[]);
+    // Hour 1, part 0: parts A -> B, sent as fresh tags; the server carries A.
+    let mut changed = proof.clone();
+    changed[3].identity = login_key(D64);
+    let mut second = original.clone();
+    sticky_apply(&mut second, &changed, &state).unwrap();
+    assert_eq!(retained_marked(&second), vec![true, false, true, false]);
+    assert!(state.invalidate_replaced(&serde_json::to_value(&second).unwrap()));
+    let hour_one = second.usage_buckets[1].bucket_start.clone();
+    identity::take_identity_counts();
+    retained_ack(&mut state, &second, &[&hour_one]);
+    assert_eq!(
+        retained_count(&retained_counts(), "retained_proof_missing_received"),
+        1
+    );
+    assert_eq!(
+        state.proved_rows_for_test(&original.source_session_id),
+        Some((3, 1))
+    );
+    let carried = state.clone();
+    // Unchanged next revision: fresh B tags again, no marker, so no A overlay.
+    let mut third = original.clone();
+    sticky_apply(&mut third, &changed, &state).unwrap();
+    assert_eq!(retained_marked(&third), vec![true, false, true, false]);
+    let row = &third.usage_buckets[1].model_usage[0];
+    assert!(row
+        .identity_parts
+        .as_ref()
+        .unwrap()
+        .iter()
+        .any(|part| part.account_identifier_hash.as_deref() == Some(D64)));
+    assert_eq!(third.request_identity_refusals, 0);
+    retained_assert_exclusive(&third);
+    sticky_assert_reconciled(&third);
+    // A normal replacement (bucket not listed) is admitted as before.
+    retained_ack(&mut state, &third, &[]);
+    let mut fourth = original.clone();
+    sticky_apply(&mut fourth, &changed, &state).unwrap();
+    assert_eq!(retained_marked(&fourth), vec![true, true, true, false]);
+    // If the transcript stops proving the carried row, the server may still
+    // hold A: untagged with a counted refusal, never a marker or zero.
+    let mut lost = changed.clone();
+    for contribution in &mut lost[3..6] {
+        contribution.identity = RequestIdentity::Missing;
+    }
+    let mut carried = carried;
+    carried.forget_share_hints_for_test(&original.source_session_id);
+    let mut unproved = original.clone();
+    sticky_apply(&mut unproved, &lost, &carried).unwrap();
+    let row = &unproved.usage_buckets[1].model_usage[0];
+    assert!(!row.identity_retained && !sticky_tagged(row));
+    assert!(unproved.request_identity_refusals > 0);
+    retained_assert_exclusive(&unproved);
+    sticky_assert_reconciled(&unproved);
+}
+
+#[test]
+fn retained_carried_login_proof_does_not_loop() {
+    let (original, proof) = retained_login_session();
+    let mut state = retained_state();
+    let mut first = original.clone();
+    sticky_apply(&mut first, &proof, &state).unwrap();
+    retained_ack(&mut state, &first, &[]);
+    let mut changed = proof.clone();
+    for contribution in &mut changed[..3] {
+        contribution.identity = login_key(D64);
+    }
+    let hour_zero = first.usage_buckets[0].bucket_start.clone();
+    identity::take_identity_counts();
+    // While the server keeps carrying A, every revision re-tags B fresh: no
+    // marker/missing alternation, one received count per ACK.
+    for _ in 0..3 {
+        let mut next = original.clone();
+        sticky_apply(&mut next, &changed, &state).unwrap();
+        let row = &next.usage_buckets[0].model_usage[0];
+        assert!(!row.identity_retained && sticky_tagged(row));
+        assert_eq!(row.account_identifier_hash.as_deref(), Some(D64));
+        assert_eq!(next.request_identity_refusals, 0);
+        retained_assert_exclusive(&next);
+        sticky_assert_reconciled(&next);
+        state.invalidate_replaced(&serde_json::to_value(&next).unwrap());
+        retained_ack(&mut state, &next, &[&hour_zero]);
+    }
+    assert_eq!(
+        retained_count(&retained_counts(), "retained_proof_missing_received"),
+        3
+    );
+    // Once the server takes B, the marker carries B's row hash, never A's.
+    let mut taken = original.clone();
+    sticky_apply(&mut taken, &changed, &state).unwrap();
+    retained_ack(&mut state, &taken, &[]);
+    let mut marked = original.clone();
+    sticky_apply(&mut marked, &changed, &state).unwrap();
+    let row = &marked.usage_buckets[0].model_usage[0];
+    assert!(row.identity_retained);
+    assert_eq!(row.account_identifier_hash.as_deref(), Some(D64));
+}
+
+#[test]
+fn retained_tag_guard_never_marks_a_tagged_row_and_counts_a_refusal() {
+    let (original, proof) = retained_session(4);
+    let mut tagged = original.clone();
+    sticky_apply(&mut tagged, &proof, &retained_state()).unwrap();
+    assert_eq!(tagged.request_identity_refusals, 0);
+    // SOURCE Q5: a row that skips its marker is never sent with zero refusals.
+    assert_eq!(identity::mark_every_row_for_test(&mut tagged), 4);
+    assert_eq!(retained_marked(&tagged), vec![false; 4]);
+    assert_eq!(tagged.request_identity_refusals, 4);
+    retained_assert_exclusive(&tagged);
+}
