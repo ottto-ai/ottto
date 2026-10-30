@@ -1027,9 +1027,18 @@ fn terminal_off_rediscovery_deadline_survives_two_save_load_cycles() {
         0,
         "R25 G3: destination work never force-wakes the whole walk"
     );
-    assert_eq!(index.traversal.as_ref().unwrap().pending_candidates.len(), 1,
-        "R25 G1/G2: the current-context mismatch queues its key");
-    assert!(index.traversal.as_ref().unwrap().pending_candidates.iter().all(|p| !p.census_member));
+    assert_eq!(
+        index.traversal.as_ref().unwrap().pending_candidates.len(),
+        1,
+        "R25 G1/G2: the current-context mismatch queues its key"
+    );
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .iter()
+        .all(|p| !p.census_member));
     assert!(!first.census_complete);
 }
 
@@ -1152,7 +1161,8 @@ fn terminal_off_idle_cadence_never_parks_already_owed_read_work() {
                 .set_unverified_deadline(1),
             "contract" => {
                 index.activate_terminal_contract_retries(
-                    index.file_snapshot_fingerprints[&key].clone());
+                    index.file_snapshot_fingerprints[&key].clone(),
+                );
             }
             "cleared" => index
                 .files
@@ -1178,8 +1188,11 @@ fn terminal_off_idle_cadence_never_parks_already_owed_read_work() {
             0,
             "R25 G3: {cause} must not force-wake the root walk"
         );
-        assert_eq!(index.traversal.as_ref().unwrap().pending_candidates.len(), 1,
-            "R25 G1/G2: {cause} queues the actual owning key");
+        assert_eq!(
+            index.traversal.as_ref().unwrap().pending_candidates.len(),
+            1,
+            "R25 G1/G2: {cause} queues the actual owning key"
+        );
         assert!(!index.traversal.as_ref().unwrap().pending_candidates[0].census_member);
         assert_eq!(
             START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get),
@@ -1588,10 +1601,40 @@ fn terminal_off_targeted_adoption_is_page_bounded_deduplicated_and_never_census(
         let (_, rows) = crate::local_resource_diagnostics::capture(|| {
             terminal_off_discovery::targeted(&mut index, now, 2)
         });
-        let count = rows.iter().find(|r| r["stage"] == "terminal_off_target_inspections").unwrap();
+        let count = rows
+            .iter()
+            .find(|r| r["stage"] == "terminal_off_target_inspections")
+            .unwrap();
         assert_eq!(count["counts"]["keys"], 2);
-        assert_eq!(count["counts"]["stat_operations"], 0, "queued paths are not re-statted");
-        assert_eq!(index.traversal.as_ref().unwrap().pending_candidates.len(), 9);
+        assert_eq!(
+            count["counts"]["stat_operations"], 0,
+            "queued paths are not re-statted"
+        );
+        assert_eq!(
+            index.traversal.as_ref().unwrap().pending_candidates.len(),
+            9
+        );
+    }
+    index.traversal.as_mut().unwrap().pending_candidates.clear();
+    for _ in 0..6 {
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            terminal_off_discovery::targeted(&mut index, now, 2)
+        });
+        let count = rows
+            .iter()
+            .find(|r| r["stage"] == "terminal_off_target_inspections")
+            .unwrap();
+        assert_eq!(count["counts"]["keys"], 2);
+        assert_eq!(
+            count["counts"]["stat_operations"], 2,
+            "even an all-token-deduplicated cohort has a bounded stat turn"
+        );
+        assert!(index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .is_empty());
     }
 }
 
