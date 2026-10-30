@@ -85,3 +85,52 @@ restored prefix markers and id-less usage; retry debt covers intervening page
 pruning and restart. Before release, measure local files, holder groups, copied
 requests, longest resume chain and charged bytes; occupancy above 50% needs
 review before release.
+
+## Default-off release switch
+
+The complete resumed-prefix behavior above ships OFF. The one local process
+setting is `OTTTO_CLAUDE_RESUMED_PREFIX_DEDUPE=1`; only the exact value `1`
+enables it. Unset, `0`, invalid or non-Unicode values keep released behavior.
+This controls resumed dedupe, saved-removal use/writes, prefix retry selection
+and expiry, metadata recovery, marker re-derivation and prefix flags/counters.
+Existing all-copy and certified-writer decisions retain their released path
+when OFF. A frozen pre-change native builder from main `d0dcfbc72` pins actual
+upload bytes, hashes and ACK witnesses for a six-file old-writer demo family
+in full and sampled scans. Existing resumed-prefix fixtures explicitly opt in.
+
+For a later authorized local enable, set that environment key in the daemon's
+launch environment (for a manual launch, prefix the existing daemon command
+with `OTTTO_CLAUDE_RESUMED_PREFIX_DEDUPE=1`). Exporting it in another shell does
+not change an already-running daemon; the operator must arrange the next
+launch using the existing service management procedure. This task does not
+set the environment, restart the daemon or inspect private source data.
+Enabling first requires the operator's typed authorization and a money PLAN
+with expected removed requests/dollars and expected own-turn requests for the
+same measurement cohort. Default-ON needs a later release and money review.
+
+The independent wire capability remains OFF unless the backend advertises
+`copy_unproven:v1`, and cannot bypass local OFF. ON qualifies the upload
+context separately from that capability, so retry bodies cannot cross a local
+mode change. OFF preserves the released context. Stored removal decisions are
+retained but ignored while OFF, ready for a later authorized ON launch.
+
+For the post-enable counts-only check, use existing schema-2
+`native_collection_page` records with `source: "claude_code"` and `counts.money`:
+`copy_skipped` (removed request decisions), `copy_prefix_removed_priced_requests`,
+`copy_prefix_removed_cost_micros`, `copy_prefix_unproven_requests`,
+`copy_prefix_unproven_priced_requests`, `copy_prefix_unproven_cost_micros`,
+`copy_prefix_held_requests`, `copy_prefix_held_files`, `copy_prefix_hold_expired`,
+and `copy_prefix_own_requests`. Costs are microdollars with partial local
+telemetry coverage. Removed pricing excludes files with a partly held prefix,
+conflicting/invalid telemetry and ambiguous requests; never price a hold as a
+removal. COST must supply the unpriced remainder before comparing total dollars
+to PLAN. Own-turn counts exclude side calls and copied-prefix requests.
+These are decision events, including rereads, not unique requests or gauges.
+An isolated bounded cohort/pass is required; raw sums across retries or other
+families cannot prove PLAN agreement. Use an operator-provided, already
+counts-only export; never export transcript rows, paths, keys or ids.
+
+A separate counts-only local-state measurement still needs files, holder
+groups, saved copied requests, longest resume chain and charged bytes. The
+4 MiB bound and 2 MiB escalation threshold remain. No such measurement has
+been performed by this implementation task.

@@ -3148,6 +3148,109 @@ fn demo_family(c: &mut Corpus, progress: &mut SnapshotUploadProgress) -> ScanInd
     settle(c, &prior, second, progress)
 }
 
+/// The independent native builder is frozen from main d0dcfbc72. Compare
+/// real uploaded batch bytes, semantic fingerprints, witnesses and ACK state;
+/// this is not two invocations of the switch-OFF builder.
+#[test]
+fn e2_pipeline_resumed_switch_off_matches_pre_change_builder_demo_family() {
+    with_e2(|| {
+        let _off = e2::ResumedPrefixForTest::set(false);
+        assert!(!e2::resumed_prefix_enabled());
+        for sampled in [false, true] {
+            let mut c = Corpus::new("e2-copy-switch-off-reference");
+            let mut current = ScanIndex::default();
+            let mut reference = ScanIndex::default();
+            let mut progress = e2_progress();
+            let mut reference_progress = e2_progress();
+            let sessions = [ROOT, COPY, THIRD,
+                "5338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+                "6338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+                "7338a80a-f36e-4cbc-a5bb-50fc66430ba5"];
+            let mut lines = vec![A, B];
+            let mut own_clocks = Vec::new();
+            let mut own_ids = Vec::new();
+            for n in 0..sessions.len() {
+                own_clocks.push(format!("2026-08-02T07:{:02}:10Z", n * 3));
+                own_ids.push(format!("own-{n}"));
+            }
+            for (n, session) in sessions.iter().enumerate() {
+                if n > 0 {
+                    lines.push((&own_ids[n], &own_clocks[n], RESUME_WRITER));
+                }
+                c.write_at(&file(session), &resumed(session, &lines),
+                    &format!("2026-08-02T07:{:02}:00Z", n * 3));
+                // An advertised wire capability cannot bypass the local OFF.
+                current.copy_unproven_enabled = true;
+                reference.copy_unproven_enabled = true;
+                let mut actual = ready(&c, &E2ScanFixture::capturing_identity(), current.clone(), 100, sampled);
+                let mut expected = e2::with_pre_change_builder(||
+                    ready(&c, &E2ScanFixture::capturing_identity(), reference.clone(), 100, sampled));
+                assert_eq!(body(&actual, session).unwrap().request_count, (n + 2) as u64);
+                assert_eq!(canonical(&actual.scan.snapshots), canonical(&expected.scan.snapshots));
+                actual.finish();
+                expected.finish();
+                assert_eq!(actual.receipt(), expected.receipt());
+                let (a, bytes, order) = upload(&actual.scan.snapshots, &mut progress, ack);
+                let (b, expected_bytes, expected_order) = upload(&expected.scan.snapshots, &mut reference_progress, ack);
+                assert_eq!(a.unwrap(), b.unwrap());
+                assert_eq!(bytes, expected_bytes);
+                assert_eq!(order, expected_order);
+                assert_eq!(canonical(&progress), canonical(&reference_progress));
+                assert!(actual.index.claude_copy_removals.is_empty());
+                assert_eq!(copy_diag(&PREFIX_KEYS), [0; 5]);
+                current = settle(&c, &current, actual, &mut progress);
+                reference = settle(&c, &reference, expected, &mut reference_progress);
+            }
+        }
+    });
+}
+
+#[test]
+fn e2_pipeline_switch_off_ignores_saved_removals_and_pending_holds() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-copy-switch-off-saved");
+        let mut prior = demo_family(&mut c, &mut e2_progress());
+        let key = crate::snapshots::claude_money_birth_store::location_key(
+            &local_index_key(&c.root.join(file(COPY))));
+        assert!(prior.claude_copy_removals.advance_hold(key));
+        let saved = serde_json::to_value(&prior.claude_copy_removals).unwrap();
+        let _off = e2::ResumedPrefixForTest::set(false);
+        e2::take_diag();
+        let mut actual = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        let mut expected = e2::with_pre_change_builder(||
+            ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false));
+        assert_eq!(canonical(&actual.scan.snapshots), canonical(&expected.scan.snapshots));
+        actual.finish(); expected.finish();
+        assert_eq!(actual.receipt(), expected.receipt());
+        assert_eq!(serde_json::to_value(&actual.index.claude_copy_removals).unwrap(), saved);
+        assert_eq!(copy_diag(&PREFIX_KEYS), [0; 5]);
+    });
+}
+
+#[test]
+fn e2_pipeline_resumed_switch_counts_removed_partial_dollars_and_own_turns() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-copy-switch-counts");
+        c.root(ROOT, &resumed(ROOT, &[A, B]));
+        let old = ScanIndex::default();
+        let original = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
+        let prior = settle(&c, &old, original, &mut e2_progress());
+        c.write_at(&file(COPY), &resumed(COPY, &[A, B, C]), "2026-08-02T07:03:00Z");
+        c.evidence_for(COPY, &[api_for(COPY, "a", 10, 100),
+            api_for(COPY, "b", 10, 200), api_for(COPY, "c", 10, 400)], &[]);
+        e2::take_diag();
+        let on = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        assert_eq!(body(&on, COPY).unwrap().removed_request_count, Some(2));
+        assert_eq!(copy_diag(&["copy_prefix_removed_priced_requests",
+            "copy_prefix_removed_cost_micros", "copy_prefix_own_requests"]), [2, 300, 1]);
+        let _off = e2::ResumedPrefixForTest::set(false);
+        let off = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        assert_eq!(body(&off, COPY).unwrap().request_count, 3);
+        assert_eq!(copy_diag(&["copy_prefix_removed_priced_requests",
+            "copy_prefix_removed_cost_micros", "copy_prefix_own_requests"]), [0; 3]);
+    });
+}
+
 #[test]
 fn e2_pipeline_resumed_old_writer_family_counts_each_request_once() {
     with_e2(|| {

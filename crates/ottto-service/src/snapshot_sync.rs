@@ -5893,6 +5893,19 @@ fn cycle_upload_context(
     }
 }
 
+/// Bind persisted retry pages to the local money mode. OFF is the released
+/// context; an operator's next launch in another mode cannot replay old bodies.
+fn resumed_prefix_upload_context(context: String, enabled: bool) -> String {
+    if enabled {
+        format!(
+            "{:x}",
+            Sha256::digest(format!("{context}:resumed-prefix:v1"))
+        )
+    } else {
+        context
+    }
+}
+
 /// Keep capability-qualified ACK contexts in the loader's 64-hex domain.
 fn copy_unproven_upload_context(context: String, enabled: bool) -> String {
     if enabled {
@@ -6220,10 +6233,13 @@ fn prepare_sync_source_inner(
         checkpoint_namespace.as_deref(),
         cache_observations_enabled,
     );
-    let copy_unproven_enabled = source == SnapshotSource::ClaudeCode
+    let resumed_prefix_enabled = source == SnapshotSource::ClaudeCode
+        && crate::snapshots::claude_request_money::e2::resumed_prefix_enabled();
+    let copy_unproven_enabled = resumed_prefix_enabled
         && activity_hint.copy_unproven_contract.as_deref() == Some("copy_unproven:v1");
     // Context adoption invalidates stale pending pages on capability downgrade.
     // OFF preserves the exact released context and body bytes.
+    let upload_context = resumed_prefix_upload_context(upload_context, resumed_prefix_enabled);
     let upload_context = copy_unproven_upload_context(upload_context, copy_unproven_enabled);
     let legacy_policy_index_path = legacy_policy_scoped_snapshot_index_path(
         support_dir,
@@ -18761,7 +18777,11 @@ mod tests {
     fn copy_capability_context_preserves_partial_ack_progress_after_restart() {
         let base = cycle_upload_context(SnapshotUploadPolicy::default(), None, false);
         assert_eq!(copy_unproven_upload_context(base.clone(), false), base);
-        let context = copy_unproven_upload_context(base.clone(), true);
+        assert_eq!(resumed_prefix_upload_context(base.clone(), false), base);
+        let local_context = resumed_prefix_upload_context(base.clone(), true);
+        assert_ne!(local_context, base);
+        assert!(is_snapshot_fingerprint(&local_context));
+        let context = copy_unproven_upload_context(local_context, true);
         assert_ne!(context, base);
         assert!(is_snapshot_fingerprint(&context));
         let root = test_dir("copy-capability-ack-context");
