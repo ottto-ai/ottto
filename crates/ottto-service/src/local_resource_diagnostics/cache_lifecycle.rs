@@ -54,6 +54,8 @@ counters! {
     insert_no_victim_refused: InsertNoVictimRefused,
     insert_poisoned_lock: InsertPoisonedLock,
     insert_entries_evicted: InsertEntriesEvicted,
+    cache_evicted_by_pi_claude_code: CacheEvictedByPiClaudeCode,
+    cache_evicted_by_pi_codex: CacheEvictedByPiCodex,
     cursor_reservation_entries_evicted: CursorReservationEntriesEvicted,
     // M1 copy refusals. `entries_evicted` and `admission_evicted` count
     // entries; `bytes_released` their stored charge, for both causes.
@@ -76,6 +78,9 @@ counters! {
     retention_incomplete_or_lossy: RetentionIncompleteOrLossy,
     retention_incompatible: RetentionIncompatible,
     retention_bound_refused: RetentionBoundRefused,
+    retention_bound_refused_pi: RetentionBoundRefusedPi,
+    // Transitional Pi Full on change without a RAM record (no durable Pi yet).
+    pi: Pi,
     retention_no_plan: RetentionNoPlan,
     retention_unsealed_eof: RetentionUnsealedEof,
     retention_clone_bound_refused: RetentionCloneBoundRefused,

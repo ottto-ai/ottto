@@ -605,47 +605,42 @@ impl OwnedSourceScan {
         namespace: Scope,
     ) -> Self {
         self.durable_guard = Some(Arc::downgrade(&cache));
-        if matches!(
-            self.source,
-            SnapshotSource::ClaudeCode | SnapshotSource::Codex
-        ) {
-            sampled_audit::normalize_marker_storage(&mut self.index);
-            if self.source == SnapshotSource::ClaudeCode {
-                sampled_audit::restore_held_audit_deadlines(&mut self.index, self.audit_now);
-                self.prepare_held_audit_progress(self.audit_now);
-            }
-            let pending = self
-                .index
-                .files
-                .values()
-                .filter(|entry| entry.has_unverified_source())
-                .take(CACHE_ENTRIES + 1)
-                .count();
-            self.sampling = Some(Context {
-                cache,
-                namespace,
-                // Legacy prefix/audit scheduling and diagnostic observations
-                // keep these values; ordinary restore never gates on them.
-                audit_metadata_supported: pending <= CACHE_ENTRIES,
-                audit_slots: CACHE_ENTRIES.saturating_sub(pending),
-                full_files: 0,
-                tail_files: 0,
-                unchanged_files: 0,
-                native_bytes: 0,
-                sample_bytes: 0,
-                full_reasons: [0; 11],
-                priority_replays: 0,
-                audits_started: 0,
-                audits_completed: 0,
-                audit_quiet_retired: 0,
-                audit_cap_full: 0,
-                audit_cap_delay: 0,
-                pace_evicted: 0,
-                start_overdue_seconds: 0,
-                completion_overdue_seconds: 0,
-                admission: Default::default(),
-            });
+        sampled_audit::normalize_marker_storage(&mut self.index);
+        if self.source == SnapshotSource::ClaudeCode {
+            sampled_audit::restore_held_audit_deadlines(&mut self.index, self.audit_now);
+            self.prepare_held_audit_progress(self.audit_now);
         }
+        let pending = self
+            .index
+            .files
+            .values()
+            .filter(|entry| entry.has_unverified_source())
+            .take(CACHE_ENTRIES + 1)
+            .count();
+        self.sampling = Some(Context {
+            cache,
+            namespace,
+            // Legacy prefix/audit scheduling and diagnostic observations
+            // keep these values; ordinary restore never gates on them.
+            audit_metadata_supported: pending <= CACHE_ENTRIES,
+            audit_slots: CACHE_ENTRIES.saturating_sub(pending),
+            full_files: 0,
+            tail_files: 0,
+            unchanged_files: 0,
+            native_bytes: 0,
+            sample_bytes: 0,
+            full_reasons: [0; 11],
+            priority_replays: 0,
+            audits_started: 0,
+            audits_completed: 0,
+            audit_quiet_retired: 0,
+            audit_cap_full: 0,
+            audit_cap_delay: 0,
+            pace_evicted: 0,
+            start_overdue_seconds: 0,
+            completion_overdue_seconds: 0,
+            admission: Default::default(),
+        });
         self
     }
     /// The conservative release: no measurement is supplied, so every shape

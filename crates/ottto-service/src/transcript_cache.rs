@@ -16,6 +16,10 @@ pub(crate) const CACHE_ENTRIES: usize = 256;
 /// measured capacities could change without transferring ownership back out.
 pub(crate) trait FrozenCacheState: HeapLayoutBound {
     fn supports_frozen_charge(&self) -> bool;
+    fn is_pi(&self) -> bool {
+        false
+    }
+    fn record_evicted_by_pi(&self) {}
 }
 impl FrozenCacheState for String {
     fn supports_frozen_charge(&self) -> bool {
@@ -490,6 +494,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         finalization_charge: usize,
         rank: (i64, i64),
     ) -> bool {
+        let by_pi = retained.state.is_pi();
         self.entries.remove(&key);
         let Some(resident_limit) = self.byte_limit.checked_sub(live_bytes) else {
             record(Event::InsertLiveReservationRefused);
@@ -565,7 +570,11 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
                 return false;
             };
             let count_pressure = self.entries.len() > self.count_limit;
-            self.entries.remove(&victim);
+            if let Some(entry) = self.entries.remove(&victim) {
+                if by_pi {
+                    entry.retained.state.record_evicted_by_pi();
+                }
+            }
             record(Event::InsertEntriesEvicted);
             crate::local_resource_diagnostics::claude_reread::cache_capacity_eviction(
                 count_pressure,

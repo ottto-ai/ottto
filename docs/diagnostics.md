@@ -1309,6 +1309,41 @@ Fallback Drop release counts `codex_zst_owner.counts.leaked_release`; it is a
 cancellation/unwind safety net. Stores-held debug assertions guard admission and
 explicit release, including real durable I/O paths.
 
+Pi joins the shared sampled RAM reader. Its `native_collection_page` acquisition
+counts report Full, Tail and Unchanged decisions with the actual planner reasons.
+Pi inherits the accepted sampled residual (Ron's decisions, 2026-10-30 and
+2026-10-31): an interior same-length rewrite plus growth can Tail a stale prefix
+until the next Full. Pi's writer is append-only, and its header rewrite reads
+Full. The shared
+`sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual` test
+pins it for Claude Code, Codex and Pi.
+Age and clock changes do not invalidate checkpoints. Admission of a new sampled
+obligation follows the shared audit cap: with no slot left, an unmarked change
+reads a counted cap Full (or waits); already-marked files keep Tailing.
+Until Pi durable records are enabled, an already-indexed file that changes
+without a RAM reduction still reads Full: the transitional `pi` leaf in
+`retained_cache_page_events` counts that attempt once at read start, alongside
+`state_missing`. A newly discovered file's first Full read does not increment
+that leaf. A no-RAM-copy cap Full on a changed indexed file can increment both
+`pi` and `audit_cap_full` for one read. Audit, upload-context and other non-content
+reparse reasons do not increment `pi`; a change that an earlier gate (such as a
+due audit) selects first is counted under that reason, not `pi`. After a restart or eviction, an idle Pi
+file whose 1 h verification marker falls due is read once (audit); Pi-b2's durable
+record removes this. The verified Full retires the marker without re-staging it.
+This is a staged exception; it does not turn a cache miss into a first-read
+authorization.
+
+The same #799 page line (source `pi`) reports cache-only
+`retention_bound_refused_pi` events, a subset of `retention_bound_refused`.
+The refusal count reuses the retention decision without another heap walk.
+It does not mean a durable write was attempted or refused.
+`cache_evicted_by_pi_claude_code` and `cache_evicted_by_pi_codex` count respective
+insert-time capacity victims (excludes `Release::CopyAdmission` releases).
+They also appear on the existing
+`process_retained_cache_lifecycle_totals` line (source `unknown`): cumulative,
+saturating process totals since startup, shared across namespaces. They are
+counts only, with no file names, response ids or content.
+
 The tag-1 audit-safe bootstrap core is a hard release pair with the grouped
 custody and stored-representation binding completion. The first part preserves
 main's narrower current-representation binding formula. Grouped Codex members

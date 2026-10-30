@@ -857,31 +857,6 @@ fn fe_claude_sp11_codex_in_page_full_with_append_keeps_main_failure() {
     );
 }
 
-/// SP-11-c, Pi (GREEN): Pi has no sampled acquisition, so no in-page read
-/// for H1c-H3c to change.
-#[test]
-fn fe_claude_sp11_pi_has_no_in_page_sampled_read() {
-    let root = std::env::temp_dir();
-    let scan = OwnedSourceScan::new(
-        SnapshotSource::Pi,
-        std::slice::from_ref(&root),
-        ScanIndex::default(),
-        NOW,
-        BACKFILL_WINDOW_DAYS,
-        10,
-        false,
-        None,
-        &[],
-        false,
-        true,
-    )
-    .with_sampled_acquisition(
-        Arc::new(sampled_scan::SharedCache::default()),
-        Scope(NAMESPACE.into()),
-    );
-    assert!(scan.sampling.is_none(), "Pi reads stay unsampled");
-}
-
 /// SOURCE, s below the last committed size (GREEN): the last page committed
 /// a file ending in a complete but unterminated row (size C, main's
 /// trailing-line rule). The file is re-selected at size C and, during its

@@ -1,5 +1,5 @@
-// Compare emitted upload envelopes, never pre-finalization reductions. All input
-// files are synthetic. The dispatch overlays only this test harness on the base.
+// Compare emitted upload envelopes; inspect pre-finalization candidates only to
+// prove ledger no-ops. All inputs are synthetic. Dispatch overlays this harness.
 use super::*;
 use serde_json::Value;
 
@@ -131,7 +131,10 @@ impl ReceiptBody {
             }
             canonical(&wire)
         };
-        if self.source == SnapshotSource::ClaudeCode {
+        if self.source == SnapshotSource::Pi && self.items.is_empty() {
+            assert_eq!(self.raw, b"[]", "quarantine emits no envelope");
+            self.raw.clone()
+        } else if self.source == SnapshotSource::ClaudeCode {
             // Claude's real uploader returns a sequence of encoded envelopes.
             let batches: Vec<Vec<u8>> = serde_json::from_slice(&self.raw).unwrap();
             canonical(
@@ -1012,7 +1015,1006 @@ pending!(
     twin_mixed_accounts,
     "E3: family commit vector with per-member account evidence not on main"
 );
-pending!(
-    pi,
-    "E1 design D1: Pi explicitly remains Full-on-change; no retained Pi reduction on main"
-);
+
+// Pi uses the same scanner and committed index; durable Pi is unsupported.
+// Its lines intentionally contain only synthetic text and identifiers.
+fn pi_json(value: Value) -> String {
+    value.to_string() + "\n"
+}
+
+fn pi_header(id: &str, version: u64, parent: Option<&str>) -> String {
+    pi_json(json!({"type":"session", "version":version, "id":id,
+        "timestamp":"2026-10-27T06:00:00Z", "cwd":"/synthetic/pi-work",
+        "parentSession":parent}))
+}
+
+fn pi_turn(shape: &str, response: Option<&str>, input: u64, at: &str) -> Value {
+    let mut value = json!({"type":shape, "id":"a0000001", "parentId":"a0000000",
+        "timestamp":"2026-10-27T07:00:01Z", "message":{
+            "role":"assistant", "provider":"openai", "model":"gpt-5.4",
+            "api":"openai-responses", "timestamp":at, "thinkingLevel":"low",
+            "stopReason":"stop", "content":[{"type":"text","text":"Synthetic answer."}],
+            "usage":{"input":input,"output":2,"cacheRead":3,"cacheWrite":4,
+                "totalTokens":input+9,"cost":{"total":0.001}}}});
+    if let Some(response) = response {
+        value["message"]["responseId"] = json!(response);
+    }
+    value
+}
+
+fn pi_seed() -> String {
+    pi_header("synthetic-pi-session", 3, None)
+        + &pi_json(
+            json!({"type":"model_change","id":"a0000000","parentId":null,
+            "timestamp":"2026-10-27T06:00:00Z","provider":"openai","modelId":"gpt-5.4"}),
+        )
+        + &pi_json(json!({"type":"thinking_level_change","id":"a0000002",
+            "parentId":"a0000000","thinkingLevel":"low","timestamp":"2026-10-27T06:00:00Z"}))
+        + &pi_json(
+            json!({"type":"message","id":"a0000003","parentId":"a0000002",
+            "message":{"role":"system","content":"Synthetic system instruction. ".repeat(250),
+                "timestamp":1793080800000u64}}),
+        )
+        + &pi_json(
+            json!({"type":"message","id":"a0000004","parentId":"a0000003",
+            "message":{"role":"user","content":[{"type":"text","text":"Synthetic first prompt."}],
+                "timestamp":1793080800000u64}}),
+        )
+        + &pi_json(pi_turn(
+            "message",
+            Some("seed-response"),
+            10,
+            "2026-10-27T06:00:01Z",
+        ))
+}
+
+struct PiProof {
+    sampled: bool,
+    bodies: Vec<ReceiptBody>,
+}
+
+impl PiProof {
+    fn capture(&mut self, scan: &SourceScanResult) {
+        self.bodies.push(ReceiptBody {
+            raw: if scan.snapshots.is_empty() {
+                b"[]".to_vec()
+            } else {
+                other_wire(SnapshotSource::Pi, scan)
+            },
+            source: SnapshotSource::Pi,
+            items: scan.snapshots.clone(),
+        });
+    }
+
+    fn finish(self, c: &Corpus, disk: &Disk) {
+        let name = c.base.file_name().unwrap().to_str().unwrap();
+        receipt(name, &self.bodies);
+        assert_eq!(disk.records(), 0, "Pi-a has no durable store");
+        println!("MONEY_EQUIVALENCE_PI_CAPABILITY {name} UNSUPPORTED");
+        println!("MONEY_EQUIVALENCE_DISK {name} UNSUPPORTED");
+    }
+}
+
+fn pi_disk_corpus(
+    name: &str,
+    initial: &str,
+) -> (Corpus, Disk, PathBuf, E2ScanFixture, ScanIndex, PiProof) {
+    let c = corpus(name);
+    let path = c.root.join("session.jsonl");
+    std::fs::write(&path, initial).unwrap();
+    input_clock(&path);
+    let disk = Disk::new(&c);
+    let scanner = disk.owner(SnapshotSource::Pi);
+    let (mut index, scan, modes) =
+        other_page(&c, &scanner, SnapshotSource::Pi, ScanIndex::default());
+    // The copied harness runs on main too: only head admits Pi to RAM.
+    let sampled = match std::env::var("OTTTO_MONEY_EQUIVALENCE_PI_RAM_EXPECTED").as_deref() {
+        Ok("0") => false,
+        Ok("1") | Err(_) => true,
+        Ok(other) => panic!("invalid Pi RAM expectation: {other}"),
+    };
+    assert_eq!(
+        modes,
+        if sampled { (1, 0, 0) } else { (0, 0, 0) },
+        "head must exercise sampled Pi; base must exercise cold Full"
+    );
+    assert!(scanner.cache.durable_counters(SnapshotSource::Pi).is_none());
+    assert!(!scan.snapshots.is_empty());
+    let prior = disk.commit(&scanner.cache, SnapshotSource::Pi, &mut index);
+    assert_eq!(disk.records(), 0);
+    let mut proof = PiProof {
+        sampled,
+        bodies: Vec::new(),
+    };
+    proof.capture(&scan);
+    (c, disk, path, scanner, prior, proof)
+}
+
+fn pi_grow(path: &Path, value: Value) {
+    append(path, &pi_json(value));
+    input_clock(path);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PiLedgerStep {
+    Emit(u64, u64),
+    Noop(u64, u64),
+    ConflictDrop(u64, u64),
+}
+
+impl PiLedgerStep {
+    fn totals(self) -> (u64, u64) {
+        match self {
+            Self::Emit(requests, input)
+            | Self::Noop(requests, input)
+            | Self::ConflictDrop(requests, input) => (requests, input),
+        }
+    }
+}
+
+fn pi_ledger_totals(items: &[SnapshotItem]) -> (u64, u64) {
+    assert_eq!(items.len(), 1, "ledger fixture has one cumulative session");
+    (
+        items.iter().map(|s| s.request_count).sum(),
+        items.iter().map(|s| s.input_tokens).sum(),
+    )
+}
+
+struct PiLedgerCheck<'a> {
+    step: PiLedgerStep,
+    accepted: &'a [SnapshotItem],
+}
+
+impl PiLedgerCheck<'_> {
+    fn page(
+        &self,
+        c: &Corpus,
+        scanner: &E2ScanFixture,
+        prior: ScanIndex,
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+        let previous_files = prior.files.clone();
+        let previous_entities = prior.file_snapshot_fingerprints.clone();
+        let mut candidates = Vec::new();
+        let (index, scan, modes) =
+            other_page_observing_raw(c, scanner, SnapshotSource::Pi, prior, |items| {
+                candidates = items.to_vec();
+            });
+        match self.step {
+            PiLedgerStep::Emit(..) => {
+                assert_eq!(pi_ledger_totals(&scan.snapshots), self.step.totals());
+                assert_eq!(scan.semantic_noop_count, 0);
+                assert_eq!(scan.dropped_usage_record_count, 0);
+            }
+            PiLedgerStep::Noop(..) | PiLedgerStep::ConflictDrop(..) => {
+                assert!(scan.snapshots.is_empty());
+                assert_eq!(pi_ledger_totals(self.accepted), self.step.totals());
+                assert_eq!(index.files.len(), 1);
+                assert_eq!(previous_files.len(), 1);
+                for (key, before) in &previous_files {
+                    let after = &index.files[key];
+                    assert!(before.last_snapshot_fingerprint.is_some());
+                    assert!(before.last_upload_body_witness.is_some());
+                    assert_eq!(
+                        after.last_snapshot_fingerprint,
+                        before.last_snapshot_fingerprint
+                    );
+                    assert_eq!(
+                        after.last_upload_body_witness,
+                        before.last_upload_body_witness
+                    );
+                    match self.step {
+                        PiLedgerStep::Noop(..) => {
+                            assert_eq!(scan.semantic_noop_count, 1);
+                            assert_eq!(scan.dropped_usage_record_count, 0);
+                            assert_eq!(pi_ledger_totals(&candidates), self.step.totals());
+                            let candidate = &candidates[0];
+                            let accepted = &self.accepted[0];
+                            // The copy precedes finalization's fingerprint
+                            // recomputation and suppression of the candidate.
+                            assert_eq!(
+                                (
+                                    crate::snapshots::snapshot_fingerprint(
+                                        SnapshotSource::Pi,
+                                        candidate
+                                    ),
+                                    snapshot_upload_body_witness(candidate),
+                                ),
+                                (
+                                    accepted.snapshot_fingerprint.clone(),
+                                    snapshot_upload_body_witness(accepted),
+                                ),
+                            );
+                            assert!(after.size_bytes > before.size_bytes);
+                        }
+                        PiLedgerStep::ConflictDrop(..) => {
+                            assert_eq!(scan.semantic_noop_count, 0);
+                            assert_eq!(scan.dropped_usage_record_count, 1);
+                            // The incomplete parse must not advance the file
+                            // checkpoint: the resolving append remains retryable.
+                            assert_eq!(
+                                serde_json::to_value(after).unwrap(),
+                                serde_json::to_value(before).unwrap()
+                            );
+                        }
+                        PiLedgerStep::Emit(..) => unreachable!(),
+                    }
+                }
+                assert_eq!(index.file_snapshot_fingerprints, previous_entities);
+            }
+        }
+        (index, scan, modes)
+    }
+}
+
+// Return each arm's own finished index, so a later page cannot borrow another
+// arm's settlement. Quarantined files have no emitted body; compare their
+// disposition and retryability instead of inventing a successful upload.
+#[allow(clippy::too_many_arguments)]
+fn pi_pages(
+    proof: &mut PiProof,
+    c: &Corpus,
+    retained: &E2ScanFixture,
+    restart: &E2ScanFixture,
+    priors: [ScanIndex; 3],
+    ram_mode: (usize, usize, usize),
+    disk_mode: (usize, usize, usize),
+    restores: u64,
+) -> ([ScanIndex; 3], SourceScanResult) {
+    pi_pages_checked(
+        proof, c, retained, restart, priors, ram_mode, disk_mode, restores, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pi_pages_checked(
+    proof: &mut PiProof,
+    c: &Corpus,
+    retained: &E2ScanFixture,
+    restart: &E2ScanFixture,
+    priors: [ScanIndex; 3],
+    ram_mode: (usize, usize, usize),
+    disk_mode: (usize, usize, usize),
+    restores: u64,
+    ledger: Option<&PiLedgerCheck<'_>>,
+) -> ([ScanIndex; 3], SourceScanResult) {
+    save_inputs(c);
+    let page = |scanner: &E2ScanFixture, prior| match ledger {
+        Some(check) => check.page(c, scanner, prior),
+        None => other_page(c, scanner, SnapshotSource::Pi, prior),
+    };
+    let [tail_prior, full_prior, disk_prior] = priors;
+    let (tail_index, tail, mode) = page(retained, tail_prior);
+    assert_eq!(
+        mode,
+        if proof.sampled { ram_mode } else { (0, 0, 0) },
+        "Pi retained acquisition"
+    );
+    let (full_index, full, mode) = page(&E2ScanFixture::default(), full_prior);
+    assert_eq!(mode.1 + mode.2, 0, "cold Pi cannot reuse a reduction");
+    let (disk_index, restored, mode) = page(restart, disk_prior);
+    assert_eq!(
+        mode,
+        if proof.sampled {
+            (disk_mode.0 + disk_mode.1, 0, disk_mode.2)
+        } else {
+            (0, 0, 0)
+        },
+        "Pi disk acquisition"
+    );
+    // Restart is still recordless: its changed files read Full on head.
+    let _ = restores;
+    assert!(restart.cache.durable_counters(SnapshotSource::Pi).is_none());
+    for scan in [&tail, &restored] {
+        assert_eq!(
+            scan.dropped_usage_record_count,
+            full.dropped_usage_record_count
+        );
+        assert_eq!(scan.census_complete, full.census_complete);
+        assert_eq!(scan.snapshots.len(), full.snapshots.len());
+    }
+    if !full.snapshots.is_empty() {
+        let expected = other_wire(SnapshotSource::Pi, &full);
+        assert_eq!(
+            other_wire(SnapshotSource::Pi, &tail),
+            expected,
+            "Pi RAM Tail != Full"
+        );
+        assert_eq!(
+            other_wire(SnapshotSource::Pi, &restored),
+            expected,
+            "Pi disk restore != Full"
+        );
+        for (a, b) in restored.snapshots.iter().zip(&full.snapshots) {
+            assert_eq!(
+                snapshot_upload_body_witness(a),
+                snapshot_upload_body_witness(b)
+            );
+        }
+    } else {
+        assert_eq!(tail_index.files.len(), full_index.files.len());
+        assert_eq!(disk_index.files.len(), full_index.files.len());
+    }
+    proof.capture(&full);
+    ([tail_index, full_index, disk_index], full)
+}
+
+fn pi_splits(name: &str, prefix: &str, suffix: Vec<Value>, requests: u64) -> SourceScanResult {
+    let (c, disk, path, scanner, prior, mut proof) = pi_disk_corpus(name, prefix);
+    let mut priors = [prior.clone(), prior.clone(), prior];
+    let mut last = None;
+    for value in suffix {
+        pi_grow(&path, value);
+        let restart = disk.owner(SnapshotSource::Pi);
+        let ([tail, full, mut restored], scan) = pi_pages(
+            &mut proof,
+            &c,
+            &scanner,
+            &restart,
+            priors,
+            (0, 1, 0),
+            (0, 1, 0),
+            1,
+        );
+        let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
+        priors = [tail, full, next];
+        last = Some(scan);
+    }
+    let scan = last.expect("fixture must cross a seal");
+    assert_eq!(
+        scan.snapshots.iter().map(|s| s.request_count).sum::<u64>(),
+        requests,
+        "{name}"
+    );
+    proof.finish(&c, &disk);
+    scan
+}
+
+fn pi_ledger_splits(
+    name: &str,
+    prefix: &str,
+    initial: PiLedgerStep,
+    suffix: Vec<(Value, PiLedgerStep)>,
+    final_totals: (u64, u64),
+) {
+    let (c, disk, path, scanner, prior, mut proof) = pi_disk_corpus(name, prefix);
+    assert!(matches!(initial, PiLedgerStep::Emit(..)));
+    let mut accepted = proof.bodies[0].items.clone();
+    assert_eq!(pi_ledger_totals(&accepted), initial.totals());
+    // The shared initial prefix is accepted by all three arms. Check cold and
+    // recordless restart against the retained arm's actual captured body too.
+    for initial_scanner in [E2ScanFixture::default(), disk.owner(SnapshotSource::Pi)] {
+        let (_, scan, _) = PiLedgerCheck {
+            step: initial,
+            accepted: &[],
+        }
+        .page(&c, &initial_scanner, ScanIndex::default());
+        assert_eq!(other_wire(SnapshotSource::Pi, &scan), proof.bodies[0].raw);
+    }
+    let mut priors = [prior.clone(), prior.clone(), prior];
+    let mut ram_mode = (0, 1, 0);
+    for (value, step) in suffix {
+        pi_grow(&path, value);
+        let restart = disk.owner(SnapshotSource::Pi);
+        let ([tail, full, mut restored], scan) = pi_pages_checked(
+            &mut proof,
+            &c,
+            &scanner,
+            &restart,
+            priors,
+            ram_mode,
+            (0, 1, 0),
+            1,
+            Some(&PiLedgerCheck {
+                step,
+                accepted: &accepted,
+            }),
+        );
+        if matches!(step, PiLedgerStep::Emit(..)) {
+            accepted = scan.snapshots;
+        }
+        let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
+        priors = [tail, full, next];
+        // A conflict consumes the retained reduction without reinserting it.
+        // The NEXT append must therefore acquire Full, not Tail.
+        ram_mode = if matches!(step, PiLedgerStep::ConflictDrop(..)) {
+            (1, 0, 0)
+        } else {
+            (0, 1, 0)
+        };
+    }
+    assert_eq!(pi_ledger_totals(&accepted), final_totals, "{name}");
+    proof.finish(&c, &disk);
+}
+
+#[test]
+fn pi() {
+    if !supported("pi") {
+        return;
+    }
+    // P1: every appended line boundary, including model/thinking changes,
+    // the large system message, and the user/assistant flush boundary.
+    let lines: Vec<Value> = pi_seed()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    let scan = pi_splits(
+        "pi_plain_session",
+        &pi_seed(),
+        lines.into_iter().skip(1).collect(),
+        2,
+    );
+    assert_eq!(scan.snapshots[0].input_tokens, 20);
+}
+
+#[test]
+fn pi_tool_turn() {
+    if !supported("pi_tool_turn") {
+        return;
+    }
+    let mut tool = pi_turn("message", Some("tool-response"), 20, "2026-10-27T06:01:00Z");
+    tool["message"]["stopReason"] = json!("toolUse");
+    tool["message"]["content"] = json!([{"type":"toolCall","id":"synthetic-call",
+        "name":"read","arguments":{"path":"synthetic.txt"}}]);
+    pi_splits(
+        "pi_tool_turn",
+        &pi_seed(),
+        vec![
+            tool,
+            json!({"type":"message","id":"a0000005","parentId":"a0000001",
+            "timestamp":"2026-10-27T06:01:01Z", "message":{"role":"toolResult",
+            "toolCallId":"synthetic-call","toolName":"read","isError":false,
+            "content":[{"type":"text","text":"Synthetic tool result."}],"timestamp":1793080861000u64}}),
+            pi_turn("message", Some("after-tool"), 30, "2026-10-27T06:02:00Z"),
+        ],
+        3,
+    );
+}
+
+#[test]
+fn pi_summary_usage() {
+    if !supported("pi_summary_usage") {
+        return;
+    }
+    for kind in ["compaction", "branch_summary"] {
+        let summary = json!({"type":kind,"id":"b0000001","parentId":"a0000001",
+            "timestamp":"2026-10-27T07:00:01Z", "summary":"Synthetic branch checkpoint.",
+            "firstKeptEntryId":"a0000004","tokensBefore":8000,
+            "usage":{"input":20,"output":5,"cost":{"total":0.002}},
+            "details":{"systemPrompt":"Synthetic checkpoint. ".repeat(320)}});
+        let scan = pi_splits(
+            &format!("pi_{kind}"),
+            &pi_seed(),
+            vec![
+                summary,
+                pi_turn("message", Some("after-summary"), 30, "2026-10-27T07:01:00Z"),
+            ],
+            3,
+        );
+        let item = &scan.snapshots[0];
+        assert_eq!((item.input_tokens, item.output_tokens), (60, 9));
+        assert_eq!(
+            item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.004")
+        );
+        let hour = item
+            .usage_buckets
+            .iter()
+            .find(|b| b.bucket_start == "2026-10-27T07:00:00Z")
+            .unwrap();
+        let summary = hour
+            .model_usage
+            .iter()
+            .find(|r| r.model_provider.is_none())
+            .unwrap();
+        assert_eq!(
+            (&*summary.model, summary.input_tokens, summary.request_count),
+            ("gpt-5.4", 20, 1)
+        );
+    }
+}
+
+#[test]
+fn pi_usage_entry_kinds() {
+    if !supported("pi_usage_entry_kinds") {
+        return;
+    }
+    let entries = ["cache_warm", "synthetic_future_kind"]
+        .into_iter()
+        .map(|kind| {
+            json!({"type":"usage","id":"c0000001","parentId":"a0000001","kind":kind,
+            "timestamp":"2026-10-27T07:00:01Z", "provider":"google", "model":"gemini-2.5-flash",
+            "usage":{"input":20,"output":5,"cost":{"total":0.002}}})
+        })
+        .collect();
+    let scan = pi_splits("pi_usage_entry_kinds", &pi_seed(), entries, 3);
+    let row = scan.snapshots[0]
+        .model_usage
+        .iter()
+        .find(|r| r.model == "gemini-2.5-flash")
+        .unwrap();
+    assert_eq!(row.model_provider.as_deref(), Some("google"));
+    assert_eq!((row.request_count, row.input_tokens), (2, 40));
+}
+
+#[test]
+fn pi_ledger_seal_boundaries() {
+    if !supported("pi_ledger_seal_boundaries") {
+        return;
+    }
+    use PiLedgerStep::{ConflictDrop, Emit, Noop};
+    let message = pi_turn(
+        "message",
+        Some("synthetic-reused"),
+        20,
+        "2026-10-27T06:01:00Z",
+    );
+    let mut end = message.clone();
+    end["type"] = json!("message_end");
+    // SOURCE duplicate on both sides of the seal; count > 1 must survive.
+    let prefix = pi_seed() + &pi_json(message.clone()) + &pi_json(message.clone());
+    pi_ledger_splits(
+        "pi_ledger_count_above_one",
+        &prefix,
+        Emit(3, 50),
+        vec![
+            (end.clone(), Noop(3, 50)),
+            (end.clone(), Noop(3, 50)),
+            (message.clone(), Emit(4, 70)),
+            (end.clone(), Noop(4, 70)),
+        ],
+        (4, 70),
+    );
+    // SOURCE paired_digests is nonempty at commit, before another exact pair.
+    pi_ledger_splits(
+        "pi_ledger_paired_digest",
+        &(pi_seed() + &pi_json(message.clone()) + &pi_json(end.clone())),
+        Emit(2, 30),
+        vec![(message.clone(), Emit(3, 50)), (end.clone(), Noop(3, 50))],
+        (3, 50),
+    );
+    // Reused-id pairing temporarily conflicts until both digests have paired.
+    let mut later = pi_turn(
+        "message",
+        Some("synthetic-reused"),
+        30,
+        "2026-10-27T06:02:00Z",
+    );
+    let prefix = pi_seed() + &pi_json(message.clone()) + &pi_json(later.clone());
+    later["type"] = json!("message_end");
+    pi_ledger_splits(
+        "pi_ledger_reused_id",
+        &prefix,
+        Emit(3, 60),
+        vec![(later, ConflictDrop(3, 60)), (end.clone(), Noop(3, 60))],
+        (3, 60),
+    );
+    pi_ledger_splits(
+        "pi_ledger_reverse_pair",
+        &(pi_seed() + &pi_json(end)),
+        Emit(2, 30),
+        vec![(message, Noop(2, 30))],
+        (2, 30),
+    );
+}
+
+#[test]
+fn pi_divergent_pair_quarantine() {
+    if !supported("pi_divergent_pair_quarantine") {
+        return;
+    }
+    for paired in [false, true] {
+        let message = pi_turn(
+            "message",
+            Some("synthetic-conflict"),
+            20,
+            "2026-10-27T06:01:00Z",
+        );
+        let mut end = message.clone();
+        end["type"] = json!("message_end");
+        let mut prefix = pi_seed() + &pi_json(message);
+        if paired {
+            prefix += &pi_json(end.clone());
+        }
+        end["message"]["usage"]["input"] = json!(99);
+        let scan = pi_splits(
+            if paired {
+                "pi_conflict_after_pair"
+            } else {
+                "pi_conflict"
+            },
+            &prefix,
+            vec![end],
+            0,
+        );
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(scan.dropped_usage_record_count, 1);
+    }
+}
+
+fn pi_usage_case(name: &str) {
+    if !supported(name) {
+        return;
+    }
+    let (response, input, repeats, requests, tokens) = match name {
+        "pi_no_response_id" => (None, 20, 2, 4, 70),
+        "pi_error_zero_requests" => (Some("synthetic-error"), 0, 1, 1, 10),
+        _ => panic!("unknown Pi usage row: {name}"),
+    };
+    let mut prefix = pi_seed();
+    let mut turn = pi_turn("message", response, input, "2026-10-27T06:01:00Z");
+    if response.is_none() {
+        turn["message"]["provider"] = json!("google");
+        turn["message"]["model"] = json!("gemini-2.5-flash");
+        prefix += &pi_json(turn.clone());
+    } else {
+        turn["message"]["stopReason"] = json!("error");
+        turn["message"]["errorMessage"] = json!("Synthetic provider error.");
+        turn["message"]["usage"] = json!({"input":0,"output":0,"cacheRead":0,"cacheWrite":0,
+            "totalTokens":0,"cost":{"total":0}});
+    }
+    let scan = pi_splits(name, &prefix, vec![turn; repeats], requests);
+    assert_eq!(scan.snapshots[0].input_tokens, tokens, "{name}");
+}
+
+/// [money] Missing response IDs must retain every billable occurrence.
+#[test]
+fn pi_no_response_id() {
+    pi_usage_case("pi_no_response_id");
+}
+
+#[test]
+fn pi_selector_across_seal() {
+    if !supported("pi_selector_across_seal") {
+        return;
+    }
+    let scan = pi_splits(
+        "pi_selector_across_seal",
+        &pi_seed(),
+        vec![
+            json!({"type":"custom","id":"d0000001","parentId":"a0000001",
+            "customType":"ottto-selector","timestamp":"2026-10-27T06:01:00Z",
+            "data":{"selector_context":{"service_tier":"flex","batch_mode":true,"context_bucket":"long"}}}),
+            pi_turn(
+                "message",
+                Some("selector-response"),
+                20,
+                "2026-10-27T06:02:00Z",
+            ),
+        ],
+        2,
+    );
+    let row = scan.snapshots[0]
+        .model_usage
+        .iter()
+        .find(|r| r.input_tokens == 20)
+        .unwrap();
+    assert_eq!(
+        row.selector_context.get("service_tier").map(String::as_str),
+        Some("flex")
+    );
+    assert_eq!(
+        row.selector_context.get("batch_mode").map(String::as_str),
+        Some("true")
+    );
+}
+
+#[test]
+fn pi_time_and_invalid_evidence() {
+    if !supported("pi_time_and_invalid_evidence") {
+        return;
+    }
+    let scan = pi_splits(
+        "pi_provider_hour_and_late_time",
+        &pi_seed(),
+        vec![
+            pi_turn(
+                "message",
+                Some("boundary-response"),
+                20,
+                "2026-10-27T06:59:59Z",
+            ),
+            pi_turn("message", Some("late-response"), 30, "2026-10-27T05:59:59Z"),
+        ],
+        3,
+    );
+    assert_eq!(
+        scan.snapshots[0]
+            .usage_buckets
+            .iter()
+            .map(|b| b.bucket_start.as_str())
+            .collect::<Vec<_>>(),
+        ["2026-10-27T05:00:00Z", "2026-10-27T06:00:00Z"]
+    );
+    let mut bad_cost = pi_turn("message", Some("bad-cost"), 20, "2026-10-27T06:01:00Z");
+    bad_cost["message"]["usage"]["cost"] = json!({"total":null,"input":"invalid","output":-1});
+    let scan = pi_splits("pi_invalid_cost", &pi_seed(), vec![bad_cost], 2);
+    assert!(scan.snapshots[0].cost.is_none());
+    let bad_time = pi_turn("message", Some("bad-time"), 20, "synthetic-invalid-time");
+    let scan = pi_splits("pi_invalid_time", &pi_seed(), vec![bad_time], 0);
+    assert_eq!(scan.dropped_usage_record_count, 1);
+    let huge = pi_turn(
+        "message",
+        Some("overflow-response"),
+        u64::MAX - 9,
+        "2026-10-27T06:01:00Z",
+    );
+    let scan = pi_splits("pi_usage_overflow", &pi_seed(), vec![huge], 0);
+    assert_eq!(scan.dropped_usage_record_count, 1);
+}
+
+/// [money] A zero-usage error must not add a billable request.
+#[test]
+fn pi_error_zero_requests() {
+    pi_usage_case("pi_error_zero_requests");
+}
+
+#[test]
+fn pi_cli_fork_preserves_double_count() {
+    if !supported("pi_cli_fork_preserves_double_count") {
+        return;
+    }
+    // M-2 will change these request/input totals when inherited usage is skipped.
+    const EXPECTED_FORK_TOTALS: (u64, u64) = (3, 40);
+    let (c, disk, path, scanner, prior, mut proof) =
+        pi_disk_corpus("pi_cli_fork_preserves_double_count", &pi_seed());
+    let fork = c.root.join("fork.jsonl");
+    let copied = pi_seed()
+        .lines()
+        .skip(1)
+        .map(|s| s.to_owned() + "\n")
+        .collect::<String>();
+    let mut header: Value = serde_json::from_str(&pi_header(
+        "synthetic-fork-session",
+        3,
+        Some("synthetic-parent.jsonl"),
+    ))
+    .unwrap();
+    header["timestamp"] = json!("2026-10-27T07:00:00Z");
+    std::fs::write(&fork, pi_json(header) + &copied).unwrap();
+    input_clock(&fork);
+    pi_grow(
+        &path,
+        pi_turn("message", Some("parent-growth"), 20, "2026-10-27T06:02:00Z"),
+    );
+    let restart = disk.owner(SnapshotSource::Pi);
+    let (_, scan) = pi_pages(
+        &mut proof,
+        &c,
+        &scanner,
+        &restart,
+        [prior.clone(), prior.clone(), prior],
+        (1, 1, 0),
+        (1, 1, 0),
+        1,
+    );
+    assert_eq!(scan.snapshots.len(), 2);
+    assert_eq!(
+        (
+            scan.snapshots.iter().map(|s| s.request_count).sum::<u64>(),
+            scan.snapshots.iter().map(|s| s.input_tokens).sum::<u64>(),
+        ),
+        EXPECTED_FORK_TOTALS
+    );
+    proof.finish(&c, &disk);
+}
+
+fn pi_lifecycle_case(name: &str) {
+    if !supported(name) {
+        return;
+    }
+    let (rewrite, downgrade, turns): (bool, bool, &[(&str, u64, &str)]) = match name {
+        "pi_upgrade_without_semantic_revision" => (
+            false,
+            false,
+            &[("upgrade-growth", 20, "2026-10-27T06:01:00Z")],
+        ),
+        "pi_downgrade_then_reupgrade" => (
+            false,
+            true,
+            &[
+                ("reupgrade-growth", 30, "2026-10-27T06:02:00Z"),
+                ("next-restart", 40, "2026-10-27T06:03:00Z"),
+            ],
+        ),
+        "pi_version_rewrite_after_tail" => (
+            true,
+            false,
+            &[
+                ("before-migration", 20, "2026-10-27T06:01:00Z"),
+                ("after-migration", 30, "2026-10-27T06:02:00Z"),
+            ],
+        ),
+        _ => panic!("unknown Pi lifecycle row: {name}"),
+    };
+    let initial = if rewrite {
+        pi_seed().replacen("\"version\":3", "\"version\":1", 1)
+    } else {
+        pi_seed()
+    };
+    let (c, disk, path, mut scanner, prior, mut proof) = pi_disk_corpus(name, &initial);
+    let mut priors = if downgrade {
+        drop(scanner);
+        scanner = E2ScanFixture::default();
+        pi_grow(
+            &path,
+            pi_turn(
+                "message",
+                Some("downgrade-growth"),
+                20,
+                "2026-10-27T06:01:00Z",
+            ),
+        );
+        let (mut down, scan, mode) = other_page(&c, &scanner, SnapshotSource::Pi, prior);
+        assert_eq!(
+            mode,
+            if proof.sampled { (1, 0, 0) } else { (0, 0, 0) },
+            "{name}"
+        );
+        proof.capture(&scan);
+        down.save(&disk.index).unwrap();
+        let committed = ScanIndex::load(&disk.index).unwrap();
+        assert_eq!(disk.records(), 0, "{name}");
+        [committed.clone(), committed.clone(), committed]
+    } else if rewrite {
+        [prior.clone(), prior.clone(), prior]
+    } else {
+        disk.begin(&scanner, SnapshotSource::Pi);
+        let (mut quiet, _, mode) = other_page(&c, &scanner, SnapshotSource::Pi, prior.clone());
+        assert_eq!(mode.0 + mode.1, 0, "{name}");
+        let committed = disk.commit(&scanner.cache, SnapshotSource::Pi, &mut quiet);
+        assert!(committed.generation > prior.generation, "{name}");
+        [committed.clone(), committed.clone(), committed]
+    };
+    for (step, &(response, input, at)) in turns.iter().enumerate() {
+        let turn = pi_turn("message", Some(response), input, at);
+        let migrating = rewrite && step == 1;
+        if migrating {
+            let mut migrated = std::fs::read_to_string(&path).unwrap().replacen(
+                "\"version\":1",
+                "\"version\":3",
+                1,
+            );
+            migrated += &pi_json(turn);
+            let before = std::fs::metadata(&path).unwrap();
+            std::fs::write(&path, migrated).unwrap();
+            input_clock(&path);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(
+                    before.ino(),
+                    std::fs::metadata(&path).unwrap().ino(),
+                    "{name}"
+                );
+            }
+            assert!(
+                std::fs::metadata(&path).unwrap().len() > before.len(),
+                "{name}"
+            );
+        } else {
+            pi_grow(&path, turn);
+        }
+        let restart = disk.owner(SnapshotSource::Pi);
+        let ram_mode = if migrating { (1, 0, 0) } else { (0, 1, 0) };
+        let (disk_mode, restores) = if migrating || (downgrade && step == 0) {
+            ((1, 0, 0), 0)
+        } else {
+            ((0, 1, 0), 1)
+        };
+        let ([tail, full, mut restored], scan) = pi_pages(
+            &mut proof, &c, &scanner, &restart, priors, ram_mode, disk_mode, restores,
+        );
+        if migrating {
+            assert_eq!(scan.snapshots[0].request_count, 3, "{name}");
+        }
+        if step + 1 == turns.len() {
+            break;
+        }
+        let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
+        priors = [tail, full, next];
+    }
+    proof.finish(&c, &disk);
+}
+
+/// [money] A version rewrite after Tail must reacquire Full without double billing.
+#[test]
+fn pi_version_rewrite_after_tail() {
+    pi_lifecycle_case("pi_version_rewrite_after_tail");
+}
+
+#[test]
+fn pi_restart_between_pages() {
+    if !supported("pi_restart_between_pages") {
+        return;
+    }
+    pi_splits(
+        "pi_restart_between_pages",
+        &pi_seed(),
+        vec![
+            pi_turn("message", Some("restart-one"), 20, "2026-10-27T06:01:00Z"),
+            pi_turn("message", Some("restart-two"), 30, "2026-10-27T06:02:00Z"),
+        ],
+        3,
+    );
+}
+
+/// [money] An index-only upgrade must preserve emitted usage across restart.
+#[test]
+fn pi_upgrade_without_semantic_revision() {
+    pi_lifecycle_case("pi_upgrade_without_semantic_revision");
+}
+
+/// [money] Downgrade and reupgrade must preserve each arm's committed usage.
+#[test]
+fn pi_downgrade_then_reupgrade() {
+    pi_lifecycle_case("pi_downgrade_then_reupgrade");
+}
+
+#[cfg(unix)]
+#[test]
+fn pi_acquisition_metadata_changes() {
+    if !supported("pi_acquisition_metadata_changes") {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let (c, disk, path, scanner, prior, mut proof) =
+        pi_disk_corpus("pi_acquisition_metadata_changes", &pi_seed());
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let permissions = std::fs::metadata(&path).unwrap().permissions().mode();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(permissions ^ 0o100)).unwrap();
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        modified
+    );
+    let restart = disk.owner(SnapshotSource::Pi);
+    let ([tail, full, mut restored], _) = pi_pages(
+        &mut proof,
+        &c,
+        &scanner,
+        &restart,
+        [prior.clone(), prior.clone(), prior],
+        (0, 0, 0),
+        (0, 0, 0),
+        0,
+    );
+    let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(modified + std::time::Duration::from_secs(2))
+        .unwrap();
+    let restart = disk.owner(SnapshotSource::Pi);
+    let ([tail, full, mut restored], _) = pi_pages(
+        &mut proof,
+        &c,
+        &scanner,
+        &restart,
+        [tail, full, next],
+        (1, 0, 0),
+        (1, 0, 0),
+        0,
+    );
+    let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
+    pi_grow(
+        &path,
+        pi_turn(
+            "message",
+            Some("metadata-growth"),
+            20,
+            "2026-10-27T06:01:00Z",
+        ),
+    );
+    let restart = disk.owner(SnapshotSource::Pi);
+    pi_pages(
+        &mut proof,
+        &c,
+        &scanner,
+        &restart,
+        [tail, full, next],
+        (0, 1, 0),
+        (0, 1, 0),
+        1,
+    );
+    proof.finish(&c, &disk);
+}
