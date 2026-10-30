@@ -9,6 +9,9 @@ use sampled_scan::codex_cursor::OpenStamp;
 use sampled_scan::side_ledger::{namespace_of, parent_of, LedgerEntry, LedgerKey, LedgerTag};
 use std::os::unix::fs::{FileExt, PermissionsExt};
 
+/// The sweep's clock in these tests: past every fixture pace's `not_before`.
+const SWEEP_NOW: u64 = 1_800_000_000;
+
 const KEY: &str = "/s/rollout-parent.jsonl";
 
 struct Parent {
@@ -435,6 +438,108 @@ fn a_ctime_only_change_is_the_same_object_and_a_rewrite_consumes_the_record() {
     assert_eq!(restarted.state_ctime, parent.ctime());
 }
 
+/// R1-M1: one fence reads the record's sealed windows at most once. On the
+/// `SameSizeEdit` path with changed samples, the guard and the `_` arm
+/// share one `samples_match`.
+#[test]
+fn a_same_size_edit_with_changed_samples_reads_them_once() {
+    let mut parent = Parent::new("samples-once", 9_000);
+    let now = now();
+    let len = parent.len();
+    let mut index = with_record(parent.record(SideVerdict::Settled, now));
+    parent.rewrite_head();
+    crate::transcript_acquisition::samples_match_calls();
+    let (fenced, _) = parent.fence(&mut index, len, now);
+    assert_eq!(fenced, SideFence::Unknown, "a rewrite consumes the record");
+    assert!(!index.codex_parent_side.contains_key(KEY));
+    assert_eq!(crate::transcript_acquisition::samples_match_calls(), 1);
+}
+
+/// R2-M3: the epoch prune moves a charged `Live` request's pacing onto P's
+/// same-object record first, so the next reference re-arms with attempts
+/// ≥ the pruned ones (never a fresh ladder); with no such record the
+/// request is kept.
+#[test]
+fn an_epoch_pruned_request_rearms_with_at_least_its_attempts() {
+    let mut parent = Parent::new("epoch-prune", 9_000);
+    let now = now();
+    // The fence refuses this record (`ClockChanged`): the request path decides.
+    let mut record = parent.record(SideVerdict::Settled, now + 600);
+    record.referenced_epoch = 10;
+    let charged = SideRequest {
+        referenced_epoch: 1,
+        ..parent.request(SideRequestState::Live, 3)
+    };
+    let mut index = with_record(record);
+    index.codex_parent_proof_wrap_epoch = 10;
+    index.codex_parent_side_requests.insert(KEY.into(), charged);
+    assert_eq!(
+        index
+            .sweep_codex_parent_side(false, None, SWEEP_NOW)
+            .requests_pruned,
+        1
+    );
+    assert!(index.codex_parent_side_requests.is_empty());
+    let (fenced, _) = parent.fence(&mut index, 1, now);
+    assert_eq!(fenced, SideFence::Refused(FullReason::ClockChanged));
+    let rearmed = index.codex_parent_side_requests[KEY];
+    assert!(rearmed.attempts >= charged.attempts, "{rearmed:?}");
+    assert_eq!(
+        rearmed.not_before_unix_seconds,
+        charged.not_before_unix_seconds
+    );
+
+    // Fix round 2 (DM2): unreferenced for 3+ wraps, the record keeps the
+    // pruned pacing (its pace is active), so the re-reference re-arms at
+    // the floor with the same `not_before`, never `Live{0}`.
+    let mut record = parent.record(SideVerdict::Settled, now + 600);
+    record.referenced_epoch = 10;
+    let mut index = with_record(record);
+    index.codex_parent_proof_wrap_epoch = 10;
+    index.codex_parent_side_requests.insert(KEY.into(), charged);
+    assert_eq!(
+        index
+            .sweep_codex_parent_side(false, None, now)
+            .requests_pruned,
+        1
+    );
+    for wrap in 11..=14 {
+        index.codex_parent_proof_wrap_epoch = wrap;
+        assert_eq!(
+            index
+                .sweep_codex_parent_side(false, None, now)
+                .records_pruned,
+            0,
+            "wrap {wrap}"
+        );
+    }
+    assert!(index.codex_parent_side.contains_key(KEY));
+    let (fenced, _) = parent.fence(&mut index, 1, now);
+    assert_eq!(fenced, SideFence::Refused(FullReason::ClockChanged));
+    let rearmed = index.codex_parent_side_requests[KEY];
+    assert!(
+        rearmed.attempts >= SIDE_REQUEST_EVICT_ATTEMPTS - 1,
+        "{rearmed:?}"
+    );
+    assert_eq!(
+        rearmed.not_before_unix_seconds,
+        charged.not_before_unix_seconds
+    );
+
+    let mut index = ScanIndex {
+        codex_parent_proof_wrap_epoch: 10,
+        ..ScanIndex::default()
+    };
+    index.codex_parent_side_requests.insert(KEY.into(), charged);
+    assert_eq!(
+        index
+            .sweep_codex_parent_side(false, None, SWEEP_NOW)
+            .requests_pruned,
+        0
+    );
+    assert_eq!(index.codex_parent_side_requests[KEY], charged);
+}
+
 /// The request-side object test: a shrink below `state_extent`, or a record
 /// for another object, is a new object (record consumed, request
 /// restarted); a same-size ctime change with matching record samples only
@@ -781,4 +886,33 @@ fn a_terminal_disclosure_refreshes_an_existing_record_to_held_only() {
     let record = &index.codex_parent_side[KEY];
     assert_eq!((record.generation, record.referenced_epoch), (2, 4));
     assert_eq!(refresh(&mut index), (false, Counts::default()));
+}
+
+/// D6(b): every fence use is a child's reference to P: the request it arms
+/// takes the wrap epoch, and a later use (no other write) refreshes it.
+/// The ledger projection carries no epoch, so its stamp is kept.
+#[test]
+fn a_fence_use_stamps_the_request_with_the_wrap_epoch() {
+    let mut parent = Parent::new("epoch", 9_000);
+    let now = now();
+    let mut index = ScanIndex {
+        codex_parent_proof_wrap_epoch: 5,
+        ..ScanIndex::default()
+    };
+    assert_eq!(parent.fence(&mut index, 500, now).0, SideFence::Unknown);
+    let armed = index.codex_parent_side_requests[KEY];
+    assert_eq!(armed.referenced_epoch, 5);
+    index.codex_parent_proof_wrap_epoch = 9;
+    assert_eq!(parent.fence(&mut index, 500, now).0, SideFence::Unknown);
+    assert_eq!(
+        index.codex_parent_side_requests[KEY],
+        SideRequest {
+            referenced_epoch: 9,
+            ..armed
+        }
+    );
+    assert_eq!(
+        sampled_scan::side_ledger::LedgerEntry::of_request(&armed),
+        sampled_scan::side_ledger::LedgerEntry::of_request(&index.codex_parent_side_requests[KEY])
+    );
 }

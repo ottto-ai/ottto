@@ -129,6 +129,31 @@ fn proof_outcome_ordinals_are_frozen() {
     assert_eq!(ProofOutcome::LAST, 18);
 }
 
+/// Backoff keys on the outcome kind only: 112 s doubling to the audit
+/// interval; a new kind starts over; a regressed clock is never parked.
+#[test]
+fn owed_backoff_keys_on_the_outcome_kind() {
+    let now = 1_792_540_800;
+    let mut owed = CodexParentProofOwed::new("p".into(), 1, 3, OwedOrigin::Child);
+    assert_eq!(owed.wake, ProofWake::Due);
+    assert!(!owed.backed_off(now));
+    let mut gaps = Vec::new();
+    for _ in 0..7 {
+        owed.after_attempt(ProofOutcome::ParentExhausted, ProofWake::Backoff, now);
+        gaps.push(owed.not_before_unix_seconds - now);
+    }
+    assert_eq!(gaps, [112, 225, 450, 900, 1800, 3600, 3600]);
+    assert_eq!(owed.outcome, ProofOutcome::ParentExhausted as u8);
+    assert!(owed.backed_off(now));
+    assert!(!owed.backed_off(now + 3600));
+    // A clock that went back past the cap is due, not parked.
+    assert!(!owed.backed_off(now - 3601));
+
+    owed.after_attempt(ProofOutcome::ChildExhausted, ProofWake::Backoff, now);
+    assert_eq!(owed.attempts, 1);
+    assert_eq!(owed.not_before_unix_seconds - now, 112);
+}
+
 #[test]
 fn proof_state_serde_is_tagged_and_round_trips_every_wake() {
     let scope = sha256_hex(&["proof-scope"]);
@@ -390,6 +415,71 @@ fn proof_map_cursors_and_seq_follow_the_index_lifecycle() {
         replayed.codex_proof_index_incarnation,
         loaded.codex_proof_index_incarnation
     );
+}
+
+/// Row 4 (U-T54(e) unit): liveness by any of P's ids in the ownership refs
+/// or the owed-parent fold, or by P's key in the side requests; the fold
+/// comes back after save, load and the subset, and goes with replay.
+#[test]
+fn side_liveness_reads_refs_and_the_owed_fold_by_id_and_requests_by_key() {
+    const P: &str = "019a0000-0000-7000-8000-00000000000a";
+    const PATH_ID: &str = "019a0000-0000-7000-8000-00000000000b";
+    let p_key = "/s/rollout-p.jsonl";
+    let ids = [P.to_owned(), PATH_ID.to_owned()];
+    let mut index = ScanIndex::default();
+    assert!(!codex_parent_side_live(&index, p_key, &ids));
+    // A path-only id in the refs (an N1 parent with no header).
+    index.codex_parent_ownership_refs.insert(PATH_ID.into());
+    assert!(codex_parent_side_live(&index, p_key, &ids));
+    assert!(!codex_parent_side_live(&index, p_key, &ids[..1]));
+    index.codex_parent_ownership_refs.clear();
+    // A side request, by P's key only.
+    let request: SideRequest = serde_json::from_value(serde_json::json!({
+        "dev_ino": [1, 7],
+        "needed_extent": 4096,
+        "state": { "kind": "live" },
+        "state_extent": 4096,
+        "state_ctime": [1_792_540_800, 0],
+        "attempt_extent": 4096,
+        "attempt_ctime": [1_792_540_800, 0],
+        "attempts": 0,
+        "not_before_unix_seconds": 0,
+    }))
+    .unwrap();
+    index
+        .codex_parent_side_requests
+        .insert(p_key.into(), request);
+    assert!(codex_parent_side_live(&index, p_key, &[]));
+    assert!(!codex_parent_side_live(&index, "/s/other.jsonl", &ids));
+    index.codex_parent_side_requests.clear();
+    // An owed entry naming P, through the fold rebuilt at load and in the
+    // subset; a proven entry alone is not liveness.
+    let cause = CodexParentUnresolvable::DeferredRef.index() as u8;
+    index
+        .codex_parent_prefix_proofs
+        .insert("/s/child.jsonl".into(), owed(P, cause, OwedOrigin::Child));
+    index.codex_parent_prefix_proofs.insert(
+        "/s/proven.jsonl".into(),
+        CodexParentProofState::Proven(CodexParentPrefixProof {
+            parent: PATH_ID.into(),
+            ..proof(&"f".repeat(64), 1, true)
+        }),
+    );
+    assert!(
+        !codex_parent_side_live(&index, p_key, &ids),
+        "not folded yet"
+    );
+    let path = temp_index_path("side-live");
+    index.save(&path).unwrap();
+    let loaded = ScanIndex::load(&path).unwrap();
+    assert!(codex_parent_side_live(&loaded, p_key, &ids));
+    assert!(!codex_parent_side_live(&loaded, p_key, &ids[1..]));
+    let subset =
+        index.committable_subset(&ScanIndex::default(), &BTreeSet::new(), &BTreeMap::new());
+    assert!(codex_parent_side_live(&subset, p_key, &ids));
+    let mut replayed = loaded;
+    replayed.prepare_historical_replay("replay-1".into());
+    assert!(!codex_parent_side_live(&replayed, p_key, &ids));
 }
 
 const OWE_P: &str = "019a0000-0000-7000-8000-000000000001";

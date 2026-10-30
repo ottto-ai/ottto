@@ -22673,6 +22673,21 @@ struct ProofWalk {
     buffers: usize,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests only: the largest walked readers' bound after any step of a
+    /// `run`, beside the room that run checked (`proof_run_peak`).
+    static PROOF_RUN_PEAK: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Tests only: `(peak walked bound after a step, room checked)` since the
+/// last call, which resets it.
+#[cfg(test)]
+pub(in crate::snapshots) fn proof_run_peak() -> (usize, usize) {
+    PROOF_RUN_PEAK.with(|peak| peak.replace((0, 0)))
+}
+
 /// U1a-2a (rev 11 §6.1, D6(d)): the most one reader step consumes (a capped
 /// line and its newline, or one chunk of an overlong skip after its capped
 /// prefix). A step runs only with this much budget left, so a page never
@@ -22790,8 +22805,22 @@ impl CodexProofReaders {
                 // of it is kept; the job is dropped (`StepRefusedMemory`).
                 return CodexProofRun::Memory;
             }
+            self.note_peak(room);
         }
     }
+
+    /// Tests only: the walked readers' bound after a step (`proof_run_peak`).
+    #[cfg(test)]
+    fn note_peak(&self, room: usize) {
+        if let Some(walked) = crate::heap_layout_bound::bound(self, usize::MAX) {
+            PROOF_RUN_PEAK.with(|peak| {
+                let (max, _) = peak.get();
+                peak.set((max.max(walked), room));
+            });
+        }
+    }
+    #[cfg(not(test))]
+    fn note_peak(&self, _room: usize) {}
 
     /// Every reader buffer's capacity.
     fn buffers(&self) -> usize {
