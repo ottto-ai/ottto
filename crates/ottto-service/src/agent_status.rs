@@ -37199,9 +37199,6 @@ exit 0
             .all(|endpoint| endpoint.contains("cedar_ember=1")));
     }
 
-    /// Claude Code's refresh grant has expired: the slot's upkeep stops
-    /// collection after the identity gate passed.
-
     fn respond_variant_unrecognized(_endpoint: &str) -> Result<Value, u16> {
         Ok(serde_json::json!({
             "five_hour": {"utilization": 12, "resets_at": "2026-10-01T15:00:00+00:00"},
