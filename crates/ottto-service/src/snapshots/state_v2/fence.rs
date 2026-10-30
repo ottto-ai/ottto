@@ -57,6 +57,11 @@ pub(super) const ARTIFACTS: &[(&str, Cleanup, Option<&str>)] = &[
     (".v2.sqlite", Cleanup::SourceOnly, None),
     (".v2.sqlite-wal", Cleanup::SourceOnly, None),
     (".v2.sqlite-shm", Cleanup::SourceOnly, None),
+    (
+        ".v2.sqlite.owner",
+        Cleanup::SourceOnly,
+        Some("owner_lock_inventory"),
+    ),
     // Cleanup-only names: no writer or recovery/adoption path remains.
     (".v2.sqlite.migration-backup", Cleanup::ObsoleteBackup, None),
     (".v2-recovery", Cleanup::ObsoleteBackup, None),
