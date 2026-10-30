@@ -1647,6 +1647,7 @@ impl ApcFixture {
         // Build historical INPUT from a complete ordinary read of the actual
         // fixture files, independently of this release's partial held window.
         // This is setup work, not a claimed release terminal grant or receipt.
+        let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
         let mut coverage = ScanIndex::default();
         let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
@@ -1669,6 +1670,19 @@ impl ApcFixture {
         let proof = index.restore_historical_claude_family_from_for_test(
             APC_ROOT, &coverage, &api, &trace, correction,
         );
+        // Labelled old-reader input includes its same-save family re-arm
+        // (snapshots.rs proof fold), for both the proof and grant save. This
+        // creates read debt only; it grants no ACK or context receipt.
+        let mut rearmed = 0;
+        for agent in std::iter::once(None).chain(APC_AGENTS.iter().copied().map(Some)) {
+            let path = self.member_path(agent);
+            let key = index.files.keys().find(|key| {
+                std::path::Path::new(key).file_name() == path.file_name()
+            }).expect("indexed historical family member").clone();
+            index.files.get_mut(&key).unwrap().source_file_fingerprint.clear();
+            rearmed += 1;
+        }
+        assert_eq!(rearmed, apc_family_sessions().len());
         index
             .save(&self.index_path)
             .expect("restore old-reader proof/owed custody");
@@ -2261,6 +2275,7 @@ fn changed_proof_after_terminal_authority_owes_one_exact_correction() {
 #[serial(source_manifests)]
 fn terminal_off_on_changed_proof_after_terminal_authority_owes_one_exact_correction() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -2360,6 +2375,7 @@ fn account_held_member_stays_owed_while_owed_siblings_drain_across_passes() {
 #[serial(source_manifests)]
 fn terminal_off_on_account_held_member_stays_owed_while_owed_siblings_drain_across_passes() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
@@ -2559,6 +2575,7 @@ fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
 #[serial(client_report)]
 fn terminal_off_on_crash_and_shed_before_settlement_keep_the_grant_unchanged() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -2781,6 +2798,7 @@ fn superseded_revision_ack_never_drains_the_current_revision() {
 #[serial(client_report)]
 fn terminal_off_on_superseded_revision_ack_never_drains_the_current_revision() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -2932,6 +2950,7 @@ fn unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant() {
 #[serial(source_manifests)]
 fn terminal_off_on_unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -3078,6 +3097,7 @@ fn new_request_after_the_grant_fails_then_one_new_proof_regrants_all_members() {
 #[serial(source_manifests)]
 fn terminal_off_on_new_request_after_the_grant_fails_then_one_new_proof_regrants_all_members() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -3295,6 +3315,7 @@ fn natural_owed_members_drain_on_separate_bounded_pages() {
 #[serial(source_manifests)]
 fn terminal_off_on_natural_owed_members_drain_on_separate_bounded_pages() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -3479,6 +3500,7 @@ fn controlled_three_owed_members_settle_on_their_own_pages_while_one_is_account_
 #[serial(source_manifests)]
 fn terminal_off_on_controlled_three_owed_members_settle_on_their_own_pages_while_one_is_account_held() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
@@ -3831,6 +3853,7 @@ fn controlled_last_owed_empty_member_with_a_prior_entity_rolls_back_on_a_partial
 #[test]
 fn terminal_off_on_controlled_last_owed_empty_member_with_a_prior_entity_rolls_back_on_a_partial_checkpoint() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     apc_checkpoint_last_owed_empty_agent(true, false);
     apc_checkpoint_last_owed_empty_agent(true, true);
@@ -3845,6 +3868,7 @@ fn controlled_last_owed_empty_member_without_a_prior_entity_carries_its_pair_and
 #[test]
 fn terminal_off_on_controlled_last_owed_empty_member_without_a_prior_entity_carries_its_pair_and_drains() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     apc_checkpoint_last_owed_empty_agent(false, false);
     apc_checkpoint_last_owed_empty_agent(false, true);
@@ -3925,6 +3949,7 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
 #[test]
 fn terminal_off_on_last_empty_correction_completes_replay_in_its_drain_cycle() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     for complete in [false, true] {
         for (outcome, held, expected_transport) in [
@@ -4059,6 +4084,7 @@ fn exact_permanent_refusal_drains_correction_and_keeps_refusal_witness() {
 #[serial(client_report)]
 fn terminal_off_on_exact_permanent_refusal_drains_correction_and_keeps_refusal_witness() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -4138,6 +4164,7 @@ fn retryable_refusal_keeps_its_member_owed_across_restart() {
 #[serial(source_manifests)]
 fn terminal_off_on_retryable_refusal_keeps_its_member_owed_across_restart() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -4184,6 +4211,7 @@ fn complete_cutoff_drains_without_upload_or_repeated_grant_parse() {
 #[serial(source_manifests)]
 fn terminal_off_on_complete_cutoff_drains_without_upload_or_repeated_grant_parse() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -4305,6 +4333,7 @@ fn locked_partial_checkpoint_requested_bytes_receipt() {
 #[test]
 fn terminal_off_on_locked_partial_checkpoint_requested_bytes_receipt() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     let scan = apc_m2_scan(false);
     let variants: [(&str, usize, bool, bool); 4] = [
@@ -4469,6 +4498,7 @@ fn retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_qua
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn terminal_off_on_retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_quarantine() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -4663,6 +4693,7 @@ fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
 #[serial(source_manifests)]
 fn terminal_off_on_controlled_unbound_record_rearms_its_family_and_reforms_bound() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -4938,6 +4969,7 @@ fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() 
 #[serial(source_manifests)]
 fn terminal_off_on_returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -5163,6 +5195,7 @@ fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
 #[serial(source_manifests)]
 fn terminal_off_on_e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-e2-flip", false);
@@ -5347,6 +5380,7 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
 #[serial(source_manifests)]
 fn terminal_off_on_e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
 
     let _manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("e2-tombstone-returns", false);
@@ -5476,9 +5510,18 @@ fn terminal_off_new_cohort_correction_evidence_waits_durably_for_reconstruction(
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("terminal-off-delayed-proof-custody", false);
+    let mut accepted = BTreeSet::new();
     for hour in [8, 9] {
         let pages = fixture.generation(hour, |_| ApcUpload::Accept);
         let last = pages.last().unwrap();
+        if hour == 8 {
+            accepted.extend(pages.iter().flat_map(|page| page.offered_bodies.values().cloned()));
+        } else {
+            let family = apc_family_sessions();
+            assert!(pages.iter().all(|page| page.parsed.is_disjoint(&family)
+                && page.offered.is_empty() && page.held.is_empty()));
+            assert!(accepted.iter().all(|body| last.index.accepted_snapshot_fingerprint_recorded(body)));
+        }
         assert!(!last.scan.census_complete);
         assert!(last
             .index
