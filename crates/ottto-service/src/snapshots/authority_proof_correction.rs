@@ -33,6 +33,17 @@ pub(crate) struct ClaudeProofBodyDrains {
     >,
 }
 
+impl ClaudeProofBodyDrains {
+    /// Adds a later settlement's drains. A family keeps its earliest
+    /// pre-drain record and pending proof.
+    pub(crate) fn append(&mut self, later: Self) {
+        self.drains.extend(later.drains);
+        for (root, family) in later.families {
+            self.families.entry(root).or_insert(family);
+        }
+    }
+}
+
 // A positive-proof correction is local checkpoint bookkeeping. It never
 // authorizes collection, ownership, or acceptance of an unacknowledged body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -859,8 +870,8 @@ impl ScanIndex {
 
     /// Called only at an index settlement boundary. A following save either
     /// commits both exact body state and owed progress, or commits neither.
-    /// Before save selection, pass the returned drains to
-    /// `restore_unselected_claude_proof_body_drains` after the last selection.
+    /// Pass the returned drains to `restore_unselected_claude_proof_body_drains`
+    /// after the last selection and the account-audit release.
     pub(crate) fn settle_claude_proof_corrections(
         &mut self,
         previous: &ScanIndex,
