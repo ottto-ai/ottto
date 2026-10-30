@@ -5820,6 +5820,7 @@ fn pi_insertion_counts_claude_and_codex_cache_victims_only() {
         cache.insert_admitted(
             key,
             sampled_jsonl::CompletedNativeAcquisition {
+                durable: Default::default(),
                 checkpoint: checkpoint.clone(),
                 reduction: Some(state.clone()),
                 released: Some((rank, 0)),
@@ -5864,7 +5865,7 @@ fn pi_ledger_cap_counter_prints_in_the_pi_summary_only() {
     let disk = store::StoreCounters::default();
     assert!(counts
         .summary(SnapshotSource::Pi, &disk)
-        .contains(" peak_body_bytes=0 retained_refused_pi_ledger_cap=2 disk_records=0 "));
+        .contains(" peak_body_bytes=0 retained_refused_pi_ledger_cap=2 store_write_failed[setup,inventory,statvfs]=[0, 0, 0] disk_records=0 "));
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         assert!(!counts
             .summary(source, &disk)
@@ -6201,7 +6202,7 @@ fn q11_complete_map_is_paid_before_the_first_key() {
     let pace_nodes =
         crate::heap_layout_bound::tree_node_bytes::<store::Digest32, FullPace>().unwrap();
     assert!((2 * store::MAX_RECORDS + 1) * (nodes + pace_nodes) <= reserve);
-    assert_eq!(STORES_RESIDENT_BOUND, 1_978_368);
+    assert_eq!(STORES_RESIDENT_BOUND, 2_404_792);
     assert_eq!(
         super::super::STATE_BYTES
             + super::super::KEY_RESERVE_BYTES
@@ -14829,11 +14830,11 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
     assert!(writer.insert_admitted(
         key.clone(),
         sampled_jsonl::CompletedNativeAcquisition {
+            durable: Default::default(),
             checkpoint: incoming.checkpoint,
             reduction: Some(incoming.state),
             released: None,
             unsealed: false,
-            durable: Default::default(),
         },
         0
     ));
@@ -15020,4 +15021,84 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
         assert_eq!(records(), saved, "restore cannot change durable authority");
     }
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_live_prepare_ledger_cap_counts_codec_refusal_once() {
+    let root = crate::test_scratch::ScratchDir::new("pi-live-ledger-cap");
+    let _lock = test_locks::hold(&root);
+    let path = root.join("fixture.jsonl");
+    std::fs::write(&path, b"{\"type\":\"session\",\"id\":\"fixture\"}\n").unwrap();
+    let source = SnapshotSource::Pi;
+    let scope = Scope("pi-live-ledger-cap".into());
+    let (_, checkpoint) = native_record_of(&path, &scope, source);
+    let mut accumulator = SnapshotAccumulator::new(source);
+    let report = JsonlReadReport::default();
+    let index_path = root.join("index.json");
+    let mut index = ScanIndex::default();
+    index.save(&index_path).unwrap();
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &scope, false);
+    let store::LeaseWait::Granted(mut lease) = cache.acquire_active(source, 0) else {
+        panic!("isolated active lease");
+    };
+    let key = local_index_key(&path);
+    let held = File::open(&path).unwrap();
+    let counting = ImmutableCounting::from_accumulator(&accumulator).unwrap();
+    let chain = cache
+        .durable_capture_chain(
+            &mut lease,
+            source,
+            &key,
+            "synthetic-object",
+            &held,
+            &checkpoint,
+            &index,
+            true,
+            &counting,
+        )
+        .unwrap();
+    for over_cap in [false, true] {
+        accumulator.seen_pi_usage_keys = (0..codec::pi::PI_LEDGER_MAX_KEYS + usize::from(over_cap))
+            .map(|n| (format!("{n:064x}"), PiUsageDedupState::default()))
+            .collect();
+        let view = LiveFinishView::new(
+            &accumulator,
+            &report,
+            0,
+            0,
+            false,
+            &checkpoint,
+            &chain,
+            jsonl_line_cap() as u64,
+        )
+        .unwrap();
+        match cache.prepare_live(&mut lease, view) {
+            PrepareOutcome::Prepared(prepared) if !over_cap => cache.discard_prepared(prepared),
+            PrepareOutcome::NotPersisted(NotPersisted::Codec) if over_cap => {}
+            _ => panic!("expected prepared at cap, Codec above cap"),
+        }
+        let counts = &cache.durable().unwrap().counters;
+        assert_eq!(counts.retained_refused_pi_ledger_cap, u64::from(over_cap));
+        assert_eq!(
+            counts.not_persisted.get("wa.codec").copied().unwrap_or(0),
+            u64::from(over_cap)
+        );
+    }
+    lease.release();
+}
+
+#[test]
+fn pi_census_and_summary_work_before_any_native_record() {
+    let mut index = ScanIndex::default();
+    index.note_carried_ack_census(SnapshotSource::Pi, true, std::time::SystemTime::now());
+    let lines = scan_index_containment_lines_for_test();
+    assert!(lines
+        .last()
+        .unwrap()
+        .contains("source=pi census_complete=true retained_carried_entries=0"));
+    let summary = Counters::default().summary(SnapshotSource::Pi, &store::StoreCounters::default());
+    assert!(summary.starts_with("ottto-service: durable_tail source=pi "));
+    assert!(summary.contains("retail_physical_bytes[process,daily]="));
 }

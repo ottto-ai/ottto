@@ -285,11 +285,6 @@ impl Checkpoint {
     pub(crate) fn audit_debt(&self) -> Option<AuditDebt> {
         self.audit_debt
     }
-    /// The interpretation scope this checkpoint was made under.
-    pub(crate) fn scope(&self) -> &Scope {
-        &self.scope
-    }
-
     /// Cheap quiet-file validation, never historical Full verification. The
     /// host must require complete c provenance and a loss-free Unchanged read.
     pub(crate) fn quiet_audit_matches(
@@ -2043,6 +2038,7 @@ mod tests {
                 std::array::from_fn(|i| u8::from_str_radix(&pin[2 * i..2 * i + 2], 16).unwrap());
             let mut disk = store::DurableTailStore::new(state.0.join("cache"), source);
             let saved = store::PendingRecord {
+                acquisition: None,
                 binding: store::Binding {
                     source,
                     key,
@@ -2059,9 +2055,14 @@ mod tests {
                 allowlist,
             };
             assert_eq!(
-                disk.write_after_save(&lock, 1, vec![saved])
-                    .unwrap()
-                    .written,
+                disk.write_after_save(
+                    &lock,
+                    1,
+                    fs::metadata(state.0.join("index.json")).unwrap().len(),
+                    vec![saved]
+                )
+                .unwrap()
+                .written,
                 1
             );
             drop(disk);

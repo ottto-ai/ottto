@@ -162,8 +162,8 @@ impl<'a> Enc<'a> {
         &mut self,
         put: impl FnOnce(&mut Enc) -> Result<T, Refuse>,
     ) -> Result<T, Refuse> {
-        struct Guard<'a>(&'a mut Enc);
-        impl Drop for Guard<'_> {
+        struct Guard<'a, 'b>(&'a mut Enc<'b>);
+        impl Drop for Guard<'_, '_> {
             fn drop(&mut self) {
                 self.0.moved_field = None;
             }
@@ -1785,6 +1785,8 @@ mod tests {
         let mut out = Short(Vec::new());
         {
             let mut e = Enc {
+                moved_field: None,
+                written: 0,
                 sink: Sink::Write {
                     out: &mut out,
                     len: 0,
@@ -1798,6 +1800,8 @@ mod tests {
         assert_eq!(out.0, b"abc");
         let mut empty = &mut [][..];
         let mut e = Enc {
+            moved_field: None,
+            written: 0,
             sink: Sink::Write {
                 out: &mut empty,
                 len: 0,

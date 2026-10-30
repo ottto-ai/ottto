@@ -702,6 +702,7 @@ fn pinned_header(out: &mut Vec<u8>, record: &PendingRecord, generation: u64) {
     out.push(match binding.source {
         DurableSource::ClaudeCode => 1,
         DurableSource::Codex => 2,
+        DurableSource::Pi => panic!("Pi has no archived format-1 representation"),
     });
     for part in [
         &binding.key,

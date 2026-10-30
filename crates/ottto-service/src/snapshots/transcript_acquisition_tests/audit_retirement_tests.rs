@@ -1327,6 +1327,7 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
             restart.insert(
                 key.clone(),
                 sampled_jsonl::CompletedNativeAcquisition {
+                    durable: Default::default(),
                     checkpoint: copy.retained.checkpoint,
                     reduction: Some(copy.retained.state),
                     released: None,
@@ -1911,7 +1912,7 @@ fn protected_codex_absence_retires_only_the_audit_obligation() {
     traversal.observed_index_keys.clear();
     traversal.reconciliation_upper_bound = Some(key.clone());
     let (done, diagnostics) = crate::local_resource_diagnostics::capture(|| {
-        reconcile_missing_index_entries_with_side(&mut index, 10, None, source)
+        reconcile_missing_index_entries_with_side(&mut index, 10, None, source, None)
     });
     assert!(done);
     assert!(!index.files[&key].has_unverified_source());
@@ -1977,7 +1978,8 @@ fn audit_absence_preserves_legacy_counting_evidence_or_retains_its_entry() {
             &mut index,
             10,
             None,
-            SnapshotSource::Codex
+            SnapshotSource::Codex,
+            None
         ));
         if full_tombstones {
             assert_eq!(

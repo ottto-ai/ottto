@@ -29989,6 +29989,8 @@ impl OwnedSourceScan {
                             Some(&parser.reader.reader),
                         ));
                 #[cfg(unix)]
+                // E5-PI-B2-SEAM: Pi activation awaits the e4 publication decision
+                // at snapshot_sync::capture_after_shed; M3 keeps it private here.
                 let m3_route = sampling
                     .as_ref()
                     .zip(file_sampling.as_ref())
@@ -31824,6 +31826,7 @@ impl OwnedSourceScan {
                     reconcile_missing_index_entries_bounded(
                         index,
                         codex_side_drop,
+                        source,
                         sampling
                             .as_ref()
                             .map(|context| (source, context.cache.as_ref())),
@@ -33864,10 +33867,10 @@ impl OwnedSourceScan {
                                 .get(&key)
                                 .is_some_and(ScanIndexEntry::has_unverified_source)
                             && !retained.as_ref().is_some_and(|old| {
-                                old.checkpoint.audit_debt().is_none()
-                                    && old.checkpoint.sealed_offset() == candidate.size_bytes
-                                    && old.checkpoint.scope() == &scope
-                                    && old
+                                old.retained.checkpoint.audit_debt().is_none()
+                                    && old.retained.checkpoint.sealed_offset() == candidate.size_bytes
+                                    && old.retained.checkpoint.scope() == &scope
+                                    && old.retained
                                         .checkpoint
                                         .stamp_matches(parser.reader.reader.get_ref())
                                         .unwrap_or(false)
@@ -45207,28 +45210,30 @@ fn candidate_from_traversal_path_at<'a>(
 fn reconcile_missing_index_entries_bounded(
     index: &mut ScanIndex,
     codex_side_drop: Option<(&sampled_scan::SharedCache, u128)>,
+    source: SnapshotSource,
     durable: Option<(SnapshotSource, &sampled_scan::SharedCache)>,
 ) -> bool {
     reconcile_missing_index_entries_with_side(
         index,
         MAX_BACKFILL_FILES_PER_SOURCE,
         codex_side_drop,
+        source,
         durable,
     )
 }
 
 #[cfg(test)]
 fn reconcile_missing_index_entries_with_limit(index: &mut ScanIndex, limit: usize) -> bool {
-    reconcile_missing_index_entries_with_side(index, limit, None, None)
+    reconcile_missing_index_entries_with_side(index, limit, None, SnapshotSource::ClaudeCode, None)
 }
 
 fn reconcile_missing_index_entries_with_side(
     index: &mut ScanIndex,
     limit: usize,
     codex_side_drop: Option<(&sampled_scan::SharedCache, u128)>,
+    source: SnapshotSource,
     durable: Option<(SnapshotSource, &sampled_scan::SharedCache)>,
 ) -> bool {
-    let source = durable.map_or(SnapshotSource::ClaudeCode, |(source, _)| source);
     let Some(snapshot) = index.traversal.as_ref() else {
         return false;
     };

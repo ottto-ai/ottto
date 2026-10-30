@@ -85,6 +85,25 @@ pub(crate) const SOURCES: &[Properties] = &[
         #[cfg(test)]
         apply_line: apply_codex_line,
     },
+    Properties {
+        source: DurableSource::Pi,
+        snapshot: SnapshotSource::Pi,
+        tag: 3,
+        write_format: 3,
+        representations: &[Representation {
+            format: 3,
+            allowlist_pin: "bd43c3d6197e6a6dfe339a486b0bbf4aaa121fc40022fcc8418f9d900baac4f7",
+            header_bytes: crate::durable_tail_store::HEADER_V3_BYTES,
+        }],
+        encode: durable::encode_body,
+        #[cfg(test)]
+        decode: durable::decode_body,
+        #[cfg(unix)]
+        decode_bounded: durable::decode_body_bounded,
+        verify: durable::pi::verify,
+        #[cfg(test)]
+        apply_line: apply_pi_line,
+    },
 ];
 
 impl DurableSource {

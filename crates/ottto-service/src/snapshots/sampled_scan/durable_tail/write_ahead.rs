@@ -629,6 +629,12 @@ impl SharedCache {
         let limit = store::BODY_BYTES - (store::HEADER_V3_BYTES - store::HEADER_BYTES);
         let body_len = match plan.count(limit) {
             Ok(len) => len,
+            Err(Refuse::NonEmpty(codec::pi::PI_LEDGER_CAP)) => {
+                if let Some(mut stores) = self.durable() {
+                    stores.counters.retained_refused_pi_ledger_cap += 1;
+                }
+                return PrepareOutcome::NotPersisted(NotPersisted::Codec);
+            }
             Err(Refuse::TooLarge) => return PrepareOutcome::NotPersisted(NotPersisted::EntryCap),
             Err(_) => return PrepareOutcome::NotPersisted(NotPersisted::Codec),
         };

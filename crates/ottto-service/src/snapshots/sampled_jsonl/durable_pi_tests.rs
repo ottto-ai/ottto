@@ -404,3 +404,77 @@ fn ledger_h_values_must_be_lower_hex_digests() {
         );
     }
 }
+
+#[test]
+fn pi_registered_body_rows_preserve_populated_round_one_bytes() {
+    use crate::durable_tail_store::DurableSource;
+    let original = reduction(ledger());
+    let row = DurableSource::Pi.properties();
+    assert_eq!(row.tag, 3);
+    assert_eq!(row.source.slot(), 2);
+    assert_eq!(row.write_format, 3);
+    assert_eq!(row.representations.len(), 1);
+    let pin = row.allowlist();
+    assert_eq!(
+        row.representation(3, &pin).unwrap().allowlist_pin,
+        "bd43c3d6197e6a6dfe339a486b0bbf4aaa121fc40022fcc8418f9d900baac4f7"
+    );
+    for format in [0, 1, 2, 4] {
+        assert!(row.representation(format, &pin).is_none());
+    }
+    assert!(row.representation(3, &[0; 32]).is_none());
+    let bytes = (row.encode)(&original, RECORD_BYTES, 1024 * 1024).unwrap();
+    assert_eq!(bytes, back_patched(&original));
+    assert_eq!((row.verify)(&bytes), Ok(()));
+    let decoded = (row.decode)(&bytes, SnapshotSource::Pi).unwrap();
+    assert_eq!(
+        (row.encode)(&decoded.reduction, RECORD_BYTES, 1024 * 1024).unwrap(),
+        bytes
+    );
+    let plan = BodyEncoding::new(
+        &original.accumulator,
+        &original.report,
+        (1, 2, true),
+        1024 * 1024,
+    )
+    .unwrap();
+    let len = plan.count(RECORD_BYTES).unwrap();
+    let mut streamed = Vec::new();
+    assert_eq!(plan.write(&mut streamed, len).unwrap(), bytes.len());
+    assert_eq!(streamed, bytes);
+    for end in 0..bytes.len() {
+        assert!((row.verify)(&bytes[..end]).is_err());
+        assert!((row.decode)(&bytes[..end], SnapshotSource::Pi).is_err());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_registered_bounded_decode_charges_the_shared_graph_and_ledger() {
+    use crate::durable_tail_store::{ActiveLease, DurableSource, LeaseWait};
+    let original = reduction(ledger());
+    let row = DurableSource::Pi.properties();
+    let bytes = (row.encode)(&original, RECORD_BYTES, 1024 * 1024).unwrap();
+    let LeaseWait::Granted(mut lease) = ActiveLease::acquire("pi") else {
+        panic!("isolated active lease");
+    };
+    let decoded = (row.decode_bounded)(&bytes, SnapshotSource::Pi, &mut lease).unwrap();
+    assert_eq!(
+        (row.encode)(&decoded.reduction, RECORD_BYTES, 1024 * 1024).unwrap(),
+        bytes
+    );
+    drop(decoded);
+    lease.release();
+    let LeaseWait::Granted(mut lease) = ActiveLease::acquire("pi") else {
+        panic!("released active lease");
+    };
+    lease
+        .charge(crate::durable_tail_store::ACTIVE_BYTES)
+        .unwrap();
+    assert!(matches!(
+        (row.decode_bounded)(&bytes, SnapshotSource::Pi, &mut lease),
+        Err(DecodeFailure::Budget)
+    ));
+    lease.release();
+}

@@ -68,9 +68,9 @@ pub(in crate::snapshots) fn set_test_write_bytes(bytes: Option<usize>) {
     TEST_WRITE_BYTES.with(|budget| budget.set(bytes));
 }
 
-/// Upper bound of both stores' resident maps (two sources), ONE canonical value:
-/// - memo 2*256*256 = 131,072 bytes;
-/// - compact store pending 2*(32+1)*4096 = 270,336 bytes: a wire pending
+/// Upper bound of the stores' resident maps (three sources):
+/// - memo 3*256*256 = 196,608 bytes;
+/// - compact store pending 3*(32+1)*4096 = 405,504 bytes: a wire pending
 ///   entry stays <=320 bytes per node. Root's expanded stage/receipt metadata
 ///   (full `RecordIdentity`, boxed in `ReceiptProof`) is NOT pending: it is
 ///   charged on the acquisition's active lease inside `stream_reserve_bytes`
@@ -81,16 +81,17 @@ pub(in crate::snapshots) fn set_test_write_bytes(bytes: Option<usize>) {
 ///   <=1024 bytes = 526,336 bytes (`KEY_RESERVE_BYTES`).
 ///
 /// Plus the 225,720-byte fixed-digest diagnostic set (512 entries + root).
-/// Total 2,204,088 bytes; the previous canonical pin was 1,978,368 bytes.
+/// Total 2,404,792 bytes. Shared key-map capacities remain unchanged.
 /// The 526,336-byte M3 key reserve is debited from STATE_BYTES, within the
 /// existing cache budget. Native/container evidence remains required; this
 /// explicit prepayment is separate from the retained graph's heap walk.
 #[cfg(test)]
-pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 256
-    + 2 * (store::MAX_BATCH + 1) * 4096
-    + super::RETAIL_RESERVE_BYTES
-    + KEY_RESERVE_BYTES
-    + STALE_PREDECESSOR_RESERVE_BYTES;
+pub(crate) const STORES_RESIDENT_BOUND: usize =
+    crate::snapshots::durable_sources::SOURCES.len() * store::MAX_RECORDS * 256
+        + crate::snapshots::durable_sources::SOURCES.len() * (store::MAX_BATCH + 1) * 4096
+        + super::RETAIL_RESERVE_BYTES
+        + KEY_RESERVE_BYTES
+        + STALE_PREDECESSOR_RESERVE_BYTES;
 
 /// M3 per-key maps outside the A0-h custody node, each with its own prepaid
 /// capacity of `MAX_RECORDS` nodes (plus the retained root) of <=1024 bytes:
@@ -132,7 +133,8 @@ const _: () = assert!(RECOVERY_PACE_SECONDS < 24 * 3600);
 /// Existing class-X re-derivation is bounded at `HEAD_BOUND`, on a RAM
 /// miss only, so the census pass line reports it beside the guard's own
 /// counters (SOURCE N1).
-static REDERIVE_HEAD_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static REDERIVE_HEAD_BYTES: [AtomicU64; crate::snapshots::durable_sources::SOURCES.len()] =
+    [const { AtomicU64::new(0) }; crate::snapshots::durable_sources::SOURCES.len()];
 
 pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
     durable_source(source).map_or(0, |source| {
@@ -205,8 +207,6 @@ pub(crate) struct Counters {
     /// state-directory lock (not the daemon).
     pub(crate) write_unlocked: u64,
     pub(crate) peak_body_bytes: u64,
-    // E5-PI-B2-SEAM: P4b live receipt bumps this on
-    // `PrepareOutcome::NotPersisted(Codec)` with class `PI_LEDGER_CAP`.
     /// Pi ledgers over `PI_LEDGER_MAX_KEYS`, refused at prepare; printed in
     /// the Pi summary only.
     pub(crate) retained_refused_pi_ledger_cap: u64,
@@ -1306,10 +1306,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for RetailAttempt {
 }
 
 // Process totals by source: native physical Tail bytes and old-suffix overlap.
-static RETAIL_BYTES: [[AtomicU64; 4]; 2] = [
-    [const { AtomicU64::new(0) }; 4],
-    [const { AtomicU64::new(0) }; 4],
-];
+static RETAIL_BYTES: [[AtomicU64; 4]; crate::snapshots::durable_sources::SOURCES.len()] =
+    [const { [const { AtomicU64::new(0) }; 4] }; crate::snapshots::durable_sources::SOURCES.len()];
 fn retail_bytes(source: SnapshotSource, metric: usize) -> u64 {
     durable_source(source).map_or(0, |s| {
         RETAIL_BYTES[s as usize][metric].load(Ordering::Relaxed)

@@ -27,8 +27,6 @@ pub(super) fn shape_extension(shape: &mut Shape) {
     PiSection::shape(shape);
 }
 
-// E5-PI-B2-SEAM: format-3 codec table, `(3, 3) => A_P` encode row (P4a
-// `encode_parts`, inside `Enc::count_write`).
 /// The Pi body from the borrowed live parts, in `CachedJsonlReduction` field
 /// order. The ledger leaves the shared body as the moved `E` field and is
 /// written once, into the section, without a clone.
@@ -58,8 +56,11 @@ pub(in crate::snapshots) fn put_body(
     e.section(SECTION_TAG, |e| PiSection::put_borrowed(e, keys))
 }
 
-// E5-PI-B2-SEAM: format-3 codec table, `(3, 3) => A_P` verify row (P4a, on the
-// header-dispatched source).
+/// Header-dispatched Pi verification row; the table admits only format 3.
+pub(in crate::snapshots) fn verify(body: &[u8]) -> Result<(), Corrupt> {
+    verify_body(&mut Dec::new(body))
+}
+
 /// Structural verification of a Pi body, without allocation.
 pub(crate) fn verify_body(d: &mut Dec<'_>) -> Result<(), Corrupt> {
     d.require_section();
@@ -73,9 +74,6 @@ pub(crate) fn verify_body(d: &mut Dec<'_>) -> Result<(), Corrupt> {
     d.ended()
 }
 
-// E5-PI-B2-SEAM: format-3 codec table, `(3, 3) => A_P` decode row (P4a, on the
-// header-dispatched source; the caller passes 5c1a0b's bounded `Dec` and maps
-// `Dec::outcome`).
 /// Decodes a Pi body. The ledger refills the accumulator before the end check,
 /// so a section that is absent, short, long or not refilled is corrupt.
 pub(crate) fn take_body(d: &mut Dec<'_>) -> Result<Decoded, Corrupt> {

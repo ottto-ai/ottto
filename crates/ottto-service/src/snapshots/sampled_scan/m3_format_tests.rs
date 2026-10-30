@@ -71,8 +71,12 @@ fn resign(bytes: &mut [u8]) {
 #[test]
 fn m3_p4a_source_table_admits_exact_triples_without_repinning_body() {
     let rows = crate::snapshots::durable_sources::SOURCES;
-    assert_eq!(rows.len(), 2);
-    for (slot, row) in rows.iter().enumerate() {
+    assert_eq!(rows.len(), 3);
+    for (slot, row) in rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.source != DurableSource::Pi)
+    {
         assert_eq!(row.source.slot(), slot);
         assert_eq!(row.tag as usize, slot + 1);
         assert_eq!(
@@ -106,7 +110,10 @@ fn m3_p4a_wire_offsets_generation_and_mixed_restart_twice() {
     let transcript = root.join("fixture.jsonl");
     std::fs::write(&transcript, b"{\"n\":1}\n").unwrap();
     let cert = certificate(&transcript);
-    for row in crate::snapshots::durable_sources::SOURCES {
+    for row in crate::snapshots::durable_sources::SOURCES
+        .iter()
+        .filter(|row| row.source != DurableSource::Pi)
+    {
         let dir = root.join(row.snapshot.api_slug());
         let mut store = store::DurableTailStore::new(dir.clone(), row.source);
         let old = pending(row.source, "v1", &cert, false);
@@ -276,4 +283,52 @@ fn m3_p4a_scope_formula_uses_canonical_counting_and_distinct_domain() {
         store::replay_scope_digest(&v3, 17, 19, 1, false),
         store::replay_scope_digest(&v3, 18, 19, 1, false)
     );
+}
+
+#[test]
+fn pi_format_three_store_row_round_trips_and_v1_v2_stay_unknown() {
+    let root = crate::test_scratch::ScratchDir::new("pi-format-three");
+    let lock = test_locks::hold(&root);
+    let transcript = root.join("fixture.jsonl");
+    std::fs::write(&transcript, b"{\"type\":\"session\",\"id\":\"fixture\"}\n").unwrap();
+    let cert = certificate(&transcript);
+    let mut record = pending(DurableSource::Pi, "pi-format-three", &cert, true);
+    record.acquisition = Some(AcquisitionFields {
+        acquired_revision: 1,
+        protocol: AcquisitionProtocol::WriteAhead,
+    });
+    let key = record.binding.key;
+    let body = record.body.clone();
+    let dir = root.join("store");
+    let mut writer = store::DurableTailStore::new(dir.clone(), DurableSource::Pi);
+    assert_eq!(
+        writer
+            .write_after_save(lock, 1, 0, vec![record])
+            .unwrap()
+            .written,
+        1
+    );
+    drop(writer);
+    let file = path(&dir, &key);
+    let bytes = std::fs::read(&file).unwrap();
+    assert_eq!(bytes[42], 3);
+    assert_eq!(&bytes[8..10], &3u16.to_le_bytes());
+    let mut reader = store::DurableTailStore::new(dir.clone(), DurableSource::Pi);
+    let record = found(reader.read(&key));
+    assert_eq!(record.format, 3);
+    assert_eq!(record.record.body, body);
+    assert_eq!(
+        record.record.acquisition.unwrap().protocol,
+        AcquisitionProtocol::WriteAhead
+    );
+    for format in [1u16, 2] {
+        let mut unknown = bytes.clone();
+        unknown[8..10].copy_from_slice(&format.to_le_bytes());
+        resign(&mut unknown);
+        std::fs::write(&file, &unknown).unwrap();
+        let mut reader = store::DurableTailStore::new(dir.clone(), DurableSource::Pi);
+        assert_eq!(reader.read(&key), ReadOutcome::Refused(Refusal::Unknown));
+        reader.gc(lock, &[0; 32], &BTreeMap::new()).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), unknown);
+    }
 }

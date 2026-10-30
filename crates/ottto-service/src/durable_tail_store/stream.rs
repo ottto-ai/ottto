@@ -1324,7 +1324,7 @@ mod tests {
             assert!(store.resource_paused());
             let disposition = store.finish_resolution(plan.resolve());
             match source {
-                DurableSource::ClaudeCode => {
+                DurableSource::ClaudeCode | DurableSource::Pi => {
                     assert!(matches!(
                         disposition,
                         FailureDisposition::Hold {

@@ -203,6 +203,15 @@ impl<'a> BodyEncoding<'a> {
         })
     }
     fn put(&self, e: &mut Enc<'_>) -> Result<(), Refuse> {
+        if self.accumulator.source == SnapshotSource::Pi {
+            return pi::put_body(
+                e,
+                self.accumulator,
+                self.report,
+                self.scalars,
+                &self.rederive,
+            );
+        }
         self.accumulator.put(e)?;
         self.report.put(e)?;
         self.scalars.0.put(e)?;
@@ -235,10 +244,7 @@ pub(in crate::snapshots) fn encode_parts(
     line_cap: u64,
 ) -> Result<Vec<u8>, Refuse> {
     let plan = BodyEncoding::new(acc, report, scalars, line_cap)?;
-    let len = plan.count(limit)?;
-    let mut out = Vec::with_capacity(len);
-    plan.write(&mut out, len)?;
-    Ok(out)
+    Enc::count_write(limit, |e| plan.put(e))
 }
 
 /// Structural body verification only: no reduction, re-derivation or live
@@ -270,6 +276,9 @@ pub(in crate::snapshots) fn decode_body(
     source: SnapshotSource,
 ) -> Result<Decoded, Corrupt> {
     let mut d = Dec::new(body);
+    if source == SnapshotSource::Pi {
+        return pi::take_body(&mut d);
+    }
     let reduction = CachedJsonlReduction::take(&mut d)?;
     let rederive = Rederive::take(&mut d)?;
     d.finish()?;
@@ -311,6 +320,9 @@ pub(in crate::snapshots) fn decode_body_bounded(
     let mut reserve = |bytes| lease.charge(bytes).is_ok();
     let mut d = Dec::bounded(body, &mut reserve);
     let result = (|| {
+        if source == SnapshotSource::Pi {
+            return pi::take_body(&mut d);
+        }
         let reduction = CachedJsonlReduction::take(&mut d)?;
         let rederive = Rederive::take(&mut d)?;
         if d.remaining() != 0 || reduction.accumulator.source != source {
@@ -565,9 +577,6 @@ pub(crate) fn rederive_parser(
 #[path = "durable_tests.rs"]
 mod tests;
 
-// E5-PI-B2-SEAM: format-3 codec table `(3, 3) => A_P` row (P4a) and the P4b
-// live receipt call this module; this allow goes at that wiring.
-#[cfg_attr(not(test), allow(dead_code))]
 #[path = "durable_pi.rs"]
 pub(in crate::snapshots) mod pi;
 

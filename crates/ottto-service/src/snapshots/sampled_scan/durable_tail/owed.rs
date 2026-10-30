@@ -530,6 +530,7 @@ impl SharedCache {
                 match ds {
                     DurableSource::ClaudeCode => "wa.debt_absence_parked.claude",
                     DurableSource::Codex => "wa.debt_absence_parked.codex",
+                    DurableSource::Pi => "wa.debt_absence_parked.pi",
                 },
             );
         }
