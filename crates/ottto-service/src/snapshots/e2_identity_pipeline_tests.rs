@@ -563,12 +563,20 @@ fn e2_pipeline_discarded_trace_read_leaves_requests_unbound_never_another_accoun
         assert_eq!(fired.get(), discard, "discard={discard}");
         assert_eq!(items.len(), 2);
         for item in &items {
-            e2_assert_identity_consistent(item, &format!("discard={discard}"));
             let (login, requests) = if item.source_session_id == root {
                 ("a", 4)
             } else {
                 ("b", 1)
             };
+            // Only this item's own login, and none at all after a discard.
+            let allowed = (!discard).then(|| login.repeat(64));
+            for row in e2_rows(item) {
+                assert!(
+                    row.account_identifier_hash.is_none()
+                        || row.account_identifier_hash == allowed,
+                    "discard={discard}: never another item's account"
+                );
+            }
             let expected = if discard {
                 BTreeMap::from([(None, requests)])
             } else {
