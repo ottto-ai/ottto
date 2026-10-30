@@ -49660,9 +49660,11 @@ impl ScanIndex {
             codex_counting_evicted_legacy: self.codex_counting_evicted_legacy.clone(),
             codex_counting_evictions: self.codex_counting_evictions,
             v2: previous.v2.as_ref().map(|state| {
-                let mut state = state.clone();
-                state.growth_retention = sampled_audit::growth_subset(self, previous, &safe_keys);
-                state
+                Box::new(state_v2::IndexState {
+                    persistence_v2: state.persistence_v2.clone(),
+                    growth_claim_context: state.growth_claim_context.clone(),
+                    growth_retention: sampled_audit::growth_subset(self, previous, &safe_keys),
+                })
             }),
             persistence_root: previous.persistence_root.clone(),
             persistence_controls: previous.persistence_controls.clone(),

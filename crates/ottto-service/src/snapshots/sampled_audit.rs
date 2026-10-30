@@ -3062,7 +3062,7 @@ mod growth_tests {
             ));
             let raw = decoded
                 .decode_holds
-                .v2_records()
+                .v2_entries()
                 .find(|(field, key, ..)| *field == "growth_retention" && *key == fixture.key)
                 .unwrap()
                 .2;

@@ -378,7 +378,11 @@ fn retained_heap(index: &ScanIndex) -> RetainedHeap {
     }
 }
 fn side_maps(index: &ScanIndex) -> Option<u64> {
-    let mut bytes = 0_u64;
+    let mut bytes = if index.v2.is_some() {
+        std::mem::size_of::<super::IndexState>() as u64
+    } else {
+        0
+    };
     bytes = bytes.checked_add(heap(&index.v2().growth_retention)?)?;
     bytes = bytes.checked_add(heap(&index.persistence_legacy_recovery)?)?;
     bytes = bytes.checked_add(heap(&index.persistence_root)?)?;

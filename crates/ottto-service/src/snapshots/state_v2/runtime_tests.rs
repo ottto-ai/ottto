@@ -63,10 +63,14 @@ fn off_v1_growth_is_unknown_and_diagnostics_need_no_registry() {
         let registry = states().lock().unwrap();
         let root = &root;
         scope.spawn(move || {
-            for source in ["claude_code", "codex", "pi"] {
+            for source in [
+                crate::snapshots::SnapshotSource::ClaudeCode,
+                crate::snapshots::SnapshotSource::Codex,
+                crate::snapshots::SnapshotSource::Pi,
+            ] {
                 // An unbound path has no custody-probe exception. The bound
                 // Claude probe is covered by the existing custody regression.
-                let path = root.join(format!("{source}-test-scan-index.json"));
+                let path = root.join(format!("{}-test-scan-index.json", source.api_slug()));
                 for growth in [
                     serde_json::Value::Null,
                     serde_json::json!(42),
@@ -76,9 +80,10 @@ fn off_v1_growth_is_unknown_and_diagnostics_need_no_registry() {
                     wire["growth_retention"] = growth;
                     fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
                     crate::local_resource_diagnostics::source_prepare(
-                        source,
+                        source.api_slug(),
                         || {
-                            let mut index = ScanIndex::load(&path).unwrap();
+                            let mut index =
+                                ScanIndex::load_attributed(&path, Some(source)).unwrap();
                             assert!(index.v2.is_none());
                             assert!(index.decode_holds.is_empty());
                             index.save(&path).unwrap();
