@@ -104,6 +104,11 @@ fn in_window(member: &Member, now: u64, days: u64) -> bool {
         .ok()
         .is_some_and(|modified| is_recent_enough_at(modified, now, days))
 }
+fn runnable(member: &Member, now: u64, days: u64) -> bool {
+    member.bytes <= max_jsonl_file_bytes(SnapshotSource::ClaudeCode)
+        && member.bytes <= body_witness_adoption_byte_budget()
+        && in_window(member, now, days)
+}
 fn estimate(request: &Request, now: u64) -> Estimate {
     let mut pages: usize = 0;
     let mut files = 0;
@@ -112,8 +117,7 @@ fn estimate(request: &Request, now: u64) -> Estimate {
     let mut runnable_files = 0;
     let mut runnable_bytes = 0;
     for m in &request.members {
-        if m.bytes > body_witness_adoption_byte_budget() || !in_window(m, now, request.window_days)
-        {
+        if !runnable(m, now, request.window_days) {
             blocked += 1;
             continue;
         }
@@ -240,8 +244,8 @@ pub(crate) fn prepare(
             "scope metadata changed; request refused"
         );
         ensure!(
-            in_window(m, scan_now, request.window_days),
-            "scope outside scan window"
+            runnable(m, scan_now, request.window_days),
+            "scope outside scan window or native size bounds"
         );
         ensure!(
             resolved_roots.iter().any(|root| m.path.starts_with(root)),

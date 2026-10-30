@@ -233,6 +233,31 @@ fn estimate_reports_out_of_window_members_and_apply_refuses_without_state() {
 }
 
 #[test]
+fn estimate_refuses_native_oversize_below_the_history_page_budget() {
+    let (home, _, index, paths) = setup("copy-prefix-native-file-cap");
+    let size = max_jsonl_file_bytes(SnapshotSource::ClaudeCode) + 1;
+    assert!(size < body_witness_adoption_byte_budget());
+    // Sparse metadata only: neither allocate nor read a transcript this big.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&paths[0])
+        .unwrap()
+        .set_len(size)
+        .unwrap();
+    let support = home.join("never-created-oversize-support");
+    let before = serde_json::to_value(&index).unwrap();
+    let counts = run(&home.join("scope.json"), &support, false).unwrap();
+    assert_eq!(
+        (counts.files, counts.runnable_files, counts.blocked_files),
+        (3, 2, 1)
+    );
+    assert!(run(&home.join("scope.json"), &support, true).is_err());
+    assert!(!support.exists());
+    assert_eq!(serde_json::to_value(&index).unwrap(), before);
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn aged_or_changed_scan_window_refuses_before_any_reowe() {
     let (home, root, mut index, _) = setup("copy-prefix-window-runtime");
     let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);

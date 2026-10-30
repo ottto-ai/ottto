@@ -145,7 +145,8 @@ by opening transcripts. It stats only those files, refuses symlink paths,
 requires creation-time metadata, and emits numeric counts/durations only.
 Estimate neither creates a support directory nor changes state or uploads.
 Files/bytes cover the exact scope; runnable files/bytes exclude oversized
-and out-of-window members. Either kind is counted as blocked and apply
+and out-of-window members. The existing Claude 512 MiB per-file limit also
+applies, independently of the 1 GiB page limit. Any blocked member means apply
 refuses the whole request. Required `--window-days` is the ordinary daemon
 scan window, at most the existing 183-day limit; it never widens scanning. Scope is bounded by the existing 10,000-file scan
 limit and a 4 MiB local request envelope.
