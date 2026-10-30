@@ -121,7 +121,7 @@ fn fixed_values(table: Table, fixed: &Fixed) -> Result<Vec<SqlValue>> {
     fn sql<T: rusqlite::ToSql>(v: &T) -> Result<SqlValue> {
         Ok(match v.to_sql()? {
             ToSqlOutput::Owned(v) => v,
-            ToSqlOutput::Borrowed(v) => v.into(),
+            ToSqlOutput::Borrowed(v) => SqlValue::try_from(v)?,
             _ => bail!("state_v2_sql_type"),
         })
     }
@@ -595,13 +595,16 @@ fn sqlite_uri(path: &Path) -> Result<String> {
     Ok(uri)
 }
 fn settings(conn: &Connection, import: bool) -> Result<()> {
+    // SQL exposes sqlite3_libversion/sourceid from the linked engine, not the
+    // OS installation. Refuse an accidental older link before using the store.
+    ensure!(rusqlite::version_number() >= 3_051_003, "state_v2_sqlite_version");
     let engine: (String, String) =
         conn.query_row("SELECT sqlite_version(), sqlite_source_id()", [], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?;
     super::telemetry::event(
         "sqlite_engine",
-        &serde_json::json!({"version":engine.0,"source_id":engine.1}),
+        &serde_json::json!({"version":engine.0,"source_id":engine.1,"bundled":true}),
     );
     conn.set_prepared_statement_cache_capacity(32);
     conn.busy_timeout(BUSY)?;
