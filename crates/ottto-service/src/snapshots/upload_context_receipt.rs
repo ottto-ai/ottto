@@ -109,15 +109,22 @@ impl ScanIndex {
         self.active_upload_context_fingerprint.as_ref()
     }
 
-    fn unaffected_source_context_matches_base(&self) -> bool {
+    fn same_copy_prefix_base(&self, context: &str) -> bool {
         let Some(base) = self.copy_prefix_base_upload_context.as_ref() else {
             return false;
         };
         let local_on = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
         let wire_on = crate::snapshot_sync::copy_unproven_upload_context(local_on.clone(), true);
-        self.upload_context_fingerprint
-            .as_ref()
-            .is_some_and(|stored| stored == base || stored == &local_on || stored == &wire_on)
+        context == base || context == local_on || context == wire_on
+    }
+
+    fn unaffected_file(&self, key: &str) -> bool {
+        self.copy_prefix_base_upload_context.is_some()
+            && self
+                .claude_money_birth_store
+                .money_marks(claude_money_birth_store::location_key(key))
+                & claude_copy_prefix_reread::REOWED
+                == 0
     }
 
     fn receipt_matches(&self, key: &str, entry: &ScanIndexEntry) -> bool {
@@ -125,7 +132,11 @@ impl ScanIndex {
             .upload_context_receipt
             .as_ref()
             .is_some_and(|receipt| {
-                self.file_expected_context(key) == Some(&receipt.context_fingerprint)
+                (self.file_expected_context(key) == Some(&receipt.context_fingerprint)
+                    // Pre-scope builds may already have valid mode-qualified
+                    // receipts. Do not turn them into unrelated read debt.
+                    || (self.unaffected_file(key)
+                        && self.same_copy_prefix_base(&receipt.context_fingerprint)))
                     && receipt.replay_generation == self.context_curve_replay_epoch
                     && receipt.source_witness == entry.source_file_fingerprint
                     && entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
@@ -147,10 +158,12 @@ impl ScanIndex {
             // An already-adopted legacy file may have no per-file receipt.
             // Recognize only mode variants of THIS base; a genuine policy,
             // destination or attribution-context change still re-acquires it.
-            let unaffected = expected == self.copy_prefix_base_upload_context.as_ref();
-            if unaffected
+            if self.unaffected_file(key)
                 && entry.upload_context_receipt.is_none()
-                && self.unaffected_source_context_matches_base()
+                && self
+                    .upload_context_fingerprint
+                    .as_deref()
+                    .is_some_and(|context| self.same_copy_prefix_base(context))
             {
                 return false;
             }

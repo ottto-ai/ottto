@@ -427,6 +427,49 @@ fn acknowledged_unaffected_receipt_survives_resumed_prefix_mode_changes() {
         assert_eq!(f.entry().upload_context_receipt, receipt);
     }
 }
+
+#[test]
+fn pre_scope_mode_qualified_receipt_keeps_unaffected_history_quiet() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let base = "d".repeat(64);
+    let old_on = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
+    // Simulate the earlier ON builder: no scoped base override, so a real
+    // uploader ACK grants the mode-qualified receipt to this unchanged file.
+    f.index
+        .activate_file_upload_context(f.source, old_on.clone());
+    assert_eq!(f.adopt().files, 1);
+    let receipt = f.entry().upload_context_receipt.clone().unwrap();
+    assert_eq!(receipt.context_fingerprint, old_on);
+    f.index = serde_json::from_value(serde_json::to_value(&f.index).unwrap()).unwrap();
+    f.index.copy_prefix_base_upload_context = Some(base.clone());
+    for (enabled, wire) in [(true, false), (true, true), (false, false)] {
+        let mode = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), enabled);
+        let mode = crate::snapshot_sync::copy_unproven_upload_context(mode, wire);
+        f.index.activate_file_upload_context(f.source, mode);
+        let (scan, bytes) = f.walk(true);
+        assert_eq!((scan.scanned_file_count, bytes), (0, 0));
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(f.entry().upload_context_receipt.as_ref(), Some(&receipt));
+    }
+    // A context alias grants no body/source/replay authority of its own.
+    f.index.context_curve_replay_epoch += 1;
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+    f.index.context_curve_replay_epoch -= 1;
+    let witness = f.entry().source_file_fingerprint.clone();
+    f.index
+        .files
+        .get_mut(&f.key())
+        .unwrap()
+        .source_file_fingerprint = "changed".into();
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+    f.index
+        .files
+        .get_mut(&f.key())
+        .unwrap()
+        .source_file_fingerprint = witness;
+    f.index.copy_prefix_base_upload_context = Some("e".repeat(64));
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+}
 #[test]
 fn upload_context_receipt_stale_source_witness_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
