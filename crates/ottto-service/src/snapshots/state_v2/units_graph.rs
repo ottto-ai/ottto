@@ -768,43 +768,58 @@ pub(super) fn plan(
             }
             planner.add(scopes, vec![m.change()], bytes, windows)?;
         }
-        // Packed JSON never expands the input. A manifest for all pending
-        // mutations with maximal position widths bounds every selected subset.
-        let upper = Manifest {
-            version: 2,
-            identity: identity.clone(),
-            generation: next.generation,
-            mutations: changes
-                .iter()
-                .map(|m| StoredMutation {
-                    key: m.key.clone(),
-                    before: m.before.clone(),
-                    after: m.after.clone(),
-                    payload_position: m.value.as_ref().map(|_| u64::MAX),
-                })
-                .collect(),
-        };
-        let len = admit_json(&upper, SCRATCH)? as u64;
-        drop(upper);
-        let key = carry_key()?;
-        let mut header = preflight(&RowInput {
-            key: &key,
-            fixed: &Fixed::None,
-            value_version: 2,
-            value: &Bytes(&[]),
-        })?;
-        header.len = len;
-        header.parts = if len > INLINE_BYTES as u64 {
-            len.div_ceil(PART_BYTES as u64) as u16
+        let prior_carry = recorder.inner.get(&carry_key()?)?;
+        if let Some(header) = prior_carry.as_ref() {
+            planner.reserve_custody(Change {
+                before: Some(header.clone()),
+                after: None,
+                refs_only: false,
+            })?;
+        }
+        let preliminary = planner.clone().select()?;
+        let mut selection = if preliminary.deferred() == 0 {
+            // Fully selected work needs no new manifest. Long repeated JSON
+            // keys must not impose hypothetical carry admission on this case.
+            preliminary
         } else {
-            0
+            // Packed JSON never expands the input. A manifest for all pending
+            // mutations with maximal position widths bounds every selected subset.
+            let upper = Manifest {
+                version: 2,
+                identity: identity.clone(),
+                generation: next.generation,
+                mutations: changes
+                    .iter()
+                    .map(|m| StoredMutation {
+                        key: m.key.clone(),
+                        before: m.before.clone(),
+                        after: m.after.clone(),
+                        payload_position: m.value.as_ref().map(|_| u64::MAX),
+                    })
+                    .collect(),
+            };
+            let len = admit_json(&upper, SCRATCH)? as u64;
+            drop(upper);
+            let key = carry_key()?;
+            let mut header = preflight(&RowInput {
+                key: &key,
+                fixed: &Fixed::None,
+                value_version: 2,
+                value: &Bytes(&[]),
+            })?;
+            header.len = len;
+            header.parts = if len > INLINE_BYTES as u64 {
+                len.div_ceil(PART_BYTES as u64) as u16
+            } else {
+                0
+            };
+            planner.reserve_custody(Change {
+                before: recorder.inner.get(&key)?,
+                after: Some(header),
+                refs_only: false,
+            })?;
+            planner.select()?
         };
-        planner.reserve_custody(Change {
-            before: recorder.inner.get(&key)?,
-            after: Some(header),
-            refs_only: false,
-        })?;
-        let mut selection = planner.select()?;
         let selected: BTreeSet<_> = selection.keys().cloned().collect();
         let mut selected_rows = BTreeMap::new();
         let mut deferred = Vec::new();

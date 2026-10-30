@@ -729,3 +729,22 @@ fn interrupted_inert_staging_never_restores_unpublished_work() {
     let (saved, _) = kinds::hydrate(&mut db, f.1.binding.clone()).unwrap();
     assert_eq!(saved.generation, prev.generation);
 }
+
+#[test]
+fn fully_selected_long_keys_do_not_require_a_hypothetical_carry_manifest() {
+    let (f, mut db, prev, mut cx) = Fixture::new();
+    let mut next = prev.clone();
+    for n in 0..800 {
+        next.claude_account_deferred_holds
+            .insert(format!("{n:04}{}", "k".repeat(1_500)), "held".into());
+    }
+    ClaudeMapper
+        .selected_save(&mut db, &f.1, &prev, &mut next, &mut cx)
+        .unwrap();
+    assert_eq!(next.claude_account_deferred_holds.len(), 800);
+    assert!(
+        carry(&mut db.begin(TxnMode::Read).unwrap(), &f.1, next.generation)
+            .unwrap()
+            .is_none()
+    );
+}

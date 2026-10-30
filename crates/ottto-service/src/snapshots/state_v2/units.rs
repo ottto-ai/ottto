@@ -229,12 +229,14 @@ impl Schedule {
         Ok(value)
     }
 }
+#[derive(Clone)]
 struct Fragment {
     scopes: BTreeSet<[u8; 32]>,
     changes: Vec<Change>,
     stage_bytes: u64,
     account_windows: u64,
 }
+#[derive(Clone)]
 pub(super) struct Planner {
     identity: Identity,
     generation: u64,
