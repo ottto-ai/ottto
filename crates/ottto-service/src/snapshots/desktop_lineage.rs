@@ -137,40 +137,84 @@ impl ClaudeTitleMetadata {
     }
 }
 
+// Shared custody for the root selector maps keyed by the local file index key
+// (lineage edge baselines and identity latches): the same record cap, key bound
+// and ONE joint decode-span byte budget, counted refusal and no eviction.
+pub(super) const EDGE_RECORD_BYTES: usize = 70;
+
 // Compact JSON upper bound, including escaped path keys, before insert/clone.
-// The root serializer keeps this value compact even in held/pretty output.
-fn file_edges_bytes(edges: &BTreeMap<String, String>) -> usize {
-    2 + edges
+// `record` covers quotes, colon, the widest fixed value and comma.
+// The root serializer keeps each map compact even in held/pretty output.
+pub(super) fn selector_bytes<V>(map: &BTreeMap<String, V>, record: usize) -> usize {
+    2 + map
         .keys()
-        .map(|key| {
-            key.bytes()
-                .map(|b| match b {
-                    b'"' | b'\\' => 2,
-                    0..=31 => 6,
-                    _ => 1,
-                })
-                .sum::<usize>()
-                + 70
-        })
+        .map(|key| escaped_len(key) + record)
         .sum::<usize>()
 }
-fn insert_file_edge(edges: &mut BTreeMap<String, String>, key: &str, edge: &str) {
-    if (!edges.contains_key(key) && edges.len() >= MAX_EDGES) || key.len() > 8192 {
+fn escaped_len(key: &str) -> usize {
+    key.bytes()
+        .map(|b| match b {
+            b'"' | b'\\' => 2,
+            0..=31 => 6,
+            _ => 1,
+        })
+        .sum()
+}
+/// `others` is the compact size of the sibling selector map.
+pub(super) fn insert_selector<V>(
+    map: &mut BTreeMap<String, V>,
+    record: usize,
+    others: usize,
+    key: &str,
+    value: V,
+) {
+    if (!map.contains_key(key) && map.len() >= MAX_EDGES) || key.len() > 8192 {
         dropped();
         return;
     }
-    // Updating an existing hash cannot increase its JSON length.
-    if !edges.contains_key(key) {
-        let mut extra = BTreeMap::new();
-        extra.insert(key.to_owned(), edge.to_owned());
-        if file_edges_bytes(edges).saturating_add(file_edges_bytes(&extra))
+    // Updating an existing fixed-width record cannot increase its JSON length.
+    if !map.contains_key(key)
+        && selector_bytes(map, record)
+            .saturating_add(2 + escaped_len(key) + record)
+            .saturating_add(others)
             > MAX_DECODE_BYTES as usize
-        {
-            dropped();
-            return;
+    {
+        dropped();
+        return;
+    }
+    map.insert(key.to_owned(), value);
+}
+/// Whether a NEW key could be admitted now; callers never select work whose
+/// settlement the budget would refuse (no revisit loop at the cap).
+pub(super) fn selector_admits<V>(
+    map: &BTreeMap<String, V>,
+    record: usize,
+    others: usize,
+    key: &str,
+) -> bool {
+    map.contains_key(key)
+        || (map.len() < MAX_EDGES
+            && key.len() <= 8192
+            && selector_bytes(map, record)
+                .saturating_add(2 + escaped_len(key) + record)
+                .saturating_add(others)
+                <= MAX_DECODE_BYTES as usize)
+}
+/// The committed map: the previous value plus only safe (ACK-settled) keys.
+pub(super) fn committable_selector<V: Clone>(
+    working: &BTreeMap<String, V>,
+    previous: &BTreeMap<String, V>,
+    safe: &BTreeSet<String>,
+    record: usize,
+    others: usize,
+) -> BTreeMap<String, V> {
+    let mut map = previous.clone();
+    for (key, value) in working {
+        if safe.contains(key) {
+            insert_selector(&mut map, record, others, key, value.clone());
         }
     }
-    edges.insert(key.to_owned(), edge.to_owned());
+    map
 }
 
 impl ScanIndex {
@@ -206,7 +250,14 @@ impl ScanIndex {
     pub(super) fn record_desktop_lineage_file_edge(&mut self, key: &str, edge: String) {
         self.claude_desktop_lineage_file_edges
             .retain(|key, _| self.files.contains_key(key));
-        insert_file_edge(&mut self.claude_desktop_lineage_file_edges, key, &edge);
+        let others = desktop_identity::latch_bytes(&self.claude_desktop_identity_latches);
+        insert_selector(
+            &mut self.claude_desktop_lineage_file_edges,
+            EDGE_RECORD_BYTES,
+            others,
+            key,
+            edge,
+        );
     }
 }
 
@@ -215,11 +266,11 @@ pub(super) fn committable_file_edges(
     previous: &ScanIndex,
     safe: &BTreeSet<String>,
 ) -> BTreeMap<String, String> {
-    let mut edges = previous.claude_desktop_lineage_file_edges.clone();
-    for (key, edge) in &working.claude_desktop_lineage_file_edges {
-        if safe.contains(key) {
-            insert_file_edge(&mut edges, key, edge);
-        }
-    }
-    edges
+    committable_selector(
+        &working.claude_desktop_lineage_file_edges,
+        &previous.claude_desktop_lineage_file_edges,
+        safe,
+        EDGE_RECORD_BYTES,
+        desktop_identity::latch_bytes(&previous.claude_desktop_identity_latches),
+    )
 }

@@ -236,6 +236,87 @@ pub(crate) struct DesktopMetadata {
     pub(crate) lineage_edge_reoffer: LineageEdgeReoffer,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) lineage_selector_drops: u64,
+    /// Lead B: a re-offer after this child's own ACKed missing disposition.
+    #[serde(skip_serializing_if = "RecoveredReoffer::is_empty")]
+    pub(crate) desktop_identity_recovered_reoffer: RecoveredReoffer,
+    /// SOURCE Addendum 7: a legacy/re-upgrade child with no latch entry.
+    #[serde(skip_serializing_if = "AdoptionReoffer::is_empty")]
+    pub(crate) desktop_identity_adoption_reoffer: AdoptionReoffer,
+}
+/// One finalized identity re-offer. `posted`/`sent` is a new body carrying the
+/// child's own complete disposition; `unchanged` matched the stored body;
+/// `refused` emitted no complete disposition (live evidence won). `bytes` are
+/// native transcript bytes the re-offer consumed (0 when served from cache).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct RecoveredReoffer {
+    pub(crate) posted: u64,
+    pub(crate) unchanged: u64,
+    pub(crate) refused: u64,
+    pub(crate) bytes: u64,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct AdoptionReoffer {
+    pub(crate) sent: u64,
+    pub(crate) unchanged: u64,
+    pub(crate) refused: u64,
+    pub(crate) bytes: u64,
+}
+impl RecoveredReoffer {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+    fn merge(&mut self, other: Self) {
+        self.posted = self.posted.saturating_add(other.posted);
+        self.unchanged = self.unchanged.saturating_add(other.unchanged);
+        self.refused = self.refused.saturating_add(other.refused);
+        self.bytes = self.bytes.saturating_add(other.bytes);
+    }
+}
+impl AdoptionReoffer {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+    fn merge(&mut self, other: Self) {
+        self.sent = self.sent.saturating_add(other.sent);
+        self.unchanged = self.unchanged.saturating_add(other.unchanged);
+        self.refused = self.refused.saturating_add(other.refused);
+        self.bytes = self.bytes.saturating_add(other.bytes);
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdentityReoffered {
+    Posted,
+    Unchanged,
+    Refused,
+}
+pub(crate) fn desktop_identity_reoffer(adoption: bool, outcome: IdentityReoffered, bytes: u64) {
+    let (posted, unchanged, refused) = match outcome {
+        IdentityReoffered::Posted => (1, 0, 0),
+        IdentityReoffered::Unchanged => (0, 1, 0),
+        IdentityReoffered::Refused => (0, 0, 1),
+    };
+    let mut counts = Counts::default();
+    if adoption {
+        counts.desktop_metadata.desktop_identity_adoption_reoffer = AdoptionReoffer {
+            sent: posted,
+            unchanged,
+            refused,
+            bytes,
+        };
+    } else {
+        counts.desktop_metadata.desktop_identity_recovered_reoffer = RecoveredReoffer {
+            posted,
+            unchanged,
+            refused,
+            bytes,
+        };
+    }
+    if active() {
+        update(|current| current.desktop_metadata.merge(counts.desktop_metadata));
+    } else {
+        // Finalization can run outside the scan's step scope, as for lineage.
+        super::rearm_collection(counts);
+    }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct LineageEdgeReoffer {
@@ -281,6 +362,10 @@ impl DesktopMetadata {
         *self == Self::default()
     }
     fn merge(&mut self, other: Self) {
+        self.desktop_identity_recovered_reoffer
+            .merge(other.desktop_identity_recovered_reoffer);
+        self.desktop_identity_adoption_reoffer
+            .merge(other.desktop_identity_adoption_reoffer);
         self.lineage_selector_drops = self
             .lineage_selector_drops
             .saturating_add(other.lineage_selector_drops);

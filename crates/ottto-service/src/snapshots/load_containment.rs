@@ -834,6 +834,7 @@ impl ScanIndex {
         // census or granting identity authority. Missing stays unknown.
         self.claude_desktop_completed_lineage = carry.claude_desktop_completed_lineage;
         self.claude_desktop_lineage_file_edges = carry.claude_desktop_lineage_file_edges;
+        self.claude_desktop_identity_latches = carry.claude_desktop_identity_latches;
         self.claude_account_deferred_holds = carry.claude_account_deferred_holds;
         self.claude_request_identity_contract = carry.claude_request_identity_contract;
         self.claude_request_identity_contract_changed = true;

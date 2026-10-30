@@ -1415,7 +1415,7 @@ pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
 /// offsets to ScanIndex's declaration order. JSON struct sequences are accepted
 /// by the old reader too; census and selectors need the same optional evidence
 /// bounds as object fields.
-fn sequence_fields() -> [usize; 5] {
+fn sequence_fields() -> [usize; 6] {
     struct Fields<'a>(&'a mut Option<&'static [&'static str]>);
     impl<'de> Deserializer<'de> for Fields<'_> {
         type Error = serde::de::value::Error;
@@ -1437,7 +1437,7 @@ fn sequence_fields() -> [usize; 5] {
             tuple_struct map enum identifier ignored_any
         }
     }
-    static SLOTS: std::sync::OnceLock<[usize; 5]> = std::sync::OnceLock::new();
+    static SLOTS: std::sync::OnceLock<[usize; 6]> = std::sync::OnceLock::new();
     *SLOTS.get_or_init(|| {
         let mut fields = None;
         let _ = ScanIndex::deserialize(Fields(&mut fields));
@@ -1459,6 +1459,7 @@ fn sequence_fields() -> [usize; 5] {
             slot("reread_guard"),
             slot("claude_desktop_completed_lineage"),
             slot("claude_desktop_lineage_file_edges"),
+            slot("claude_desktop_identity_latches"),
         ]
     })
 }
@@ -1479,7 +1480,7 @@ struct CensusRead<R> {
     depth: usize,
     root_array: bool,
     array_index: usize,
-    sequence_fields: [usize; 5],
+    sequence_fields: [usize; 6],
     retired_guard: bool,
     quoted: bool,
     escaped: bool,
@@ -1603,6 +1604,11 @@ impl<R: std::io::Read> CensusRead<R> {
                         self.desktop_selector = Some("claude_desktop_lineage_file_edges");
                         false
                     }
+                    "claude_desktop_identity_latches" => {
+                        self.shadow_key = true;
+                        self.desktop_selector = Some("claude_desktop_identity_latches");
+                        false
+                    }
                     _ => false,
                 };
                 if duplicate {
@@ -1705,10 +1711,14 @@ impl<R: std::io::Read> CensusRead<R> {
                     serde_json::to_vec(&state.0).expect("Desktop selector serialization")
                 }};
             }
-            return Ok(if field == "claude_desktop_completed_lineage" {
-                selector!(super::desktop_lineage::Projection)
-            } else {
-                selector!(super::desktop_lineage::FileEdges)
+            return Ok(match field {
+                "claude_desktop_completed_lineage" => {
+                    selector!(super::desktop_lineage::Projection)
+                }
+                "claude_desktop_identity_latches" => {
+                    selector!(super::desktop_identity::IdentityLatches)
+                }
+                _ => selector!(super::desktop_lineage::FileEdges),
             });
         }
         if overflow {
@@ -1764,6 +1774,8 @@ impl<R: std::io::Read> CensusRead<R> {
                 Some("claude_desktop_completed_lineage")
             } else if self.array_index == self.sequence_fields[4] {
                 Some("claude_desktop_lineage_file_edges")
+            } else if self.array_index == self.sequence_fields[5] {
+                Some("claude_desktop_identity_latches")
             } else {
                 None
             };

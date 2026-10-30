@@ -337,6 +337,12 @@ impl Serialize for ScanIndex {
                 .map_err(serde::ser::Error::custom)?;
             map.serialize_entry("claude_desktop_lineage_file_edges", &compact)?;
         }
+        if !self.claude_desktop_identity_latches.is_empty() {
+            // Same joint budget and compact rule as the lineage baselines.
+            let compact = serde_json::value::to_raw_value(&self.claude_desktop_identity_latches)
+                .map_err(serde::ser::Error::custom)?;
+            map.serialize_entry("claude_desktop_identity_latches", &compact)?;
+        }
         map.end()
     }
 }
@@ -431,6 +437,7 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_desktop_store_inventory",
     "claude_desktop_completed_lineage",
     "claude_desktop_lineage_file_edges",
+    "claude_desktop_identity_latches",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -497,6 +504,7 @@ pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
     "session_account_bindings",
     "claude_desktop_completed_lineage",
     "claude_desktop_lineage_file_edges",
+    "claude_desktop_identity_latches",
     "claude_account_deferred_holds",
     "claude_request_identity_contract",
     "claude_request_identity_contract_changed",
@@ -887,6 +895,7 @@ fn optional_resource_field(name: Option<&str>) -> bool {
                 "claude_money_birth_store"
                     | "claude_desktop_completed_lineage"
                     | "claude_desktop_lineage_file_edges"
+                    | "claude_desktop_identity_latches"
             )
         )
 }
@@ -1652,6 +1661,19 @@ impl<R: BufRead + Seek> Decoder<R> {
                                 BTreeMap::new()
                             } else {
                                 self.desktop_selector::<desktop_lineage::FileEdges>(value)?
+                                    .0
+                            };
+                        }
+                        "claude_desktop_identity_latches" => {
+                            // Damage or loss is not settled: at most one
+                            // counted re-offer, never a wrong account.
+                            index.claude_desktop_identity_latches = if value.resource
+                                || value.len > desktop_lineage::MAX_DECODE_BYTES
+                            {
+                                desktop_lineage::dropped();
+                                BTreeMap::new()
+                            } else {
+                                self.desktop_selector::<desktop_identity::IdentityLatches>(value)?
                                     .0
                             };
                         }
@@ -2683,3 +2705,7 @@ fn repair_commitment_is_order_independent_and_removes_frozen_records() {
 #[cfg(test)]
 #[path = "desktop_lineage_decode_tests.rs"]
 mod desktop_lineage_decode_tests;
+
+#[cfg(test)]
+#[path = "desktop_identity_decode_tests.rs"]
+mod desktop_identity_decode_tests;

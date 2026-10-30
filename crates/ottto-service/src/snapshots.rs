@@ -1,3 +1,5 @@
+#[path = "snapshots/desktop_identity.rs"]
+mod desktop_identity;
 #[path = "snapshots/desktop_lineage.rs"]
 mod desktop_lineage;
 
@@ -3975,6 +3977,17 @@ pub struct ScanIndex {
         deserialize_with = "desktop_lineage::deserialize_file_edges"
     )]
     claude_desktop_lineage_file_edges: BTreeMap<String, String>,
+    /// Class L: per-child identity re-offer latch, keyed like the baselines
+    /// above (the key keeps its class). Closed state only; selection history,
+    /// never owner/account/ACK/money authority, never uploaded or logged.
+    /// Absent is legacy/unknown (one adoption re-offer from cached data).
+    /// Shares the baselines' record cap, custody and one decode-span budget.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "desktop_identity::deserialize_identity_latches"
+    )]
+    claude_desktop_identity_latches: BTreeMap<String, desktop_identity::IdentityLatch>,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
@@ -4179,6 +4192,7 @@ impl Default for ScanIndex {
             claude_desktop_store_inventory: None,
             claude_desktop_completed_lineage: None,
             claude_desktop_lineage_file_edges: BTreeMap::new(),
+            claude_desktop_identity_latches: BTreeMap::new(),
             claude_desktop_store_cursor: None,
             claude_desktop_store_upper_bound: None,
             claude_desktop_store_sweep_had_errors: false,
@@ -7701,6 +7715,8 @@ impl SourceScanResult {
 struct PendingIndexFinalization {
     sampled_audit_verified: bool,
     lineage_edge_reoffer_bytes: Option<u64>,
+    /// Selected only by the Desktop identity latch, with its native bytes.
+    desktop_identity_reoffer: Option<(desktop_identity::IdentityReoffer, u64)>,
     codex_pending_recovery: bool,
     index_key: String,
     source_file_fingerprint: String,
@@ -8188,6 +8204,15 @@ pub fn finalize_scan_after_policy_with_body_witness(
             result.semantic_noop_count = result
                 .semantic_noop_count
                 .saturating_add(pending.parsed_snapshot_count);
+        }
+        if source == SnapshotSource::ClaudeCode {
+            // The emitted body, after every downgrade and veto; its latch
+            // commits with this file's ACK-settled entry only.
+            index.note_desktop_identity_emission(
+                pending,
+                &result.snapshots,
+                noop_source_files.contains(&pending.source_file_fingerprint),
+            );
         }
     }
     if source == SnapshotSource::ClaudeCode {
@@ -25998,6 +26023,8 @@ pub(crate) struct OwnedSourceScan {
     pending_finalization: Vec<PendingIndexFinalization>,
     claude_authority_preflight: bool,
     forced_claude_family_reparses: BTreeSet<String>,
+    /// Index keys whose unchanged body only the Desktop identity latch selected.
+    desktop_identity_reoffers: BTreeMap<String, desktop_identity::IdentityReoffer>,
     /// E2: forced roots selected only for path-twin co-scheduling. Their
     /// owed adoption-only members keep the history gate (both or neither).
     claude_twin_only_family_reparses: BTreeSet<String>,
@@ -26545,6 +26572,7 @@ impl OwnedSourceScan {
             pending_finalization: Vec::new(),
             claude_authority_preflight: false,
             forced_claude_family_reparses: Default::default(),
+            desktop_identity_reoffers: Default::default(),
             claude_twin_only_family_reparses: Default::default(),
             identified_candidates: Default::default(),
             active_file: Default::default(),
@@ -27249,6 +27277,7 @@ impl OwnedSourceScan {
             pending_finalization,
             claude_authority_preflight,
             forced_claude_family_reparses,
+            desktop_identity_reoffers: BTreeMap::new(),
             claude_twin_only_family_reparses,
             identified_candidates: identified_candidates.into(),
             active_file: Default::default(),
@@ -27438,6 +27467,7 @@ impl OwnedSourceScan {
             mut pending_finalization,
             claude_authority_preflight,
             mut forced_claude_family_reparses,
+            mut desktop_identity_reoffers,
             claude_twin_only_family_reparses,
             mut identified_candidates,
             active_file: active_frame,
@@ -30519,6 +30549,7 @@ impl OwnedSourceScan {
                         pending_finalization.push(PendingIndexFinalization {
                             sampled_audit_verified: false,
                             lineage_edge_reoffer_bytes: None,
+                            desktop_identity_reoffer: None,
                             codex_pending_recovery: index
                                 .files
                                 .get(&local_index_key(&alias.path))
@@ -30609,9 +30640,19 @@ impl OwnedSourceScan {
                             .map(|edge| edge.parent_session_id.as_str()),
                     )
                 });
+                // Recheck: an abandoned or since-changed selection is ordinary.
+                let desktop_identity_reoffer = desktop_identity_reoffers
+                    .remove(&index_key)
+                    .filter(|_| {
+                        index
+                            .desktop_identity_reoffer(&candidate, &claude_title_metadata)
+                            .is_some()
+                    })
+                    .map(|kind| (kind, lineage_native_bytes));
                 pending_finalization.push(PendingIndexFinalization {
                     sampled_audit_verified,
                     lineage_edge_reoffer_bytes,
+                    desktop_identity_reoffer,
                     codex_pending_recovery: index
                         .files
                         .get(&index_key)
@@ -31927,7 +31968,7 @@ impl OwnedSourceScan {
                 index.mark_bounded_sweep_unsettled();
                 pending!();
             }
-            let (mut decision, parse_reason) =
+            let (mut decision, mut parse_reason) =
                 match claude_index_path_family_member(&candidate.path).filter(
                     |(root_session_id, _)| forced_claude_family_reparses.contains(root_session_id),
                 ) {
@@ -31952,6 +31993,26 @@ impl OwnedSourceScan {
                     ),
                     None => index.candidate_decision_with_reason(&candidate),
                 };
+            if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Skip {
+                // Selection only, through the ordinary source-revision path.
+                // Adoption never reads: only a RAM reduction of exactly this
+                // unchanged extent qualifies; otherwise it waits for a natural read.
+                let key = local_index_key(&candidate.path);
+                let reoffer = index
+                    .desktop_identity_reoffer(&candidate, &claude_title_metadata)
+                    .filter(|kind| {
+                        *kind == desktop_identity::IdentityReoffer::Recovered
+                            || sampling.as_ref().is_some_and(|context| {
+                                context.cache.retained_sealed_offset(&key)
+                                    == Some(candidate.size_bytes)
+                            })
+                    });
+                if let Some(kind) = reoffer {
+                    decision = CandidateDecision::Parse;
+                    parse_reason = Some(CandidateParseReason::SourceChanged);
+                    desktop_identity_reoffers.insert(key, kind);
+                }
+            }
             let target_match = native_comparison
                 .as_ref()
                 .and_then(|phase| phase.target_revision_matches(&candidate));
@@ -33296,6 +33357,7 @@ impl OwnedSourceScan {
             pending_finalization,
             claude_authority_preflight,
             forced_claude_family_reparses,
+            desktop_identity_reoffers,
             claude_twin_only_family_reparses,
             identified_candidates,
             active_file: sampled_scan::codex_cursor::ActiveFrame::new(
@@ -48960,6 +49022,7 @@ impl ScanIndex {
             claude_desktop_lineage_file_edges: desktop_lineage::committable_file_edges(
                 self, previous, &safe_keys,
             ),
+            claude_desktop_identity_latches: BTreeMap::new(),
             claude_account_family_witnesses: self.claude_account_family_witnesses.clone(),
             claude_account_family_pending: self.claude_account_family_pending.clone(),
             claude_usage_family_witnesses: self.claude_usage_family_witnesses.clone(),
@@ -49074,6 +49137,12 @@ impl ScanIndex {
             claude_no_list_policy: self.claude_no_list_policy,
             claude_history_emission: self.claude_history_emission.clone(),
         };
+        result.claude_desktop_identity_latches = desktop_identity::committable_identity_latches(
+            self,
+            previous,
+            &safe_keys,
+            &result.claude_desktop_lineage_file_edges,
+        );
         for key in &safe_keys {
             match self.terminal_jsonl_dispositions.get(key) {
                 Some(disposition) => {
@@ -92099,8 +92168,8 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; lineage_edge_reoffer_bytes, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, desktop_identity_reoffers, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; lineage_edge_reoffer_bytes, desktop_identity_reoffer, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {
@@ -92117,7 +92186,7 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U subscription_product: Option<String>,
 });
 crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store, claude_desktop_store_inventory, claude_desktop_completed_lineage, claude_desktop_lineage_file_edges);
+crate::heap_layout_bound::fields!(ScanIndex; decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store, claude_desktop_store_inventory, claude_desktop_completed_lineage, claude_desktop_lineage_file_edges, claude_desktop_identity_latches);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);

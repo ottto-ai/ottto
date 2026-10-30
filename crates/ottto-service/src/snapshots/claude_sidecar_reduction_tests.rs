@@ -1804,3 +1804,6 @@ fn desktop_inventory_backoff_keeps_growing_native_prefix_and_cold_body_parity() 
 
 #[path = "desktop_lineage_tests.rs"]
 mod desktop_lineage_tests;
+
+#[path = "desktop_identity_tests.rs"]
+mod desktop_identity_tests;
