@@ -2107,6 +2107,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
 
 #[test]
 fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
+    let _on = RestartRestoreForTest::enabled();
     let index = every_persisted_field_fixture();
     let bytes = serde_json::to_vec_pretty(&index).unwrap();
     let encoded: BTreeMap<String, &serde_json::value::RawValue> =
@@ -2123,22 +2124,25 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
 
 #[test]
 fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
+    let _on = RestartRestoreForTest::enabled();
     // Main shipped audit progress first. The earlier E2 writer saved a named
     // map with birth storage but no audit progress. Neither may lose custody.
     let seed = every_persisted_field_fixture();
     let current = serde_json::to_value(&seed).unwrap();
     let fields = lenient_decode::FIELDS;
     assert_eq!(
-        &fields[fields.len() - 4..],
+        &fields[fields.len() - 5..],
         &[
             "upload_ack_retirement_handoff",
             "held_audit_progress",
             "claude_money_birth_store",
             "claude_desktop_store_inventory",
+            "tail_capacity_debt",
         ]
     );
     for earlier_e2 in [false, true] {
         let mut legacy = current.clone();
+        legacy.as_object_mut().unwrap().remove("tail_capacity_debt");
         legacy
             .as_object_mut()
             .unwrap()
@@ -2153,7 +2157,7 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
             // The main positional schema ends at audit progress; appending E2
             // must leave every already-shipped position intact.
             forms.push(Value::Array(
-                fields[..fields.len() - 2]
+                fields[..fields.len() - 3]
                     .iter()
                     .map(|name| legacy[*name].clone())
                     .collect(),
@@ -2180,6 +2184,7 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
 
 #[test]
 fn desktop_inventory_keeps_existing_positional_index_slots() {
+    let _on = RestartRestoreForTest::enabled();
     let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
     let mut legacy = current.clone();
     legacy.as_object_mut().unwrap().remove("tail_capacity_debt");
@@ -4564,6 +4569,7 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
 /// only negative evidence; it must never restore a live read permission.
 #[test]
 fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
+    let _on = RestartRestoreForTest::enabled();
     let seed = every_persisted_field_fixture();
     let expected = serde_json::to_vec(&seed).unwrap();
     let census = serde_json::to_vec(&seed.claude_request_census).unwrap();
@@ -4713,6 +4719,7 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
 /// Pin the absent-field downgrade contract while preserving the census bytes.
 #[test]
 fn retired_reread_new_writer_keeps_previous_default_contract() {
+    let _on = RestartRestoreForTest::enabled();
     #[derive(Default, serde::Deserialize)]
     #[serde(default)]
     struct PreviousCounts {
@@ -4815,6 +4822,7 @@ fn quiet_retired_index_loads_under_previous_entry_defaults() {
 
 #[test]
 fn o3_negative_spend_crosses_full_positional_and_named_readers() {
+    let _on = RestartRestoreForTest::enabled();
     let mut seed = every_persisted_field_fixture();
     seed.o3_replay = upgrade_replay::State::default();
     assert!(!seed.o3_replay.upgrade_missing("old-bound-file", true));

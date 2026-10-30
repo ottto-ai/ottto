@@ -4062,8 +4062,11 @@ pub struct ScanIndex {
     /// Appended to preserve every older positional index slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_desktop_store_inventory: Option<String>,
-    /// Capacity refusal custody only: path keys and observed source lengths.
-    /// Never authority to advance a checkpoint or settle a body.
+    /// Capacity refusal custody: existing index keys mapped to observed whole
+    /// source-file byte lengths (u64), not encoded size, append delta, or extent.
+    /// Values contain no path/content. The map can include not-yet-delivered
+    /// keys; it has no separate cardinality/byte cap. Never checkpoint or ACK
+    /// authority. Only the effectively-ON serializer emits this optional field.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     tail_capacity_debt: BTreeMap<String, u64>,
 }

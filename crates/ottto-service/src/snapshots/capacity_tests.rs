@@ -103,3 +103,58 @@ fn capacity_full_defers_to_each_existing_admission_owner() {
         Some("cache_transit")
     );
 }
+
+#[test]
+fn capacity_off_tolerates_existing_debt_but_never_serializes_or_saves_it() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let _on = RestartRestoreForTest::enabled();
+    let root = crate::test_scratch::ScratchDir::new("capacity-off-loaded-debt");
+    let index_path = root.join("index.json");
+    let mut index = ScanIndex::default();
+    index
+        .tail_capacity_debt
+        .insert("synthetic-index-key".into(), u64::MAX);
+    let bytes = serde_json::to_vec(&index).unwrap();
+    let encoded: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        encoded["tail_capacity_debt"],
+        serde_json::json!({"synthetic-index-key": u64::MAX})
+    );
+    for dependency_refused in [false, true] {
+        let _off = if dependency_refused {
+            RestartRestoreForTest::requested_without_dependency()
+        } else {
+            RestartRestoreForTest::disabled()
+        };
+        assert!(!restart_restore::enabled());
+        let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+        let streaming =
+            lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+        let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+        for decoded in [native, streaming, bounded] {
+            assert_eq!(
+                decoded.tail_capacity_debt.get("synthetic-index-key"),
+                Some(&u64::MAX)
+            );
+            assert!(serde_json::to_value(decoded)
+                .unwrap()
+                .get("tail_capacity_debt")
+                .is_none());
+        }
+        fs::write(&index_path, &bytes).unwrap();
+        let mut loaded = ScanIndex::load(&index_path).unwrap();
+        assert_eq!(
+            loaded.tail_capacity_debt.get("synthetic-index-key"),
+            Some(&u64::MAX)
+        );
+        loaded.save(&index_path).unwrap();
+        let saved: Value = serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+        assert!(saved.get("tail_capacity_debt").is_none());
+        assert!(ScanIndex::load(&index_path)
+            .unwrap()
+            .tail_capacity_debt
+            .is_empty());
+    }
+}

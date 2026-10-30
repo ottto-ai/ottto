@@ -337,7 +337,11 @@ impl Serialize for ScanIndex {
             claude_money_birth_store::BirthStore::is_empty
         );
         field!(claude_desktop_store_inventory, Option::is_none);
-        field!(tail_capacity_debt, BTreeMap::is_empty);
+        // OFF follows M1 even after loading an index previously written ON.
+        // Readers tolerate the field; an OFF save never publishes it again.
+        if super::restart_restore::enabled() {
+            field!(tail_capacity_debt, BTreeMap::is_empty);
+        }
         map.end()
     }
 }
