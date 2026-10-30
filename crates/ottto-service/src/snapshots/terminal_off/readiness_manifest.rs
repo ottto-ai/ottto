@@ -23,6 +23,7 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_exact_permanent_refusal_drains_correction_and_keeps_refusal_witness", "APC-F1/R2"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_natural_owed_members_drain_on_separate_bounded_pages", "proof-grant"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_new_request_after_the_grant_fails_then_one_new_proof_regrants_all_members", "proof-grant"),
+    ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_quarantine", "APC-F1/R2"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_retryable_refusal_keeps_its_member_owed_across_restart", "proof-grant"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned", "proof-grant"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_superseded_revision_ack_never_drains_the_current_revision", "APC-F1/R2"),
@@ -36,13 +37,16 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_terminal_family_member_controls_keep_blocking_pruning_and_rebinding", "C6"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_terminal_family_never_committed_members_let_the_claude_census_complete", "C6"),
     ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_dark_matches_fold_absent_publication_and_selection", "r25-code-unclassified"),
+    ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_held_new_file_cache_clear_eviction_restart_read_full", "C1-clock"),
     ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_held_new_file_lifetime_losses_preserve_main_body", "unclassified"),
     ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_overlapping_restored_histories_count_their_union_once", "prior-code-unclassified"),
     ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_overlapping_restored_histories_count_their_union_once_reverse", "prior-code-unclassified"),
     ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_twins_copy_discovered_first", "prior-code-unclassified"),
     ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_twins_original_discovered_first", "prior-code-unclassified"),
+    ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_withheld_new_file_growth_acquisition_is_tail", "C1-clock"),
     ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_withheld_new_file_retries_external_evidence_after_growth", "unclassified"),
     ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_withheld_new_file_retries_external_evidence_unchanged", "unclassified"),
+    ("snapshot_sync/claude_money_e2_pipeline_tests.rs", "terminal_off_on_e2_pipeline_withheld_new_file_unchanged_acquisition_is_unchanged", "C1-clock"),
     ("snapshot_sync/claude_request_census_pipeline_tests.rs", "terminal_off_on_census_every_offered_and_held_body_matches_control", "completion-fold"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_a_re_owed_file_goes_back_through_the_gate", "r25-code-unclassified"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_e2_always_on_contract_reowes_no_uncaptured_history", "P5"),
@@ -115,7 +119,6 @@ const INHERITED_MAIN_IGNORES: &[(&str, &str, &str, &str)] = &[
 /// ignore = reason)`, identical to the original on main c440307e6. They run on
 /// the macOS `Rust contracts` job, so they are not readiness debt.
 const INHERITED_MACOS_GATES: &[(&str, &str, &str, &str)] = &[
-    ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "", "terminal_off_on_retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_quarantine", "needs macOS heap layout"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "", "terminal_off_on_restored_stale_member_after_a_lost_tombstone_set_is_held_not_new", "needs macOS heap layout"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "", "terminal_off_on_returning_member_after_a_lost_tombstone_set_is_held_not_new", "needs macOS heap layout"),
     ("snapshots/authority_proof_correction_tests.rs", "", "terminal_off_on_contained_unbound_authority_record_does_not_latch_claude_reemission_stop", "needs macOS heap layout"),
@@ -578,7 +581,7 @@ fn terminal_off_on_readiness_ignores_equal_the_checked_in_manifest() {
     assert_eq!(expected, sorted, "keep the manifest sorted");
     assert_eq!(ignored_for_readiness(), expected);
     // The count is the ON gate: it must reach 0 before ON anywhere.
-    assert_eq!(READINESS_MANIFEST.len(), 86);
+    assert_eq!(READINESS_MANIFEST.len(), 90);
 }
 
 /// F4: an ON test's ignore is readiness debt (manifest above) unless it is

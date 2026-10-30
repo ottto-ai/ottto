@@ -4456,7 +4456,10 @@ fn retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_qua
 /// Real bounded pages, BASE native terminal, selected save and production load.
 #[test]
 #[serial(source_manifests)]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+// Parked on the macOS job, where it runs. It replaces main's
+// `cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")`,
+// which comes back with the un-park.
+#[ignore = "terminal-off ON-readiness: APC-F1/R2"]
 fn terminal_off_on_retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_quarantine() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

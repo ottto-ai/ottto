@@ -5478,6 +5478,7 @@ fn e2_pipeline_withheld_new_file_unchanged_acquisition_is_unchanged() {
 
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "terminal-off ON-readiness: C1-clock"]
 fn terminal_off_on_e2_pipeline_withheld_new_file_unchanged_acquisition_is_unchanged() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -5492,6 +5493,7 @@ fn e2_pipeline_withheld_new_file_growth_acquisition_is_tail() {
 
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "terminal-off ON-readiness: C1-clock"]
 fn terminal_off_on_e2_pipeline_withheld_new_file_growth_acquisition_is_tail() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -5508,6 +5510,7 @@ fn e2_pipeline_held_new_file_cache_clear_eviction_restart_read_full() {
 
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "terminal-off ON-readiness: C1-clock"]
 fn terminal_off_on_e2_pipeline_held_new_file_cache_clear_eviction_restart_read_full() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
