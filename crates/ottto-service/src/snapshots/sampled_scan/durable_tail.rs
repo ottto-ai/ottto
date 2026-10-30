@@ -5755,7 +5755,8 @@ impl SharedCache {
         struct StoreAlarm {
             #[serde(flatten)]
             store: store::StoreCounters,
-            store_bytes_alarm: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            store_bytes_alarm: Option<bool>,
             owed_overflow_discovery_only: bool,
             platform: &'static str,
             native_stage_skipped: StageSkipped,
@@ -5888,7 +5889,8 @@ impl SharedCache {
             crate::local_resource_diagnostics::durable_tail_alarm(
                 snapshot_source.api_slug(),
                 &StoreAlarm {
-                    store_bytes_alarm: store.disk_bytes > 512 * 1024 * 1024,
+                    store_bytes_alarm: restart_restore::enabled()
+                        .then_some(store.disk_bytes > 512 * 1024 * 1024),
                     store,
                     owed_overflow_discovery_only,
                     platform: std::env::consts::OS,
