@@ -1230,7 +1230,7 @@ fn a_page_that_removes_a_key_and_adds_a_path_elsewhere_recounts_the_root() {
     keys_seen.insert(gone.clone());
     index.traversal.as_mut().unwrap().observed_index_keys = keys_seen;
     let touched = Touched::from_paths([Path::new(&keys[0])]);
-    let parsed = revisions(&index);
+    let parsed = [(keys[0].clone(), "source".to_string())];
     let mut runtime = Runtime::default();
     let first = evaluate_page(
         &mut runtime,
@@ -1618,7 +1618,7 @@ fn a_large_corpus_is_counted_across_small_pages() {
         );
         assert!(pages < 64);
     }
-    // Both inventories, each key once, plus the one parse's validation.
+    // Each key once in both inventories, plus the one parse's validation.
     assert_eq!(processed, 2 * KEYS + 1);
     assert!(pages as usize >= 2 * KEYS / ROOT_PASS_KEYS_PER_PAGE);
     let settled = evaluate_page(
@@ -1685,6 +1685,118 @@ fn root_evidence() -> BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocal
         })
         .collect();
     BTreeMap::from([(ROOT.to_string(), rows)])
+}
+
+/// R1: mid-pass, a key the merged pass already counted as observed-only moves
+/// into `files` while a post-observer settlement drops another entry, so both
+/// inventory sizes and the generation hold and no page reports a change. The
+/// union keeps the key: the cross-directory duplicate is counted either way,
+/// and the family never completes.
+#[test]
+fn a_masked_observed_to_indexed_migration_mid_pass_keeps_the_duplicate() {
+    const FILLER: usize = 2 * ROOT_PASS_KEYS_PER_PAGE;
+    let mut index = index();
+    // `dir-z` sorts after everything below, so the first page never reaches it.
+    let keys = add_family(&mut index, "dir-z", 1, 0);
+    let root = root_id(1);
+    // The same root in `dir-a`: observed, unindexed, first in the union.
+    let duplicate = root_key("dir-a", &root);
+    let traversal = index.traversal.as_mut().unwrap();
+    traversal.observed_index_keys.insert(duplicate.clone());
+    for n in 0..FILLER {
+        let key = root_key(&format!("dir-m-{n:06}"), &root_id(n % 1_000 + 10));
+        index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .observed_index_keys
+            .insert(key.clone());
+        index.files.insert(key, tests::manifest_index_entry(None));
+    }
+    let touched = Touched::from_paths([Path::new(&keys[0])]);
+    let parsed = [(keys[0].clone(), "source".to_string())];
+    let mut runtime = Runtime::default();
+    let first = evaluate_page(
+        &mut runtime,
+        &index,
+        &touched,
+        as_parsed(&parsed),
+        false,
+        "scope",
+        NOW,
+    )
+    .unwrap();
+    assert!(!first.cost.root_index_complete, "the pass spans pages");
+    // The migration and its balancing drop: both sizes hold, and the parsed
+    // key was already observed, so no invalidation input fires.
+    let dropped = root_key("dir-m-000000", &root_id(10));
+    assert!(dropped > duplicate, "the drop is ahead of the moved key");
+    index.files.remove(&dropped);
+    index.files.insert(duplicate.clone(), finalized_entry());
+    let mut pages = 1;
+    loop {
+        let parsed = [(duplicate.clone(), "source".to_string())];
+        let page = evaluate_page(
+            &mut runtime,
+            &index,
+            &touched,
+            as_parsed(&parsed[..usize::from(pages == 1)]),
+            false,
+            "scope",
+            NOW + pages * 60,
+        )
+        .unwrap();
+        // The moved key's own family joins as a follow-up: also not unique.
+        assert_eq!(page.families.complete, 0, "page {pages}");
+        assert!(
+            page.families.incomplete[&Incomplete::PathNotUnique] >= 1,
+            "page {pages}"
+        );
+        pages += 1;
+        if page.cost.root_index_complete {
+            assert!(
+                !page.cost.root_index_restarted,
+                "the masked move went unseen"
+            );
+            break;
+        }
+        assert!(pages < 64);
+    }
+}
+
+/// One full-budget call and one that must stop short agree: the merged pass
+/// charges both inventories, never exceeds a page, and resumes after its last
+/// key, so a key in both inventories is counted once.
+#[test]
+fn the_merged_pass_counts_a_shared_key_once_across_a_budget_stop() {
+    let mut index = index();
+    let keys = add_family(&mut index, "dir-a", 1, 2);
+    let observed_only = root_key("dir-b", &root_id(1));
+    let indexed_only = root_key("dir-c", &root_id(1));
+    let traversal = index.traversal.as_mut().unwrap();
+    traversal.observed_index_keys.insert(observed_only.clone());
+    index
+        .files
+        .insert(indexed_only.clone(), tests::manifest_index_entry(None));
+    let traversal = index.traversal.as_ref().unwrap();
+    let whole = RootCounts::build(&index, traversal);
+    assert_eq!(whole.paths_of(&root_id(1)), Some(5));
+    let mut stepped = RootCounts::default();
+    let mut advances = 0;
+    let mut pages = 0;
+    loop {
+        let (visited, _) = stepped.advance(&index, traversal, 3);
+        assert!(visited <= 3);
+        advances += visited;
+        pages += 1;
+        if stepped.paths_of(&root_id(1)).is_some() {
+            break;
+        }
+        assert!(pages < 16);
+    }
+    assert_eq!(stepped.paths_of(&root_id(1)), Some(5));
+    // Three keys in both inventories and one in each alone.
+    assert_eq!(advances, 2 * keys.len() + 2);
 }
 
 /// One production Claude page of one file, through the real step, the page

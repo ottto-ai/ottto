@@ -26,8 +26,9 @@
 //! Runtime state (rotation cursor, root path counts, attestations, sticky
 //! vetoes, `first_pending_at`) is process-local, bounded and charged in
 //! `runtime_heap_bytes`; it is never persisted and never used for a decision.
-//! Per-page work is counted against the caps below in `cost`, and runs outside
-//! the runtime mutex: no page visits the whole corpus.
+//! Per-page work is counted against the caps below in `cost`, and one page's
+//! evaluation is one update under the runtime mutex, so no veto or attestation
+//! of another caller is lost: no page visits the whole corpus.
 use super::*;
 use std::hash::Hasher;
 use std::ops::Bound;
@@ -292,10 +293,14 @@ impl FamilyCounts {
     }
 }
 
-/// Global count of member paths per root, over indexed and observed keys
-/// (confirmed-empty ones too), for the cross-directory uniqueness check.
+/// Global count of member paths per root, over the union of indexed and
+/// observed keys (confirmed-empty ones too), for the cross-directory uniqueness
+/// check.
 ///
-/// Counted by a pass over the keys, at most `ROOT_PASS_KEYS_PER_PAGE` a page.
+/// Counted by one ordered pass over the union, at most
+/// `ROOT_PASS_KEYS_PER_PAGE` advances a page, walking both inventories together
+/// so each key is counted once when the cursor passes it. A key that moves from
+/// observed-only to indexed stays in the union, on either side of the cursor.
 /// Until a pass ends `paths_of` answers unknown: a partial count is never
 /// published. A pass stays valid while `Population` holds and no page reports
 /// a change that keeps it equal, so an unchanged corpus costs no key visits. A
@@ -309,7 +314,7 @@ pub(super) struct RootCounts {
     overflowed: bool,
 }
 
-/// What a finished pass counted. The key set can only gain a path through
+/// What a finished pass counted. The union can only gain a path through
 /// `observed_index_keys` (its size moves unless a page also removes, which the
 /// page reports) or through a parse outside it (which `evaluate_page` checks).
 /// A loss only over-counts, which fails closed.
@@ -320,10 +325,9 @@ struct Population {
     observed: usize,
 }
 
-/// Where a counting pass resumes.
+/// Where a counting pass resumes: the last union key it counted.
 #[derive(Debug, Default)]
 struct RootPass {
-    in_observed: bool,
     after: Option<String>,
 }
 
@@ -342,9 +346,10 @@ impl RootCounts {
         self.population = None;
     }
 
-    /// Start over if the population moved, then count up to `budget` keys.
-    /// Returns the keys visited and whether the count restarted.
-    fn advance(
+    /// Start over if the population moved, then count up to `budget` range
+    /// advances of the union. Returns the advances made and whether the count
+    /// restarted.
+    pub(super) fn advance(
         &mut self,
         index: &ScanIndex,
         traversal: &ScanTraversalCheckpoint,
@@ -365,39 +370,38 @@ impl RootCounts {
         let Some(mut pass) = self.pass.take() else {
             return (0, restarted);
         };
+        let bounds = after(&pass.after);
+        let mut files = index
+            .files
+            .range::<str, _>(bounds)
+            .map(|(key, _)| key)
+            .peekable();
+        let mut observed = traversal
+            .observed_index_keys
+            .range::<str, _>(bounds)
+            .peekable();
         let mut roots = Vec::new();
+        let mut last = None;
         let mut visited = 0;
-        if !pass.in_observed {
-            let keys = index
-                .files
-                .range::<str, _>(after(&pass.after))
-                .map(|(key, _)| key);
-            match count_keys(keys, budget, &mut visited, &mut roots) {
-                Some(stopped) => pass.after = Some(stopped.clone()),
-                None => {
-                    pass = RootPass {
-                        in_observed: true,
-                        after: None,
-                    }
-                }
+        let finished = loop {
+            let key = match (files.peek().copied(), observed.peek().copied()) {
+                (None, None) => break true,
+                (Some(key), None) | (None, Some(key)) => key,
+                (Some(file), Some(seen)) => file.min(seen),
+            };
+            // A key in both inventories takes two advances.
+            if budget - visited < 2 {
+                break false;
             }
-        }
-        let mut finished = false;
-        if pass.in_observed && visited < budget {
-            let keys = traversal
-                .observed_index_keys
-                .range::<str, _>(after(&pass.after));
-            let mut unindexed = Vec::new();
-            let stopped = count_keys(keys, budget, &mut visited, &mut unindexed);
-            roots.extend(
-                unindexed
-                    .into_iter()
-                    .filter(|(key, _)| !index.files.contains_key(*key)),
-            );
-            match stopped {
-                Some(stopped) => pass.after = Some(stopped.clone()),
-                None => finished = true,
+            visited += usize::from(files.next_if_eq(&key).is_some());
+            visited += usize::from(observed.next_if_eq(&key).is_some());
+            last = Some(key);
+            if let Some(member) = claude_index_path_member_ref(Path::new(key.as_str())) {
+                roots.push(hash64(member.root.as_bytes()));
             }
+        };
+        if let Some(last) = last {
+            pass.after = Some(last.clone());
         }
         self.merge(roots);
         self.pass = (!finished && !self.overflowed).then_some(pass);
@@ -406,9 +410,9 @@ impl RootCounts {
 
     /// Bounded while it merges: past `MAX_ROOT_COUNTS` distinct roots the
     /// count empties and stays overflowed until the population moves.
-    fn merge(&mut self, roots: Vec<(&str, u64)>) {
+    fn merge(&mut self, roots: Vec<u64>) {
         let mut fresh = Vec::new();
-        for (_, root) in roots {
+        for root in roots {
             match self.counts.binary_search_by_key(&root, |(hash, _)| *hash) {
                 Ok(position) => {
                     let count = &mut self.counts[position].1;
@@ -440,7 +444,7 @@ impl RootCounts {
     }
 
     /// The root's path count, or `None` while it is unknown.
-    fn paths_of(&self, root: &str) -> Option<u32> {
+    pub(super) fn paths_of(&self, root: &str) -> Option<u32> {
         if self.pass.is_some() || self.overflowed || self.population.is_none() {
             return None;
         }
@@ -470,28 +474,6 @@ fn after(key: &Option<String>) -> (Bound<&str>, Bound<&str>) {
     match key.as_deref() {
         Some(key) => (Bound::Excluded(key), Bound::Unbounded),
         None => (Bound::Unbounded, Bound::Unbounded),
-    }
-}
-
-/// Collect each member key's root hash, up to `budget` keys in all. Returns the
-/// last key visited when the budget stopped it, `None` once `keys` ran out.
-fn count_keys<'k>(
-    mut keys: impl Iterator<Item = &'k String>,
-    budget: usize,
-    visited: &mut usize,
-    roots: &mut Vec<(&'k str, u64)>,
-) -> Option<&'k String> {
-    let mut last = None;
-    loop {
-        if *visited >= budget {
-            return last;
-        }
-        let key = keys.next()?;
-        *visited += 1;
-        last = Some(key);
-        if let Some(member) = claude_index_path_member_ref(Path::new(key.as_str())) {
-            roots.push((key.as_str(), hash64(member.root.as_bytes())));
-        }
     }
 }
 
@@ -1520,9 +1502,12 @@ pub(super) const RUNTIME_RETAINED_WORST_BYTES: usize = {
 /// typical lengths), outside `runtime_heap_bytes`. Counts only, so nothing is
 /// refused at the bound.
 ///
-/// `observe_page` takes the state out and works without this lock, so the
-/// lock's hold is one swap there. A concurrent page of another scope would
-/// lose this state, as a scope switch does: coverage only falls.
+/// `observe_page` holds this lock for its whole evaluation and each equality
+/// Skip for its own attestation, so every update is whole: a sticky veto,
+/// attestation or cap meter is never overwritten, and one state exists. The
+/// hold is bounded by the page budgets (16,384 member advances, 8,192 root
+/// advances, 4,096 rotation keys, 16,384 history gates) plus the queue passes,
+/// which are O(queue). No I/O runs under it and it nests no other lock.
 #[cfg(not(test))]
 static RUNTIME: Mutex<Runtime> = Mutex::new(Runtime::new());
 
@@ -1590,8 +1575,9 @@ pub(super) fn attest_equality_skip(
     });
 }
 
-/// Evaluate and emit one Claude page's shadow counts, outside the runtime
-/// mutex. Counts only. Called from the scan step, like `attest_equality_skip`.
+/// Evaluate one Claude page's shadow counts under the runtime mutex and emit
+/// them after it. Counts only. Called from the scan step, like
+/// `attest_equality_skip`.
 #[inline(never)]
 pub(super) fn observe_page(
     index: &ScanIndex,
@@ -1614,17 +1600,9 @@ pub(super) fn observe_page(
             )
         });
     let removed_keys = !census.removed_index_keys.is_empty();
-    let mut runtime = with_runtime(std::mem::take);
-    let counts = evaluate_page(
-        &mut runtime,
-        index,
-        touched,
-        parsed,
-        removed_keys,
-        scope,
-        now,
-    );
-    with_runtime(|slot| *slot = runtime);
+    let counts = with_runtime(|runtime| {
+        evaluate_page(runtime, index, touched, parsed, removed_keys, scope, now)
+    });
     if let Some(counts) = counts {
         crate::local_resource_diagnostics::claude_family_census_shadow(&counts);
     }
