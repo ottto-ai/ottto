@@ -1065,9 +1065,6 @@ struct MaRun {
     tail_key: String,
     /// The tail's finished items.
     snapshots: Vec<SnapshotItem>,
-    /// The shared cache's charge besides its retained entries (cursor state
-    /// and side ledger), before and after the tail's scan.
-    cursor_before: usize,
 }
 impl MaRun {
     fn receipt(&self) -> String {
@@ -1135,16 +1132,6 @@ struct MaOpts {
     workspace: Option<String>,
     /// Runs after `retain_reduction`, before `finish`.
     after_retain: Option<Box<dyn FnMut()>>,
-}
-
-/// The shared cache's charge besides its retained entries.
-fn cursor_charge(cache: &Arc<sampled_scan::SharedCache>) -> usize {
-    let retained = crate::heap_layout_bound::bound(
-        &*cache.retained().expect("retained cache lock"),
-        usize::MAX,
-    )
-    .expect("bounded retained cache");
-    optional_resident(cache) - retained
 }
 
 /// `m_a_tail` with `opts`.
@@ -1227,7 +1214,6 @@ fn m_a_tail_with(
             },
         );
     }
-    let cursor_before = cursor_charge(&cache);
     let (tail, counts) = observe(|| observed_scan(&tailed, source, index, &cache));
     let run = MaRun {
         modes: tail.modes,
@@ -1238,7 +1224,6 @@ fn m_a_tail_with(
         after: residents(&cache),
         tail_key,
         snapshots: tail.snapshots,
-        cursor_before,
     };
     sampled_scan::test_hooks::clear();
     eprintln!("CACHE_POLICY M-a {source:?} {}", run.receipt());
