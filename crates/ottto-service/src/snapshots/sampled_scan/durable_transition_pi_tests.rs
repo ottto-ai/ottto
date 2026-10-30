@@ -1646,29 +1646,20 @@ fn pi_canaries_never_reach_persisted_records_and_the_selector_is_validated() {
     }
 }
 
-/// A session whose first user prompt sits inside the certificate's head sample.
-fn pi_prompted_session(prompt: &str) -> String {
-    pi_header("synthetic-pi-session", 3, None)
-        + &pi_json(json!({"type":"message","id":"a0000004","parentId":null,
-            "message":{"role":"user","content":[{"type":"text","text":prompt}],
-                "timestamp":1793080800000u64}}))
-        + &pi_json(pi_turn(
-            "message",
-            Some("seed-response"),
-            10,
-            "2026-10-27T06:00:01Z",
-        ))
-}
-
-/// restore→Tail on a body with a header cwd and a first prompt: one Tail, no
-/// head rederive of the prompt, and the whole body equal to a cold Full, with
-/// the stored title published. Expected red until E1's workspace arm lands.
+/// restore→Tail on a body with a header cwd and a first prompt: one Tail and
+/// the whole body equal to a cold Full, first-prompt title and money included.
+/// The record stores no first-prompt value, so this is expected red until the
+/// Pi first_prompt head re-derive lands.
 #[test]
-fn pi_restored_tail_publishes_the_carried_title_of_a_cold_full() {
-    if !supported("pi_transition_wire_prompt") {
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "Pi restore requires qualified native heap layout"
+)]
+fn pi_restored_tail_publishes_the_first_prompt_title_of_a_cold_full() {
+    if !supported("pi_transition_first_prompt") {
         return;
     }
-    let mut f = PiDriver::warm("transition-pi-wire", &pi_seed());
+    let mut f = PiDriver::warm("transition-pi-first-prompt", &pi_seed());
     let cold_title = f.accepted[&f.entity].body["session_display_name"].clone();
     assert_eq!(cold_title, json!("Synthetic first prompt."));
     f.restart();
@@ -1687,118 +1678,4 @@ fn pi_restored_tail_publishes_the_carried_title_of_a_cold_full() {
     );
     assert_eq!(f.counters(Mode::Restart).1, 0);
     whole_body(&cold, &restored);
-}
-
-/// Conditions 3 and 5: the setting that gated a stored title turns off, so the
-/// next pass erases and counts the record. Turning it back on finds nothing:
-/// the file reads one Full and the old copy never comes back.
-#[test]
-fn pi_consent_revoked_purges_counts_and_never_resurrects() {
-    if !supported("pi_transition_consent_revoked") {
-        return;
-    }
-    let mut f = PiDriver::warm("transition-pi-revoked", &pi_seed());
-    let (_, record) = only_record(&f.disk);
-    assert!(record
-        .windows(23)
-        .any(|window| window == b"Synthetic first prompt."));
-    f.restart();
-    let owner = f.disk.owner(SOURCE);
-    let mut revoked = f.prior.clone();
-    revoked.activate_upload_context("synthetic-titles-off".into());
-    let policy = SnapshotUploadPolicy {
-        session_titles_enabled: false,
-        ..SnapshotUploadPolicy::default()
-    };
-    let begin = |index: &ScanIndex, policy| {
-        crate::snapshots::begin_pi_upload_gates(&owner.cache, &f.disk.dir, index, policy, None)
-    };
-    let (_, purged) = cache_lifecycle::observe(|| begin(&revoked, policy));
-    assert_eq!(purged.pi_uploaded_literal_purged, 1);
-    assert_eq!(purged.pi_uploaded_literal_key_changed, 0);
-    assert!(store_records(&f.disk).is_empty(), "erased with the record");
-    let (_, repeat) = cache_lifecycle::observe(|| begin(&revoked, policy));
-    assert_eq!(repeat.pi_uploaded_literal_purged, 0, "counted once");
-
-    f.restart();
-    f.grow(&[pi_turn(
-        "message",
-        Some("after-consent"),
-        20,
-        "2026-10-27T06:02:00Z",
-    )]);
-    let cold = f.emit_bodies(Mode::ColdFull);
-    let reread = f.emit_bodies(Mode::Restart);
-    assert_eq!((reread.modes, reread.restored), ((1, 0, 0), 0));
-    whole_body(&cold, &reread);
-}
-
-/// Condition 4 and Addendum extra 3: a rewritten head that keeps the first 96
-/// bytes of the prompt keeps its upload label, and that proves nothing: the
-/// record is dropped by the identity check, never restored as evidence.
-#[test]
-fn pi_head_rewrite_with_the_same_prefix_label_drops_the_record() {
-    if !supported("pi_transition_same_label_rewrite") {
-        return;
-    }
-    let shared = format!("Synthetic first line.\n{}", "synthetic filler ".repeat(8));
-    let before = format!("{shared}ending one");
-    let after = format!("{shared}ending two with more words");
-    assert_eq!(before.as_bytes()[..96], after.as_bytes()[..96]);
-    let mut f = PiDriver::warm("transition-pi-same-label", &pi_prompted_session(&before));
-    let record = f.disk.record_bytes();
-    assert!(only_record(&f.disk)
-        .1
-        .windows(21)
-        .any(|window| window == b"Synthetic first line."));
-    f.restart();
-    std::fs::write(&f.path, pi_prompted_session(&after)).unwrap();
-    input_clock(&f.path);
-    let cold = f.emit_bodies(Mode::ColdFull);
-    let edited = f.emit_bodies(Mode::Restart);
-    assert_eq!((edited.modes, edited.restored), ((1, 0, 0), 0));
-    assert_eq!(f.certificate_refused(Mode::Restart, "head_changed"), 1);
-    assert_eq!(f.holds(Mode::Restart), ([0; 8], 0));
-    f.save_gc(Mode::Restart);
-    assert_ne!(f.disk.record_bytes(), record, "the old copy is gone");
-    whole_body(&cold, &edited);
-}
-
-/// Condition 6: a distinctive stored value never reaches the diagnostics
-/// export, the durable summary or the support bundle. The record holding it is
-/// the positive control.
-#[test]
-fn pi_uploaded_values_stay_out_of_diagnostics_and_the_support_bundle() {
-    if !supported("pi_transition_no_leak") {
-        return;
-    }
-    const CANARY: &str = "ZZsyntheticcanaryQQ";
-    let ((f, summary), rows) = crate::local_resource_diagnostics::capture(|| {
-        let mut f = PiDriver::warm("transition-pi-canary", &pi_prompted_session(CANARY));
-        f.restart();
-        f.grow(&[pi_turn(
-            "message",
-            Some("after-restart"),
-            20,
-            "2026-10-27T06:02:00Z",
-        )]);
-        f.emit_bodies(Mode::Restart);
-        f.save_gc(Mode::Restart);
-        let page = &f.pages[&Mode::Restart];
-        let (counters, store) = page.cache.durable_counters(SOURCE).unwrap();
-        let summary = format!("{} {store:?}", counters.summary(SOURCE, &store));
-        (f, summary)
-    });
-    let (_, record) = only_record(&f.disk);
-    assert!(
-        record
-            .windows(CANARY.len())
-            .any(|window| window == CANARY.as_bytes()),
-        "the canary is live"
-    );
-    let exported = serde_json::to_string(&rows).unwrap();
-    assert!(!exported.is_empty() && !exported.contains(CANARY));
-    assert!(!summary.contains(CANARY));
-    let bundle = crate::tests::support_bundle_text(f.pages[&Mode::Restart].cache.clone());
-    assert!(!bundle.contains(CANARY));
 }

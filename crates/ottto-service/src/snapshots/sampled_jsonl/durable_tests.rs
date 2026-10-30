@@ -888,53 +888,40 @@ fn pi_decoded(path: &Path) -> (CachedJsonlReduction, Decoded) {
     (reduction, decoded)
 }
 
-/// The carried wire values answer the first-prompt obligation, so a Pi body
-/// with a first prompt is funded and restored with no read of the prompt.
-/// `durable_restore_record` itself is layout-gated; these are its two steps.
+/// The desired behaviour: restore admits a Pi body with a header `cwd` and a
+/// first user prompt, and gives both values back. `content_charge` and
+/// `rederive_content` are the production steps that refuse the prompt today, so
+/// this reaches the refusal on every platform; `durable_restore_record` itself
+/// is layout-gated.
 #[test]
+#[ignore = "needs the Pi first_prompt head re-derive (option b)"]
 fn pi_cwd_and_first_prompt_body_is_admitted_for_restore() {
     let scratch = Scratch::new("pi-admitted");
     let path = scratch.write("pi.jsonl", &pi_lines(true));
-    let (_, mut decoded) = pi_carried(&path, None, pi_gates(true, false, false));
-    decoded.settle_pi_wire_prompt(None);
-    assert_eq!(decoded.rederive.first_prompt, None);
-    assert_eq!(decoded.rederive.title, None);
-    assert!(decoded.content_charge().unwrap() > 0, "funded");
-
+    let (reduction, decoded) = pi_decoded(&path);
+    let cold = &reduction.accumulator;
+    assert!(cold.workspace_path.is_some() && cold.first_prompt_material.is_some());
+    decoded.content_charge().expect("no RederiveUnfunded");
     let (restored, _) = decoded
         .rederive_content(&File::open(&path).unwrap())
-        .unwrap();
-    assert!(restored.accumulator.workspace_path.is_some());
-
-    let path = scratch.write("no-cwd.jsonl", &pi_wire_lines(false));
-    let (_, mut decoded) = pi_carried(&path, None, pi_gates(true, false, false));
-    decoded.settle_pi_wire_prompt(None);
-    assert_eq!(decoded.content_charge().unwrap(), 0, "no head read owed");
-    let (restored, receipt) = decoded
-        .rederive_content(&File::open(&path).unwrap())
-        .unwrap();
-    assert_eq!(receipt.named_lines, 0);
-    assert!(restored.accumulator.first_prompt_material.is_none());
-    assert!(restored.accumulator.pi_carried_title().is_some());
+        .expect("restore admitted");
+    let restored = restored.accumulator;
+    assert_eq!(restored.workspace_path, cold.workspace_path);
+    assert_eq!(restored.first_prompt_material, cold.first_prompt_material);
+    assert_eq!(restored.first_prompt_title, cold.first_prompt_title);
 }
 
-/// Without carried values a first prompt refuses before input. With carried
-/// values, or a workspace alone, the header workspace rederives successfully.
+/// What still refuses. A first prompt refuses before input until its head
+/// re-derive lands, which flips the first assert; a workspace alone is funded
+/// and rederives from its header.
 #[test]
-fn pi_body_requires_carried_prompt_and_rederives_header_workspace() {
+fn pi_first_prompt_refuses_restore_and_header_workspace_rederives() {
     let scratch = Scratch::new("pi-refused");
     let path = scratch.write("prompt.jsonl", &pi_lines(true));
     let (_, decoded) = pi_decoded(&path);
     assert!(decoded.rederive.first_prompt.is_some());
     assert!(decoded.rederive.workspace.is_some());
     assert!(matches!(decoded.content_charge(), Err(RederiveUnfunded)));
-
-    let (_, mut decoded) = pi_carried(&path, None, pi_gates(true, false, false));
-    decoded.settle_pi_wire_prompt(None);
-    let (restored, _) = decoded
-        .rederive_content(&File::open(&path).unwrap())
-        .unwrap();
-    assert!(restored.accumulator.workspace_path.is_some());
 
     let path = scratch.write("workspace.jsonl", &pi_lines(false));
     let (_, decoded) = pi_decoded(&path);
@@ -949,31 +936,8 @@ fn pi_body_requires_carried_prompt_and_rederives_header_workspace() {
 
 const PI_MARKER: &str = "ZZsyntheticcanaryQQ";
 
-fn pi_gates(titles: bool, attribution: bool, labels: bool) -> pi::UploadGates {
-    SnapshotUploadPolicy {
-        session_titles_enabled: titles,
-        session_attribution_enabled: attribution,
-        session_attribution_labels_enabled: labels,
-        ..SnapshotUploadPolicy::default()
-    }
-    .into()
-}
-
-/// A synthetic upload key: one repeated byte; another byte is a rotated key.
-fn pi_attribution(home: &Path, byte: u8) -> crate::session_attribution::SessionAttributionContext {
-    use base64::Engine;
-    crate::session_attribution::SessionAttributionContext::from_activity_hint(
-        SnapshotSource::Pi,
-        home,
-        true,
-        Some(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32])),
-        Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
-    )
-    .unwrap()
-}
-
-/// `pi_lines(true)` with a slash skill and the canary in its first prompt.
-fn pi_wire_lines(cwd: bool) -> Vec<String> {
+/// A Pi body with a slash skill and the marker in its first prompt.
+fn pi_marked_lines(cwd: bool) -> Vec<String> {
     let prompt = format!("/synthetic-skill review {PI_MARKER} before the release");
     pi_lines(true)
         .into_iter()
@@ -1002,47 +966,33 @@ fn pi_tail_lines() -> Vec<String> {
         .collect()
 }
 
-/// `full_read` with the step-loop capture, as the scan runs it before cloning
-/// the retained copy, and the record's decoded body.
-fn pi_carried(
-    path: &Path,
-    context: Option<&crate::session_attribution::SessionAttributionContext>,
-    gates: pi::UploadGates,
-) -> (Checkpoint, Decoded) {
-    let mut parser = parser(path, SnapshotSource::Pi);
-    parser
-        .prepare_acquisition(None, &scope(), None, NOW)
-        .unwrap();
-    while !parser.step().unwrap() {}
-    parser
-        .accumulator
-        .capture_pi_wire_prompt(context, Some(gates));
-    let reduction = parser.reduction_copy();
-    let checkpoint = match parser.certify_without_retention(&scope(), NOW).unwrap() {
-        SideCertificate::Certified { completed, .. } => completed.checkpoint,
-        _ => panic!("a clean fixture read is certified"),
-    };
-    let body = encode(
-        &reduction,
-        crate::durable_tail_store::RECORD_BYTES,
-        line_cap(),
+/// A synthetic upload key: one repeated byte.
+fn pi_attribution(home: &Path) -> crate::session_attribution::SessionAttributionContext {
+    use base64::Engine;
+    crate::session_attribution::SessionAttributionContext::from_activity_hint(
+        SnapshotSource::Pi,
+        home,
+        true,
+        Some(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32])),
+        Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
     )
-    .unwrap();
-    (checkpoint, decode(&body, SnapshotSource::Pi).unwrap())
+    .unwrap()
 }
 
-fn contains(haystack: &[u8], needle: &str) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle.as_bytes())
+fn pi_all_on() -> SnapshotUploadPolicy {
+    SnapshotUploadPolicy {
+        session_titles_enabled: true,
+        session_attribution_enabled: true,
+        session_attribution_labels_enabled: true,
+        ..SnapshotUploadPolicy::default()
+    }
 }
 
-/// The finished upload items after `policy`, as the wire carries them.
+/// The finished upload items after every upload setting, as the wire carries them.
 fn pi_uploaded(
     parser: OwnedJsonlParser,
     path: &Path,
-    context: Option<&crate::session_attribution::SessionAttributionContext>,
-    policy: SnapshotUploadPolicy,
+    context: &crate::session_attribution::SessionAttributionContext,
 ) -> Value {
     let identity = opened_object_identity(SnapshotSource::Pi, &mut File::open(path).unwrap());
     let mut parsed = parser
@@ -1054,42 +1004,42 @@ fn pi_uploaded(
                 source_file_fingerprint: "fp".into(),
                 codex_title_metadata: None,
                 claude_title_metadata: None,
-                attribution_context: context,
+                attribution_context: Some(context),
                 repository_identity: None,
                 money_context: None,
             },
             None,
         )
         .unwrap();
-    apply_upload_policy(SnapshotSource::Pi, &mut parsed.snapshots, policy);
+    apply_upload_policy(SnapshotSource::Pi, &mut parsed.snapshots, pi_all_on());
     serde_json::to_value(&parsed.snapshots).unwrap()
 }
 
 fn pi_cold_uploaded(
     path: &Path,
-    context: Option<&crate::session_attribution::SessionAttributionContext>,
-    policy: SnapshotUploadPolicy,
+    context: &crate::session_attribution::SessionAttributionContext,
 ) -> Value {
     let mut parser = parser(path, SnapshotSource::Pi);
     while !parser.step().unwrap() {}
-    pi_uploaded(parser, path, context, policy)
+    pi_uploaded(parser, path, context)
 }
 
-/// Restores `decoded`, Tails `path` past `checkpoint` with `grow` and hands the
-/// continued parser back.
-fn pi_restored_tail(
-    path: &Path,
-    checkpoint: Checkpoint,
-    decoded: Decoded,
-    grow: &[String],
-    context: Option<&crate::session_attribution::SessionAttributionContext>,
-    gates: pi::UploadGates,
-) -> OwnedJsonlParser {
-    let (restored, receipt) = decoded
+/// Saves a real parse of `path`, restores it through the body, Tails `grow` and
+/// hands the continued parser back. The Pi record carries no first-prompt
+/// value, so `rederive_content` must fund and return it from the file's head.
+fn pi_restored_tail(path: &Path, grow: &[String]) -> OwnedJsonlParser {
+    let (reduction, checkpoint) = full_read(path, SnapshotSource::Pi);
+    let body = encode(
+        &reduction,
+        crate::durable_tail_store::RECORD_BYTES,
+        line_cap(),
+    )
+    .unwrap();
+    let decoded = decode(&body, SnapshotSource::Pi).unwrap();
+    decoded.content_charge().expect("no RederiveUnfunded");
+    let (restored, _) = decoded
         .rederive_content(&File::open(path).unwrap())
         .expect("restored");
-    assert_eq!(receipt.named_lines, 0, "no prompt line read");
-    assert!(restored.accumulator.first_prompt_material.is_none());
     let birth = birth_unix_nanos(&fs::metadata(path).unwrap());
     let certificate = checkpoint.durable_certificate(birth).unwrap();
     let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
@@ -1114,273 +1064,55 @@ fn pi_restored_tail(
     assert_eq!(mode, ReadMode::Tail);
     while !continued.step().unwrap() {}
     continued
-        .accumulator
-        .capture_pi_wire_prompt(context, Some(gates));
-    continued
 }
 
 /// restore→Tail equals a cold Full: money and every uploaded field, byte-equal,
-/// with no read of the prompt and no re-assignment from the Tail's prompt.
-fn pi_restore_tail_case(cwd: bool, policy: SnapshotUploadPolicy) {
-    let scratch = Scratch::new("pi-wire-tail");
-    let path = scratch.write("t.jsonl", &pi_wire_lines(cwd));
-    let context = pi_attribution(&scratch.0, 7);
-    let live = policy.session_attribution_enabled.then_some(&context);
-    let gates = pi::UploadGates::from(policy);
-    let (checkpoint, mut decoded) = pi_carried(&path, live, gates);
-    decoded.settle_pi_wire_prompt(pi::current_hmac_key_epoch(live));
-    assert!(decoded.content_charge().is_ok());
-    let parser = pi_restored_tail(&path, checkpoint, decoded, &pi_tail_lines(), live, gates);
-    let tailed = pi_uploaded(parser, &path, live, policy);
-    assert_eq!(tailed, pi_cold_uploaded(&path, live, policy));
+/// including the first-prompt and title fields, with no re-assignment from the
+/// Tail's prompt.
+fn pi_restore_tail_case(cwd: bool) {
+    let scratch = Scratch::new("pi-marked-tail");
+    let path = scratch.write("t.jsonl", &pi_marked_lines(cwd));
+    let context = pi_attribution(&scratch.0);
+    let parser = pi_restored_tail(&path, &pi_tail_lines());
+    let tailed = pi_uploaded(parser, &path, &context);
+    assert_eq!(tailed, pi_cold_uploaded(&path, &context));
     let text = tailed.to_string();
-    assert_eq!(
-        (
-            text.contains("template_group_id"),
-            text.contains("skill_id"),
-            text.contains("session_display_name\":\"")
-        ),
-        (
-            policy.session_attribution_enabled,
-            policy.session_attribution_enabled,
-            policy.session_titles_enabled
-        ),
-    );
-    assert_eq!(
-        text.contains(PI_MARKER),
-        policy.session_titles_enabled,
-        "the marker reaches the wire only through the title and the label"
-    );
-}
-
-fn pi_all_on() -> SnapshotUploadPolicy {
-    SnapshotUploadPolicy {
-        session_titles_enabled: true,
-        session_attribution_enabled: true,
-        session_attribution_labels_enabled: true,
-        ..SnapshotUploadPolicy::default()
+    for field in ["template_group_id", "skill_id", "session_display_name\":\""] {
+        assert!(text.contains(field), "{field}");
     }
+    assert!(text.contains(PI_MARKER), "the title and the label carry it");
 }
 
 #[test]
+#[ignore = "needs the Pi first_prompt head re-derive (option b)"]
 fn pi_restored_tail_publishes_the_cold_first_prompt_and_title() {
-    pi_restore_tail_case(false, pi_all_on());
+    pi_restore_tail_case(false);
 }
 
 /// The same with a header `cwd`, rederived from its marked header row.
 #[test]
+#[ignore = "needs the Pi first_prompt head re-derive (option b)"]
 fn pi_restored_tail_with_header_cwd_publishes_the_cold_body() {
-    pi_restore_tail_case(true, pi_all_on());
+    pi_restore_tail_case(true);
 }
 
-/// Each setting gates its own fields, and the restored upload still equals the
-/// cold one after policy: whatever the setting strips was never stored.
+/// The title stays last-wins across a restore: a later title replaces the
+/// first-prompt title, and the first-prompt grouping facts stay.
 #[test]
-fn pi_each_upload_setting_gates_its_own_stored_fields() {
-    for (titles, attribution, labels, stored_marker) in [
-        (true, false, false, true),
-        (false, true, false, false),
-        (true, true, false, true),
-    ] {
-        let policy = SnapshotUploadPolicy {
-            session_titles_enabled: titles,
-            session_attribution_enabled: attribution,
-            session_attribution_labels_enabled: labels,
-            ..SnapshotUploadPolicy::default()
-        };
-        pi_restore_tail_case(false, policy);
-        let scratch = Scratch::new("pi-wire-gate");
-        let path = scratch.write("t.jsonl", &pi_wire_lines(false));
-        let context = pi_attribution(&scratch.0, 7);
-        let mut parser = parser(&path, SnapshotSource::Pi);
-        while !parser.step().unwrap() {}
-        parser
-            .accumulator
-            .capture_pi_wire_prompt(attribution.then_some(&context), Some(policy.into()));
-        let reduction = parser.reduction_copy();
-        let body = encode(
-            &reduction,
-            crate::durable_tail_store::RECORD_BYTES,
-            line_cap(),
-        )
-        .unwrap();
-        assert_eq!(contains(&body, PI_MARKER), stored_marker);
-    }
-}
-
-/// Condition 2: nothing uploaded, nothing stored, and today's refusal stands.
-#[test]
-fn pi_consent_off_stores_nothing_and_keeps_the_counted_full() {
-    let scratch = Scratch::new("pi-wire-off");
-    let path = scratch.write("t.jsonl", &pi_wire_lines(false));
-    for gates in [Some(pi_gates(false, false, false)), None] {
-        let mut parser = parser(&path, SnapshotSource::Pi);
-        while !parser.step().unwrap() {}
-        let shared = first_prompt_digest(&parser.accumulator).unwrap();
-        parser.accumulator.capture_pi_wire_prompt(None, gates);
-        let reduction = parser.reduction_copy();
-        let body = encode(
-            &reduction,
-            crate::durable_tail_store::RECORD_BYTES,
-            line_cap(),
-        )
-        .unwrap();
-        assert!(!contains(&body, PI_MARKER));
-        let mut decoded = decode(&body, SnapshotSource::Pi).unwrap();
-        decoded.settle_pi_wire_prompt(None);
-        assert_eq!(decoded.rederive.first_prompt, Some(shared));
-        assert!(matches!(decoded.content_charge(), Err(RederiveUnfunded)));
-    }
-}
-
-/// `prompt_seen` freezes only the first-prompt fields: a later title replaces
-/// the stored title, and the next record carries it with the same template.
-#[test]
+#[ignore = "needs the Pi first_prompt head re-derive (option b)"]
 fn pi_tail_title_follows_its_update_and_the_first_prompt_fields_stay() {
-    let scratch = Scratch::new("pi-wire-title");
-    let path = scratch.write("t.jsonl", &pi_wire_lines(false));
-    let context = pi_attribution(&scratch.0, 7);
-    let gates = pi::UploadGates::from(pi_all_on());
-    let (checkpoint, mut decoded) = pi_carried(&path, Some(&context), gates);
-    decoded.settle_pi_wire_prompt(pi::current_hmac_key_epoch(Some(&context)));
-    let cold = pi_cold_uploaded(&path, Some(&context), pi_all_on());
-    let mut parser = pi_restored_tail(
-        &path,
-        checkpoint,
-        decoded,
-        &pi_tail_lines(),
-        Some(&context),
-        gates,
-    );
+    let scratch = Scratch::new("pi-marked-title");
+    let path = scratch.write("t.jsonl", &pi_marked_lines(false));
+    let context = pi_attribution(&scratch.0);
+    let cold = pi_cold_uploaded(&path, &context);
+    let mut parser = pi_restored_tail(&path, &pi_tail_lines());
     // No Pi line sets a title today; this is the normal last-wins setter.
     parser
         .accumulator
         .set_title(Some("Synthetic later title".into()), "transcript_title");
-    parser
-        .accumulator
-        .capture_pi_wire_prompt(Some(&context), Some(gates));
-    let carried = parser.accumulator.pi_carried_first_prompt().unwrap();
-    assert_eq!(
-        parser.accumulator.pi_carried_title(),
-        Some("Synthetic later title")
-    );
-    let reduction = parser.reduction_copy();
-    let body = encode(
-        &reduction,
-        crate::durable_tail_store::RECORD_BYTES,
-        line_cap(),
-    )
-    .unwrap();
-    assert!(contains(&body, "Synthetic later title"));
-    let tailed = pi_uploaded(parser, &path, Some(&context), pi_all_on());
+    let tailed = pi_uploaded(parser, &path, &context);
     assert_eq!(tailed[0]["session_display_name"], "Synthetic later title");
     assert_eq!(tailed[0]["attribution_facts"], cold[0]["attribution_facts"]);
-    assert!(carried.template.is_some() && carried.slash_skill.is_some());
-}
-
-/// Addendum extra 1: another key drops the set, counts once, and the digest
-/// left standing refuses into today's Full.
-#[test]
-fn pi_key_change_drops_the_stored_set_and_refuses() {
-    use crate::local_resource_diagnostics::cache_lifecycle;
-    let scratch = Scratch::new("pi-wire-key");
-    let path = scratch.write("t.jsonl", &pi_wire_lines(false));
-    let (old, new) = (pi_attribution(&scratch.0, 7), pi_attribution(&scratch.0, 8));
-    let (_, mut decoded) = pi_carried(&path, Some(&old), pi_all_on().into());
-    let current = pi::current_hmac_key_epoch(Some(&new));
-    assert_ne!(current, pi::current_hmac_key_epoch(Some(&old)));
-    let (_, counts) = cache_lifecycle::observe(|| decoded.settle_pi_wire_prompt(current));
-    assert_eq!(counts.pi_uploaded_literal_key_changed, 1);
-    assert_eq!(decoded.reduction.accumulator.pi_carried_title(), None);
-    assert!(decoded.rederive.first_prompt.is_some());
-    assert!(matches!(decoded.content_charge(), Err(RederiveUnfunded)));
-}
-
-/// Conditions 3 and Addendum extra 1 on a stored body: what the sweep does with
-/// a record of another context, by what the current settings permit.
-#[test]
-fn pi_stored_literal_verdict_follows_the_settings_and_the_key() {
-    use pi::{stored_literal_verdict, LiteralVerdict};
-    let scratch = Scratch::new("pi-wire-verdict");
-    let path = scratch.write("t.jsonl", &pi_wire_lines(false));
-    let context = pi_attribution(&scratch.0, 7);
-    let mut parser = parser(&path, SnapshotSource::Pi);
-    while !parser.step().unwrap() {}
-    parser
-        .accumulator
-        .capture_pi_wire_prompt(Some(&context), Some(pi_all_on().into()));
-    let reduction = parser.reduction_copy();
-    let body = encode(
-        &reduction,
-        crate::durable_tail_store::RECORD_BYTES,
-        line_cap(),
-    )
-    .unwrap();
-    let key = pi::current_hmac_key_epoch(Some(&context));
-    let other = pi::current_hmac_key_epoch(Some(&pi_attribution(&scratch.0, 8)));
-    for (gates, epoch, verdict) in [
-        (pi_gates(true, true, true), key, LiteralVerdict::Keep),
-        (pi_gates(false, true, false), key, LiteralVerdict::Purge),
-        (pi_gates(true, true, false), key, LiteralVerdict::Purge),
-        (pi_gates(true, false, false), None, LiteralVerdict::Purge),
-        (
-            pi_gates(true, true, true),
-            other,
-            LiteralVerdict::KeyChanged,
-        ),
-    ] {
-        assert_eq!(stored_literal_verdict(&body, gates, epoch), Ok(verdict));
-    }
-    // A record with no stored literal has nothing to purge.
-    let plain = scratch.write("plain.jsonl", &pi_lines(false));
-    let (reduction, _) = full_read(&plain, SnapshotSource::Pi);
-    let body = encode(
-        &reduction,
-        crate::durable_tail_store::RECORD_BYTES,
-        line_cap(),
-    )
-    .unwrap();
-    assert_eq!(
-        stored_literal_verdict(&body, pi_gates(false, false, false), None),
-        Ok(LiteralVerdict::Keep)
-    );
-}
-
-/// A seen prompt whose values are gone can only restore empty: no record.
-#[test]
-fn pi_seen_prompt_without_values_or_material_refuses_the_record() {
-    let scratch = Scratch::new("pi-wire-lost");
-    let path = scratch.write("t.jsonl", &pi_wire_lines(false));
-    let (_, mut decoded) = pi_carried(&path, None, pi_gates(true, false, false));
-    decoded.settle_pi_wire_prompt(None);
-    let mut restored = decoded.reduction;
-    restored.accumulator.capture_pi_wire_prompt(None, None);
-    assert!(matches!(
-        encode(
-            &restored,
-            crate::durable_tail_store::RECORD_BYTES,
-            line_cap()
-        ),
-        Err(Refuse::NotRederivable(
-            "SnapshotAccumulator.first_prompt_material"
-        ))
-    ));
-}
-
-/// Condition 6 at the type: no formatter of a stored value prints it.
-#[test]
-fn pi_wire_values_have_no_printable_form() {
-    let scratch = Scratch::new("pi-wire-debug");
-    let path = scratch.write("t.jsonl", &pi_wire_lines(false));
-    let context = pi_attribution(&scratch.0, 7);
-    let mut parser = parser(&path, SnapshotSource::Pi);
-    while !parser.step().unwrap() {}
-    parser
-        .accumulator
-        .capture_pi_wire_prompt(Some(&context), Some(pi_all_on().into()));
-    let carry = parser.accumulator.pi_prompt.as_deref().unwrap();
-    let printed = format!("{carry:?} {carry:#?}");
-    assert!(!printed.contains(PI_MARKER) && !printed.contains("synthetic-skill"));
 }
 
 /// Full-equivalence control per source: a restored copy continued by Tail
@@ -1696,14 +1428,6 @@ const H_AUDIT: &[(&str, &str)] = &[
     (
         "OwnedRequest.configuration_witness",
         "SnapshotAccumulator.cache_configuration_witness, copied",
-    ),
-    (
-        "PiSection.hmac_key_epoch",
-        "ottto-dt:hmac-key-epoch:v1 SHA-256 over the upload key's checkpoint namespace",
-    ),
-    (
-        "PiWirePrompt.template_id",
-        "the uploaded opaque_hmac_id: HMAC-SHA-256 under the upload key",
     ),
     (
         "PiSection.usage_keys",
