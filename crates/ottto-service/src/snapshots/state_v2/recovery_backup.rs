@@ -1,6 +1,5 @@
-//! A sealed import recovery bundle. This is independent custody, not an
-//! in-memory proof or a second restart-record implementation. Source erasure
-//! and the first subsequent semantic write remove it before PL can be retired.
+//! Verified rolling recovery custody. Publish a new descriptor before reclaiming
+//! any older bundle; explicit erasure removes every generation immediately.
 use super::*;
 use anyhow::{ensure, Context};
 use sha2::{Digest, Sha256};
@@ -13,6 +12,7 @@ const DESCRIPTOR_LIMIT: u64 = 8 * 1024 * 1024;
 #[serde(deny_unknown_fields)]
 enum Role {
     Database,
+    Wal,
     Fence,
     Receipt,
     Baseline,
@@ -116,7 +116,7 @@ fn member(dir: &Path, n: usize) -> PathBuf {
 }
 fn check(descriptor: &Descriptor, dir: &Path) -> Result<()> {
     ensure!(
-        descriptor.version == 1 && descriptor.artifacts.len() <= 65_536,
+        matches!(descriptor.version, 1 | 2) && descriptor.artifacts.len() <= 65_536,
         "state_v2_backup_version"
     );
     for role in [Role::Database, Role::Fence, Role::Receipt] {
@@ -130,6 +130,15 @@ fn check(descriptor: &Descriptor, dir: &Path) -> Result<()> {
             "state_v2_backup_members"
         );
     }
+    ensure!(
+        descriptor
+            .artifacts
+            .iter()
+            .filter(|a| a.role == Role::Wal)
+            .count()
+            <= 1,
+        "state_v2_backup_members"
+    );
     let checkpoints = descriptor.set.checkpoints()?;
     let mut names = std::collections::BTreeSet::new();
     for artifact in &descriptor.artifacts {
@@ -174,10 +183,29 @@ fn check(descriptor: &Descriptor, dir: &Path) -> Result<()> {
 /// held. Descriptor publication is the final fsync; no fence replacement may
 /// start until the independently read-back bundle passes verification.
 pub(super) fn persist_import(path: &Path, set: ack::RecoverySet) -> Result<()> {
-    let dir = root(path);
+    persist(path, set, &fence::sibling(path, ".v2.sqlite.import"))
+}
+fn persist(path: &Path, set: ack::RecoverySet, database: &Path) -> Result<()> {
+    let parent = root(path);
+    if !fence::exists(&parent)? {
+        fs::DirBuilder::new().mode(0o700).create(&parent)?;
+    }
+    check_dir(&parent)?;
+    let name = format!(
+        "generation-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    );
+    let dir = parent.join(&name);
     fs::DirBuilder::new().mode(0o700).create(&dir)?;
     let mut descriptor = Descriptor {
-        version: 1,
+        version: if database == fence::sibling(path, ".v2.sqlite") {
+            2
+        } else {
+            1
+        },
         set,
         artifacts: Vec::new(),
     };
@@ -199,11 +227,15 @@ pub(super) fn persist_import(path: &Path, set: ack::RecoverySet) -> Result<()> {
         });
         Ok(())
     };
-    copy(
-        Role::Database,
-        fence::sibling(path, ".v2.sqlite.import"),
-        None,
-    )?;
+    copy(Role::Database, database.to_owned(), None)?;
+    // The source owner excludes writes through both copies. Retain the exact
+    // WAL rather than forcing a TRUNCATE on every ordinary save/recovery.
+    if database == fence::sibling(path, ".v2.sqlite") {
+        let wal = fence::sibling(path, ".v2.sqlite-wal");
+        if fence::exists(&wal)? {
+            copy(Role::Wal, wal, None)?;
+        }
+    }
     copy(Role::Receipt, fence::sibling(path, ".v2-ack-receipt"), None)?;
     let baseline = fence::sibling(path, ".v1-readonly");
     if fence::exists(&baseline)? {
@@ -235,17 +267,22 @@ pub(super) fn persist_import(path: &Path, set: ack::RecoverySet) -> Result<()> {
             Some(checkpoint.trailer_digest),
         )?;
     }
-    let n = descriptor.artifacts.len();
-    let bytes = serde_json::to_vec(&fence::Fence::new(descriptor.set.identity()))?;
-    let fence_path = member(&dir, n);
-    ottto_core::write_owner_only_file_atomic(&fence_path, &bytes)?;
-    let (bytes, digest) = commitment(&fence_path, None)?;
-    descriptor.artifacts.push(Artifact {
-        role: Role::Fence,
-        bytes,
-        digest,
-        trailer: None,
-    });
+    if database == fence::sibling(path, ".v2.sqlite") {
+        // Rolling backup retains the independent witness's exact bytes.
+        copy(Role::Fence, path.to_owned(), None)?;
+    } else {
+        let n = descriptor.artifacts.len();
+        let bytes = serde_json::to_vec(&fence::Fence::new(descriptor.set.identity()))?;
+        let fence_path = member(&dir, n);
+        ottto_core::write_owner_only_file_atomic(&fence_path, &bytes)?;
+        let (bytes, digest) = commitment(&fence_path, None)?;
+        descriptor.artifacts.push(Artifact {
+            role: Role::Fence,
+            bytes,
+            digest,
+            trailer: None,
+        });
+    }
     let mut encoded = units_spool::Builder::new(DESCRIPTOR_LIMIT)?;
     serde_json::to_writer(&mut encoded, &descriptor)?;
     let encoded = encoded.finish()?;
@@ -255,15 +292,43 @@ pub(super) fn persist_import(path: &Path, set: ack::RecoverySet) -> Result<()> {
     ottto_core::write_owner_only_file_atomic(&descriptor_path, &bytes)?;
     super::super::sync_checkpoint_parent(&descriptor_path)?;
     super::super::sync_checkpoint_parent(&dir)?;
-    let readback = read(path)?;
+    let readback = read_dir(&dir)?;
     ensure!(readback.set == descriptor.set, "state_v2_backup_descriptor");
     check(&readback, &dir)?;
+    // The old CURRENT and all exact .rec/receipt/baseline copies stay valid
+    // until the replacement's independent read-back has completed.
+    let pointer = parent.join("current.json");
+    ottto_core::write_owner_only_file_atomic(&pointer, &serde_json::to_vec(&name)?)?;
+    super::super::sync_checkpoint_parent(&pointer)?;
+    ensure!(
+        read(path)?.set == descriptor.set,
+        "state_v2_backup_descriptor"
+    );
     telemetry::event("recovery_backup_verified", &1);
+    // Reclaim only after the newer verified bundle is durable. Partial GC is
+    // harmless and retried on the next roll; it cannot invalidate CURRENT.
+    for entry in fs::read_dir(&parent)? {
+        let entry = entry?;
+        if entry.file_name() == name.as_str() || entry.file_name() == "current.json" {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        ensure!(
+            !metadata.file_type().is_symlink(),
+            "state_v2_backup_private"
+        );
+        if metadata.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    super::super::sync_checkpoint_parent(&pointer)?;
+    telemetry::event("recovery_backup_superseded", &1);
     Ok(())
 }
-fn read(path: &Path) -> Result<Descriptor> {
-    let dir = root(path);
-    let m = fs::symlink_metadata(&dir)?;
+fn check_dir(dir: &Path) -> Result<()> {
+    let m = fs::symlink_metadata(dir)?;
     ensure!(
         m.is_dir()
             && !m.file_type().is_symlink()
@@ -271,15 +336,69 @@ fn read(path: &Path) -> Result<Descriptor> {
             && m.mode() & 0o077 == 0,
         "state_v2_backup_private"
     );
+    Ok(())
+}
+fn active_dir(path: &Path) -> Result<PathBuf> {
+    let parent = root(path);
+    check_dir(&parent)?;
+    let pointer = parent.join("current.json");
+    if !fence::exists(&pointer)? {
+        return Ok(parent);
+    } // sealed-import v1 layout
+    let file = open(&pointer)?;
+    ensure!(file.metadata()?.len() <= 512, "state_v2_backup_name");
+    let name: String = serde_json::from_reader(file.take(513))?;
+    safe_name(&name)?;
+    Ok(parent.join(name))
+}
+fn read(path: &Path) -> Result<Descriptor> {
+    read_dir(&active_dir(path)?)
+}
+fn read_dir(dir: &Path) -> Result<Descriptor> {
+    check_dir(dir)?;
     let file = open(&dir.join("descriptor.json"))?;
     ensure!(
         file.metadata()?.len() <= DESCRIPTOR_LIMIT,
         "state_v2_backup_admission"
     );
     let descriptor: Descriptor = serde_json::from_reader(file.take(DESCRIPTOR_LIMIT + 1))?;
-    check(&descriptor, &dir)?;
+    check(&descriptor, dir)?;
     Ok(descriptor)
 }
+/// Caller holds source/checkpoint ownership; progress stays locked from capture
+/// through descriptor publication. The exact DB/WAL pair is copied while the
+/// same Sqlite owner excludes writes. Failure retains the previous bundle.
+pub(super) fn roll(path: &Path, db: &mut sqlite::Sqlite, identity: &Identity) -> Result<()> {
+    if !fence::exists(&fence::sibling(path, ".v2-ack-receipt"))? {
+        return Ok(());
+    }
+    crate::snapshot_sync::with_state_v2_progress_lock(path, |progress| {
+        let generation = db.stamp()?.0;
+        let recovery = ack::ProgressRecovery::for_backup(identity.clone(), generation, path);
+        let set = {
+            let mut tx = db.begin(TxnMode::Read)?;
+            ack::RecoverySet::capture(&mut tx, &recovery, progress)?
+        };
+        let database = fence::sibling(path, ".v2.sqlite");
+        if let Ok(previous) = read(path) {
+            if previous.set == set {
+                if let Some(artifact) = previous
+                    .artifacts
+                    .iter()
+                    .find(|a| matches!(a.role, Role::Database))
+                {
+                    if commitment(&database, None)? == (artifact.bytes, artifact.digest)
+                        && wal_matches(path, &previous)?
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        persist(path, set, &database)
+    })
+}
+
 /// Explicit recovery only: the caller retains source + checkpoint ownership.
 /// Refuse an older DB when a newer external receipt cannot be reconciled with
 /// this snapshot. Recovery never rewinds progress or synthesizes a missing ACK.
@@ -301,9 +420,9 @@ pub(super) fn restore(path: &Path) -> Result<()> {
         descriptor.set.reconcile_before_restore(
             path,
             progress_path,
-            &member(&root(path), receipt),
+            &member(&active_dir(path)?, receipt),
         )?;
-        check(&descriptor, &root(path))?;
+        check(&descriptor, &active_dir(path)?)?;
         // Every existing destination must already match. Destructive repair of
         // a differing published pair needs a separately reviewed recovery plan.
         for (n, artifact) in descriptor.artifacts.iter().enumerate() {
@@ -322,9 +441,9 @@ pub(super) fn restore(path: &Path) -> Result<()> {
                         fs::DirBuilder::new().mode(0o700).create(parent)?;
                     }
                 }
-                fence::preserve_file(&member(&root(path), n), &target)?;
+                fence::preserve_file(&member(&active_dir(path)?, n), &target)?;
             }
-            if matches!(artifact.role, Role::Database) {
+            if matches!(artifact.role, Role::Database | Role::Wal) {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
                 open(&target)?.sync_all()?;
@@ -344,7 +463,7 @@ pub(super) fn restore(path: &Path) -> Result<()> {
                 "state_v2_backup_restore_conflict"
             );
         } else {
-            fence::preserve_file(&member(&root(path), n), path)?;
+            fence::preserve_file(&member(&active_dir(path)?, n), path)?;
         }
         super::super::sync_checkpoint_parent(path)?;
         telemetry::event("recovery_backup_restored", &1);
@@ -354,6 +473,7 @@ pub(super) fn restore(path: &Path) -> Result<()> {
 fn destination(path: &Path, role: &Role) -> Result<PathBuf> {
     Ok(match role {
         Role::Database => fence::sibling(path, ".v2.sqlite"),
+        Role::Wal => fence::sibling(path, ".v2.sqlite-wal"),
         Role::Fence => path.to_owned(),
         Role::Receipt => fence::sibling(path, ".v2-ack-receipt"),
         Role::Baseline => fence::sibling(path, ".v1-readonly"),
@@ -367,9 +487,16 @@ fn destination(path: &Path, role: &Role) -> Result<PathBuf> {
         }
     })
 }
+fn wal_matches(path: &Path, descriptor: &Descriptor) -> Result<bool> {
+    let wal = fence::sibling(path, ".v2.sqlite-wal");
+    match descriptor.artifacts.iter().find(|a| a.role == Role::Wal) {
+        Some(a) => Ok(fence::exists(&wal)? && commitment(&wal, None)? == (a.bytes, a.digest)),
+        None => Ok(!fence::exists(&wal)? || commitment(&wal, None)?.0 == 0),
+    }
+}
 /// A database-only migration copy is insufficient. Destructive migrations
 /// require the independently sealed bundle for this exact current database.
-/// This deliberately refuses stale/import-only backups after ordinary saves.
+/// A stale bundle cannot authorize a destructive migration.
 pub(super) fn require_destructive_backup(database: &Path) -> Result<()> {
     let name = database
         .file_name()
@@ -387,7 +514,7 @@ pub(super) fn require_destructive_backup(database: &Path) -> Result<()> {
         descriptor.set.reconcile_before_restore(
             &index,
             progress,
-            &member(&root(&index), receipt),
+            &member(&active_dir(&index)?, receipt),
         )?;
         let artifact = descriptor
             .artifacts
@@ -395,15 +522,16 @@ pub(super) fn require_destructive_backup(database: &Path) -> Result<()> {
             .find(|a| matches!(a.role, Role::Database))
             .context("state_v2_backup_database")?;
         ensure!(
-            commitment(database, None)? == (artifact.bytes, artifact.digest),
+            commitment(database, None)? == (artifact.bytes, artifact.digest)
+                && wal_matches(&index, &descriptor)?,
             "state_v2_backup_database_changed"
         );
         Ok(())
     })
 }
 
-/// No recovery copy may outlive a semantic write that could erase PL. This
-/// removes only redundant backup custody; it never deletes a live restart ref.
+/// Explicit forget/uninstall/source erasure overrides backup protection and
+/// removes ALL generations, including interrupted, unpublished replacements.
 pub(super) fn erase(path: &Path) -> Result<()> {
     let dir = root(path);
     match fs::symlink_metadata(&dir) {

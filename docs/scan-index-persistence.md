@@ -489,10 +489,16 @@ and copied exact restart files. Every restart copy is checked against its traile
 The descriptor is published last and read back before fence replacement starts.
 Explicit restore verifies every member and replays newer external receipts first;
 newer or conflicting custody refuses restoration without overwriting progress.
-The bundle is removed before a later semantic write can retire private state,
-and immediately on source erasure. It covers the sealed import, rather than a
-rolling backup of later saves. Destructive migrations require an independently
-verified bundle for the exact database; a DB-only copy is insufficient.
+Authenticated saves retain a rolling bundle with the exact DB/WAL pair,
+independent fence, companion, baselines and exact restart files. The source and
+progress owners exclude changes through capture and publication; copying the WAL
+avoids imposing a TRUNCATE on each save. A private atomic current pointer switches
+only after the replacement descriptor and every member pass read-back. Superseded
+bundles are reclaimed afterward; a failed replacement keeps the prior seal.
+Source erasure, forget and uninstall remove every generation immediately, including
+interrupted replacements. Scheduled private-text purge also removes backup custody
+before clearing its erasure obligation. Destructive migrations require a verified
+bundle matching the exact current DB/WAL pair; a DB-only copy is insufficient.
 Companions share the source's erasure and immediate-removal obligations.
 
 Explicit source erasure also removes the exact ACK companion. Maintenance reports
@@ -503,11 +509,21 @@ on authenticated saves and at maintenance/load boundaries.
 Deferred selected-save custody uses version 2 of `unit.deferred`: a bounded
 manifest at position zero names exact before/after headers and payload positions;
 other positions hold original row bytes. Keys and payloads inherit their owner
-classes. Old version-1 carries retain a legacy decoder whose per-payload scratch
-descriptors can exhaust the process limit; this remains an activation blocker. Private anonymous scratch files
-stream planned values with one shared file descriptor per plan/carry; they are
-unlinked before receiving private bytes. Metadata retains its 8 MiB admission,
-individual payloads retain their kind limits, and selected writes plus deferred
-custody retain the 256 MiB transaction ceiling. Excess custody holds the save and
-raises the oversize alarm; it is never truncated or acknowledged. These seams do
-not enable conversion: the Claude route still returns `publication_pending`.
+classes. Old version-1 carries decode within the bounded 8 MiB expanded envelope
+and move their payloads into one shared anonymous arena. Scratch files are unlinked
+before receiving private bytes; each plan/carry uses one descriptor. Metadata keeps
+its 8 MiB admission and scratch keeps its 512 MiB disk envelope.
+
+Pending payloads are durably staged in separate admitted inert transactions. These
+writes change neither semantic generation nor fairness; only the position-zero
+manifest activates custody. A crash before manifest publication leaves inert residue.
+Later passes reuse exact unchanged payloads, atomically advance the manifest and
+persist the fair cursor with selected work. GC consumes remaining transaction space;
+it cannot prevent semantic progress. Individual values retain their kind limits.
+Every transaction stays within 256 MiB, including prior/new values, controls,
+manifest replacement and GC. A lone unit may exceed the 5,000-row/32 MiB target up
+to that hard ceiling; a larger indivisible unit has a named `hard_ceiling` hold and
+oversize alarm while independent units remain eligible. No held work is truncated
+or acknowledged. Conversion remains paused with reason **R1 staging not installed**.
+Omitting checkpoint rows is unsafe: the next active file admission still needs M1
+protection, and a published source cannot fall back to v1 on missing staging.

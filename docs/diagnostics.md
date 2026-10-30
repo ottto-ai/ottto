@@ -1522,8 +1522,14 @@ retry. Only an intact current grouping can enter the cap allocator.
 
 The default-OFF Claude state-v2 route also emits `growth_claim_refused` with fixed
 lineage/publication labels and `recovery_backup_verified` / `recovery_backup_restored`
-counts. Backup verification is evidence for a sealed import only; it is not a
-rolling-backup, restore-qualification or collection-activation claim. Streamed
-selected saves retain `unit_selected`, `unit_deferred`, charge rows/bytes/pages,
+counts, plus `recovery_backup_superseded` after a verified replacement switches
+the current pointer. These counters describe rolling artifact protection, without
+claiming runtime/native restore qualification or enabling conversion.
+Selected saves retain `unit_selected`, `unit_deferred`, charge rows/bytes/pages,
 `unit_oversize_alarm`, retained-account-window counts and `save_page_reduced`.
+Inert staging reports `unit_custody_staged` and
+`unit_custody_charge_rows_bytes_pages`; bounded cleanup reports
+`unit_custody_reclaimed` and `unit_custody_gc_deferred`. Staging does not advance
+semantic generation or inflate semantic selection counts. The fixed import pause
+label `r1_staging_not_installed` means **R1 staging not installed**.
 These events contain no keys, paths, restart names, reference tuples or digests.

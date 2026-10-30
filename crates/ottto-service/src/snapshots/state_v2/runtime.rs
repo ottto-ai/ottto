@@ -235,9 +235,10 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
                             .get(&RowKey::record("unit.deferred", Vec::new(), 0)?)?
                             .is_some()
                         {
-                            super::recovery_backup::erase(path)?;
+                            super::recovery_backup::roll(path, &mut session.db, &identity)?;
                         }
                         mapper.restore_selected(&mut session.db, &mut index, &mut cx)?;
+                        super::recovery_backup::roll(path, &mut session.db, &identity)?;
                         session.stamp = session.db.stamp()?;
                         ensure!(index.generation == session.stamp.0, Hold::DbUnavailable);
                         normalize_hydrated(&mut index)?;
@@ -268,9 +269,10 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
                 .get(&RowKey::record("unit.deferred", Vec::new(), 0)?)?
                 .is_some()
             {
-                super::recovery_backup::erase(path)?;
+                super::recovery_backup::roll(path, &mut db, &identity)?;
             }
             mapper.restore_selected(&mut db, &mut index, &mut cx)?;
+            super::recovery_backup::roll(path, &mut db, &identity)?;
             let stamp = db.stamp()?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
             normalize_hydrated(&mut index)?;
@@ -571,20 +573,26 @@ fn save_with_mode<M: Mapper>(
             index.generation = previous.generation;
         }
         super::ack::ProgressRecovery::recover_route(&identity, session.stamp.0, path)?;
-        super::recovery_backup::erase(path)?;
+        super::recovery_backup::roll(path, &mut session.db, &identity)?;
         let selected = if claim_only {
             M::selected_claim_save
         } else {
             M::selected_save
         };
-        if selected(
+        let save_result = selected(
             mapper,
             &mut session.db,
             &identity,
             &previous,
             index,
             &mut session.cx,
-        )? {
+        );
+        // A subset save can commit and then return SaveAdmission. Protect that
+        // exact generation before propagating its collection hold.
+        if session.db.stamp()?.0 != previous.generation {
+            super::recovery_backup::roll(path, &mut session.db, &identity)?;
+        }
+        if save_result? {
             session.stamp = session.db.stamp()?;
             state.cached = Some(index.clone());
             return Ok(true);

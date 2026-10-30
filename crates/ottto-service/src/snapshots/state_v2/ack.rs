@@ -329,6 +329,16 @@ impl OriginalProgress {
 }
 
 impl ProgressRecovery {
+    pub(super) fn for_backup(identity: Identity, generation: u64, path: &Path) -> Self {
+        Self {
+            scope: Scope {
+                identity,
+                generation,
+            },
+            path: fence::sibling(path, ".v2-ack-receipt"),
+            db_path: None,
+        }
+    }
     /// Runtime load already holds CheckpointLock and has authenticated the DB.
     /// Replay before returning either a hydrated or cached graph, without
     /// recursively acquiring the checkpoint/route/session locks.

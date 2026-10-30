@@ -94,7 +94,7 @@ fn missing_or_corrupt_backup_member_prevents_any_restore() {
     let f = Fixture::new();
     let db = fence::sibling(&f.path, ".v2.sqlite");
     let before = fs::read(&db).unwrap();
-    let payload = member(&root(&f.path), 0);
+    let payload = member(&active_dir(&f.path).unwrap(), 0);
     fs::set_permissions(&payload, fs::Permissions::from_mode(0o600)).unwrap();
     fs::write(&payload, b"synthetic-corruption").unwrap();
     assert!(restore(&f.path).is_err());
@@ -117,4 +117,168 @@ fn exact_record_trailer_is_verified_without_a_restart_store_codec() {
     bytes[0] ^= 1;
     ottto_core::write_owner_only_file_atomic(&path, &bytes).unwrap();
     assert!(commitment(&path, Some(trailer)).is_err());
+}
+
+#[test]
+fn rolling_backup_supersedes_only_verified_generations_and_erases_interrupted_ones() {
+    let f = Fixture::new();
+    let old_dir = active_dir(&f.path).unwrap();
+    let old_set = read(&f.path).unwrap().set;
+    let identity = old_set.identity().clone();
+    let db_path = fence::sibling(&f.path, ".v2.sqlite");
+    let mut db = sqlite::Sqlite::open(&db_path, &identity).unwrap();
+    let tx = db.begin(TxnMode::Write).unwrap();
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    // A missing mandatory member fails replacement without deleting the seal.
+    let receipt = fence::sibling(&f.path, ".v2-ack-receipt");
+    let bytes = fs::read(&receipt).unwrap();
+    ottto_core::write_owner_only_file_atomic(&receipt, b"invalid-receipt").unwrap();
+    assert!(roll(&f.path, &mut db, &identity).is_err());
+    assert_eq!(active_dir(&f.path).unwrap(), old_dir);
+    assert_eq!(read(&f.path).unwrap().set, old_set);
+    ottto_core::write_owner_only_file_atomic(&receipt, &bytes).unwrap();
+    roll(&f.path, &mut db, &identity).unwrap();
+    assert_ne!(active_dir(&f.path).unwrap(), old_dir);
+    assert!(!old_dir.exists());
+    let newer = read(&f.path).unwrap();
+    assert_ne!(newer.set, old_set);
+    let interrupted = root(&f.path).join("generation-interrupted");
+    fs::create_dir(&interrupted).unwrap();
+    fs::write(interrupted.join("private.member"), b"synthetic-private").unwrap();
+    erase(&f.path).unwrap();
+    assert!(!root(&f.path).exists());
+    assert!(db_path.exists());
+}
+
+#[test]
+fn exact_rec_predecessor_is_protected_until_replacement_bundle_verifies() {
+    let f = Fixture::new();
+    let identity = read(&f.path).unwrap().set.identity().clone();
+    let db_path = fence::sibling(&f.path, ".v2.sqlite");
+    let mut db = sqlite::Sqlite::open(&db_path, &identity).unwrap();
+    let records = crate::durable_tail_store::store_dir_for_index(&f.path);
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&records)
+        .unwrap();
+    let key = RowKey::record("resume.checkpoint", b"synthetic-file".to_vec(), 0).unwrap();
+    let mut old_dir: Option<PathBuf> = None;
+    for generation in 1..=2 {
+        let prefix = format!("synthetic-record-{generation}");
+        let digest: [u8; 32] = Sha256::digest(prefix.as_bytes()).into();
+        let name = format!("synthetic.{generation}.attempt.rec");
+        let mut record = prefix.into_bytes();
+        record.extend_from_slice(&digest);
+        let source = records.join(&name);
+        ottto_core::write_owner_only_file_atomic(&source, &record).unwrap();
+        let checkpoint = kinds_files::ResumeCheckpoint {
+            record_generation: generation,
+            record_name: name.clone(),
+            trailer_digest: digest,
+            file_generation: generation,
+            committed_bytes: 0,
+            reduction_version: 1,
+            reduction_allowlist: [1; 32],
+            reduction_pin: vec![1],
+            binding: identity.binding.clone(),
+            key_digest: [2; 32],
+            context: [3; 32],
+            scope: [4; 32],
+            entry: [5; 32],
+            publication: [6; 16],
+            certificate: kinds_files::Certificate {
+                device: 1,
+                inode: 2,
+                length: 0,
+                modified: (0, 0),
+                birth_nanos: 0,
+                sealed_offset: 0,
+                sample_len: 0,
+                head_sha256: [7; 32],
+                boundary_sha256: [8; 32],
+                verified_unix_seconds: 1,
+                audit_debt_unix_seconds: None,
+            },
+        };
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        tx.put(RowInput {
+            key: &key,
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: &packed::Json(&checkpoint),
+        })
+        .unwrap();
+        assert_eq!(
+            tx.commit(generation - 1, generation),
+            DurableCommitOutcome::Committed(generation)
+        );
+        if generation == 2 {
+            // Live GC cannot invalidate the exact predecessor's independent copy.
+            fs::remove_file(records.join("synthetic.1.attempt.rec")).unwrap();
+            ottto_core::write_owner_only_file_atomic(&source, b"bad-record").unwrap();
+            assert!(roll(&f.path, &mut db, &identity).is_err());
+            let old = read(&f.path).unwrap();
+            assert_eq!(
+                active_dir(&f.path).unwrap(),
+                old_dir.as_ref().unwrap().to_owned()
+            );
+            assert_eq!(
+                old.set.checkpoints().unwrap()[0].record_name,
+                "synthetic.1.attempt.rec"
+            );
+            assert!(old
+                .artifacts
+                .iter()
+                .any(|a| matches!(&a.role, Role::Baseline)));
+            ottto_core::write_owner_only_file_atomic(&source, &record).unwrap();
+        }
+        roll(&f.path, &mut db, &identity).unwrap();
+        let descriptor = read(&f.path).unwrap();
+        assert_eq!(descriptor.set.checkpoints().unwrap()[0], checkpoint);
+        let current = active_dir(&f.path).unwrap();
+        if let Some(old) = old_dir.replace(current) {
+            assert!(!old.exists());
+        }
+    }
+}
+
+#[test]
+fn rolling_db_wal_pair_restores_without_forcing_a_source_checkpoint() {
+    let f = Fixture::new();
+    let identity = read(&f.path).unwrap().set.identity().clone();
+    let db_path = fence::sibling(&f.path, ".v2.sqlite");
+    let mut db = sqlite::Sqlite::open(&db_path, &identity).unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    tx.put(RowInput {
+        key: &RowKey::Meta("baseline_bytes".into()),
+        fixed: &Fixed::None,
+        value_version: 1,
+        value: &ControlJson(&123_u64),
+    })
+    .unwrap();
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let wal = fence::sibling(&f.path, ".v2.sqlite-wal");
+    let before = fs::read(&wal).unwrap();
+    assert!(!before.is_empty());
+    roll(&f.path, &mut db, &identity).unwrap();
+    assert_eq!(fs::read(&wal).unwrap(), before);
+    assert!(read(&f.path)
+        .unwrap()
+        .artifacts
+        .iter()
+        .any(|a| matches!(a.role, Role::Wal)));
+    drop(db);
+    fs::remove_file(&db_path).unwrap();
+    if wal.exists() {
+        fs::remove_file(&wal).unwrap();
+    }
+    fs::remove_file(&f.path).unwrap();
+    restore(&f.path).unwrap();
+    let restored = sqlite::Sqlite::open(&db_path, &identity).unwrap();
+    assert_eq!(restored.stamp().unwrap().0, 1);
+    assert_eq!(
+        restored.read_control::<u64>("baseline_bytes").unwrap(),
+        Some(123)
+    );
 }
