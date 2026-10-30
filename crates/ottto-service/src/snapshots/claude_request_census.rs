@@ -127,7 +127,7 @@ pub(crate) const MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES: usize = 48 * 1024 *
 const TOMBSTONE_RESERVE_BYTES: usize = 1024 * 1024;
 /// Decoder bounds: at most this many records, and keys of at most this many
 /// bytes. Anything beyond is skipped entry by entry, never the index.
-const MAX_CLAUDE_REQUEST_CENSUS_RECORDS: usize = MAX_DECODE_ENTRIES;
+pub(crate) const MAX_CLAUDE_REQUEST_CENSUS_RECORDS: usize = MAX_DECODE_ENTRIES;
 /// Interpretation and raw buffering budgets are independent of retained
 /// records: at most this many entries are visited, whatever they hold.
 const MAX_DECODE_ENTRIES: usize = 65_536;
@@ -783,8 +783,43 @@ pub(crate) struct ClaudeRequestCensus {
     hash_total: usize,
     /// Exact serialized bytes of every `"key":record` pair.
     serialized_total: usize,
+    /// Runtime only (never persisted: a decoded census starts without it).
+    release_memo: Option<ReleaseMemo>,
 }
-crate::heap_layout_bound::fields!(ClaudeRequestCensus; records, hash_total, serialized_total);
+crate::heap_layout_bound::fields!(ClaudeRequestCensus; records, hash_total, serialized_total, release_memo);
+
+/// E7 #920: an admission derive scan (`release_aged`) at `cutoff` released
+/// nothing: no record was releasable, or releasing every one (`freeable`
+/// hashes and serialized bytes) would still not have admitted the record.
+/// Every other record that may age at that cutoff (`may_age`) is in
+/// `suspects`: those the scan saw, and every later insert of one. Only a
+/// record that may age can be released, whether a suspect can depends on
+/// the index entry, and the releasable records the scan saw can only stay
+/// releasable or stop (a replacement that may age is a suspect, and a
+/// removed one frees less than `freeable` says). So re-checking
+/// the suspects against the current index, and `freeable` against the
+/// current totals, decides exactly whether a scan would release anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseMemo {
+    cutoff: u64,
+    freeable: (usize, usize),
+    suspects: Vec<String>,
+}
+crate::heap_layout_bound::fields!(ReleaseMemo; cutoff, freeable, suspects);
+
+/// Most suspects a release memo keeps; past it no memo is kept.
+const MAX_RELEASE_MEMO_SUSPECTS: usize = 4_096;
+
+/// The record may be released at `cutoff` under some index entry: it is an
+/// unretired record holding hashes, and its own mtime is unknown or before
+/// the cutoff. A superset of `transcript_retirement_age` that does not read
+/// the index.
+fn may_age(record: &ClaudeRequestCensusRecord, cutoff: u64) -> bool {
+    !record.is_birth_stub()
+        && record.retired.is_none()
+        && record.hash_count() > 0
+        && record.modified.map_or(true, |modified| modified < cutoff)
+}
 
 /// One family's answer from [`ClaudeRequestCensus::family_transcript_holders`].
 #[derive(Debug, Default)]
@@ -841,6 +876,19 @@ pub(crate) fn with_side_call_walk_deadline_for_test<T>(run: impl FnOnce() -> T) 
 #[cfg(test)]
 fn walk_deadline_forced(walk: u8) -> bool {
     WALK_DEADLINE_FOR_TEST.with(std::cell::Cell::get) & walk != 0
+}
+
+// Test seam: derive scans (full `release_aged` passes, not memo skips) on
+// this thread.
+#[cfg(test)]
+thread_local! {
+    static DERIVE_SCANS_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Derive scans run on this thread so far.
+#[cfg(test)]
+pub(crate) fn derive_scans_for_test() -> u64 {
+    DERIVE_SCANS_FOR_TEST.with(std::cell::Cell::get)
 }
 
 /// Why an insert did not store the record as given.
@@ -1106,7 +1154,20 @@ impl ClaudeRequestCensus {
     pub(crate) fn insert(
         &mut self,
         key: String,
+        record: ClaudeRequestCensusRecord,
+    ) -> ClaudeRequestCensusInsert {
+        self.insert_releasing(key, record, |_, _| {})
+    }
+
+    /// `insert`, except that a record that does not fit whole first lets
+    /// `release` free room. `release` gets the census (the key's old record
+    /// already removed) and whether given (hash, serialized) totals would
+    /// admit the record whole.
+    fn insert_releasing(
+        &mut self,
+        key: String,
         mut record: ClaudeRequestCensusRecord,
+        release: impl FnOnce(&mut Self, &dyn Fn(usize, usize) -> bool),
     ) -> ClaudeRequestCensusInsert {
         if let Some(old) = self.records.remove(&key) {
             self.charge(&key, &old, false);
@@ -1116,23 +1177,30 @@ impl ClaudeRequestCensus {
         // admission and charging instead of serializing each one twice.
         let mut bytes = entry_serialized_bytes(&key, &record);
         let fits =
-            |census: &Self, record: &ClaudeRequestCensusRecord, bytes: usize, limit: usize| {
-                census
-                    .hash_total
-                    .checked_add(record.hash_count())
+            |hash_total: usize, serialized_total: usize, hashes: usize, bytes: usize, limit| {
+                hash_total
+                    .checked_add(hashes)
                     .is_some_and(|total| total <= MAX_CLAUDE_REQUEST_CENSUS_HASHES)
-                    && census
-                        .serialized_total
+                    && serialized_total
                         .checked_add(bytes)
                         .is_some_and(|total| total <= limit)
             };
+        let (hashes, whole_bytes) = (record.hash_count(), bytes);
+        let whole_limit = MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES - TOMBSTONE_RESERVE_BYTES;
+        let whole = |hash_total, serialized_total| {
+            fits(
+                hash_total,
+                serialized_total,
+                hashes,
+                whole_bytes,
+                whole_limit,
+            )
+        };
+        if !whole(self.hash_total, self.serialized_total) {
+            release(self, &whole);
+        }
         let mut outcome = ClaudeRequestCensusInsert::Stored;
-        if !fits(
-            self,
-            &record,
-            bytes,
-            MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES - TOMBSTONE_RESERVE_BYTES,
-        ) {
+        if !whole(self.hash_total, self.serialized_total) {
             record.shape = ClaudeRequestCensusShape::OverBudget;
             record.request_hashes = None;
             record.retired = None;
@@ -1142,22 +1210,154 @@ impl ClaudeRequestCensus {
             outcome = ClaudeRequestCensusInsert::Tombstone;
             bytes = entry_serialized_bytes(&key, &record);
             if !fits(
-                self,
-                &record,
+                self.hash_total,
+                self.serialized_total,
+                record.hash_count(),
                 bytes,
                 MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES,
             ) {
                 return ClaudeRequestCensusInsert::Refused;
             }
         }
+        // A stored record that may age at the memo's cutoff joins its
+        // suspects, so the memo is re-checked against it.
+        let keep_memo = match self.release_memo.as_mut() {
+            Some(memo) if may_age(&record, memo.cutoff) && !memo.suspects.contains(&key) => {
+                memo.suspects.push(key.clone());
+                memo.suspects.len() <= MAX_RELEASE_MEMO_SUSPECTS
+            }
+            _ => true,
+        };
+        if !keep_memo {
+            self.release_memo = None;
+        }
         self.charge_totals(record.hash_count(), bytes, true);
         self.records.insert(key, record);
         outcome
     }
 
+    /// E7 stopgap (#920 round 3): retire, oldest first (by mtime, then key),
+    /// the records the transcript retirement rule would retire at `cutoff`
+    /// but that still hold their hashes (kept by overlap, or aged since the
+    /// last terminal), until `fits` admits the totals or none is left. Each
+    /// is a record the pre-stopgap terminal would already have retired, so
+    /// kept stock never tombstones or refuses a record the old rule would
+    /// have admitted. Derived from the census and the index on demand, never
+    /// stored: every page reloads the index, so a set kept by the terminal
+    /// would be gone before the next insert. Also the terminal's occupancy
+    /// release, with `fits` the 90% bound. Returns the records and hashes it
+    /// retired.
+    ///
+    /// With `all_or_none` (admission), a record that would not fit even
+    /// after every releasable record retired releases none: kept proofs are
+    /// never spent on a record that tombstones anyway. Without it (the
+    /// terminal's occupancy release), all retire, as the pre-stopgap rule
+    /// retired every aged record.
+    ///
+    /// A release is an ordinary aged retirement (`retire`), never a refusal:
+    /// it must never set a census-lost or refusal mark on the released key
+    /// (#915's lost marks must keep this when they merge).
+    fn release_aged(
+        &mut self,
+        files: &BTreeMap<String, ScanIndexEntry>,
+        cutoff: u64,
+        fits: &dyn Fn(usize, usize) -> bool,
+        all_or_none: bool,
+    ) -> (u64, u64) {
+        // A scan at this cutoff released nothing; only a suspect can have
+        // become releasable since, and none has, and releasing all it saw
+        // would still not admit this record.
+        if let Some(memo) = self.release_memo.as_ref().filter(|_| all_or_none) {
+            if memo.cutoff == cutoff
+                && !fits(
+                    self.hash_total.saturating_sub(memo.freeable.0),
+                    self.serialized_total.saturating_sub(memo.freeable.1),
+                )
+                && memo.suspects.iter().all(|key| {
+                    self.records.get(key).map_or(true, |record| {
+                        transcript_retirement_age(files, cutoff, key, record).is_none()
+                    })
+                })
+            {
+                return (0, 0);
+            }
+        }
+        self.release_memo = None;
+        #[cfg(test)]
+        DERIVE_SCANS_FOR_TEST.with(|scans| scans.set(scans.get() + 1));
+        // One pass: (mtime, position in the census, hashes, serialized bytes
+        // retiring the record frees) of each releasable record, in census
+        // order, and the records that may age but cannot be released now.
+        let mut aged = Vec::new();
+        let mut suspects = Some(Vec::new());
+        for (position, (key, record)) in self.records.iter().enumerate() {
+            if !may_age(record, cutoff) {
+                continue;
+            }
+            let Some(modified) = transcript_retirement_age(files, cutoff, key, record) else {
+                suspects = suspects
+                    .filter(|suspects: &Vec<String>| suspects.len() < MAX_RELEASE_MEMO_SUSPECTS)
+                    .map(|mut suspects| {
+                        suspects.push(key.clone());
+                        suspects
+                    });
+                continue;
+            };
+            // A record clone shares its hashes: nothing is copied.
+            let mut retired = record.clone();
+            retired.retire();
+            let freed = entry_serialized_bytes(key, record)
+                .saturating_sub(entry_serialized_bytes(key, &retired));
+            aged.push((modified, position, record.hash_count(), freed));
+        }
+        aged.sort_unstable();
+        let (mut hash_total, mut serialized_total) = (self.hash_total, self.serialized_total);
+        let mut release = 0;
+        for &(_, _, hashes, freed) in &aged {
+            if fits(hash_total, serialized_total) {
+                break;
+            }
+            hash_total -= hashes;
+            serialized_total = serialized_total.saturating_sub(freed);
+            release += 1;
+        }
+        // Sum first: a hopeless admission (or nothing releasable) retires
+        // none, and remembers what releasing all would have freed.
+        if aged.is_empty() || (all_or_none && !fits(hash_total, serialized_total)) {
+            let freeable = (
+                self.hash_total - hash_total,
+                self.serialized_total - serialized_total,
+            );
+            self.release_memo = suspects.map(|suspects| ReleaseMemo {
+                cutoff,
+                freeable,
+                suspects,
+            });
+            return (0, 0);
+        }
+        aged.truncate(release);
+        aged.sort_unstable_by_key(|&(_, position, _, _)| position);
+        let mut retire = aged.iter().map(|&(_, position, _, _)| position).peekable();
+        let mut freed = (0_usize, 0_usize);
+        for (position, (key, record)) in self.records.iter_mut().enumerate() {
+            if retire.next_if_eq(&position).is_none() {
+                continue;
+            }
+            let before = (record.hash_count(), entry_serialized_bytes(key, record));
+            record.retire();
+            let after = entry_serialized_bytes(key, record);
+            freed.0 += before.0;
+            freed.1 += before.1.saturating_sub(after);
+        }
+        self.hash_total -= freed.0;
+        self.serialized_total = self.serialized_total.saturating_sub(freed.1);
+        (release as u64, freed.0 as u64)
+    }
+
     /// A decoded record that would pass either budget is dropped, never
     /// stored. True when stored without replacing a duplicate key.
     fn insert_decoded(&mut self, key: String, record: ClaudeRequestCensusRecord) -> bool {
+        self.release_memo = None;
         let duplicate = self.records.remove(&key);
         if let Some(old) = &duplicate {
             self.charge(&key, old, false);
@@ -2606,6 +2806,10 @@ pub(crate) struct ClaudeRequestCensusParse<'a> {
     pub(crate) complete: bool,
     pub(crate) lossy: bool,
     pub(crate) source_verified: bool,
+    /// Successful, loss-free, debt-free Unchanged acquisition. Its checkpoint
+    /// binds the same physical object and interpretation scope; this is not
+    /// Full credit and cannot promote an unverified census record.
+    pub(crate) unchanged_source: bool,
     pub(crate) itemless_request_hashes: Vec<u64>,
     /// Creation time and identity of the object this parse opened, when the
     /// parse opened one and the file system reports a creation time.
@@ -2645,7 +2849,8 @@ pub(super) fn claude_buffered_request_hashes(parser: &super::OwnedJsonlParser) -
 /// Every Claude family-member parse that reaches `finish` replaces the key's
 /// record with one bound to the candidate fingerprint and this window: a
 /// complete parse by its shape, an incomplete or residue parse as `Lossy`
-/// with the ids it saw. An older record never survives a newer parse.
+/// with the ids it saw. Only an identical, debt-free Unchanged completion
+/// carries forward an existing record's verification.
 pub(crate) fn record_claude_request_census(
     index: &mut ScanIndex,
     parse: ClaudeRequestCensusParse<'_>,
@@ -2688,10 +2893,6 @@ pub(crate) fn record_claude_request_census(
         .carried_birth(parse.index_key, parse.opened_birth);
     record.modified = (parse.modified_unix_seconds > 0).then_some(parse.modified_unix_seconds);
     if let Some(old) = index.claude_request_census.get(parse.index_key) {
-        // S3(d): the same verified revision under the same derivation must
-        // yield the same census. Residue, lossy and budget tombstones (whose
-        // shape and hashes the budget replaced) and retired records (whose
-        // hashes retirement dropped) are excluded.
         let comparable = |record: &ClaudeRequestCensusRecord| {
             !record.unverified
                 && record.retired.is_none()
@@ -2700,6 +2901,22 @@ pub(crate) fn record_claude_request_census(
                     ClaudeRequestCensusShape::Lossy | ClaudeRequestCensusShape::OverBudget
                 )
         };
+        if parse.unchanged_source
+            && parse.complete
+            && !parse.lossy
+            && comparable(old)
+            && old.derivation == record.derivation
+            && old.source_file_fingerprint == record.source_file_fingerprint
+            && old.shape == record.shape
+            && old.request_hashes == record.request_hashes
+            && old.twin == record.twin
+        {
+            record.unverified = false;
+        }
+        // S3(d): the same verified revision under the same derivation must
+        // yield the same census. Residue, lossy and budget tombstones (whose
+        // shape and hashes the budget replaced) and retired records (whose
+        // hashes retirement dropped) are excluded.
         if parse.complete
             && comparable(old)
             && comparable(&record)
@@ -2723,9 +2940,7 @@ pub(crate) fn record_claude_request_census(
             record.retire();
         }
     }
-    let _ = index
-        .claude_request_census
-        .insert(parse.index_key.to_owned(), record);
+    let _ = insert_transcript_record(index, parse.index_key, record, window);
     if let Some(stored) = index.claude_request_census.get(parse.index_key) {
         note_identity_incomplete_hold(
             !was_held && stored.identity_incomplete_hold(),
@@ -2742,6 +2957,47 @@ pub(crate) fn record_claude_request_census(
                 && (!stored.unverified || stored.can_bind_recomposed_body()),
         );
     }
+}
+
+/// Stores a transcript parse's record. E7 stopgap (#920 round 3): a record
+/// that does not fit whole first releases what the retirement rule would
+/// retire at this window (`release_aged`), counted as admission overflow.
+///
+/// The decoder's record bound holds live too: a new key past
+/// `MAX_CLAUDE_REQUEST_CENSUS_RECORDS` records gets no record (`Refused`),
+/// as a decode drops it; every reader treats the key as missing (unknown,
+/// never "no holder"). A replaced key is always admitted against the hash
+/// and serialized budgets as before. So a live census never holds more
+/// records than a decoded one, which bounds retirement's per-record buffers.
+fn insert_transcript_record(
+    index: &mut ScanIndex,
+    key: &str,
+    record: ClaudeRequestCensusRecord,
+    window: u64,
+) -> ClaudeRequestCensusInsert {
+    let census = &index.claude_request_census;
+    if census.records.len() >= MAX_CLAUDE_REQUEST_CENSUS_RECORDS
+        && !census.records.contains_key(key)
+    {
+        // Under #915 this refusal must mark the key lost (~lost), as an
+        // insert `Refused` does, so the #915 merge must keep it here.
+        note_record_limit_refused();
+        return ClaudeRequestCensusInsert::Refused;
+    }
+    let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
+    let files = &index.files;
+    let mut released = 0;
+    let outcome =
+        index
+            .claude_request_census
+            .insert_releasing(key.to_owned(), record, |census, fits| {
+                // A release retires; it never marks the key lost or refused.
+                if window > 0 {
+                    released = census.release_aged(files, cutoff, fits, true).0;
+                }
+            });
+    note_kept_overlap_admission(released);
+    outcome
 }
 
 /// A Held key keeps copy proof while its committed entry is still the
@@ -2811,10 +3067,11 @@ pub(crate) fn settle_claude_request_census_terminal(
         .claude_request_census
         .retain_keys(|key| files.contains_key(key) || observed_index_keys.contains(key));
     let window = rfc3339_unix_seconds(census_window_end).unwrap_or_default();
-    let aged = retire_claude_transcript_records(index, window);
-    note_transcript_retirements(aged, vanished);
+    let retirement = retire_claude_transcript_records(index, window);
+    note_transcript_retirements(retirement.aged, vanished);
     let join = ClaudeRequestCensusJoin::new(index, window, residue_index_keys);
     let mut counts = join.counts(true);
+    note_kept_overlap(retirement, counts.missing_over_budget);
     let state = &mut index.claude_request_census_shadow;
     if state
         .would_open
@@ -2848,6 +3105,47 @@ fn note_transcript_retirements(aged: u64, vanished: u64) {
     TRANSCRIPT_RETIRED[1].fetch_add(vanished, Ordering::Relaxed);
 }
 
+/// The terminal's kept-overlap row, beside the same terminal's census-full
+/// tombstone count (the shadow's `missing_over_budget`).
+fn note_kept_overlap(retirement: TranscriptRetirement, missing_over_budget: usize) {
+    if retirement.kept_overlap_records > 0 || retirement.overflow_occupancy > 0 {
+        crate::local_resource_diagnostics::claude_census_retire_kept_overlap(
+            crate::local_resource_diagnostics::CensusRetireKeptOverlapCounts {
+                records: retirement.kept_overlap_records,
+                hashes: retirement.kept_overlap_hashes,
+                overflow_occupancy: retirement.overflow_occupancy,
+                overflow_admission: 0,
+                record_limit_refused: 0,
+                missing_over_budget: Some(missing_over_budget as u64),
+            },
+        );
+    }
+}
+
+/// Records a new key refused at the live census record bound.
+fn note_record_limit_refused() {
+    crate::local_resource_diagnostics::claude_census_retire_kept_overlap(
+        crate::local_resource_diagnostics::CensusRetireKeptOverlapCounts {
+            record_limit_refused: 1,
+            ..Default::default()
+        },
+    );
+}
+
+/// Records an insert released for admission (`release_aged`): aged
+/// retirements, and kept-overlap overflow by admission, with the alarm.
+fn note_kept_overlap_admission(released: u64) {
+    if released > 0 {
+        TRANSCRIPT_RETIRED[0].fetch_add(released, std::sync::atomic::Ordering::Relaxed);
+        crate::local_resource_diagnostics::claude_census_retire_kept_overlap(
+            crate::local_resource_diagnostics::CensusRetireKeptOverlapCounts {
+                overflow_admission: released,
+                ..Default::default()
+            },
+        );
+    }
+}
+
 /// Transcript records retired since the process started: (aged, vanished).
 pub(crate) fn transcript_retirements() -> (u64, u64) {
     use std::sync::atomic::Ordering;
@@ -2857,6 +3155,55 @@ pub(crate) fn transcript_retirements() -> (u64, u64) {
     )
 }
 
+/// Occupancy up to which a terminal keeps aged records that share a request
+/// id (E7 stopgap): 90% of the census hash budget and of its serialized
+/// budget, after the other aged records retire.
+const CLAUDE_RETIRE_KEEP_OCCUPANCY_HASHES: usize = MAX_CLAUDE_REQUEST_CENSUS_HASHES * 9 / 10;
+const CLAUDE_RETIRE_KEEP_OCCUPANCY_BYTES: usize =
+    MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES * 9 / 10;
+
+fn within_keep_occupancy(hash_total: usize, serialized_total: usize) -> bool {
+    hash_total <= CLAUDE_RETIRE_KEEP_OCCUPANCY_HASHES
+        && serialized_total <= CLAUDE_RETIRE_KEEP_OCCUPANCY_BYTES
+}
+
+/// One terminal's transcript retirement: records retired by age, and the
+/// aged records kept because they share a request id with another unretired
+/// record (their hashes, and those retired anyway above the occupancy).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TranscriptRetirement {
+    aged: u64,
+    kept_overlap_records: u64,
+    kept_overlap_hashes: u64,
+    overflow_occupancy: u64,
+}
+
+/// The mtime by which the transcript retirement rule retires `key`'s record
+/// at `cutoff`, if it does: an unretired record holding hashes whose indexed
+/// revision is still the one it describes, last modified before the cutoff.
+fn transcript_retirement_age(
+    files: &BTreeMap<String, ScanIndexEntry>,
+    cutoff: u64,
+    key: &str,
+    record: &ClaudeRequestCensusRecord,
+) -> Option<u64> {
+    if record.is_birth_stub() || record.retired.is_some() || record.hash_count() == 0 {
+        return None;
+    }
+    // Not dirty: the indexed revision is still the one the record (and its
+    // mtime) describes.
+    let entry = files.get(key).filter(|entry| {
+        decode_fingerprint(&entry.source_file_fingerprint)
+            .is_some_and(|fingerprint| fingerprint == record.source_file_fingerprint)
+    })?;
+    // A record written before `m` (#664) takes the entry's mtime: the equal
+    // fingerprint hashes that same mtime.
+    record
+        .modified
+        .or((entry.modified_unix_seconds > 0).then_some(entry.modified_unix_seconds))
+        .filter(|modified| *modified < cutoff)
+}
+
 /// P1 ledger transcript retirement, by the record's own mtime (never the
 /// index entry's): a record whose file was last modified more than 35 days
 /// before this window keeps its hash count and drops its hashes. A later
@@ -2864,42 +3211,60 @@ pub(crate) fn transcript_retirements() -> (u64, u64) {
 /// `owned_after_retirement` (an overcount risk the ledger discloses: the
 /// copy is counted although the original already was).
 ///
+/// E7 stopgap: an aged record that shares a request id with another
+/// unretired record is kept, so a resumed copy keeps its cross-session proof
+/// while both files are indexed. They stay while the census, after the
+/// other aged records retire, is at most 90% full (hashes and serialized
+/// bytes); above that the oldest retire until it is back at 90% (counted as
+/// occupancy overflow). The next terminal re-decides, so a survivor whose
+/// partner was pruned or retired retires then. A record that does not fit
+/// whole at insert first retires them, oldest first (`release_aged`).
+///
 /// A vanished file (StateMissing's red producer removes its index entry at
 /// page end) is not retired here: the terminal prune drops its record and
 /// counts it, so a copy elsewhere owns those ids under the approved rule
 /// (telemetry owner first, else the copy). Retirement edits records in
 /// place: nothing is cloned.
-fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> u64 {
+fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> TranscriptRetirement {
+    // Every terminal starts the admission release memo afresh.
+    index.claude_request_census.release_memo = None;
+    let mut retirement = TranscriptRetirement::default();
     if !index.persistence_available() {
-        return 0;
+        return retirement;
     }
 
     if window == 0 {
-        return 0;
+        return retirement;
     }
     let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
     let files = &index.files;
     let census = &mut index.claude_request_census;
-    let mut aged = 0_u64;
+    // (record mtime, position in the census, hash count) of every record
+    // past the cutoff, in census order. Exact capacity: at most one per
+    // record holding a hash, so at most min(records, hash total).
+    let count = census
+        .records
+        .iter()
+        .filter(|(key, record)| transcript_retirement_age(files, cutoff, key, record).is_some())
+        .count();
+    let mut aged = Vec::with_capacity(count);
+    aged.extend(
+        census
+            .records
+            .iter()
+            .enumerate()
+            .filter_map(|(position, (key, record))| {
+                transcript_retirement_age(files, cutoff, key, record)
+                    .map(|modified| (modified, position, record.hash_count()))
+            }),
+    );
+    if !aged.is_empty() {
+        keep_overlapping_records(census, &mut aged, &mut retirement);
+    }
+    let mut retire = aged.iter().map(|&(_, position, _)| position).peekable();
     let mut freed = (0_usize, 0_usize);
-    for (key, record) in census.records.iter_mut() {
-        if record.is_birth_stub() || record.retired.is_some() || record.hash_count() == 0 {
-            continue;
-        }
-        // Not dirty: the indexed revision is still the one the record (and
-        // its mtime) describes.
-        let Some(entry) = files.get(key.as_str()).filter(|entry| {
-            decode_fingerprint(&entry.source_file_fingerprint)
-                .is_some_and(|fingerprint| fingerprint == record.source_file_fingerprint)
-        }) else {
-            continue;
-        };
-        // A record written before `m` (#664) takes the entry's mtime: the
-        // equal fingerprint hashes that same mtime.
-        let modified = record
-            .modified
-            .or((entry.modified_unix_seconds > 0).then_some(entry.modified_unix_seconds));
-        if !modified.is_some_and(|modified| modified < cutoff) {
+    for (position, (key, record)) in census.records.iter_mut().enumerate() {
+        if retire.next_if_eq(&position).is_none() {
             continue;
         }
         let before = (record.hash_count(), entry_serialized_bytes(key, record));
@@ -2907,11 +3272,92 @@ fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> u64 {
         let after = entry_serialized_bytes(key, record);
         freed.0 += before.0;
         freed.1 += before.1.saturating_sub(after);
-        aged += 1;
+        retirement.aged += 1;
     }
     census.hash_total -= freed.0;
     census.serialized_total = census.serialized_total.saturating_sub(freed.1);
-    aged
+    drop(aged);
+    // Above 90% occupancy, the kept records (now the only unretired aged
+    // ones) retire oldest first until it is back at 90%.
+    if retirement.kept_overlap_records > 0
+        && !within_keep_occupancy(census.hash_total, census.serialized_total)
+    {
+        let (records, hashes) = census.release_aged(files, cutoff, &within_keep_occupancy, false);
+        retirement.overflow_occupancy = records;
+        retirement.kept_overlap_records -= records;
+        retirement.kept_overlap_hashes -= hashes;
+    }
+    retirement
+}
+
+/// Removes from `aged` (census order, kept that way) every record that shares
+/// a request hash with another unretired record, and counts them (records,
+/// hashes) as kept. One transient sorted copy of the census hashes (8 bytes
+/// per hash: at most 16 MiB at the budget) and one flag per candidate are
+/// freed before returning; nothing else is allocated.
+fn keep_overlapping_records(
+    census: &ClaudeRequestCensus,
+    aged: &mut Vec<(u64, usize, usize)>,
+    retirement: &mut TranscriptRetirement,
+) {
+    let shared = shared_request_hashes(census);
+    if shared.is_empty() {
+        return;
+    }
+    // One flag per candidate, in census order; the hash copy is freed before
+    // the overlapping candidates are removed.
+    let mut records = census.records.values().enumerate();
+    let overlaps = aged
+        .iter()
+        .map(|&(_, position, _)| {
+            records
+                .find(|(at, _)| *at == position)
+                .is_some_and(|(_, record)| {
+                    record
+                        .request_hashes()
+                        .iter()
+                        .any(|hash| shared.binary_search(hash).is_ok())
+                })
+        })
+        .collect::<Vec<_>>();
+    drop(shared);
+    let mut flags = overlaps.iter();
+    aged.retain(|&(_, _, hashes)| {
+        let overlap = flags.next().copied().unwrap_or(false);
+        if overlap {
+            retirement.kept_overlap_records += 1;
+            retirement.kept_overlap_hashes += hashes as u64;
+        }
+        !overlap
+    });
+}
+
+/// Every request hash held by at least two unretired records, sorted, once
+/// each. Request hashes are unique within a record.
+fn shared_request_hashes(census: &ClaudeRequestCensus) -> Vec<u64> {
+    let mut hashes = Vec::with_capacity(census.hash_total);
+    for record in census.records.values() {
+        if !record.is_birth_stub() && record.retired.is_none() {
+            hashes.extend_from_slice(record.request_hashes());
+        }
+    }
+    hashes.sort_unstable();
+    let mut shared = 0;
+    let mut at = 0;
+    while at < hashes.len() {
+        let hash = hashes[at];
+        let run = hashes[at..]
+            .iter()
+            .take_while(|&&next| next == hash)
+            .count();
+        if run > 1 {
+            hashes[shared] = hash;
+            shared += 1;
+        }
+        at += run;
+    }
+    hashes.truncate(shared);
+    hashes
 }
 
 fn serialized_bytes(census: &ClaudeRequestCensus) -> usize {
@@ -3407,6 +3853,12 @@ impl ClaudeRequestCensusRecord {
         self.modified = modified;
         self
     }
+    /// `request_hashes` must already be strictly ascending.
+    pub(crate) fn with_request_hashes_for_test(mut self, request_hashes: Vec<u64>) -> Self {
+        assert!(request_hashes.windows(2).all(|pair| pair[0] < pair[1]));
+        self.request_hashes = shared_hashes(request_hashes);
+        self
+    }
     pub(crate) fn is_birth_stub_for_test(&self) -> bool {
         self.is_birth_stub()
     }
@@ -3507,6 +3959,31 @@ impl ClaudeRequestCensusShadowState {
 impl ScanIndex {
     pub(crate) fn claude_request_census_for_test(&self) -> &ClaudeRequestCensus {
         &self.claude_request_census
+    }
+
+    /// The transcript parse path's insert (`record_claude_request_census`).
+    pub(crate) fn insert_transcript_record_for_test(
+        &mut self,
+        key: &str,
+        record: ClaudeRequestCensusRecord,
+        window: u64,
+    ) -> ClaudeRequestCensusInsert {
+        insert_transcript_record(self, key, record, window)
+    }
+
+    /// The terminal's production retirement step alone: (aged, kept records,
+    /// kept hashes, occupancy overflow).
+    pub(crate) fn retire_claude_transcript_records_for_test(
+        &mut self,
+        window: u64,
+    ) -> (u64, u64, u64, u64) {
+        let retirement = retire_claude_transcript_records(self, window);
+        (
+            retirement.aged,
+            retirement.kept_overlap_records,
+            retirement.kept_overlap_hashes,
+            retirement.overflow_occupancy,
+        )
     }
 
     pub(crate) fn claude_request_census_mut_for_test(&mut self) -> &mut ClaudeRequestCensus {
