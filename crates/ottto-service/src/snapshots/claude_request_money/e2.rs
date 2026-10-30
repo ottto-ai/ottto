@@ -2125,6 +2125,7 @@ pub(crate) fn decide_page_copies(
 ) -> CopyRemovalUpdates {
     let _spent = PageSpent::start("page.copies");
     let mut holders = Vec::new();
+    let mut resolved_holds = Vec::new();
     for at in 0..items.len() {
         let Some(fold) = items[at].claude_money.as_deref_mut() else {
             continue;
@@ -2136,17 +2137,32 @@ pub(crate) fn decide_page_copies(
             ..PrefixTally::default()
         };
         let proof = fold.proof.clone();
+        if enabled() && !matches!(proof, Some(CopyProof::Holders(_))) {
+            if let Some(Located(file)) = fold.location {
+                if index.claude_copy_removals.pending(file) {
+                    resolved_holds.push(file);
+                }
+            }
+        }
         match proof {
             Some(CopyProof::Twin(witness)) => decide_twin(items, at, &witness, index),
             Some(CopyProof::Holders(_)) => holders.push(at),
             None => {}
         }
     }
-    let updates = if holders.is_empty() {
+    let mut updates = if holders.is_empty() {
         CopyRemovalUpdates::default()
     } else {
         decide_holders(items, &holders, index)
     };
+    if !resolved_holds.is_empty() {
+        let state = updates
+            .state
+            .get_or_insert_with(|| index.claude_copy_removals.clone());
+        for file in resolved_holds {
+            state.clear_hold(file);
+        }
+    }
     if enabled() {
         for at in holders {
             finish_holder_identity(&mut items[at]);

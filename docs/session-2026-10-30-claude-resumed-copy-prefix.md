@@ -40,6 +40,9 @@ counted by `copy_prefix_hold_expired`. If debt cannot fit, it expires immediatel
 `copy_prefix_held_requests` and `copy_prefix_held_files` disclose pending holds.
 An intervening page cannot prune retry debt merely because a new whole-body
 held file is absent from the settled index. Confirmed source removal clears it.
+Conclusive reads that no longer need holder proof, including confirmed empty
+or policy-suppressed parses, clear retry attempts while preserving saved
+removals. Disabled E2 does not select files solely for this retry debt.
 
 The local CCR2 encoding accepts CCR1 removal records. Absent, damaged or
 downgraded metadata is uncertainty. The read already happening re-derives any

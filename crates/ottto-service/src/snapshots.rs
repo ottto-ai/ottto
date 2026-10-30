@@ -50433,9 +50433,10 @@ impl ScanIndex {
         }
         // A prefix-only hold must survive settlement of the file's own turns.
         // Its persisted attempt counter expires on the third decision pass.
-        if self
-            .claude_copy_removals
-            .pending(claude_money_birth_store::location_key(&key))
+        if claude_request_money::e2::enabled()
+            && self
+                .claude_copy_removals
+                .pending(claude_money_birth_store::location_key(&key))
         {
             return (
                 CandidateDecision::Parse,
@@ -50790,6 +50791,8 @@ impl ScanIndex {
         );
         match parse_outcome {
             ScanParseOutcome::ConfirmedEmpty | ScanParseOutcome::PolicySuppressed => {
+                self.claude_copy_removals
+                    .clear_hold(claude_money_birth_store::location_key(&key));
                 self.confirmed_empty_files.insert(key);
             }
             ScanParseOutcome::Snapshot | ScanParseOutcome::Unknown => {

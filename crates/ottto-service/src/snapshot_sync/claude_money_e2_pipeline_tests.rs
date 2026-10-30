@@ -3397,3 +3397,36 @@ fn e2_pipeline_zero_usage_prefix_responses_neither_lend_markers_nor_hold_own_tur
         });
     }
 }
+
+#[test]
+fn e2_pipeline_rewritten_prefix_clears_retry_debt_but_preserves_recorded_removals() {
+    for empty in [false, true] {
+    with_e2(|| {
+        use crate::snapshots::claude_money_birth_store::location_key;
+        let mut c = Corpus::new("e2-pipeline-rewritten-prefix-debt");
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let mut prior = demo_family(&mut c, &mut progress);
+        let key = location_key(&c.root.join(file(THIRD)).to_string_lossy());
+        let recorded = prior.claude_copy_removals.get(key).to_vec();
+        assert_eq!(recorded.iter().map(|(_, hashes)| hashes.len()).sum::<usize>(), 3);
+        c.write_at(&file(THIRD), &resumed(THIRD, &[A, B, C,
+            ("unresolved", "2026-08-02T07:05:00Z", RESUME_WRITER), D]), "2026-08-02T07:06:00Z");
+        let mut held = c.raw(&scanner, prior.clone(), 100, false, &[]);
+        crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| { held.enrich(&c); });
+        assert_eq!(body(&held, THIRD).map(|b| (b.request_count, b.removed_request_count)), Some((1, Some(3))));
+        prior = settle(&c, &prior, held, &mut progress);
+        assert!(prior.claude_copy_removals.pending(key));
+        c.write_at(&file(THIRD), &if empty { String::new() } else { resumed(THIRD, &[D]) }, "2026-08-02T07:06:00Z");
+        let rewritten = ready(&c, &scanner, prior.clone(), 100, false);
+        assert_eq!(body(&rewritten, THIRD).map(|b| (b.request_count, b.removed_request_count)), if empty { None } else { Some((1, Some(0))) });
+        assert!(!rewritten.index.claude_copy_removals.pending(key));
+        assert_eq!(rewritten.index.claude_copy_removals.get(key), recorded.as_slice());
+        prior = settle(&c, &prior, rewritten, &mut progress);
+        assert!(!prior.claude_copy_removals.pending(key));
+        assert_eq!(prior.claude_copy_removals.get(key), recorded.as_slice());
+        let quiet = ready(&c, &scanner, prior, 100, false);
+        assert!(body(&quiet, THIRD).is_none(), "resolved debt cannot force indefinite reads after ACK/restart");
+    });
+    }
+}
