@@ -160,11 +160,12 @@ fn raw_scan_at(
     mut after_start: impl FnMut(&mut OwnedSourceScan),
 ) -> Run {
     if crate::snapshots::ClaudeTerminalOffForTest::active() {
-        return terminal_off_on_raw_scan_capturing(
+        return terminal_off_on_raw_scan_at(
             fixture,
             index,
             cache,
             identity_capture,
+            collected_at,
             after_start,
         );
     }
@@ -172,7 +173,7 @@ fn raw_scan_at(
         SOURCE,
         std::slice::from_ref(&fixture.dir),
         index,
-        COLLECTED,
+        collected_at,
         BACKFILL_WINDOW_DAYS,
         100,
         false,
@@ -219,11 +220,12 @@ fn raw_scan_at(
     }
 }
 
-fn terminal_off_on_raw_scan_capturing(
+fn terminal_off_on_raw_scan_at(
     fixture: &Fixture,
     index: ScanIndex,
     cache: Option<Arc<SharedCache>>,
     identity_capture: bool,
+    collected_at: &str,
     mut after_start: impl FnMut(&mut OwnedSourceScan),
 ) -> Run {
     // Each call compares a deliberately serviced native-reader page with a
