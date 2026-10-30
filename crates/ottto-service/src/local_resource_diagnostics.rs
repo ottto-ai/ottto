@@ -2824,3 +2824,23 @@ pub(crate) fn scan_index_repair_required(
         }),
     );
 }
+
+/// V2 growth counters use the existing local #799 row. No keys or paths.
+pub(crate) fn v2_growth_retained(bytes: u64) {
+    claude_state_v2(&serde_json::json!({"v2_growth_retained": {"files": 1, "bytes": bytes}}));
+}
+pub(crate) fn v2_growth_revalidate(uncertain: bool) {
+    claude_state_v2(
+        &serde_json::json!({"v2_growth_revalidate": {"stats": 1, "uncertain": u64::from(uncertain)}}),
+    );
+}
+pub(crate) fn v2_growth_uncertain_alarm(passes: u32) {
+    traversal_point(
+        "v2_growth_uncertain_alarm",
+        "claude_code",
+        &serde_json::json!({"consecutive_passes": passes}),
+    );
+}
+pub(crate) fn census_retire_skipped_grown() {
+    claude_state_v2(&serde_json::json!({"census_retire_skipped_grown": 1}));
+}
