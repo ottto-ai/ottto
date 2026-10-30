@@ -1177,6 +1177,111 @@ mod application_cases {
         }
     }
 
+    /// [format] real-data traversal admission: 3 MiB imports byte-equal in chunks;
+    /// over-cap JSON refuses before publication, on expansion and on fenced save.
+    #[test]
+    fn large_traversal_import_roundtrips_and_above_cap_refuses() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/scan_index/real-shaped-v1.json"
+        ))
+        .unwrap();
+        for target in [3 * 1024 * 1024, 16 * 1024 * 1024 + 1] {
+            let c = Corpus::new();
+            let mut index = ScanIndex {
+                traversal: serde_json::from_value(fixture["logical"]["traversal"].clone()).unwrap(),
+                ..Default::default()
+            };
+            let traversal = index.traversal.as_mut().unwrap();
+            traversal.observed_index_keys = (0..target / 133 - 20)
+                .map(|n| format!("synthetic-{n:0120}"))
+                .collect();
+            let len = serde_json::to_vec(traversal).unwrap().len();
+            traversal
+                .context_fingerprint
+                .push_str(&"x".repeat(target - len));
+            let expected = serde_json::to_vec(&index.traversal).unwrap();
+            assert_eq!(expected.len(), target);
+            let original_bytes = serde_json::to_vec(&index).unwrap();
+            ottto_core::write_owner_only_file_atomic(&c.path, &original_bytes).unwrap();
+            let progress = serde_json::to_vec(&serde_json::json!({
+                "schema_version": 3, "generation": 0,
+                "destination_namespace_hash": c.binding().namespace_hash
+            }))
+            .unwrap();
+            let progress_path =
+                crate::snapshot_sync::with_state_v2_progress_lock(&c.path, |path| {
+                    ottto_core::write_owner_only_file_atomic(path, &progress)?;
+                    Ok(path.to_owned())
+                })
+                .unwrap();
+            let mut original = Original::read(&c.path).unwrap();
+            let identity = Identity {
+                format: FORMAT,
+                db_id: "large-traversal".into(),
+                binding: c.binding(),
+                fence_generation: 1,
+            };
+            let mut db =
+                sqlite::Sqlite::create_import(&fence::sibling(&c.path, ".v2.sqlite.import"))
+                    .unwrap();
+            db.path_extractor(kinds::private_paths);
+            db.reference_extractor(kinds::references);
+            db.control("identity", &identity).unwrap();
+            db.control("generation", &0_u64).unwrap();
+            let result = ClaudeMapper.import_graph(&mut db, &index, Some(&original));
+            let key = mapper::key("scan_state.traversal", "", 0).unwrap();
+            if target > 16 * 1024 * 1024 {
+                let error = result.err().unwrap();
+                assert!(error.to_string().contains("state_v2_value_admission"));
+                let compressed = codec::encode(&expected).unwrap();
+                assert!(compressed.len() < 1024 * 1024);
+                assert_eq!(
+                    codec::expand(&compressed, value_cap(&key))
+                        .unwrap_err()
+                        .to_string(),
+                    "state_v2_value_admission"
+                );
+                assert_eq!(fs::read(&c.path).unwrap(), original_bytes);
+                assert_eq!(fs::read(&progress_path).unwrap(), progress);
+                assert!(!fence::sibling(&c.path, ".v2.sqlite").exists());
+                continue;
+            }
+            result.unwrap();
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            let header = tx.get(&key).unwrap().unwrap();
+            assert!(header.parts > 0);
+            let stored = mapper::bytes(&mut tx, &header).unwrap();
+            assert_eq!(codec::expand(&stored, value_cap(&key)).unwrap(), expected);
+            drop(tx);
+            let restored = ClaudeMapper.hydrate(&mut db).unwrap();
+            assert_eq!(serde_json::to_vec(&restored.traversal).unwrap(), expected);
+            original.capture_progress(&c.path).unwrap();
+            original.preserve(&c.path).unwrap();
+            original
+                .publish_import(&c.path, &identity, db, &mut false)
+                .unwrap();
+            let _lock = super::super::super::CheckpointLock::acquire(&c.path).unwrap();
+            let mut current = super::super::runtime::load_locked(&c.path, None, true)
+                .unwrap()
+                .0
+                .unwrap();
+            let fence_bytes = fs::read(&c.path).unwrap();
+            current.traversal.as_mut().unwrap().context_fingerprint = "x".repeat(16 * 1024 * 1024);
+            let error =
+                super::super::runtime::save_locked(&c.path, &mut current, false, None, true)
+                    .unwrap_err();
+            assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::DbUnavailable));
+            let reloaded = super::super::runtime::load_locked(&c.path, None, true)
+                .unwrap()
+                .0
+                .unwrap();
+            assert_eq!(reloaded.generation, 1);
+            assert_eq!(serde_json::to_vec(&reloaded.traversal).unwrap(), expected);
+            assert_eq!(fs::read(&c.path).unwrap(), fence_bytes);
+            assert_eq!(fs::read(&progress_path).unwrap(), progress);
+        }
+    }
+
     /// [format] import publication holds progress owner and reopens real claude mapper at new generation.
     #[test]
     fn import_publication_holds_progress_owner_and_reopens_real_claude_mapper_at_new_generation() {

@@ -12,6 +12,30 @@ values preserve presence, spelling and exact accounting evidence. Variable
 values use at most 256 parts of 256 KiB each, or inline storage up to 512 bytes.
 Unchunked keys and strings have a checked 4 KiB fallback cap.
 
+Whole v1 traversal fields have these per-value logical JSON admission caps,
+applied before compression and again during bounded decompression:
+
+| Record kind | Cap |
+| --- | --- |
+| `scan_state.traversal` | 16 MiB |
+| `scan_state.scan_residue_witness` | 16 MiB |
+| `scan_state.claude_stale_family_carry` | 16 MiB |
+
+These fields already hold their complete queues and sets in memory in v1.
+Measured traversal members reached 2,848,835 bytes; residue and stale-family
+carry members reached 24,083 and 1,171 bytes respectively. The bounded exception
+allows collection-wide queues to grow without splitting their semantic members.
+Stored bytes still use the same optional zstd codec and `value_chunks` (256 KiB
+per part); compression cannot bypass the logical cap. Other kind caps are
+unchanged, including the existing 8 MiB birth-store allowance. This exception
+does not raise mutable account/usage caps or replace their segmentation policy
+(64 KiB target / 1 MiB segment cap).
+
+Above-cap values refuse with `state_v2_value_admission`. Before a durable fence,
+the existing import pause and alarm retain v1 collection and leave upload progress
+unchanged. After a fence, the existing named storage hold and diagnostics apply;
+no stale-v1 fallback or reset is permitted. See the recovery guidance below.
+
 Request-set lookup commitments are nonunique. Reuse requires streamed equality
 of the complete evidence tuple, including encoding, payload, full fingerprint,
 optional identity revision and count presence. Reference updates preserve the

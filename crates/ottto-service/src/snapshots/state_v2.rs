@@ -345,6 +345,18 @@ fn value_cap(key: &RowKey) -> u64 {
     match key {
         RowKey::Meta(_) => CONTROL_BYTES,
         RowKey::Record { kind, .. } if kind.name().starts_with("raw_hold.") => VALUE_BYTES,
+        // These whole v1 fields retain traversal queues/sets in memory already.
+        // Bound logical JSON on both admission and decompression, before chunks.
+        RowKey::Record { kind, .. }
+            if matches!(
+                kind.name(),
+                "scan_state.traversal"
+                    | "scan_state.scan_residue_witness"
+                    | "scan_state.claude_stale_family_carry"
+            ) =>
+        {
+            16 * 1024 * 1024
+        }
         RowKey::Record { kind, .. }
             if matches!(
                 kind.name(),
