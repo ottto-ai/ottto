@@ -1249,6 +1249,7 @@ fn u3_measured_repository_identity_is_the_finished_value() {
         "f".repeat(64),
         None,
         Some(u3_identity("measured")),
+        false,
     );
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].repository_hash.as_deref(), Some("hash-measured"));

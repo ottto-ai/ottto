@@ -1410,7 +1410,7 @@ impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
         self,
     ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>> {
         match self {
-            Self::Restored(taken) => Some(*taken),
+            Self::Restored(taken, _) => Some(*taken),
             Self::Miss(_) => None,
             Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
         }

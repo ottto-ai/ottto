@@ -16138,3 +16138,66 @@ pub(in crate::snapshots) fn advance_scanner_clock_past_eviction_fillers(cache: &
         .unwrap();
     stores.retail_full_now = Some(latest + std::time::Duration::from_secs(1));
 }
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn non_pi_fork_live_encode_refusal_is_counted_and_writes_nothing() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let root = crate::test_scratch::ScratchDir::new("m2-non-pi-fork-refused");
+        let _lock = test_locks::hold(&root);
+        let path = root.join("fixture.jsonl");
+        std::fs::write(&path, b"{\"type\":\"session\",\"id\":\"fixture\"}\n").unwrap();
+        let scope = Scope("m2-non-pi-fork-refused".into());
+        let (_, checkpoint) = native_record_of(&path, &scope, source);
+        let mut accumulator = SnapshotAccumulator::new(source);
+        let report = JsonlReadReport::default();
+        let index_path = root.join("index.json");
+        let mut index = ScanIndex::default();
+        index.save(&index_path).unwrap();
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &scope, false);
+        let store::LeaseWait::Granted(mut lease) = cache.acquire_active(source, 0) else {
+            panic!("isolated active lease");
+        };
+        let key = local_index_key(&path);
+        let held = File::open(&path).unwrap();
+        let counting = ImmutableCounting::from_accumulator(&accumulator).unwrap();
+        let chain = cache
+            .durable_capture_chain(
+                &mut lease,
+                source,
+                &key,
+                "synthetic-object",
+                &held,
+                &checkpoint,
+                &index,
+                true,
+                &counting,
+            )
+            .unwrap();
+        accumulator.seen_pi_usage_keys = PiLedger::from_parts(BTreeMap::new(), true, Some(1));
+        let view = LiveFinishView::new(
+            &accumulator,
+            &report,
+            0,
+            0,
+            false,
+            &checkpoint,
+            &chain,
+            jsonl_line_cap() as u64,
+        )
+        .unwrap();
+        match cache.prepare_live(&mut lease, view) {
+            PrepareOutcome::NotPersisted(NotPersisted::Codec) => {}
+            _ => panic!("a non-Pi fork must refuse"),
+        }
+        let counts = &cache.durable().unwrap().counters;
+        assert_eq!(counts.retained_refused_pi_ledger_cap, 0);
+        assert_eq!(
+            counts.not_persisted.get("wa.codec").copied().unwrap_or(0),
+            1
+        );
+        lease.release();
+        assert_eq!(cache.durable_counters(source).unwrap().1.disk_records, 0);
+    }
+}

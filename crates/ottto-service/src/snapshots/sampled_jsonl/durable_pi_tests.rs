@@ -37,7 +37,7 @@ fn ledger() -> BTreeMap<String, PiUsageDedupState> {
 
 fn reduction(keys: BTreeMap<String, PiUsageDedupState>) -> CachedJsonlReduction {
     let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Pi);
-    accumulator.seen_pi_usage_keys = keys;
+    *accumulator.seen_pi_usage_keys = keys;
     CachedJsonlReduction {
         accumulator,
         report: JsonlReadReport::default(),
@@ -76,8 +76,10 @@ fn body(reduction: &CachedJsonlReduction) -> Result<Vec<u8>, Refuse> {
 
 fn section(keys: &BTreeMap<String, PiUsageDedupState>) -> Vec<u8> {
     let mut e = Enc::bytes(RECORD_BYTES);
-    e.section(SECTION_TAG, |e| PiSection::put_borrowed(e, keys))
-        .unwrap();
+    e.section(SECTION_TAG, |e| {
+        PiSection::put_borrowed(e, keys, &false, &None)
+    })
+    .unwrap();
     e.into_bytes()
 }
 
@@ -95,7 +97,9 @@ fn back_patched(reduction: &CachedJsonlReduction) -> Vec<u8> {
     let start = out.len();
     out.extend([0_u8; 8]);
     let mut e = Enc::bytes(RECORD_BYTES);
-    PiSection::put_borrowed(&mut e, &reduction.accumulator.seen_pi_usage_keys).unwrap();
+    let ledger = &reduction.accumulator.seen_pi_usage_keys;
+    let (has_parent, header_nanos) = ledger.fork_parts();
+    PiSection::put_borrowed(&mut e, ledger.usage_keys(), &has_parent, &header_nanos).unwrap();
     out.extend(e.into_bytes());
     let len = (out.len() - start - 8) as u64;
     out[start..start + 8].copy_from_slice(&len.to_le_bytes());
@@ -152,12 +156,14 @@ fn pi_section_bytes_are_pinned() {
         },
     )]);
     let golden = [
-        &[1_u8, 101, 0, 0, 0, 0, 0, 0, 0, 1][..],
+        &[1_u8, 103, 0, 0, 0, 0, 0, 0, 0, 1][..],
         &[0x11; 32],
         &[1],
         &[0x22; 32],
         &[1, 0, 1],
         &[0x33; 32],
+        // M-2: `has_parent` false, no header time.
+        &[0, 0],
     ]
     .concat();
     assert_eq!(section(&keys), golden);
@@ -479,4 +485,275 @@ fn pi_registered_bounded_decode_charges_the_shared_graph_and_ledger() {
         Err(DecodeFailure::Budget)
     ));
     lease.release();
+}
+
+const FORK_TIME: &str = "2026-10-27T06:00:00.000000001Z";
+const PARENT_CANARY: &str = "/synthetic/CANARY_M2_PARENT/session.jsonl";
+
+fn fork_header(parent: Option<&str>, at: &str) -> Value {
+    serde_json::json!({"type":"session", "id":"synthetic-m2-fork",
+        "timestamp":at, "parentSession":parent})
+}
+fn fork_usage(kind: &str, id: &str, at: &str, input: u64) -> Value {
+    let usage = serde_json::json!({"input":input, "output":2});
+    if matches!(kind, "compaction" | "branch_summary" | "usage") {
+        serde_json::json!({"type":kind, "id":id, "timestamp":at, "usage":usage})
+    } else {
+        serde_json::json!({"type":kind, "id":id, "timestamp":at,
+            "message":{"role":"assistant", "responseId":id, "model":"gpt-5.4",
+                "timestamp":at, "usage":usage}})
+    }
+}
+
+#[test]
+fn fork_copies_before_the_header_skip_usage_but_at_and_after_count() {
+    use crate::local_resource_diagnostics::cache_lifecycle;
+    for kind in [
+        "message",
+        "message_end",
+        "compaction",
+        "branch_summary",
+        "usage",
+    ] {
+        let mut acc = SnapshotAccumulator::new(SnapshotSource::Pi);
+        apply_pi_line(&fork_header(Some(PARENT_CANARY), FORK_TIME), &mut acc);
+        let (_, counts) = cache_lifecycle::observe(|| {
+            apply_pi_line(
+                &fork_usage(kind, "before", "2026-10-27T06:00:00Z", 100),
+                &mut acc,
+            );
+            apply_pi_line(&fork_usage(kind, "at", FORK_TIME, 20), &mut acc);
+            apply_pi_line(
+                &fork_usage(kind, "after", "2026-10-27T06:00:00.000000002Z", 30),
+                &mut acc,
+            );
+            acc.seen_pi_usage_keys.finish_fork_read(|_| false);
+        });
+        assert_eq!(acc.accepted_usage_totals.input_tokens, 50, "{kind}");
+        assert_eq!(acc.accepted_usage_totals.request_count, 2, "{kind}");
+        assert_eq!(counts.pi_fork_copies_skipped_entries, 1);
+        assert_eq!(counts.pi_fork_copies_skipped_tokens, 102);
+        assert_eq!(counts.pi_fork_parent_unseen, 1);
+        assert!(acc
+            .seen_pi_usage_keys
+            .fork
+            .as_ref()
+            .unwrap()
+            .parent_ref
+            .is_none());
+        // An ordinary file keeps historical usage, with normal identity.
+        let mut ordinary = SnapshotAccumulator::new(SnapshotSource::Pi);
+        apply_pi_line(&fork_header(None, FORK_TIME), &mut ordinary);
+        apply_pi_line(
+            &fork_usage(kind, "before", "2026-10-27T06:00:00Z", 100),
+            &mut ordinary,
+        );
+        assert_eq!(ordinary.accepted_usage_totals.input_tokens, 100);
+    }
+}
+
+#[test]
+fn fork_cutoff_uses_envelope_then_provider_only_when_envelope_is_absent() {
+    let header = fork_header(Some(PARENT_CANARY), FORK_TIME);
+    let mut acc = SnapshotAccumulator::new(SnapshotSource::Pi);
+    apply_pi_line(&header, &mut acc);
+    let mut value = fork_usage("message", "envelope", "2026-10-27T05:59:59Z", 100);
+    value["message"]["timestamp"] = serde_json::json!("2026-10-27T07:00:00Z");
+    apply_pi_line(&value, &mut acc); // old envelope, later provider: copied
+    assert_eq!(acc.accepted_usage_totals.input_tokens, 0);
+    value["message"]["responseId"] = serde_json::json!("provider");
+    value["message"]["timestamp"] = serde_json::json!("2026-10-27T05:59:59Z");
+    value.as_object_mut().unwrap().remove("timestamp");
+    apply_pi_line(&value, &mut acc); // absent envelope: provider proves copied
+    assert_eq!(acc.accepted_usage_totals.input_tokens, 0);
+    value["timestamp"] = serde_json::json!("invalid");
+    value["message"]["responseId"] = serde_json::json!("invalid-envelope");
+    apply_pi_line(&value, &mut acc); // invalid envelope cannot prove a copy
+    assert_eq!(acc.accepted_usage_totals.input_tokens, 100);
+    value.as_object_mut().unwrap().remove("timestamp");
+    value["message"]
+        .as_object_mut()
+        .unwrap()
+        .remove("timestamp");
+    value["message"]["responseId"] = serde_json::json!("no-clock");
+    apply_pi_line(&value, &mut acc);
+    assert_eq!(acc.accepted_usage_totals.input_tokens, 200);
+    for at in ["invalid", ""] {
+        let mut acc = SnapshotAccumulator::new(SnapshotSource::Pi);
+        apply_pi_line(&fork_header(Some(PARENT_CANARY), at), &mut acc);
+        apply_pi_line(
+            &fork_usage("message", "old", "2026-10-26T00:00:00Z", 100),
+            &mut acc,
+        );
+        assert_eq!(
+            acc.accepted_usage_totals.input_tokens, 100,
+            "unknown header clock"
+        );
+    }
+}
+
+#[test]
+fn fork_round_trip_keeps_only_the_two_n_fields_and_funds_the_box() {
+    let mut original = reduction(ledger());
+    original
+        .accumulator
+        .seen_pi_usage_keys
+        .note_header(&fork_header(Some(PARENT_CANARY), FORK_TIME));
+    let bytes = body(&original).unwrap();
+    assert!(!bytes
+        .windows(PARENT_CANARY.len())
+        .any(|w| w == PARENT_CANARY.as_bytes()));
+    assert!(!format!("{:?}", original.accumulator).contains(PARENT_CANARY));
+    assert_eq!(verify_without_allocation(&bytes), Ok(()));
+    let decoded = take_body(&mut Dec::new(&bytes)).unwrap();
+    let fork = decoded
+        .reduction
+        .accumulator
+        .seen_pi_usage_keys
+        .fork
+        .as_ref()
+        .unwrap();
+    assert!(fork.has_parent);
+    assert_eq!(fork.header_nanos, pi_timestamp_nanos(FORK_TIME));
+    assert!(fork.parent_ref.is_none());
+    assert_eq!(body(&decoded.reduction).unwrap(), bytes);
+    let cloned = original.accumulator.seen_pi_usage_keys.clone();
+    assert!(cloned.fork.as_ref().unwrap().parent_ref.is_none());
+}
+
+#[test]
+fn non_pi_fork_refuses_instead_of_silently_dropping_and_default_is_empty() {
+    use crate::durable_tail_codec::DurableEmpty;
+    let mut ledger = PiLedger::default();
+    ledger.fork = Some(Box::default());
+    assert!(ledger.durable_empty());
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let mut acc = SnapshotAccumulator::new(source);
+        acc.seen_pi_usage_keys =
+            PiLedger::from_parts(BTreeMap::new(), true, pi_timestamp_nanos(FORK_TIME));
+        assert!(!acc.seen_pi_usage_keys.durable_empty());
+        assert_eq!(
+            acc.put(&mut Enc::count(RECORD_BYTES)),
+            Err(Refuse::NonEmpty("SnapshotAccumulator.seen_pi_usage_keys"))
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "native heap layout")]
+fn fork_heap_bound_charges_inline_box_allocation_and_parent_capacity() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    // Measure the decoder's charge on an empty ledger (no native tree layout).
+    let with_fork = PiLedger::from_parts(BTreeMap::new(), true, pi_timestamp_nanos(FORK_TIME));
+    let mut e = Enc::bytes(RECORD_BYTES);
+    let (has_parent, nanos) = with_fork.fork_parts();
+    e.section(SECTION_TAG, |e| {
+        PiSection::put_borrowed(e, with_fork.usage_keys(), &has_parent, &nanos)
+    })
+    .unwrap();
+    let section = e.into_bytes();
+    let mut charged = 0;
+    let mut grant = |n| {
+        charged += n;
+        true
+    };
+    let mut d = Dec::bounded(&section, &mut grant);
+    take_ledger(&mut d).unwrap();
+    d.finish().unwrap();
+    assert!(charged >= std::mem::size_of::<PiFork>() as u64);
+    let base = PiLedger::default();
+    assert_eq!(
+        std::mem::size_of::<PiLedger>(),
+        std::mem::size_of::<BTreeMap<String, PiUsageDedupState>>() + 8
+    );
+    let mut fork = base.clone();
+    fork.note_header(&fork_header(Some(PARENT_CANARY), FORK_TIME));
+    let extra = std::mem::size_of::<PiFork>()
+        + std::mem::align_of::<PiFork>()
+        + fork
+            .fork
+            .as_ref()
+            .unwrap()
+            .parent_ref
+            .as_ref()
+            .unwrap()
+            .capacity();
+    for measure in [
+        crate::heap_layout_bound::bound::<PiLedger>,
+        crate::heap_layout_bound::completed_bound::<PiLedger>,
+    ] {
+        let before = measure(&base, usize::MAX).unwrap();
+        let after = measure(&fork, usize::MAX).unwrap();
+        assert_eq!(after - before, extra);
+        assert!(measure(&fork, after - 1).is_none());
+    }
+}
+
+#[test]
+fn fork_parent_membership_is_full_read_only_and_never_retained() {
+    use crate::local_resource_diagnostics::cache_lifecycle;
+    for known in [false, true] {
+        let mut ledger = PiLedger::default();
+        ledger.note_header(&fork_header(Some(PARENT_CANARY), FORK_TIME));
+        let (_, counts) = cache_lifecycle::observe(|| {
+            assert!(ledger.skip_fork_copy(&fork_usage(
+                "message",
+                "old",
+                "2026-10-27T05:00:00Z",
+                10
+            )));
+            ledger.finish_fork_read(|parent| {
+                assert_eq!(parent, PARENT_CANARY);
+                known
+            });
+            // The parent value ends with the Full read. Even another skipped
+            // entry cannot recreate a parent membership count during Tail.
+            assert!(ledger.skip_fork_copy(&fork_usage(
+                "message",
+                "tail-old",
+                "2026-10-27T05:00:00Z",
+                10
+            )));
+            ledger.finish_fork_read(|_| panic!("Tail must not acquire parent history"));
+        });
+        assert_eq!(counts.pi_fork_copies_skipped_entries, 2);
+        assert_eq!(counts.pi_fork_parent_unseen, u64::from(!known));
+        assert!(ledger.fork.as_ref().unwrap().parent_ref.is_none());
+    }
+}
+
+#[test]
+fn fork_section_semantics_agree_between_verify_and_decode() {
+    let reduction = reduction(BTreeMap::new());
+    let original = body(&reduction).unwrap();
+    let prefix = original.len() - section(&BTreeMap::new()).len();
+    let mut e = Enc::bytes(RECORD_BYTES);
+    e.section(SECTION_TAG, |e| {
+        PiSection::put_borrowed(e, &BTreeMap::new(), &false, &Some(1))
+    })
+    .unwrap();
+    let bad = [&original[..prefix], &e.into_bytes()].concat();
+    assert_eq!(verify_without_allocation(&bad), Err(Corrupt));
+    assert!(take_body(&mut Dec::new(&bad)).is_err());
+}
+
+#[test]
+fn copied_top_level_usage_keeps_the_model_for_owned_summaries() {
+    let mut acc = SnapshotAccumulator::new(SnapshotSource::Pi);
+    apply_pi_line(&fork_header(Some(PARENT_CANARY), FORK_TIME), &mut acc);
+    let mut copied = fork_usage("usage", "copy", "2026-10-27T05:59:59Z", 100);
+    copied["model"] = serde_json::json!("copied-context-model");
+    apply_pi_line(&copied, &mut acc);
+    assert_eq!(acc.latest_model.as_deref(), Some("copied-context-model"));
+    for kind in ["compaction", "branch_summary"] {
+        apply_pi_line(&fork_usage(kind, kind, FORK_TIME, 20), &mut acc);
+    }
+    assert_eq!(acc.accepted_usage_totals.input_tokens, 40);
+    assert!(acc
+        .usage_buckets
+        .values()
+        .flat_map(|b| b.rows.keys())
+        .all(|k| k.model == "copied-context-model"));
 }

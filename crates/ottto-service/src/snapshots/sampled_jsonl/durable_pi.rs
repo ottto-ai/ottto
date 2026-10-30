@@ -4,6 +4,8 @@
 //! has no envelope field and no format number. `A_P` binds it through the
 //! `ottto-dt-ext:pi-ledger:v1` domain and `PiSection`'s shape. Ledger keys and
 //! occurrence digests are SOURCE option A `H` values (64-char lower hex).
+//! M-2 adds the fork state's two `N` values: `has_parent` and the header
+//! time. `parentSession` itself is never persisted.
 use super::*;
 
 /// Response-id keys, not occurrences. Oversized ledgers refuse, never truncate.
@@ -13,9 +15,13 @@ const SECTION_TAG: u64 = 1;
 
 struct PiSection {
     usage_keys: BTreeMap<String, PiUsageDedupState>,
+    has_parent: bool,
+    header_nanos: Option<i128>,
 }
 crate::durable_tail_codec::durable_struct!(borrowed PiSection {
     H usage_keys: BTreeMap<String, PiUsageDedupState>,
+    N has_parent: bool,
+    N header_nanos: Option<i128>,
 });
 
 /// What `A_P` adds after the shared shapes.
@@ -37,7 +43,8 @@ pub(in crate::snapshots) fn put_body(
     if acc.source != SnapshotSource::Pi {
         return Err(Refuse::NotRederivable("SnapshotAccumulator.source"));
     }
-    let keys = &acc.seen_pi_usage_keys;
+    let keys = acc.seen_pi_usage_keys.usage_keys();
+    let (has_parent, header_nanos) = acc.seen_pi_usage_keys.fork_parts();
     if keys.len() > PI_LEDGER_MAX_KEYS {
         return Err(Refuse::TooLarge);
     }
@@ -49,7 +56,9 @@ pub(in crate::snapshots) fn put_body(
         scalars.2.put(e)
     })?;
     rederive.put(e)?;
-    e.section(SECTION_TAG, |e| PiSection::put_borrowed(e, keys))
+    e.section(SECTION_TAG, |e| {
+        PiSection::put_borrowed(e, keys, &has_parent, &header_nanos)
+    })
 }
 
 /// Header-dispatched Pi verification row; the table admits only format 3.
@@ -64,7 +73,10 @@ pub(crate) fn verify_body(d: &mut Dec<'_>) -> Result<(), Corrupt> {
     Rederive::verify(d)?;
     d.section(SECTION_TAG, |d| {
         ledger_bound(d)?;
-        PiSection::verify(d)
+        <BTreeMap<String, PiUsageDedupState> as crate::durable_tail_codec::HDigest>::verify_h(d)?;
+        let has_parent = bool::take(d)?;
+        let header_nanos = Option::<i128>::take(d)?;
+        valid_fork_fields(has_parent, header_nanos)
     })?;
     d.refilled_section();
     d.ended()
@@ -88,11 +100,29 @@ pub(crate) fn take_body(d: &mut Dec<'_>) -> Result<Decoded, Corrupt> {
     })
 }
 
-fn take_ledger(d: &mut Dec<'_>) -> Result<BTreeMap<String, PiUsageDedupState>, Corrupt> {
+fn take_ledger(d: &mut Dec<'_>) -> Result<PiLedger, Corrupt> {
     d.section(SECTION_TAG, |d| {
         ledger_bound(d)?;
-        Ok(PiSection::take(d)?.usage_keys)
+        let section = PiSection::take(d)?;
+        // Only the writer's two shapes: no parent and no time, or a parent.
+        valid_fork_fields(section.has_parent, section.header_nanos)?;
+        if section.has_parent {
+            // Charge the complete Box before allocating it, including its
+            // empty RAM-only fields, through the shared bounded decoder.
+            d.slots::<PiFork>(1)?;
+        }
+        Ok(PiLedger::from_parts(
+            section.usage_keys,
+            section.has_parent,
+            section.header_nanos,
+        ))
     })
+}
+
+fn valid_fork_fields(has_parent: bool, header_nanos: Option<i128>) -> Result<(), Corrupt> {
+    (has_parent || header_nanos.is_none())
+        .then_some(())
+        .ok_or(Corrupt)
 }
 
 /// The key count, checked before the ledger allocates or charges anything.

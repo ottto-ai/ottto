@@ -1806,3 +1806,154 @@ fn pi_same_length_prompt_rewrite_hits_the_rederive_fence() {
     let quiet = f.emit_bodies(Mode::Restart);
     assert_eq!((quiet.modes.0, quiet.modes.1), (0, 0));
 }
+
+/// M-2: copied usage arrives after the header, preserving old envelope time.
+/// Include every entry shape and a message/message_end pair split by restore.
+fn m2_turn(kind: &str, id: &str, at: &str, input: u64) -> Value {
+    if matches!(kind, "compaction" | "branch_summary" | "usage") {
+        json!({"type":kind, "id":id, "timestamp":at,
+            "usage":{"input":input,"output":2,"cost":{"total":0.001}}})
+    } else {
+        let mut value = pi_turn(kind, Some(id), input, at);
+        value["timestamp"] = json!(at);
+        value
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "Pi restore requires qualified native heap layout"
+)]
+fn pi_fork_tail_restart_and_eviction_equal_cold_full_at_each_cut() {
+    if !supported("pi_m2_fork") {
+        return;
+    }
+    let initial = pi_seed().replacen(
+        &pi_header("synthetic-pi-session", 3, None),
+        &pi_header("synthetic-pi-session", 3, Some(CANARY_PARENT)),
+        1,
+    );
+    let mut f = PiDriver::warm("pi-m2-fork", &initial);
+    let mut requests = 1_u64;
+    let mut lines = Vec::new();
+    for kind in [
+        "message",
+        "message_end",
+        "compaction",
+        "branch_summary",
+        "usage",
+    ] {
+        lines.push((
+            m2_turn(kind, &format!("copied-{kind}"), "2026-10-27T05:59:59Z", 100),
+            false,
+        ));
+        lines.push((
+            m2_turn(kind, &format!("at-{kind}"), "2026-10-27T06:00:00Z", 20),
+            true,
+        ));
+        lines.push((
+            m2_turn(kind, &format!("after-{kind}"), "2026-10-27T06:01:00Z", 30),
+            true,
+        ));
+    }
+    // Same identity at/after the header uses the normal pairing ledger.
+    lines.push((
+        m2_turn("message", "paired", "2026-10-27T06:02:00Z", 40),
+        true,
+    ));
+    lines.push((
+        m2_turn("message_end", "paired", "2026-10-27T06:02:00Z", 40),
+        false,
+    ));
+    for (line, counted) in lines {
+        let tail = f.grow(&[line]);
+        requests += u64::from(counted);
+        let cold = f.emit_bodies(Mode::ColdFull);
+        assert_eq!(cold.snapshots[&f.entity]["request_count"], json!(requests));
+        for mode in [Mode::Ram, Mode::Restart, Mode::EvictRetry] {
+            let route = f.emit_bodies(mode);
+            assert_eq!(route.modes, (0, 1, 0));
+            if mode != Mode::Ram {
+                assert_eq!(route.restored, 1);
+            }
+            assert_eq!(route.io.consumed, tail + route.io.rederive_head);
+            money_oracle::assert_equivalent(&cold, &route);
+            whole_body(&cold, &route);
+            for batch in &route.batches {
+                assert_private("fork upload", batch);
+            }
+        }
+        f.save_gc(Mode::EvictRetry);
+        for bytes in f.disk.record_bytes().values() {
+            assert_private("fork record", bytes);
+        }
+        f.restart();
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "Pi restore requires qualified native heap layout"
+)]
+fn pi_fork_unknown_parent_counts_skips_without_uploading_parent_and_lower_money_publishes() {
+    if !supported("pi_m2_lower") {
+        return;
+    }
+    for all_copied in [false, true] {
+        use crate::local_resource_diagnostics::cache_lifecycle;
+        let copy = m2_turn("message", "copied", "2026-10-27T05:59:59Z", 100);
+        let inflated = pi_seed() + &pi_json(copy);
+        let mut f = PiDriver::warm("pi-m2-lower", &inflated);
+        assert_eq!(f.accepted[&f.entity].body["request_count"], json!(2));
+        // A normal file edit exercises the correction; M-2 adds no replay cause.
+        let mut fork_header = pi_header("synthetic-pi-session", 3, Some(CANARY_PARENT));
+        if all_copied {
+            fork_header = fork_header.replace("2026-10-27T06:00:00Z", "2026-10-27T08:00:00Z");
+        }
+        let corrected =
+            inflated.replacen(&pi_header("synthetic-pi-session", 3, None), &fork_header, 1);
+        std::fs::write(&f.path, corrected).unwrap();
+        input_clock(&f.path);
+        let ((route, events), counts) = cache_lifecycle::observe(|| {
+            crate::local_resource_diagnostics::capture(|| f.emit_bodies(Mode::Ram))
+        });
+        assert_eq!(
+            counts.pi_fork_copies_skipped_entries,
+            if all_copied { 2 } else { 1 }
+        );
+        assert_eq!(
+            counts.pi_fork_copies_skipped_tokens,
+            if all_copied { 128 } else { 109 }
+        );
+        assert_eq!(counts.pi_fork_parent_unseen, if all_copied { 2 } else { 1 });
+        assert_eq!(
+            route.snapshots[&f.entity]["request_count"],
+            json!(u64::from(!all_copied))
+        );
+        assert!(
+            route.snapshots[&f.entity]["input_tokens"].as_u64().unwrap()
+                < f.accepted[&f.entity].body["input_tokens"].as_u64().unwrap()
+        );
+        assert!(
+            !route.batches.is_empty(),
+            "lower usage publishes as an ordinary revision"
+        );
+        for batch in &route.batches {
+            assert_private("corrected fork upload", batch);
+        }
+        assert_private(
+            "Full fork diagnostics",
+            &serde_json::to_vec(&events).unwrap(),
+        );
+        f.save_gc(Mode::Ram);
+        f.restart();
+        let quiet = f.emit_bodies(Mode::Restart);
+        assert_eq!(
+            quiet.modes.0, 0,
+            "a copied-only fork is complete, with no repeated Full"
+        );
+        assert_eq!(quiet.io.consumed, 0);
+    }
+}

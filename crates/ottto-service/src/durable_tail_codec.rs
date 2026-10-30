@@ -346,7 +346,8 @@ impl<'a> Dec<'a> {
         self.refused |= !granted;
         granted.then_some(()).ok_or(Corrupt)
     }
-    fn slots<T>(&mut self, len: usize) -> Result<(), Corrupt> {
+    // Typed Pi-section reconstruction also charges its RAM-only wrapper.
+    pub(crate) fn slots<T>(&mut self, len: usize) -> Result<(), Corrupt> {
         self.reserve(len.checked_mul(std::mem::size_of::<T>()))
     }
     pub(crate) fn tree<K, V>(&mut self, len: usize) -> Result<(), Corrupt> {
@@ -847,6 +848,72 @@ fn verify_entries<'a, K: Ord>(
 pub(crate) trait DurableEmpty {
     fn durable_empty(&self) -> bool;
 }
+
+mod pi_only_sealed {
+    pub trait Sealed {}
+}
+
+/// A Pi-only runtime type behind a labelled `E` field
+/// (`E f: Real as Label`). The shape keeps `Label`'s text, so the shared
+/// allowlist digests do not move when Pi-only state grows. Sealed: only the
+/// types next to `PI_ONLY_E_LABELS` implement it, and the labelled arm of
+/// `durable_struct!` refuses to compile for any other type, path or label.
+pub(crate) trait PiOnlyDurable: pi_only_sealed::Sealed + DurableEmpty + Default {
+    /// The `Type.field` path the label is allowed on.
+    const FIELD: &'static str;
+    /// The type whose text the shape keeps.
+    type Label: ?Sized;
+}
+
+/// The labelled `E` allowlist: (field path, label text). One entry per sealed
+/// type; anything else is a compile error in `durable_struct!`.
+pub(crate) const PI_ONLY_E_LABELS: &[(&str, &str)] = &[
+    // M-2 (E1, 2026-10-30): the Pi usage ledger plus the Pi fork state. An
+    // `E` field: Claude and Codex must leave it empty, and Pi moves it into
+    // the Pi section under `A_P`. The shape keeps the pre-M-2 type text, so
+    // `A_C` 8d141d53… and `A_X` 02206079… stay byte-identical.
+    (
+        "SnapshotAccumulator.seen_pi_usage_keys",
+        "BTreeMap<String, PiUsageDedupState>",
+    ),
+];
+impl pi_only_sealed::Sealed for crate::snapshots::PiLedger {}
+
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Whether `path` is allowlisted and is the path `field` (the sealed type's
+/// own `FIELD`) names. Evaluated in a const by the labelled arm.
+pub(crate) const fn pi_only_label_allowed(path: &str, field: &str, label: &str) -> bool {
+    if !str_eq(path, field) {
+        return false;
+    }
+    let mut i = 0;
+    while i < PI_ONLY_E_LABELS.len() {
+        if str_eq(PI_ONLY_E_LABELS[i].0, path) && str_eq(PI_ONLY_E_LABELS[i].1, label) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Compiles only when `A` and `B` are the same type.
+pub(crate) trait SameType<T: ?Sized> {}
+impl<T: ?Sized> SameType<T> for T {}
+pub(crate) fn same_type<A: ?Sized + SameType<B>, B: ?Sized>() {}
 
 // Scalar validation stays identical to decode, including ranges and labels.
 macro_rules! scalar_verify {
@@ -1545,6 +1612,26 @@ macro_rules! durable_field {
     (shape E, $s:ident, $f:ident, $ty:ty) => {
         $s.push(concat!("E ", stringify!($f), ": ", stringify!($ty)))
     };
+    // A labelled `E` field: the shape keeps the label's text, exactly as the
+    // unlabelled arm above would print it for that type.
+    (shape E, $s:ident, $f:ident, $ty:ty, as $label:ty, $path:expr) => {{
+        const _: () = assert!(
+            $crate::durable_tail_codec::pi_only_label_allowed(
+                $path,
+                <$ty as $crate::durable_tail_codec::PiOnlyDurable>::FIELD,
+                stringify!($label),
+            ),
+            "labelled E field is not in PI_ONLY_E_LABELS"
+        );
+        $crate::durable_tail_codec::same_type::<
+            $label,
+            <$ty as $crate::durable_tail_codec::PiOnlyDurable>::Label,
+        >();
+        $s.push(concat!("E ", stringify!($f), ": ", stringify!($label)))
+    }};
+    (shape $c:ident, $s:ident, $f:ident, $ty:ty, as $label:ty, $path:expr) => {
+        compile_error!("only E fields may carry a shape label")
+    };
     (shape I, $s:ident, $f:ident, $ty:ty) => {
         $s.push(concat!("I ", stringify!($f), ": ", stringify!($ty)))
     };
@@ -1586,7 +1673,7 @@ macro_rules! durable_struct {
             }
         }
     };
-    ($t:ident { $($c:ident $f:ident : $ty:ty),* $(,)? }) => {
+    ($t:ident { $($c:ident $f:ident : $ty:ty $(as $label:ty)?),* $(,)? }) => {
         impl $crate::durable_tail_codec::Durable for $t {
             #[allow(unused_variables)]
             fn put(
@@ -1612,7 +1699,10 @@ macro_rules! durable_struct {
             }
             fn shape(s: &mut $crate::durable_tail_codec::Shape) {
                 if s.enter(stringify!($t)) {
-                    $($crate::durable_tail_codec::durable_field!(shape $c, s, $f, $ty);)*
+                    $($crate::durable_tail_codec::durable_field!(
+                        shape $c, s, $f, $ty
+                        $(, as $label, concat!(stringify!($t), ".", stringify!($f)))?
+                    );)*
                     s.leave();
                 }
             }

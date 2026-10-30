@@ -90,6 +90,12 @@ counters! {
     // Pi source-field parsing observations, independent of retention decisions.
     pi_cost_refused_overflow: PiCostRefusedOverflow,
     pi_cost_precision_rounded: PiCostPrecisionRounded,
+    // M-2 Pi fork copies (SOURCE option (a)): fixed content-free totals.
+    // Skipped copied usage entries and their tokens, and the skipped entries
+    // whose parent is not a known Pi session (Full reads only).
+    pi_fork_copies_skipped_entries: PiForkCopiesSkippedEntries,
+    pi_fork_copies_skipped_tokens: PiForkCopiesSkippedTokens,
+    pi_fork_parent_unseen: PiForkParentUnseen,
 }
 
 pub(crate) fn add(event: Event, amount: u64) {

@@ -360,6 +360,13 @@ const LIFECYCLE_COUNTERS: &[(&str, CounterClass)] = &[
     // snapshots.rs::apply_pi_line: cost parsing, never a retention decision.
     ("pi_cost_refused_overflow", CounterClass::Observation),
     ("pi_cost_precision_rounded", CounterClass::Observation),
+    // snapshots.rs::PiLedger::skip_fork_copy: a Pi fork's copied usage entry
+    // and its tokens skipped (M-2); disclosure, not refusal.
+    ("pi_fork_copies_skipped_entries", CounterClass::Observation),
+    ("pi_fork_copies_skipped_tokens", CounterClass::Observation),
+    // snapshots.rs::PiLedger::finish_fork_read: skipped copies whose parent is
+    // not in the Pi scan index, after a Full read (M-2); disclosure only.
+    ("pi_fork_parent_unseen", CounterClass::Observation),
 ];
 
 // CachePage flattens the registry above and adds these sparse scalars.
