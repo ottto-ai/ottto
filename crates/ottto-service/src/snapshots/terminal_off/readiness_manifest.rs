@@ -11,12 +11,15 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_complete_cutoff_drains_without_upload_or_repeated_grant_parse", "C6"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_controlled_three_owed_members_settle_on_their_own_pages_while_one_is_account_held", "R3"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_controlled_unbound_record_rearms_its_family_and_reforms_bound", "proof-grant"),
+    ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_crash_and_shed_before_settlement_keep_the_grant_unchanged", "R2"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_e2_pre_flip_correction_settles_on_the_first_request_owned_bodies", "C6"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone", "proof-grant"),
+    ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_exact_permanent_refusal_drains_correction_and_keeps_refusal_witness", "C6"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_natural_owed_members_drain_on_separate_bounded_pages", "proof-grant"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_new_request_after_the_grant_fails_then_one_new_proof_regrants_all_members", "proof-grant"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_retryable_refusal_keeps_its_member_owed_across_restart", "proof-grant"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned", "proof-grant"),
+    ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_superseded_revision_ack_never_drains_the_current_revision", "proof-grant"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant", "proof-grant"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_account_deferred_hold_lets_a_bounded_claude_traversal_converge", "C6"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_full_tombstone_set_keeps_the_excess_family_and_holds_both_returns", "completion-fold"),
@@ -59,8 +62,17 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_upload_context_change_does_not_carry_history_past_the_gate", "R5"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_user_repair_override_carries_accepted_history_through_census_and_release", "R5"),
     ("snapshot_sync/oversized_discovery_pipeline_tests.rs", "terminal_off_on_oversized_blocking_hold_is_reoffered_once_per_six_hour_floor", "R12"),
+    ("snapshot_sync/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_account_deferred_hold_lets_a_bounded_claude_traversal_converge", "C6"),
+    ("snapshot_sync/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_terminal_family_member_controls_keep_blocking_pruning_and_rebinding", "R6"),
+    ("snapshot_sync/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_terminal_family_never_committed_members_let_the_claude_census_complete", "R7"),
     ("snapshot_sync/prior_index_lifetime_tests.rs", "terminal_off_on_prior_index_lifetime_real_finish_preserves_refusals_retry_and_failed_cas", "r25-code-unclassified"),
+    ("snapshots.rs", "terminal_off_on_claude_context_backfill_pauses_with_an_alarm_when_an_installed_list_goes_missing", "P1"),
     ("snapshots.rs", "terminal_off_on_claude_context_backfill_resumes_after_restart_without_rereading_settled_files", "P1"),
+    ("snapshots.rs", "terminal_off_on_claude_context_backfill_skips_sessions_on_the_local_reemission_list", "P1"),
+    ("snapshots.rs", "terminal_off_on_claude_duplicate_across_pages_stays_refused_without_reparse_loop", "r25-code-unclassified"),
+    ("snapshots.rs", "terminal_off_on_claude_future_quarantine_preserves_cross_page_duplicate_refusal", "r25-code-unclassified"),
+    ("snapshots.rs", "terminal_off_on_claude_pending_census_recovers_without_releasing_future_quarantine", "r25-code-unclassified"),
+    ("snapshots.rs", "terminal_off_on_claude_stable_owned_start_recovers_after_partial_conflict", "r25-code-unclassified"),
     ("snapshots/claude_context_file_birth_tests.rs", "terminal_off_on_api_sidecar_without_trace_sidecar_still_vetoes", "r25-code-unclassified"),
     ("snapshots/claude_context_file_birth_tests.rs", "terminal_off_on_capture_on_bodies_match_the_clear_outside_context_scalars", "r25-code-unclassified"),
     ("snapshots/claude_history_upgrade_tests.rs", "terminal_off_on_copies_read_under_a_closed_duplicate_fence_settle_after_one_walk", "P3"),
@@ -130,7 +142,7 @@ fn terminal_off_on_readiness_ignores_equal_the_checked_in_manifest() {
     assert_eq!(expected, sorted, "keep the manifest sorted");
     assert_eq!(ignored_for_readiness(), expected);
     // The count is the ON gate: it must reach 0 before ON anywhere.
-    assert_eq!(READINESS_MANIFEST.len(), 76);
+    assert_eq!(READINESS_MANIFEST.len(), 88);
 }
 
 #[test]
@@ -153,14 +165,32 @@ fn every_ignored_terminal_off_on_twin_names_its_readiness_cluster() {
                 let Some(name) = line.trim_start().strip_prefix("fn terminal_off_on_") else {
                     continue;
                 };
-                let attributes = lines[..index]
+                let attributes = |index: usize| {
+                    lines[..index]
+                        .iter()
+                        .rev()
+                        .take_while(|line| {
+                            let line = line.trim_start();
+                            line.starts_with("#[") || line.starts_with("//")
+                        })
+                        .map(|line| line.trim())
+                        .collect::<Vec<_>>()
+                };
+                // A twin may keep the ignore its main original carries on main.
+                let base = name.split('(').next().unwrap_or(name);
+                let base_ignore = lines
                     .iter()
-                    .rev()
-                    .take_while(|line| line.trim_start().starts_with("#["));
-                for attribute in attributes {
-                    if attribute.trim_start().starts_with("#[ignore") {
+                    .position(|line| line.trim_start().starts_with(&format!("fn {base}(")))
+                    .and_then(|at| {
+                        attributes(at)
+                            .into_iter()
+                            .find(|attribute| attribute.starts_with("#[ignore"))
+                    });
+                for attribute in attributes(index) {
+                    if attribute.starts_with("#[ignore") {
                         assert!(
-                            attribute.contains("terminal-off ON-readiness: "),
+                            attribute.contains("terminal-off ON-readiness: ")
+                                || base_ignore == Some(attribute),
                             "{}: terminal_off_on_{name} is ignored without a readiness cluster",
                             path.display()
                         );

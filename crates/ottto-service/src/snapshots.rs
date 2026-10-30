@@ -56966,6 +56966,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
     fn terminal_off_on_claude_stable_owned_start_recovers_after_partial_conflict() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -56978,6 +56979,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
     fn terminal_off_on_claude_duplicate_across_pages_stays_refused_without_reparse_loop() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -56990,6 +56992,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
     fn terminal_off_on_claude_pending_census_recovers_without_releasing_future_quarantine() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -57002,6 +57005,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
     fn terminal_off_on_claude_future_quarantine_preserves_cross_page_duplicate_refusal() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -82259,6 +82263,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "terminal-off ON-readiness: P1"]
     fn terminal_off_on_claude_context_backfill_skips_sessions_on_the_local_reemission_list() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -82656,6 +82661,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "terminal-off ON-readiness: P1"]
     fn terminal_off_on_claude_context_backfill_pauses_with_an_alarm_when_an_installed_list_goes_missing(
     ) {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();

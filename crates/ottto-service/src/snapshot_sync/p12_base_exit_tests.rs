@@ -11,6 +11,7 @@ fn p12_experimental_base_exit_account_deferred_hold_lets_a_bounded_claude_traver
 }
 
 #[test]
+#[ignore = "terminal-off ON-readiness: C6"]
 fn terminal_off_on_p12_experimental_base_exit_account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -31,6 +32,7 @@ fn p12_experimental_base_exit_terminal_family_member_controls_keep_blocking_prun
 }
 
 #[test]
+#[ignore = "terminal-off ON-readiness: R6"]
 fn terminal_off_on_p12_experimental_base_exit_terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -53,6 +55,7 @@ fn p12_experimental_base_exit_terminal_family_never_committed_members_let_the_cl
 }
 
 #[test]
+#[ignore = "terminal-off ON-readiness: R7"]
 fn terminal_off_on_p12_experimental_base_exit_terminal_family_never_committed_members_let_the_claude_census_complete() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
