@@ -2283,7 +2283,7 @@ fn skill_label_bounds_and_consent_preserve_the_whole_native_state() {
 }
 
 #[test]
-fn skill_labels_retain_native_33_entry_sentinel_and_drop_34th() {
+fn skill_labels_preserve_native_provider_and_activity_caps() {
     let scratch = Scratch::new("label-cap");
     let path = scratch.write("t.jsonl", &claude_lines(1, 1));
     let (mut record, _) = full_read(&path, SnapshotSource::ClaudeCode);
@@ -2303,8 +2303,14 @@ fn skill_labels_retain_native_33_entry_sentinel_and_drop_34th() {
         .note_activity_skills("/synthetic/skills/Aardvark/SKILL.md");
     assert!(!record.accumulator.provider_skills.contains("aardvark"));
     assert!(!record.accumulator.activity_skills.contains("Aardvark"));
-    assert_eq!(record.accumulator.provider_skills.len(), 33);
+    assert_eq!(
+        record.accumulator.provider_skills.len(),
+        crate::session_attribution::MAX_SKILL_FACTS + 1
+    );
     assert_eq!(record.accumulator.activity_skills.len(), 33);
+    assert!(record.accumulator.provider_skills.contains("provider08"));
+    assert!(!record.accumulator.provider_skills.contains("provider09"));
+    assert!(record.accumulator.activity_skills.contains("Activity32"));
     assert!(!record.accumulator.provider_skills.contains("provider33"));
     assert!(!record.accumulator.activity_skills.contains("Activity33"));
     let body = encode_permitted(&record, usize::MAX, line_cap(), true).unwrap();
@@ -2317,7 +2323,15 @@ fn skill_labels_retain_native_33_entry_sentinel_and_drop_34th() {
         decoded.reduction.accumulator.activity_skills,
         record.accumulator.activity_skills
     );
-    record.accumulator.provider_skills.insert("extra".into());
+    record.accumulator.activity_skills.insert("extra".into());
+    assert_eq!(
+        encode_permitted(&record, usize::MAX, line_cap(), true).err(),
+        Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=activity}"))
+    );
+    record.accumulator.activity_skills.remove("extra");
+    // Native provider insertion stops at nine. Also pin the record codec's
+    // approved <=33 bound independently of that narrower native cap.
+    record.accumulator.provider_skills = (0..34).map(|n| format!("provider{n:02}")).collect();
     assert_eq!(
         encode_permitted(&record, usize::MAX, line_cap(), true).err(),
         Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=provider}"))

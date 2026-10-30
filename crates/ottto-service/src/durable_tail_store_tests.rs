@@ -3521,6 +3521,7 @@ fn full_v1_writer_goldens_preserve_zero_and_nonzero_debt() {
         assert_eq!(store.counters().store_write_skipped[0], 1);
         assert!(!record_file(&store, &[1; 32]).exists(), "historical records are refused, never written under the new codec");
         let file = record_file(&store, &[1; 32]);
+        ensure_private_dir(store.dir()).unwrap();
         put_record(&file, &golden);
         assert!(matches!(store.read(&[1;32]), ReadOutcome::Refused(Refusal::Unknown)));
         assert_eq!(store.counters().format_hold[Refusal::Unknown as usize],1);
@@ -4835,15 +4836,20 @@ fn private_label_purge_continues_past_corruption_and_reports_partial_progress() 
     let path = scratch.transcript("source.jsonl", b"{}\n");
     let mut store = scratch.store();
     let bad = binding("bad", "scope", ("bad", None));
-    let good = binding("good", "scope", ("good", None));
+    let mut good = binding("good", "scope", ("good", None));
+    good.key = key_digest(DurableSource::ClaudeCode, "synthetic-good.jsonl");
     let make = |binding| {
         let mut item = pending(binding, certificate(&path), 1);
         item.body = crate::snapshots::durable_store_fixture_body_with_skill();
         item
     };
-    store
-        .write_after_save(&lock, 1, 0, vec![make(bad.clone()), make(good.clone())])
-        .unwrap();
+    assert_eq!(
+        store
+            .write_after_save(&lock, 1, 0, vec![make(bad.clone()), make(good.clone())])
+            .unwrap()
+            .written,
+        2
+    );
     let file = record_file(&store, &bad.key);
     let mut corrupt = fs::read(&file).unwrap();
     *corrupt.last_mut().unwrap() ^= 1;
