@@ -1085,35 +1085,49 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
 /// [regress] reloading after R1 staging failure preserves exclusion before transcript parsing.
 #[test]
 fn resume_exclusion_survives_reload_and_skips_transcript_before_parse() {
-    let f = Fixture::new();
-    f.published();
-    let roots = f.support.join("transcripts");
-    fs::create_dir(&roots).unwrap();
-    let transcript = roots.join("held.jsonl");
-    fs::write(&transcript, b"invalid json\n").unwrap();
-    let key = super::super::super::local_index_key(&transcript);
-    let _index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
-    with_state(&f.path, |state| {
-        state
-            .resume_excluded
-            .insert(key.clone(), Instant::now() + Duration::from_secs(60));
-        state.cached = None;
-        Ok(())
-    })
-    .unwrap();
-    let mut index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
-    let scan = super::super::super::scan_source_roots_with_test_limit(
-        super::super::super::SnapshotSource::ClaudeCode,
-        &[roots],
-        &mut index,
-        "2026-10-31T12:00:00Z",
-        30,
-        10,
-        false,
-    )
-    .unwrap();
-    assert!(scan.snapshots.is_empty());
-    assert_eq!(scan.scanned_file_count, 0);
-    assert_eq!(scan.malformed_json_line_count, 0);
-    assert!(!index.files.contains_key(&key));
+    for forced_family in [false, true] {
+        let f = Fixture::new();
+        f.published();
+        let roots = f.support.join("transcripts");
+        fs::create_dir(&roots).unwrap();
+        let root_id = "11111111-1111-4111-8111-111111111111";
+        let transcript = roots.join(format!("{root_id}.jsonl"));
+        fs::write(&transcript, b"invalid json\n").unwrap();
+        let key = super::super::super::local_index_key(&transcript);
+        let _index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+        with_state(&f.path, |state| {
+            state
+                .resume_excluded
+                .insert(key.clone(), Instant::now() + Duration::from_secs(60));
+            state.cached = None;
+            Ok(())
+        })
+        .unwrap();
+        let mut index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+        if forced_family {
+            assert!(super::super::super::claude_index_path_family_member(&transcript).is_some());
+            index.claude_usage_authority_quarantine.insert(
+                root_id.into(),
+                serde_json::from_value(serde_json::json!({
+                    "contract":"synthetic-contract", "proven_witness_fingerprint":"a".repeat(64),
+                    "member_source_file_fingerprints":{}, "retry_after_unix_seconds":0
+                }))
+                .unwrap(),
+            );
+        }
+        let scan = super::super::super::scan_source_roots_with_test_limit(
+            super::super::super::SnapshotSource::ClaudeCode,
+            &[roots],
+            &mut index,
+            "2026-10-31T12:00:00Z",
+            30,
+            10,
+            false,
+        )
+        .unwrap();
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(scan.scanned_file_count, 0);
+        assert_eq!(scan.malformed_json_line_count, 0);
+        assert!(!index.files.contains_key(&key));
+    }
 }
