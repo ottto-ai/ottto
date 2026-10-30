@@ -72,6 +72,8 @@ struct PipelineFixture {
     index_path: PathBuf,
     page_files: usize,
     durable_progress: bool,
+    /// ON audit clock: (wall-clock anchor, first page's `collected_at`).
+    audit_clock: std::cell::Cell<Option<(u64, i64)>>,
 }
 
 impl PipelineFixture {
@@ -95,6 +97,7 @@ impl PipelineFixture {
             index_path: base.join("claude-scan-index.json"),
             page_files: PIPELINE_PAGE_FILES,
             durable_progress: false,
+            audit_clock: Default::default(),
             base,
             root,
             support,
@@ -118,6 +121,7 @@ impl PipelineFixture {
             index_path: base.join("claude-scan-index.json"),
             page_files: PIPELINE_PAGE_FILES,
             durable_progress: false,
+            audit_clock: Default::default(),
             base,
             root,
             support,
@@ -486,8 +490,53 @@ impl PipelineFixture {
         before_classify: impl FnOnce(&mut ScanIndex),
         reoffers: bool,
     ) -> PipelinePage {
+        let audit_now = self.terminal_off_on_pipeline_audit_now(collected_at);
+        crate::snapshots::with_terminal_off_audit_now_for_test(audit_now, || {
+            self.terminal_off_on_page_at_audit_now(
+                collected_at,
+                cycle,
+                upload,
+                before_classify,
+                reoffers,
+            )
+        })
+    }
+
+    /// ON adapter (C1): the page's captured audit clock follows the fixture's
+    /// synthetic `collected_at` from a wall-clock anchor taken on the first
+    /// page, so the 300 s rediscovery cadence and wall-clock seeded deadlines
+    /// keep their real order. An outer pin (P2-1's captured clock) wins.
+    fn terminal_off_on_pipeline_audit_now(&self, collected_at: &str) -> u64 {
+        if let Some(pinned) = crate::snapshots::terminal_off_audit_now_pin_for_test() {
+            return pinned;
+        }
+        let at = OffsetDateTime::parse(collected_at, &Rfc3339)
+            .expect("synthetic collected_at")
+            .unix_timestamp();
+        let (anchor, first) = self.audit_clock.get().unwrap_or_else(|| {
+            let anchor = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            self.audit_clock.set(Some((anchor, at)));
+            (anchor, at)
+        });
+        anchor.saturating_add_signed(at - first)
+    }
+
+    fn terminal_off_on_page_at_audit_now(
+        &self,
+        collected_at: &str,
+        cycle: &PipelineCycle<'_>,
+        upload: PipelineUpload,
+        before_classify: impl FnOnce(&mut ScanIndex),
+        reoffers: bool,
+    ) -> PipelinePage {
+        // ON adapter (C6): production upload contexts are SHA-256 hex; the
+        // durable ledger quarantines any other context on reload.
+        let upload_context = terminal_off_on_pipeline_context_digest(cycle.upload_context);
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
-        index.activate_upload_context(cycle.upload_context.to_string());
+        index.activate_upload_context(upload_context.clone());
         if cycle.historical_replay {
             index.prepare_historical_replay(cycle.replay_generation.to_string());
         }
@@ -499,7 +548,10 @@ impl PipelineFixture {
             SnapshotUploadProgress::load(
                 &progress_path,
                 &format!("{:064x}", 99),
-                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+                crate::snapshots::snapshot_quarantine_witness_for_context(
+                    SnapshotSource::ClaudeCode,
+                    &upload_context,
+                ),
             )
             .expect("load durable synthetic upload progress")
         } else {
@@ -507,7 +559,7 @@ impl PipelineFixture {
         };
         activate_source_upload_context(
             SnapshotSource::ClaudeCode,
-            cycle.upload_context.to_string(),
+            upload_context,
             &mut index,
             &mut progress,
         );
@@ -817,6 +869,7 @@ impl PipelineFixture {
     /// A finite service round covers actual synthetic paths, never proof.
     fn terminal_off_on_traversal(&self, hour: u32, cycle: &PipelineCycle<'_>) -> Vec<PipelinePage> {
         let mut pages: Vec<PipelinePage> = Vec::new();
+        let mut parsed = BTreeSet::new();
         for number in 0..PIPELINE_MAX_PAGES {
             let upload = if number == 0 {
                 cycle.first_page_upload
@@ -828,10 +881,16 @@ impl PipelineFixture {
                 cycle,
                 upload,
             );
+            parsed.extend(page.parsed.iter().cloned());
             // Native walk exhaustion is scheduling, never terminal authority.
+            // P3 round end: discovery drained and only already-read members
+            // remain queued.
             let complete = page.scan.census_complete
+                || !page.index.scan_traversal_in_progress_for_test()
                 || page.index.scan_traversal_exhausted_for_test()
-                || page.parsed.contains(PIPELINE_SESSIONS[2]);
+                || page
+                    .index
+                    .terminal_off_service_round_serviced_for_test(&parsed);
             pages.push(page);
             if complete {
                 break;
@@ -1008,6 +1067,14 @@ impl PipelineFixture {
         assert_eq!(index.claude_usage_authority_pending_count(), 0);
         revision
     }
+}
+
+/// ON adapter (C6): the synthetic cycle label as a 64-hex upload context.
+fn terminal_off_on_pipeline_context_digest(context: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!("pipeline-upload-context:{context}"))
+    )
 }
 
 impl Drop for PipelineFixture {

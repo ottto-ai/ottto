@@ -2032,6 +2032,12 @@ pub(super) fn set_test_now(now: Option<u64>) {
     TEST_NOW.with(|clock| clock.set(now));
 }
 
+/// This thread's pinned scan clock, if a caller pinned one (tests only).
+#[cfg(test)]
+pub(super) fn test_now() -> Option<u64> {
+    TEST_NOW.with(std::cell::Cell::get)
+}
+
 #[cfg(test)]
 pub(super) fn with_test_now<T>(now: u64, f: impl FnOnce() -> T) -> T {
     struct Reset(Option<u64>);

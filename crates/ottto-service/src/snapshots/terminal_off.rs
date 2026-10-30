@@ -1291,6 +1291,12 @@ pub(crate) fn with_terminal_off_audit_now_for_test<T>(now: u64, f: impl FnOnce()
     sampled_scan::with_test_now(now, f)
 }
 
+/// The audit clock an outer `with_terminal_off_audit_now_for_test` pinned.
+#[cfg(test)]
+pub(crate) fn terminal_off_audit_now_pin_for_test() -> Option<u64> {
+    sampled_scan::test_now()
+}
+
 // Only #899's added decision sites use this adapter: OFF preserves main's
 // fresh-clock call; ON uses the selecting page's one captured #870 clock.
 fn terminal_off_decision_now(captured: u64) -> u64 {
