@@ -82,8 +82,11 @@ Linux and the merge-queue Mac. Two ON blockers are fixed here, both gated on
   re-arm every stale family at every red-retry or floor start. A bounded RAM
   memo (16,384 hashed keys, FIFO, eviction diagnostic) now serves it once per
   family and generation (traversal context, upload context pair, contract,
-  latch). A cleared member stays cleared until it is read; eviction or a
-  restart costs at most one more re-read, never proof, ACK or settlement.
+  latch). A start counts the clear as served only when the traversal it
+  replaces is the one whose start cleared it, so a working index discarded
+  after a cancelled page or a failed checkpoint save is cleared again. A
+  cleared member stays cleared until it is read; eviction or a restart costs
+  at most one more re-read, never proof, ACK or settlement.
 
 ## OFF proof and the ON-readiness manifest
 
