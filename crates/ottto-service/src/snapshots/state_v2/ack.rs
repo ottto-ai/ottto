@@ -378,7 +378,10 @@ impl ProgressRecovery {
         if !state_v2_growth_retention_active(index) {
             return Ok(None);
         }
-        guard_external(index_path, index.persistence_v2.as_ref(), index.generation)?;
+        let generation =
+            super::super::sampled_audit::own_growth_claim_generation(index, index_path)
+                .unwrap_or(index.generation);
+        guard_external(index_path, index.persistence_v2.as_ref(), generation)?;
         let binding = super::super::scan_index_integration::scan_index_storage_binding(index_path)
             .context("state_v2_ack_binding")?;
         let (identity, _) =
@@ -386,7 +389,7 @@ impl ProgressRecovery {
         Ok(Some(Self {
             scope: Scope {
                 identity,
-                generation: index.generation,
+                generation,
             },
             path: fence::sibling(index_path, ".v2-ack-receipt"),
             db_path: Some(fence::sibling(index_path, ".v2.sqlite")),

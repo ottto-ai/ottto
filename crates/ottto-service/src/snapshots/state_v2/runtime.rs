@@ -754,7 +754,8 @@ pub(in super::super) fn recovery_save_guard(
     }
     let path = path.to_owned();
     let runtime = runtime.clone();
-    let generation = index.generation;
+    let generation = super::super::sampled_audit::own_growth_claim_generation(index, &path)
+        .unwrap_or(index.generation);
     Ok(Some(move || {
         guard_current(&path, Some(&runtime), generation, false)
     }))

@@ -618,6 +618,7 @@ impl Sqlite {
     /// Immutable identity probe must precede a read-write open, WAL recovery,
     /// settings changes, and SHM creation. The expected identity comes from the
     /// independently read fence, never from the candidate database.
+    #[cfg(test)]
     pub(super) fn open(path: &Path, identity: &super::Identity) -> Result<Self> {
         Self::open_with_policy(
             path,
@@ -980,18 +981,12 @@ fn scan(
 fn scan_record_range(
     conn: &Connection,
     kind: &RecordKind,
-    key: Option<&[u8]>,
     after: Option<&RowKey>,
     limit: usize,
 ) -> Result<Vec<Header>> {
     ensure!(limit <= PAGE_HEADERS, "state_v2_header_page_admission");
     let mut values = vec![SqlValue::Text(kind.name().into())];
     let mut filter = String::from("kind=?1");
-    if let Some(key) = key {
-        ensure!(key.len() <= KEY_BYTES, "state_v2_key_admission");
-        values.push(SqlValue::Blob(key.to_vec()));
-        filter.push_str(" AND key_bytes=?2");
-    }
     if let Some(after) = after {
         let RowKey::Record {
             kind: k,
@@ -1002,7 +997,7 @@ fn scan_record_range(
             bail!("state_v2_prefix_key")
         };
         ensure!(
-            k == kind && key.map_or(true, |key| key == key_bytes) && key_bytes.len() <= KEY_BYTES,
+            k == kind && key_bytes.len() <= KEY_BYTES,
             "state_v2_prefix_key"
         );
         let n = values.len() + 1;
@@ -1574,9 +1569,6 @@ impl Transaction for Txn<'_> {
         self.failed |= result.is_err();
         result
     }
-    fn value_matches(&mut self, header: &Header, value: &dyn Value) -> Result<bool> {
-        references::matches(self.store.conn()?, header, value)
-    }
     fn request_set_candidates(
         &mut self,
         commitment: &[u8; 32],
@@ -1625,28 +1617,7 @@ impl Transaction for Txn<'_> {
         after: Option<&RowKey>,
         limit: usize,
     ) -> Result<Vec<Header>> {
-        scan_record_range(self.store.conn()?, kind, None, after, limit)
-    }
-    fn scan_family(
-        &mut self,
-        kind: &RecordKind,
-        key_bytes: &[u8],
-        after: Option<u64>,
-        limit: usize,
-    ) -> Result<Vec<Header>> {
-        ensure!(key_bytes.len() <= KEY_BYTES, "state_v2_key_admission");
-        let after = after.map(|position| RowKey::Record {
-            kind: kind.clone(),
-            key_bytes: key_bytes.to_vec(),
-            position,
-        });
-        scan_record_range(
-            self.store.conn()?,
-            kind,
-            Some(key_bytes),
-            after.as_ref(),
-            limit,
-        )
+        scan_record_range(self.store.conn()?, kind, after, limit)
     }
     fn commit(self, expected: u64, next: u64) -> DurableCommitOutcome {
         self.commit_inner(expected, next)

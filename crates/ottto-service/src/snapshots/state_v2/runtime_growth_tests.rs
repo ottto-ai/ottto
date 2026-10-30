@@ -113,7 +113,7 @@ impl Fixture {
         let session = guard.as_mut().unwrap();
         let mut tx = session.db.begin(TxnMode::Write).unwrap();
         tx.put(RowInput {
-            key: &RowKey::record("file.growth_retention", self.key.as_bytes(), 0).unwrap(),
+            key: &RowKey::record("file.growth_retention", self.key.as_bytes(), 1).unwrap(),
             fixed: &Fixed::None,
             value_version: 1,
             value: &PackedDebt(&index.growth_retention[&self.key]),
@@ -225,6 +225,7 @@ fn independent_load_cannot_borrow_claim_generation_even_without_working_debt() {
         sampled_audit::own_growth_claim_generation(&stale, &f.path),
         None
     );
+    assert!(crate::snapshots::state_v2_side_effect_guard(&f.path, &stale)().is_err());
     stale.growth_retention.clear();
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
         for reason in [FullReason::StateMissing, FullReason::Replaced] {
@@ -332,8 +333,16 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
         sampled_audit::own_growth_claim_generation(&old, &f.path),
         Some(claim.generation)
     );
+    let guard = crate::snapshots::state_v2_side_effect_guard(&f.path, &old);
+    guard().unwrap();
+    let receipt = super::super::ack::ProgressRecovery::for_index(&old, &f.path).unwrap();
+    assert!(receipt.is_some());
     old.upload_context_fingerprint = Some("synthetic-next-context".into());
     old.save(&f.path).unwrap();
+    assert!(
+        guard().is_err(),
+        "an ordinary save ends this claim's authority"
+    );
     assert!(!Arc::ptr_eq(
         old.growth_claim_context.as_ref().unwrap(),
         &context

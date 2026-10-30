@@ -198,6 +198,7 @@ impl Sqlite {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(in super::super) fn maintenance_stats(&self) -> MaintenanceStats {
         self.stats.clone()
     }

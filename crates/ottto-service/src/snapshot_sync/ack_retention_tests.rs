@@ -2716,6 +2716,7 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
                     .downcast_ref::<ack_retention::AckSettlementRequired>()
                     .is_some());
             }
+            let persisted_progress = std::fs::read(&progress_path).unwrap();
             working.mark_bounded_sweep_unsettled();
             let saved = checkpoint_partial_snapshot_index_with_comparison(
                 &working,
@@ -2763,7 +2764,7 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
             );
             assert_eq!(
                 std::fs::read(&progress_path).unwrap(),
-                serde_json::to_vec(&progress).unwrap()
+                persisted_progress
             );
             progress
                 .release_acks_after_partial_index_save(

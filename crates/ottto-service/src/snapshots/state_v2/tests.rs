@@ -782,25 +782,6 @@ fn f8_set_last_reference_reclaims_parts_without_reusing_ids() {
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
 }
 
-/// [format] f8 full stream comparison validates parts and all bytes.
-#[test]
-fn f8_full_stream_comparison_validates_parts_and_all_bytes() {
-    let tmp = Scratch::new();
-    let mut db = tmp.store();
-    let bytes = vec![b'a'; PART_BYTES * 2 + 17];
-    let mut changed = bytes.clone();
-    *changed.last_mut().unwrap() = b'b';
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    let h = put(&mut tx, &traversal("stream".into()), &bytes);
-    assert!(tx.value_matches(&h, &Bytes(bytes)).unwrap());
-    assert!(!tx.value_matches(&h, &Bytes(changed)).unwrap());
-    assert!(!tx.value_matches(&h, &Repeat(17)).unwrap());
-    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    sqlite::damage_part_for_test(&mut db);
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    assert!(tx.value_matches(&h, &Repeat(h.len)).is_err());
-}
-
 /// [format] f6 busy purge retains obligation paces retry and allows in deadline writes.
 #[test]
 fn f6_busy_purge_retains_obligation_paces_retry_and_allows_in_deadline_writes() {
@@ -1192,16 +1173,6 @@ fn age_erasure(db: &mut sqlite::Sqlite, seconds: u64) {
     db.control("erasure_since", &now.saturating_sub(seconds))
         .unwrap();
 }
-fn tx_header(key: &RowKey, bytes: &[u8]) -> Header {
-    preflight(&RowInput {
-        value_version: 1,
-        key,
-        fixed: &Fixed::None,
-        value: &Bytes(bytes.into()),
-    })
-    .unwrap()
-}
-
 /// [format] typed keys and json headers round trip every physical owner.
 #[test]
 fn typed_keys_and_json_headers_round_trip_every_physical_owner() {
@@ -1431,7 +1402,8 @@ fn positions_and_current_pointer_survive_retirement_without_renumbering() {
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
     let mut tx = db.begin(TxnMode::Read).unwrap();
     let k = RecordKind::parse(kind).unwrap();
-    let page = tx.scan_family(&k, &root, Some(17), 1).unwrap();
+    let after = RowKey::record(kind, root.clone(), 17).unwrap();
+    let page = tx.scan_kind(&k, Some(&after), 1).unwrap();
     assert_eq!(page.len(), 1);
     assert!(matches!(page[0].key, RowKey::Record { position: 18, .. }));
     assert_eq!(tx.scan_kind(&k, None, 128).unwrap().len(), 2);

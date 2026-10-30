@@ -153,6 +153,10 @@ impl ResumeCheckpoint {
 /// age, ACK and ordinary pass completion have no representation in this API.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FinishReason {
+    #[expect(
+        dead_code,
+        reason = "R1 constructs this source-authoritative token when its same-train adapter is installed"
+    )]
     IrreversibleTerminal,
     AuthoritativeRemoval,
 }

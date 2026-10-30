@@ -306,10 +306,10 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
     let scratch = crate::test_scratch::ScratchDir::new("money-segmented");
     let mut raw = serde_json::to_value(fixture()).unwrap();
     let mut members = serde_json::Map::new();
-    let hashes = (0_u64..6_000)
+    let hashes = (0_u64..12_000)
         .map(|n| {
             let hash = format!("{:x}", sha2::Sha256::digest(n.to_be_bytes()));
-            members.insert(format!("synthetic-member-{n:04}"), json!(1));
+            members.insert(hash.clone(), json!(1));
             hash
         })
         .collect::<Vec<_>>();
@@ -317,6 +317,7 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
     raw["claude_usage_family_pending"]["synthetic-family"]["member_request_id_hashes"]
         ["synthetic-file"] = json!(hashes);
     raw["file_snapshot_fingerprints"]["synthetic-file"] = json!(hashes);
+    raw["upload_context_fingerprint"] = json!(hashes.join(""));
     let index: ScanIndex = serde_json::from_value(raw).unwrap();
     let mut db = money_test_support::populate(
         &scratch.join("segments.v2.sqlite.import"),
@@ -331,8 +332,8 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
         serde_json::to_vec(&expected).unwrap()
     );
     assert_refs(&mut db);
-    // Delete one interior row of each independently segmented kind in a
-    // rolled-back fault txn, then prove the complete original still opens.
+    // Remove a physical chunk from each independent money domain inside a
+    // rolled-back transaction, then prove the complete original still opens.
     for kind in [
         "account_window",
         "file.entities",
@@ -342,8 +343,11 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
         let rows = tx
             .scan_kind(&RecordKind::parse(kind).unwrap(), None, 128)
             .unwrap();
-        assert!(rows.len() > 2, "{kind} fixture must span multiple rows");
-        tx.delete(&rows[rows.len() / 2].key).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.parts > 1)
+            .unwrap_or_else(|| panic!("{kind} fixture must span physical chunks"));
+        sqlite::remove_value_chunk(&tx, row);
         assert!(
             kinds::hydrate_txn(&mut tx, money_test_support::binding()).is_err(),
             "missing {kind} segment"

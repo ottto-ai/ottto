@@ -1066,7 +1066,7 @@ struct ReadBack<'a> {
 }
 impl Transaction for ReadBack<'_> {
     // Present a fresh import to the semantic encoders. The real rows are read
-    // only by put/value_matches/candidate lookup, never rewritten by the proof.
+    // only by put/candidate lookup, never rewritten by the proof.
     fn get(&mut self, _: &RowKey) -> Result<Option<Header>> {
         Ok(None)
     }
@@ -1104,9 +1104,6 @@ impl Transaction for ReadBack<'_> {
     fn delete(&mut self, _: &RowKey) -> Result<bool> {
         bail!(Pause::Mismatch)
     }
-    fn value_matches(&mut self, h: &Header, value: &dyn Value) -> Result<bool> {
-        self.inner.value_matches(h, value)
-    }
     fn request_set_candidates(
         &mut self,
         digest: &[u8; 32],
@@ -1129,15 +1126,6 @@ impl Transaction for ReadBack<'_> {
         Ok(Vec::new())
     }
     fn scan_kind(&mut self, _: &RecordKind, _: Option<&RowKey>, _: usize) -> Result<Vec<Header>> {
-        Ok(Vec::new())
-    }
-    fn scan_family(
-        &mut self,
-        _: &RecordKind,
-        _: &[u8],
-        _: Option<u64>,
-        _: usize,
-    ) -> Result<Vec<Header>> {
         Ok(Vec::new())
     }
     fn commit(self, _: u64, _: u64) -> DurableCommitOutcome {

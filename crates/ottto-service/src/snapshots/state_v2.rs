@@ -242,7 +242,6 @@ pub(super) trait Transaction {
     fn put(&mut self, row: RowInput<'_>) -> Result<Header>;
     fn delete(&mut self, key: &RowKey) -> Result<bool>;
     /// Compare complete admitted bytes, never just a digest. Corruption errs.
-    fn value_matches(&mut self, header: &Header, value: &dyn Value) -> Result<bool>;
     fn request_set_candidates(
         &mut self,
         commitment: &[u8; 32],
@@ -286,13 +285,6 @@ pub(super) trait Transaction {
         &mut self,
         kind: &RecordKind,
         after: Option<&RowKey>,
-        limit: usize,
-    ) -> Result<Vec<Header>>;
-    fn scan_family(
-        &mut self,
-        kind: &RecordKind,
-        key_bytes: &[u8],
-        after: Option<u64>,
         limit: usize,
     ) -> Result<Vec<Header>>;
     fn commit(self, expected_generation: u64, next_generation: u64) -> DurableCommitOutcome;

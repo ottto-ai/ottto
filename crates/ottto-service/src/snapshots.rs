@@ -72,8 +72,6 @@ pub(crate) mod claude_request_identity;
 pub(crate) mod claude_request_money;
 mod scan_index_integration;
 pub(crate) mod scan_index_persistence;
-// The engine is not routed until importer/fence/hydrate integration is complete.
-#[allow(dead_code)]
 pub(crate) mod state_v2;
 use scan_index_integration::read_scan_index_representation;
 mod idless_retry_marker;
@@ -93285,7 +93283,8 @@ pub(crate) fn state_v2_side_effect_guard(
     let runtime = index.persistence_v2.clone();
     // This guard belongs to this graph, not to the mutable shared connection.
     // After adopting a successful save, construct a new guard for further IO.
-    let graph_generation = index.generation;
+    let graph_generation =
+        sampled_audit::own_growth_claim_generation(index, path).unwrap_or(index.generation);
     let path = path.to_owned();
     move || state_v2::guard_external(&path, runtime.as_ref(), graph_generation)
 }

@@ -129,3 +129,13 @@ pub(in super::super) fn fail_part_full_for_test() {
 pub(super) fn part_full() -> bool {
     PART_FULL.with(|v| v.replace(false))
 }
+
+/// Damage one checked physical value inside the caller's rollback transaction.
+pub(in super::super) fn remove_value_chunk(tx: &Txn<'_>, header: &Header) {
+    let owner = chunk_owner(&header.key).unwrap();
+    let removed = tx.store.conn().unwrap().execute(
+        "DELETE FROM value_chunks WHERE owner_table=?1 AND owner_kind=?2 AND owner_key=?3 AND position=?4 AND chunk_no=?5",
+        params![owner.table, owner.kind, owner.key, owner.position, header.parts / 2],
+    ).unwrap();
+    assert_eq!(removed, 1);
+}
