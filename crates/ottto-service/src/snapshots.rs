@@ -32723,10 +32723,12 @@ impl OwnedSourceScan {
             {
                 #[cfg(test)]
                 TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST.with(|count| count.set(count.get() + 1));
-                eprintln!(
-                    "upload_context_confirmed_empty_reparse files=1 source={}",
-                    source.api_slug()
-                );
+                if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+                    eprintln!(
+                        "upload_context_confirmed_empty_reparse files=1 source={}",
+                        source.api_slug()
+                    );
+                }
             }
             #[cfg(unix)]
             let mut recovered_audit_due = None;
