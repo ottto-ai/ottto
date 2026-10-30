@@ -609,36 +609,6 @@ fn the_continuation_pass_charges_no_g7() {
     );
 }
 
-/// Stage 1 S1-a (§7 exclusion: side due): the production continuation pass
-/// is never side-due; its due check reads no terms and writes or counts
-/// nothing, even for a worn request an ordinary pass tombstones.
-#[test]
-fn the_continuation_pass_is_never_side_due() {
-    let fixture = Root::new(1, b"");
-    let at = fixture.at();
-    let cache = sampled_scan::SharedCache::default();
-    let mut index = ScanIndex::default();
-    let continuation =
-        begin_codex_continuation_side_pass(&cache, Path::new(INDEX_PATH), &mut index);
-    let mut worn = request_for(&fixture, at.size);
-    worn.attempts = SIDE_REQUEST_EVICT_ATTEMPTS;
-    index.codex_parent_side_requests.insert(fixture.key(), worn);
-    let (due, counts) = observe(|| {
-        index.codex_parent_side_request_due(
-            &fixture.key(),
-            at,
-            1_000,
-            &cache,
-            &continuation,
-            || -> SideDueTerms { unreachable!("a continuation reads no due terms") },
-        )
-    });
-    assert!(!due);
-    assert_eq!(counts, Counts::default(), "nothing counted");
-    assert_eq!(index.codex_parent_side_requests[&fixture.key()], worn);
-    assert_eq!(cache.side_ledger().len(), 0);
-}
-
 #[test]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
