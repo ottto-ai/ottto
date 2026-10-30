@@ -895,7 +895,7 @@ fn pi_version_rewrite_after_restart_reads_one_real_edit_full() {
         );
         assert_eq!(edited.io.consumed, after.len(), "{arm}");
         assert_eq!(
-            page_reads(&rows),
+            page_reads(rows),
             (1, 0, after.len()),
             "{arm}: the Full's bytes are counted"
         );
@@ -1629,7 +1629,7 @@ fn pi_canaries_never_reach_persisted_records_and_the_selector_is_validated() {
     assert_eq!(restored.io.consumed, tail);
     money_oracle::assert_equivalent(&cold, &restored);
     whole_body(&cold, &restored);
-    assert_private("diagnostics", &serde_json::to_vec(&events).unwrap());
+    assert_private("diagnostics", &serde_json::to_vec(events).unwrap());
     assert_store_private(&f, Mode::Restart);
     let body = restored.snapshots[&f.entity].to_string();
     assert!(
