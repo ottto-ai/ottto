@@ -43,9 +43,6 @@ impl E2ScanFixture {
             &scope,
             capture,
         );
-        // The daemon's default upload policy, for Pi's carried values.
-        self.cache
-            .durable_note_pi_upload(SnapshotUploadPolicy::default().into(), None);
     }
 
     pub(crate) fn evict(&self) {

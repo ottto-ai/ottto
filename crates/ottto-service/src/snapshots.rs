@@ -3221,26 +3221,6 @@ pub(crate) fn begin_durable_pass(
     }
 }
 
-/// The pass's upload settings and key epoch for Pi's carried first-prompt
-/// values, then the purge of stored copies they no longer permit. Runs before
-/// the pass can replace a record, so each purge is counted once. Removal needs
-/// the state-directory lock, as in `begin_durable_pass`; a pass without it
-/// still refuses those records through their context binding.
-#[cfg(unix)]
-pub(crate) fn begin_pi_upload_gates(
-    cache: &sampled_scan::SharedCache,
-    support_dir: &Path,
-    index: &ScanIndex,
-    policy: SnapshotUploadPolicy,
-    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
-) {
-    let current = sampled_jsonl::durable::pi::current_hmac_key_epoch(attribution_context);
-    cache.durable_note_pi_upload(policy.into(), current);
-    if let Some(writer) = crate::locked_state_dir::held_for(support_dir) {
-        let _ = cache.durable_purge_pi_literals(writer, index);
-    }
-}
-
 /// M1: after the pass's final index save, writes this source's admitted,
 /// still-resident copies the save kept, then collects records it no longer
 /// keeps. A store failure is never a sync failure: the store is a cache, and
@@ -18210,8 +18190,6 @@ struct SnapshotAccumulator {
     // required because transitional writers may reuse one response id for more
     // than one paired occurrence.
     seen_pi_usage_keys: BTreeMap<String, PiUsageDedupState>,
-    /// The Pi record's first-prompt wire values and flag; see `durable_pi.rs`.
-    pi_prompt: Option<Box<sampled_jsonl::durable::pi::PiPromptCarry>>,
     // Positive usage observations deliberately refused because their activity
     // timestamp could not produce a truthful hourly bucket.
     dropped_usage_record_count: u64,
@@ -18428,7 +18406,6 @@ impl SnapshotAccumulator {
             tool_usage_counts: BTreeMap::new(),
             tool_usage_truncated: false,
             seen_pi_usage_keys: BTreeMap::new(),
-            pi_prompt: None,
             dropped_usage_record_count: 0,
             claude_last_user_ts: None,
             peak_context_fill_tokens: 0,
@@ -20004,11 +19981,11 @@ impl SnapshotAccumulator {
             return;
         }
         let mut assigned = false;
-        if self.first_prompt_material.is_none() && !self.pi_first_prompt_frozen() {
+        if self.first_prompt_material.is_none() {
             self.first_prompt_material = Some(value.to_string());
             assigned = true;
         }
-        if self.first_prompt_title.is_none() && self.pi_carried_title().is_none() {
+        if self.first_prompt_title.is_none() {
             self.first_prompt_title = first_prompt_display_title(self.source, value.to_string());
             assigned |= self.first_prompt_title.is_some();
         }
@@ -20517,13 +20494,6 @@ impl SnapshotAccumulator {
 
     fn apply_first_prompt_fallback(&mut self) {
         if self.title.is_some() {
-            return;
-        }
-        // Already normalized when it was uploaded: the same bytes, not a
-        // second pass over them.
-        if let Some(title) = self.pi_carried_title().map(str::to_owned) {
-            self.title = Some(title);
-            self.title_source = Some("first_prompt".to_string());
             return;
         }
         self.set_title_if_absent(self.first_prompt_title.clone(), "first_prompt");
@@ -21035,7 +21005,6 @@ impl SnapshotAccumulator {
             });
             attribution_facts.extend(launch_facts);
         }
-        let carried_first_prompt = self.pi_carried_first_prompt();
         if let Some(context) = attribution_context {
             attribution_facts.extend(
                 context.grouping_facts(
@@ -21046,7 +21015,6 @@ impl SnapshotAccumulator {
                         observed_at: collected_at,
                         source_version: self.source.parser_version(),
                         first_prompt: self.first_prompt_material.as_deref(),
-                        carried_first_prompt: carried_first_prompt.as_ref(),
                         provider_skills: &self.provider_skills,
                         activity_skills: &self.activity_skills,
                         repository_hash: repository_identity
@@ -29786,16 +29754,6 @@ impl OwnedSourceScan {
                     None
                 };
                 let copy_budget = finish_copy_budget.unwrap_or(0);
-                // Before the retained copy: every record body reads this state.
-                #[cfg(unix)]
-                if source == SnapshotSource::Pi && side_origin.is_none() {
-                    parser.accumulator.capture_pi_wire_prompt(
-                        attribution_context,
-                        sampling
-                            .as_ref()
-                            .and_then(|context| context.cache.durable_pi_upload_gates()),
-                    );
-                }
                 let mut completed_acquisition = if let Some(certificate) = cursor_certificate {
                     certificate.map(|checkpoint| {
                         parser.retain_sealed_prefix(
@@ -95134,7 +95092,7 @@ crate::durable_tail_codec::durable_struct!(SessionAccountEvidence {
     N source_created_at: Option<String>,
 });
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_prefix_digest, codex_parent_prefix_decided, codex_parent_prefix_proof, codex_parent_proof_used, codex_parent_proof_mismatch, codex_parent_proof_refusal, codex_proof_decision_only, codex_boundary_buffer_count, codex_proof_ledger_row, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, claude_fork_parent, claude_money, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, pi_prompt, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start, durable_marks);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_prefix_digest, codex_parent_prefix_decided, codex_parent_prefix_proof, codex_parent_proof_used, codex_parent_proof_mismatch, codex_parent_proof_refusal, codex_proof_decision_only, codex_boundary_buffer_count, codex_proof_ledger_row, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, claude_fork_parent, claude_money, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start, durable_marks);
 crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
     N source: SnapshotSource,
     H cache_configuration_witness: Option<String>,
@@ -95271,7 +95229,6 @@ crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
     U tool_usage_counts: BTreeMap<String, u64>,
     N tool_usage_truncated: bool,
     E seen_pi_usage_keys: BTreeMap<String, PiUsageDedupState>,
-    R pi_prompt: Option<Box<sampled_jsonl::durable::pi::PiPromptCarry>>,
     N dropped_usage_record_count: u64,
     N claude_last_user_ts: Option<String>,
     N peak_context_fill_tokens: u64,

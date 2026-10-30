@@ -76,10 +76,8 @@ fn body(reduction: &CachedJsonlReduction) -> Result<Vec<u8>, Refuse> {
 
 fn section(keys: &BTreeMap<String, PiUsageDedupState>) -> Vec<u8> {
     let mut e = Enc::bytes(RECORD_BYTES);
-    e.section(SECTION_TAG, |e| {
-        PiSection::put_borrowed(e, keys, &None, &false, &None)
-    })
-    .unwrap();
+    e.section(SECTION_TAG, |e| PiSection::put_borrowed(e, keys))
+        .unwrap();
     e.into_bytes()
 }
 
@@ -94,14 +92,7 @@ fn back_patched(reduction: &CachedJsonlReduction) -> Vec<u8> {
     let start = out.len();
     out.extend([0_u8; 8]);
     let mut e = Enc::bytes(RECORD_BYTES);
-    PiSection::put_borrowed(
-        &mut e,
-        &reduction.accumulator.seen_pi_usage_keys,
-        &None,
-        &false,
-        &None,
-    )
-    .unwrap();
+    PiSection::put_borrowed(&mut e, &reduction.accumulator.seen_pi_usage_keys).unwrap();
     out.extend(e.into_bytes());
     let len = (out.len() - start - 8) as u64;
     out[start..start + 8].copy_from_slice(&len.to_le_bytes());
@@ -115,7 +106,7 @@ fn verify_without_allocation(body: &[u8]) -> Result<(), Corrupt> {
     result
 }
 
-fn take_raw_section(d: &mut Dec<'_>) -> Result<PiSection, Corrupt> {
+fn take_section(d: &mut Dec<'_>) -> Result<PiSection, Corrupt> {
     d.section(SECTION_TAG, PiSection::take)
 }
 
@@ -182,7 +173,7 @@ fn ledger_decode_funds_the_tree_before_any_allocation() {
     };
     let (taken, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
         let mut d = Dec::bounded(&bytes, &mut grant);
-        let result = take_raw_section(&mut d);
+        let result = take_section(&mut d);
         d.outcome(result).map(|section| section.usage_keys.len())
     });
     assert_eq!(taken, Ok(3));
@@ -199,7 +190,7 @@ fn ledger_decode_funds_the_tree_before_any_allocation() {
     };
     let (refused, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
         let mut d = Dec::bounded(&bytes, &mut short);
-        let result = take_raw_section(&mut d);
+        let result = take_section(&mut d);
         d.outcome(result).map(|section| section.usage_keys.len())
     });
     assert_eq!(refused, Err(DecodeFailure::Budget));
@@ -217,7 +208,7 @@ fn ledger_decode_funds_the_tree_before_any_allocation() {
     };
     let (refused, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
         let mut d = Dec::bounded(&bytes, &mut tree_only);
-        let result = take_raw_section(&mut d);
+        let result = take_section(&mut d);
         d.outcome(result).map(|section| section.usage_keys.len())
     });
     assert_eq!(refused, Err(DecodeFailure::Budget));
@@ -255,7 +246,7 @@ fn ledger_cap_decodes_at_the_bound_and_refuses_past_it() {
         true
     };
     let mut d = Dec::bounded(&bytes, &mut grant);
-    let result = take_section(&mut d).map(|section| section.usage_keys.len());
+    let result = take_ledger(&mut d).map(|keys| keys.len());
     assert_eq!(d.outcome(result), Err(DecodeFailure::Integrity));
     assert_eq!(calls, 0);
 }
@@ -360,7 +351,7 @@ fn corrupt_truncated_or_misframed_sections_are_refused() {
     d.require_section();
     CachedJsonlReduction::take(&mut d).unwrap();
     Rederive::take(&mut d).unwrap();
-    take_section(&mut d).unwrap();
+    take_ledger(&mut d).unwrap();
     assert_eq!(d.ended(), Err(Corrupt));
     d.refilled_section();
     assert_eq!(d.finish(), Ok(()));
@@ -486,53 +477,4 @@ fn pi_registered_bounded_decode_charges_the_shared_graph_and_ledger() {
         Err(DecodeFailure::Budget)
     ));
     lease.release();
-}
-
-/// A populated prompt set survives the section byte for byte, walks without
-/// allocating, and an over-bound literal is corrupt before it allocates.
-#[test]
-fn prompt_fields_round_trip_and_verify_without_allocation() {
-    let wire = PiWirePrompt {
-        prefix_label: PlText::new("Synthetic label"),
-        template_id: Some([7; 32]),
-        skill_id: PlText::new("hmac-sha256:v1:synthetic"),
-        skill_label: PlText::new("synthetic-skill"),
-        title: PlText::new("Synthetic title"),
-    };
-    let mut reduction = reduction(ledger());
-    reduction.accumulator.pi_prompt = Some(Box::new(PiPromptCarry {
-        wire: Some(wire.clone()),
-        prompt_seen: true,
-        key_epoch: Some([9; 32]),
-    }));
-    let bytes = body(&reduction).unwrap();
-    assert_eq!(verify_without_allocation(&bytes), Ok(()));
-    let decoded = take_body(&mut Dec::new(&bytes)).unwrap_or_else(|_| panic!("decodes"));
-    let carry = decoded.reduction.accumulator.pi_prompt.as_deref().unwrap();
-    assert_eq!(carry.wire.as_ref(), Some(&wire));
-    assert!(carry.prompt_seen);
-    assert_eq!(carry.key_epoch, Some([9; 32]));
-    assert_eq!(body(&decoded.reduction).unwrap(), bytes);
-
-    let mut e = Enc::bytes(RECORD_BYTES);
-    "x".repeat(PREFIX_LABEL_BOUND + 1).put(&mut e).unwrap();
-    let over = e.into_bytes();
-    assert!(PlText::<PREFIX_LABEL_BOUND>::new(&"x".repeat(PREFIX_LABEL_BOUND + 1)).is_none());
-    assert_eq!(
-        PlText::<PREFIX_LABEL_BOUND>::verify(&mut Dec::new(&over)),
-        Err(Corrupt)
-    );
-    assert!(PlText::<PREFIX_LABEL_BOUND>::take(&mut Dec::new(&over)).is_err());
-}
-
-/// The section's prompt fields cannot reach a shared body.
-#[test]
-fn prompt_fields_refuse_every_body_but_pi() {
-    let mut reduction = reduction(BTreeMap::new());
-    reduction.accumulator.pi_prompt = Some(Box::default());
-    let mut e = Enc::bytes(RECORD_BYTES);
-    assert_eq!(
-        reduction.put(&mut e),
-        Err(Refuse::NonEmpty("SnapshotAccumulator.pi_prompt"))
-    );
 }

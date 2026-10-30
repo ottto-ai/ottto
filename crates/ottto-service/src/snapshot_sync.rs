@@ -6388,16 +6388,6 @@ fn prepare_sync_source_inner(
         &sampled_scope,
         request_identity_capture,
     );
-    #[cfg(unix)]
-    if source == SnapshotSource::Pi {
-        crate::snapshots::begin_pi_upload_gates(
-            &daemon.transcript_cache,
-            support_dir,
-            &index,
-            upload_policy,
-            attribution_context.as_ref(),
-        );
-    }
     let mut scan = crate::snapshots::OwnedSourceScan::new_with_durable_cache(
         source,
         &roots,
