@@ -3211,7 +3211,7 @@ fn e2_pipeline_switch_off_ignores_saved_removals_and_pending_holds() {
         let mut c = Corpus::new("e2-copy-switch-off-saved");
         let mut prior = demo_family(&mut c, &mut e2_progress());
         let key = crate::snapshots::claude_money_birth_store::location_key(
-            &local_index_key(&c.root.join(file(COPY))));
+            &c.root.join(file(COPY)).to_string_lossy());
         assert!(prior.claude_copy_removals.advance_hold(key));
         let saved = serde_json::to_value(&prior.claude_copy_removals).unwrap();
         let _off = e2::ResumedPrefixForTest::set(false);
