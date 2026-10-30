@@ -87,6 +87,17 @@ fn full_read(path: &Path, source: SnapshotSource) -> (CachedJsonlReduction, Chec
 /// context over an index holding the file), so the money fold is compared
 /// too.
 fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value {
+    items_at(parser, path, source, None)
+}
+
+/// `items`, through the shared native body with an M3 PRE-finalization hook
+/// (`None`: the legacy wrapper itself).
+fn items_at(
+    parser: OwnedJsonlParser,
+    path: &Path,
+    source: SnapshotSource,
+    pre: Option<&mut dyn FnMut(crate::snapshots::PreFinalization<'_>)>,
+) -> Value {
     let identity = opened_object_identity(source, &mut File::open(path).unwrap()).unwrap();
     let mut index = ScanIndex::default();
     index.files.insert(
@@ -103,8 +114,8 @@ fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value
             path,
             twins: &twins,
         });
-    let parsed = parser
-        .finish_with_repository_identity(
+    let parsed = match pre {
+        None => parser.finish_with_repository_identity(
             &identity,
             path,
             COLLECTED,
@@ -114,8 +125,23 @@ fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value
             None,
             None,
             money,
-        )
-        .unwrap();
+        ),
+        Some(pre) => parser.finish_native(
+            crate::snapshots::FinishRequest {
+                expected_opened_object_identity: &identity,
+                path,
+                collected_at: COLLECTED,
+                source_file_fingerprint: "fp".into(),
+                codex_title_metadata: None,
+                claude_title_metadata: None,
+                attribution_context: None,
+                repository_identity: None,
+                money_context: money,
+            },
+            Some(pre),
+        ),
+    }
+    .unwrap();
     // The fold is not serialized (`serde(skip)`): compare its entity body.
     let money = parsed
         .snapshots
@@ -1283,6 +1309,7 @@ fn fallback_classes_over_the_synthetic_corpus() {
             ) => field,
             Err(Refuse::TooLarge) => "record_bytes",
             Err(Refuse::UnknownLabel) => "static_label",
+            Err(Refuse::WriteFailed) => "encode_io",
         };
         *tally.entry(class).or_default() += 1;
     }
@@ -1299,13 +1326,13 @@ fn fallback_classes_over_the_synthetic_corpus() {
 /// Budget receipt (static): the bounds every restore and write is held to.
 #[test]
 fn budget_bounds_hold() {
-    use crate::durable_tail_store::{MAX_BATCH, MAX_RECORDS, RECORD_BYTES, STORE_BYTES};
+    use crate::durable_tail_store::{INVENTORY_BOUND, MAX_BATCH, MAX_RECORDS, RECORD_BYTES};
     // A restored copy is charged to the 31 MiB state budget like any
     // retained copy; one record never exceeds one cache entry.
     assert_eq!(RECORD_BYTES, crate::transcript_cache::ENTRY_BYTES);
     assert_eq!(MAX_RECORDS, crate::transcript_cache::CACHE_ENTRIES);
-    // Disk: at most 32 MiB per source store.
-    assert_eq!(STORE_BYTES, 32 * 1024 * 1024);
+    // Disk admission is independent of memo precision; the old writer inventories 512 keys.
+    assert_eq!(INVENTORY_BOUND, 512);
     // Per restore: one record read, two 4 KiB sample windows, a head
     // re-parse of at most 1 MiB and at most NAMED_LINES capped lines.
     assert_eq!(HEAD_BOUND, 1024 * 1024);
@@ -1313,7 +1340,7 @@ fn budget_bounds_hold() {
     // Beside the cache, outside its state budget: both stores' digest maps.
     assert_eq!(
         crate::snapshots::sampled_scan::durable_tail::STORES_RESIDENT_BOUND,
-        64 * 1024
+        1_978_368
     );
     // Per write pass: at most MAX_BATCH records of at most RECORD_BYTES.
     assert_eq!(MAX_BATCH, 32);
@@ -1364,7 +1391,7 @@ fn structurally_decodes(body: &[u8]) -> bool {
         SnapshotSource::Pi,
     ]
     .into_iter()
-    .any(|source| decode(body, source).is_ok())
+    .any(|source| decode_body(body, source).is_ok())
 }
 
 fn verified_without_allocation(body: &[u8]) -> Result<(), Corrupt> {
@@ -1512,6 +1539,86 @@ fn structural_verifier_large_body_still_allocates_nothing() {
     );
 }
 
+fn assert_borrowed_count_identity(reduction: &CachedJsonlReduction) {
+    take_l_spans();
+    let rederive = rederive_digests(&reduction.accumulator, line_cap()).unwrap();
+    let mut old = Enc::bytes(crate::durable_tail_store::RECORD_BYTES);
+    reduction.put(&mut old).unwrap();
+    rederive.put(&mut old).unwrap();
+    let expected = old.into_bytes();
+    take_l_spans();
+    let (count, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        let mut count = Enc::count(expected.len());
+        reduction.put(&mut count).unwrap();
+        rederive.put(&mut count).unwrap();
+        count.counted()
+    });
+    assert_eq!(stats.allocations, 0, "count must not allocate: {stats:?}");
+    assert_eq!(count, expected.len());
+    let (refused, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        let mut count = Enc::count(expected.len() - 1);
+        reduction
+            .put(&mut count)
+            .and_then(|()| rederive.put(&mut count))
+    });
+    assert_eq!(refused, Err(Refuse::TooLarge));
+    assert_eq!(stats.allocations, 0, "refusal precedes any body allocation");
+    assert!(
+        take_l_spans().is_empty(),
+        "count is not a second L-span output"
+    );
+    let actual = encode(reduction, expected.len(), line_cap()).unwrap();
+    assert_eq!(
+        actual, expected,
+        "borrowed parts preserve the original codec bytes"
+    );
+    assert_eq!(actual.capacity(), actual.len());
+    assert_eq!(
+        encode(reduction, expected.len() - 1, line_cap()),
+        Err(Refuse::TooLarge)
+    );
+    let (_, options) = crate::durable_tail_codec::trace_verify(|| verify(&actual).unwrap());
+    assert!(options >= 5, "fixture must populate nested optional state");
+    take_l_spans();
+}
+
+#[test]
+fn borrowed_count_exact_encoding_matches_populated_both_source_canaries() {
+    let scratch = Scratch::new("borrowed-count-canaries");
+    let mut covered = BTreeSet::new();
+    for case in cases() {
+        let path = scratch.write("nested.jsonl", &case.lines);
+        let (reduction, _) = full_read(&path, case.source);
+        covered.insert(case.source.api_slug());
+        assert_borrowed_count_identity(&reduction);
+    }
+    assert_eq!(covered, BTreeSet::from(["claude_code", "codex"]));
+}
+
+#[test]
+fn borrowed_count_identity_covers_codex_absent_legacy_and_v2_state() {
+    use codex_counting_version::AckEvidence;
+    let scratch = Scratch::new("borrowed-count-contract");
+    let path = scratch.write("codex.jsonl", &codex_lines());
+    for (evidence, version) in [
+        (None, 0),
+        (Some(AckEvidence::LegacyAcked), 1),
+        (Some(AckEvidence::None), 2),
+    ] {
+        let mut parser = parser(&path, SnapshotSource::Codex);
+        if let Some(evidence) = evidence {
+            codex_counting_version::configure(&mut parser.accumulator, evidence, Some(0));
+        }
+        parser
+            .prepare_acquisition(None, &scope(), None, NOW)
+            .unwrap();
+        while !parser.step().unwrap() {}
+        let reduction = parser.durable_test_reduction_copy();
+        assert_eq!(reduction.durable_counting().map_or(0, |c| c.1), version);
+        assert_borrowed_count_identity(&reduction);
+    }
+}
+
 #[test]
 fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
     let scratch = Scratch::new("zst-refusal");
@@ -1536,4 +1643,380 @@ fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
             "refused before offset use"
         );
     });
+}
+
+#[test]
+fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
+    use crate::transcript_cache::Retained;
+    let scratch = Scratch::new("tail-admission");
+    let path = scratch.write("native.jsonl", &["{}".into()]);
+    let source = SnapshotSource::ClaudeCode;
+    let (state, checkpoint) = full_read(&path, source);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{}\n")
+        .unwrap();
+    let mut due = parser(&path, source);
+    let mode = due
+        .prepare_acquisition_with_reuse_gate(
+            Some(Retained {
+                checkpoint: checkpoint.clone(),
+                state: state.clone(),
+            }),
+            &scope(),
+            Some(crate::transcript_acquisition::AuditDebt {
+                due_unix_seconds: NOW,
+            }),
+            NOW,
+            |_, _| panic!("an owed Full never spends or checks a Tail allowance"),
+        )
+        .unwrap();
+    assert_eq!(mode, ReadMode::Full(FullReason::AuditDue));
+    let mut limited = parser(&path, source);
+    let calls = std::cell::Cell::new(0);
+    let mode = limited
+        .prepare_acquisition_with_reuse_gate(
+            Some(Retained { checkpoint, state }),
+            &scope(),
+            None,
+            NOW,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(false)
+            },
+        )
+        .unwrap();
+    assert_eq!(calls.get(), 1, "only the actual Tail asks for permission");
+    assert_eq!(mode, ReadMode::Full(FullReason::StateMissing));
+    while !limited.step().unwrap() {}
+    let (cold, _) = full_read(&path, source);
+    assert_eq!(
+        encode(&limited.reduction_copy(), 1 << 20, 1 << 20).unwrap(),
+        encode(&cold, 1 << 20, 1 << 20).unwrap(),
+        "fallback uses the fresh native reduction"
+    );
+}
+
+#[test]
+fn no_input_completion_requires_every_rederive_digest_absent() {
+    for field in 0..5 {
+        let mut obligation = Rederive::default();
+        let slot = match field {
+            0 => &mut obligation.first_prompt,
+            1 => &mut obligation.workspace,
+            2 => &mut obligation.agent_label,
+            3 => &mut obligation.session_start,
+            _ => &mut obligation.title,
+        };
+        *slot = Some([1; 32]);
+        let decoded = Decoded {
+            reduction: CachedJsonlReduction {
+                accumulator: SnapshotAccumulator::new(SnapshotSource::ClaudeCode),
+                report: JsonlReadReport::default(),
+                recognized_usage_drop_count: 0,
+                positive_recognized_usage_count: 0,
+                positive_usage_evidence: false,
+            },
+            rederive: obligation,
+        };
+        let (result, stats) =
+            crate::retry_allocation_probe::measure_caller_thread(|| decoded.without_rederive());
+        assert!(
+            result.is_err(),
+            "obligation{field} cannot use a zero/missing head mark as absence"
+        );
+        assert_eq!(stats.allocations, 0);
+    }
+    let decoded = Decoded {
+        reduction: CachedJsonlReduction {
+            accumulator: SnapshotAccumulator::new(SnapshotSource::ClaudeCode),
+            report: JsonlReadReport::default(),
+            recognized_usage_drop_count: 0,
+            positive_recognized_usage_count: 0,
+            positive_usage_evidence: false,
+        },
+        rederive: Rederive::default(),
+    };
+    let (result, stats) =
+        crate::retry_allocation_probe::measure_caller_thread(|| decoded.without_rederive());
+    let (_, receipt) = result.unwrap();
+    assert_eq!(receipt, RederiveReceipt::default());
+    assert_eq!(stats.allocations, 0);
+}
+
+/// Differential projection of the enabled workspace class from the actual
+/// codec corpus. Other digest obligations are deliberately left unsupported;
+/// this projection is NOT a claim that the complete rich records restore.
+#[test]
+fn bounded_workspace_matches_native_corpus_and_refuses_other_classes() {
+    let scratch = Scratch::new("bounded-workspace");
+    let cases = [
+        (SnapshotSource::ClaudeCode, claude_lines(3, 3)),
+        (SnapshotSource::Codex, codex_lines()),
+    ];
+    for (source, mut lines) in cases {
+        // Compaction, title updates, later cwd and unknown nested payloads
+        // cannot overwrite native first-write-wins workspace selection.
+        lines.push(
+            json!({"type":"system", "subtype":"compact_boundary",
+            "cwd":"/later-workspace", "customTitle":"Later title",
+            "payload":{"cwd":"/other-later"},
+            "ignored":{"many":[{"content":"skip me"}]}})
+            .to_string(),
+        );
+        let path = scratch.write(source.api_slug(), &lines);
+        let (native, _) = full_read(&path, source);
+        let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
+        let decoded = decode(&body, source).unwrap();
+        assert!(decoded.rederive.workspace.is_some());
+        assert!(
+            decoded.content_charge().is_err(),
+            "rich record remains unsupported"
+        );
+        let oracle = restore(&path, &body, source).unwrap().0;
+        let mut workspace = decode(&body, source).unwrap();
+        workspace.rederive = Rederive {
+            workspace: workspace.rederive.workspace,
+            ..Default::default()
+        };
+        let charge = workspace.content_charge().unwrap();
+        assert!(charge >= workspace.head_end().unwrap());
+        let mut wrong = decode(&body, source).unwrap();
+        wrong.rederive = Rederive {
+            workspace: Some([0; 32]),
+            ..Default::default()
+        };
+        wrong.content_charge().unwrap();
+        assert!(matches!(
+            wrong.rederive_content(&File::open(&path).unwrap()),
+            Err(Refuse::NotRederivable("workspace_digest"))
+        ));
+        let (bounded, receipt) = workspace
+            .rederive_content(&File::open(&path).unwrap())
+            .unwrap();
+        assert_eq!(
+            bounded.accumulator.workspace_path,
+            oracle.accumulator.workspace_path
+        );
+        assert_eq!(
+            bounded.accumulator.workspace_path,
+            native.accumulator.workspace_path
+        );
+        assert_eq!(receipt.named_lines, 0);
+        assert_eq!(receipt.line_bytes, 0);
+        assert_eq!(
+            receipt.head_bytes,
+            native.accumulator.durable_marks.workspace.unwrap()
+        );
+        // Every excluded class refuses before any I/O, independently.
+        for class in 0..4 {
+            let mut excluded = decode(&body, source).unwrap();
+            excluded.rederive = Rederive::default();
+            match class {
+                0 => excluded.rederive.first_prompt = Some([1; 32]),
+                1 => excluded.rederive.title = Some([1; 32]),
+                2 => excluded.rederive.agent_label = Some([1; 32]),
+                _ => excluded.rederive.session_start = Some([1; 32]),
+            }
+            assert!(excluded.content_charge().is_err());
+        }
+    }
+}
+
+#[test]
+fn bounded_workspace_cap_and_escaped_text_keep_native_values_or_refuse() {
+    let scratch = Scratch::new("workspace-cap");
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for length in [4095, 4096, 4097] {
+            let cwd = "x".repeat(length);
+            let line = match source {
+                SnapshotSource::ClaudeCode => json!({"type":"progress", "cwd":cwd}),
+                _ => json!({"type":"session_meta", "payload":{"id":CODEX_SESSION,
+                    "cwd":cwd, "source":"cli"}}),
+            };
+            let path = scratch.write(
+                &format!("{}-{length}", source.api_slug()),
+                &[line.to_string()],
+            );
+            let (native, _) = full_read(&path, source);
+            let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
+            let mut decoded = decode(&body, source).unwrap();
+            assert!(decoded.rederive.workspace.is_some());
+            decoded.rederive = Rederive {
+                workspace: decoded.rederive.workspace,
+                ..Default::default()
+            };
+            decoded.content_charge().unwrap();
+            let actual = decoded.rederive_content(&File::open(&path).unwrap());
+            if length > 4096 {
+                assert!(matches!(
+                    actual,
+                    Err(Refuse::NotRederivable("workspace_capture"))
+                ));
+            } else {
+                assert_eq!(
+                    actual.unwrap().0.accumulator.workspace_path,
+                    native.accumulator.workspace_path
+                );
+            }
+        }
+    }
+    let path = scratch.write("escaped", &[r#"{"type":"progress","cwd":"  /tmp/a\u0062\u0063  ","ignored":[{"key":"not captured"}]}"#.into()]);
+    let (native, _) = full_read(&path, SnapshotSource::ClaudeCode);
+    let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
+    let mut decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
+    decoded.rederive = Rederive {
+        workspace: decoded.rederive.workspace,
+        ..Default::default()
+    };
+    decoded.content_charge().unwrap();
+    assert_eq!(
+        decoded
+            .rederive_content(&File::open(&path).unwrap())
+            .unwrap()
+            .0
+            .accumulator
+            .workspace_path,
+        Some(PathBuf::from("/tmp/abc"))
+    );
+}
+
+#[test]
+fn workspace_wrong_object_shapes_refuse_without_formatting_the_input() {
+    let scratch = Scratch::new("workspace-shape-error");
+    for field in ["payload", "session_meta", "turn_context"] {
+        let path = scratch.write(
+            "wrong-shape",
+            &[json!({"type":"progress", "cwd":"/tmp/synthetic",
+            field: "\u{0080}".repeat(100_000)})
+            .to_string()],
+        );
+        let (native, _) = full_read(&path, SnapshotSource::ClaudeCode);
+        let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
+        let mut decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
+        decoded.rederive = Rederive {
+            workspace: decoded.rederive.workspace,
+            ..Default::default()
+        };
+        assert!(decoded.rederive.workspace.is_some());
+        decoded.content_charge().unwrap();
+        assert!(matches!(
+            decoded.rederive_content(&File::open(&path).unwrap()),
+            Err(Refuse::NotRederivable("workspace_capture"))
+        ));
+    }
+}
+
+// M3 G1 (r6 native): the one native finish body and its PRE-finalization
+// seam. The seam is what `finish_with_repository_identity_prepared` stages
+// from; these controls pin where it runs and what it sees, without a store.
+
+/// The body bytes the seam's live view encodes to, and whether the
+/// scan-shared live inputs were detached while it ran.
+fn seam_body(live: crate::snapshots::PreFinalization<'_>) -> (Vec<u8>, bool) {
+    let detached = live.accumulator.codex_turn_traces.is_none()
+        && live.accumulator.codex_parent_ownership_ledgers.is_none();
+    let body = encode_parts(
+        live.accumulator,
+        live.report,
+        (
+            live.recognized_usage_drop_count,
+            live.positive_recognized_usage_count,
+            live.positive_usage_evidence,
+        ),
+        usize::MAX,
+        line_cap(),
+    )
+    .expect("a clean fixture encodes");
+    (body, detached)
+}
+
+#[test]
+fn m3_seam_live_bytes_equal_retained_copy_and_output_equals_legacy() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let scratch = Scratch::new("m3-seam");
+        let lines = match source {
+            SnapshotSource::Codex => codex_lines(),
+            _ => claude_lines(2, 2),
+        };
+        let path = scratch.write("t.jsonl", &lines);
+        let traces = || Some(std::sync::Arc::new(Default::default()));
+        // Oracle: the copy a certified completion retains, then the legacy
+        // wrapper's output over the same parser.
+        let mut legacy = parser(&path, source);
+        legacy
+            .prepare_acquisition(None, &scope(), None, NOW)
+            .unwrap();
+        while !legacy.step().unwrap() {}
+        legacy.accumulator.codex_turn_traces = traces();
+        // This fixture qualifies an encodable live state; first-prompt raw
+        // material is deliberately outside the durable codec's allowlist.
+        legacy.accumulator.first_prompt_material = None;
+        legacy.accumulator.first_prompt_title = None;
+        let retained = legacy.durable_test_reduction_copy();
+        let legacy = items(legacy, &path, source);
+        let mut live = parser(&path, source);
+        live.prepare_acquisition(None, &scope(), None, NOW).unwrap();
+        while !live.step().unwrap() {}
+        live.accumulator.codex_turn_traces = traces();
+        // This fixture qualifies an encodable live state; first-prompt raw
+        // material is deliberately outside the durable codec's allowlist.
+        live.accumulator.first_prompt_material = None;
+        live.accumulator.first_prompt_title = None;
+        let mut seen = Vec::new();
+        let at_seam = items_at(
+            live,
+            &path,
+            source,
+            Some(&mut |view: crate::snapshots::PreFinalization<'_>| seen.push(seam_body(view))),
+        );
+        assert_eq!(seen.len(), 1, "{source:?}: the seam runs exactly once");
+        let (body, detached) = &seen[0];
+        assert!(
+            detached,
+            "{source:?}: live scan inputs are detached at the seam"
+        );
+        assert_eq!(
+            body,
+            &encode_body(&retained, usize::MAX, line_cap()).unwrap(),
+            "{source:?}: PRE-finalization live bytes are the retained copy's bytes"
+        );
+        assert_eq!(
+            at_seam, legacy,
+            "{source:?}: the shared body publishes exactly the legacy output"
+        );
+    }
+}
+
+#[test]
+fn m3_seam_never_runs_before_the_held_object_is_revalidated() {
+    let scratch = Scratch::new("m3-seam-refused");
+    let path = scratch.write("t.jsonl", &claude_lines(1, 1));
+    let request = |expected: &'static str| crate::snapshots::FinishRequest {
+        expected_opened_object_identity: expected,
+        path: &path,
+        collected_at: COLLECTED,
+        source_file_fingerprint: "fp".into(),
+        codex_title_metadata: None,
+        claude_title_metadata: None,
+        attribution_context: None,
+        repository_identity: None,
+        money_context: None,
+    };
+    let mut calls = 0;
+    // An unfinished read and a changed opened object both fail before the
+    // seam: nothing is staged, so nothing needs discarding.
+    let unfinished = parser(&path, SnapshotSource::ClaudeCode);
+    let mut count = |_: crate::snapshots::PreFinalization<'_>| calls += 1;
+    assert!(unfinished
+        .finish_native(request("unused"), Some(&mut count))
+        .is_err());
+    let mut changed = parser(&path, SnapshotSource::ClaudeCode);
+    while !changed.step().unwrap() {}
+    assert!(changed
+        .finish_native(request("another opened object"), Some(&mut count))
+        .is_err());
+    assert_eq!(calls, 0);
 }

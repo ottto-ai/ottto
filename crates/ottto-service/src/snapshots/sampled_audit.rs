@@ -252,6 +252,24 @@ pub(super) fn path_requires_verification(
     })
 }
 
+/// Retain the existing partial growth safeguard and S2 shorter/future floors
+/// until E3 #876 joins through main with its bounded old-directory rescue.
+/// This predicate alone does NOT implement or qualify that dependency.
+/// Discovery grants no ACK, census proof or independent read permission.
+pub(super) fn path_requires_recovery(
+    source: SnapshotSource,
+    files: &BTreeMap<String, ScanIndexEntry>,
+    path: &Path,
+    length: u64,
+) -> bool {
+    path_requires_verification(files, path)
+        || files.get(&local_index_key(path)).is_some_and(|entry| {
+            length != entry.size_bytes
+                || entry.effective_upload_body_witness_revision
+                    > crate::snapshot_sync::effective_upload_body_witness_revision(source)
+        })
+}
+
 pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
     for entry in index
         .files

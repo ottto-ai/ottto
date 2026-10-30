@@ -1519,7 +1519,7 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
         assert_eq!(
             records,
             usize::from(supported),
-            "{arm}: written after the save"
+            "{arm}: native persistence requires supported bounded restore"
         );
 
         fixture.file.append(&usage(source, 130, 1, "fixture-model"));
@@ -2478,7 +2478,11 @@ fn durable_inventory_overflow_keeps_tail_reuse_and_defers_new_keys() {
     assert_eq!(modes, (1, 0, 0));
     index.save(&index_path).unwrap();
     first.durable_write_after_save(lock, source, &index);
-    assert_eq!(records(), usize::from(supported));
+    assert_eq!(
+        records(),
+        usize::from(supported),
+        "native persistence requires supported bounded restore"
+    );
 
     // Kept U records (opaque headers) past the inventory bound.
     fs::DirBuilder::new()
@@ -4385,13 +4389,11 @@ fn codex_compaction_events_and_points_match_full_read_at_every_tail_split() {
 /// expected/scope/restore/write seams. Each restart has zero Fulls.
 #[cfg(unix)]
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() {
     use crate::durable_tail_store as store;
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    // OwnedSourceScan::new enables identity capture for both sources in tests.
-    // Bind every durable pass to that same mode, including Codex.
+    assert!(crate::heap_layout_bound::layout_supported());
+    // Match OwnedSourceScan::new capture mode for both sources.
     let identity_capture = true;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
@@ -4581,10 +4583,9 @@ mod audit_retirement_tests;
 /// Enabling the durable cache must preserve main's Full-on-miss admission.
 #[cfg(unix)]
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn no_record_keys_keep_existing_full_admission_after_restart() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
+    assert!(crate::heap_layout_bound::layout_supported());
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
@@ -4602,7 +4603,7 @@ fn no_record_keys_keep_existing_full_admission_after_restart() {
             source,
             &index_path,
             &namespace,
-            source == SnapshotSource::ClaudeCode,
+            true, // Match production_scan's cfg(test) identity capture.
         );
         let loaded = ScanIndex::load(&index_path).unwrap();
         let (_, scan, modes) = production_scan(
@@ -4617,7 +4618,7 @@ fn no_record_keys_keep_existing_full_admission_after_restart() {
         assert_eq!(production_body(source, scan), production_body(source, cold));
         assert_eq!(
             cache.durable_counters(source).unwrap().0.durable_held,
-            [0; 5]
+            [0; 8]
         );
     }
 }
@@ -4626,12 +4627,10 @@ fn no_record_keys_keep_existing_full_admission_after_restart() {
 /// Restart must re-arm the audit, not freeze the old debt-bearing record.
 #[cfg(unix)]
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    // OwnedSourceScan::new enables identity capture for both sources in tests.
-    // Bind every durable pass to that same mode, including Codex.
+    assert!(crate::heap_layout_bound::layout_supported());
+    // Match OwnedSourceScan::new capture mode for both sources.
     let identity_capture = true;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
@@ -4735,7 +4734,7 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
         );
         assert_eq!(
             restart.durable_counters(source).unwrap().0.durable_held,
-            [0; 5]
+            [0; 8]
         );
         assert_eq!(production_body(source, scan), production_body(source, cold));
         assert!(!repaired.files[&key].has_unverified_source());
@@ -4797,6 +4796,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
         certificate.audit_debt_unix_seconds = Some(now + 60);
         let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
         let pending = store::PendingRecord {
+            acquisition: None,
             binding: store::Binding {
                 source: ds,
                 key: record_key,
@@ -4809,7 +4809,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
             allowlist: sampled_jsonl::durable::allowlist_digest(source),
         };
         assert_eq!(
-            disk.write_after_save(lock, 1, vec![pending])
+            disk.write_after_save(lock, 1, 0, vec![pending])
                 .unwrap()
                 .written,
             1
@@ -4903,7 +4903,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
             None,
             "verified-first Full never stages recovered debt"
         );
-        assert_eq!(counts.durable_held, [0; 5]);
+        assert_eq!(counts.durable_held, [0; 8]);
         assert_eq!(
             counts.restore_attempts, 0,
             "missing membership never reaches restore"
@@ -5011,7 +5011,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
         let (counts, _) = restart.durable_counters(source).unwrap();
         assert_eq!(counts.ineligible.get("audit_carrier"), None);
         assert_eq!(counts.restore_attempts, 0);
-        assert_eq!(counts.durable_held, [0; 5]);
+        assert_eq!(counts.durable_held, [0; 8]);
         // Quiet restart alone never probes the record. A new suffix must
         // restore the ordinary replacement under the same capture binding.
         fixture.file.append(&usage(source, 190, 3, "fixture-model"));
@@ -5061,6 +5061,7 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
         certificate.audit_debt_unix_seconds = Some(now);
         let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
         let pending = store::PendingRecord {
+            acquisition: None,
             binding: store::Binding {
                 source: ds,
                 key: record_key,
@@ -5073,7 +5074,7 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
             allowlist: sampled_jsonl::durable::allowlist_digest(source),
         };
         assert_eq!(
-            disk.write_after_save(lock, 1, vec![pending])
+            disk.write_after_save(lock, 1, 0, vec![pending])
                 .unwrap()
                 .written,
             1
@@ -5146,7 +5147,7 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
         );
         assert_eq!(counts.restored, 0);
         assert_eq!(counts.restore_attempts, 0);
-        assert_eq!(counts.durable_held, [0; 5]);
+        assert_eq!(counts.durable_held, [0; 8]);
         let (_, cold, _) =
             production_scan(&fixture, source, ScanIndex::default(), None, &namespace.0);
         assert_eq!(production_body(source, scan), production_body(source, cold));
@@ -5299,6 +5300,7 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
             let mut disk =
                 store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
             let pending = store::PendingRecord {
+                acquisition: None,
                 binding: store::Binding {
                     source: ds,
                     key: record_key,
@@ -5318,7 +5320,7 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
                 allowlist: sampled_jsonl::durable::allowlist_digest(source),
             };
             assert_eq!(
-                disk.write_after_save(lock, 1, vec![pending])
+                disk.write_after_save(lock, 1, 0, vec![pending])
                     .unwrap()
                     .written,
                 1
@@ -5339,7 +5341,7 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
                 source,
                 &index_path,
                 &namespace,
-                source == SnapshotSource::ClaudeCode,
+                true, // Match production_scan's cfg(test) identity capture.
             );
             begin_durable_pass(
                 &cache,
@@ -5348,7 +5350,7 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
                 &index_path,
                 true,
                 &namespace,
-                source == SnapshotSource::ClaudeCode,
+                true, // Match production_scan's cfg(test) identity capture.
             );
             assert_eq!(
                 fs::read(&record_path).unwrap(),
@@ -5374,7 +5376,7 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
             let (counts, _) = cache.durable_counters(source).unwrap();
             assert_eq!(counts.restored, 0);
             assert_eq!(counts.restore_attempts, 0);
-            assert_eq!(counts.durable_held, [0; 5]);
+            assert_eq!(counts.durable_held, [0; 8]);
             if matching {
                 assert!(index.files[&key].has_unverified_source());
                 let due = index.files[&key].unverified_deadline().unwrap();

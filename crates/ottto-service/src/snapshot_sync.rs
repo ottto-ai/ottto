@@ -5374,6 +5374,17 @@ impl SourcePreparation {
     }
     fn step_inner(mut self) -> SourcePreparationStep {
         let mut state = self.scan.take().expect("active source preparation");
+        if state
+            .persist_upgrade_reservations(&mut self.committed_index, &self.index_path)
+            .is_err()
+        {
+            self.scan = Some(state);
+            return SourcePreparationStep::Refused(
+                self,
+                crate::source_rotation::LocalRefusal("upgrade reservation save failed"),
+            );
+        }
+
         if state.native_capture_active() {
             let initialize = self
                 .native_comparison_reservation
@@ -6377,7 +6388,7 @@ fn prepare_sync_source_inner(
         &sampled_scope,
         request_identity_capture,
     );
-    let mut scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
+    let mut scan = crate::snapshots::OwnedSourceScan::new_with_durable_cache(
         source,
         &roots,
         index,
@@ -6394,6 +6405,7 @@ fn prepare_sync_source_inner(
         watcher_hints.overflowed,
         context_curve_enabled,
         request_identity_capture,
+        &daemon.transcript_cache,
     )
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
     .with_codex_side_pass(codex_side_pass)
@@ -6796,6 +6808,14 @@ fn prepare_continuation_source(
         home,
         &inputs.scan_agent_status_collection.codex_scan_homes,
     )?;
+    // K5: reuse the ordinary page's namespace and durable pass, including GC/breaker state.
+    let sampled_scope = cycle_sampled_scope(
+        &inputs.account_witness,
+        &inputs.upload_destination_namespace,
+        &inputs.index_path,
+        inputs.context_curve_enabled,
+        false,
+    );
     let scan = crate::snapshots::OwnedSourceScan::new_continuation(
         &roots,
         index,
@@ -6808,17 +6828,7 @@ fn prepare_continuation_source(
         inputs.evidence.take(),
     )
     .with_continuation_deadline(deadline)
-    .with_sampled_acquisition(
-        std::sync::Arc::clone(cache),
-        // K5: the ordinary Codex page's scope; Codex never captures.
-        cycle_sampled_scope(
-            &inputs.account_witness,
-            &inputs.upload_destination_namespace,
-            &inputs.index_path,
-            inputs.context_curve_enabled,
-            false,
-        ),
-    )
+    .with_sampled_acquisition(std::sync::Arc::clone(cache), sampled_scope)
     .with_codex_side_pass(Some(codex_side_pass))
     .with_line_observer("codex_prelude", inputs.codex_preludes.observer(&roots))
     .with_codex_versions(inputs.codex_versions.clone());
@@ -6984,6 +6994,17 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    // D3: a source-fault fallback may not reach any POST until the retained
+    // Codex entry no longer binds stale A on disk. Save only committed PRE
+    // facts; a failed barrier returns before upload/ACK/settlement.
+    #[cfg(unix)]
+    crate::snapshots::commit_store_fault_barrier(
+        &daemon.transcript_cache,
+        source,
+        &mut index,
+        &mut committed_index,
+        &index_path,
+    )?;
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
     if let Some(lease) = native_comparison_lease.as_mut() {

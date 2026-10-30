@@ -989,7 +989,9 @@ impl FullCauses {
     fn is_empty(&self) -> bool {
         self.restore_outcome.restored == 0
             && self.restore_outcome.held == 0
+            && self.restore_outcome.pending == 0
             && self.restore_outcome.miss.is_empty()
+            && self.restore_outcome.stale.is_empty()
     }
 }
 #[derive(Debug, Default, Serialize)]
@@ -998,17 +1000,36 @@ pub(crate) struct RestoreCounts {
     restored: u64,
     #[serde(skip_serializing_if = "is_zero")]
     held: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pending: u64,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     miss: BTreeMap<&'static str, u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    stale: BTreeMap<&'static str, u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    stale_attribution: BTreeMap<&'static str, u64>,
 }
 impl RestoreCounts {
     #[cfg(unix)]
     pub(crate) fn record(&mut self, outcome: &crate::snapshots::sampled_scan::RestoreOutcome) {
         use crate::snapshots::sampled_scan::RestoreOutcome;
         let count = match outcome {
-            RestoreOutcome::Restored(_) => &mut self.restored,
-            RestoreOutcome::Held(_) => &mut self.held,
+            RestoreOutcome::Restored(..) => &mut self.restored,
+            RestoreOutcome::Held(_) | RestoreOutcome::FloorHeld => &mut self.held,
+            RestoreOutcome::Pending => &mut self.pending,
             RestoreOutcome::Miss(class) => self.miss.entry(class.label()).or_default(),
+            RestoreOutcome::Stale(reason) => self.stale.entry(reason).or_default(),
+            RestoreOutcome::StaleUnregistered(reason, obligation) => {
+                let label =
+                    crate::snapshots::sampled_scan::MissClass::Unregistered(*obligation).label();
+                let attribution = self.stale_attribution.entry(label).or_default();
+                *attribution = attribution.saturating_add(1);
+                self.stale.entry(reason).or_default()
+            }
+            RestoreOutcome::Degraded => self
+                .miss
+                .entry("degraded_no_record.active_bound")
+                .or_default(),
         };
         *count = count.saturating_add(1);
     }
@@ -1492,9 +1513,16 @@ mod tests {
             crate::durable_tail_store::Refusal::Unknown,
         ));
         assert_eq!(counts.held, u64::MAX);
-        counts.restored = 1;
+        counts.held = 0;
+        counts.record(&RestoreOutcome::Pending);
+        assert!(
+            !probe.full_causes.is_empty(),
+            "pending-only pages remain visible"
+        );
+        probe.full_causes.restore_outcome.restored = 1;
         let json = serde_json::to_value(&probe.full_causes).unwrap();
         assert_eq!(json["restore_outcome"]["restored"], 1);
+        assert_eq!(json["restore_outcome"]["pending"], 1);
     }
 
     #[test]

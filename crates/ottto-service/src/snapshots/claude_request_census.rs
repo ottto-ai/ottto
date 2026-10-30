@@ -1399,12 +1399,19 @@ pub(super) fn decode_index<R: std::io::Read>(reader: R) -> serde_json::Result<Sc
     CensusRead::new(reader).decode()
 }
 
-pub(super) fn normalized_bounded_bytes(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, bool, bool)> {
+pub(super) fn normalized_bounded_bytes(
+    bytes: &[u8],
+) -> anyhow::Result<(Vec<u8>, bool, bool, bool)> {
     use std::io::Read;
     let mut normalized = Vec::new();
     let mut reader = CensusRead::new(bytes);
     reader.read_to_end(&mut normalized)?;
-    Ok((normalized, reader.duplicate_census, reader.duplicate_shadow))
+    Ok((
+        normalized,
+        reader.duplicate_census,
+        reader.duplicate_shadow,
+        reader.duplicate_upgrade,
+    ))
 }
 
 pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
@@ -1477,12 +1484,14 @@ struct CensusRead<R> {
     root_array: bool,
     array_index: usize,
     sequence_fields: (usize, usize, usize),
-    retired_guard: bool,
+    upgrade_guard: bool,
     quoted: bool,
     escaped: bool,
     expect_key: bool,
     seen_census: bool,
     seen_shadow: bool,
+    seen_upgrade: bool,
+    duplicate_upgrade: bool,
     duplicate_census: bool,
     duplicate_shadow: bool,
     shadow_key: bool,
@@ -1505,12 +1514,14 @@ impl<R: std::io::Read> CensusRead<R> {
             root_array: false,
             array_index: 0,
             sequence_fields: sequence_fields(),
-            retired_guard: false,
+            upgrade_guard: false,
             quoted: false,
             escaped: false,
             expect_key: false,
             seen_census: false,
             seen_shadow: false,
+            seen_upgrade: false,
+            duplicate_upgrade: false,
             duplicate_census: false,
             duplicate_shadow: false,
             shadow_key: false,
@@ -1535,6 +1546,9 @@ impl<R: std::io::Read> CensusRead<R> {
     fn invalidate_duplicates(&self, index: &mut ScanIndex) {
         if self.duplicate_census {
             index.claude_request_census = ClaudeRequestCensus::default();
+        }
+        if self.duplicate_upgrade {
+            index.o3_replay = super::upgrade_replay::State::refused();
         }
         if self.duplicate_shadow {
             index.claude_request_census_shadow = ClaudeRequestCensusShadowState::default();
@@ -1562,7 +1576,7 @@ impl<R: std::io::Read> CensusRead<R> {
             }
         }
         self.shadow_key = false;
-        self.retired_guard = false;
+        self.upgrade_guard = false;
         if !self.quoted {
             if let Ok(name) = serde_json::from_slice::<String>(&key) {
                 let duplicate = match name.as_str() {
@@ -1584,8 +1598,11 @@ impl<R: std::io::Read> CensusRead<R> {
                     }
                     "reread_guard" => {
                         self.shadow_key = true;
-                        self.retired_guard = true;
-                        return Ok(b"\"_ignored_retired_reread_guard\"".to_vec());
+                        self.upgrade_guard = true;
+                        let duplicate = self.seen_upgrade;
+                        self.seen_upgrade = true;
+                        self.duplicate_upgrade |= duplicate;
+                        duplicate
                     }
                     _ => false,
                 };
@@ -1623,7 +1640,7 @@ impl<R: std::io::Read> CensusRead<R> {
         // Original admitted evidence was grammar-checked by the lexical
         // boundary. The syntax-only pass substitutes null without buffering
         // or interpreting census records, even before header controls run.
-        let mut overflow = self.syntax_only || self.retired_guard;
+        let mut overflow = self.syntax_only;
         while let Some(byte) = self.byte()? {
             if !quoted && depth == 0 && matches!(byte, b',' | b'}' | b']') {
                 self.replay = Some(byte);
@@ -1666,7 +1683,12 @@ impl<R: std::io::Read> CensusRead<R> {
         // Parsing is isolated from the enclosing index, including numeric
         // conversion and wrong-token errors. Only canonical, finite tokens
         // leave this reader. JSON syntax outside the optional field is intact.
-        Ok(if self.shadow_state {
+        Ok(if self.upgrade_guard {
+            let state = serde_json::from_slice::<super::upgrade_replay::State>(&bytes)
+                .unwrap_or_else(|_| super::upgrade_replay::State::refused());
+            drop(bytes);
+            serde_json::to_vec(&state).expect("O3 spend serialization")
+        } else if self.shadow_state {
             let state = serde_json::from_slice::<ClaudeRequestCensusShadowState>(&bytes)
                 .unwrap_or_default();
             drop(bytes);
@@ -1710,7 +1732,7 @@ impl<R: std::io::Read> CensusRead<R> {
                 || self.array_index == self.sequence_fields.2)
         {
             self.shadow_state = self.array_index == self.sequence_fields.1;
-            self.retired_guard = self.array_index == self.sequence_fields.2;
+            self.upgrade_guard = self.array_index == self.sequence_fields.2;
             self.replay = Some(byte);
             self.output = std::io::Cursor::new(self.evidence()?);
             return self.next();
@@ -2740,6 +2762,31 @@ pub(crate) fn record_claude_request_census(
     }
 }
 
+/// A2 metadata proof for the currently opened object, independent of optional
+/// RAM/disk restore. A verified census must bind the exact committed fingerprint,
+/// mtime and physical object. Missing/stale/unknown evidence grants nothing.
+pub(super) fn proves_indexed_shrink(
+    index: &ScanIndex,
+    key: &str,
+    length: u64,
+    physical: Option<[u64; 2]>,
+) -> bool {
+    let (Some(record), Some(entry)) = (index.claude_request_census.get(key), index.files.get(key))
+    else {
+        return false;
+    };
+    length < entry.size_bytes
+        && !record.unverified
+        && !record.is_birth_stub()
+        && !entry.source_file_fingerprint.is_empty()
+        && decode_fingerprint(&entry.source_file_fingerprint)
+            == Some(record.source_file_fingerprint)
+        && record.modified == Some(entry.modified_unix_seconds)
+        && record
+            .birth
+            .is_some_and(|birth| physical == Some([birth.device, birth.inode]))
+}
+
 /// A Held key keeps copy proof while its committed entry is still the
 /// version the record describes (the server's stale body), on the same
 /// physical object; the file itself may have grown. A cleared (reparse-debt)
@@ -2799,7 +2846,7 @@ pub(crate) fn settle_claude_request_census_terminal(
         .claude_request_census
         .retain_keys(|key| files.contains_key(key) || observed_index_keys.contains(key));
     let window = rfc3339_unix_seconds(census_window_end).unwrap_or_default();
-    let aged = retire_claude_transcript_records(index, window);
+    let aged = retire_claude_transcript_records(index, window, residue_index_keys);
     note_transcript_retirements(aged, vanished);
     let join = ClaudeRequestCensusJoin::new(index, window, residue_index_keys);
     let mut counts = join.counts(true);
@@ -2857,7 +2904,11 @@ pub(crate) fn transcript_retirements() -> (u64, u64) {
 /// counts it, so a copy elsewhere owns those ids under the approved rule
 /// (telemetry owner first, else the copy). Retirement edits records in
 /// place: nothing is cloned.
-fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> u64 {
+fn retire_claude_transcript_records(
+    index: &mut ScanIndex,
+    window: u64,
+    held: &BTreeSet<String>,
+) -> u64 {
     if window == 0 {
         return 0;
     }
@@ -2867,6 +2918,11 @@ fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> u64 {
     let mut aged = 0_u64;
     let mut freed = (0_usize, 0_usize);
     for (key, record) in census.records.iter_mut() {
+        // A paced/correctness residue still owns unread growth. Its old
+        // committed stamp must not retire the request evidence before catch-up.
+        if held.contains(key.as_str()) {
+            continue;
+        }
         if record.is_birth_stub() || record.retired.is_some() || record.hash_count() == 0 {
             continue;
         }

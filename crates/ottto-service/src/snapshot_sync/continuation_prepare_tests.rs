@@ -814,3 +814,210 @@ fn a_prepared_continuation_page_keeps_the_ordinary_side_gate() {
         );
     }
 }
+
+/// Drive a real paused ordinary job through the production continuation builder,
+/// native EOF, index save and the production durable-after-save hook.
+#[cfg(unix)]
+fn ordinary_durable_continuation_to_eof(
+    name: &str,
+    check: impl FnOnce(
+        &crate::snapshots::ContinuationDurableState,
+        &crate::snapshots::sampled_scan::SharedCache,
+        &ScanIndex,
+    ),
+) {
+    assert!(crate::heap_layout_bound::layout_supported());
+    use crate::snapshots::{OwnedSourceScan, OwnedSourceScanStep};
+    let fixture = ContinuationFixture::quiescent(name);
+    let root = fixture.home.join(".codex/sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let at = current_rfc3339();
+    let session = "019fa111-2222-7333-8444-555555555555";
+    let path = root.join(format!("rollout-2026-10-29T10-00-00-{session}.jsonl"));
+    let mut lines =
+        vec![serde_json::json!({"timestamp":at,"type":"session_meta","payload":{"id":session}})];
+    for n in 1..=80 {
+        lines.push(serde_json::json!({"timestamp":at,"type":"event_msg","payload":{
+            "type":"token_count","info":{"model":"fixture-model",
+            "total_token_usage":{"input_tokens":n*100,"cached_input_tokens":n*50,"output_tokens":n*10},
+            "last_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":10}}}}));
+    }
+    std::fs::write(
+        &path,
+        lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
+    let writer = crate::locked_state_dir::test_locks::hold(fixture.index_path.parent().unwrap());
+    let mut minted = fixture.preparation(false);
+    let mut inputs = take_continuation_inputs(
+        &mut minted,
+        &std::sync::Arc::default(),
+        std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+    );
+    let namespace = cycle_sampled_scope(
+        &inputs.account_witness,
+        &inputs.upload_destination_namespace,
+        &inputs.index_path,
+        false,
+        false,
+    );
+    let (_, mut index) = fixture.load();
+    index.activate_upload_context(cycle_upload_context(inputs.upload_policy, None, false));
+    index.mark_context_curve_capability_disabled();
+    index.activate_effective_upload_body_witness_revision(cycle_body_witness_revision(
+        SnapshotSource::Codex,
+    ));
+    crate::snapshots::begin_durable_pass(
+        &cache,
+        &fixture.support_dir,
+        SnapshotSource::Codex,
+        &fixture.index_path,
+        false,
+        &namespace,
+        false,
+    );
+    crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
+        let mut ordinary = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            index,
+            &at,
+            30,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            false,
+        )
+        .with_sampled_acquisition(std::sync::Arc::clone(&cache), namespace.clone());
+        let (mut index, mut scan) = loop {
+            match ordinary.step(None) {
+                OwnedSourceScanStep::Pending(next) => ordinary = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => break (index, scan),
+            }
+        };
+        assert!(
+            scan.snapshots.is_empty(),
+            "ordinary job genuinely paused before EOF"
+        );
+        inputs.evidence = scan.take_continuation_evidence();
+        assert!(
+            inputs.evidence.is_some(),
+            "carry certified ordinary inventory"
+        );
+        let ticket = scan
+            .continuation_ticket()
+            .expect("ordinary job genuinely paused");
+        let port = crate::snapshots::CodexCursorPort::new(std::sync::Arc::clone(&cache));
+        assert!(port.ready(ticket));
+        let members = port.members(ticket).expect("paused member identity");
+        assert_eq!(
+            members,
+            BTreeSet::from([path.to_string_lossy().into_owned()])
+        );
+        let state = crate::snapshots::ContinuationDurableState::seed(
+            &cache,
+            &mut index,
+            &fixture.index_path,
+            &namespace,
+            writer,
+        );
+        state.assert_preserved(&cache);
+        for page in 0..64 {
+            let result = run_continuation_scan(
+                &fixture.home,
+                &fixture.support_dir,
+                &cache,
+                &mut inputs,
+                Some(Duration::from_secs(300)),
+                Instant::now() + Duration::from_secs(20),
+            )
+            .unwrap();
+            state.assert_preserved(&cache);
+            match result {
+                ContinuationScan::Uncommitted {
+                    ticket: Some(_),
+                    snapshots,
+                } => {
+                    assert_eq!(
+                        snapshots, 0,
+                        "page {page}: no publication before native EOF"
+                    );
+                }
+                ContinuationScan::Uncommitted {
+                    ticket: None,
+                    snapshots,
+                } => {
+                    assert_eq!(
+                        snapshots, 0,
+                        "continuation parks EOF for ordinary settlement"
+                    );
+                    let (mut index, scan) = state.finish_ordinary_eof(|| {
+                        let mut ordinary = OwnedSourceScan::new(
+                            SnapshotSource::Codex,
+                            std::slice::from_ref(&root),
+                            ScanIndex::load(&fixture.index_path).unwrap(),
+                            &at,
+                            30,
+                            10,
+                            false,
+                            None,
+                            &[],
+                            false,
+                            false,
+                        )
+                        .with_sampled_acquisition(std::sync::Arc::clone(&cache), namespace.clone());
+                        loop {
+                            match ordinary.step(None) {
+                                OwnedSourceScanStep::Pending(next) => ordinary = next,
+                                OwnedSourceScanStep::Complete { index, scan, .. } => {
+                                    break (index, scan)
+                                }
+                            }
+                        }
+                    });
+                    assert!(
+                        scan.continuation_ticket().is_none(),
+                        "ordinary settled genuine native EOF"
+                    );
+                    assert!(!scan.snapshots.is_empty(), "native result reached EOF");
+                    state.assert_preserved(&cache);
+                    index.save(&fixture.index_path).unwrap();
+                    crate::snapshots::durable_after_save(
+                        &cache,
+                        &fixture.support_dir,
+                        SnapshotSource::Codex,
+                        &index,
+                    );
+                    check(&state, &cache, &index);
+                    return;
+                }
+                _ => panic!("production continuation refused the quiescent paused job"),
+            }
+        }
+        panic!("continuation never reached native EOF");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
+fn continuation_keeps_ordinary_gc_decisions_through_native_eof() {
+    ordinary_durable_continuation_to_eof("continuation-durable-gc", |state, cache, index| {
+        state.assert_gc_at_eof(cache, index);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
+fn continuation_keeps_ordinary_breaker_and_rebuilt_keys_through_native_eof() {
+    ordinary_durable_continuation_to_eof("continuation-durable-breaker", |state, cache, _| {
+        state.assert_breaker_at_eof(cache);
+    });
+}

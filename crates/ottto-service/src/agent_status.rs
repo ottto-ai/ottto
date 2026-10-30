@@ -23787,8 +23787,8 @@ for line in sys.stdin:
         }
         // A diagnostic has a code and a message.
         for diagnostic in rows(collection, "diagnostics") {
-            if text(&diagnostic, "code").is_none_or(|code| code.is_empty())
-                || text(&diagnostic, "message").is_none_or(|message| message.is_empty())
+            if text(&diagnostic, "code").map_or(true, |code| code.is_empty())
+                || text(&diagnostic, "message").map_or(true, |message| message.is_empty())
             {
                 return Err("empty diagnostic".to_string());
             }
@@ -23799,7 +23799,7 @@ for line in sys.stdin:
         let mut fresh_evidence = false;
         if let Some(snapshot) = snapshot {
             // A snapshot has a capture time.
-            if text(snapshot, "captured_at").is_none_or(|at| at.is_empty()) {
+            if text(snapshot, "captured_at").map_or(true, |at| at.is_empty()) {
                 return Err("quota_snapshot without captured_at".to_string());
             }
             // A snapshot only on these states.
@@ -23857,7 +23857,7 @@ for line in sys.stdin:
         // A fresh slot proves its reading.
         if state == "fresh"
             && (account.is_none()
-                || text(collection, "observed_at").is_none_or(|at| at.is_empty())
+                || text(collection, "observed_at").map_or(true, |at| at.is_empty())
                 || !fresh_evidence)
         {
             return Err("fresh without identity, read time or fresh meters".to_string());
@@ -33117,9 +33117,9 @@ for line in sys.stdin:
         // retired streak must not come back.
         let resurrected = read_claude_oauth_usage_breaker(account, organization, fingerprint);
         assert!(
-            resurrected
-                .as_ref()
-                .is_none_or(|breaker| !breaker.auth_callers.contains_key(&slot_a.breaker_key())),
+            resurrected.as_ref().map_or(true, |breaker| !breaker
+                .auth_callers
+                .contains_key(&slot_a.breaker_key())),
             "a caller's success must permanently retire its streak: {resurrected:?}"
         );
         let _ = fs::remove_dir_all(support_dir);

@@ -473,7 +473,7 @@ fn acquire(
                         .any(|entry| entry.codex_joined_member_set.is_some());
                     let complete = scan.census_complete;
                     index = next;
-                    if complete && cache.is_none_or(|cache| cache.cursor_slot_free()) {
+                    if complete && cache.map_or(true, |cache| cache.cursor_slot_free()) {
                         return index;
                     }
                     break;

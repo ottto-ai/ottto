@@ -253,6 +253,11 @@ pub(crate) struct Checkpoint {
 }
 
 impl Checkpoint {
+    /// The interpretation scope this checkpoint was made under.
+    pub(crate) fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
     /// A cache admission hint only. Source validation still uses the complete
     /// stamp, scope, samples and independent audit obligation.
     pub(crate) fn modified_hint(&self) -> (i64, i64) {
@@ -659,6 +664,26 @@ fn earlier_debt(a: Option<AuditDebt>, b: Option<AuditDebt>) -> Option<AuditDebt>
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static SAMPLE_READ_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Physical certificate input observer; production reads/credit are unchanged.
+#[cfg(test)]
+pub(crate) fn capture_sample_bytes<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SAMPLE_READ_BYTES.set(None);
+        }
+    }
+    assert!(SAMPLE_READ_BYTES.replace(Some(0)).is_none());
+    let _reset = Reset;
+    let output = run();
+    (output, SAMPLE_READ_BYTES.get().unwrap())
+}
+
 fn read_sample(file: &mut File, offset: u64, len: usize, count: &mut usize) -> io::Result<Vec<u8>> {
     file.seek(SeekFrom::Start(offset))?;
     let mut bytes = vec![0; len];
@@ -678,6 +703,12 @@ fn read_sample(file: &mut File, offset: u64, len: usize, count: &mut usize) -> i
             }
         });
         let n = result?;
+        #[cfg(test)]
+        SAMPLE_READ_BYTES.with(|bytes| {
+            if let Some(total) = bytes.get() {
+                bytes.set(Some(total + n));
+            }
+        });
         *count += n;
         if n == 0 {
             return Err(io::Error::new(
@@ -846,6 +877,12 @@ impl ReadPlan {
             scope,
             now,
             |at| {
+                #[cfg(test)]
+                if OLD_SAMPLE_IO_ERROR.with(std::cell::Cell::get) {
+                    return Err(io::Error::other(
+                        "injected persistent old-checkpoint sample I/O",
+                    ));
+                }
                 let old = checkpoint.expect("samples are compared only with a checkpoint");
                 match at {
                     SampleAt::Head => sample_at(file, 0, &old.samples.head, &mut guard_bytes_read),
@@ -1620,11 +1657,48 @@ impl DurableCertificate {
         Ok((checkpoint, admission))
     }
 
-    #[allow(clippy::type_complexity)]
-    fn admit_samples(
+    /// A stale interpretation cannot hide independent physical/content edits.
+    /// Mtime alone is deliberately excluded: compare the existing bounded
+    /// samples even when the unchanged-length mtime moved.
+    pub(crate) fn independent_edit(
         &self,
         file: &mut File,
-    ) -> Result<(DurableAdmission, Vec<u8>, Vec<u8>, FileStamp), CertificateRefusal> {
+    ) -> Result<Option<FullReason>, CertificateRefusal> {
+        let stamp = file
+            .metadata()
+            .and_then(FileStamp::capture)
+            .map_err(|_| CertificateRefusal::ReadError)?;
+        if stamp.device == self.device
+            && stamp.inode == self.inode
+            && stamp.length == self.length
+            && stamp.modified == self.modified
+            && (self.birth_nanos == 0
+                || birth_unix_nanos(&file.metadata().map_err(|_| CertificateRefusal::ReadError)?)
+                    == self.birth_nanos)
+        {
+            return Ok(None);
+        }
+        let mut probe = self.clone();
+        probe.modified = stamp.modified;
+        match probe.admit_samples(file) {
+            Err(CertificateRefusal::Changed(
+                reason @ (FullReason::Replaced
+                | FullReason::Shrunk
+                | FullReason::HeadChanged
+                | FullReason::BoundaryChanged),
+            )) => Ok(Some(reason)),
+            Ok(_) | Err(CertificateRefusal::Changed(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The existing allocation-free certificate edits. Keep these before
+    /// typed decode/rederive admission so resource pressure cannot hide A2.
+    pub(crate) fn check_metadata(&self, file: &File) -> Result<(), CertificateRefusal> {
+        self.checked_stamp(file).map(|_| ())
+    }
+
+    fn checked_stamp(&self, file: &File) -> Result<FileStamp, CertificateRefusal> {
         let metadata = file.metadata().map_err(|_| CertificateRefusal::ReadError)?;
         let stamp =
             FileStamp::capture(metadata.clone()).map_err(|_| CertificateRefusal::ReadError)?;
@@ -1643,10 +1717,19 @@ impl DurableCertificate {
         if stamp.length < self.length {
             return Err(CertificateRefusal::Changed(FullReason::Shrunk));
         }
-        let unchanged = stamp.length == self.length;
-        if unchanged && stamp.modified != self.modified {
+        if stamp.length == self.length && stamp.modified != self.modified {
             return Err(CertificateRefusal::Changed(FullReason::SameSizeEdit));
         }
+        Ok(stamp)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn admit_samples(
+        &self,
+        file: &mut File,
+    ) -> Result<(DurableAdmission, Vec<u8>, Vec<u8>, FileStamp), CertificateRefusal> {
+        let stamp = self.checked_stamp(file)?;
+        let unchanged = stamp.length == self.length;
         let len = self.sample_len as usize;
         let mut read = 0;
         #[cfg(test)]
@@ -1693,6 +1776,7 @@ impl DurableCertificate {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static OLD_SAMPLE_IO_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SAMPLES_MATCH_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BETWEEN_GUARDS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };

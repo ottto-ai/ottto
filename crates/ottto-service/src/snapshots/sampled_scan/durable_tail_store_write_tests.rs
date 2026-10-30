@@ -1,7 +1,7 @@
 //! Lead B's condition for #882: count the restart Fulls left by a failed
 //! post-save store write, and the write failures themselves. Counters and
 //! alarm only; the requeue fix is E1 / M3 D3.
-use super::tests::{certificate, known_corrupt_scan, native_fixture};
+use super::tests::{certificate, codex_budget_fixture, native_fixture};
 use super::*;
 use crate::locked_state_dir::test_locks;
 use crate::transcript_acquisition::ReadMode;
@@ -33,7 +33,18 @@ impl Restarted {
             &interpretation,
         ) {
             RestoreOutcome::Miss(class) => class.label(),
-            RestoreOutcome::Restored(_) => "restored",
+            RestoreOutcome::Restored(taken, lease) => {
+                drop(taken);
+                lease.release();
+                "restored"
+            }
+            RestoreOutcome::Pending | RestoreOutcome::FloorHeld | RestoreOutcome::Degraded => {
+                panic!("unexpected resource/floor deferral")
+            }
+            RestoreOutcome::Stale(reason) => reason,
+            RestoreOutcome::StaleUnregistered(reason, _) => {
+                panic!("unexpected unregistered obligation: {reason}")
+            }
             RestoreOutcome::Held(_) => "held",
         }
     }
@@ -94,7 +105,9 @@ fn restart_over(name: &str, stale: Option<bool>) -> Restarted {
             .write_after_save(
                 lock,
                 index.generation,
+                0,
                 vec![PendingRecord {
+                    acquisition: None,
                     binding,
                     certificate,
                     body: crate::snapshots::durable_store_fixture_body(SOURCE, 0, 0),
@@ -256,10 +269,9 @@ fn restart_full_alarm_fires_on_the_first_file_once_per_process() {
     let _ = std::fs::remove_dir_all(&run.root);
 }
 
-/// The real path: a post-save write whose rename fails counts the offered
-/// record and keeps the predecessor; after a restart the next change reads
-/// Full, counted with the bytes that Full read. The fault-free control
-/// restores and Tails with both counters at 0.
+/// Real M1 post-save boundary, independent of M3's earlier native v3 write.
+/// A failed rename preserves A; without the quiet-RAM repair, restart must
+/// refuse A and count the actual Full. The healthy control restores a Tail.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS retained layout")]
 fn failed_write_after_save_costs_one_counted_full_after_restart() {
@@ -277,72 +289,100 @@ fn failed_write_case(fail: bool) {
         }
     }
     let _reset = Reset;
-    let root = crate::test_scratch::private_dir("ottto-dt-store-write-failed");
-    let _lock = test_locks::hold(&root);
-    let sessions = root.join("sessions");
-    std::fs::create_dir(&sessions).unwrap();
-    let held = sessions.join("held.jsonl");
-    native_fixture(&held);
-    let key = local_index_key(&held);
-    let capture = claude_request_identity::captures(SOURCE);
+    let root = crate::test_scratch::ScratchDir::new("ottto-dt-store-write-failed");
+    let lock = test_locks::hold(&root);
+    let path = root.join("source.jsonl");
+    let source = SnapshotSource::Codex;
+    codex_budget_fixture(&path, "019fa111-2222-7333-8444-555555555555", None);
+    let key = local_index_key(&path);
+    let scope = Scope("store-write-failed-file".into());
     let namespace = Scope("store-write-failed-scan".into());
     let index_path = root.join("index.json");
-    let digest = store::key_digest(DurableSource::ClaudeCode, &key);
     let record = store::store_dir_for_index(&index_path).join(format!(
         "{}.rec",
-        digest
+        store::key_digest(DurableSource::Codex, &key)
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     ));
-    let append = |request: &str| {
-        let row = serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555","timestamp":"2026-10-07T10:00:01Z","requestId":request,"message":{"id":request,"model":"fixture-model","usage":{"input_tokens":200,"output_tokens":20}}});
-        writeln!(
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(&held)
-                .unwrap(),
-            "{row}"
+    // Drive the real parser/certificate and retained owner, but deliberately
+    // exercise M1's post-save writer: no native v3 seed or synthetic receipt.
+    let parse = |taken| {
+        let mut parser = OwnedJsonlParser::new(
+            File::open(&path).unwrap(),
+            &path,
+            source,
+            apply_codex_line,
+            None,
+            None,
+            None,
+            false,
+            true,
         )
         .unwrap();
+        let mode = parser
+            .prepare_acquisition_owned(taken, &scope, None, 1_800_000_000)
+            .unwrap_or_else(|_| panic!("native acquisition must prepare"));
+        while !parser.step().unwrap() {}
+        let bytes = parser.reader.consumed_bytes();
+        let reduction = parser.durable_test_reduction_copy();
+        let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
+        let sampled_jsonl::SideCertificate::Certified { mut completed, .. } = parser
+            .certify_without_retention(&scope, 1_800_000_000)
+            .unwrap()
+        else {
+            panic!("native acquisition must certify");
+        };
+        completed.reduction = Some(reduction);
+        (completed, mode, bytes, body)
     };
-    let (mut index, _, _) = known_corrupt_scan(
-        SOURCE,
-        &sessions,
-        &Arc::new(SharedCache::default()),
-        ScanIndex::default(),
-        &namespace,
-        "2026-10-20T12:00:00Z",
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":std::fs::metadata(&path).unwrap().len(),
+            "modified_unix_seconds":1,"source_file_fingerprint":"fp-a"
+        }))
+        .unwrap(),
     );
-    // Process 1: a Full admits the copy and the post-save write records it.
-    let cache = Arc::new(SharedCache::default());
-    cache.durable_begin_pass(SOURCE, &index_path, &namespace, capture);
-    for entry in index.files.values_mut() {
-        entry.source_file_fingerprint.clear();
-    }
-    let (mut index, _, _) = known_corrupt_scan(
-        SOURCE,
-        &sessions,
-        &cache,
-        index,
-        &namespace,
-        "2026-10-20T12:01:00Z",
-    );
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let (completed, mode, _, _) = parse(None);
+    assert!(matches!(mode, ReadMode::Full(_)));
+    assert!(cache.insert_admitted(key.clone(), completed, 0));
+    cache.durable_note_selection(&key, "fp-a");
+    cache.durable_note_scope(source, &key, &scope);
     index.save(&index_path).unwrap();
-    crate::snapshots::durable_after_save(&cache, &root, SOURCE, &index);
-    let predecessor = std::fs::read(&record).unwrap();
-    // The file grows; the RAM copy Tails and the save accepts the new entry.
-    append("req-after-record");
-    cache.durable_begin_pass(SOURCE, &index_path, &namespace, capture);
-    let (mut index, _, reads) = known_corrupt_scan(
-        SOURCE,
-        &sessions,
-        &cache,
-        index,
-        &namespace,
-        "2026-10-20T12:02:00Z",
+    assert_eq!(
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap()
+            .written,
+        1
     );
-    assert_eq!(reads[0], 0, "RAM Tail, not Full");
+    let predecessor = std::fs::read(&record).unwrap();
+    let append = || {
+        let suffix = b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(suffix)
+            .unwrap();
+        suffix.len() as u64
+    };
+    let suffix_bytes = append();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let taken = cache.take(&key).expect("real admitted RAM predecessor");
+    let (completed, mode, bytes, _) = parse(Some(Box::new(taken)));
+    assert_eq!(mode, ReadMode::Tail);
+    assert_eq!(bytes, suffix_bytes, "RAM Tail reads only new bytes");
+    assert!(cache.insert_admitted(key.clone(), completed, 0));
+    cache.durable_note_selection(&key, "fp-b");
+    cache.durable_note_scope(source, &key, &scope);
+    let entry = index.files.get_mut(&key).unwrap();
+    entry.source_file_fingerprint = "fp-b".into();
+    entry.size_bytes = std::fs::metadata(&path).unwrap().len();
     index.save(&index_path).unwrap();
     if fail {
         let target = record.clone();
@@ -354,49 +394,66 @@ fn failed_write_case(fail: bool) {
             }
         })));
     }
-    crate::snapshots::durable_after_save(&cache, &root, SOURCE, &index);
+    let written = cache.durable_write_after_save(lock, source, &index);
     store::test_hooks::set_before_rename(None);
-    let (counts, _) = cache.durable_counters(SOURCE).unwrap();
+    if fail {
+        assert!(written.is_none());
+    } else {
+        assert_eq!(written.unwrap().written, 1);
+    }
+    let counts = cache.durable_counters(source).unwrap().0;
     assert_eq!(counts.store_write_after_save_failed, u64::from(fail));
     assert_eq!(counts.store_write_failed_restart_full, [0, 0]);
     assert_eq!(
         std::fs::read(&record).unwrap() == predecessor,
         fail,
-        "a failed write keeps the predecessor"
+        "failed post-save write never deletes a valid predecessor"
     );
-    drop(cache);
-    // Restart: the next change reads Full when the predecessor is refused.
-    let cache = Arc::new(SharedCache::default());
-    cache.durable_begin_pass(SOURCE, &index_path, &namespace, capture);
-    append("req-after-restart");
-    let (_, _, reads) = known_corrupt_scan(
-        SOURCE,
-        &sessions,
-        &cache,
-        index,
-        &namespace,
-        "2026-10-20T12:03:00Z",
-    );
-    let (counts, store) = cache.durable_counters(SOURCE).unwrap();
-    let line = counts.summary(SOURCE, &store);
-    assert_eq!(counts.store_write_after_save_failed, 0, "process-local");
-    if fail {
-        assert_eq!(reads[0], 1, "{line}");
-        assert_eq!(
-            reads[2],
-            std::fs::metadata(&held).unwrap().len(),
-            "whole file"
-        );
-        assert_eq!(
-            counts.store_write_failed_restart_full,
-            [1, reads[2]],
-            "{line}"
-        );
-        assert_eq!(counts.ineligible["entry_changed"], 1);
-    } else {
-        assert_eq!(reads[0], 0, "{line}");
-        assert_eq!(counts.restored, 1, "{line}");
-        assert_eq!(counts.store_write_failed_restart_full, [0, 0], "{line}");
+    drop(cache); // Deliberately crash before M3's healthy quiet-RAM retry.
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let index = ScanIndex::load(&index_path).unwrap();
+    let suffix_bytes = append();
+    let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+    let (taken, lease) = match cache.durable_restore(
+        source,
+        &key,
+        &path,
+        &scope,
+        &mut File::open(&path).unwrap(),
+        &index,
+        &interpretation,
+    ) {
+        RestoreOutcome::Miss(MissClass::Failure(Failure::Ineligible(
+            store::Ineligible::EntryChanged,
+        ))) if fail => (None, None),
+        RestoreOutcome::Restored(taken, lease) if !fail => (Some(taken), Some(lease)),
+        // A floor/resource/receipt hold must never be converted to a Full.
+        _ => panic!("restart must refuse stale A or restore the exact healthy record"),
+    };
+    let (completed, mode, bytes, body) = parse(taken);
+    drop(completed); // The restored native graph is gone before its lease.
+    if let Some(lease) = lease {
+        lease.release();
     }
-    let _ = std::fs::remove_dir_all(&root);
+    if fail {
+        assert!(matches!(mode, ReadMode::Full(FullReason::StateMissing)));
+        assert_eq!(bytes, std::fs::metadata(&path).unwrap().len());
+    } else {
+        assert_eq!(mode, ReadMode::Tail);
+        assert_eq!(bytes, suffix_bytes);
+    }
+    cache.durable_acquisition_completed(&key, mode, bytes);
+    let counts = cache.durable_counters(source).unwrap().0;
+    assert_eq!(counts.store_write_after_save_failed, 0, "process-local");
+    assert_eq!(
+        counts.store_write_failed_restart_full,
+        if fail { [1, bytes] } else { [0, 0] }
+    );
+    assert_eq!(counts.restored, u64::from(!fail));
+    let (cold, cold_mode, cold_bytes, cold_body) = parse(None);
+    assert!(matches!(cold_mode, ReadMode::Full(_)));
+    assert_eq!(cold_bytes, std::fs::metadata(&path).unwrap().len());
+    assert_eq!(body, cold_body, "actual restart reduction equals cold Full");
+    drop(cold);
 }

@@ -30,6 +30,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::Write;
 
 use sha2::{Digest, Sha256};
 
@@ -42,6 +43,8 @@ pub(crate) enum Refuse {
     UnknownLabel,
     /// The encoded body outgrew the record cap.
     TooLarge,
+    /// The output sink could not accept the encoded bytes.
+    WriteFailed,
     /// An `X` field cannot be re-derived from the file under the bound.
     NotRederivable(&'static str),
     /// An `H` text field that is not exactly 64 lower-case hex (a 32-byte
@@ -60,41 +63,86 @@ pub(crate) enum DecodeFailure {
     Budget,
 }
 
-enum Sink {
-    Bytes { out: Vec<u8>, limit: usize },
-    Count { limit: usize },
+enum Sink<'a> {
+    Write {
+        out: &'a mut dyn Write,
+        len: usize,
+        limit: usize,
+    },
+    Bytes {
+        out: Vec<u8>,
+        limit: usize,
+    },
+    Count {
+        len: usize,
+        limit: usize,
+    },
     Hash(Box<Sha256>),
 }
 
 /// Encoder. In hash mode it also feeds `X` fields, so a re-derived value can
 /// be checked against the digest without storing it.
-pub(crate) struct Enc {
-    sink: Sink,
-    written: usize,
+pub(crate) struct Enc<'a> {
+    sink: Sink<'a>,
     moved_field: Option<&'static str>,
+    written: usize,
 }
 
-impl Enc {
+impl<'a> Enc<'a> {
     pub(crate) fn bytes(limit: usize) -> Self {
         Self {
-            written: 0,
             moved_field: None,
+            written: 0,
             sink: Sink::Bytes {
-                out: Vec::new(),
+                out: Vec::with_capacity(limit),
                 limit,
             },
         }
     }
+    /// Count and emit through the same field walk. The body allocation is
+    /// exact and only happens after every admission/size check succeeds.
+    pub(crate) fn count_write(
+        limit: usize,
+        put: impl Fn(&mut Enc<'_>) -> Result<(), Refuse>,
+    ) -> Result<Vec<u8>, Refuse> {
+        let mut count = Enc::count(limit);
+        put(&mut count)?;
+        let len = count.counted();
+        let mut out = Vec::with_capacity(len);
+        let mut writer = Enc::writer(&mut out, len);
+        put(&mut writer)?;
+        writer.finish_written()?;
+        Ok(out)
+    }
+    /// Borrow a sink after counting. Both overrun and underrun refuse the record.
+    pub(crate) fn writer(out: &'a mut dyn Write, exact_len: usize) -> Self {
+        Self {
+            moved_field: None,
+            written: 0,
+            sink: Sink::Write {
+                out,
+                len: 0,
+                limit: exact_len,
+            },
+        }
+    }
+    pub(crate) fn finish_written(self) -> Result<usize, Refuse> {
+        match self.sink {
+            Sink::Write { len, limit, .. } if len == limit => Ok(len),
+            Sink::Write { .. } => Err(Refuse::WriteFailed),
+            _ => unreachable!("only a writer has an emitted length"),
+        }
+    }
     pub(crate) fn count(limit: usize) -> Self {
         Self {
-            sink: Sink::Count { limit },
-            written: 0,
             moved_field: None,
+            written: 0,
+            sink: Sink::Count { len: 0, limit },
         }
     }
     pub(crate) fn counted(&self) -> usize {
         match &self.sink {
-            Sink::Count { .. } => self.written,
+            Sink::Count { len, .. } => *len,
             _ => unreachable!("only a count sink has a counted length"),
         }
     }
@@ -103,9 +151,9 @@ impl Enc {
         hasher.update((domain.len() as u64).to_le_bytes());
         hasher.update(domain.as_bytes());
         Self {
-            sink: Sink::Hash(Box::new(hasher)),
-            written: 0,
             moved_field: None,
+            written: 0,
+            sink: Sink::Hash(Box::new(hasher)),
         }
     }
     /// One record's Pi body may omit exactly this E field. Drop clears the
@@ -153,6 +201,7 @@ impl Enc {
     pub(crate) fn position(&self) -> Option<usize> {
         match &self.sink {
             Sink::Bytes { out, .. } => Some(out.len()),
+            Sink::Write { len, .. } => Some(*len),
             Sink::Hash(_) | Sink::Count { .. } => None,
         }
     }
@@ -162,6 +211,14 @@ impl Enc {
             .checked_add(bytes.len())
             .ok_or(Refuse::TooLarge)?;
         match &mut self.sink {
+            Sink::Write { out, len, limit } => {
+                let end = len.checked_add(bytes.len()).ok_or(Refuse::TooLarge)?;
+                if end > *limit {
+                    return Err(Refuse::TooLarge);
+                }
+                out.write_all(bytes).map_err(|_| Refuse::WriteFailed)?;
+                *len = end;
+            }
             Sink::Bytes { out, limit } => {
                 if out.len().saturating_add(bytes.len()) > *limit {
                     return Err(Refuse::TooLarge);
@@ -169,8 +226,9 @@ impl Enc {
                 out.extend_from_slice(bytes);
             }
             Sink::Hash(hasher) => hasher.update(bytes),
-            Sink::Count { limit } => {
-                if written > *limit {
+            Sink::Count { len, limit } => {
+                *len = len.checked_add(bytes.len()).ok_or(Refuse::TooLarge)?;
+                if *len > *limit {
                     return Err(Refuse::TooLarge);
                 }
             }
@@ -202,7 +260,7 @@ impl Enc {
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         match self.sink {
             Sink::Bytes { out, .. } => out,
-            Sink::Hash(_) | Sink::Count { .. } => Vec::new(),
+            Sink::Hash(_) | Sink::Count { .. } | Sink::Write { .. } => Vec::new(),
         }
     }
     /// Hash mode: the digest.
@@ -210,7 +268,7 @@ impl Enc {
         match self.sink {
             Sink::Hash(hasher) => hasher.finalize().into(),
             Sink::Bytes { out, .. } => Sha256::digest(out).into(),
-            Sink::Count { .. } => unreachable!("counting is not hashing"),
+            Sink::Count { .. } | Sink::Write { .. } => unreachable!("sink is not hashing"),
         }
     }
 }
@@ -221,7 +279,6 @@ pub(crate) struct Dec<'a> {
     at: usize,
     allowance: Option<&'a mut dyn FnMut(u64) -> bool>,
     refused: bool,
-    /// A section the body must carry: `Some(false)` until it is read.
     required_section: Option<bool>,
 }
 
@@ -235,8 +292,6 @@ impl<'a> Dec<'a> {
             required_section: None,
         }
     }
-    // E5-PI-B2-SEAM: reuse the bounded Dec allowance from the active restore
-    // owner (r2-interfaces G1 `ActiveLease::charge`); it is not a second lease.
     pub(crate) fn bounded(bytes: &'a [u8], allowance: &'a mut dyn FnMut(u64) -> bool) -> Self {
         Self {
             bytes,
@@ -583,6 +638,7 @@ impl<T: HDigest + crate::heap_layout_bound::HeapLayoutBound> HDigest
     }
     fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.slots::<T>(len)?;
         let mut out = Vec::with_capacity(len);
         for _ in 0..len {
             out.push(T::take_h(d)?);
@@ -902,6 +958,7 @@ impl Durable for String {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let bytes = d.len_prefixed()?;
+        d.slots::<u8>(bytes.len())?;
         std::str::from_utf8(bytes)
             .map(str::to_string)
             .map_err(|_| Corrupt)
@@ -933,7 +990,9 @@ impl Durable for std::path::PathBuf {
         e.len_prefixed(self.as_os_str().as_encoded_bytes())
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
-        String::take(d).map(Self::from)
+        let value = String::take(d)?;
+        d.slots::<u8>(value.len())?; // Conservative conversion overlap, including non-Unix.
+        Ok(Self::from(value))
     }
     fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
         String::verify(d)
@@ -1024,6 +1083,7 @@ impl<T: Durable> Durable for Box<T> {
         (**self).put(e)
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        d.slots::<T>(1)?;
         T::take(d).map(Box::new)
     }
     fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
@@ -1052,6 +1112,7 @@ impl<T: Durable> Durable for Vec<T> {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.slots::<T>(len)?;
         let mut out = Vec::with_capacity(len);
         for _ in 0..len {
             out.push(T::take(d)?);
@@ -1078,7 +1139,10 @@ impl<T: Durable> Durable for VecDeque<T> {
         put_seq(e, self.len(), self.iter())
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
-        Vec::<T>::take(d).map(VecDeque::from)
+        let values = Vec::<T>::take(d)?;
+        // Fund both allocations even if the native conversion transfers storage.
+        d.slots::<T>(values.capacity())?;
+        Ok(VecDeque::from(values))
     }
     fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
         Vec::<T>::verify(d)
@@ -1098,6 +1162,7 @@ impl<T: Durable, const N: usize> Durable for [T; N] {
         Ok(())
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        d.slots::<T>(N)?;
         let mut out = Vec::with_capacity(N);
         for _ in 0..N {
             out.push(T::take(d)?);
@@ -1122,6 +1187,7 @@ impl<T: DurableKey + Ord> Durable for BTreeSet<T> {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.tree::<T, ()>(len)?;
         let mut out = BTreeSet::new();
         for _ in 0..len {
             if !out.insert(T::take(d)?) {
@@ -1164,6 +1230,7 @@ impl<K: DurableKey + Ord, V: Durable> Durable for BTreeMap<K, V> {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.tree::<K, V>(len)?;
         let mut out = BTreeMap::new();
         for _ in 0..len {
             let key = K::take(d)?;
@@ -1224,6 +1291,7 @@ where
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.tree::<K, V>(len)?;
         let mut out = Self::new();
         for _ in 0..len {
             let key = K::take(d)?;
@@ -1677,7 +1745,184 @@ pub(crate) fn trace_verify(f: impl FnOnce()) -> (Vec<(usize, bool)>, usize) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn count_write_matches_bytes_and_refuses_before_output() {
+        let put = |e: &mut Enc<'_>| {
+            e.varint(300)?;
+            e.len_prefixed(b"synthetic")
+        };
+        let mut legacy = Enc::bytes(64);
+        put(&mut legacy).unwrap();
+        let expected = legacy.into_bytes();
+        let actual = Enc::count_write(expected.len(), put).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.capacity(), actual.len());
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            Enc::count_write(expected.len() - 1, |e| {
+                calls.set(calls.get() + 1);
+                put(e)
+            }),
+            Err(Refuse::TooLarge)
+        );
+        assert_eq!(calls.get(), 1, "count refusal never starts the output pass");
+    }
+
+    #[test]
+    fn write_sink_handles_short_writes_limits_and_io_errors() {
+        struct Short(Vec<u8>);
+        impl std::io::Write for Short {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let n = bytes.len().min(1);
+                self.0.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut out = Short(Vec::new());
+        {
+            let mut e = Enc {
+                sink: Sink::Write {
+                    out: &mut out,
+                    len: 0,
+                    limit: 3,
+                },
+            };
+            e.raw(b"abc").unwrap();
+            assert_eq!(e.position(), Some(3));
+            assert_eq!(e.raw(b"d"), Err(Refuse::TooLarge));
+        }
+        assert_eq!(out.0, b"abc");
+        let mut empty = &mut [][..];
+        let mut e = Enc {
+            sink: Sink::Write {
+                out: &mut empty,
+                len: 0,
+                limit: 1,
+            },
+        };
+        assert_eq!(e.raw(b"x"), Err(Refuse::WriteFailed));
+        assert_eq!(e.position(), Some(0));
+    }
     use super::*;
+
+    // Direct codec fixtures: the actual allocator proves the first refused
+    // constructor allocates nothing; paid successful peaks include overlap.
+    fn budget_probe<T>(bytes: &[u8], take: fn(&mut Dec<'_>) -> Result<T, Corrupt>) {
+        let mut calls = 0;
+        let mut paid = 0u64;
+        let mut grant = |bytes: u64| {
+            calls += 1;
+            paid = paid.checked_add(bytes).unwrap();
+            true
+        };
+        let (result, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+            let mut d = Dec::bounded(bytes, &mut grant);
+            let result = take(&mut d);
+            assert_eq!(d.remaining(), 0);
+            d.outcome(result)
+        });
+        assert!(result.is_ok());
+        drop(result);
+        assert!(calls > 0, "allocation hook missing");
+        assert!(
+            stats.requested_peak_with_overlap as u64 <= paid,
+            "{stats:?}, paid={paid}"
+        );
+        let mut refused = 0;
+        let mut deny = |_: u64| {
+            refused += 1;
+            false
+        };
+        let (result, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+            let mut d = Dec::bounded(bytes, &mut deny);
+            let result = take(&mut d);
+            d.outcome(result)
+        });
+        assert!(matches!(result, Err(DecodeFailure::Budget)));
+        assert_eq!(refused, 1);
+        assert_eq!(
+            stats.allocations, 0,
+            "allocation before allowance: {stats:?}"
+        );
+        // Stop at each later hook too; already-funded children must be dropped.
+        for cutoff in 1..calls {
+            let mut seen = 0;
+            let mut grant = |_: u64| {
+                seen += 1;
+                seen <= cutoff
+            };
+            let mut d = Dec::bounded(bytes, &mut grant);
+            let result = take(&mut d);
+            assert!(matches!(d.outcome(result), Err(DecodeFailure::Budget)));
+            assert_eq!(seen, cutoff + 1);
+        }
+    }
+    fn budget_round<T: Durable>(value: T) {
+        let mut e = Enc::bytes(1 << 20);
+        value.put(&mut e).unwrap();
+        budget_probe(&e.into_bytes(), T::take);
+    }
+    #[test]
+    fn bounded_decode_funds_every_scalar_sequence_ordered_and_owned_constructor() {
+        budget_round(String::from("scalar"));
+        budget_round(Box::new(String::from("boxed")));
+        budget_round(vec![String::from("one"), String::from("two")]);
+        budget_round(VecDeque::from([String::from("deque")]));
+        budget_round([String::from("array")]);
+        budget_round(BTreeSet::from([String::from("set")]));
+        budget_round(BTreeMap::from([(
+            String::from("key"),
+            String::from("value"),
+        )]));
+        budget_round(crate::owned_heap::OwnedVec::from(vec![String::from(
+            "owned",
+        )]));
+        let mut map = crate::owned_heap::OwnedMap::new();
+        map.insert(String::from("key"), String::from("owned value"));
+        budget_round(map);
+        let digest = "ab".repeat(32);
+        let mut e = Enc::bytes(1 << 20);
+        <String as HDigest>::put_h(&digest, &mut e, "fixture").unwrap();
+        budget_probe(&e.into_bytes(), <String as HDigest>::take_h);
+        let mut e = Enc::bytes(1 << 20);
+        <BTreeSet<String> as HDigest>::put_h(&BTreeSet::from([digest.clone()]), &mut e, "fixture")
+            .unwrap();
+        budget_probe(&e.into_bytes(), <BTreeSet<String> as HDigest>::take_h);
+        let mut e = Enc::bytes(1 << 20);
+        <crate::owned_heap::OwnedVec<String> as HDigest>::put_h(
+            &crate::owned_heap::OwnedVec::from(vec![digest]),
+            &mut e,
+            "fixture",
+        )
+        .unwrap();
+        budget_probe(
+            &e.into_bytes(),
+            <crate::owned_heap::OwnedVec<String> as HDigest>::take_h,
+        );
+        // PathBuf is never persisted as X, but its trait conversion is funded.
+        let mut e = Enc::bytes(32);
+        String::from("path").put(&mut e).unwrap();
+        budget_probe(&e.into_bytes(), std::path::PathBuf::take);
+    }
+    #[test]
+    fn bounded_decode_keeps_integrity_distinct_and_checks_budget_arithmetic() {
+        let mut deny = |_: u64| false;
+        let mut d = Dec::bounded(&[2], &mut deny);
+        let result = bool::take(&mut d);
+        assert_eq!(d.outcome(result), Err(DecodeFailure::Integrity));
+        let mut d = Dec::bounded(&[7], &mut deny);
+        assert_eq!(u64::take(&mut d), Ok(7)); // Inline scalar needs no heap.
+        let mut d = Dec::bounded(&[], &mut deny);
+        let result = d.tree::<u128, u128>(usize::MAX);
+        assert_eq!(d.outcome(result), Err(DecodeFailure::Budget));
+        let mut d = Dec::bounded(&[127], &mut deny);
+        let result = Vec::<String>::take(&mut d);
+        assert!(matches!(d.outcome(result), Err(DecodeFailure::Integrity)));
+    }
 
     fn round_bytes<T: Durable>(value: T) {
         let mut e = Enc::bytes(1 << 20);

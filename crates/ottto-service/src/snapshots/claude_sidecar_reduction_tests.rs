@@ -949,8 +949,11 @@ mod durable_restart {
         state.begin(&first);
         let prior = seed_predecessor(f, &first);
         first.durable_write_after_save(state.lock, SOURCE, &prior);
-        let expected = usize::from(crate::heap_layout_bound::layout_supported());
-        assert_eq!(state.store_records(), expected);
+        assert_eq!(
+            state.store_records(),
+            usize::from(crate::heap_layout_bound::layout_supported()),
+            "native persistence requires this binary's supported restore layout"
+        );
         prior
     }
 
@@ -1103,10 +1106,13 @@ mod durable_restart {
             .into_test_option()
             .is_none());
         let (counters, store) = fresh.durable_counters(SOURCE).unwrap();
-        assert_eq!(counters.ineligible.get("selection_cleared"), Some(&1));
+        // #865 selection-clear permits acquisition proof; it is no longer an
+        // early refusal. Unsupported layouts wrote no predecessor at all.
+        assert!(!counters.ineligible.contains_key("selection_cleared"));
+        let present = u64::from(crate::heap_layout_bound::layout_supported());
         assert_eq!(
             (counters.missing, store.records_read, counters.restored),
-            (0, 0, 0)
+            (1 - present, present, 0)
         );
         second.durable_write_after_save(state.lock, SOURCE, &settled);
         assert_selection_refused(&second, &state);
@@ -1134,6 +1140,9 @@ mod durable_restart {
         f.append_transcript(2);
         f.evidence(3);
         state.begin(&second);
+        // Round4 approved absent-upgrade growth pacing. This row requires a
+        // second acquisition (ahead of the saved selection), not a paced hold.
+        crate::snapshots::sampled_scan::durable_tail::tests::expire_full_pace(&second, &key);
         let ahead = raw_scan(&f, first_pass.index.clone(), Some(second.clone()), |_| {});
         assert_ne!(
             ahead.index.files[&key].source_file_fingerprint,
@@ -1405,23 +1414,6 @@ mod durable_restart {
                     }
                 }
             }
-        }
-    }
-}
-
-trait RestoreTestOutcome {
-    fn into_test_option(
-        self,
-    ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>;
-}
-impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
-    fn into_test_option(
-        self,
-    ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>> {
-        match self {
-            Self::Restored(taken) => Some(*taken),
-            Self::Miss(_) => None,
-            Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
         }
     }
 }

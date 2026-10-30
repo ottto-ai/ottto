@@ -58,7 +58,6 @@ impl CodexCounting {
         self.cutover_unix_ms
     }
 
-    #[cfg(test)]
     pub(super) fn durable_contract(&self) -> (Option<i64>, u8, u8) {
         (
             self.cutover_unix_ms,
