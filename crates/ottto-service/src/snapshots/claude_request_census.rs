@@ -2651,6 +2651,10 @@ pub(crate) fn record_claude_request_census(
     parse: ClaudeRequestCensusParse<'_>,
     items: &[SnapshotItem],
 ) {
+    if !index.persistence_available() {
+        return;
+    }
+
     let Some(path_owner) = claude_index_path_family_member(parse.path) else {
         return;
     };
@@ -2769,6 +2773,10 @@ pub(super) fn retain_held(index: &mut ScanIndex, candidate: &super::CandidateFil
 /// old unverified hold solely as an exclusion/retry obligation until a fully
 /// finalized, verified Full replaces it.
 pub(crate) fn invalidate_claude_request_census(index: &mut ScanIndex, path: &Path) {
+    if !index.persistence_available() {
+        return;
+    }
+
     let key = super::local_index_key(path);
     // A recovery Full has no sampled marker to retain its obligation. Its
     // old unverified IdentityIncomplete record cannot bind a body or grant
@@ -2794,6 +2802,10 @@ pub(crate) fn settle_claude_request_census_terminal(
     residue_index_keys: &BTreeSet<String>,
     census_window_end: &str,
 ) -> ClaudeRequestCensusShadowCounts {
+    if !index.persistence_available() {
+        return ClaudeRequestCensusShadowCounts::default();
+    }
+
     let files = &index.files;
     let vanished = index
         .claude_request_census
@@ -2858,6 +2870,10 @@ pub(crate) fn transcript_retirements() -> (u64, u64) {
 /// (telemetry owner first, else the copy). Retirement edits records in
 /// place: nothing is cloned.
 fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> u64 {
+    if !index.persistence_available() {
+        return 0;
+    }
+
     if window == 0 {
         return 0;
     }
@@ -2978,6 +2994,7 @@ impl ClaudeRequestCensusJoin {
         let census = &index.claude_request_census;
         let mut join = Self {
             counts: ClaudeRequestCensusShadowCounts {
+                transient_limited: !index.persistence_available(),
                 // Birth stubs are no record.
                 records: census.records().count(),
                 hashes: census.hash_total,
@@ -3828,4 +3845,20 @@ mod memo_accounting_tests {
         assert_eq!(census.serialized_total, 0);
         assert_eq!(census.hash_total, 0);
     }
+}
+
+/// Same index census visitor and admission, but no tolerant record loss.
+pub(super) fn decode_persistence_census<R: std::io::Read>(
+    mut reader: R,
+) -> anyhow::Result<ClaudeRequestCensus> {
+    use std::io::Read;
+    let mut first = [0];
+    reader.read_exact(&mut first)?;
+    anyhow::ensure!(first == [b'{'], "census map required");
+    let mut decoder =
+        serde_json::Deserializer::from_reader(std::io::Cursor::new(first).chain(reader));
+    let (census, dropped) = decoder.deserialize_map(CensusVisitor { ledger: false })?;
+    decoder.end()?;
+    anyhow::ensure!(dropped == 0, "census records unavailable");
+    Ok(census)
 }
