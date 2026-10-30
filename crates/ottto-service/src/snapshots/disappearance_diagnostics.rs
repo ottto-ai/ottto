@@ -754,9 +754,8 @@ mod tests {
         let fixture = ForcedFamilyFixture::new("absence-forced-family");
         let member_key = local_index_key(&fixture.member_path);
         let mut index = fixture.index();
-        // N3: the member's snapshot fingerprints keep their own census rules.
-        // R14/H1 explicitly releases a positively absent account hold together
-        // with its now-unfulfillable audit debt; no body/ACK credit is granted.
+        // N3 keeps snapshot incidence; proven absence now releases the
+        // unfulfillable account hold without granting body/ACK credit.
         let held = std::collections::BTreeSet::from(["held-member-body".to_string()]);
         index
             .file_snapshot_fingerprints
@@ -765,12 +764,38 @@ mod tests {
             .claude_account_deferred_holds
             .insert(member_key.clone(), "held-member-revision".to_string());
         for at in [NOW, RETRY] {
-            let (((pages, events), sites), vanished) = observe_vanished(|| {
-                observe_sites(|| {
-                    observe(|| claude_generation(&mut index, &fixture.dir, at, 10, &[]))
+            let (result, rows) = crate::local_resource_diagnostics::capture(|| {
+                observe_vanished(|| {
+                    observe_sites(|| {
+                        observe(|| claude_generation(&mut index, &fixture.dir, at, 10, &[]))
+                    })
                 })
             });
+            let (((pages, events), sites), vanished) = result;
             let retired = u64::from(at == NOW);
+            // Pin the shared #799 keys and meanings independently of the
+            // temporary stage/carrier, including zero on the next generation.
+            // Count across ALL records so a second emitter cannot hide behind
+            // a different stage when these paths compose with #876.
+            for (key, expected) in [
+                ("audit_retired_absent", serde_json::json!({"events": 1})),
+                ("withheld_hold_released", serde_json::json!({"deleted": 1})),
+            ] {
+                let emissions = rows
+                    .iter()
+                    .filter(|row| row["counts"].get(key).is_some())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    emissions.len(),
+                    retired as usize,
+                    "{key}: exactly one emission, never duplicate carriers"
+                );
+                for row in emissions {
+                    assert_eq!(row["schema_version"], 2);
+                    assert_eq!(row["source"], "claude_code");
+                    assert_eq!(row["counts"][key], expected, "{key}: shared count meaning");
+                }
+            }
             let mut expected_sites = [[[0; OUTCOMES]; SITES]; 3];
             expected_sites[1][Site::CandidateForcedIndex.index()] = [0, retired];
             assert_eq!(sites, expected_sites, "{at}: retired once");
@@ -806,7 +831,7 @@ mod tests {
                     .get(&member_key)
                     .map(String::as_str),
                 None,
-                "R14/H1: positively absent account hold is released"
+                "positively absent account hold is released"
             );
         }
     }
@@ -1501,13 +1526,13 @@ mod tests {
             source
                 .matches(".retire_vanished_claude_audit_debt_entry(")
                 .count(),
-            2
+            3
         );
         assert_eq!(
             source
                 .matches("index.retire_vanished_claude_audit_debt_entry(")
                 .count(),
-            1
+            2
         );
         assert_eq!(
             source

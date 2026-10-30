@@ -951,7 +951,10 @@ fn proven_from(result: ChildResult) -> CodexParentPrefixProof {
 /// parent, an unsigned record between matches, and a boundary-buffer
 /// overflow (count-only in job mode, the same 64-record rule).
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn a_job_decides_as_the_complete_ledger_and_its_proof_reparses_as_main() {
     let root = temp_root("job-parity");
     let parent = rollout(&root, PARENT);
@@ -1078,7 +1081,10 @@ fn a_job_decides_as_the_complete_ledger_and_its_proof_reparses_as_main() {
 /// is `ParentExhausted`, while P's complete ledger (which saw the row) would
 /// decide it: the job never decides on a withheld row.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn a_straddling_parent_row_pushes_no_signature() {
     let root = temp_root("job-straddle");
     let parent = rollout(&root, PARENT);
@@ -1126,7 +1132,10 @@ fn a_straddling_parent_row_pushes_no_signature() {
 
 /// No overshoot: a run reads only while one more step fits its budget.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn a_job_reads_nothing_past_its_budget() {
     let root = temp_root("job-budget");
     let parent = rollout(&root, PARENT);
@@ -1522,6 +1531,10 @@ fn hook_context(cache: &Arc<sampled_scan::SharedCache>) -> sampled_scan::Context
         priority_replays: 0,
         audits_started: 0,
         audits_completed: 0,
+        audit_quiet_retired: 0,
+        audit_cap_full: 0,
+        audit_cap_delay: 0,
+        pace_evicted: 0,
         start_overdue_seconds: 0,
         completion_overdue_seconds: 0,
         admission: Default::default(),
@@ -1603,7 +1616,10 @@ use sampled_scan::codex_cursor::{Limits, PageBudget};
 /// is `Proven` as the complete ledger decides. Its install then reparses C
 /// exactly as the complete ledger does. Nothing is left in the holder.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn the_hook_proves_an_owed_child_end_to_end() {
     let mut scene = Scene::owed("hook-e2e");
     let cache = Arc::new(sampled_scan::SharedCache::default());
@@ -1646,7 +1662,10 @@ fn the_hook_proves_an_owed_child_end_to_end() {
 /// revalidates its held FDs and P's locate, and finishes it. The entry
 /// stays `Owed` in between.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn a_budget_short_page_suspends_and_the_next_page_finishes() {
     let mut scene = Scene::owed("hook-suspend");
     let cache = Arc::new(sampled_scan::SharedCache::default());
@@ -1677,7 +1696,10 @@ fn a_budget_short_page_suspends_and_the_next_page_finishes() {
 /// with a `Census` wake; the next visit does not retry it until the census
 /// fingerprint (or C) changes. Then P is back and the job proves C.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn an_identity_refusal_waits_for_its_census_wake() {
     let mut scene = Scene::owed("hook-identity");
     let parent_key = local_index_key(&scene.parent);
@@ -1733,10 +1755,12 @@ fn a_memory_dropped_job_backs_off_and_rereads_nothing_inside_the_backoff() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let now = sampled_scan::now_seconds();
     // P's fence, then one step: P is not done.
     let leftover = codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES;
     let mut scene = Scene::owed("hook-refused-suspend");
+    // After the scene: it seals P's side record at its own clock read, and
+    // an earlier `now` is a clock regression to the side fence.
+    let now = sampled_scan::now_seconds();
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut read = Vec::new();
     for _ in 0..5 {
@@ -1785,7 +1809,10 @@ fn a_memory_dropped_job_backs_off_and_rereads_nothing_inside_the_backoff() {
 /// no proof (nothing read, the entry untouched) and finishes none: a held
 /// job steps fd-only and suspends again. A saved pass finishes it.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn a_closed_side_gate_starts_and_finishes_no_proof() {
     let limits = Limits::current();
     let index_path = Path::new(HOOK_INDEX);
@@ -1843,7 +1870,10 @@ fn a_closed_side_gate_starts_and_finishes_no_proof() {
 /// held while the job was suspended), the finish records the same and owes
 /// nothing either.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn a_lineage_held_parent_is_refused_before_its_read_and_owes_nothing() {
     let held = SideVerdict::Held {
         lineage: true,
@@ -1937,7 +1967,10 @@ fn the_stage1_gates_exclude_a_continuation_page_whatever_its_gate() {
 /// the orphan and finishes the job. (The ordinary save outage, where a held
 /// job steps fd-only and suspends, is `a_closed_side_gate_...`.)
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn a_continuation_page_steps_no_held_job_and_sweeps_nothing() {
     let mut scene = Scene::owed("hook-continuation");
     let cache = Arc::new(sampled_scan::SharedCache::default());
@@ -1983,7 +2016,10 @@ fn a_continuation_page_steps_no_held_job_and_sweeps_nothing() {
 /// each off (`MemoryRefused` + `Backoff`). Repeated retirements therefore
 /// pace the restarts: one per backoff, none inside it, never proven.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn main_retirements_pace_the_restarts() {
     let leftover = codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES;
     let mut scene = Scene::owed("hook-retired");
@@ -2023,8 +2059,10 @@ fn an_invalid_page_whose_suspend_fails_backs_off_and_publishes_nothing() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let now = sampled_scan::now_seconds();
     let mut scene = Scene::owed("hook-invalid-refused");
+    // After the scene: it seals P's side record at its own clock read, and
+    // an earlier `now` is a clock regression to the side fence.
+    let now = sampled_scan::now_seconds();
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut page = page_with(codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES);
     scene.hook_in(&cache, &hook_pass(), &mut page, now);
@@ -2054,7 +2092,10 @@ fn an_invalid_page_whose_suspend_fails_backs_off_and_publishes_nothing() {
 /// side-allowed page. On a save-outage page its ring entry waits (no
 /// backoff write, nothing read); the next open page drains it.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn a_save_outage_page_leaves_the_retired_record_for_an_open_gate() {
     let leftover = codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES;
     let mut scene = Scene::owed("hook-retired-outage");
@@ -2626,7 +2667,10 @@ fn a_proven_entry_ends_its_childs_hold_memo() {
 /// verdict and generation; an unchanged expired seal does not wake it, and
 /// the backoff still governs.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn a_parent_held_wake_fires_on_a_refreshed_seal_only() {
     let now = sampled_scan::now_seconds();
     let mut scene = Scene::owed("hook-seal-refresh");
@@ -2693,7 +2737,10 @@ fn a_parent_held_wake_fires_on_a_refreshed_seal_only() {
 /// birth fence exists (S3b). An untouched pair keeps a `Rewritten` wake
 /// asleep; a metadata-only change of C, or of P, fires it and C is proven.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn a_rewritten_proof_wake_fires_on_a_metadata_only_change() {
     use std::os::unix::fs::PermissionsExt;
     // A chmod, retried until the path stamp moves: ctime alone.
@@ -2713,8 +2760,10 @@ fn a_rewritten_proof_wake_fires_on_a_metadata_only_change() {
         panic!("chmod never moved ctime");
     };
     for parent_changed in [false, true] {
-        let now = sampled_scan::now_seconds();
         let mut scene = Scene::owed("hook-rewritten-ctime");
+        // After the scene: it seals P's side record at its own clock read, and
+        // an earlier `now` is a clock regression to the side fence.
+        let now = sampled_scan::now_seconds();
         let key = scene.key();
         let Some(CodexParentProofState::Owed(owed)) =
             scene.index.codex_parent_prefix_proofs.get_mut(&key)

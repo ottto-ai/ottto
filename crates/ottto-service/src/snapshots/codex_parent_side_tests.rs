@@ -628,6 +628,7 @@ fn file_entry() -> ScanIndexEntry {
         codex_counting_owner: None,
         opened_changed_nanos: 0,
         opened_birth_nanos: 0,
+        upload_context_receipt: None,
     }
 }
 

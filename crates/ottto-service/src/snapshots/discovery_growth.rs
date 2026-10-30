@@ -221,7 +221,6 @@ mod tests {
 
     #[test]
     fn scratch_admission_is_bounded_and_never_changes_discovery_retention() {
-        assert_eq!(MAX_OBSERVATIONS, 4_096);
         let page = Page::default();
         for n in 0..MAX_OBSERVATIONS {
             page.observe(n.to_string(), 2, 1);

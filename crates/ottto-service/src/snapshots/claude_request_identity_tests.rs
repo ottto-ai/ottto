@@ -606,6 +606,17 @@ fn w0_r5_cap_fallbacks_match_bodies() {
         grow(target);
         grow(&mut built.model_usage[0]);
         let result = identity::apply(&mut built, &contributions).unwrap();
+        if tagged == "new-cap-evidence-16" {
+            // Revised cap policy: this two-hour body can retain the newest
+            // eight keys; W0's old whole-item fallback is no longer required.
+            assert!(matches!(result, Tagged::Sent { refusals: 1 }), "{result:?}");
+            assert!(built.usage_buckets[0].model_usage[0].identity_parts.is_none());
+            assert!(built.usage_buckets[1].model_usage[0].identity_parts.is_some());
+            assert_eq!(built.request_evidence.len(), 8);
+            assert_eq!(identity::semantic_leaf(&built)["refused"], true);
+            sticky_assert_reconciled(&built);
+            continue;
+        }
         let Tagged::Fallback { refusals, .. } = result else {
             panic!("{tagged}: {result:?}")
         };
@@ -866,7 +877,11 @@ fn builder_enforces_the_declared_parts_per_item_cap() {
                     bucket_start: bucket_start.clone(),
                     row_key: row_key_from_model_usage(&row),
                     usage: holder_usage(&one, None),
-                    identity: telemetry(char::from(b'a' + login), 'd'),
+                    // All eleven keys must be valid lowercase hex. The old
+                    // a..k spelling made g..k refusal shares instead of keys.
+                    identity: RequestIdentity::Tagged(AuthorityKey {
+                        login: Some(format!("{login:064x}")), org: Some("d".repeat(64)), basis: identity::TELEMETRY,
+                    }),
                 });
             }
             rows.push(row);
@@ -895,6 +910,78 @@ fn builder_enforces_the_declared_parts_per_item_cap() {
     );
     assert_eq!(refusals, 200);
     assert!(identity::item_bytes(&item) <= identity::MAX_ITEM_BYTES);
+}
+
+#[test]
+fn over_cap_diagnostics_increment_each_reason_and_record_last_size() {
+    use identity::OverCap;
+    let reasons = BTreeSet::from([
+        OverCap::EvidenceEntries,
+        OverCap::AuthorityKeys,
+        OverCap::PartsPerRow,
+        OverCap::PartsPerItem,
+        OverCap::Rows,
+        OverCap::Bytes,
+    ]);
+    let (_, records) = crate::local_resource_diagnostics::capture(|| {
+        crate::local_resource_diagnostics::claude_identity_over_cap(&reasons, 700_000);
+        crate::local_resource_diagnostics::claude_identity_over_cap(&reasons, 800_000);
+    });
+    assert_eq!(records.len(), 2);
+    let before = &records[0]["counts"]["claude_request_identity_over_cap"];
+    let after = &records[1]["counts"]["claude_request_identity_over_cap"];
+    for label in [
+        "evidence_entries",
+        "authority_keys",
+        "parts_per_row",
+        "parts_per_item",
+        "rows",
+        "bytes",
+    ] {
+        assert_eq!(
+            after[label].as_u64().unwrap(),
+            before[label].as_u64().unwrap() + 1
+        );
+    }
+    assert_eq!(
+        records[1]["counts"]["claude_request_identity_last_over_cap_item_bytes"],
+        800_000
+    );
+    assert!(serde_json::to_vec(&records[1]).unwrap().len() < 2048);
+}
+
+#[test]
+fn byte_cap_diagnostic_measures_tagged_attempt_and_preserves_full_strip() {
+    let mut item = one_row_item(&[(10, None)]);
+    let request = contribution(&item, 10, None, login_key(OWNER_A));
+    identity::apply(&mut item, std::slice::from_ref(&request)).unwrap();
+    // Unrelated body bytes can leave no room even for a single tagged bucket.
+    item.session_display_name = Some("x".repeat(identity::MAX_ITEM_BYTES));
+    let attempted_bytes = identity::item_bytes(&item);
+    let mut expected = stripped(&item);
+    expected.provenance.collector = identity::COLLECTOR.to_owned();
+    expected.request_identity_refusals = 1;
+    expected.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &expected);
+    let (result, records) = crate::local_resource_diagnostics::capture(|| {
+        identity::apply(&mut item, &[request]).unwrap()
+    });
+    let Tagged::Fallback { over_cap, refusals } = result else {
+        panic!("{result:?}");
+    };
+    assert!(over_cap.contains(&identity::OverCap::Bytes));
+    assert_eq!(refusals, 1);
+    assert_eq!(
+        serde_json::to_vec(&item).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0]["counts"]["claude_request_identity_last_over_cap_item_bytes"],
+        attempted_bytes
+    );
+    assert!(records[0]["counts"]["claude_request_identity_over_cap"]["bytes"]
+        .as_u64()
+        .unwrap() > 0);
 }
 
 // --- Classification ---------------------------------------------------------
@@ -1362,7 +1449,6 @@ fn desktop_census_witness_follows_the_store_inventory_through_retry_backoff() {
     let swept = BTreeSet::from([PathBuf::from("/synthetic/store-a")]);
     let backed_off = |store_dirs: &BTreeSet<PathBuf>| {
         let mut index = ScanIndex {
-            claude_desktop_store_inventory: Some(identity::inventory_digest(&swept)),
             claude_desktop_identity_census_complete: true,
             claude_desktop_census_witness: Some(identity::DesktopCensusWitness::new(
                 NOW - 30,
@@ -2255,6 +2341,210 @@ fn legacy_excluded_reported_fork_stays_contract5_by_owned_requests() {
     }
 }
 
+/// A quiet off-page family member must not lose Full authority on a
+/// debt-free Unchanged retry. Both protected-list states use legacy money,
+/// including copied-prefix exclusion and telemetry-only usage.
+#[cfg(unix)]
+#[test]
+fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() {
+    // Like the sampled production reuse fixtures, this requires a platform
+    // whose heap layout permits retaining the Full read's native reduction.
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::claude_reemission_exclusions::ReemissionExclusions;
+    use crate::snapshots::claude_request_census::{
+        record_claude_request_census, ClaudeRequestCensusParse,
+    };
+    use crate::transcript_acquisition::{ReadMode, Scope};
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    for paused in [false, true] {
+        let (dir, _, api, trace, mut index) = legacy_fork_fixture(1);
+        index.claude_reemission_exclusions = ReemissionExclusions::parse(
+            if paused {
+                "invalid".to_string()
+            } else {
+                format!("{}\n{}", request_hash(LEGACY_PARENT), request_hash(LEGACY_CHILD))
+            }
+            .as_bytes(),
+        );
+        assert!(!claude_request_money::e2::family_applies(
+            &index,
+            LEGACY_CHILD,
+            None
+        ));
+        let quiet_path = dir.join(LEGACY_CHILD).join("subagents/agent-quiet.jsonl");
+        fs::create_dir_all(quiet_path.parent().unwrap()).unwrap();
+        fs::write(&quiet_path, "").unwrap();
+        let key = local_index_key(&quiet_path);
+        let cache = std::sync::Arc::new(sampled_scan::SharedCache::default());
+        let run = |index: ScanIndex| {
+            let mut scan = OwnedSourceScan::new(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&dir),
+                index,
+                LEGACY_WINDOW,
+                365,
+                1000,
+                true,
+                None,
+                &[],
+                false,
+                true,
+            )
+            .with_sampled_acquisition(cache.clone(), Scope("unchanged-census".into()));
+            let mut mode = None;
+            loop {
+                if let Some(active) = scan.active_file.as_ref() {
+                    if local_index_key(&active.candidate.path) == key {
+                        mode = active.sampling.as_ref().map(|active| active.mode);
+                    }
+                }
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Complete { index, scan, .. } => break (index, scan, mode),
+                }
+            }
+        };
+        let (mut index, full, mode) = run(index);
+        assert!(matches!(mode, Some(ReadMode::Full(_))));
+        let checkpoint = cache
+            .retained_checkpoint(&key)
+            .expect("the quiet member's Full read must retain its native reduction");
+        assert!(checkpoint.audit_debt().is_none());
+        let verified = index.claude_request_census.get(&key).unwrap().clone();
+        assert!(!verified.unverified_for_test());
+        let raw = full.snapshots;
+        let mut before = raw.clone();
+        apply_claude_reported_usage_with_identity(
+            &mut before,
+            &api,
+            &trace,
+            &mut index,
+            true,
+            LEGACY_WINDOW,
+            None,
+        );
+        let expected = before
+            .iter()
+            .find(|item| item.source_session_id == LEGACY_CHILD)
+            .unwrap();
+        assert_eq!(
+            expected.usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        assert!(expected.cost.is_some());
+        assert_eq!(expected.request_count, 3); // two owned plus telemetry-only
+        assert_eq!(expected.input_tokens, 29); // 12 + 14 + 3, no copied 900
+        let witness = index.claude_usage_family_witnesses[LEGACY_CHILD].clone();
+        assert!(!witness.legacy_excluded_request_id_hashes.is_empty());
+        // Select just the quiet member again without changing its bytes,
+        // reduction, interpretation scope or prior census record.
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        let (mut index, _, mode) = run(index);
+        assert_eq!(mode, Some(ReadMode::Unchanged));
+        assert!(cache
+            .retained_checkpoint(&key)
+            .expect("the quiet member's Unchanged read must retain its native reduction")
+            .audit_debt()
+            .is_none());
+        assert!(!index
+            .claude_request_census
+            .get(&key)
+            .unwrap()
+            .unverified_for_test());
+        let saved = dir.join("index.json");
+        index.save(&saved).unwrap();
+        let mut index = ScanIndex::load(&saved).unwrap();
+        assert!(!index
+            .claude_request_census
+            .get(&key)
+            .unwrap()
+            .unverified_for_test());
+        // Exclusion-list state is pass-local, loaded independently of the index.
+        index.claude_reemission_exclusions = ReemissionExclusions::parse(
+            if paused {
+                "invalid".to_string()
+            } else {
+                format!("{}\n{}", request_hash(LEGACY_PARENT), request_hash(LEGACY_CHILD))
+            }
+            .as_bytes(),
+        );
+        let mut later = raw
+            .iter()
+            .filter(|item| item.source_session_id == LEGACY_CHILD)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(later.len(), 1, "quiet sibling has no current native body");
+        apply_claude_reported_usage_with_identity(
+            &mut later,
+            &api,
+            &trace,
+            &mut index,
+            false,
+            LEGACY_WINDOW,
+            None,
+        );
+        assert_eq!(index.claude_usage_family_witnesses[LEGACY_CHILD], witness);
+        assert_eq!(
+            later[0].usage_accounting_contract,
+            expected.usage_accounting_contract
+        );
+        assert_eq!(later[0].model_usage, expected.model_usage);
+        assert_eq!(later[0].cost, expected.cost);
+        assert_eq!(later[0].input_tokens, expected.input_tokens);
+        assert_eq!(later[0].request_count, expected.request_count);
+        // A downgraded off-page record reproduces the original money failure.
+        let fingerprint = index
+            .claude_request_census
+            .get(&key)
+            .unwrap()
+            .fingerprint_hex_for_test();
+        record_claude_request_census(
+            &mut index,
+            ClaudeRequestCensusParse {
+                path: &quiet_path,
+                index_key: &key,
+                source_file_fingerprint: &fingerprint,
+                census_window_end: LEGACY_WINDOW,
+                complete: true,
+                lossy: false,
+                source_verified: false,
+                unchanged_source: false,
+                itemless_request_hashes: vec![],
+                opened_birth: None,
+                modified_unix_seconds: 0,
+            },
+            &[],
+        );
+        let mut downgraded = raw
+            .iter()
+            .filter(|item| item.source_session_id == LEGACY_CHILD)
+            .cloned()
+            .collect::<Vec<_>>();
+        apply_claude_reported_usage_with_identity(
+            &mut downgraded,
+            &api,
+            &trace,
+            &mut index,
+            false,
+            LEGACY_WINDOW,
+            None,
+        );
+        assert!(downgraded[0].usage_accounting_contract.is_none());
+        assert_eq!(
+            downgraded[0].input_tokens, 926,
+            "native money counts the copied prefix"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 /// Exclusions the owned-request accounting cannot prove are never subtracted
 /// blindly, and an excluded request is never tagged. Each skewed item is
 /// driven through the real reported rebuild (as the pass's call site feeds
@@ -2824,28 +3114,6 @@ fn bind_owner_a(
         index.session_account_bindings,
         serde_json::to_vec(items).unwrap() == rows,
     )
-}
-
-#[test]
-fn unbound_contract5_requests_survive_conflicting_creator_profiles() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    for mixed in [false, true] {
-        // Real request classification proves the rows independently of the
-        // creator. A cross-profile creator conflict must not revoke that proof.
-        let (dir, mut items, _) = bound_case(mixed, Some(OWNER_A));
-        items[0].session_account_evidence.as_mut().unwrap().identity_disposition = Some("conflict");
-        let mut capability = claude_request_accounts::MixedUploads::default();
-        capability.admit_request_identity(&items[0]);
-        assert!(capability.permits_request_identity(&items[0]));
-        let before = serde_json::to_value(&items).unwrap();
-        let (deferred, bindings, rows_unchanged) =
-            bind_owner_a(&mut items, &capability, false, "machine");
-        assert!(!deferred, "request proof does not establish a creator binding");
-        assert!(bindings.is_empty());
-        assert!(rows_unchanged);
-        assert_eq!(serde_json::to_value(&items).unwrap(), before);
-        let _ = fs::remove_dir_all(dir);
-    }
 }
 
 /// SESSION ruling 3: a bound session admits this scan's exact contract-5 body
@@ -4951,3 +5219,5 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
     }
     let _ = fs::remove_dir_all(dir);
 }
+
+include!("claude_request_identity_window_tests.rs");

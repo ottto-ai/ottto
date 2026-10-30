@@ -283,3 +283,130 @@ fn fe_n1_failing_held_open_backs_off_parks_and_never_blocks_healthy_key() {
     assert_eq!(sampled_audit::held_audit_open_failed(now).0, 0);
     assert_eq!(markers(&index), CACHE_ENTRIES - 1);
 }
+
+/// #870/#903 composition: rescue and failed-open backoff share the page's
+/// captured clock, even when the live clock crosses D before secure open.
+#[test]
+fn fe_n1_rescue_and_failed_open_use_captured_due_across_clock_edge() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _clock = TestClock;
+    let due = sampled_scan::now_seconds();
+    for denied in [false, true] {
+        sampled_audit::reset_open_backoff_for_test();
+        let hold = erased_hold(due);
+        let key = hold.key.clone();
+        File::open(&hold.fixture.file.0)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        let mut index = hold.index;
+        saturate(&mut index, &key, due);
+        owe(&mut index, &key, due);
+        sampled_scan::set_test_now(Some(due));
+        let scan = OwnedSourceScan::new(
+            CLAUDE,
+            std::slice::from_ref(&hold.fixture.root),
+            index,
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(hold.cache.clone(), Scope(NAMESPACE.into()));
+        assert_eq!(scan.audit_now, due);
+        let slot = scan.index.held_audit_progress.as_ref().unwrap();
+        assert_eq!(
+            (slot.key.as_str(), slot.due, slot.attempted),
+            (key.as_str(), due, false),
+            "queueing is not a successful open"
+        );
+        assert!(scan
+            .identified_candidates
+            .iter()
+            .any(|candidate| local_index_key(&candidate.path) == key));
+        assert!(sampled_audit::progress_debt(&scan.index, &key, scan.audit_now).is_some());
+        // Success needs rescue although the live clock is now before D.
+        // Failure must date backoff by D, not this much later live clock.
+        sampled_scan::set_test_now(Some(if denied { due + 6 * INTERVAL } else { due - 1 }));
+        let (mut index, raw, _, modes, _) = if denied {
+            crate::snapshots::with_transcript_io_denied(|| {
+                finish_production_scan_page(scan, CLAUDE)
+            })
+        } else {
+            finish_production_scan_page(scan, CLAUDE)
+        };
+        assert_eq!(modes, (usize::from(!denied), 0, 0));
+        assert_eq!(markers(&index), CACHE_ENTRIES - 1);
+        let slot = index.held_audit_progress.as_ref().unwrap();
+        assert_eq!(
+            (slot.key.as_str(), slot.due, slot.attempted),
+            (key.as_str(), due, !denied)
+        );
+        if denied {
+            assert!(raw.unreadable_path_count > 0, "the real secure open failed");
+            assert!(sampled_audit::awaits_hold_deadline_restoration(
+                &index, &key
+            ));
+            assert_eq!(
+                sampled_audit::held_audit_open_failed(due + 1),
+                (1, 1),
+                "failed-open backoff starts at the captured page time"
+            );
+        } else {
+            assert!(
+                !raw.snapshots.is_empty(),
+                "the owed turn read its native body"
+            );
+            assert!(hold_released(&index, &key));
+            assert_eq!(sampled_audit::held_audit_open_failed(due + 1), (0, 0));
+        }
+        index.save(&hold.index_path).unwrap();
+        let index = ScanIndex::load(&hold.index_path).unwrap();
+        assert_eq!(
+            index.held_audit_progress.as_ref().unwrap().due,
+            due,
+            "D survives restart"
+        );
+        if denied {
+            // The next allowed page retries D; a rollback after capture must
+            // neither suppress its rescue nor re-arm a later obligation.
+            sampled_scan::set_test_now(Some(due + INTERVAL / 2));
+            let scan = OwnedSourceScan::new(
+                CLAUDE,
+                std::slice::from_ref(&hold.fixture.root),
+                index,
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            )
+            .with_sampled_acquisition(hold.cache.clone(), Scope(NAMESPACE.into()));
+            let slot = scan.index.held_audit_progress.as_ref().unwrap();
+            assert_eq!((slot.due, slot.attempted), (due, false));
+            assert!(scan
+                .identified_candidates
+                .iter()
+                .any(|candidate| local_index_key(&candidate.path) == key));
+            sampled_scan::set_test_now(Some(due - 1));
+            let (index, raw, _, modes, _) = finish_production_scan_page(scan, CLAUDE);
+            assert_eq!(modes, (1, 0, 0));
+            assert!(!raw.snapshots.is_empty());
+            assert!(hold_released(&index, &key));
+            let slot = index.held_audit_progress.as_ref().unwrap();
+            assert_eq!((slot.due, slot.attempted), (due, true));
+            assert_eq!(sampled_audit::held_audit_open_failed(due + 1), (0, 0));
+            assert_eq!(markers(&index), CACHE_ENTRIES - 1);
+        }
+    }
+}

@@ -1148,6 +1148,16 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
         "2026-10-07T12:00:00Z",
         7,
     );
+    assert!(!sampled_audit::proven_absent(
+        &held_path,
+        std::slice::from_ref(&scan_root)
+    ));
+    absent.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    assert_eq!(
+        absent.claude_account_deferred_hold_count(),
+        1,
+        "still present"
+    );
     fs::remove_file(&held_path).unwrap();
     assert!(sampled_audit::proven_absent(
         &held_path,
@@ -1768,7 +1778,10 @@ fn fresh_index_loads_leave_their_path_unverified_until_a_restart() {
 // #705/#712 composition: both daemon and general loads share freshness,
 // retain guard (b) after the index fills, and repair a lost tombstone set.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn source_aware_loads_share_history_freshness_and_repair_tombstones() {
     forget_claude_unverified_history_indexes_for_test();
     let dir = temp_dir("patha-history-origin-composition");
@@ -1851,7 +1864,10 @@ fn source_aware_loads_share_history_freshness_and_repair_tombstones() {
 // wrong container type decodes as empty, each counted; the index and all its
 // other state still load, never quarantined.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn malformed_tombstones_never_fail_the_index_decode() {
     let dir = temp_dir("patha-malformed-tombstones");
     let path = dir.join("scan-index.json");
@@ -2084,7 +2100,10 @@ type IndexJsonEdit<'a> = dyn Fn(&mut serde_json::Map<String, serde_json::Value>)
 // member is still read through the authority path, never as a new file, and
 // that survives a save and reload. An unwitnessed new root stays new.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn a_lost_tombstone_set_never_restores_new_file_eligibility() {
     restart_claude_reemission_stop_for_test();
     let dir = temp_dir("patha-lost-tombstones");
@@ -2236,7 +2255,10 @@ fn a_lost_tombstone_set_never_restores_new_file_eligibility() {
 // settled proof frees enough slots, the next complete terminal (Round 15)
 // tombstones the absent witnessed roots and lowers it.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn an_unplaceable_tombstone_loss_keeps_a_durable_fence() {
     restart_claude_reemission_stop_for_test();
     let cap = MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES;
@@ -2341,7 +2363,10 @@ fn an_unplaceable_tombstone_loss_keeps_a_durable_fence() {
 // the member is gone again its return is still read through the authority
 // path.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn an_indexed_member_never_waives_a_lost_tombstone() {
     restart_claude_reemission_stop_for_test();
     let dir = temp_dir("patha-indexed-member-lost-tombstone");
@@ -2664,7 +2689,10 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
 // marker (and could evict at its cap) is caught the same way. A healthy
 // unmarked index (the witnessed root is indexed) still starts empty.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn a_downgrade_that_drops_the_marker_and_set_fails_closed() {
     restart_claude_reemission_stop_for_test();
     let fallback = MAX_CLAUDE_TOMBSTONE_FENCE_FALLBACK_ROOTS;

@@ -82,7 +82,10 @@ pub(crate) fn bound<T: HeapLayoutBound>(value: &T, limit: usize) -> Option<usize
     Some(c.bytes)
 }
 pub(crate) fn layout_supported() -> bool {
-    cfg!(target_os = "macos")
+    // Linux unit-test builds use the same std container layouts on the same
+    // 64-bit toolchain, so PR checks run the shipped macOS path. Non-test
+    // Linux builds keep refusing.
+    (cfg!(target_os = "macos") || cfg!(all(test, target_os = "linux")))
         && cfg!(target_pointer_width = "64")
         && compiler_layout_supported(env!("OTTTO_SCAN_LAYOUT_RUSTC"))
 }

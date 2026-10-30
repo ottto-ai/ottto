@@ -164,11 +164,7 @@ fn legacy(values: &[Value]) -> Run {
 /// compiled cutover unchanged. Legacy uses the same factory without a test cutover.
 fn run_price_source(values: &[Value], active: bool) -> Run {
     let _cutover = active.then(|| codex_counting_version::TestCutover::set(0));
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("ottto-v2-price-{unique}"));
+    let root = crate::test_scratch::unique_path("ottto-v2-price");
     fs::create_dir_all(&root).unwrap();
     let path = root.join(format!("rollout-2026-08-31T23-00-00-{SESSION}.jsonl"));
     let text: String = values.iter().map(|value| format!("{value}\n")).collect();

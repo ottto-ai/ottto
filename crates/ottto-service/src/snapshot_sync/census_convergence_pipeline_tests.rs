@@ -3189,7 +3189,10 @@ type IndexJsonDamage = fn(&mut serde_json::Value, &str);
 /// witness: nothing is uploaded or accepted and a bounded record re-forms.
 #[test]
 #[serial(source_manifests)]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn returning_member_after_a_lost_tombstone_set_is_held_not_new() {
     // Tombstone hold until reported proof is gate-off policy; an E2 body replaces its session.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -3325,7 +3328,10 @@ fn assert_returning_member_held(pages: &[PipelinePage], session: &str, witness: 
 /// the returning member is held, never new.
 #[test]
 #[serial(source_manifests)]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn restored_stale_member_after_a_lost_tombstone_set_is_held_not_new() {
     // Tombstone hold until reported proof is gate-off policy; an E2 body replaces its session.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
