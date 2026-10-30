@@ -328,6 +328,15 @@ impl Serialize for ScanIndex {
             claude_money_birth_store::BirthStore::is_empty
         );
         field!(claude_desktop_store_inventory, Option::is_none);
+        field!(claude_desktop_completed_lineage, Option::is_none);
+        if !self.claude_desktop_lineage_file_edges.is_empty() {
+            // Keep this bounded value compact even when holds require pretty
+            // root output. Already-admitted maps must still fit their decode
+            // span after a compact-to-held save; never evict to fund whitespace.
+            let compact = serde_json::value::to_raw_value(&self.claude_desktop_lineage_file_edges)
+                .map_err(serde::ser::Error::custom)?;
+            map.serialize_entry("claude_desktop_lineage_file_edges", &compact)?;
+        }
         map.end()
     }
 }
@@ -420,6 +429,8 @@ pub(super) const FIELDS: &[&str] = &[
     "held_audit_progress",
     "claude_money_birth_store",
     "claude_desktop_store_inventory",
+    "claude_desktop_completed_lineage",
+    "claude_desktop_lineage_file_edges",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -484,6 +495,8 @@ pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
     "claude_retired_family_tombstones_initialized",
     "claude_retired_family_tombstones_uncertain",
     "session_account_bindings",
+    "claude_desktop_completed_lineage",
+    "claude_desktop_lineage_file_edges",
     "claude_account_deferred_holds",
     "claude_request_identity_contract",
     "claude_request_identity_contract_changed",
@@ -813,7 +826,7 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
                 reader.consume(1);
                 name
             };
-            let optional = optional_census(name) || name == Some("claude_money_birth_store");
+            let optional = optional_resource_field(name);
             // CensusRead streams positional-array separator whitespace before
             // capture; object-field evidence starts immediately after ':'.
             if array {
@@ -865,6 +878,17 @@ fn optional_census(name: Option<&str>) -> bool {
         name,
         Some("claude_request_census" | "claude_request_census_shadow" | "reread_guard")
     )
+}
+fn optional_resource_field(name: Option<&str>) -> bool {
+    optional_census(name)
+        || matches!(
+            name,
+            Some(
+                "claude_money_birth_store"
+                    | "claude_desktop_completed_lineage"
+                    | "claude_desktop_lineage_file_edges"
+            )
+        )
 }
 
 fn note_refusal(error: &Error, stage: &str, source: &str) {
@@ -1172,6 +1196,25 @@ impl<R: BufRead + Seek> Decoder<R> {
 
     // History scalars repair only type damage, without allocating a Value for
     // an arbitrarily large malformed record. Seek/I/O errors still propagate.
+    fn desktop_selector<T: serde::de::DeserializeOwned + Default>(
+        &mut self,
+        span: Span,
+    ) -> std::result::Result<T, Error> {
+        self.reader.seek(SeekFrom::Start(span.start))?;
+        let result = serde_json::from_reader((&mut self.reader).take(span.len));
+        self.reader.seek(SeekFrom::Start(span.start + span.len))?;
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) if error.is_io() => Err(Error::Io(std::io::Error::new(
+                error.io_error_kind().unwrap_or(std::io::ErrorKind::Other),
+                error,
+            ))),
+            Err(_) => {
+                desktop_lineage::dropped();
+                Ok(T::default())
+            }
+        }
+    }
     fn history_scalar<T: serde::de::DeserializeOwned>(
         &mut self,
         span: Span,
@@ -1509,6 +1552,13 @@ impl<R: BufRead + Seek> Decoder<R> {
         Ok(hash.finalize().into())
     }
     fn index(&mut self, pass: Pass) -> std::result::Result<ScanIndex, Error> {
+        self.index_fields(pass, FIELDS)
+    }
+    fn index_fields(
+        &mut self,
+        pass: Pass,
+        fields: &'static [&'static str],
+    ) -> std::result::Result<ScanIndex, Error> {
         let mut index = ScanIndex {
             accepted_snapshot_fingerprint_ledger_version: 0,
             ..ScanIndex::default()
@@ -1519,7 +1569,7 @@ impl<R: BufRead + Seek> Decoder<R> {
         let mut position = 0;
         while self.ws()? != Some(if array { b']' } else { b'}' }) {
             let name = if array {
-                let name = *FIELDS
+                let name = *fields
                     .get(position)
                     .ok_or(Error::Refused("extra positional field"))?;
                 position += 1;
@@ -1529,18 +1579,17 @@ impl<R: BufRead + Seek> Decoder<R> {
                 // Known field names have bounded escaped spellings. Unknown long
                 // keys are ignored without allocating an unbounded String.
                 let name = if key.len
-                    <= (FIELDS.iter().map(|s| s.len()).max().unwrap_or(0) * 6 + 2) as u64
+                    <= (fields.iter().map(|s| s.len()).max().unwrap_or(0) * 6 + 2) as u64
                 {
                     let key: String = self.typed(key)?;
-                    FIELDS.iter().copied().find(|name| *name == key)
+                    fields.iter().copied().find(|name| *name == key)
                 } else {
                     None
                 };
                 self.eat(b':')?;
                 name
             };
-            let value = self
-                .span_optional(optional_census(name) || name == Some("claude_money_birth_store"))?;
+            let value = self.span_optional(optional_resource_field(name))?;
             if let Some(name) = name {
                 if matches!(
                     name,
@@ -1581,6 +1630,30 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "upload_context_fingerprint" => {
                             index.upload_context_fingerprint = self.typed(value)?
+                        }
+                        "claude_desktop_completed_lineage" => {
+                            // Optional selector state: malformed/oversized means
+                            // unknown, never a held authority record or index loss.
+                            index.claude_desktop_completed_lineage = if value.resource
+                                || value.len > desktop_lineage::MAX_DECODE_BYTES
+                            {
+                                desktop_lineage::dropped();
+                                None
+                            } else {
+                                self.desktop_selector::<desktop_lineage::Projection>(value)?
+                                    .0
+                            };
+                        }
+                        "claude_desktop_lineage_file_edges" => {
+                            index.claude_desktop_lineage_file_edges = if value.resource
+                                || value.len > desktop_lineage::MAX_DECODE_BYTES
+                            {
+                                desktop_lineage::dropped();
+                                BTreeMap::new()
+                            } else {
+                                self.desktop_selector::<desktop_lineage::FileEdges>(value)?
+                                    .0
+                            };
                         }
                         "files" => index.files = self.records("files", value, true)?,
                         "session_account_bindings" => {
@@ -2529,6 +2602,8 @@ fn held_file_owner(raw: &RawValue) -> Option<std::ops::Range<usize>> {
 // admission check below. Compact JSON, except while decode holds exist: then
 // the earlier pretty layout stays, so a hold that an older pretty file's
 // whitespace funded is still funded by the bytes rewritten on every save.
+// The byte-bounded Desktop file selector is always a compact raw value;
+// check_held_output still checks the exact resulting hold funding.
 pub(super) fn write_index<W: std::io::Write>(
     writer: W,
     index: &ScanIndex,
@@ -2604,3 +2679,7 @@ fn repair_commitment_is_order_independent_and_removes_frozen_records() {
     only_native.add("quarantined_snapshot_fingerprints", "a", [1; 32]);
     assert_eq!(right, only_native);
 }
+
+#[cfg(test)]
+#[path = "desktop_lineage_decode_tests.rs"]
+mod desktop_lineage_decode_tests;

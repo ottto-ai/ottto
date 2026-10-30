@@ -2147,6 +2147,7 @@ fn rebuild_reads(index: &ScanIndex) -> Vec<PendingIndexFinalization> {
         .iter()
         .map(|(key, entry)| PendingIndexFinalization {
             sampled_audit_verified: false,
+            lineage_edge_reoffer_bytes: None,
             codex_pending_recovery: false,
             index_key: key.clone(),
             source_file_fingerprint: entry.source_file_fingerprint.clone(),

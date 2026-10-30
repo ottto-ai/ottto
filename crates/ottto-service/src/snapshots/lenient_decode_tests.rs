@@ -830,6 +830,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     scan.snapshots = vec![snapshot];
     scan.pending_finalization.push(PendingIndexFinalization {
         sampled_audit_verified: false,
+        lineage_edge_reoffer_bytes: None,
         codex_pending_recovery: false,
         index_key: key.clone(),
         source_file_fingerprint: "source".into(),
@@ -2002,6 +2003,12 @@ fn every_persisted_field_fixture() -> ScanIndex {
                 "parsed":{"dev":1,"ino":2,"extent":1,"modified":[1,0],"changed":[1,0]},
                 "seal":{"stamp":{"length":1,"device":1,"inode":2,"modified":[1,0],"changed":[1,0]},
                     "scope":codex_parent_side_scope().0,"sample_len":1,"head_sha256":"a".repeat(64),"boundary_sha256":"b".repeat(64),"verified_unix_seconds":1,"sealed_unix_seconds":1}}}),
+            "claude_desktop_lineage_file_edges" => {
+                serde_json::json!({"/synthetic/child.jsonl":"a".repeat(64)})
+            }
+            "claude_desktop_completed_lineage" => serde_json::json!({
+                "00000000-0000-4000-8000-000000000001":"00000000-0000-4000-8000-000000000002"
+            }),
             "claude_desktop_title_files" => {
                 serde_json::json!({"sidecar":{"cli_session_id":"session","title":"title","user_set":true}})
             }
@@ -2132,20 +2139,25 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
     let current = serde_json::to_value(&seed).unwrap();
     let fields = lenient_decode::FIELDS;
     assert_eq!(
-        &fields[fields.len() - 4..],
+        &fields[fields.len() - 6..],
         &[
             "upload_ack_retirement_handoff",
             "held_audit_progress",
             "claude_money_birth_store",
             "claude_desktop_store_inventory",
+            "claude_desktop_completed_lineage",
+            "claude_desktop_lineage_file_edges",
         ]
     );
     for earlier_e2 in [false, true] {
         let mut legacy = current.clone();
-        legacy
-            .as_object_mut()
-            .unwrap()
-            .remove("claude_desktop_store_inventory");
+        for appended in [
+            "claude_desktop_store_inventory",
+            "claude_desktop_completed_lineage",
+            "claude_desktop_lineage_file_edges",
+        ] {
+            legacy.as_object_mut().unwrap().remove(appended);
+        }
         legacy.as_object_mut().unwrap().remove(if earlier_e2 {
             "held_audit_progress"
         } else {
@@ -2156,7 +2168,7 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
             // The main positional schema ends at audit progress; appending E2
             // must leave every already-shipped position intact.
             forms.push(Value::Array(
-                fields[..fields.len() - 2]
+                fields[..fields.len() - 4]
                     .iter()
                     .map(|name| legacy[*name].clone())
                     .collect(),
@@ -2184,14 +2196,32 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
 #[test]
 fn desktop_inventory_keeps_existing_positional_index_slots() {
     let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
-    let mut legacy = current.clone();
+    let mut before_lineage = current.clone();
+    for appended in [
+        "claude_desktop_completed_lineage",
+        "claude_desktop_lineage_file_edges",
+    ] {
+        before_lineage.as_object_mut().unwrap().remove(appended);
+    }
+    let mut legacy = before_lineage.clone();
     legacy
         .as_object_mut()
         .unwrap()
         .remove("claude_desktop_store_inventory");
     let fields = lenient_decode::FIELDS;
-    assert_eq!(fields.last(), Some(&"claude_desktop_store_inventory"));
-    for (expected, slots) in [(&legacy, &fields[..fields.len() - 1]), (&current, fields)] {
+    assert_eq!(
+        &fields[fields.len() - 3..],
+        &[
+            "claude_desktop_store_inventory",
+            "claude_desktop_completed_lineage",
+            "claude_desktop_lineage_file_edges"
+        ]
+    );
+    for (expected, slots) in [
+        (&legacy, &fields[..fields.len() - 3]),
+        (&before_lineage, &fields[..fields.len() - 2]),
+        (&current, fields),
+    ] {
         let array = Value::Array(slots.iter().map(|name| expected[*name].clone()).collect());
         let bytes = serde_json::to_vec(&array).unwrap();
         let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
@@ -2309,6 +2339,7 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                 opened_object_identity: String::new(),
                 fingerprint_changed_nanos: 0,
                 fingerprint_birth_nanos: 0,
+                fingerprint_opened_identity: String::new(),
             };
             assert_eq!(
                 loaded.candidate_decision_with_reason(&candidate),
@@ -4664,6 +4695,7 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
                     opened_object_identity: String::new(),
                     fingerprint_changed_nanos: 0,
                     fingerprint_birth_nanos: 0,
+                    fingerprint_opened_identity: String::new(),
                 };
                 assert_eq!(
                     decoded.candidate_decision_with_reason_at(&candidate, 0),

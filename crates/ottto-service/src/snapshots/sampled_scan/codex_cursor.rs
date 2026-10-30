@@ -6932,6 +6932,7 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
     }
     targets.pending_finalization.push(PendingIndexFinalization {
         sampled_audit_verified: false,
+        lineage_edge_reoffer_bytes: None,
         codex_pending_recovery: index
             .files
             .get(&index_key)

@@ -854,6 +854,7 @@ fn apc_pending(
 ) -> PendingIndexFinalization {
     PendingIndexFinalization {
         sampled_audit_verified: false,
+        lineage_edge_reoffer_bytes: None,
         codex_pending_recovery: false,
         index_key: apc_keys()[slot].clone(),
         source_file_fingerprint: revision.to_string(),
