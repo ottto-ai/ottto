@@ -44,4 +44,11 @@ The real scanner/evidence regressions are
 tags None, and the next clean page tags B again. They check root/child shares,
 identity_parts, unchanged per-session request/token/cost totals, history custody
 and the request counter. `e2_pipeline_bound_a_malformed_trace_keeps_main_fallback`
-controls the existing non-discard fallback to A.
+controls main's uniform-login case: an unhealthy, non-discard trace keeps the
+uniform own login B already set on the wire. The split-login family (root B,
+child C, binding A) shows the retained-account hazard:
+`e2_pipeline_bound_a_split_logins_malformed_trace_matches_main_a` keeps main's
+non-discard fallback to A, while
+`e2_pipeline_bound_a_split_logins_cap_discard_blocks_retained_a` and
+`e2_pipeline_bound_a_split_logins_generation_discard_blocks_retained_a`
+(Unix-only) tag None on discard and B/C again on the next clean page.
