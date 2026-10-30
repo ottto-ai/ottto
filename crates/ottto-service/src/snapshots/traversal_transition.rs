@@ -419,7 +419,7 @@ mod tests {
             },
         );
         index.bounded_sweep_had_unsettled_upload = true;
-        let (_, rows) = capture(|| {
+        let (_, all_rows) = capture(|| {
             ensure_bounded_traversal(
                 SnapshotSource::ClaudeCode,
                 &[],
@@ -428,6 +428,18 @@ mod tests {
                 BACKFILL_WINDOW_DAYS,
             )
         });
+        // B3 phase 1 adds its own held-family diagnostics rows beside the
+        // transition row; every emitted row stays content-free.
+        for row in &all_rows {
+            let serialized = row.to_string();
+            for forbidden in [key, "private-session", "private-body-witness"] {
+                assert!(!serialized.contains(forbidden));
+            }
+        }
+        let rows = all_rows
+            .into_iter()
+            .filter(|row| row["stage"] == "bounded_traversal_transition")
+            .collect::<Vec<_>>();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["source"], "claude_code");
         assert_eq!(rows[0]["counts"]["prior_unsettled_upload"], true);
