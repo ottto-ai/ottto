@@ -42,6 +42,47 @@ fn budget() -> usize {
     CENSUS_PREFIX_MAX_BYTES
 }
 
+/// Alarm threshold of the OverBudget gauge: one record already makes the
+/// hold projection global (local tuning, counts only).
+const OVERBUDGET_ALARM_RECORDS: u64 = 1;
+const OVERBUDGET_ALARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3_600);
+
+#[cfg(not(test))]
+static OVERBUDGET_LAST_ALARM: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+#[cfg(test)]
+thread_local! {
+    static OVERBUDGET_LAST_ALARM: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether an OverBudget alarm is due at `now`; takes the slot when it is.
+fn take_overbudget_alarm_slot(now: std::time::Instant) -> bool {
+    let due = |last: Option<std::time::Instant>| {
+        last.map_or(true, |at| {
+            now.saturating_duration_since(at) >= OVERBUDGET_ALARM_INTERVAL
+        })
+    };
+    #[cfg(not(test))]
+    {
+        let mut last = OVERBUDGET_LAST_ALARM
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let due = due(*last);
+        if due {
+            *last = Some(now);
+        }
+        due
+    }
+    #[cfg(test)]
+    OVERBUDGET_LAST_ALARM.with(|last| {
+        let due = due(last.get());
+        if due {
+            last.set(Some(now));
+        }
+        due
+    })
+}
+
 /// What the census says about some request prefixes of one family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CensusPrefixVerdict {
@@ -187,14 +228,33 @@ impl CensusPrefixIndex {
                 ..Self::default()
             };
         }
+        // Gauge (B), Lead B 2026-10-30: each OverBudget record alone makes
+        // the index Unknown, and an Unknown index refuses retirement to every
+        // family with usage pending (`fork_lineage_incomplete` is
+        // source-wide). Overflow alone counts in neither.
+        let blocked_roots = if over_budget == 0 {
+            0
+        } else {
+            index.claude_usage_family_pending.len()
+        };
         crate::local_resource_diagnostics::traversal_point(
             "claude_census_prefix_veto",
             SnapshotSource::ClaudeCode.api_slug(),
             &json!({"census_prefix_records":records,"census_prefix_entries":out.prefixes.len(),
                 "census_prefix_bytes":out.bytes,"census_prefix_build_peak_bytes":peak,
                 "census_prefix_over_budget_records":over_budget,"census_prefix_overflow":overflow,
-                "census_prefix_unknown":u64::from(out.unknown)}),
+                "census_prefix_unknown":u64::from(out.unknown),
+                "census_prefix_unknown_overbudget_records":over_budget,
+                "census_prefix_unknown_blocked_roots":blocked_roots}),
         );
+        if over_budget >= OVERBUDGET_ALARM_RECORDS
+            && take_overbudget_alarm_slot(std::time::Instant::now())
+        {
+            crate::local_resource_diagnostics::claude_census_prefix_unknown_overbudget_alarm(
+                &json!({"census_prefix_unknown_overbudget_records":over_budget,
+                    "census_prefix_unknown_blocked_roots":blocked_roots}),
+            );
+        }
         out
     }
 

@@ -1203,6 +1203,125 @@ fn census_prefix_over_budget_record_is_unknown_under_the_byte_budget() {
 }
 
 #[test]
+fn census_prefix_overbudget_gauge_counts_blocked_roots_and_alarms_hourly() {
+    // Lead B 2026-10-30 (B): the census-prefix row counts the OverBudget
+    // records that make the index Unknown and the usage-pending roots whose
+    // retirement that refuses, with the local hourly alarm. Counts only.
+    const PENDING_ROOT: &str = "d4444444-4444-4444-8444-444444444444";
+    let pending = |window: &str| ClaudeUsageFamilyPending {
+        derived_request_members: BTreeSet::new(),
+        census_window_end: window.into(),
+        member_request_id_hashes: BTreeMap::new(),
+        member_occurrences: BTreeMap::new(),
+        invalid: false,
+        idless_revision: None,
+    };
+    let mut index = ScanIndex::default();
+    let _ = index.claude_request_census_mut_for_test().insert(
+        carry_key(CARRY_OTHER, None),
+        claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+            &"a".repeat(64),
+            1,
+            claude_request_census::ClaudeRequestCensusShape::Exact,
+            vec![claude_request_census::claude_request_hash("req_other")],
+        ),
+    );
+    index
+        .claude_usage_family_pending
+        .insert(CARRY_ROOT.into(), pending(CARRY_FAILED));
+    index
+        .claude_usage_family_pending
+        .insert(PENDING_ROOT.into(), pending(CARRY_RETRY));
+    let gauge = |rows: &[serde_json::Value]| {
+        let row = rows
+            .iter()
+            .find(|row| {
+                row["stage"] == "claude_census_prefix_veto"
+                    && row["counts"]["census_prefix_unknown"].is_u64()
+            })
+            .expect("census-prefix build row");
+        (
+            row["counts"]["census_prefix_unknown_overbudget_records"].clone(),
+            row["counts"]["census_prefix_unknown_blocked_roots"].clone(),
+        )
+    };
+    let alarms = |rows: &[serde_json::Value]| {
+        rows.iter()
+            .filter(|row| row["stage"] == "census_prefix_unknown_overbudget_alarm")
+            .count()
+    };
+    // No OverBudget record: zero, and no alarm.
+    let (built, rows) = crate::local_resource_diagnostics::capture(|| {
+        usage_census_prefix::CensusPrefixIndex::build(&index)
+    });
+    assert!(!built.unknown());
+    assert_eq!(gauge(&rows), (json!(0), json!(0)));
+    assert_eq!(alarms(&rows), 0);
+    // One pending-free OverBudget record: Unknown, both pending roots blocked.
+    let _ = index.claude_request_census_mut_for_test().insert(
+        carry_key(CARRY_UNWITNESSED, None),
+        claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+            &"b".repeat(64),
+            1,
+            claude_request_census::ClaudeRequestCensusShape::OverBudget,
+            vec![],
+        ),
+    );
+    // An OverBudget record of a root with usage pending is out of the index.
+    let _ = index.claude_request_census_mut_for_test().insert(
+        carry_key(PENDING_ROOT, None),
+        claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+            &"c".repeat(64),
+            1,
+            claude_request_census::ClaudeRequestCensusShape::OverBudget,
+            vec![],
+        ),
+    );
+    let (built, rows) = crate::local_resource_diagnostics::capture(|| {
+        usage_census_prefix::CensusPrefixIndex::build(&index)
+    });
+    assert!(built.unknown());
+    assert_eq!(gauge(&rows), (json!(1), json!(2)));
+    assert_eq!(alarms(&rows), 1);
+    let alarm = rows
+        .iter()
+        .find(|row| row["stage"] == "census_prefix_unknown_overbudget_alarm")
+        .unwrap();
+    assert_eq!(
+        alarm["counts"]["census_prefix_unknown_overbudget_records"],
+        1
+    );
+    assert_eq!(alarm["counts"]["census_prefix_unknown_blocked_roots"], 2);
+    // Privacy: every count is a number (the peak may be null); no root, key,
+    // request id or fingerprint reaches a row.
+    for row in &rows {
+        for value in row["counts"].as_object().unwrap().values() {
+            assert!(value.is_u64() || value.is_null(), "{row}");
+        }
+        let text = row.to_string();
+        for secret in [
+            CARRY_ROOT,
+            CARRY_OTHER,
+            CARRY_UNWITNESSED,
+            PENDING_ROOT,
+            "req_other",
+            ".jsonl",
+            "aaaaaaaa",
+            "bbbbbbbb",
+            "cccccccc",
+        ] {
+            assert!(!text.contains(secret), "{row}");
+        }
+    }
+    // At most hourly.
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        usage_census_prefix::CensusPrefixIndex::build(&index)
+    });
+    assert_eq!(gauge(&rows), (json!(1), json!(2)));
+    assert_eq!(alarms(&rows), 0);
+}
+
+#[test]
 fn fork_lineage_unknown_is_source_wide_beside_an_unrelated_qualified_family() {
     if !crate::heap_layout_bound::layout_supported() {
         return;

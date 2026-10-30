@@ -716,6 +716,18 @@ pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) 
 pub(crate) fn claude_usage_held_no_witness_alarm(counts: &impl Serialize) {
     traversal_point("usage_held_no_witness_alarm", "claude_code", counts);
 }
+/// Local alarm, at most hourly: pending-free Claude census records whose
+/// hashes the census dropped (OverBudget) make the census-prefix index
+/// Unknown, which holds every family and refuses every usage-pending
+/// retirement (gauge on the `claude_census_prefix_veto` row). Counts only;
+/// no path, id or wire event.
+pub(crate) fn claude_census_prefix_unknown_overbudget_alarm(counts: &impl Serialize) {
+    traversal_point(
+        "census_prefix_unknown_overbudget_alarm",
+        "claude_code",
+        counts,
+    );
+}
 /// Local alarm, once per park: a held Claude key's progress audit failed its
 /// secure open 8 times in a row and is parked, its audit debt still owed.
 /// Counts only; no path, id or wire event.
