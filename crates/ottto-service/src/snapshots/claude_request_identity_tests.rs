@@ -2717,6 +2717,78 @@ fn unreadable_sidecars_refuse_and_unqualified_items_keep_todays_bytes() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// Aggregation is bounded by rows and authority keys, not by requests: ten
+/// times the requests over the same rows and keys retain exactly the same
+/// heap, keys past the cap fold into untagged as they arrive, and a request
+/// outside the item's rows stops construction.
+#[test]
+fn grouping_retains_nothing_per_request() {
+    use crate::retry_allocation_probe::measure;
+    let (row_key, _, _) = build_row_identity("claude-haiku-4-5", &SelectorCapture::default(), None);
+    let usage = UsageTotals {
+        input_tokens: 3,
+        request_count: 1,
+        costs: UsageCosts {
+            observed: true,
+            reported: true,
+            total: Some(1_000_000),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let keys = (0..40_u8)
+        .map(|n| {
+            RequestIdentity::Tagged(AuthorityKey {
+                login: Some(format!("{n:064x}")),
+                org: None,
+                basis: identity::TELEMETRY,
+            })
+        })
+        .collect::<Vec<_>>();
+    let build = |requests: usize| {
+        measure(|| {
+            let mut grouping = identity::Grouping::new(2);
+            for n in 0..requests {
+                let bucket = if n % 2 == 0 {
+                    "2026-08-02T07:00:00Z"
+                } else {
+                    "2026-08-02T08:00:00Z"
+                };
+                let identity = match n % 50 {
+                    40 => RequestIdentity::Refused(Refusal::BadClock),
+                    41 => RequestIdentity::Missing,
+                    k if k < 40 => keys[k].clone(),
+                    _ => keys[0].clone(),
+                };
+                grouping.add(bucket, &row_key, &usage, identity.as_ref());
+            }
+            grouping
+        })
+    };
+    let (small, small_stats) = build(1_000);
+    let (large, large_stats) = build(10_000);
+    assert_eq!(small_stats.requested_live, large_stats.requested_live);
+    assert!(small_stats.requested_peak <= large_stats.requested_peak);
+    assert_eq!(large_stats.requested_peak, small_stats.requested_peak);
+    assert_ne!(small, large, "amounts still count every request");
+    // A third row the item does not carry: never reproducible, stop growing.
+    let mut overflow = identity::Grouping::new(2);
+    for bucket in [
+        "2026-08-02T07:00:00Z",
+        "2026-08-02T08:00:00Z",
+        "2026-08-02T09:00:00Z",
+    ] {
+        overflow.add(bucket, &row_key, &usage, keys[0].as_ref());
+    }
+    let mut item = one_row_item(&[(1, None)]);
+    let before = serde_json::to_vec(&item).unwrap();
+    assert_eq!(
+        identity::apply_grouped(&mut item, overflow),
+        Err(identity::Ineligible::RowsNotReproduced)
+    );
+    assert_eq!(serde_json::to_vec(&item).unwrap(), before);
+}
+
 // --- Review regressions ---------------------------------------------------------
 
 #[test]
@@ -3545,379 +3617,326 @@ fn rows_under_another_root_own_the_request() {
     );
 }
 
-/// [money] Withdraw copied markers in settled/unsettled census states on both
-/// grouping paths, conserving usage, foreign-owner refusals and replay bytes.
+/// A witnessed duplicate still refuses. Every pass withdraws marker-derived
+/// tags to missing or login-only, including a fully compared/open census.
+/// Usage never moves and full telemetry remains authoritative.
+#[test]
+fn transcript_markers_are_withdrawn_even_when_a_settled_census_shows_unduplicated() {
+    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    use crate::snapshots::ClaudeDuplicateCensusCounts;
+    let dir = temp_dir("claude-request-identity-ownership");
+    let org = org_hash(ORG_1);
+    let mut lines = email_session(false, false);
+    // A second request whose login-only telemetry joins the marker org.
+    lines.push(json!({"timestamp": "2026-08-02T07:00:02Z", "type": "assistant", "sessionId": ROOT,
+        "requestId": "req_2", "message": {"id": "m2", "model": "claude-haiku-4-5",
+        "usage": {"input_tokens": 20, "output_tokens": 2}}}));
+    let mut member = complete_api_row(ROOT, "req_member", 9, 10, 1, 0);
+    member.request_identity = Some(org_identity(&org));
+    let (api, trace) = reports(
+        vec![signed(member), signed(complete_api_row(ROOT, "req_2", 2, 20, 2, 0))],
+        vec![
+            complete_trace_row(ROOT, "req_member", ""),
+            complete_trace_row(ROOT, "req_2", ""),
+        ],
+    );
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let before = parse_session(&dir, &lines).remove(0);
+    let run = |index: &ScanIndex, census: &ClaudeDuplicateCensusCounts, compared: bool| {
+        let mut items = parse_session(&dir, &lines);
+        let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition {
+            duplicate_census: *census,
+            transcript_ownership_complete: compared,
+            ..Default::default()
+        };
+        let ownership = identity::TranscriptOwnership::after_census(index, &disposition);
+        identity::apply_scan_with_ownership(&mut items, &evidence, BTreeMap::new(), &ownership);
+        items.remove(0)
+    };
+    let conserved = |item: &SnapshotItem| {
+        let rows = |item: &SnapshotItem| {
+            item.usage_buckets
+                .iter()
+                .flat_map(|bucket| &bucket.model_usage)
+                .chain(&item.model_usage)
+                .map(|row| (row.request_count, row.input_tokens, row.output_tokens, row.cost_usd.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(item), rows(&before));
+        assert_eq!(
+            (item.input_tokens, item.output_tokens, item.request_count),
+            (before.input_tokens, before.output_tokens, before.request_count)
+        );
+        assert_eq!(item.cost, before.cost);
+    };
+    let bases = |item: &SnapshotItem| {
+        item.request_evidence
+            .iter()
+            .map(|evidence| (evidence.identity_basis.clone(), evidence.provider_workspace_hash.clone()))
+            .collect::<BTreeSet<_>>()
+    };
+    let settled = ClaudeDuplicateCensusCounts {
+        census_complete: true,
+        coverage_complete: true,
+        ..Default::default()
+    };
+    let clean = ScanIndex::default();
+
+    // Settled and unduplicated: marker tags are still withdrawn, as `apply_scan`.
+    let tagged = run(&clean, &settled, true);
+    assert_eq!(
+        bases(&tagged),
+        BTreeSet::from([(identity::TELEMETRY_LOGIN.to_string(), None)])
+    );
+    assert_eq!(tagged.request_identity_refusals, 0);
+    let mut via_default = parse_session(&dir, &lines);
+    identity::apply_scan(&mut via_default, &evidence, BTreeMap::new());
+    assert_eq!(serde_json::to_vec(&via_default[0]).unwrap(), serde_json::to_vec(&tagged).unwrap());
+    conserved(&tagged);
+
+    // A witnessed duplicate of the unrowed request refuses it, never borrows.
+    let mut duplicated = ScanIndex::default();
+    duplicated.claude_duplicate_request_owners.insert(
+        format!("{:x}", Sha256::digest(b"req_1")),
+        BTreeSet::from([
+            claude_duplicate_request_owner(ROOT, ROOT),
+            claude_duplicate_request_owner(OTHER_ROOT, OTHER_ROOT),
+        ]),
+    );
+    let refused = run(&duplicated, &settled, true);
+    assert!(refused.request_identity_refusals >= 1);
+    assert!(!bases(&refused).iter().any(|(basis, _)| basis == identity::TRANSCRIPT_ORG));
+    conserved(&refused);
+
+    // Unsettled passes: no marker reaches the wire, nothing is refused that
+    // was not, and the refusal above survives. The last case passes every
+    // census flag but left an indexed member uncompared (a quarantined
+    // original): ownership alone withdraws.
+    for (census, compared) in [
+        (ClaudeDuplicateCensusCounts::default(), false),
+        (ClaudeDuplicateCensusCounts { coverage_complete: false, ..settled }, true),
+        (ClaudeDuplicateCensusCounts { census_invalid: true, ..settled }, true),
+        (ClaudeDuplicateCensusCounts { fence_after: true, ..settled }, true),
+        (settled, false),
+    ] {
+        let withdrawn = run(&clean, &census, compared);
+        assert_eq!(
+            bases(&withdrawn),
+            BTreeSet::from([(identity::TELEMETRY_LOGIN.to_string(), None)]),
+            "{census:?} compared={compared}"
+        );
+        assert_eq!(withdrawn.request_identity_refusals, 0, "{census:?} compared={compared}");
+        conserved(&withdrawn);
+        let still_refused = run(&duplicated, &census, compared);
+        assert!(still_refused.request_identity_refusals >= 1, "{census:?} compared={compared}");
+        conserved(&still_refused);
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// The open/settled result that D2 will supply cannot authorize copied
+/// markers. Both production grouping routes must withdraw them, even before
+/// D2 exists, on legacy/OFF and default state, and after index reload.
 #[test]
 fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
-    {
-        // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-        use crate::snapshots::ClaudeDuplicateCensusCounts;
-        let dir = temp_dir("claude-request-identity-ownership");
-        let org = org_hash(ORG_1);
-        let mut lines = email_session(false, false);
-        // A second request whose login-only telemetry joins the marker org.
-        lines.push(
-            json!({"timestamp": "2026-08-02T07:00:02Z", "type": "assistant", "sessionId": ROOT,
-        "requestId": "req_2", "message": {"id": "m2", "model": "claude-haiku-4-5",
-        "usage": {"input_tokens": 20, "output_tokens": 2}}}),
-        );
-        let mut member = complete_api_row(ROOT, "req_member", 9, 10, 1, 0);
-        member.request_identity = Some(org_identity(&org));
-        let (api, trace) = reports(
-            vec![
-                signed(member),
-                signed(complete_api_row(ROOT, "req_2", 2, 20, 2, 0)),
-            ],
-            vec![
-                complete_trace_row(ROOT, "req_member", ""),
-                complete_trace_row(ROOT, "req_2", ""),
-            ],
-        );
-        let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
-        let before = parse_session(&dir, &lines).remove(0);
-        let run = |index: &ScanIndex, census: &ClaudeDuplicateCensusCounts, compared: bool| {
-            let mut items = parse_session(&dir, &lines);
-            let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition {
-                duplicate_census: *census,
-                transcript_ownership_complete: compared,
-                ..Default::default()
-            };
-            let ownership = identity::TranscriptOwnership::after_census(index, &disposition);
-            identity::apply_scan_with_ownership(&mut items, &evidence, BTreeMap::new(), &ownership);
-            items.remove(0)
+    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    use crate::snapshots::ClaudeDuplicateCensusCounts;
+    let dir = temp_dir("claude-i1b-copied-markers");
+    let org = org_hash(ORG_1);
+    // A copied prefix can contain a perfectly valid marker and request id.
+    // The current census may not have observed its other holder yet.
+    // Keep one unchanged selector context so withdrawn marker usage and a
+    // foreign-owner refusal must merge within the same bucket row.
+    let mut lines = vec![json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment", "sessionId": ROOT,
+        "attachment": {"type": "credential_org", "organizationUuid": ORG_1}})];
+    for n in 1..=5 {
+        lines.push(owned_response(
+            &format!("req_{n}"),
+            "2026-08-02T07:00:02Z",
+            n * 10,
+            n,
+        ));
+    }
+    let mut paired = complete_api_row(ROOT, "req_3", 3, 30, 3, 0);
+    paired.request_identity = Some(org_identity(&org));
+    let (api, mut trace) = reports(
+        vec![
+            signed(complete_api_row(ROOT, "req_2", 2, 20, 2, 0)),
+            signed(paired),
+        ],
+        vec![
+            complete_trace_row(ROOT, "req_2", ""),
+            complete_trace_row(ROOT, "req_3", ""),
+        ],
+    );
+    trace.evidence.insert(
+        OTHER_ROOT.to_string(),
+        vec![complete_trace_row(OTHER_ROOT, "req_5", "")],
+    );
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let open = ClaudeDuplicateCensusCounts {
+        census_complete: true,
+        coverage_complete: true,
+        ..Default::default()
+    };
+    let clean = ScanIndex::default();
+    let mut saved = clean.clone();
+    saved.claude_duplicate_request_owners.insert(
+        format!("{:x}", Sha256::digest(b"req_5")),
+        BTreeSet::from([
+            claude_duplicate_request_owner(ROOT, ROOT),
+            claude_duplicate_request_owner(OTHER_ROOT, OTHER_ROOT),
+        ]),
+    );
+    let restarted: ScanIndex =
+        serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+    assert_eq!(restarted.claude_duplicate_request_owners, saved.claude_duplicate_request_owners);
+    // There is deliberately no D2 switch in this prerequisite. Legacy/OFF
+    // and future D2-open inputs reach the same unconditional boundary.
+    for (state, index, census, compared) in [
+        ("settled-open", &clean, open, true),
+        (
+            "legacy-off-closed",
+            &clean,
+            ClaudeDuplicateCensusCounts {
+                fence_after: true,
+                ..open
+            },
+            true,
+        ),
+        (
+            "default-index",
+            &clean,
+            ClaudeDuplicateCensusCounts::default(),
+            false,
+        ),
+        ("restart-open", &restarted, open, true),
+    ] {
+        let disposition = ClaudeUsageAuthorityDisposition {
+            duplicate_census: census,
+            transcript_ownership_complete: compared,
+            ..Default::default()
         };
-        let conserved = |item: &SnapshotItem| {
-            let rows = |item: &SnapshotItem| {
-                item.usage_buckets
-                    .iter()
-                    .flat_map(|bucket| &bucket.model_usage)
-                    .chain(&item.model_usage)
-                    .map(|row| {
-                        (
-                            row.request_count,
-                            row.input_tokens,
-                            row.output_tokens,
-                            row.cost_usd.clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
+        let ownership = identity::TranscriptOwnership::after_census(index, &disposition);
+        for reported in [false, true] {
+            let mut item = parse_session(&dir, &lines).remove(0);
+            let groupings = if reported {
+                item.usage_accounting_contract = Some("session_exclusive_reported_usage:v1".into());
+                let mut sink =
+                    identity::RequestSink::for_item(&evidence, &item, usize::MAX).unwrap();
+                for (request_id, occurrence) in &item.claude_usage_occurrences {
+                    let (row_key, _, _) = build_row_identity(
+                        occurrence.model.as_deref().unwrap(),
+                        &occurrence.selector,
+                        occurrence.reasoning_effort.as_deref(),
+                    );
+                    let mut usage = occurrence.usage.clone();
+                    usage.request_count = 1;
+                    sink.add(
+                        &item,
+                        identity::Request {
+                            request_id,
+                            occurrence: Some((
+                                occurrence.sequence,
+                                occurrence.event_clock_complete,
+                            )),
+                            timestamp: occurrence.timestamp.as_deref().unwrap(),
+                            bucket_start: "2026-08-02T07:00:00Z",
+                            row_key: &row_key,
+                            usage: &usage,
+                        },
+                    );
+                }
+                let grouping = sink.finish();
+                assert!(grouping.owned_reported_requests(&item));
+                BTreeMap::from([(item.source_session_id.clone(), grouping)])
+            } else {
+                BTreeMap::new()
             };
-            assert_eq!(rows(item), rows(&before));
+            let before = item.clone();
+            let mut items = vec![item];
+            let outcome =
+                identity::apply_scan_with_ownership(&mut items, &evidence, groupings, &ownership);
+            assert_eq!(outcome.sent, 1, "{state} reported={reported}: {outcome:?}");
+            let item = &items[0];
+            assert_usage_conserved(item, &before);
             assert_eq!(
-                (item.input_tokens, item.output_tokens, item.request_count),
-                (
-                    before.input_tokens,
-                    before.output_tokens,
-                    before.request_count
-                )
+                item.request_identity_refusals, 1,
+                "the foreign-owner refusal survives"
             );
-            assert_eq!(item.cost, before.cost);
-        };
-        let bases = |item: &SnapshotItem| {
-            item.request_evidence
-                .iter()
-                .map(|evidence| {
-                    (
-                        evidence.identity_basis.clone(),
-                        evidence.provider_workspace_hash.clone(),
-                    )
+            assert_eq!(
+                item.request_evidence
+                    .iter()
+                    .map(|e| (
+                        e.identity_basis.as_str(),
+                        e.provider_workspace_hash.as_deref()
+                    ))
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([
+                    (identity::TELEMETRY, Some(org.as_str())),
+                    (identity::TELEMETRY_LOGIN, None)
+                ]),
+                "{state} reported={reported}"
+            );
+            let parts = contributions_of(item).unwrap();
+            let shares = |basis| {
+                parts.iter().filter(|p| matches!(&p.identity, RequestIdentity::Tagged(key) if key.basis == basis)).collect::<Vec<_>>()
+            };
+            let login = shares(identity::TELEMETRY_LOGIN);
+            assert_eq!(login.len(), 1);
+            assert_eq!(
+                login[0].identity,
+                RequestIdentity::Tagged(AuthorityKey {
+                    login: Some(OWNER_A.into()),
+                    org: None,
+                    basis: identity::TELEMETRY_LOGIN
                 })
-                .collect::<BTreeSet<_>>()
-        };
-        let settled = ClaudeDuplicateCensusCounts {
-            census_complete: true,
-            coverage_complete: true,
-            ..Default::default()
-        };
-        let clean = ScanIndex::default();
-
-        // Settled and unduplicated: marker tags are still withdrawn, as `apply_scan`.
-        let tagged = run(&clean, &settled, true);
-        assert_eq!(
-            bases(&tagged),
-            BTreeSet::from([(identity::TELEMETRY_LOGIN.to_string(), None)])
-        );
-        assert_eq!(tagged.request_identity_refusals, 0);
-        let mut via_default = parse_session(&dir, &lines);
-        identity::apply_scan(&mut via_default, &evidence, BTreeMap::new());
-        assert_eq!(
-            serde_json::to_vec(&via_default[0]).unwrap(),
-            serde_json::to_vec(&tagged).unwrap()
-        );
-        conserved(&tagged);
-
-        // A witnessed duplicate of the unrowed request refuses it, never borrows.
-        let mut duplicated = ScanIndex::default();
-        duplicated.claude_duplicate_request_owners.insert(
-            format!("{:x}", Sha256::digest(b"req_1")),
-            BTreeSet::from([
-                claude_duplicate_request_owner(ROOT, ROOT),
-                claude_duplicate_request_owner(OTHER_ROOT, OTHER_ROOT),
-            ]),
-        );
-        let refused = run(&duplicated, &settled, true);
-        assert!(refused.request_identity_refusals >= 1);
-        assert!(!bases(&refused)
-            .iter()
-            .any(|(basis, _)| basis == identity::TRANSCRIPT_ORG));
-        conserved(&refused);
-
-        // Unsettled passes: no marker reaches the wire, nothing is refused that
-        // was not, and the refusal above survives. The last case passes every
-        // census flag but left an indexed member uncompared (a quarantined
-        // original): ownership alone withdraws.
-        for (census, compared) in [
-            (ClaudeDuplicateCensusCounts::default(), false),
-            (
-                ClaudeDuplicateCensusCounts {
-                    coverage_complete: false,
-                    ..settled
-                },
-                true,
-            ),
-            (
-                ClaudeDuplicateCensusCounts {
-                    census_invalid: true,
-                    ..settled
-                },
-                true,
-            ),
-            (
-                ClaudeDuplicateCensusCounts {
-                    fence_after: true,
-                    ..settled
-                },
-                true,
-            ),
-            (settled, false),
-        ] {
-            let withdrawn = run(&clean, &census, compared);
-            assert_eq!(
-                bases(&withdrawn),
-                BTreeSet::from([(identity::TELEMETRY_LOGIN.to_string(), None)]),
-                "{census:?} compared={compared}"
             );
             assert_eq!(
-                withdrawn.request_identity_refusals, 0,
-                "{census:?} compared={compared}"
+                (login[0].usage.request_count, login[0].usage.input_tokens),
+                (1, 20)
             );
-            conserved(&withdrawn);
-            let still_refused = run(&duplicated, &census, compared);
-            assert!(
-                still_refused.request_identity_refusals >= 1,
-                "{census:?} compared={compared}"
+            let telemetry = shares(identity::TELEMETRY);
+            assert_eq!(telemetry.len(), 1);
+            assert_eq!(
+                (
+                    telemetry[0].usage.request_count,
+                    telemetry[0].usage.input_tokens
+                ),
+                (1, 30)
             );
-            conserved(&still_refused);
+            let untagged = parts
+                .iter()
+                .filter(|p| !matches!(p.identity, RequestIdentity::Tagged(_)))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                untagged.len(),
+                1,
+                "withdrawn marker and refused usage merge"
+            );
+            assert_eq!(
+                (
+                    untagged[0].usage.request_count,
+                    untagged[0].usage.input_tokens
+                ),
+                (3, 100)
+            );
+            // An already tagged re-emission stays byte-identical. It cannot
+            // reclassify old marker evidence or add refusals a second time.
+            let bytes = serde_json::to_vec(&items).unwrap();
+            let again = identity::apply_scan_with_ownership(
+                &mut items,
+                &evidence,
+                BTreeMap::new(),
+                &ownership,
+            );
+            assert_eq!(again, identity::ScanOutcome::default());
+            assert_eq!(serde_json::to_vec(&items).unwrap(), bytes);
         }
-        let _ = fs::remove_dir_all(dir);
     }
-    {
-        // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-        use crate::snapshots::ClaudeDuplicateCensusCounts;
-        let dir = temp_dir("claude-i1b-copied-markers");
-        let org = org_hash(ORG_1);
-        // A copied prefix can contain a perfectly valid marker and request id.
-        // The current census may not have observed its other holder yet.
-        // Keep one unchanged selector context so withdrawn marker usage and a
-        // foreign-owner refusal must merge within the same bucket row.
-        let mut lines = vec![
-            json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment", "sessionId": ROOT,
-        "attachment": {"type": "credential_org", "organizationUuid": ORG_1}}),
-        ];
-        for n in 1..=5 {
-            lines.push(owned_response(
-                &format!("req_{n}"),
-                "2026-08-02T07:00:02Z",
-                n * 10,
-                n,
-            ));
-        }
-        let mut paired = complete_api_row(ROOT, "req_3", 3, 30, 3, 0);
-        paired.request_identity = Some(org_identity(&org));
-        let (api, mut trace) = reports(
-            vec![
-                signed(complete_api_row(ROOT, "req_2", 2, 20, 2, 0)),
-                signed(paired),
-            ],
-            vec![
-                complete_trace_row(ROOT, "req_2", ""),
-                complete_trace_row(ROOT, "req_3", ""),
-            ],
-        );
-        trace.evidence.insert(
-            OTHER_ROOT.to_string(),
-            vec![complete_trace_row(OTHER_ROOT, "req_5", "")],
-        );
-        let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
-        let open = ClaudeDuplicateCensusCounts {
-            census_complete: true,
-            coverage_complete: true,
-            ..Default::default()
-        };
-        let clean = ScanIndex::default();
-        let mut saved = clean.clone();
-        saved.claude_duplicate_request_owners.insert(
-            format!("{:x}", Sha256::digest(b"req_5")),
-            BTreeSet::from([
-                claude_duplicate_request_owner(ROOT, ROOT),
-                claude_duplicate_request_owner(OTHER_ROOT, OTHER_ROOT),
-            ]),
-        );
-        let restarted: ScanIndex =
-            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
-        assert_eq!(
-            restarted.claude_duplicate_request_owners,
-            saved.claude_duplicate_request_owners
-        );
-        // There is deliberately no D2 switch in this prerequisite. Legacy/OFF
-        // and future D2-open inputs reach the same unconditional boundary.
-        for (state, index, census, compared) in [
-            ("settled-open", &clean, open, true),
-            (
-                "legacy-off-closed",
-                &clean,
-                ClaudeDuplicateCensusCounts {
-                    fence_after: true,
-                    ..open
-                },
-                true,
-            ),
-            (
-                "default-index",
-                &clean,
-                ClaudeDuplicateCensusCounts::default(),
-                false,
-            ),
-            ("restart-open", &restarted, open, true),
-        ] {
-            let disposition = ClaudeUsageAuthorityDisposition {
-                duplicate_census: census,
-                transcript_ownership_complete: compared,
-                ..Default::default()
-            };
-            let ownership = identity::TranscriptOwnership::after_census(index, &disposition);
-            for reported in [false, true] {
-                let mut item = parse_session(&dir, &lines).remove(0);
-                let groupings = if reported {
-                    item.usage_accounting_contract =
-                        Some("session_exclusive_reported_usage:v1".into());
-                    let mut sink =
-                        identity::RequestSink::for_item(&evidence, &item, usize::MAX).unwrap();
-                    for (request_id, occurrence) in &item.claude_usage_occurrences {
-                        let (row_key, _, _) = build_row_identity(
-                            occurrence.model.as_deref().unwrap(),
-                            &occurrence.selector,
-                            occurrence.reasoning_effort.as_deref(),
-                        );
-                        let mut usage = occurrence.usage.clone();
-                        usage.request_count = 1;
-                        sink.add(
-                            &item,
-                            identity::Request {
-                                request_id,
-                                occurrence: Some((
-                                    occurrence.sequence,
-                                    occurrence.event_clock_complete,
-                                )),
-                                timestamp: occurrence.timestamp.as_deref().unwrap(),
-                                bucket_start: "2026-08-02T07:00:00Z",
-                                row_key: &row_key,
-                                usage: &usage,
-                            },
-                        );
-                    }
-                    let grouping = sink.finish();
-                    assert!(grouping.owned_reported_requests(&item));
-                    BTreeMap::from([(item.source_session_id.clone(), grouping)])
-                } else {
-                    BTreeMap::new()
-                };
-                let before = item.clone();
-                let mut items = vec![item];
-                let outcome = identity::apply_scan_with_ownership(
-                    &mut items, &evidence, groupings, &ownership,
-                );
-                assert_eq!(outcome.sent, 1, "{state} reported={reported}: {outcome:?}");
-                let item = &items[0];
-                assert_usage_conserved(item, &before);
-                assert_eq!(
-                    item.request_identity_refusals, 1,
-                    "the foreign-owner refusal survives"
-                );
-                assert_eq!(
-                    item.request_evidence
-                        .iter()
-                        .map(|e| (
-                            e.identity_basis.as_str(),
-                            e.provider_workspace_hash.as_deref()
-                        ))
-                        .collect::<BTreeSet<_>>(),
-                    BTreeSet::from([
-                        (identity::TELEMETRY, Some(org.as_str())),
-                        (identity::TELEMETRY_LOGIN, None)
-                    ]),
-                    "{state} reported={reported}"
-                );
-                let parts = contributions_of(item).unwrap();
-                let shares = |basis| {
-                    parts.iter().filter(|p| matches!(&p.identity, RequestIdentity::Tagged(key) if key.basis == basis)).collect::<Vec<_>>()
-                };
-                let login = shares(identity::TELEMETRY_LOGIN);
-                assert_eq!(login.len(), 1);
-                assert_eq!(
-                    login[0].identity,
-                    RequestIdentity::Tagged(AuthorityKey {
-                        login: Some(OWNER_A.into()),
-                        org: None,
-                        basis: identity::TELEMETRY_LOGIN
-                    })
-                );
-                assert_eq!(
-                    (login[0].usage.request_count, login[0].usage.input_tokens),
-                    (1, 20)
-                );
-                let telemetry = shares(identity::TELEMETRY);
-                assert_eq!(telemetry.len(), 1);
-                assert_eq!(
-                    (
-                        telemetry[0].usage.request_count,
-                        telemetry[0].usage.input_tokens
-                    ),
-                    (1, 30)
-                );
-                let untagged = parts
-                    .iter()
-                    .filter(|p| !matches!(p.identity, RequestIdentity::Tagged(_)))
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    untagged.len(),
-                    1,
-                    "withdrawn marker and refused usage merge"
-                );
-                assert_eq!(
-                    (
-                        untagged[0].usage.request_count,
-                        untagged[0].usage.input_tokens
-                    ),
-                    (3, 100)
-                );
-                // An already tagged re-emission stays byte-identical. It cannot
-                // reclassify old marker evidence or add refusals a second time.
-                let bytes = serde_json::to_vec(&items).unwrap();
-                let again = identity::apply_scan_with_ownership(
-                    &mut items,
-                    &evidence,
-                    BTreeMap::new(),
-                    &ownership,
-                );
-                assert_eq!(again, identity::ScanOutcome::default());
-                assert_eq!(serde_json::to_vec(&items).unwrap(), bytes);
-            }
-        }
-        let _ = fs::remove_dir_all(dir);
-    }
+    let _ = fs::remove_dir_all(dir);
 }
 
 /// Non-marker capture-ON bodies retain main's pre-withdrawal wire bytes.

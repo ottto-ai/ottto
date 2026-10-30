@@ -1059,39 +1059,53 @@ fn write_deep_optional(path: &Path, prefix: &[u8], depth: usize) -> usize {
     prefix.len() + field.len() + 2 * depth + 1
 }
 
-/// [money] An invalid optional census must not erase a sibling's durable ACK
-/// during load, either CAS writer, or restart. Depth 257 crosses the decoder
-/// limit with a small fixture; allocation measurements add no money behaviour.
 #[test]
-fn sibling_ack_survives_lenient_optional_decode_failure() {
-    let scratch = crate::test_scratch::ScratchDir::new("lenient-census-sibling-ack");
+fn streamed_million_deep_census_is_resource_unknown_with_bounded_allocations() {
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-deep-census");
     let path = scratch.as_ref().join("index.json");
     let mut seed = fixture();
-    seed.files.retain(|key, _| key == "/synthetic/15.jsonl");
-    seed.file_snapshot_fingerprints
-        .retain(|key, _| key == "/synthetic/15.jsonl");
-    let sibling = format!("{:064x}", 15);
-    seed.snapshot_activity_at.retain(|key, _| key == &sibling);
-    seed.accepted_snapshot_fingerprints
-        .retain(|key| key == &sibling);
     seed.save(&path).unwrap();
     let prefix = fs::read(&path).unwrap();
-    let input_len = write_deep_optional(&path, &prefix, 257);
-    let loaded = ScanIndex::load(&path).unwrap();
-    assert_sibling(&loaded);
-    assert!(loaded.claude_request_census.is_empty());
-    let mut ordinary = loaded.clone();
-    ordinary.save(&path).unwrap();
-    let restarted = ScanIndex::load(&path).unwrap();
-    assert_sibling(&restarted);
-    assert!(restarted.claude_request_census.is_empty());
-    write_deep_optional(&path, &prefix, 257);
-    let mut bounded = loaded;
-    bounded.save_with_read_limit(&path, input_len).unwrap();
-    let restarted = ScanIndex::load(&path).unwrap();
-    assert_sibling(&restarted);
-    assert!(restarted.claude_request_census.is_empty());
-    assert_eq!(corrupt_count(scratch.as_ref()), 0);
+    for depth in [128, 200, 256, 257, 1_000, 1_000_000] {
+        let input_len = write_deep_optional(&path, &prefix, depth);
+        // The retained main codec is the baseline for optional unknown/null.
+        let (baseline, main) = crate::retry_allocation_probe::measure(|| {
+            claude_request_census::decode_index(File::open(&path).unwrap()).unwrap()
+        });
+        assert!(baseline.claude_request_census.is_empty());
+        let (loaded, load) =
+            crate::retry_allocation_probe::measure(|| ScanIndex::load(&path).unwrap());
+        assert!(loaded.claude_request_census.is_empty());
+        assert_sibling(&loaded);
+        assert_eq!(corrupt_count(scratch.as_ref()), 0);
+        assert!(load.requested_peak <= main.requested_peak + 96 * 1024);
+        assert!(load.usable_peak <= main.usable_peak + 128 * 1024);
+        let mut ordinary = loaded.clone();
+        let (result, cas) = crate::retry_allocation_probe::measure(|| ordinary.save(&path));
+        result.unwrap();
+        assert!(cas.requested_peak <= main.requested_peak + 192 * 1024);
+        assert!(cas.usable_peak <= main.usable_peak + 256 * 1024);
+        write_deep_optional(&path, &prefix, depth);
+        let (input, input_read) = crate::retry_allocation_probe::measure(|| {
+            crate::snapshot_retry::read_state(&path, input_len).unwrap()
+        });
+        assert_eq!(input.len(), input_len);
+        drop(input);
+        let mut bounded = loaded.clone();
+        let (result, selected) = crate::retry_allocation_probe::measure(|| {
+            bounded.save_with_read_limit(&path, input_len)
+        });
+        result.unwrap();
+        assert!(
+            selected.requested_peak <= input_read.requested_peak + main.requested_peak + 192 * 1024
+        );
+        assert!(selected.usable_peak <= input_read.usable_peak + main.usable_peak + 256 * 1024);
+        let restarted = ScanIndex::load(&path).unwrap();
+        assert_sibling(&restarted);
+        assert!(restarted.claude_request_census.is_empty());
+        assert_eq!(corrupt_count(scratch.as_ref()), 0);
+        eprintln!("lenient_deep_census_receipt depth={depth} main_requested={} main_usable={} load_requested={} load_usable={} cas_requested={} cas_usable={} input_requested={} input_usable={} selected_requested={} selected_usable={}", main.requested_peak, main.usable_peak, load.requested_peak, load.usable_peak, cas.requested_peak, cas.usable_peak, input_read.requested_peak, input_read.usable_peak, selected.requested_peak, selected.usable_peak);
+    }
 }
 
 #[test]
@@ -1267,6 +1281,87 @@ fn optional_raw_cap_counts_object_field_leading_whitespace() {
     assert!(loaded.claude_request_census_shadow.is_empty());
     assert_sibling(&loaded);
     assert_eq!(corrupt_count(scratch.as_ref()), 0);
+}
+
+#[test]
+fn streamed_64_mib_record_key_refuses_before_key_allocation() {
+    use std::io::{Read, Write};
+    fn digest(path: &Path) -> [u8; 32] {
+        let mut file = File::open(path).unwrap();
+        let mut hash = Sha256::new();
+        let mut bytes = [0; 8192];
+        loop {
+            let count = file.read(&mut bytes).unwrap();
+            if count == 0 {
+                return hash.finalize().into();
+            }
+            hash.update(&bytes[..count]);
+        }
+    }
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-oversize-record-key");
+    let path = scratch.as_ref().join("index.json");
+    let mut working = fixture();
+    working.save(&path).unwrap();
+    let generation = working.generation;
+    let mut file = BufWriter::new(File::create(&path).unwrap());
+    write!(file, "{{\"generation\":{generation},\"files\":{{\"").unwrap();
+    let block = [b'k'; 8192];
+    for _ in 0..64 * 1024 * 1024 / block.len() {
+        file.write_all(&block).unwrap();
+    }
+    file.write_all(b"\":false}}").unwrap();
+    file.flush().unwrap();
+    drop(file);
+    let input_len = fs::metadata(&path).unwrap().len() as usize;
+    let original = digest(&path);
+    let (result, cas) = crate::retry_allocation_probe::measure(|| working.save(&path));
+    assert!(format!("{:#}", result.unwrap_err()).contains("lenient_hold_budget_exceeded"));
+    assert!(cas.requested_peak < 256 * 1024);
+    assert!(cas.usable_peak < 512 * 1024);
+    assert_eq!(working.generation, generation);
+    assert_eq!(digest(&path), original);
+    assert_sibling(&working);
+    // Selected CAS retains its preexisting input and normalization buffers.
+    // Price those independently; no additional 64-MiB key String is allowed.
+    let (input, input_read) = crate::retry_allocation_probe::measure(|| {
+        crate::snapshot_retry::read_state(&path, input_len).unwrap()
+    });
+    let (normalized, normalization) = crate::retry_allocation_probe::measure(|| {
+        claude_request_census::normalized_bounded_bytes(&input).unwrap()
+    });
+    drop(normalized);
+    drop(input);
+    let (result, selected) =
+        crate::retry_allocation_probe::measure(|| working.save_with_read_limit(&path, input_len));
+    assert!(format!("{:#}", result.unwrap_err()).contains("lenient_hold_budget_exceeded"));
+    assert!(
+        selected.requested_peak
+            <= input_read.requested_peak + normalization.requested_peak + 256 * 1024
+    );
+    assert!(
+        selected.usable_peak <= input_read.usable_peak + normalization.usable_peak + 512 * 1024
+    );
+    assert_eq!(working.generation, generation);
+    assert_eq!(digest(&path), original);
+    assert_eq!(corrupt_count(scratch.as_ref()), 0);
+    let before = scan_index_containment_lines_for_test().len();
+    let (loaded, load) = crate::retry_allocation_probe::measure(|| ScanIndex::load(&path).unwrap());
+    assert!(loaded.files.is_empty());
+    assert!(!path.exists());
+    assert_eq!(corrupt_count(scratch.as_ref()), 1);
+    let quarantined = fs::read_dir(scratch.as_ref())
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().contains(".corrupt."))
+        .unwrap();
+    assert_eq!(digest(&quarantined.path()), original);
+    assert!(load.requested_peak < 256 * 1024);
+    assert!(load.usable_peak < 512 * 1024);
+    assert!(scan_index_containment_lines_for_test()[before..]
+        .iter()
+        .any(|line| line.contains("lenient_hold_budget_exceeded=1")
+            && line.contains("fallback=gated_rebuild history_policy=prior_history_gated_rebuild")));
+    eprintln!("lenient_oversize_key_receipt key_bytes={} load_requested={} load_usable={} cas_requested={} cas_usable={} input_requested={} normalization_requested={} selected_requested={} selected_usable={}", 64 * 1024 * 1024, load.requested_peak, load.usable_peak, cas.requested_peak, cas.usable_peak, input_read.requested_peak, normalization.requested_peak, selected.requested_peak, selected.usable_peak);
 }
 
 #[test]

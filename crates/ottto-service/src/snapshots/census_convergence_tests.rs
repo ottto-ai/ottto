@@ -1559,6 +1559,28 @@ fn bounded_absence_fallback_cursor_is_scoped_per_index() {
     }
 }
 
+// Re-review r4: the per-index cursor map is capped. A new index at the cap
+// evicts only the least recently used cursor; every other cursor survives.
+#[test]
+fn bounded_absence_fallback_cursors_evict_only_the_least_recently_used() {
+    let cap = MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS;
+    assert_eq!(cap, 32);
+    let mut cursors = ClaudeAbsentFamilyFallbackCursors::new();
+    for scope in 0..cap {
+        cursors.set(&format!("index-{scope:02}"), scope + 1);
+    }
+    // Touch index-00, so index-01 is now the least recently used.
+    assert_eq!(cursors.cursor("index-00"), 1);
+    cursors.set("index-new", 7);
+    assert_eq!(cursors.by_index.len(), cap);
+    assert_eq!(cursors.cursor("index-01"), 0, "the evicted index restarts");
+    assert_eq!(cursors.cursor("index-new"), 7);
+    assert_eq!(cursors.cursor("index-00"), 1);
+    for scope in 2..cap {
+        assert_eq!(cursors.cursor(&format!("index-{scope:02}")), scope + 1);
+    }
+}
+
 /// A synthetic traversal problem, applied to a clean terminal traversal.
 type TraversalProblem = fn(&mut ScanTraversalCheckpoint);
 
