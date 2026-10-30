@@ -4,6 +4,8 @@ fn retained_session(hours: usize) -> (SnapshotItem, Vec<Contribution>) {
     item.removed_request_count = Some(0);
     item.removed_usage = Some(ClaudeRemovedUsage::default());
     item.telemetry_owned_complete = Some(true);
+    // Scans always fingerprint before tagging; the budget measures this length.
+    item.snapshot_fingerprint = "a".repeat(64);
     (item, proof)
 }
 // Option (ii): `identity_retained` markers over the witnessed proved-row
