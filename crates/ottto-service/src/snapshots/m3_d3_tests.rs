@@ -356,6 +356,200 @@ impl Rig {
     }
 }
 
+/// Keep readable native A while main's real terminal-loss settlement records B.
+/// Repair only the terminal row, adding healthy usage on the same object: A < C < B.
+fn lossy_shrink_rig() -> (Rig, Vec<u8>) {
+    let mut rig = Rig::new(SnapshotSource::ClaudeCode, "m3-due-lossy-shrink");
+    rig.create(SESSION_A, 2);
+    assert_eq!(rig.pass().published(SESSION_A), 1);
+    rig.assert_native_record(SESSION_A);
+    let record = fs::read(rig.record(SESSION_A)).unwrap();
+    let path = rig.path(SESSION_A);
+    let clean = fs::read_to_string(&path).unwrap();
+    File::options()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&("x".repeat(jsonl_line_cap() + 1) + "\n").into_bytes())
+        .unwrap();
+    // No store slot here: an actual Full records the lossy extent without
+    // replacing A or inventing a checkpoint, scope, receipt or accepted body.
+    let (index, _) = scan(
+        rig.source,
+        &rig.sessions,
+        std::mem::take(&mut rig.index),
+        Arc::new(SharedCache::default()),
+        &rig.namespace,
+    );
+    rig.index = index;
+    let key = rig.key(SESSION_A);
+    assert!(rig.index.files[&key].has_unverified_source());
+    let b = rig.index.files[&key].size_bytes;
+    assert_eq!(b, fs::metadata(&path).unwrap().len());
+    rig.index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .set_unverified_deadline(now_unix().saturating_sub(1));
+    rig.index.save(&rig.index_path).unwrap();
+    fs::write(&path, clean + &claude_line(SESSION_A, 3)).unwrap();
+    assert!(fs::metadata(&path).unwrap().len() < b);
+    assert_eq!(fs::read(rig.record(SESSION_A)).unwrap(), record);
+    rig.restart();
+    (rig, record)
+}
+
+fn owed_shrink_fulls(pass: &Pass) -> u64 {
+    pass.events
+        .iter()
+        .filter_map(|e| e["counts"]["full_causes"]["owed_full_after_lossy_shrink"].as_u64())
+        .sum()
+}
+
+fn assert_cold_body(rig: &Rig, pass: &Pass) {
+    let (_, mut cold) = scan(
+        rig.source,
+        &rig.sessions,
+        ScanIndex::default(),
+        Arc::new(SharedCache::default()),
+        &rig.namespace,
+    );
+    let mut actual = pass.snapshots.clone();
+    apply_upload_policy(rig.source, &mut actual, SnapshotUploadPolicy::default());
+    apply_upload_policy(rig.source, &mut cold, SnapshotUploadPolicy::default());
+    assert_eq!(
+        serde_json::to_value(actual).unwrap(),
+        serde_json::to_value(cold).unwrap(),
+        "entire emitted body, including usage and money, equals cold Full"
+    );
+}
+
+#[test]
+fn m3_due_matching_record_lossy_shrink_full_verifies_once_across_restart() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    with_test_line_cap(64 * 1024, || {
+        let (mut rig, record) = lossy_shrink_rig();
+        let key = rig.key(SESSION_A);
+        let corrected = rig.pass();
+        assert_eq!(corrected.full(), 1);
+        assert_eq!(corrected.tail(), 0);
+        assert_eq!(
+            owed_shrink_fulls(&corrected),
+            1,
+            "must reach matching A's Held arm, not Stale"
+        );
+        assert_eq!(corrected.published(SESSION_A), 1);
+        assert_eq!(corrected.snapshots[0].input_tokens, 600);
+        assert_cold_body(&rig, &corrected);
+        assert_eq!(
+            rig.counters().0.ineligible.get("behind_accepted.legacy"),
+            Some(&1)
+        );
+        assert_eq!(rig.index.files[&key].unverified_deadline(), None);
+        assert!(!rig.index.files[&key].has_unverified_source());
+        assert_ne!(fs::read(rig.record(SESSION_A)).unwrap(), record);
+        rig.restart();
+        assert_eq!(rig.index.files[&key].unverified_deadline(), None);
+        let quiet = rig.pass();
+        assert_eq!(quiet.full(), 0, "verified publication does not repeat Full");
+        assert_eq!(quiet.published(SESSION_A), 0);
+        assert_eq!(owed_shrink_fulls(&quiet), 0);
+    });
+}
+
+#[test]
+fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    with_test_line_cap(64 * 1024, || {
+        for control in ["verified_extent", "future_revision", "not_due"] {
+            let (mut rig, record) = lossy_shrink_rig();
+            let key = rig.key(SESSION_A);
+            let revision = rig.index.files[&key].effective_upload_body_witness_revision;
+            let entry = rig.index.files.get_mut(&key).unwrap();
+            match control {
+                "verified_extent" => {
+                    entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into())
+                }
+                "future_revision" => entry.effective_upload_body_witness_revision = revision + 1,
+                "not_due" => entry.set_unverified_deadline(now_unix() + 30 * 86_400),
+                _ => unreachable!(),
+            }
+            rig.index.save(&rig.index_path).unwrap();
+            rig.restart();
+            let accepted = rig.accepted(SESSION_A);
+            let held = rig.pass();
+            assert_eq!(held.full(), 0, "{control}");
+            assert_eq!(held.published(SESSION_A), 0, "{control}");
+            assert_eq!(owed_shrink_fulls(&held), 0, "{control}");
+            assert_eq!(rig.accepted(SESSION_A), accepted, "{control}");
+            assert_eq!(
+                fs::read(rig.record(SESSION_A)).unwrap(),
+                record,
+                "{control}"
+            );
+            let counters = rig.counters().0;
+            assert!(
+                counters
+                    .ineligible
+                    .get(if control == "not_due" {
+                        "behind_accepted.legacy"
+                    } else {
+                        "accepted_body_floor"
+                    })
+                    .is_some_and(|n| *n > 0),
+                "{control}: exercise the actual held outcome"
+            );
+            if control != "future_revision" {
+                continue;
+            }
+            // A correctness hold may delay this append, never lose it after
+            // the transcript stops growing and leaves the discovery window.
+            rig.append(SESSION_A, 1);
+            assert_eq!(rig.pass().published(SESSION_A), 0);
+            File::options()
+                .write(true)
+                .open(rig.path(SESSION_A))
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(400 * 86_400))
+                .unwrap();
+            let aged = rig.pass();
+            assert_eq!(aged.full(), 0);
+            assert_eq!(aged.published(SESSION_A), 0);
+            assert!(rig.index.files[&key].unverified_deadline().is_some());
+            rig.restart();
+            let still_held = rig.pass();
+            assert_eq!(still_held.full(), 0);
+            assert_eq!(still_held.published(SESSION_A), 0);
+            assert_eq!(rig.accepted(SESSION_A), accepted);
+            assert!(rig.index.files[&key].unverified_deadline().is_some());
+            rig.index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .effective_upload_body_witness_revision = revision;
+            rig.index.save(&rig.index_path).unwrap();
+            rig.restart();
+            let caught_up = rig.pass();
+            assert_eq!(caught_up.full(), 1);
+            assert_eq!(owed_shrink_fulls(&caught_up), 1);
+            assert_eq!(caught_up.published(SESSION_A), 1);
+            assert_eq!(caught_up.snapshots[0].input_tokens, 1000);
+            assert_cold_body(&rig, &caught_up);
+            assert_eq!(rig.index.files[&key].unverified_deadline(), None);
+            rig.restart();
+            assert_eq!(rig.pass().full(), 0);
+        }
+    });
+}
+
 struct ClearFaults;
 impl Drop for ClearFaults {
     fn drop(&mut self) {
@@ -1046,18 +1240,25 @@ fn m3_d3_sigkill_at_native_order_points_recovers_exactly_once() {
 /// The real Codex native fault reaches the PRE barrier before any upload is
 /// authorized. The barrier saves retained facts, never the newly parsed end.
 #[test]
-fn m3_codex_native_double_fault_commits_only_pre_binding_before_publish() {
+fn m3_codex_native_double_fault_bound_barrier_then_working_save_preserves_both_publications() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
     let _clear = ClearFaults;
     let mut rig = Rig::new(SnapshotSource::Codex, "m3-codex-pre-ack");
+    use std::os::unix::fs::PermissionsExt;
+    let namespace = rig.root.join("b".repeat(64));
+    fs::create_dir(&namespace).unwrap();
+    fs::set_permissions(&namespace, fs::Permissions::from_mode(0o700)).unwrap();
+    rig.index_path = namespace.join("codex-scan-index-v3.json");
     rig.create(CODEX_SESSION, 3);
     assert_eq!(rig.pass().published(CODEX_SESSION), 1);
+    assert!(rig.index.persistence_root.is_some(), "bound root premise");
     rig.assert_native_record(CODEX_SESSION);
     let key = rig.key(CODEX_SESSION);
     let mut committed = rig.index.clone();
+    let pre_generation = committed.generation;
     let pre = serde_json::to_value(&committed.files[&key]).unwrap();
     let membership = committed.file_snapshot_fingerprints[&key].clone();
     let a = fs::read(rig.record(CODEX_SESSION)).unwrap();
@@ -1083,6 +1284,11 @@ fn m3_codex_native_double_fault_commits_only_pre_binding_before_publish() {
         pre,
         "no post-upload save is being counted as this barrier"
     );
+    let mut expected_pre = committed.files[&key].clone();
+    expected_pre.carry_sampled_audit(&working.files[&key]);
+    expected_pre.source_file_fingerprint.clear();
+    let advanced = serde_json::to_value(&working.files[&key]).unwrap();
+    assert!(working.files[&key].size_bytes > committed.files[&key].size_bytes);
     assert!(commit_store_fault_barrier(
         &rig.cache,
         rig.source,
@@ -1092,17 +1298,40 @@ fn m3_codex_native_double_fault_commits_only_pre_binding_before_publish() {
     )
     .unwrap());
     let disk = ScanIndex::load(&rig.index_path).unwrap();
+    assert!(disk.persistence_root.is_some());
+    assert_eq!(disk.generation, pre_generation + 1);
     assert!(disk.files[&key].source_file_fingerprint.is_empty());
-    let mut rebound = serde_json::to_value(&disk.files[&key]).unwrap();
-    rebound["source_file_fingerprint"] = pre["source_file_fingerprint"].clone();
     assert_eq!(
-        rebound, pre,
-        "real PRE revision, extent, witness and debt are retained"
+        serde_json::to_value(&disk.files[&key]).unwrap(),
+        serde_json::to_value(expected_pre).unwrap(),
+        "only PRE selection and carried audit debt may change"
     );
     assert_eq!(disk.file_snapshot_fingerprints[&key], membership);
     assert_eq!(
         working.generation, disk.generation,
         "subsequent saves CAS against the barrier"
+    );
+    let mut concurrent = working.clone();
+    working
+        .save(&rig.index_path)
+        .expect("working publication adopts the barrier's exact bound root");
+    let disk = ScanIndex::load(&rig.index_path).unwrap();
+    assert_eq!(disk.generation, pre_generation + 2);
+    assert_eq!(serde_json::to_value(&disk.files[&key]).unwrap(), advanced);
+    assert_eq!(
+        disk.file_snapshot_fingerprints,
+        working.file_snapshot_fingerprints
+    );
+    assert_eq!(
+        concurrent.save(&rig.index_path).unwrap_err().to_string(),
+        "local snapshot scan index changed concurrently",
+        "adoption does not authorize saving over a later root"
+    );
+    let surviving = ScanIndex::load(&rig.index_path).unwrap();
+    assert_eq!(surviving.generation, pre_generation + 2);
+    assert_eq!(
+        serde_json::to_value(&surviving.files[&key]).unwrap(),
+        advanced
     );
     assert!(
         !rig.cache.owes_discovery(rig.source, &key),

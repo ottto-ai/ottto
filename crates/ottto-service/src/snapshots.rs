@@ -34340,6 +34340,23 @@ impl OwnedSourceScan {
                                         }
                                         (None, taken_admission, rearmed.or(debt))
                                     }
+                                    sampled_scan::durable_tail::RestoreOutcome::Held(
+                                        crate::durable_tail_store::Refusal::BehindAccepted,
+                                    ) if restart_restore::enabled()
+                                        && source == SnapshotSource::ClaudeCode
+                                        && debt.is_some_and(|owed| audit_now >= owed.due_unix_seconds)
+                                        && restore_floor.is_some_and(|a| {
+                                            parser.reader.reader.get_ref().metadata()
+                                                .is_ok_and(|m| !a.behind(m.len()))
+                                        }) =>
+                                    {
+                                        // A marked lossy extent is not a verified prefix.
+                                        // Re-read the due body; S2 and the Full-start
+                                        // store guard still fence preparation/publication.
+                                        resource_probe.full_causes.owed_full_after_lossy_shrink =
+                                            resource_probe.full_causes.owed_full_after_lossy_shrink.saturating_add(1);
+                                        (None, taken_admission, debt)
+                                    }
                                     sampled_scan::durable_tail::RestoreOutcome::Held(reason) => {
                                         context.cache.durable_hold_exit(
                                             source,

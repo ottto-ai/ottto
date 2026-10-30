@@ -1127,6 +1127,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for NativeDecision {
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct FullCauses {
     pub(crate) restore_outcome: RestoreCounts,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) owed_full_after_lossy_shrink: u64,
 }
 impl FullCauses {
     fn is_empty(&self) -> bool {
@@ -1135,6 +1137,7 @@ impl FullCauses {
             && self.restore_outcome.pending == 0
             && self.restore_outcome.miss.is_empty()
             && self.restore_outcome.stale.is_empty()
+            && self.owed_full_after_lossy_shrink == 0
     }
 }
 #[derive(Debug, Default, Serialize)]
@@ -1667,6 +1670,15 @@ mod tests {
         let json = serde_json::to_value(&probe.full_causes).unwrap();
         assert_eq!(json["restore_outcome"]["restored"], 1);
         assert_eq!(json["restore_outcome"]["pending"], 1);
+        let causes = FullCauses {
+            owed_full_after_lossy_shrink: 1,
+            ..Default::default()
+        };
+        assert!(!causes.is_empty());
+        assert_eq!(
+            serde_json::to_value(causes).unwrap()["owed_full_after_lossy_shrink"],
+            1
+        );
     }
 
     #[test]
