@@ -50395,8 +50395,14 @@ impl ScanIndex {
         }
         // A prefix-only hold must survive settlement of the file's own turns.
         // Its persisted attempt counter expires on the third decision pass.
-        if self.claude_copy_removals.pending(claude_money_birth_store::location_key(&key)) {
-            return (CandidateDecision::Parse, Some(CandidateParseReason::SourceChanged));
+        if self
+            .claude_copy_removals
+            .pending(claude_money_birth_store::location_key(&key))
+        {
+            return (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::SourceChanged),
+            );
         }
         if entry.audit_requires_full(now) || sampled_audit::progress_debt(self, &key, now).is_some()
         {

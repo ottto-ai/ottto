@@ -2716,7 +2716,10 @@ fn defer_prefix(
         fold.entity.held = true;
         // Whole-body undecided counters are otherwise suppressed at finish;
         // the held prefix must still be visible in production diagnostics.
-        record_counts(Counts::prefix(&fold.prefix));
+        let mut held = Counts::default();
+        held.0[16] = fold.prefix.held_requests;
+        held.0[17] = u64::from(fold.prefix.held_requests > 0);
+        record_counts(held);
     }
     fold.proof = None;
 }
