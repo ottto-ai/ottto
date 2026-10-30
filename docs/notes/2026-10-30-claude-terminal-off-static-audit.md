@@ -283,3 +283,7 @@ money, ACK, hold, no-drop and final-settlement checks. It leaves the ignore
 manifest but remains in the separate `FLEET_GATE` list beside that manifest.
 Before default-ON for everyone, the real boundedness fix and strict original
 separate-pages assertion remain required. This delta does not authorize ON.
+
+The subsequent MSRV compatibility correction uses `Option::map_or(true, ...)`
+in L1-2 instead of `is_none_or`; the predicate, gating and production line
+count are unchanged. No new production hunk or behavior is introduced.

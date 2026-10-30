@@ -506,7 +506,7 @@ impl ScanIndex {
             };
             let mut restored = match self.claude_usage_authority_quarantine.get(&root) {
                 Some(record) => {
-                    if record.proof_correction.as_ref().is_none_or(|correction| {
+                    if record.proof_correction.as_ref().map_or(true, |correction| {
                         correction.proof_witness_fingerprint
                             != old_correction.proof_witness_fingerprint
                     }) {
