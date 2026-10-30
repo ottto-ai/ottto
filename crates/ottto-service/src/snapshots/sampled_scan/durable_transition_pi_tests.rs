@@ -502,17 +502,22 @@ fn pi_evict_retry_save_restart_reads_no_full() {
     whole_body(&cold, &restart);
 }
 
-// P-S (restore path: restart or RAM miss): an older surviving record on the
-// same object, same head, whose planned extent is behind the accepted body
-// holds in `durable_restore` (P11-S2): no Full, no POST. The extent regression
-// is known independently from the index. An equal-or-larger extent POSTs
-// normally. The RAM-resident cut is the in-process control below.
+// P-S (restore path: restart or RAM miss; Lead B 2026-10-30: no Pi floor): an
+// older surviving record on the same object, same head, whose restored Tail
+// ends behind the accepted extent restores and PUBLISHES the smaller body. It
+// equals a cold Full of the file, today's Pi behaviour: the floor is
+// Claude-only (`Interpretation::of`). No hold and no Full; the accepted state
+// moves down with it. The extent regression is known independently from the
+// index. The only existing count of this event is the ordinary `restored`; the
+// D-T13 name `record_behind_accepted{write_ahead}` has no production counter.
+// An equal-or-larger extent POSTs normally. The RAM-resident cut is the
+// in-process control below.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "Pi restore requires qualified native heap layout"
 )]
-fn pi_restored_tail_behind_accepted_extent_holds() {
+fn pi_restored_tail_behind_accepted_extent_publishes_the_cold_body() {
     if !supported("pi_transition_smaller") {
         return;
     }
@@ -549,21 +554,24 @@ fn pi_restored_tail_behind_accepted_extent_holds() {
     let behind = extent < f.prior.files[&key].size_bytes;
     assert!(behind, "the fixture must regress the accepted extent");
     let cold = f.emit_bodies(Mode::ColdFull);
-    let held = f.emit_bodies(Mode::Restart);
-    assert_eq!((held.modes, held.restored), ((0, 0, 0), 0));
+    let published = f.emit_bodies(Mode::Restart);
+    assert_eq!((published.modes, published.restored), ((0, 1, 0), 1));
+    assert_eq!(f.holds(Mode::Restart), ([0; 8], 0), "no hold of any class");
+    money_oracle::assert_equivalent(&cold, &published);
+    whole_body(&cold, &published);
+    assert_eq!(published.batches.len(), 1);
     // `cold` carries the accepted map as of this restart: the grown body.
-    money_oracle::assert_no_smaller_reemit(&f.entity, &cold, &held, &cold, behind);
-    assert!(held.batches.is_empty(), "no smaller re-emit POSTed");
-    let before = stored_bodies(&f.prior);
-    assert_eq!(stored_bodies(&f.pages[&Mode::Restart].index), before);
+    let requests = |body: &Value| body["request_count"].as_u64().unwrap();
+    assert_eq!(requests(&cold.accepted[&f.entity].body), 3);
+    assert_eq!(requests(&published.snapshots[&f.entity]), 2, "smaller body");
+    let emitted = f.pages[&Mode::Restart].emitted[&f.entity].clone();
     f.save_gc(Mode::Restart);
-    assert_eq!(stored_bodies(&f.prior), before);
-    assert_eq!(
-        f.disk.record_bytes(),
-        older,
-        "held survivor kept byte-identical"
-    );
+    assert_eq!(f.accepted[&f.entity], emitted, "accepted moved down");
+    assert_eq!(f.prior.files[&key].size_bytes, extent);
     // Control: the same survivor below an extent at or past accepted POSTs.
+    for (path, bytes) in &older {
+        std::fs::write(path, bytes).unwrap();
+    }
     std::fs::write(&f.path, &grown).unwrap();
     pi_grow(
         &f.path,
