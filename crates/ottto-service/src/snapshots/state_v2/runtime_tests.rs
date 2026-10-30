@@ -936,3 +936,14 @@ fn oversized_v1_storage_format_value_does_not_claim_v2_custody() {
     assert!(!states().lock().unwrap().contains_key(&f.path));
     assert_eq!(fs::read(&f.path).unwrap(), bytes.as_bytes());
 }
+
+#[test]
+fn unpublished_import_does_not_reorder_v1_progress_admission() {
+    let f = Fixture::new();
+    fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
+    assert!(load_with(&f.path, true, &EmptyMapper).unwrap().is_none());
+    assert!(states().lock().unwrap().contains_key(&f.path));
+    assert!(!published(&f.path).unwrap());
+    f.published();
+    assert!(published(&f.path).unwrap());
+}

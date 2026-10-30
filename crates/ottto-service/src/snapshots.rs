@@ -93339,6 +93339,10 @@ pub(crate) fn state_v2_post_pass_observed() {
     state_v2::telemetry::plateau();
 }
 
+pub(crate) fn state_v2_custody_published(path: &Path) -> Result<bool> {
+    state_v2::published(path)
+}
+
 pub(crate) fn state_v2_before_collection(index: &ScanIndex) -> Result<()> {
     state_v2::before_collection(index)
 }

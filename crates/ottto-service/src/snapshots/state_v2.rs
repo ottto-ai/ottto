@@ -17,7 +17,7 @@ pub(super) use runtime::invalidate_tree;
 pub(super) use runtime::Hold;
 pub(super) use runtime::{
     after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
-    idle, load_locked, save_locked,
+    idle, load_locked, published, save_locked,
 };
 #[cfg(test)]
 mod field_coverage;

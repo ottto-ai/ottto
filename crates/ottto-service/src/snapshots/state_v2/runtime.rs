@@ -147,6 +147,24 @@ fn route_needed(path: &Path, switched: bool) -> Result<bool> {
             .contains_key(path)
         || fence::evidence(path)?)
 }
+/// Probe custody without admitting a v1 path to the route registry or decoding
+/// its index. A paused, unpublished import does not change progress ordering.
+pub(in super::super) fn published(path: &Path) -> Result<bool> {
+    if binding(path).is_none() {
+        return Ok(false);
+    }
+    let state = states()
+        .lock()
+        .map_err(|_| Hold::DbUnavailable)?
+        .get(path)
+        .cloned();
+    if let Some(state) = state {
+        if state.lock().map_err(|_| Hold::DbUnavailable)?.latched {
+            return Ok(true);
+        }
+    }
+    fence::evidence(path)
+}
 pub(super) fn observed(path: &Path) -> bool {
     let state = states()
         .lock()

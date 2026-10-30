@@ -6081,6 +6081,50 @@ fn prepare_sync_source(
     result
 }
 
+/// Preserve main's progress admission before any v1 containment. Published
+/// custody must instead authenticate the route before progress can be renamed.
+fn load_source_checkpoints(
+    index_path: &Path,
+    progress_path: &Path,
+    source: SnapshotSource,
+    support_dir: &Path,
+    destination: &str,
+    witness: SnapshotQuarantineWitness,
+) -> Result<(
+    ScanIndex,
+    crate::snapshots::ScanIndexLoadOrigin,
+    SnapshotUploadProgress,
+)> {
+    let custody = source == SnapshotSource::ClaudeCode
+        && crate::snapshots::state_v2_custody_published(index_path)?;
+    let progress = if custody {
+        None
+    } else {
+        Some(SnapshotUploadProgress::load(
+            progress_path,
+            destination,
+            witness.clone(),
+        )?)
+    };
+    let (index, origin) =
+        ScanIndex::load_for_snapshot_source_with_origin(index_path, source, support_dir)?;
+    crate::snapshots::state_v2_before_collection(&index)?;
+    index.require_persistence_available()?;
+    // A first import may publish during this load. Recover/attach its receipt
+    // even though the pre-load admission correctly used the v1 ordering.
+    let recovery = crate::snapshots::ProgressRecovery::for_index(&index, index_path)?;
+    let progress = match (progress, recovery) {
+        (Some(progress), None) => progress,
+        (_, recovery) => SnapshotUploadProgress::load_with_recovery(
+            progress_path,
+            destination,
+            witness,
+            recovery,
+        )?,
+    };
+    Ok((index, origin, progress))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_sync_source_inner(
     client: &SnapshotApiClient,
@@ -6339,30 +6383,14 @@ fn prepare_sync_source_inner(
     let legacy_upload_progress_path = snapshot_upload_progress_path(&v2_index_path);
     let upload_progress_path = snapshot_upload_progress_path(&index_path);
     adopt_legacy_checkpoint_file(&legacy_upload_progress_path, &upload_progress_path)?;
-    // Codex/Pi retain their existing load/side-effect order. Claude must
-    // authenticate v2 custody before progress containment can rename a file.
-    let legacy_progress = if source != SnapshotSource::ClaudeCode {
-        Some(SnapshotUploadProgress::load(
-            &upload_progress_path,
-            &upload_destination_namespace,
-            crate::snapshots::snapshot_quarantine_witness_for_context(source, &upload_context),
-        )?)
-    } else {
-        None
-    };
-    let (mut index, load_origin) =
-        ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
-    crate::snapshots::state_v2_before_collection(&index)?;
-    index.require_persistence_available()?;
-    let mut upload_progress = match legacy_progress {
-        Some(progress) => progress,
-        None => SnapshotUploadProgress::load_with_recovery(
-            &upload_progress_path,
-            &upload_destination_namespace,
-            crate::snapshots::snapshot_quarantine_witness_for_context(source, &upload_context),
-            crate::snapshots::ProgressRecovery::for_index(&index, &index_path)?,
-        )?,
-    };
+    let (mut index, load_origin, mut upload_progress) = load_source_checkpoints(
+        &index_path,
+        &upload_progress_path,
+        source,
+        support_dir,
+        &upload_destination_namespace,
+        crate::snapshots::snapshot_quarantine_witness_for_context(source, &upload_context),
+    )?;
     upload_progress.recover_ack_retirement_handoff(
         &mut index,
         &index_path,
@@ -15898,6 +15926,77 @@ mod tests {
             .contains("resolve conflicting snapshot body witnesses"));
         assert_eq!((uploads, accepted), (0, 0));
         assert!(progress.accepted_fingerprints.is_empty());
+    }
+
+    #[test]
+    fn off_busy_progress_preserves_damaged_v1_before_containment() {
+        let root = crate::test_scratch::private_dir("off-progress-before-v1");
+        let namespace = root.join("snapshots/destinations").join("b".repeat(64));
+        std::fs::create_dir_all(&namespace).unwrap();
+        let index_path = namespace.join("claude_code-scan-index-v3.json");
+        let progress_path = snapshot_upload_progress_path(&index_path);
+        let damaged = b"{broken-v1";
+        std::fs::write(&index_path, damaged).unwrap();
+        let busy = SnapshotProgressLock::acquire(&progress_path).unwrap();
+        let error = load_source_checkpoints(
+            &index_path,
+            &progress_path,
+            SnapshotSource::ClaudeCode,
+            &root,
+            &"b".repeat(64),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .err()
+        .expect("busy progress must fail first");
+        assert!(error.to_string().contains("owned by another daemon"));
+        assert_eq!(std::fs::read(&index_path).unwrap(), damaged);
+        assert!(!progress_path.exists());
+        assert!(!std::fs::read_dir(&namespace).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".corrupt.")));
+        drop(busy);
+        // The same damage is eligible for containment once progress admits.
+        let (_, origin, _) = load_source_checkpoints(
+            &index_path,
+            &progress_path,
+            SnapshotSource::ClaudeCode,
+            &root,
+            &"b".repeat(64),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        assert_eq!(origin, crate::snapshots::ScanIndexLoadOrigin::Quarantined);
+        assert!(!index_path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn published_custody_authenticates_before_damaged_progress_containment() {
+        let root = crate::test_scratch::private_dir("v2-route-before-progress");
+        let namespace = root.join("snapshots/destinations").join("b".repeat(64));
+        std::fs::create_dir_all(&namespace).unwrap();
+        let index_path = namespace.join("claude_code-scan-index-v3.json");
+        let progress_path = snapshot_upload_progress_path(&index_path);
+        std::fs::write(&index_path, b"{broken-fence").unwrap();
+        std::fs::write(index_path.with_extension("json.v2.sqlite"), b"untrusted-db").unwrap();
+        std::fs::write(&progress_path, b"{broken-progress").unwrap();
+        let error = load_source_checkpoints(
+            &index_path,
+            &progress_path,
+            SnapshotSource::ClaudeCode,
+            &root,
+            &"b".repeat(64),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .err()
+        .expect("unauthenticated custody must hold");
+        assert!(error.to_string().contains("state_v2_fence_lost"));
+        assert_eq!(std::fs::read(&progress_path).unwrap(), b"{broken-progress");
+        assert_eq!(std::fs::read(&index_path).unwrap(), b"{broken-fence");
+        assert!(!progress_path.with_extension("lock").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn test_quarantine_witness() -> SnapshotQuarantineWitness {
