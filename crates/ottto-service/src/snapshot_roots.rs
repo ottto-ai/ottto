@@ -282,12 +282,16 @@ mod tests {
         assert!(repeated.snapshots.is_empty());
         let first = &roots[0];
         write_session(first, "session-0", 15);
-        let changed = scan_source_roots(
+        let changed = crate::snapshots::scan_source_roots_with_attribution_and_hints(
             SnapshotSource::ClaudeCode,
             &roots,
             &mut restarted,
             "2026-10-07T12:08:00Z",
             30,
+            true,
+            None,
+            &[first.join("project/session-0.jsonl")],
+            false,
         )
         .unwrap();
         assert_eq!(changed.snapshots.len(), 1);

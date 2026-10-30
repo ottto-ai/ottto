@@ -562,7 +562,7 @@ fn production_scan(
         10,
         false,
         None,
-        &[],
+        std::slice::from_ref(&file.path),
         false,
         true,
     );

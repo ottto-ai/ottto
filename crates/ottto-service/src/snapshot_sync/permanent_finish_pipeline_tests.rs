@@ -271,8 +271,16 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         ];
         assert_eq!(
             scan.scanned_file_count,
-            if unclean { 2 } else { 1 },
-            "UploadContext remains due until the paired receipt PR is consumed"
+            if cycle == 0 {
+                if unclean {
+                    2
+                } else {
+                    1
+                }
+            } else {
+                0
+            },
+            "#901 exact current-context ACK stops UploadContext reselection"
         );
         if cycle == 0 {
             assert_eq!(scan.snapshots.len(), 1);

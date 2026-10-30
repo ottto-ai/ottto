@@ -460,6 +460,13 @@ impl RearmFixture {
         index.activate_effective_upload_body_witness_revision(
             effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
+        let mut progress = test_upload_progress();
+        activate_source_upload_context(
+            SnapshotSource::ClaudeCode,
+            "upload-context-rearm".to_string(),
+            &mut index,
+            &mut progress,
+        );
         let (mut native_preparation, mut index, mut scan, committed_index) =
             if crate::snapshots::claude_native_comparison::enabled()
                 || self.request_identity
@@ -607,7 +614,6 @@ impl RearmFixture {
             &mut scan.snapshots,
             SnapshotUploadPolicy::default(),
         );
-        let mut progress = test_upload_progress();
         exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
         if let Some(comparison) = comparison_completion.as_mut() {
             comparison.prepare_native_corrections(&scan, &committed_index, &disposition);
@@ -681,6 +687,7 @@ impl RearmFixture {
         let mut uploaded = BTreeSet::new();
         let mut accepted = 0;
         let mut actual_upload = RearmUpload::Accept;
+        progress.prepare_context_receipt_candidates(&index, &committed_index, &scan.snapshots);
         let result = upload_resumable_batches_with_body_witness(
             &scan.snapshots,
             &unique_poison_scope(),
@@ -847,6 +854,10 @@ impl RearmFixture {
             true,
             census_complete && fully_settled,
             "replay-generation-rearm",
+        );
+        index.accept_file_upload_context_acks(
+            &progress.context_receipt_candidates,
+            &progress.fresh_context_body_acks,
         );
         let (window_start, window_end) =
             snapshot_manifest_window(&scan.census_window_end, 183).expect("manifest window");

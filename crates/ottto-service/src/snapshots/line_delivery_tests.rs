@@ -110,6 +110,10 @@ fn append(path: &Path, bytes: &[u8]) {
 }
 
 fn new_scan(root: &Path, index: ScanIndex) -> OwnedSourceScan {
+    let hints = std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
     OwnedSourceScan::new(
         SnapshotSource::ClaudeCode,
         &[root.to_path_buf()],
@@ -119,7 +123,7 @@ fn new_scan(root: &Path, index: ScanIndex) -> OwnedSourceScan {
         10,
         false,
         None,
-        &[],
+        &hints,
         false,
         true,
     )

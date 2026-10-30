@@ -1154,7 +1154,7 @@ fn production_scan_page_at_with_setup(
         10,
         false,
         None,
-        &[],
+        std::slice::from_ref(&fixture.file.0),
         false,
         true,
     );
@@ -3055,7 +3055,7 @@ fn cached_scan(
         10,
         false,
         None,
-        &[],
+        std::slice::from_ref(&fixture.file.0),
         false,
         true,
     )

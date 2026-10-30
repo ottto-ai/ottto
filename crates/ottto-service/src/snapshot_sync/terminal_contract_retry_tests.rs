@@ -680,12 +680,19 @@ impl ReadBudgetFixture {
     }
 
     fn scan_root(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
-        crate::snapshots::scan_source_roots(
+        crate::snapshots::scan_source_roots_with_attribution_and_hints(
             SnapshotSource::ClaudeCode,
             &[root.to_owned()],
             index,
             "2026-10-25T07:01:00Z",
             crate::snapshots::BACKFILL_WINDOW_DAYS,
+            true,
+            None,
+            &std::fs::read_dir(root)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect::<Vec<_>>(),
+            false,
         )
         .unwrap()
     }

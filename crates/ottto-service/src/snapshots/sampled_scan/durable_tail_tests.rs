@@ -1502,6 +1502,10 @@ pub(super) fn known_corrupt_scan(
     namespace: &Scope,
     at: &str,
 ) -> (ScanIndex, SourceScanResult, [u64; 3]) {
+    let hints = std::fs::read_dir(sessions)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
     let capture = claude_request_identity::captures(source);
     let mut scan = OwnedSourceScan::new_with_identity_capture(
         source,
@@ -1512,7 +1516,7 @@ pub(super) fn known_corrupt_scan(
         100,
         false,
         None,
-        &[],
+        &hints,
         false,
         true,
         capture,

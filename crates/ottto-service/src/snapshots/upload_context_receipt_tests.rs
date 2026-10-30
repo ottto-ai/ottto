@@ -939,6 +939,8 @@ fn real_uploader_not_stored_backs_off_but_growth_earns_receipt() {
     );
     let posts = f.uploader.posts.len();
     for _ in 0..3 {
+        f.uploader
+            .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
         let (scan, bytes) = f.walk(true);
         assert_eq!((scan.scanned_file_count, bytes), (0, 0));
         assert_eq!(f.uploader.posts.len(), posts);
@@ -982,6 +984,8 @@ fn real_uploader_duplicate_refusal_mints_nothing_and_does_not_loop() {
     );
     let posts = f.uploader.posts.len();
     for _ in 0..3 {
+        f.uploader
+            .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
         let (scan, bytes) = f.walk(true);
         assert_eq!((scan.scanned_file_count, bytes), (0, 0));
         assert_eq!(f.uploader.posts.len(), posts);

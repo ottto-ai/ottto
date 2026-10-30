@@ -25957,6 +25957,34 @@ pub(crate) fn scan_source_roots_with_test_limit(
     )
 }
 
+/// Bounded fixture driver with real watcher input, using the service selector.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_source_roots_with_test_limit_and_hints(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+    collected_at: &str,
+    requested_backfill_window_days: u64,
+    file_limit: usize,
+    artifacts_enabled: bool,
+    hints: &[PathBuf],
+) -> Result<SourceScanResult> {
+    scan_source_roots_with_limit_and_attribution(
+        source,
+        roots,
+        index,
+        collected_at,
+        requested_backfill_window_days,
+        file_limit,
+        artifacts_enabled,
+        None,
+        None,
+        hints,
+        false,
+    )
+}
+
 /// A bounded Claude scan with an explicit local OTEL support directory, so
 /// sidecar changes enter each family member's source fingerprint, and an
 /// injectable page size.
@@ -59068,7 +59096,7 @@ mod tests {
         fs::write(&original, &bytes).expect("write over-cap fixture");
 
         let traverse = |index: &mut ScanIndex, at: &str| {
-            let mut result = scan_source_roots_with_limit(
+            let mut result = scan_source_roots_with_limit_and_attribution(
                 source,
                 std::slice::from_ref(&root),
                 index,
@@ -59076,6 +59104,13 @@ mod tests {
                 BACKFILL_WINDOW_DAYS,
                 MAX_BACKFILL_FILES_PER_SOURCE,
                 true,
+                None,
+                None,
+                &fs::read_dir(&root)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .collect::<Vec<_>>(),
+                false,
             )
             .expect("traversal completes");
             assert!(!result.census_complete);

@@ -1895,7 +1895,7 @@ fn census_assert_abandoned_parse_invalidates_record(failure: CensusAbandonedPars
         100,
         true,
         None,
-        &[],
+        &[root.join(&name)],
         false,
         true,
     )

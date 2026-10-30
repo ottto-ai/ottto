@@ -1389,7 +1389,7 @@ mod durable_restart {
             100,
             false,
             Some(&f.support),
-            &[],
+            std::slice::from_ref(&f.path),
             false,
             true,
             capture_by_default(),

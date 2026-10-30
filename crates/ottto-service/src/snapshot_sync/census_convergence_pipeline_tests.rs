@@ -172,6 +172,23 @@ impl PipelineFixture {
         index.activate_effective_upload_body_witness_revision(
             effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
+        let progress_path = self.base.join("upload-progress.json");
+        let mut progress = if self.durable_progress {
+            SnapshotUploadProgress::load(
+                &progress_path,
+                &format!("{:064x}", 99),
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            )
+            .expect("load durable synthetic upload progress")
+        } else {
+            test_upload_progress()
+        };
+        activate_source_upload_context(
+            SnapshotSource::ClaudeCode,
+            cycle.upload_context.to_string(),
+            &mut index,
+            &mut progress,
+        );
         let committed_index = index.clone();
         let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
@@ -218,17 +235,6 @@ impl PipelineFixture {
             &mut scan.snapshots,
             SnapshotUploadPolicy::default(),
         );
-        let progress_path = self.base.join("upload-progress.json");
-        let mut progress = if self.durable_progress {
-            SnapshotUploadProgress::load(
-                &progress_path,
-                &format!("{:064x}", 99),
-                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-            )
-            .expect("load durable synthetic upload progress")
-        } else {
-            test_upload_progress()
-        };
         exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
         finalize_scan_after_policy_with_body_witness(
             SnapshotSource::ClaudeCode,
@@ -304,6 +310,7 @@ impl PipelineFixture {
         let leased_reoffers = progress.active_reason_reoffers.clone();
         let mut uploaded = BTreeSet::new();
         let mut accepted = 0;
+        progress.prepare_context_receipt_candidates(&index, &committed_index, &scan.snapshots);
         let result = upload_resumable_batches_with_body_witness(
             &scan.snapshots,
             &unique_poison_scope(),
@@ -330,15 +337,16 @@ impl PipelineFixture {
                                 },
                             );
                         } else {
-                            let mut reference = entity_ack_ref(&item.snapshot_fingerprint);
-                            reference.source_session_id = item.source_session_id.clone();
-                            response.accepted_entities.push(reference);
+                            let accepted = exact_pipeline_accept(std::slice::from_ref(&item))?;
+                            response
+                                .accepted_entities
+                                .extend(accepted.accepted_entities);
                             response.accepted += 1;
                         }
                     }
                     Ok(response)
                 } else {
-                    Ok(accepted_batch(items.len()))
+                    exact_pipeline_accept(&items)
                 }
             },
             |checkpoint| {
@@ -427,6 +435,10 @@ impl PipelineFixture {
             true,
             census_complete && fully_settled,
             cycle.replay_generation,
+        );
+        index.accept_file_upload_context_acks(
+            &progress.context_receipt_candidates,
+            &progress.fresh_context_body_acks,
         );
         let (window_start, window_end) =
             snapshot_manifest_window(&scan.census_window_end, 183).expect("manifest window");
@@ -3825,4 +3837,39 @@ fn due_reoffer_rejected_page_settles_a_bound_retry_pending_hold_without_a_cause(
     assert!(last
         .index
         .claude_usage_family_pending_retained_for_test(PIPELINE_HELD_SESSION));
+}
+
+/// Receiving-side adapter: ACK only actual offered identities and public body
+/// witnesses, through the same request validator as the HTTP client.
+pub(super) fn exact_pipeline_accept(
+    items: &[SnapshotItem],
+) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+    let references = items.iter().map(|item| {
+        let version = crate::snapshot_client::snapshot_ack_body_witness_version(item)
+            .expect("production public ACK mapping");
+        serde_json::json!({
+            "source_session_id":item.source_session_id,
+            "snapshot_fingerprint":item.snapshot_fingerprint, "occurrence_count":1,
+            "body_witness_version":version,
+            "body_witness_digest":version.map(|_| snapshot_upload_body_witness(item)),
+            "head_etag":item.cache_observations.is_some().then(|| snapshot_upload_body_witness(item)),
+        })
+    }).collect::<Vec<_>>();
+    let response: crate::snapshot_client::SnapshotBatchResponse =
+        serde_json::from_value(serde_json::json!({
+            "accepted":items.len(), "sessions_reconciled":items.len(), "session_ids":[],
+            "disabled":false, "disabled_reason":null,
+            "entity_ack_contract":"snapshot_entity_ack:v1", "accepted_entities":references,
+            "unchanged_entities":[], "rejected_entities":[], "conflict_entities":[],
+        }))?;
+    response.validate_entity_ack(&SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: "claude_code".into(),
+        machine_id: PIPELINE_MACHINE_ID.into(),
+        collector_version: None,
+        snapshots: items.to_vec(),
+        upload_policy: SnapshotUploadPolicy::default(),
+        client_report: crate::client_report::ClientReport::empty(),
+    })?;
+    Ok(response)
 }

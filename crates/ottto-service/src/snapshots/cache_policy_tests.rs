@@ -253,7 +253,7 @@ fn cached_scan(
         10,
         false,
         None,
-        &[],
+        std::slice::from_ref(&fixture.path),
         false,
         true,
     )

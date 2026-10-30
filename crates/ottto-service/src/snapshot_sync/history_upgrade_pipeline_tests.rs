@@ -79,6 +79,7 @@ struct HistoryOutcome {
 }
 
 struct HistoryFixture {
+    pending_hints: std::cell::RefCell<Vec<PathBuf>>,
     base: PathBuf,
     root: PathBuf,
     support: PathBuf,
@@ -100,6 +101,7 @@ impl HistoryFixture {
             .expect("write synthetic Claude transcript");
         }
         Self {
+            pending_hints: Default::default(),
             index_path: base.join("claude-scan-index.json"),
             base,
             root,
@@ -114,6 +116,9 @@ impl HistoryFixture {
             .expect("open synthetic Claude transcript");
         file.write_all(history_line(session, request, 30).as_bytes())
             .expect("append synthetic Claude response");
+        self.pending_hints
+            .borrow_mut()
+            .push(self.root.join(format!("{session}.jsonl")));
     }
 
     fn install_list(&self, listed: &[&str]) {
@@ -271,7 +276,8 @@ impl HistoryFixture {
             &mut progress,
         );
         let committed_index = index.clone();
-        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+        let hints = self.pending_hints.take();
+        let mut scan = crate::snapshots::scan_source_roots_with_test_limit_and_hints(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&self.root),
             &mut index,
@@ -279,6 +285,7 @@ impl HistoryFixture {
             183,
             100,
             true,
+            &hints,
         )
         .expect("scan Claude page");
         before_evidence(&mut scan);

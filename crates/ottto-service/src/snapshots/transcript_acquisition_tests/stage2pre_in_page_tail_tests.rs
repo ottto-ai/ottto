@@ -110,7 +110,7 @@ fn page(
         10,
         false,
         None,
-        &[],
+        std::slice::from_ref(&fixture.file.0),
         false,
         true,
     )

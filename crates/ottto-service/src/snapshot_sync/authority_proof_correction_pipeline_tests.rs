@@ -471,6 +471,19 @@ impl ApcFixture {
         index.activate_effective_upload_body_witness_revision(
             effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
+        let empty_progress = test_upload_progress();
+        let mut progress = SnapshotUploadProgress::load(
+            &self.progress_path,
+            &empty_progress.destination_namespace_hash,
+            empty_progress.active_quarantine_witness.clone().unwrap(),
+        )
+        .expect("reload exact synthetic upload progress");
+        activate_source_upload_context(
+            SnapshotSource::ClaudeCode,
+            "upload-context-apc".to_string(),
+            &mut index,
+            &mut progress,
+        );
         let committed_index = index.clone();
         let (mut scan, mut native_completion) = if self.retain_native_terminal.get() {
             let mut state = crate::snapshots::OwnedSourceScan::new(
@@ -568,13 +581,6 @@ impl ApcFixture {
             &cutoff_state,
         );
         assert_eq!(serde_json::to_vec(&cutoff_state).unwrap(), cutoff_bytes);
-        let empty_progress = test_upload_progress();
-        let mut progress = SnapshotUploadProgress::load(
-            &self.progress_path,
-            &empty_progress.destination_namespace_hash,
-            empty_progress.active_quarantine_witness.clone().unwrap(),
-        )
-        .expect("reload exact synthetic upload progress");
         exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
         let candidates =
             index.capture_claude_proof_corrections(&mut scan, &disposition, |snapshot| {
@@ -668,6 +674,7 @@ impl ApcFixture {
                 upload,
                 ApcUpload::PermanentRejection | ApcUpload::RetryableRejection
             );
+        progress.prepare_context_receipt_candidates(&index, &committed_index, &scan.snapshots);
         let result = upload_resumable_batches_with_body_witness(
             &scan.snapshots,
             &unique_poison_scope(),
@@ -680,7 +687,7 @@ impl ApcFixture {
                 match upload {
                     ApcUpload::Accept | ApcUpload::Crash => {
                         uploaded.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
-                        Ok(accepted_batch(items.len()))
+                        exact_pipeline_accept(&items)
                     }
                     ApcUpload::Shed => Err(anyhow::Error::new(UploadShed {
                         status: 503,
@@ -824,6 +831,10 @@ impl ApcFixture {
             true,
             census_complete && fully_settled,
             "replay-generation-apc",
+        );
+        index.accept_file_upload_context_acks(
+            &progress.context_receipt_candidates,
+            &progress.fresh_context_body_acks,
         );
         let (window_start, window_end) =
             snapshot_manifest_window(&scan.census_window_end, 183).expect("manifest window");

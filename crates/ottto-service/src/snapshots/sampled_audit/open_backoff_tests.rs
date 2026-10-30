@@ -427,6 +427,19 @@ fn ordinary_open_keeps_other_slots_due(grown: bool) {
     });
     let path = root.0.join("a1111111-1111-4111-8111-111111111111.jsonl");
     fs::write(&path, b"{}\n").unwrap();
+    // #906: native checkpoints reuse by content even when audit D is due;
+    // obtain the certificate by reading and committing the real source.
+    let scope = crate::transcript_acquisition::Scope("ordinary-owed".into());
+    let mut file = File::open(&path).unwrap();
+    let mut acquisition =
+        crate::transcript_acquisition::ReadPlan::prepare(&mut file, None, &scope, None, D).unwrap();
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+    acquisition.observe_complete_records(&bytes).unwrap();
+    let checkpoint = acquisition
+        .commit_after_native_completion(&file, &scope, D)
+        .unwrap();
+
     let key = local_index_key(&path);
     let other = root.key("b1111111-1111-4111-8111-111111111111.jsonl");
     let mut index = held_index(&root, &[&key, &other]);
@@ -509,17 +522,20 @@ fn ordinary_open_keeps_other_slots_due(grown: bool) {
     let debt = debt_for_key(&index, &key, D + CAP).unwrap();
     let plan = crate::transcript_acquisition::ReadPlan::prepare(
         &mut opened_file,
-        None,
-        &crate::transcript_acquisition::Scope("ordinary-owed".into()),
+        Some(&checkpoint),
+        &scope,
         Some(debt),
         D + CAP,
     )
     .unwrap();
     assert_eq!(
         plan.mode(),
-        crate::transcript_acquisition::ReadMode::Full(
-            crate::transcript_acquisition::FullReason::AuditDue
-        )
+        if grown {
+            crate::transcript_acquisition::ReadMode::Tail
+        } else {
+            crate::transcript_acquisition::ReadMode::Unchanged
+        },
+        "#906 checkpoint reuse never promotes an owed deadline into Full authority"
     );
     assert_eq!(plan.metrics().audit_due, Some(D));
     drop(plan); // An interrupted native verification cannot discharge D.
