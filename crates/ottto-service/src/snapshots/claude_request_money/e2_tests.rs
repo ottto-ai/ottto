@@ -1266,6 +1266,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
             complete: true,
             lossy: false,
             source_verified: true,
+            unchanged_source: false,
             itemless_request_hashes: Vec::new(),
             opened_birth: None,
             modified_unix_seconds: 1,
@@ -1817,7 +1818,14 @@ fn switch_context() -> Value {
 fn org_hash(org: &str) -> String {
     ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap()
 }
-fn tag_owned(mut items: Vec<SnapshotItem>, index: &ScanIndex) -> Vec<SnapshotItem> {
+fn tag_owned(items: Vec<SnapshotItem>, index: &ScanIndex) -> Vec<SnapshotItem> {
+    tag_owned_with_fallbacks(items, index, 0)
+}
+fn tag_owned_with_fallbacks(
+    mut items: Vec<SnapshotItem>,
+    index: &ScanIndex,
+    expected_fallbacks: usize,
+) -> Vec<SnapshotItem> {
     decide_page_copies(&mut items, index);
     let api = ClaudeLocalOtelLoadReport::default();
     let trace = ClaudeTraceOwnershipLoadReport::default();
@@ -1854,7 +1862,9 @@ fn tag_owned(mut items: Vec<SnapshotItem>, index: &ScanIndex) -> Vec<SnapshotIte
         &ownership,
     );
     claude_request_identity::publish_request_owned_activity(&items, activity);
-    assert_eq!(outcome.sent, items.len());
+    assert!(expected_fallbacks <= items.len());
+    assert_eq!(outcome.sent, items.len() - expected_fallbacks);
+    assert_eq!(outcome.fallback, expected_fallbacks);
     assert_eq!(outcome.ineligible, 0);
     items
 }
@@ -2609,7 +2619,7 @@ fn e2_identity_conflicting_account_attributes_preserve_complete_own_orgs() {
 }
 
 #[test]
-fn e2_identity_final_twin_union_over_authority_cap_falls_back_to_starting_org() {
+fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity() {
     with_enabled(|| {
         let a = root_file("identity-cap-a");
         let b = root_file("identity-cap-b");
@@ -2636,19 +2646,17 @@ fn e2_identity_final_twin_union_over_authority_cap_falls_back_to_starting_org() 
         assert!(items
             .iter()
             .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
-        let item = tag_owned(items, &index).remove(0);
+        let item = tag_owned_with_fallbacks(items, &index, 1).remove(0);
         assert_eq!((item.request_count, item.input_tokens), (20, 20));
-        assert_eq!(item.request_evidence.len(), 1);
+        // SOURCE: overflowing proof cannot be replaced by the starting org.
+        // The old uniform-retry expectation would manufacture that identity.
+        assert!(item.request_evidence.is_empty());
+        assert!(rows_of(&item).all(|row| row.identity_parts.is_none()
+            && row.evidence_ref.is_none()
+            && row.account_identifier_hash.is_none()));
         assert_eq!(
-            item.request_evidence[0].provider_workspace_hash.as_deref(),
-            Some(org_hash(ORG_A).as_str())
-        );
-        assert!(
-            rows_of(&item).all(|row| row.identity_parts.is_none() && row.evidence_ref == Some(0))
-        );
-        assert_eq!(
-            item.request_identity_refusals, 0,
-            "successful retry retains no failed-attempt refusals"
+            item.request_identity_refusals, 1,
+            "the bucket row lost proof"
         );
         assert_evidence_referenced(&item);
         cleanup(&[&a, &b]);

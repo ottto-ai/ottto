@@ -327,6 +327,17 @@ impl SessionAttributionContext {
         facts
     }
 
+    /// Local accepted-share ledger uses the same negotiated attribution key.
+    /// The copy is zeroized and never serialized or exposed through Debug.
+    pub(crate) fn accepted_fingerprint_key(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(
+            self.key
+                .as_slice()
+                .try_into()
+                .expect("validated attribution key"),
+        )
+    }
+
     /// Tenant-keyed opaque id for one kind of local material, the same scheme
     /// as skill and template ids. Exists only while attribution is collected.
     pub(crate) fn opaque_id(&self, domain: &str, material: &str) -> Option<String> {

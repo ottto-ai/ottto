@@ -84,6 +84,9 @@ counters! {
     // SOURCE (B): fixed content-free totals, never per-file history.
     prefix_excluded_bodies: PrefixExcludedBody,
     prefix_tag_clears: PrefixTagCleared,
+    // Pi source-field parsing observations, independent of retention decisions.
+    pi_cost_refused_overflow: PiCostRefusedOverflow,
+    pi_cost_precision_rounded: PiCostPrecisionRounded,
 }
 
 pub(crate) fn add(event: Event, amount: u64) {

@@ -201,8 +201,6 @@ impl Rearm {
 pub(crate) struct Counts {
     #[serde(skip_serializing_if = "LineageParentless::is_empty")]
     pub(crate) lineage_parentless_while_incomplete: LineageParentless,
-    #[serde(skip_serializing_if = "DesktopDiscoveryIncomplete::is_empty")]
-    pub(crate) desktop_discovery_incomplete: DesktopDiscoveryIncomplete,
     #[serde(skip_serializing_if = "DesktopMetadata::is_empty")]
     pub(crate) desktop_metadata: DesktopMetadata,
     #[serde(skip_serializing_if = "IgnoredVetoCounts::is_empty")]
@@ -240,63 +238,6 @@ pub(crate) fn lineage_parentless_while_incomplete(files: u64) {
             .lineage_parentless_while_incomplete
             .merge(LineageParentless { files })
     });
-}
-
-/// Discovery coverage is separate from errors inside a returned metadata store.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
-pub(crate) struct DesktopDiscoveryIncomplete {
-    #[serde(skip_serializing_if = "super::is_zero")]
-    capped: u64,
-    #[serde(skip_serializing_if = "super::is_zero")]
-    error: u64,
-}
-impl DesktopDiscoveryIncomplete {
-    fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
-    fn merge(&mut self, other: Self) {
-        self.capped = self.capped.saturating_add(other.capped);
-        self.error = self.error.saturating_add(other.error);
-    }
-}
-// Bit 2 remembers the first incomplete discovery; bits 0–1 count a capped
-// streak, saturated at three. Diagnostic-only, process-local, never authority.
-#[cfg(not(test))]
-static DESKTOP_DISCOVERY_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-#[cfg(test)]
-thread_local! {
-    static DESKTOP_DISCOVERY_STATE: std::sync::atomic::AtomicU8 = const { std::sync::atomic::AtomicU8::new(0) };
-}
-pub(crate) fn desktop_discovery(capped: bool, error: bool) {
-    let observation = DesktopDiscoveryIncomplete {
-        capped: u64::from(capped),
-        error: u64::from(error),
-    };
-    update(|counts| counts.desktop_discovery_incomplete.merge(observation));
-    let observe = |state: &std::sync::atomic::AtomicU8| {
-        use std::sync::atomic::Ordering::Relaxed;
-        let old = state
-            .fetch_update(Relaxed, Relaxed, |old| {
-                let seen = (old & 4) | if capped || error { 4 } else { 0 };
-                let streak = if capped { ((old & 3) + 1).min(3) } else { 0 };
-                Some(seen | streak)
-            })
-            .expect("discovery diagnostic update always supplies a value");
-        if (capped || error) && old & 4 == 0 {
-            super::traversal_point("desktop_discovery_incomplete", "claude_code", &observation);
-        }
-        if capped && old & 3 == 2 {
-            super::traversal_point(
-                "desktop_discovery_capped_persistent",
-                "claude_code",
-                &observation,
-            );
-        }
-    };
-    #[cfg(test)]
-    DESKTOP_DISCOVERY_STATE.with(observe);
-    #[cfg(not(test))]
-    observe(&DESKTOP_DISCOVERY_STATE);
 }
 
 /// Counts only, on the existing page line. Revisions count actual body reads,
@@ -341,6 +282,9 @@ impl DesktopMetadata {
             .saturating_add(other.scoped_acquisition_attempts);
     }
 }
+// The inventory restart and scoped acquisition have no production caller until
+// the full #851 re-land, so those two counters stay zero and absent.
+#[cfg(test)]
 pub(crate) fn desktop_inventory_restart() {
     update(|counts| {
         let n = &mut counts.desktop_metadata.inventory_restarts;
@@ -425,8 +369,6 @@ impl Counts {
     pub(crate) fn merge(&mut self, other: Self) {
         self.lineage_parentless_while_incomplete
             .merge(other.lineage_parentless_while_incomplete);
-        self.desktop_discovery_incomplete
-            .merge(other.desktop_discovery_incomplete);
         self.desktop_metadata.merge(other.desktop_metadata);
         self.rearm_veto_ignored.merge(other.rearm_veto_ignored);
         self.rearm_structural_native_duplicate = self
@@ -638,52 +580,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for Reinsertion {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn discovery_alarms_count_first_failure_and_third_consecutive_cap() {
-        super::DESKTOP_DISCOVERY_STATE
-            .with(|state| state.store(0, std::sync::atomic::Ordering::Relaxed));
-        let scope = super::Scope::begin(true);
-        let (_, first) = crate::local_resource_diagnostics::capture(|| {
-            super::desktop_discovery(false, true);
-        });
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0]["stage"], "desktop_discovery_incomplete");
-        let (_, before_interruption) = crate::local_resource_diagnostics::capture(|| {
-            super::desktop_discovery(true, false);
-        });
-        assert!(before_interruption.is_empty());
-        let (_, interruption) = crate::local_resource_diagnostics::capture(|| {
-            super::desktop_discovery(false, false); // interrupts the streak
-        });
-        assert!(interruption.is_empty());
-        for consecutive in 1..=4 {
-            let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-                super::desktop_discovery(true, false);
-            });
-            if consecutive == 3 {
-                assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0]["stage"], "desktop_discovery_capped_persistent");
-            } else {
-                assert!(rows.is_empty(), "consecutive cap {consecutive}");
-            }
-        }
-        let counts = scope.finish();
-        assert_eq!(
-            serde_json::to_value(counts).unwrap()["desktop_discovery_incomplete"],
-            serde_json::json!({"capped":5,"error":1})
-        );
-        let scope = super::Scope::begin(true);
-        super::desktop_discovery(false, true);
-        let mut first = scope.finish();
-        first.desktop_discovery_incomplete.capped = u64::MAX;
-        first.merge(counts);
-        assert_eq!(first.desktop_discovery_incomplete.capped, u64::MAX);
-        assert!(serde_json::to_value(super::Counts::default())
-            .unwrap()
-            .get("desktop_discovery_incomplete")
-            .is_none());
-    }
-
     #[test]
     fn desktop_metadata_counts_are_sparse_saturating_and_scope_local() {
         let scope = super::Scope::begin(true);

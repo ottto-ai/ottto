@@ -37,6 +37,63 @@ pub(crate) fn skill_label_native_dropped(source: &str, set: &'static str, reason
     );
 }
 
+#[cfg(not(test))]
+static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 6] = const { [const { AtomicU64::new(0) }; 6] };
+}
+
+/// Append-only reason labels, cumulative per process (not distinct sessions).
+/// Records each attempted over-cap body before its identities are stripped.
+pub(crate) fn claude_identity_over_cap(
+    reasons: &std::collections::BTreeSet<crate::snapshots::claude_request_identity::OverCap>,
+    item_bytes: usize,
+) {
+    use crate::snapshots::claude_request_identity::OverCap;
+    const LABELS: [&str; 6] = [
+        "evidence_entries",
+        "authority_keys",
+        "parts_per_row",
+        "parts_per_item",
+        "rows",
+        "bytes",
+    ];
+    let record = |counters: &[AtomicU64; 6]| {
+        for reason in reasons {
+            let index = match reason {
+                OverCap::EvidenceEntries => 0,
+                OverCap::AuthorityKeys => 1,
+                OverCap::PartsPerRow => 2,
+                OverCap::PartsPerItem => 3,
+                OverCap::Rows => 4,
+                OverCap::Bytes => 5,
+            };
+            let _ = counters[index].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+        }
+        #[derive(Serialize)]
+        struct Counts {
+            claude_request_identity_over_cap: BTreeMap<&'static str, u64>,
+            claude_request_identity_last_over_cap_item_bytes: usize,
+        }
+        traversal_point(
+            "claude_request_identity_over_cap",
+            "claude_code",
+            &Counts {
+                claude_request_identity_over_cap: LABELS
+                    .into_iter()
+                    .zip(counters.iter().map(|n| n.load(Relaxed)))
+                    .collect(),
+                claude_request_identity_last_over_cap_item_bytes: item_bytes,
+            },
+        );
+    };
+    #[cfg(test)]
+    CLAUDE_IDENTITY_OVER_CAP.with(record);
+    #[cfg(not(test))]
+    record(&CLAUDE_IDENTITY_OVER_CAP);
+}
+
 /// Closed, content-free refusal labels; cumulative process counters on #799.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub(crate) enum CodexZstCause {
@@ -86,6 +143,16 @@ pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
             BTreeMap::from([(cause, previous.saturating_add(1))]),
         )]),
     );
+}
+
+/// Counts per observed usage line, before response deduplication and timestamp
+/// drops; rereads count again. Only the lifecycle registry atomics are updated.
+pub(crate) fn pi_cost_observations(refused: u64, rounded: u64) {
+    if refused == 0 && rounded == 0 {
+        return;
+    }
+    cache_lifecycle::add(cache_lifecycle::Event::PiCostRefusedOverflow, refused);
+    cache_lifecycle::add(cache_lifecycle::Event::PiCostPrecisionRounded, rounded);
 }
 
 /// Per-pass observations, not distinct entries/files or a lifetime counter.
@@ -641,18 +708,6 @@ impl Observation {
     }
 }
 
-// Final upload candidates compared with their retained accepted bodies on this worker.
-// Drained by the existing finish record; no identifiers reach the log.
-thread_local! {
-    static ACCOUNT_HASH_CHANGED: std::cell::RefCell<std::collections::BTreeSet<String>> =
-        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
-}
-pub(crate) fn account_hash_changed(session_key: &str) {
-    ACCOUNT_HASH_CHANGED.with(|sessions| {
-        sessions.borrow_mut().insert(session_key.to_string());
-    });
-}
-
 /// Local prepare window, including index load/baseline work before page probes.
 /// Return values and errors pass through; unwinding closes sampling silently.
 pub(crate) fn source_prepare<T>(source: &str, inner: impl FnOnce() -> T) -> T {
@@ -676,11 +731,6 @@ pub(crate) fn source_finish<T>(
     source: &str,
     inner: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    #[derive(Serialize)]
-    struct Counts {
-        account_hash_changed: u64,
-    }
-    ACCOUNT_HASH_CHANGED.with(|sessions| sessions.borrow_mut().clear());
     let probe = Probe::start();
     let footprint = footprint::Stage::begin();
     let result = inner();
@@ -690,13 +740,7 @@ pub(crate) fn source_finish<T>(
         stage: "source_finish",
         source: Source::from_slug(source),
         observation: probe.stage_observation(footprint.as_ref()),
-        counts: Counts {
-            account_hash_changed: ACCOUNT_HASH_CHANGED.with(|sessions| {
-                let count = sessions.borrow().len() as u64;
-                sessions.borrow_mut().clear();
-                count
-            }),
-        },
+        counts: EmptyCounts {},
     });
     result
 }
@@ -739,6 +783,9 @@ pub(crate) fn codex_census_fence(
         },
     });
 }
+
+#[derive(Serialize)]
+struct EmptyCounts {}
 
 /// Fixed-schema traversal decisions only; no CPU/RSS sample or wire event.
 pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {
@@ -787,6 +834,14 @@ pub(crate) fn claude_absent_family_tombstone_uncertain(counts: &impl Serialize) 
         "claude_code",
         counts,
     );
+}
+/// E7-8a shadow, once per Claude page: per-family census completion counts
+/// (`family_census_complete`, `family_census_incomplete{reason}`,
+/// `family_complete_deferred{quantum}`), `pending_census_members`, the
+/// skipped-set digest and predicate cost. Counts only; never an authority
+/// input, no path, id or wire event.
+pub(crate) fn claude_family_census_shadow(counts: &impl Serialize) {
+    traversal_point("claude_family_census_shadow", "claude_code", counts);
 }
 static HISTORY_PROOF_CORRECTION_DEFERRED_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -1940,10 +1995,7 @@ mod tests {
         assert_eq!(record["schema_version"], SCHEMA_VERSION);
         assert_eq!(record["stage"], "source_finish");
         assert_eq!(record["source"], source);
-        assert_eq!(
-            record["counts"],
-            serde_json::json!({"account_hash_changed": 0})
-        );
+        assert_eq!(record["counts"], serde_json::json!({}));
         assert!(record.get("result").is_none());
         println!("RESOURCE_V2_FINISH_FIXTURE {record}");
     }
@@ -2406,6 +2458,19 @@ mod tests {
     }
 
     #[test]
+    fn pi_cost_observations_update_registry_without_emitting_records() {
+        let (((), counts), rows) = capture(|| {
+            cache_lifecycle::observe(|| {
+                pi_cost_observations(0, 0);
+                pi_cost_observations(2, 3);
+            })
+        });
+        assert_eq!(counts.pi_cost_refused_overflow, 2);
+        assert_eq!(counts.pi_cost_precision_rounded, 3);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
     fn cache_lifecycle_record_is_bounded_and_explicitly_process_global() {
         let (_, records) = capture(|| {
             traversal_point(
@@ -2421,7 +2486,8 @@ mod tests {
         assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        assert!(serde_json::to_string(record).unwrap().len() < 2048);
+        // The two Pi observation fields add 97 bytes at u64::MAX.
+        assert!(serde_json::to_string(record).unwrap().len() < 2304);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);

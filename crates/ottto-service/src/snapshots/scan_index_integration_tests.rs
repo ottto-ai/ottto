@@ -50,27 +50,36 @@ impl Fixture {
             object["digest"].as_str().unwrap()
         ))
     }
+    fn metadata_path(&self) -> PathBuf {
+        self.shards.join(format!(
+            "metadata-{}.json",
+            self.manifest["objects"][0]["digest"].as_str().unwrap()
+        ))
+    }
     fn semantic_damage(&mut self, map: usize) {
         let old = self.bucket_path(map);
         let original: Value = serde_json::from_slice(&fs::read(&old).unwrap()).unwrap();
         let key = original.as_object().unwrap().keys().next().unwrap();
         let payload = serde_json::to_vec(&json!({key: null})).unwrap();
+        self.rebind_object(map + 1, &payload);
+        let new = self.bucket_path(map);
+        fs::rename(old, &new).unwrap();
+        fs::write(new, payload).unwrap();
+    }
+    fn rebind_object(&mut self, position: usize, payload: &[u8]) {
         let binding: scan_index_persistence::Binding =
             serde_json::from_value(self.manifest["binding"].clone()).unwrap();
-        let object = &mut self.manifest["objects"][map + 1];
+        let object = &mut self.manifest["objects"][position];
         let slot: scan_index_persistence::Slot =
             serde_json::from_value(object["slot"].clone()).unwrap();
         let mut hash = Sha256::new();
         hash.update(b"ottto.scan-index.storage.v1\0object\0");
         hash.update(serde_json::to_vec(&(binding, slot)).unwrap());
         hash.update([0]);
-        hash.update(&payload);
+        hash.update(payload);
         hash.update((payload.len() as u64).to_le_bytes());
         object["digest"] = json!(format!("{:x}", hash.finalize()));
         object["bytes"] = json!(payload.len());
-        let new = self.bucket_path(map);
-        fs::rename(old, &new).unwrap();
-        fs::write(new, payload).unwrap();
     }
     fn load(&self) -> ScanIndex {
         ScanIndex::load_for_snapshot_source_with_origin(
@@ -280,6 +289,30 @@ fn integrated_reader_loads_shards_and_still_writes_legacy_with_committed_generat
         serde_json::to_vec(&restored).unwrap(),
         serde_json::to_vec(&loaded).unwrap()
     );
+}
+
+/// The downgrade contract of a later shard writer: `ObjectKeys` admits only
+/// registered names, so this key must be registered before anything writes it.
+#[test]
+fn integrated_sharded_metadata_carrying_the_desktop_inventory_loads_and_saves_without_it() {
+    let mut fixture = Fixture::new();
+    let healthy = serde_json::to_vec(&fixture.load()).unwrap();
+    let old = fixture.metadata_path();
+    let mut metadata: Value = serde_json::from_slice(&fs::read(&old).unwrap()).unwrap();
+    metadata["claude_desktop_store_inventory"] = json!("a".repeat(64));
+    let payload = serde_json::to_vec(&metadata).unwrap();
+    fixture.rebind_object(0, &payload);
+    let new = fixture.metadata_path();
+    fs::rename(old, &new).unwrap();
+    fs::write(new, payload).unwrap();
+    fixture.write_root();
+    let mut loaded = fixture.load();
+    assert!(loaded.persistence_available());
+    assert_eq!(loaded.claude_desktop_store_inventory, Some("a".repeat(64)));
+    assert_eq!(serde_json::to_vec(&loaded).unwrap(), healthy);
+    loaded.save(&fixture.root).unwrap();
+    let raw: Value = serde_json::from_slice(&fs::read(&fixture.root).unwrap()).unwrap();
+    assert!(raw.get("claude_desktop_store_inventory").is_none());
 }
 
 #[test]

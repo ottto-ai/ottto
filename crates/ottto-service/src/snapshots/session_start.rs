@@ -2853,7 +2853,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux")),
+        ignore = "needs macOS heap layout"
+    )]
     fn held_state_stays_within_its_capacity_budget() {
         let mut held = String::new();
         assert!(!push_capped(&mut held, &"x".repeat(300 * 1024)));
