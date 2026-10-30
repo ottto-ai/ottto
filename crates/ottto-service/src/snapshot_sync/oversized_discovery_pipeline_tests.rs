@@ -511,40 +511,44 @@ fn oversized_does_not_suppress_another_retryable_problem() {
 #[test]
 #[serial(source_manifests)]
 fn terminal_off_on_oversized_does_not_suppress_another_retryable_problem() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    // The ON scan path overflows the 2 MiB debug test thread (Mac SIGABRT,
+    // run 41108251454); production scans run on the scan worker stack.
+    crate::snapshot_sync::tests::run_on_scan_worker_stack(|| {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    if !c1a_layout_supported("oversized-other-problem") {
-        return;
-    }
-    let _manifests = SourceManifestTestGuard::new();
-    let fixture = c1a_fixture("oversized-other-problem");
-    assert!(c1b_generation(&fixture, "oversized", (8, 0)).census_complete);
-    oversized_create(&fixture);
-    RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
-    let seed = c1b_generation(&fixture, "oversized", (8, 10));
-    assert!(seed.red && !seed.census_complete);
-    let before = c1a_saved(&fixture);
-    assert_eq!(
-        before["traversal"]["counts"]["malformed_json_line_count"],
-        1
-    );
-    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-        fixture.page(
-            &oversized_clock(oversized_deadline(&before)),
-            RearmUpload::Accept,
-        )
+        if !c1a_layout_supported("oversized-other-problem") {
+            return;
+        }
+        let _manifests = SourceManifestTestGuard::new();
+        let fixture = c1a_fixture("oversized-other-problem");
+        assert!(c1b_generation(&fixture, "oversized", (8, 0)).census_complete);
+        oversized_create(&fixture);
+        RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
+        let seed = c1b_generation(&fixture, "oversized", (8, 10));
+        assert!(seed.red && !seed.census_complete);
+        let before = c1a_saved(&fixture);
+        assert_eq!(
+            before["traversal"]["counts"]["malformed_json_line_count"],
+            1
+        );
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            fixture.page(
+                &oversized_clock(oversized_deadline(&before)),
+                RearmUpload::Accept,
+            )
+        });
+        let start = rows
+            .iter()
+            .find(|row| {
+                row["stage"] == "bounded_traversal_transition" && row["counts"]["event"] == "starting"
+            })
+            .unwrap();
+        assert_eq!(start["counts"]["reason"], "terminal_unhealthy_retry");
+        assert_eq!(
+            start["counts"]["previous"]["counts"]["oversized_file_count"],
+            1
+        );
     });
-    let start = rows
-        .iter()
-        .find(|row| {
-            row["stage"] == "bounded_traversal_transition" && row["counts"]["event"] == "starting"
-        })
-        .unwrap();
-    assert_eq!(start["counts"]["reason"], "terminal_unhealthy_retry");
-    assert_eq!(
-        start["counts"]["previous"]["counts"]["oversized_file_count"],
-        1
-    );
 }
 
 #[test]

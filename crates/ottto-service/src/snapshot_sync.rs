@@ -23010,6 +23010,22 @@ mod tests {
         }
     }
 
+    /// Run a test body on a thread sized like a production scan worker. Debug
+    /// (opt-level 0) frames on the native scan path can exceed the default 2 MiB
+    /// test thread (E5 measurement, efforts/E5-helpers/pib2-stack-measure-report.md);
+    /// `scan_worker_stack_margin_receipt` remains the production stack guard.
+    pub(super) fn run_on_scan_worker_stack<T: Send>(body: impl FnOnce() -> T + Send) -> T {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("test-scan-worker".to_string())
+                .stack_size(SNAPSHOT_SYNC_WORKER_STACK_BYTES)
+                .spawn_scoped(scope, body)
+                .expect("spawn test scan worker")
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    }
+
     fn test_daemon(machine_id: &str) -> LocalDaemon {
         LocalDaemon::new(
             MachineIdentity {
