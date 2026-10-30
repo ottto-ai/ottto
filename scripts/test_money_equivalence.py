@@ -91,6 +91,28 @@ class MoneyEquivalenceTests(unittest.TestCase):
         self.base[CONTRACT] = self.head[CONTRACT] = CONTRACT_VALUE
         self.assertFalse(has_forbidden_diff(self.compare()))
 
+    def test_allowlisted_addition_exact_string_passes(self):
+        self.head[CONTRACT] = CONTRACT_VALUE
+        diff = self.compare()
+        self.assertFalse(has_forbidden_diff(diff))
+        self.assertEqual(diff["allowed_additions"], ["/0/0/" + CONTRACT])
+
+    def test_allowlisted_addition_other_string_fails(self):
+        self.head[CONTRACT] = "usage_decrease_hold_ack:v2"
+        self.assert_change_fails("added", "/0/0/" + CONTRACT)
+        self.assertEqual(self.compare()["allowed_additions"], [])
+
+    def test_allowlisted_addition_object_fails(self):
+        self.head[CONTRACT] = {"contract": CONTRACT_VALUE}
+        self.assert_change_fails("added", "/0/0/" + CONTRACT)
+        self.assertEqual(self.compare()["allowed_additions"], [])
+
+    def test_allowlisted_addition_other_types_fail(self):
+        for value in (None, False, 1, [CONTRACT_VALUE]):
+            with self.subTest(value=value):
+                self.head[CONTRACT] = value
+                self.assert_change_fails("added", "/0/0/" + CONTRACT)
+
     def test_token_change_fails_even_with_allowed_addition(self):
         self.head[CONTRACT] = CONTRACT_VALUE
         self.head["snapshots"][0]["usage"]["input_tokens"] += 1
@@ -102,11 +124,11 @@ class MoneyEquivalenceTests(unittest.TestCase):
 
     def test_allowlisted_key_below_envelope_fails(self):
         for location, path in (
-                (self.head["snapshots"][0], "/0/0/snapshots/0"),
-                (self.head["snapshots"][0]["usage"], "/0/0/snapshots/0/usage")):
+                (self.head["snapshots"][0], "/0/0/snapshots/0/<key#9>"),
+                (self.head["snapshots"][0]["usage"], "/0/0/snapshots/0/usage/<key#2>")):
             with self.subTest(path=path):
                 location[CONTRACT] = CONTRACT_VALUE
-                self.assert_change_fails("added", path + "/" + CONTRACT)
+                self.assert_change_fails("added", path)
                 del location[CONTRACT]
 
     def test_allowlisted_key_removed_fails(self):
@@ -122,7 +144,7 @@ class MoneyEquivalenceTests(unittest.TestCase):
 
     def test_other_envelope_additions_and_removals_fail(self):
         self.head["new_contract"] = True
-        self.assert_change_fails("added", "/0/0/new_contract")
+        self.assert_change_fails("added", "/0/0/<key#1>")
         del self.head["new_contract"]
         del self.head["source"]
         self.assert_change_fails("removed", "/0/0/source")
@@ -150,11 +172,11 @@ class MoneyEquivalenceTests(unittest.TestCase):
             self.head["snapshots"][0]["usage"]["input_tokens"] = value
             self.assert_change_fails("changed", "/0/0/snapshots/0/usage/input_tokens")
         # JSON numbers that ordinary float parsing would round to equality.
-        a = b'{"cost_usd":0.100000000000000001}'
-        b = b'{"cost_usd":0.100000000000000002}'
+        a = b'{"snapshots":[{"cost_usd":0.100000000000000001}]}'
+        b = b'{"snapshots":[{"cost_usd":0.100000000000000002}]}'
         diff = receipt_diff(json.dumps([list(a)]), json.dumps([list(b)]))
         self.assertTrue(has_forbidden_diff(diff))
-        self.assertEqual(diff["changed"], ["/0/cost_usd"])
+        self.assertEqual(diff["changed"], ["/0/snapshots/0/cost_usd"])
 
     def test_order_and_added_removed_batches_and_snapshots_fail(self):
         other = copy.deepcopy(self.base)
@@ -173,13 +195,58 @@ class MoneyEquivalenceTests(unittest.TestCase):
         self.base["payload"] = encode({CONTRACT: CONTRACT_VALUE})
         self.head = copy.deepcopy(self.base)
         self.head["payload"][0] += 1
-        self.assert_change_fails("changed", "/0/0/payload/0")
+        self.assert_change_fails("changed", "/0/0/<key#1>/0")
 
-    def test_paths_are_escaped_and_contain_no_values(self):
+    def test_unknown_fields_and_values_are_redacted(self):
         self.head["snapshots"][0]["private~/key"] = "DO_NOT_LOG_THIS_VALUE"
         diff = self.compare()
-        self.assertEqual(diff["added"], ["/0/0/snapshots/0/private~0~1key"])
+        self.assertEqual(diff["added"], ["/0/0/snapshots/0/<key#3>"])
+        self.assertNotIn("private", json.dumps(diff))
         self.assertNotIn("DO_NOT_LOG_THIS_VALUE", json.dumps(diff))
+
+    def test_id_keyed_map_paths_are_redacted_with_stable_ordinals(self):
+        raw_key = "id-opaque-hash/path~private"
+        self.base["snapshots"][0]["usage_buckets"] = [{
+            "model_usage": [{"selector_context": {raw_key: "before", "zz-other": "same"}}],
+        }]
+        self.head = copy.deepcopy(self.base)
+        model_usage = self.head["snapshots"][0]["usage_buckets"][0]["model_usage"][0]
+        context = model_usage["selector_context"]
+        context[raw_key] = "after"
+        diff = self.compare()
+        self.assertTrue(has_forbidden_diff(diff))
+        self.assertEqual(diff["changed"], [
+            "/0/0/snapshots/0/usage_buckets/0/model_usage/0/selector_context/<key#0>"])
+        context = dict(reversed(list(context.items())))
+        model_usage["selector_context"] = context
+        self.assertEqual(self.compare(), diff)
+        for private in (raw_key, "zz-other", "before", "after"):
+            self.assertNotIn(private, json.dumps(diff))
+
+    def test_data_map_schema_looking_keys_are_redacted(self):
+        # A schema-looking key in a data map is still data, even when its value
+        # is an object containing another schema-looking key.
+        self.base["snapshots"][0]["semantic_envelope"]["component_hashes"] = {
+            "input_tokens": {"source": "before"}}
+        self.head = copy.deepcopy(self.base)
+        hashes = self.head["snapshots"][0]["semantic_envelope"]["component_hashes"]
+        hashes["input_tokens"]["source"] = "after"
+        self.assert_change_fails(
+            "changed", "/0/0/snapshots/0/semantic_envelope/component_hashes/<key#0>/<key#0>")
+
+    def test_added_and_removed_data_map_keys_are_redacted(self):
+        self.base["snapshots"][0]["semantic_envelope"]["component_hashes"] = {
+            "old-id": "PRIVATE_HASH_VALUE"}
+        self.head = copy.deepcopy(self.base)
+        self.head["snapshots"][0]["semantic_envelope"]["component_hashes"] = {
+            "new-id": "PRIVATE_HASH_VALUE"}
+        diff = self.compare()
+        self.assertTrue(has_forbidden_diff(diff))
+        prefix = "/0/0/snapshots/0/semantic_envelope/component_hashes/"
+        self.assertEqual(diff["added"], [prefix + "<key#0>"])
+        self.assertEqual(diff["removed"], [prefix + "<key#1>"])
+        for private in ("old-id", "new-id", "PRIVATE_HASH_VALUE"):
+            self.assertNotIn(private, json.dumps(diff))
 
     def test_invalid_receipts_fail_closed_without_values(self):
         for invalid in (b'[]', b'{}', b'[[true]]', b'[[256]]', b'[[255]]',

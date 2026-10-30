@@ -27,7 +27,44 @@ DISK_FIXTURES = ("restart_between_pages", "upgrade_without_semantic_revision",
 # Only base -> head ADDITIONS at the batch envelope may be ignored. Never
 # allowlist money or identity fields (including usage, cost, bucket, refusal or
 # request fields). This is a capability declaration, not snapshot content.
-ENVELOPE_ADDITION_ALLOWLIST = frozenset({"usage_decrease_hold_ack_contract"})
+# Additions must also match the exact string values below.
+ENVELOPE_ADDITION_ALLOWLIST = {
+    # Keep in sync with snapshots.rs::USAGE_DECREASE_HOLD_ACK_CONTRACT.
+    "usage_decrease_hold_ack_contract": "usage_decrease_hold_ack:v1",
+}
+
+# Display vocabulary only, never comparison exclusions. Recognize record fields
+# only at their schema locations; data maps (even with schema-looking keys) and
+# unknown fields are conservatively redacted. Extend this for diagnostics only.
+_MONEY_DIFF_SCHEMA = {key: {} for key in (
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_5m_tokens",
+    "cache_creation_1h_tokens", "reasoning_output_tokens", "unattributed_total_tokens",
+    "request_count", "cost_usd", "input_cost_usd", "output_cost_usd",
+    "cache_read_cost_usd", "cache_creation_cost_usd",
+)}
+_MODEL_DIFF_SCHEMA = dict(_MONEY_DIFF_SCHEMA, model={}, reasoning_effort={},
+                          selector_context={}, selector_sources={}, account_identifier_hash={})
+_SNAPSHOT_DIFF_SCHEMA = dict(_MONEY_DIFF_SCHEMA, **{key: {} for key in (
+    "source_session_id", "snapshot_fingerprint", "source_file_fingerprint", "status",
+    "account_id", "bucket", "request_id", "refusal", "telemetry_owned_complete",
+    "resolver_conflict_count", "usage_accounting_contract", "removed_request_count",
+)})
+_SNAPSHOT_DIFF_SCHEMA.update(
+    usage=_MONEY_DIFF_SCHEMA, removed_usage=_MONEY_DIFF_SCHEMA,
+    usage_buckets={"bucket_start": {}, "model_usage": _MODEL_DIFF_SCHEMA,
+                   "first_activity_at": {}, "last_activity_at": {}},
+    semantic_envelope={key: {} for key in (
+        "component_contract_version", "revision_contract_version", "upload_policy",
+        "component_hashes", "revision_hash", "revision_v2_contract_version",
+        "revision_v2_canonicalization", "revision_v2_parser_version",
+        "revision_v2_scan_identity_version", "revision_v2_hash", "content_hash",
+        "hash_epoch", "base_head_etag",
+    )})
+_ENVELOPE_DIFF_SCHEMA = {key: {} for key in (
+    "schema_version", "source", "machine_id", "collector_version", "entity_ack_contract",
+    "usage_decrease_hold_ack_contract", "head_cas_contract", "client_report",
+)}
+_ENVELOPE_DIFF_SCHEMA["snapshots"] = _SNAPSHOT_DIFF_SCHEMA
 
 
 def _json_object(pairs):
@@ -96,33 +133,42 @@ def receipt_diff(base, head):
     left, left_envelopes = decode_receipt(base)
     right, right_envelopes = decode_receipt(head)
     envelopes = left_envelopes & right_envelopes
+    display_envelopes = left_envelopes | right_envelopes
     diff = {kind: [] for kind in ("added", "removed", "changed", "allowed_additions")}
 
     def child(path, key):
         # RFC 6901 JSON Pointer escaping keeps paths unambiguous.
         return path + "/" + str(key).replace("~", "~0").replace("/", "~1")
 
-    def walk(a, b, path):
+    def walk(a, b, path, schema):
+        if path in display_envelopes:
+            schema = _ENVELOPE_DIFF_SCHEMA
         if type(a) is not type(b):
             diff["changed"].append(path)
         elif isinstance(a, dict):
+            # Stable ordinals use the sorted base/head union, independently of
+            # insertion order or which side owns a key. Never print raw data keys.
+            labels = {key: key if key in schema else f"<key#{i}>"
+                      for i, key in enumerate(sorted(a.keys() | b.keys()))}
             for key in sorted(b.keys() - a.keys()):
                 kind = ("allowed_additions" if path in envelopes and
-                        key in ENVELOPE_ADDITION_ALLOWLIST else "added")
-                diff[kind].append(child(path, key))
+                        key in ENVELOPE_ADDITION_ALLOWLIST and
+                        type(b[key]) is str and
+                        b[key] == ENVELOPE_ADDITION_ALLOWLIST[key] else "added")
+                diff[kind].append(child(path, labels[key]))
             for key in sorted(a.keys() - b.keys()):
-                diff["removed"].append(child(path, key))
+                diff["removed"].append(child(path, labels[key]))
             for key in sorted(a.keys() & b.keys()):
-                walk(a[key], b[key], child(path, key))
+                walk(a[key], b[key], child(path, labels[key]), schema.get(key, {}))
         elif isinstance(a, list):
             for i in range(min(len(a), len(b))):
-                walk(a[i], b[i], child(path, i))
+                walk(a[i], b[i], child(path, i), schema)
             diff["removed"].extend(child(path, i) for i in range(len(b), len(a)))
             diff["added"].extend(child(path, i) for i in range(len(a), len(b)))
         elif a != b:
             diff["changed"].append(path)
 
-    walk(left, right, "")
+    walk(left, right, "", {})
     return diff
 
 
