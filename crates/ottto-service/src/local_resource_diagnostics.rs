@@ -66,6 +66,26 @@ pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     );
 }
 
+/// Per-field Pi parse observations, counted once per applied source record.
+/// The lifecycle registry provides process totals and the labelled refusal
+/// projection follows the other content-free refusal diagnostics.
+pub(crate) fn pi_cost_observations(refused: u64, rounded: u64) {
+    if refused == 0 && rounded == 0 {
+        return;
+    }
+    cache_lifecycle::add(cache_lifecycle::Event::PiCostRefusedOverflow, refused);
+    cache_lifecycle::add(cache_lifecycle::Event::PiCostPrecisionRounded, rounded);
+    let totals = cache_lifecycle::snapshot();
+    traversal_point(
+        "pi_cost_observations",
+        "pi",
+        &serde_json::json!({
+            "pi_cost_refused": {"overflow": totals.pi_cost_refused_overflow},
+            "pi_cost_precision_rounded": totals.pi_cost_precision_rounded,
+        }),
+    );
+}
+
 /// Per-pass observations, not distinct entries/files or a lifetime counter.
 pub(crate) fn codex_state_only_ambiguous_identity(observations: u64, tokens: u64) {
     if observations > 0 {
@@ -2309,6 +2329,33 @@ mod tests {
     }
 
     #[test]
+    fn pi_cost_observations_use_labelled_refusals_and_registered_totals() {
+        let (((), counts), rows) = capture(|| {
+            cache_lifecycle::observe(|| {
+                pi_cost_observations(0, 0);
+                pi_cost_observations(2, 3);
+            })
+        });
+        assert_eq!(counts.pi_cost_refused_overflow, 2);
+        assert_eq!(counts.pi_cost_precision_rounded, 3);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["stage"], "pi_cost_observations");
+        assert_eq!(rows[0]["source"], "pi");
+        assert!(
+            rows[0]["counts"]["pi_cost_refused"]["overflow"]
+                .as_u64()
+                .unwrap()
+                >= 2
+        );
+        assert!(
+            rows[0]["counts"]["pi_cost_precision_rounded"]
+                .as_u64()
+                .unwrap()
+                >= 3
+        );
+    }
+
+    #[test]
     fn cache_lifecycle_record_is_bounded_and_explicitly_process_global() {
         let (_, records) = capture(|| {
             traversal_point(
@@ -2324,7 +2371,8 @@ mod tests {
         assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        assert!(serde_json::to_string(record).unwrap().len() < 2048);
+        // The two Pi observation fields add 97 bytes at u64::MAX.
+        assert!(serde_json::to_string(record).unwrap().len() < 2304);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);
