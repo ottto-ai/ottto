@@ -2303,8 +2303,6 @@ impl ClaudeStaleFamilyCarry {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct ClaudeFullRearmProgress {
-    #[serde(skip)]
-    terminal_off_rediscovery_after: u64,
     /// Current page only; retries serialize the original admitted path/root.
     #[serde(skip)]
     terminal_off_admitted: Vec<ScanTraversalPath>,
@@ -69638,6 +69636,7 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// [regress] Containment regression: account finalizer withholds the unproven member revision.
     /// Production-default ON containment for the finalizer above (no
     /// completion override). The root's own request ids are covered by
     /// checked same-account evidence, so it qualifies and records main's exact
@@ -78489,12 +78488,12 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// [format] Process-local containment state preserves persisted bytes and recovery safety.
     #[test]
     fn terminal_off_original_carrier_wire_preserves_money_and_exact_ack_without_strict_analytics() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         assert!(claude_terminal_off());
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let mut item = claude_original_carrier_fixture(&claude_original_carrier_metadata(), "");
         assert_eq!(
             (item.input_tokens, item.output_tokens, item.request_count),
@@ -93089,7 +93088,7 @@ crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_mem
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
 crate::heap_layout_bound::fields!(ClaudeRetryAdmission; after_root, upper_root, complete, roots_complete, progressed, served_before, due_through, due_after_path, due_upper_path, due_complete, oversized_root, oversized_after_path, storage_deferred);
-crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; terminal_off_rediscovery_after, terminal_off_admitted, rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, ignored_vetoes, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots, contract_cutover);
+crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; terminal_off_admitted, rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, ignored_vetoes, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots, contract_cutover);
 crate::heap_layout_bound::fields!(ClaudeCompleteRebuildRead; origin, members_digest);
 crate::heap_layout_bound::fields!(ClaudeStructuralInvalidRecord; basis, families, suppressed_since_unix_seconds, skipped_full_rearms);
 crate::heap_layout_bound::fields!(ClaudeFullRearmWindow; context_fingerprint, process, window_ends, member_digests);

@@ -8,6 +8,7 @@
 // `KeepStaleClaudeFamilyRearmForTest`, which carries nothing. Fixtures are
 // synthetic and content-free.
 use super::*;
+use super::terminal_off_tests::claude_terminal_reconstructed;
 
 const CARRY_FAILED: &str = "2026-08-02T07:10:00Z";
 const CARRY_RETRY: &str = "2026-08-02T07:20:00Z";
@@ -4517,6 +4518,7 @@ fn scanner_records_actual_contract_only_when_its_traversal_starts() {
 mod terminal_off_admission_tests {
     use super::*;
 
+    /// [behaviour] Containment contract: four batches resume across mid admission restart.
     #[test]
     fn terminal_off_four_batches_resume_across_mid_admission_restart() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -4649,6 +4651,7 @@ mod terminal_off_admission_tests {
         assert!(!claude_terminal_authority(&fixture.index, true, &window));
     }
 
+    /// [behaviour] Containment contract: rejected with holds resumes but real loss retries.
     #[test]
     fn terminal_off_rejected_with_holds_resumes_but_real_loss_retries() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -4718,6 +4721,7 @@ mod terminal_off_admission_tests {
         );
     }
 
+    /// [behaviour] Containment contract: cancel refund and passed rewind never overwrite debt.
     #[test]
     fn terminal_off_cancel_refund_and_passed_rewind_never_overwrite_debt() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -4762,6 +4766,7 @@ mod terminal_off_admission_tests {
         assert!(index.files[&root].source_file_fingerprint.is_empty());
     }
 
+    /// [behaviour] Containment contract: hard gate rejects partial coverage even with matching certificate.
     #[test]
     fn terminal_off_hard_gate_rejects_partial_coverage_even_with_matching_certificate() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -4793,6 +4798,7 @@ mod terminal_off_admission_tests {
         assert!(!claude_terminal_authority(&index, true, CARRY_RETRY));
     }
 
+    /// [behaviour] Containment contract: completed admission still services a new due horizon.
     #[test]
     fn terminal_off_completed_admission_still_services_a_new_due_horizon() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -4857,6 +4863,7 @@ mod terminal_off_admission_tests {
                 .is_some_and(|m| m.root == fixture.roots[0])));
     }
 
+    /// [behaviour] Containment contract: new due horizon advances 64 missing paths then next after reload.
     #[test]
     fn terminal_off_new_due_horizon_advances_64_missing_paths_then_next_after_reload() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -5093,18 +5100,21 @@ fn terminal_off_red_retries_rearm_once_per_generation(context: Option<&str>, lat
     assert_eq!(toggled["rearmed_index_files"], 3);
 }
 
+/// [regress] Containment regression: red retries with no adopted context rearm stale families once.
 #[test]
 fn terminal_off_red_retries_with_no_adopted_context_rearm_stale_families_once() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
     terminal_off_red_retries_rearm_once_per_generation(None, false);
 }
 
+/// [regress] Containment regression: red retries with a latched contract rearm stale families once.
 #[test]
 fn terminal_off_red_retries_with_a_latched_contract_rearm_stale_families_once() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
     terminal_off_red_retries_rearm_once_per_generation(Some(TERMINAL_OFF_DESTINATION), true);
 }
 
+/// [regress] Containment regression: suppressed start still rearms an unacked head.
 /// Lead B B-P2: with the redundant stale clear suppressed, a member whose head
 /// body the server never ACKed is still cleared (Parse); ACKed members keep
 /// their revision (Skip).

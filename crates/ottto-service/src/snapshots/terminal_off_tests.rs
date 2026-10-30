@@ -1,5 +1,50 @@
 use super::*;
 
+pub(super) fn claude_terminal_reconstructed(index: &ScanIndex, window: &str) -> bool {
+    index
+        .claude_full_rearm_progress
+        .complete_rebuild_read
+        .as_ref()
+        .is_some_and(|proof| {
+            proof.origin.process == claude_full_rearm_process()
+                && proof.origin.window_ends.contains(window)
+                && proof.members_digest == claude_rebuild_members_digest(index)
+                && index.claude_full_rearm_progress.traversal_origin.as_ref() == Some(&proof.origin)
+        })
+        && claude_family_members_unobserved_count(index, window, false) == 0
+        && index
+            .claude_usage_family_pending
+            .values()
+            .all(|p| !p.invalid && p.census_window_end == window)
+        && index.decode_holds.is_empty()
+        && !index.bounded_sweep_had_unsettled_upload
+        && index.claude_usage_authority_quarantine.is_empty()
+        && index.claude_account_deferred_holds.is_empty()
+        && complete_claude_family_members(index)
+            .iter()
+            .all(|(root, members)| {
+                index
+                    .claude_usage_family_pending
+                    .get(root)
+                    .is_some_and(|pending| {
+                        !pending.invalid
+                            && pending.census_window_end == window
+                            && pending
+                                .member_request_id_hashes
+                                .keys()
+                                .cloned()
+                                .collect::<BTreeSet<_>>()
+                                == *members
+                            && pending
+                                .member_occurrences
+                                .keys()
+                                .cloned()
+                                .collect::<BTreeSet<_>>()
+                                == *members
+                    })
+            })
+}
+
 const OFF_ROOT: &str = "a1111111-1111-4111-8111-111111111111";
 const OFF_CHILD: &str = "agent-a4d1585d310070d0f";
 const W1: &str = "2026-08-20T10:02:00Z";
@@ -93,6 +138,7 @@ fn off_accept(index: &mut ScanIndex, result: &SourceScanResult) {
     }
 }
 
+/// [behaviour] Containment contract: w1 w2 open fence skipped duplicate never verifies.
 #[test]
 fn terminal_off_w1_w2_open_fence_skipped_duplicate_never_verifies() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -272,6 +318,7 @@ fn terminal_off_w1_w2_open_fence_skipped_duplicate_never_verifies() {
     }
 }
 
+/// [behaviour] Containment contract: hard reenable requires reconstruction even after reload.
 #[test]
 fn terminal_off_hard_reenable_requires_reconstruction_even_after_reload() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -289,6 +336,7 @@ fn terminal_off_hard_reenable_requires_reconstruction_even_after_reload() {
     assert!(!claude_terminal_authority(&loaded, true, W2));
 }
 
+/// [behaviour] Containment contract: fresh start zero parses and bounded identity samples.
 #[test]
 fn terminal_off_fresh_start_zero_parses_and_bounded_identity_samples() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -348,6 +396,7 @@ fn terminal_off_fresh_start_zero_parses_and_bounded_identity_samples() {
         .all(|e| !e.source_file_fingerprint.is_empty()));
 }
 
+/// [behaviour] Containment contract: sample mismatch uses ordinary changed file path.
 #[test]
 fn terminal_off_sample_mismatch_uses_ordinary_changed_file_path() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -378,13 +427,11 @@ fn terminal_off_sample_mismatch_uses_ordinary_changed_file_path() {
         index.files[&local_index_key(&path)].source_file_fingerprint,
         old
     );
-    index
-        .claude_full_rearm_progress
-        .terminal_off_rediscovery_after = 0;
     let quiet = off_scan(&mut index, &scratch, W2, 10);
     assert_eq!(quiet.scanned_file_count, 0, "changed file read once");
 }
 
+/// [behaviour] Containment contract: offline create overflow and cadence discover without restart.
 #[test]
 fn terminal_off_offline_create_overflow_and_cadence_discover_without_restart() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -419,6 +466,7 @@ fn terminal_off_offline_create_overflow_and_cadence_discover_without_restart() {
     }
 }
 
+/// [behaviour] Containment contract: selected save requeues earlier failed page and keeps clear debt.
 #[test]
 fn terminal_off_selected_save_requeues_earlier_failed_page_and_keeps_clear_debt() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -469,6 +517,7 @@ fn terminal_off_selected_save_requeues_earlier_failed_page_and_keeps_clear_debt(
     );
 }
 
+/// [behaviour] Containment contract: delete defers all raw effects and full rearm.
 #[test]
 fn terminal_off_delete_defers_all_raw_effects_and_full_rearm() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -516,6 +565,7 @@ fn terminal_off_delete_defers_all_raw_effects_and_full_rearm() {
     assert_eq!(index.files[&key].source_file_fingerprint, before);
 }
 
+/// [behaviour] Containment contract: context change and contract debt still select.
 #[test]
 fn terminal_off_context_change_and_contract_debt_still_select() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -552,29 +602,24 @@ fn terminal_off_context_change_and_contract_debt_still_select() {
     );
 }
 
+/// [format] Process-local containment state preserves persisted bytes and recovery safety.
 #[test]
 fn terminal_off_process_state_preserves_old_decoder_shape() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let mut index = off_index();
     let before = serde_json::to_value(&index.claude_full_rearm_progress).unwrap();
-    index
-        .claude_full_rearm_progress
-        .terminal_off_rediscovery_after = 12345;
+    index.claude_full_rearm_progress.rebuild_read_full = true;
     let after = serde_json::to_value(&index.claude_full_rearm_progress).unwrap();
     assert_eq!(
         before, after,
         "cadence is process-local; no new persisted key"
     );
     let loaded: ScanIndex = serde_json::from_value(serde_json::to_value(index).unwrap()).unwrap();
-    assert_eq!(
-        loaded
-            .claude_full_rearm_progress
-            .terminal_off_rediscovery_after,
-        0
-    );
+    assert!(!loaded.claude_full_rearm_progress.rebuild_read_full);
 }
 
+/// [behaviour] Containment contract: held selected save reload preserves unaccepted retry.
 #[test]
 fn terminal_off_held_selected_save_reload_preserves_unaccepted_retry() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -613,6 +658,7 @@ fn terminal_off_held_selected_save_reload_preserves_unaccepted_retry() {
     );
 }
 
+/// [behaviour] Containment contract: rediscovery reauthorizes only current symlink target.
 #[cfg(unix)]
 #[test]
 fn terminal_off_rediscovery_reauthorizes_only_current_symlink_target() {
@@ -660,9 +706,6 @@ fn terminal_off_rediscovery_reauthorizes_only_current_symlink_target() {
             watcher_hint: false,
         });
     // Not due by cadence; root authorization must nevertheless change now.
-    index
-        .claude_full_rearm_progress
-        .terminal_off_rediscovery_after = u64::MAX;
     let page = off_scan(&mut index, &configured, W2, 10);
     assert_eq!(page.scanned_file_count, 1);
     assert!(index.claude_stale_family_carry.replay.is_empty());
@@ -677,6 +720,7 @@ fn terminal_off_rediscovery_reauthorizes_only_current_symlink_target() {
     assert_eq!(index.traversal.as_ref().unwrap().scan_roots, vec![b]);
 }
 
+/// [behaviour] Containment contract: fresh context reselection is disclosed until adoption.
 #[test]
 fn terminal_off_fresh_context_reselection_is_disclosed_until_adoption() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -696,9 +740,6 @@ fn terminal_off_fresh_context_reselection_is_disclosed_until_adoption() {
     };
     let first = off_scan(&mut index, &scratch, W1, 10);
     off_accept(&mut index, &first);
-    index
-        .claude_full_rearm_progress
-        .terminal_off_rediscovery_after = 0;
     let second = off_scan(&mut index, &scratch, W2, 10);
     assert_eq!(
         second.scanned_file_count, 1,
@@ -709,6 +750,7 @@ fn terminal_off_fresh_context_reselection_is_disclosed_until_adoption() {
     assert!(!second.census_complete);
 }
 
+/// [format] Process-local containment state preserves persisted bytes and recovery safety.
 #[test]
 fn terminal_off_save_preserves_persisted_fence_and_closes_effective_fence() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -736,6 +778,7 @@ fn terminal_off_save_preserves_persisted_fence_and_closes_effective_fence() {
     }
 }
 
+/// [behaviour] Containment contract: old reader owned start correction quiesces with custody.
 #[test]
 fn terminal_off_old_reader_owned_start_correction_quiesces_with_custody() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -791,6 +834,7 @@ fn terminal_off_old_reader_owned_start_correction_quiesces_with_custody() {
     assert!(TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get) > before);
 }
 
+/// [behaviour] Containment contract: ctime only counts one file two observations per walk.
 #[cfg(unix)]
 #[test]
 fn terminal_off_ctime_only_counts_one_file_two_observations_per_walk() {
@@ -844,6 +888,7 @@ fn terminal_off_ctime_only_counts_one_file_two_observations_per_walk() {
     START_IDENTITY_SAMPLES.with(|counts| assert_eq!(counts.borrow().observations, 0));
 }
 
+/// [behaviour] Containment contract: retention gauges never grant custody credit.
 #[test]
 fn terminal_off_retention_gauges_never_grant_custody_credit() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -869,6 +914,7 @@ fn terminal_off_retention_gauges_never_grant_custody_credit() {
     assert!(index.claude_usage_family_witnesses.is_empty());
 }
 
+/// [behaviour] Containment contract: unproven pending is counted without settlement or proof.
 #[test]
 fn terminal_off_unproven_pending_is_counted_without_settlement_or_proof() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -901,6 +947,7 @@ fn terminal_off_unproven_pending_is_counted_without_settlement_or_proof() {
     assert_eq!(serde_json::to_value(&index).unwrap(), before);
 }
 
+/// [behaviour] Containment contract: pending behind old witness is still counted and unproven.
 #[test]
 fn terminal_off_pending_behind_old_witness_is_still_counted_and_unproven() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -934,6 +981,7 @@ fn terminal_off_pending_behind_old_witness_is_still_counted_and_unproven() {
     assert_eq!(serde_json::to_value(&index).unwrap(), before);
 }
 
+/// [behaviour] Containment contract: cancellation replay precedes repeated held fifo on one file pages.
 #[test]
 fn terminal_off_cancellation_replay_precedes_repeated_held_fifo_on_one_file_pages() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -975,6 +1023,7 @@ fn terminal_off_cancellation_replay_precedes_repeated_held_fifo_on_one_file_page
     assert_eq!(queue.len(), 1, "held custody remains queued, never settled");
 }
 
+/// [behaviour] Containment contract: rediscovery deadline survives two save load cycles.
 #[test]
 fn terminal_off_rediscovery_deadline_survives_two_save_load_cycles() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -995,12 +1044,6 @@ fn terminal_off_rediscovery_deadline_survives_two_save_load_cycles() {
         index.save(&index_path).unwrap();
         index = ScanIndex::load(&index_path).unwrap();
         index.activate_upload_context("settled-destination".into());
-        assert_eq!(
-            index
-                .claude_full_rearm_progress
-                .terminal_off_rediscovery_after,
-            0
-        );
         let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
         refresh_terminal_off_discovery_at_test(&mut index, &[scratch.to_path_buf()], at, false);
         assert!(
@@ -1082,6 +1125,7 @@ fn terminal_off_rediscovery_deadline_survives_two_save_load_cycles() {
     assert!(!first.census_complete);
 }
 
+/// [behaviour] Containment contract: rediscovery memo is bounded and eviction fails toward rewalk.
 #[test]
 fn terminal_off_rediscovery_memo_is_bounded_and_eviction_fails_toward_rewalk() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -1101,6 +1145,7 @@ fn terminal_off_rediscovery_memo_is_bounded_and_eviction_fails_toward_rewalk() {
     assert!(terminal_off_rediscovery_due("scope-0".into(), 100, false));
 }
 
+/// [behaviour] Containment contract: service round preserves failed page retry without minting completion.
 #[test]
 fn terminal_off_service_round_preserves_failed_page_retry_without_minting_completion() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -1153,6 +1198,7 @@ fn terminal_off_service_round_preserves_failed_page_retry_without_minting_comple
     assert!(!claude_terminal_authority(&index, true, W1));
 }
 
+/// [behaviour] Containment contract: idle cadence never parks already owed read work.
 #[test]
 fn terminal_off_idle_cadence_never_parks_already_owed_read_work() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -1256,6 +1302,7 @@ fn terminal_off_idle_cadence_never_parks_already_owed_read_work() {
     }
 }
 
+/// [behaviour] Containment contract: counterfactual preview preserves the actual discovery turn.
 #[test]
 fn terminal_off_counterfactual_preview_preserves_the_actual_discovery_turn() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -1282,6 +1329,7 @@ fn terminal_off_counterfactual_preview_preserves_the_actual_discovery_turn() {
     );
 }
 
+/// [behaviour] Containment contract: unhinted append waits for real cadence then is discovered.
 #[test]
 fn terminal_off_unhinted_append_waits_for_real_cadence_then_is_discovered() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -1323,6 +1371,7 @@ fn terminal_off_unhinted_append_waits_for_real_cadence_then_is_discovered() {
     assert!(!changed.census_complete);
 }
 
+/// [behaviour] Containment contract: captured audit clock survives yields and owns rediscovery deadline.
 #[test]
 fn terminal_off_captured_audit_clock_survives_yields_and_owns_rediscovery_deadline() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -1404,6 +1453,7 @@ fn terminal_off_captured_audit_clock_survives_yields_and_owns_rediscovery_deadli
     );
 }
 
+/// [behaviour] Containment contract: empty context memo is bounded counts eviction and never grants credit.
 #[test]
 fn terminal_off_empty_context_memo_is_bounded_counts_eviction_and_never_grants_credit() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -1443,6 +1493,7 @@ fn freshness_at(seconds: u64) -> String {
         .unwrap()
 }
 
+/// [behaviour] Containment contract: saturated drain ceiling picks up unhinted create and rename over.
 /// The real scanner drains a backlog while one selected entry retains genuine
 /// cleared-fingerprint debt. No ACK/receipt or completion is synthesized.
 #[test]
@@ -1623,6 +1674,7 @@ fn terminal_off_saturated_drain_ceiling_picks_up_unhinted_create_and_rename_over
     }
 }
 
+/// [behaviour] Containment contract: targeted adoption is page bounded deduplicated and never census.
 #[test]
 fn terminal_off_targeted_adoption_is_page_bounded_deduplicated_and_never_census() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -1729,6 +1781,7 @@ fn terminal_off_targeted_adoption_is_page_bounded_deduplicated_and_never_census(
     }
 }
 
+/// [behaviour] Containment contract: watcher hint keeps same stat park then stat change reads once.
 #[test]
 fn terminal_off_watcher_hint_keeps_same_stat_park_then_stat_change_reads_once() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -1801,6 +1854,7 @@ fn terminal_off_watcher_hint_keeps_same_stat_park_then_stat_change_reads_once() 
     sampled_audit::reset_open_backoff_for_test();
 }
 
+/// [behaviour] Containment contract: two blocking held keys wait for the existing six hour floor.
 #[test]
 fn terminal_off_two_blocking_held_keys_wait_for_the_existing_six_hour_floor() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -1843,6 +1897,7 @@ fn terminal_off_two_blocking_held_keys_wait_for_the_existing_six_hour_floor() {
     assert!(index.accepted_snapshot_fingerprints.is_empty());
 }
 
+/// [regress] Containment regression: new round observes targeted pending and floor blocked presence.
 #[test]
 fn terminal_off_new_round_observes_targeted_pending_and_floor_blocked_presence() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -1958,6 +2013,7 @@ fn terminal_off_new_round_observes_targeted_pending_and_floor_blocked_presence()
     assert!(index.accepted_snapshot_fingerprints.is_empty());
 }
 
+/// [behaviour] Containment contract: hint preserves quarantined presence without forced family reads.
 #[test]
 fn terminal_off_hint_preserves_quarantined_presence_without_forced_family_reads() {
     let _on = ClaudeTerminalOffForTest::enabled();
@@ -2041,6 +2097,7 @@ fn terminal_off_hint_preserves_quarantined_presence_without_forced_family_reads(
     }
 }
 
+/// [behaviour] Containment contract: to default off discards retained checkpoint before reconciliation.
 #[test]
 fn terminal_off_to_default_off_discards_retained_checkpoint_before_reconciliation() {
     assert!(!claude_terminal_off());
@@ -2112,6 +2169,7 @@ fn terminal_off_to_default_off_discards_retained_checkpoint_before_reconciliatio
     );
 }
 
+/// [regress] Containment regression: unacked head stays parse and is reoffered beside an acked control.
 /// Lead B B-P2 on real files at the production default (no completion
 /// override): a stale family whose unchanged head was never ACKed stays Parse
 /// and its head is offered again; the ACKed control keeps its suppressed
@@ -2187,9 +2245,6 @@ fn terminal_off_unacked_head_stays_parse_and_is_reoffered_beside_an_acked_contro
         index.files[&acked_key].last_upload_body_witness,
         previous.files[&acked_key].last_upload_body_witness
     );
-    index
-        .claude_full_rearm_progress
-        .terminal_off_rediscovery_after = 0;
     let acked_revision = index.files[&acked_key].source_file_fingerprint.clone();
     let page = off_scan(&mut index, &root, W2, 10);
     assert!(
@@ -2211,6 +2266,7 @@ fn terminal_off_unacked_head_stays_parse_and_is_reoffered_beside_an_acked_contro
     assert!(!index.files[&unacked_key].source_file_fingerprint.is_empty());
 }
 
+/// [behaviour] Containment contract: stale clear memo is bounded and eviction fails toward another clear.
 #[test]
 fn terminal_off_stale_clear_memo_is_bounded_and_eviction_fails_toward_another_clear() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();

@@ -52,6 +52,7 @@ impl Drop for ClaudeCompletionPathsForTest {
 mod completion_policy_tests {
     use super::*;
 
+    /// [behaviour] Containment contract: money upload and history suites have no completion override.
     #[test]
     fn money_upload_and_history_suites_have_no_completion_override() {
         for (suite, source) in [
@@ -96,6 +97,7 @@ mod completion_policy_tests {
         assert!(!claude_terminal_off(), "release default is main");
     }
 
+    /// [behaviour] Containment contract: release terminal policy defaults off and fixture override is thread scoped.
     #[test]
     fn release_terminal_policy_defaults_off_and_fixture_override_is_thread_scoped() {
         assert!(!claude_terminal_off());
@@ -126,52 +128,6 @@ mod completion_policy_tests {
 // In particular an old reader must reload the pre-containment fence value.
 fn claude_effective_duplicate_fence_closed(index: &ScanIndex) -> bool {
     claude_terminal_off() || index.claude_duplicate_request_witness_overflowed
-}
-
-#[cfg(test)]
-fn claude_terminal_reconstructed(index: &ScanIndex, window: &str) -> bool {
-    index
-        .claude_full_rearm_progress
-        .complete_rebuild_read
-        .as_ref()
-        .is_some_and(|proof| {
-            proof.origin.process == claude_full_rearm_process()
-                && proof.origin.window_ends.contains(window)
-                && proof.members_digest == claude_rebuild_members_digest(index)
-                && index.claude_full_rearm_progress.traversal_origin.as_ref() == Some(&proof.origin)
-        })
-        && claude_family_members_unobserved_count(index, window, false) == 0
-        && index
-            .claude_usage_family_pending
-            .values()
-            .all(|p| !p.invalid && p.census_window_end == window)
-        && index.decode_holds.is_empty()
-        && !index.bounded_sweep_had_unsettled_upload
-        && index.claude_usage_authority_quarantine.is_empty()
-        && index.claude_account_deferred_holds.is_empty()
-        && complete_claude_family_members(index)
-            .iter()
-            .all(|(root, members)| {
-                index
-                    .claude_usage_family_pending
-                    .get(root)
-                    .is_some_and(|pending| {
-                        !pending.invalid
-                            && pending.census_window_end == window
-                            && pending
-                                .member_request_id_hashes
-                                .keys()
-                                .cloned()
-                                .collect::<BTreeSet<_>>()
-                                == *members
-                            && pending
-                                .member_occurrences
-                                .keys()
-                                .cloned()
-                                .collect::<BTreeSet<_>>()
-                                == *members
-                    })
-            })
 }
 
 pub(crate) fn claude_terminal_authority(_index: &ScanIndex, offered: bool, _window: &str) -> bool {
@@ -730,9 +686,6 @@ fn refresh_terminal_off_discovery(
     let traversal = index.traversal.as_mut().expect("retained traversal");
     reset_start_identity_samples();
     claude_terminal_rewind(traversal);
-    index
-        .claude_full_rearm_progress
-        .terminal_off_rediscovery_after = now.saturating_add(300);
     eprintln!("claude_terminal_off rediscovery=1 watcher_loss={} resolved_roots_changed={} directories={} bytes=0: bounded stat/readdir; candidate identity samples counted separately", u8::from(overflow), u8::from(changed), traversal.pending_directories.len());
 }
 
@@ -1268,6 +1221,7 @@ impl ScanIndex {
 #[cfg(test)]
 mod retention_alarm_tests {
     use super::*;
+    /// [behaviour] Containment contract: retention thresholds alarm once per window without disposing debt.
     #[test]
     fn terminal_off_retention_thresholds_alarm_once_per_window_without_disposing_debt() {
         let _on = ClaudeTerminalOffForTest::enabled();
