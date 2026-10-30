@@ -23,8 +23,6 @@ pub(super) const KINDS: &[&str] = &[
     "setting.claude_retired_family_tombstones_initialized",
     "setting.claude_retired_family_tombstones_uncertain",
 ];
-#[derive(Default)]
-pub(super) struct KindCxCensus;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -426,7 +424,7 @@ fn plain_map<V: PartialEq + Serialize>(
 pub(super) fn populate(
     index: &ScanIndex,
     txn: &mut dyn Transaction,
-    cx: &mut KindCxCensus,
+    cx: &mut KindCx,
 ) -> Result<()> {
     // Full import is into an unpublished empty store; refuse reuse so a full
     // write cannot strand stale references or forgotten tombstones.
@@ -443,7 +441,7 @@ pub(super) fn delta(
     prev: &ScanIndex,
     next: &ScanIndex,
     txn: &mut dyn Transaction,
-    cx: &mut KindCxCensus,
+    cx: &mut KindCx,
 ) -> Result<()> {
     delta_inner(prev, next, txn, cx, false)
 }
@@ -451,7 +449,7 @@ fn delta_inner(
     prev: &ScanIndex,
     next: &ScanIndex,
     tx: &mut dyn Transaction,
-    _: &mut KindCxCensus,
+    _: &mut KindCx,
     full: bool,
 ) -> Result<()> {
     map_delta(
@@ -550,12 +548,20 @@ fn delta_inner(
 
 /// The storage trait has a GAT and begin(&mut self), so dyn Store / &Store
 /// cannot express this operation. Keep the backend-agnostic generic boundary.
-pub(super) fn hydrate<S: Store>(
-    store: &mut S,
+#[cfg(test)]
+pub(super) fn hydrate(
+    store: &mut impl Store,
     index: &mut ScanIndex,
-    _: &mut KindCxCensus,
+    cx: &mut KindCx,
 ) -> Result<()> {
     let mut tx = store.begin(TxnMode::Read)?;
+    hydrate_txn(&mut tx, index, cx)
+}
+pub(super) fn hydrate_txn(
+    tx: &mut dyn Transaction,
+    index: &mut ScanIndex,
+    _: &mut KindCx,
+) -> Result<()> {
     // Stage ONLY this group's fields; an error must not install a partial graph.
     let mut census = ClaudeRequestCensus::default();
     let mut duplicates = DuplicateOwners::new();
@@ -591,13 +597,13 @@ pub(super) fn hydrate<S: Store>(
                 }
                 match *kind {
                     "file.census" => {
-                        let row: CensusRow = read(&mut tx, &h)?;
+                        let row: CensusRow = read(tx, &h)?;
                         ensure!(h.fixed == fixed(&row), "state_v2_census_projection");
                         let hashes = if let Some(id) = row.set {
                             Some(match hash_cache.entry(id) {
                                 std::collections::btree_map::Entry::Occupied(e) => e.get().clone(),
                                 std::collections::btree_map::Entry::Vacant(e) => {
-                                    e.insert(load_hashes(&mut tx, id)?).clone()
+                                    e.insert(load_hashes(tx, id)?).clone()
                                 }
                             })
                         } else {
@@ -613,7 +619,7 @@ pub(super) fn hydrate<S: Store>(
                     }
                     "family.requests" => {
                         let parts = components(key_bytes)?;
-                        let row: FamilyRow = read(&mut tx, &h)?;
+                        let row: FamilyRow = read(tx, &h)?;
                         match (parts.as_slice(), row) {
                             ([root], FamilyRow::Root { members }) => {
                                 families.entry(root.clone()).or_default().0 = Some(members);
@@ -623,14 +629,14 @@ pub(super) fn hydrate<S: Store>(
                                     .entry(root.clone())
                                     .or_default()
                                     .1
-                                    .insert(member.clone(), load_strings(&mut tx, set)?);
+                                    .insert(member.clone(), load_strings(tx, set)?);
                             }
                             _ => anyhow::bail!("state_v2_census_family_key"),
                         }
                     }
                     "v1_field.duplicate_owners" => {
                         let parts = components(key_bytes)?;
-                        match (parts.as_slice(), read::<DuplicateRow>(&mut tx, &h)?) {
+                        match (parts.as_slice(), read::<DuplicateRow>(tx, &h)?) {
                             ([hash], DuplicateRow::Root { owners }) => {
                                 duplicates.entry(hash.clone()).or_default().0 = Some(owners);
                             }
@@ -646,20 +652,20 @@ pub(super) fn hydrate<S: Store>(
                         }
                     }
                     "proof.owned_start" => {
-                        owned.insert(String::from_utf8(key_bytes.clone())?, read(&mut tx, &h)?);
+                        owned.insert(String::from_utf8(key_bytes.clone())?, read(tx, &h)?);
                     }
                     "tombstone.claude_retired_family_tombstones" => {
                         tombstones
                             .entries
-                            .insert(String::from_utf8(key_bytes.clone())?, read(&mut tx, &h)?);
+                            .insert(String::from_utf8(key_bytes.clone())?, read(tx, &h)?);
                     }
                     "v1_field.census_shadow" => {
                         ensure!(key_bytes.is_empty(), "state_v2_census_key");
-                        shadow = Some(read::<CensusManifest>(&mut tx, &h)?);
+                        shadow = Some(read::<CensusManifest>(tx, &h)?);
                     }
                     flag => {
                         ensure!(key_bytes.is_empty(), "state_v2_census_key");
-                        flags.insert(flag, read::<bool>(&mut tx, &h)?);
+                        flags.insert(flag, read::<bool>(tx, &h)?);
                     }
                 }
             }
@@ -1056,7 +1062,7 @@ mod tests {
     }
     fn populate_commit(db: &mut sqlite::Sqlite, index: &ScanIndex) {
         let mut tx = db.begin(TxnMode::Write).unwrap();
-        populate(index, &mut tx, &mut KindCxCensus).unwrap();
+        populate(index, &mut tx, &mut KindCx::default()).unwrap();
         assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
     }
     fn headers(db: &mut sqlite::Sqlite, table: Table) -> Vec<Header> {
@@ -1071,7 +1077,7 @@ mod tests {
         let index = fixture();
         populate_commit(&mut db, &index);
         let mut out = skeleton(&index);
-        hydrate(&mut db, &mut out, &mut KindCxCensus).unwrap();
+        hydrate(&mut db, &mut out, &mut KindCx::default()).unwrap();
         assert_eq!(
             serde_json::to_vec(&subset(&index)).unwrap(),
             serde_json::to_vec(&subset(&out)).unwrap()
@@ -1117,11 +1123,11 @@ mod tests {
         assert_eq!(shared.len(), 1);
         assert!(matches!(shared[0].fixed, Fixed::RequestSet { refs: 2, .. }));
         let mut out = ScanIndex::default();
-        hydrate(&mut db, &mut out, &mut KindCxCensus).unwrap();
+        hydrate(&mut db, &mut out, &mut KindCx::default()).unwrap();
         assert_eq!(index.claude_request_census, out.claude_request_census);
         let next = ScanIndex::default();
         let mut tx = db.begin(TxnMode::Write).unwrap();
-        delta(&index, &next, &mut tx, &mut KindCxCensus).unwrap();
+        delta(&index, &next, &mut tx, &mut KindCx::default()).unwrap();
         assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
         assert!(headers(&mut db, Table::RequestSets).is_empty());
     }
@@ -1141,7 +1147,7 @@ mod tests {
                     tx: &mut tx,
                     mutations: 0,
                 };
-                delta(&index, &index, &mut writes, &mut KindCxCensus).unwrap();
+                delta(&index, &index, &mut writes, &mut KindCx::default()).unwrap();
                 assert_eq!(writes.mutations, 0);
             }
             assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
@@ -1166,7 +1172,7 @@ mod tests {
                 .unwrap()
         ));
         let mut tx = db.begin(TxnMode::Write).unwrap();
-        delta(&index, &next, &mut tx, &mut KindCxCensus).unwrap();
+        delta(&index, &next, &mut tx, &mut KindCx::default()).unwrap();
         assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
         let after = headers(&mut db, Table::Records);
         assert_eq!(headers(&mut db, Table::RequestSets), shared);
@@ -1176,7 +1182,7 @@ mod tests {
             assert!(after.contains(h));
         }
         let mut out = skeleton(&next);
-        hydrate(&mut db, &mut out, &mut KindCxCensus).unwrap();
+        hydrate(&mut db, &mut out, &mut KindCx::default()).unwrap();
         assert_eq!(subset(&out), subset(&next));
     }
 
@@ -1228,7 +1234,7 @@ mod tests {
         assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
         let mut out = skeleton(&index);
         let before = subset(&out);
-        assert!(hydrate(&mut db, &mut out, &mut KindCxCensus).is_err());
+        assert!(hydrate(&mut db, &mut out, &mut KindCx::default()).is_err());
         assert_eq!(subset(&out), before);
     }
 
@@ -1244,7 +1250,7 @@ mod tests {
         assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
         let mut out = skeleton(&index);
         let before = serde_json::to_value(&out).unwrap();
-        assert!(hydrate(&mut db, &mut out, &mut KindCxCensus).is_err());
+        assert!(hydrate(&mut db, &mut out, &mut KindCx::default()).is_err());
         assert_eq!(serde_json::to_value(&out).unwrap(), before);
         for mark in ["~lost", "~saturated", "unknown_money_mark"] {
             let bytes = serde_json::to_vec(&json!({"claude_request_census": {mark: {"new":true}}}))

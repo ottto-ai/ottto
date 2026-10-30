@@ -218,13 +218,13 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     assert!(load_with(&f.path, false, &EmptyMapper).is_err());
 }
 #[test]
-fn pending_mapper_pause_does_not_touch_v1_and_off_cancels_inventory_slot() {
+fn publication_pending_pause_does_not_touch_v1_and_off_cancels_inventory_slot() {
     let f = Fixture::new();
     let bytes = serde_json::to_vec(&ScanIndex::default()).unwrap();
     fs::write(&f.path, &bytes).unwrap();
-    assert!(load_with(&f.path, true, &PendingMapper).unwrap().is_none());
+    assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
     let mut index = ScanIndex::default();
-    import_with(&f.path, &mut index, &PendingMapper).unwrap();
+    import_with(&f.path, &mut index, &ClaudeMapper).unwrap();
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
     assert_eq!(fs::read_dir(f.path.parent().unwrap()).unwrap().count(), 1);
     let f = Fixture::new();

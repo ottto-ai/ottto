@@ -11,18 +11,6 @@ use std::io::{self, Read};
 const SEGMENT: usize = 64 * 1024;
 const PAGE: usize = 64;
 
-/// Integrator-owned resident headers, never a second encoded graph. Populate
-/// or hydrate before delta. Discard/reload this context after ANY txn failure.
-#[derive(Default)]
-pub(super) struct KindCxMisc {
-    rows: BTreeMap<RowKey, (Header, bool)>,
-    /// Inventory supplies ORIGINAL root-field presence before normalization.
-    /// Hydration restores it. None means normalized graph presence (unknown
-    /// original spelling), not evidence that an old slot was present.
-    pub(super) presence: BTreeMap<String, bool>,
-    delta: bool,
-    dirty_fields: Option<BTreeSet<String>>,
-}
 struct Bytes<'a>(&'a [u8]);
 impl Value for Bytes<'_> {
     fn write(&self, out: &mut dyn Write) -> Result<()> {
@@ -30,7 +18,7 @@ impl Value for Bytes<'_> {
         Ok(())
     }
 }
-impl KindCxMisc {
+impl KindCx {
     fn put(&mut self, txn: &mut dyn Transaction, key: RowKey, bytes: &[u8]) -> Result<bool> {
         let value = Bytes(bytes);
         let old = txn.get(&key)?;
@@ -56,7 +44,7 @@ impl KindCxMisc {
                 value: &value,
             })?
         };
-        self.rows.insert(key, (header, true));
+        self.misc_rows.insert(key, (header, true));
         Ok(changed)
     }
     fn finish(&mut self, txn: &mut dyn Transaction, dirty: &BTreeSet<String>) -> Result<()> {
@@ -64,18 +52,18 @@ impl KindCxMisc {
         let mut removed = Vec::new();
         for field in dirty {
             if let Some(kind) = field_kind(field) {
-                dead_kind(&self.rows, kind, &mut removed)?;
+                dead_kind(&self.misc_rows, kind, &mut removed)?;
             }
             if field == "decode_holds" {
-                dead_kind(&self.rows, "v1_field.repair_provenance", &mut removed)?;
+                dead_kind(&self.misc_rows, "v1_field.repair_provenance", &mut removed)?;
                 for kind in KINDS.iter().filter(|k| k.starts_with("raw_hold.")) {
-                    dead_kind(&self.rows, kind, &mut removed)?;
+                    dead_kind(&self.misc_rows, kind, &mut removed)?;
                 }
             }
         }
         for key in removed {
             txn.delete(&key)?;
-            self.rows.remove(&key);
+            self.misc_rows.remove(&key);
         }
         Ok(())
     }
@@ -147,7 +135,7 @@ fn key_parts(key: &RowKey) -> Result<(&[u8], u64)> {
 
 struct Sink<'a> {
     txn: &'a mut dyn Transaction,
-    cx: &'a mut KindCxMisc,
+    cx: &'a mut KindCx,
     kind: &'a str,
     present: u8,
     changed: bool,
@@ -532,7 +520,7 @@ struct Frame {
 }
 struct JsonReader<'a> {
     txn: &'a mut dyn Transaction,
-    cx: &'a mut KindCxMisc,
+    cx: &'a mut KindCx,
     slot: &'a str,
     rows: Rows,
     stack: Vec<Frame>,
@@ -546,7 +534,7 @@ struct JsonReader<'a> {
 impl<'a> JsonReader<'a> {
     fn new(
         txn: &'a mut dyn Transaction,
-        cx: &'a mut KindCxMisc,
+        cx: &'a mut KindCx,
         kind: &str,
         slot: &'a str,
     ) -> Result<Self> {
@@ -571,7 +559,7 @@ impl<'a> JsonReader<'a> {
         );
         let mut bytes = Vec::new();
         self.txn.read_value(&h, &mut bytes)?;
-        self.cx.rows.insert(h.key.clone(), (h, true));
+        self.cx.misc_rows.insert(h.key.clone(), (h, true));
         Ok(bytes)
     }
     fn piece(&mut self) -> Result<Option<Vec<u8>>> {
@@ -702,7 +690,7 @@ fn write_field<T: Serialize + ?Sized>(
     slot: &str,
     kind: &str,
     txn: &mut dyn Transaction,
-    cx: &mut KindCxMisc,
+    cx: &mut KindCx,
 ) -> Result<()> {
     let present = cx.presence.get(slot).map_or(2, |p| u8::from(*p));
     let delta = cx.delta;
@@ -727,7 +715,7 @@ fn read_field<T: serde::de::DeserializeOwned>(
     slot: &str,
     kind: &str,
     txn: &mut dyn Transaction,
-    cx: &mut KindCxMisc,
+    cx: &mut KindCx,
 ) -> Result<T> {
     Ok(serde_json::from_reader(JsonReader::new(
         txn, cx, kind, slot,
@@ -748,7 +736,7 @@ fn read_membership(
     slot: &str,
     kind: &str,
     txn: &mut dyn Transaction,
-    cx: &mut KindCxMisc,
+    cx: &mut KindCx,
 ) -> Result<BTreeSet<String>> {
     // One field's native membership is the hydrated graph, not a JSON copy.
     struct Set(BTreeSet<String>);
@@ -782,6 +770,10 @@ fn read_membership(
 // This registry is deliberately explicit: unknown fields never fall through.
 macro_rules! fields {
     ($apply:ident) => {
+        $apply!(
+            upload_context_fingerprint,
+            "setting.upload_context_fingerprint"
+        );
         $apply!(
             known_configured_scan_roots,
             "v1_field.known_configured_scan_roots"
@@ -1001,6 +993,7 @@ macro_rules! fields {
 }
 
 pub(super) const KINDS: &[&str] = &[
+    "setting.upload_context_fingerprint",
     "v1_field.known_configured_scan_roots",
     "v1_field.legacy_unresolved_root_file_witnesses",
     "v1_field.codex_state_only_snapshot_fingerprints",
@@ -1084,7 +1077,7 @@ struct HoldSlot {
     owner: Option<(usize, usize)>,
     charge: u64,
 }
-fn write_holds(index: &ScanIndex, txn: &mut dyn Transaction, cx: &mut KindCxMisc) -> Result<()> {
+fn write_holds(index: &ScanIndex, txn: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
     let mut metadata = HoldMetadata {
         provenance: index.decode_holds.v2_provenance(),
         ..Default::default()
@@ -1112,7 +1105,7 @@ fn write_holds(index: &ScanIndex, txn: &mut dyn Transaction, cx: &mut KindCxMisc
         cx,
     )
 }
-fn read_holds(index: &mut ScanIndex, txn: &mut dyn Transaction, cx: &mut KindCxMisc) -> Result<()> {
+fn read_holds(index: &mut ScanIndex, txn: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
     let metadata: HoldMetadata = read_field("decode_holds", "v1_field.repair_provenance", txn, cx)?;
     let mut holds = super::super::lenient_decode::Holds::default();
     let mut expected = 0;
@@ -1139,7 +1132,7 @@ fn read_holds(index: &mut ScanIndex, txn: &mut dyn Transaction, cx: &mut KindCxM
                 slot.owner.map(|(a, b)| a..b),
                 slot.charge,
             )?;
-            cx.rows.insert(key, (h, true));
+            cx.misc_rows.insert(key, (h, true));
             expected += 1;
         }
     }
@@ -1161,7 +1154,7 @@ fn control<T: Serialize>(
     name: &str,
     value: &T,
     txn: &mut dyn Transaction,
-    cx: &mut KindCxMisc,
+    cx: &mut KindCx,
 ) -> Result<()> {
     cx.put(txn, RowKey::Meta(name.into()), &serde_json::to_vec(value)?)?;
     Ok(())
@@ -1169,7 +1162,7 @@ fn control<T: Serialize>(
 fn read_control<T: serde::de::DeserializeOwned>(
     name: &str,
     txn: &mut dyn Transaction,
-    cx: &mut KindCxMisc,
+    cx: &mut KindCx,
 ) -> Result<T> {
     let h = txn
         .get(&RowKey::Meta(name.into()))?
@@ -1181,14 +1174,14 @@ fn read_control<T: serde::de::DeserializeOwned>(
     let mut bytes = Vec::new();
     txn.read_value(&h, &mut bytes)?;
     let value = serde_json::from_slice(&bytes)?;
-    cx.rows.insert(h.key.clone(), (h, true));
+    cx.misc_rows.insert(h.key.clone(), (h, true));
     Ok(value)
 }
 
 pub(super) fn populate(
     index: &ScanIndex,
     txn: &mut dyn Transaction,
-    cx: &mut KindCxMisc,
+    cx: &mut KindCx,
 ) -> Result<()> {
     control("schema_version", &index.schema_version, txn, cx)?;
     control("generation", &index.generation, txn, cx)?;
@@ -1268,7 +1261,7 @@ pub(super) fn populate(
 pub(super) fn hydrate<S: Store>(
     store: &mut S,
     index: &mut ScanIndex,
-    cx: &mut KindCxMisc,
+    cx: &mut KindCx,
 ) -> Result<()> {
     let mut txn = store.begin(TxnMode::Read)?;
     hydrate_txn(&mut txn, index, cx)
@@ -1276,7 +1269,7 @@ pub(super) fn hydrate<S: Store>(
 pub(super) fn hydrate_txn(
     txn: &mut dyn Transaction,
     index: &mut ScanIndex,
-    cx: &mut KindCxMisc,
+    cx: &mut KindCx,
 ) -> Result<()> {
     index.schema_version = read_control("schema_version", txn, cx)?;
     index.generation = read_control("generation", txn, cx)?;
@@ -1330,8 +1323,8 @@ fn kind_range(kind: &str) -> Result<(std::ops::Bound<RowKey>, std::ops::Bound<Ro
         std::ops::Bound::Excluded(upper),
     ))
 }
-fn mark_kind(cx: &mut KindCxMisc, kind: &str) -> Result<()> {
-    for (_, (_, live)) in cx.rows.range_mut(kind_range(kind)?) {
+fn mark_kind(cx: &mut KindCx, kind: &str) -> Result<()> {
+    for (_, (_, live)) in cx.misc_rows.range_mut(kind_range(kind)?) {
         *live = false;
     }
     Ok(())
@@ -1352,7 +1345,7 @@ fn dead_kind(
 /// A dirty plan is mandatory, including an explicitly empty no-op plan.
 /// The integrator derives it from the selected logical mutation unit; absent
 /// tracking refuses the save rather than guessing from normalized history.
-impl KindCxMisc {
+impl KindCx {
     pub(super) fn plan_delta(
         &mut self,
         fields: impl IntoIterator<Item = impl Into<String>>,
@@ -1370,7 +1363,7 @@ impl KindCxMisc {
         Ok(())
     }
 }
-fn field_kind(field: &str) -> Option<&'static str> {
+pub(super) fn field_kind(field: &str) -> Option<&'static str> {
     let mut kind = None;
     macro_rules! lookup {
         ($field:ident, $kind:literal) => {
@@ -1386,10 +1379,11 @@ pub(super) fn delta(
     _prev: &ScanIndex,
     next: &ScanIndex,
     txn: &mut dyn Transaction,
-    cx: &mut KindCxMisc,
+    cx: &mut KindCx,
 ) -> Result<()> {
     ensure!(
-        cx.rows.contains_key(&RowKey::Meta("schema_version".into())),
+        cx.misc_rows
+            .contains_key(&RowKey::Meta("schema_version".into())),
         "state_v2_misc_context_required"
     );
     let dirty = cx
@@ -1412,7 +1406,7 @@ pub(super) fn delta(
         }
     }
     for name in CONTROLS.iter().filter(|name| dirty.contains(**name)) {
-        if let Some((_, live)) = cx.rows.get_mut(&RowKey::Meta((*name).into())) {
+        if let Some((_, live)) = cx.misc_rows.get_mut(&RowKey::Meta((*name).into())) {
             *live = false;
         }
     }
@@ -1759,8 +1753,8 @@ mod tests {
             value: &value,
         })
         .unwrap();
-        let mut cx = KindCxMisc::default();
-        cx.rows.insert(key, (h, true));
+        let mut cx = KindCx::default();
+        cx.misc_rows.insert(key, (h, true));
         assert!(delta(&index, &index, &mut NoStorageAccess, &mut cx).is_err());
         assert!(cx.plan_delta(["files"]).is_err()); // another group's state cannot be silently skipped
         cx.plan_delta(std::iter::empty::<String>()).unwrap();
@@ -1775,13 +1769,13 @@ mod tests {
         let v1 = serde_json::to_vec(&index).unwrap();
         index = super::super::super::lenient_decode::read_bounded(&v1).unwrap();
         let before = serde_json::to_vec(&index).unwrap();
-        let mut cx = KindCxMisc::default();
+        let mut cx = KindCx::default();
         let mut txn = db.begin(TxnMode::Write).unwrap();
         populate(&index, &mut txn, &mut cx).unwrap();
         assert_eq!(txn.commit(0, 1), DurableCommitOutcome::Committed(1));
         index.generation = 1;
         let mut restored = ScanIndex::default();
-        let mut loaded = KindCxMisc::default();
+        let mut loaded = KindCx::default();
         hydrate(&mut db, &mut restored, &mut loaded).unwrap();
         assert_eq!(
             serde_json::to_vec(&restored).unwrap(),
@@ -1817,13 +1811,13 @@ mod tests {
     fn unchanged_delta_writes_nothing_and_member_insertion_keeps_neighbor_rows() {
         let (_tmp, mut db) = Scratch::store();
         let mut before = fixture();
-        let mut cx = KindCxMisc::default();
+        let mut cx = KindCx::default();
         let mut txn = db.begin(TxnMode::Write).unwrap();
         populate(&before, &mut txn, &mut cx).unwrap();
         assert_eq!(txn.commit(0, 1), DurableCommitOutcome::Committed(1));
         before.generation = 1;
         let mut txn = db.begin(TxnMode::Write).unwrap();
-        let unchanged = cx.rows.clone();
+        let unchanged = cx.misc_rows.clone();
         cx.plan_delta(std::iter::empty::<String>()).unwrap();
         delta(&before, &before, &mut txn, &mut cx).unwrap();
         for (key, (header, _)) in &unchanged {
@@ -1850,7 +1844,7 @@ mod tests {
     fn presence_empty_null_zero_and_unknown_are_separate_and_runtime_is_ephemeral() {
         let (_tmp, mut db) = Scratch::store();
         let index = ScanIndex::default();
-        let mut cx = KindCxMisc::default();
+        let mut cx = KindCx::default();
         cx.presence
             .insert("claude_history_cutoff_unix_seconds".into(), false);
         cx.presence
@@ -1863,7 +1857,7 @@ mod tests {
             .reason_reoffer_retries
             .insert("lease".into(), "body".into());
         restored.claude_history_unverified_in_process = true;
-        let mut loaded = KindCxMisc::default();
+        let mut loaded = KindCx::default();
         hydrate(&mut db, &mut restored, &mut loaded).unwrap();
         assert_eq!(
             loaded.presence.get("claude_history_cutoff_unix_seconds"),
@@ -1902,7 +1896,7 @@ mod tests {
     fn segmented_unicode_values_and_ordered_queues_reassemble_without_a_second_graph() {
         let (_tmp, mut db) = Scratch::store();
         let mut txn = db.begin(TxnMode::Write).unwrap();
-        let mut cx = KindCxMisc::default();
+        let mut cx = KindCx::default();
         let value = vec!["é".repeat(SEGMENT * 2), "tail".into()];
         write_field(
             &value,
@@ -1915,13 +1909,13 @@ mod tests {
         let restored: Vec<String> =
             read_field("traversal", "scan_state.traversal", &mut txn, &mut cx).unwrap();
         assert_eq!(restored, value);
-        assert!(cx.rows.values().all(|(h, _)| h.len <= SEGMENT as u64));
+        assert!(cx.misc_rows.values().all(|(h, _)| h.len <= SEGMENT as u64));
     }
     #[test]
     fn missing_and_extra_children_and_missing_segments_refuse_hydration() {
         let (_tmp, mut db) = Scratch::store();
         let mut txn = db.begin(TxnMode::Write).unwrap();
-        let mut cx = KindCxMisc::default();
+        let mut cx = KindCx::default();
         write_field(
             &vec!["one", "two"],
             "traversal",

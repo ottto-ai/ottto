@@ -556,31 +556,32 @@ pub(super) trait ResumeHooks {
         prev: &ScanIndex,
         next: &ScanIndex,
         current: &BTreeMap<String, ResumeCheckpoint>,
-    ) -> Result<StagedCheckpoints>;
+    ) -> Result<StagedCheckpoints> {
+        let _ = (prev, next, current);
+        Ok(StagedCheckpoints::default())
+    }
     /// Same owner lock, only after an unambiguous durable commit. R1 protects
     /// current, staging, predecessor, backup and unresolved recovery roots.
     fn post_commit(
         &mut self,
         generation: u64,
         current: &BTreeMap<String, ResumeCheckpoint>,
-    ) -> Result<()>;
+    ) -> Result<()> {
+        let _ = (generation, current);
+        Ok(())
+    }
 }
-struct Prepared {
+/// A buildable seam before R1 installs its adapter. Preflight still refuses
+/// advancing an active file without a freshly staged reference.
+pub(super) struct NoResumeHooks;
+impl ResumeHooks for NoResumeHooks {}
+pub(super) struct Prepared {
     generation: u64,
     signature: [u8; 32],
     checkpoints: BTreeMap<String, ResumeCheckpoint>,
 }
-#[derive(Default)]
-pub(super) struct KindCxFiles {
-    pub binding: Option<super::super::scan_index_persistence::Binding>,
-    committed: BTreeMap<String, ResumeCheckpoint>,
-    prepared: Option<Prepared>,
-    ambiguous: bool,
-    // Legacy populate may lack references; every hydrated/live save requires
-    // fresh staging, even after the final previously protected file finishes.
-    require_preflight: bool,
-}
-impl KindCxFiles {
+
+impl KindCx {
     pub(super) fn checkpoints(&self) -> &BTreeMap<String, ResumeCheckpoint> {
         &self.committed
     }
@@ -694,7 +695,7 @@ impl KindCxFiles {
 pub(super) fn populate(
     index: &ScanIndex,
     txn: &mut dyn Transaction,
-    cx: &mut KindCxFiles,
+    cx: &mut KindCx,
 ) -> Result<()> {
     delta(&ScanIndex::default(), index, txn, cx)
 }
@@ -702,7 +703,7 @@ pub(super) fn delta(
     prev: &ScanIndex,
     next: &ScanIndex,
     txn: &mut dyn Transaction,
-    cx: &mut KindCxFiles,
+    cx: &mut KindCx,
 ) -> Result<()> {
     ensure!(!cx.ambiguous, "state_v2_resume_reopen_required");
     if let Some(prepared) = &cx.prepared {
@@ -823,18 +824,26 @@ pub(super) fn delta(
 
 // Store has a GAT and begin requires &mut self: it cannot be a `dyn Store`.
 // Keep the existing engine abstraction rather than exposing SQLite here.
-pub(super) fn hydrate<S: Store>(
-    store: &mut S,
+#[cfg(test)]
+pub(super) fn hydrate(
+    store: &mut impl Store,
     index: &mut ScanIndex,
-    cx: &mut KindCxFiles,
+    cx: &mut KindCx,
+) -> Result<()> {
+    let mut tx = store.begin(TxnMode::Read)?;
+    hydrate_txn(&mut tx, index, cx)
+}
+pub(super) fn hydrate_txn(
+    txn: &mut dyn Transaction,
+    index: &mut ScanIndex,
+    cx: &mut KindCx,
 ) -> Result<()> {
     ensure!(
         !cx.ambiguous && cx.prepared.is_none(),
         "state_v2_resume_reopen_required"
     );
-    let mut txn = store.begin(TxnMode::Read)?;
     let mut files = BTreeMap::new();
-    rows(&mut txn, "file.progress", |header, path, bytes| {
+    rows(txn, "file.progress", |header, path, bytes| {
         singleton(header)?;
         let entry = typed::<EntryWire>(bytes)?.entry();
         ensure!(
@@ -845,25 +854,25 @@ pub(super) fn hydrate<S: Store>(
         Ok(())
     })?;
     let receipts: BTreeMap<String, super::super::upload_context_receipt::Receipt> =
-        read_map(&mut txn, "file.receipt")?;
+        read_map(txn, "file.receipt")?;
     for (path, receipt) in receipts {
         files
             .get_mut(&path)
             .context("state_v2_receipt_orphan")?
             .upload_context_receipt = Some(receipt);
     }
-    let terminal: BTreeMap<String, TerminalJsonlDisposition> = read_map(&mut txn, "file.terminal")?;
-    let activity = read_map(&mut txn, "accepted.activity")?;
+    let terminal: BTreeMap<String, TerminalJsonlDisposition> = read_map(txn, "file.terminal")?;
+    let activity = read_map(txn, "accepted.activity")?;
     let titles: BTreeMap<String, ClaudeDesktopTitleIndexEntry> =
-        read_map(&mut txn, "v1_field.claude_desktop_title_files")?;
-    let growth = read_map(&mut txn, "file.growth_retention")?;
-    let entity_sets = read_entities(&mut txn)?;
-    let empty: BTreeMap<String, bool> = read_map(&mut txn, "file.confirmed_empty")?;
+        read_map(txn, "v1_field.claude_desktop_title_files")?;
+    let growth = read_map(txn, "file.growth_retention")?;
+    let entity_sets = read_entities(txn)?;
+    let empty: BTreeMap<String, bool> = read_map(txn, "file.confirmed_empty")?;
     ensure!(
         empty.values().all(|value| *value),
         "state_v2_files_empty_presence"
     );
-    let checkpoints: BTreeMap<String, ResumeCheckpoint> = read_map(&mut txn, "resume.checkpoint")?;
+    let checkpoints: BTreeMap<String, ResumeCheckpoint> = read_map(txn, "resume.checkpoint")?;
     for (path, checkpoint) in &checkpoints {
         checkpoint.validate(
             path,
@@ -998,11 +1007,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    fn cx() -> KindCxFiles {
-        KindCxFiles {
-            binding: Some(Scratch::binding()),
-            ..Default::default()
-        }
+    fn cx() -> KindCx {
+        let mut cx = KindCx::default();
+        cx.binding = Some(Scratch::binding());
+        cx
     }
     fn fixture() -> ScanIndex {
         let mut index: ScanIndex = serde_json::from_value(json!({

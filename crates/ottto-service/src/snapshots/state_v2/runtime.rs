@@ -1,8 +1,8 @@
-//! Locked runtime routing. The mapper is deliberately unavailable during table
-//! review. OFF remains v1 before publication; custody evidence always wins.
+//! Locked runtime routing. Conversion stays paused until publication integration
+//! is complete. OFF remains v1 before publication; custody evidence always wins.
 use super::*;
 use anyhow::{bail, ensure};
-use import::{Mapper, Pace, Pause, PendingMapper};
+use import::{ClaudeMapper, Mapper, Pace, Pause};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -186,7 +186,7 @@ pub(in super::super) fn load_locked(
     path: &Path,
     support: Option<&Path>,
 ) -> Result<Option<ScanIndex>> {
-    load_with(path, enabled(support), &PendingMapper)
+    load_with(path, enabled(support), &ClaudeMapper)
 }
 fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Option<ScanIndex>> {
     let Some(binding) = binding(path) else {
@@ -316,7 +316,7 @@ fn pause(state: &mut RouteState, now: Instant, class: Pause) {
 /// Import is attempted only on the normalized available graph and only if the
 /// pre-decode inventory acquired a due slot. No writes on any paused path.
 pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> Result<()> {
-    import_with(path, index, &PendingMapper)
+    import_with(path, index, &ClaudeMapper)
 }
 fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Result<()> {
     let Some(binding) = binding(path) else {
@@ -444,7 +444,7 @@ fn preserve_baseline(path: &Path) -> Result<()> {
 
 /// All save routes check independent evidence before any v1 CAS or publication.
 pub(in super::super) fn save_locked(path: &Path, index: &mut ScanIndex) -> Result<bool> {
-    save_with(path, index, &PendingMapper)
+    save_with(path, index, &ClaudeMapper)
 }
 fn save_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Result<bool> {
     let Some(binding) = binding(path) else {

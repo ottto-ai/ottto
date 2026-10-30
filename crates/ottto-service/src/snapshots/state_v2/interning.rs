@@ -222,3 +222,101 @@ pub(super) fn release_request_set(tx: &mut (impl Transaction + ?Sized), id: u64)
     tx.adjust_refs(&RowKey::RequestSet(id), -1)?;
     Ok(())
 }
+
+/// Shared evidence can contain exact literal strings. Table membership is not
+/// a privacy class: account evidence, legacy exclusion sets and census-owned
+/// full-string sets all participate in same-transaction erasure debt.
+pub(super) fn private_paths(
+    header: &Header,
+    value: &dyn Value,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    ensure!(
+        matches!(header.key, RowKey::RequestSet(_)) && header.value_version == 1,
+        "state_v2_shared_value_version"
+    );
+    let mut writer = BoundedHash::new(Vec::new());
+    value.write(&mut writer)?;
+    let mut r = EvidenceReader(&writer.out);
+    ensure!(r.byte()? == 1, "state_v2_shared_value_version");
+    let count = match r.byte()? {
+        0 => None,
+        1 => Some(r.number()?),
+        _ => anyhow::bail!("state_v2_shared_presence"),
+    };
+    match r.byte()? {
+        1 => {
+            for _ in 0..2 {
+                emit(std::str::from_utf8(r.bytes()?)?)?;
+            }
+            match r.byte()? {
+                0 => {}
+                1 => emit(std::str::from_utf8(r.bytes()?)?)?,
+                _ => anyhow::bail!("state_v2_shared_presence"),
+            }
+        }
+        2 => {
+            let payload = r.bytes()?;
+            let count = count.context("state_v2_shared_count")?;
+            match payload.first() {
+                Some(1) => {
+                    let hashes = &payload[1..];
+                    ensure!(
+                        hashes.len() % 8 == 0 && (hashes.len() / 8) as u64 == count,
+                        "state_v2_shared_count"
+                    );
+                    ensure!(
+                        hashes
+                            .chunks_exact(8)
+                            .zip(hashes.chunks_exact(8).skip(1))
+                            .all(|(a, b)| a < b),
+                        "state_v2_shared_hash_order"
+                    );
+                }
+                Some(2) => {
+                    let mut json = BoundedHash::new(Vec::new());
+                    packed::decode(&payload[1..], &mut json)?;
+                    emit_strings(&json.out, count, emit)?;
+                }
+                Some(b'[') => emit_strings(payload, count, emit)?,
+                _ => anyhow::bail!("state_v2_shared_class"),
+            }
+        }
+        _ => anyhow::bail!("state_v2_shared_class"),
+    }
+    ensure!(r.0.is_empty(), "state_v2_shared_trailer");
+    Ok(())
+}
+fn emit_strings(bytes: &[u8], count: u64, emit: &mut dyn FnMut(&str) -> Result<()>) -> Result<()> {
+    // Decode a sequence first so duplicate source strings cannot disappear in a
+    // set before the count/order proof. The stored full sets are canonical.
+    let strings: Vec<String> = serde_json::from_slice(bytes)?;
+    ensure!(
+        strings.len() as u64 == count && strings.windows(2).all(|w| w[0] < w[1]),
+        "state_v2_shared_count_order"
+    );
+    for text in strings {
+        ensure!(text.len() <= KEY_BYTES, "state_v2_string_admission");
+        emit(&text)?;
+    }
+    Ok(())
+}
+struct EvidenceReader<'a>(&'a [u8]);
+impl<'a> EvidenceReader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        ensure!(self.0.len() >= n, "state_v2_shared_shape");
+        let (head, tail) = self.0.split_at(n);
+        self.0 = tail;
+        Ok(head)
+    }
+    fn byte(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+    fn number(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into()?))
+    }
+    fn bytes(&mut self) -> Result<&'a [u8]> {
+        let n = usize::try_from(self.number()?)?;
+        self.take(n)
+    }
+}

@@ -309,6 +309,7 @@ pub(super) struct Txn<'a> {
     removed_keys: BTreeSet<RowKey>,
     original_paths: BTreeMap<RowKey, BTreeSet<String>>,
     path_bytes: usize,
+    shared_erasure: bool,
     failed: bool,
     changed: BTreeMap<RowKey, Option<Header>>,
     dirty_bytes: u64,
@@ -713,6 +714,7 @@ impl Sqlite {
                 removed_keys: BTreeSet::new(),
                 original_paths: BTreeMap::new(),
                 path_bytes: 0,
+                shared_erasure: false,
                 failed: false,
                 changed: BTreeMap::new(),
                 dirty_bytes: 0,
@@ -806,6 +808,7 @@ impl Store for Sqlite {
             removed_keys: BTreeSet::new(),
             original_paths: BTreeMap::new(),
             path_bytes: 0,
+            shared_erasure: false,
             failed: false,
             changed: BTreeMap::new(),
             dirty_bytes: 0,
@@ -1101,6 +1104,14 @@ impl Txn<'_> {
         Ok(())
     }
     fn remember_paths(&mut self, old: &Header) -> Result<()> {
+        if matches!(old.key, RowKey::RequestSet(_)) {
+            // Shared values are immutable evidence and may contain literal PL.
+            // Conservatively mark every replacement/last-reference deletion;
+            // this avoids buffering a 64 MiB set to discover one removed string.
+            // Header-only refcount adjustments do not call remember_paths.
+            self.shared_erasure = true;
+            return Ok(());
+        }
         if !pl(&old.key) || self.original_paths.contains_key(&old.key) {
             return Ok(());
         }
@@ -1132,6 +1143,9 @@ impl Txn<'_> {
         Ok(())
     }
     fn paths_removed(&mut self) -> Result<bool> {
+        if self.shared_erasure {
+            return Ok(true);
+        }
         // Consume the admitted original set. New paths only remove candidates:
         // no second encoded graph/set is allocated during the final diff.
         for (key, mut old) in std::mem::take(&mut self.original_paths) {
@@ -1225,7 +1239,7 @@ impl Write for PartWriter<'_> {
 fn pl(key: &RowKey) -> bool {
     match key {
         RowKey::Meta(name) => !control_name(name),
-        RowKey::RequestSet(_) => false,
+        RowKey::RequestSet(_) => true,
         RowKey::Record { .. } => true,
     }
 }

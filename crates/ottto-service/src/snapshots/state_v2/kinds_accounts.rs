@@ -1,9 +1,9 @@
 //! Account mapper only; not connected to the runtime until the integration round.
 //! Each map entry is a stable typed bucket, below the 64 KiB target (1 MiB cap).
 //! Root counts publish the complete bucket inventory in the SAME transaction.
-//! Callers discard KindCxAccounts after ANY abort/ambiguous commit; retain it
+//! Callers discard KindCx after ANY abort/ambiguous commit; retain it
 //! only with the committed graph. No position is derived from a vector index.
-#![allow(dead_code)] // The integration owner replaces PendingMapper.
+#![allow(dead_code)] // The integration owner replaces ClaudeMapper.
 use super::super::{
     account_pending_retention, ClaudeAccountFamilyPending, ClaudeAccountFamilyPendingWindow,
     ClaudeAccountFamilyWitness, ClaudeAccountRequestSet, ClaudeAuthorityProofCorrection,
@@ -20,7 +20,6 @@ pub(super) const KINDS: &[&str] = &[
     "account_window",
     "account.absent_members",
     "usage.pending",
-    "family.requests",
     "proof.account",
     "proof.usage",
     "proof.deferred_account",
@@ -30,15 +29,6 @@ pub(super) const KINDS: &[&str] = &[
 ];
 const TARGET: u64 = 64 * 1024;
 const RETENTION: &str = "account.window_retention";
-
-#[derive(Default)]
-pub(super) struct KindCxAccounts {
-    rows: BTreeMap<(String, String), BTreeMap<RowKey, Header>>,
-    ready: bool,
-    /// G1 hook: alarm only, never permission to retire unsettled windows.
-    pub(super) families_over_64_windows: u64,
-    pub(super) buckets_over_target: u64,
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -326,14 +316,14 @@ impl Scope<'_> {
 }
 fn scope(
     tx: &mut dyn Transaction,
-    cx: &mut KindCxAccounts,
+    cx: &mut KindCx,
     kind: &str,
     family: &str,
     emit: impl FnOnce(&mut Scope<'_>) -> Result<()>,
 ) -> Result<()> {
-    cx.ready = false;
+    cx.accounts_ready = false;
     let owner = (kind.to_owned(), family.to_owned());
-    let old = cx.rows.remove(&owner).unwrap_or_default();
+    let old = cx.account_rows.remove(&owner).unwrap_or_default();
     let mut s = Scope {
         tx,
         kind,
@@ -349,9 +339,9 @@ fn scope(
     }
     cx.buckets_over_target = cx.buckets_over_target.saturating_add(s.over_target);
     if !s.live.is_empty() {
-        cx.rows.insert(owner, s.live);
+        cx.account_rows.insert(owner, s.live);
     }
-    cx.ready = true;
+    cx.accounts_ready = true;
     Ok(())
 }
 fn canonical_hash(s: &str) -> Option<[u8; 32]> {
@@ -418,7 +408,7 @@ fn windows(
     next: Option<&ClaudeAccountFamilyPending>,
     family: &str,
     tx: &mut dyn Transaction,
-    cx: &mut KindCxAccounts,
+    cx: &mut KindCx,
 ) -> Result<()> {
     let pointer = key("account.current", family, &[], 0)?;
     let (old_current, mut high) = match tx.get(&pointer)? {
@@ -436,7 +426,10 @@ fn windows(
         "accounts_ordinal_exhausted"
     );
     let mut ids = Vec::new();
-    if let Some(rows) = cx.rows.get(&("account_window".into(), family.into())) {
+    if let Some(rows) = cx
+        .account_rows
+        .get(&("account_window".into(), family.into()))
+    {
         for k in rows.keys() {
             if let RowKey::Record {
                 key_bytes,
@@ -584,13 +577,6 @@ fn share_full_set(s: &mut Scope<'_>, path: &[&str], hashes: &BTreeSet<String>) -
         },
     )
 }
-fn request_map(s: &mut Scope<'_>, map: &BTreeMap<String, BTreeSet<String>>) -> Result<()> {
-    s.plain(&[], 0, Data::Number(map.len() as u64))?;
-    for (m, hashes) in map {
-        share_full_set(s, &[m], hashes)?;
-    }
-    Ok(())
-}
 fn account_proof(s: &mut Scope<'_>, p: &ClaudeAccountFamilyWitness) -> Result<()> {
     s.plain(
         &[],
@@ -686,28 +672,28 @@ fn counts(c: &account_pending_retention::Counts) -> [u64; 6] {
 pub(super) fn populate(
     index: &ScanIndex,
     txn: &mut dyn Transaction,
-    cx: &mut KindCxAccounts,
+    cx: &mut KindCx,
 ) -> Result<()> {
-    ensure!(cx.rows.is_empty(), "accounts_populate_nonempty");
-    cx.ready = true;
+    ensure!(cx.account_rows.is_empty(), "accounts_populate_nonempty");
+    cx.accounts_ready = true;
     delta(&ScanIndex::default(), index, txn, cx)
 }
 pub(super) fn delta(
     prev: &ScanIndex,
     next: &ScanIndex,
     txn: &mut dyn Transaction,
-    cx: &mut KindCxAccounts,
+    cx: &mut KindCx,
 ) -> Result<()> {
-    ensure!(cx.ready, "accounts_context_invalid");
+    ensure!(cx.accounts_ready, "accounts_context_invalid");
     let result = delta_inner(prev, next, txn, cx);
-    cx.ready = result.is_ok();
+    cx.accounts_ready = result.is_ok();
     result
 }
 fn delta_inner(
     prev: &ScanIndex,
     next: &ScanIndex,
     txn: &mut dyn Transaction,
-    cx: &mut KindCxAccounts,
+    cx: &mut KindCx,
 ) -> Result<()> {
     macro_rules! maps {
         ($field:ident, $kind:expr, $emit:expr) => {{
@@ -745,14 +731,6 @@ fn delta_inner(
     }
     maps!(claude_usage_family_pending, "usage.pending", usage);
     maps!(
-        claude_usage_family_pending,
-        "family.requests",
-        |s: &mut Scope<'_>, p: &ClaudeUsageFamilyPending| request_map(
-            s,
-            &p.member_request_id_hashes
-        )
-    );
-    maps!(
         claude_account_family_witnesses,
         "proof.account",
         account_proof
@@ -775,7 +753,9 @@ fn delta_inner(
     );
     // This v1 field is serde(skip): retain diagnostic counts separately and
     // never make their presence an attribution or retirement input.
-    if !cx.rows.contains_key(&(RETENTION.into(), String::new()))
+    if !cx
+        .account_rows
+        .contains_key(&(RETENTION.into(), String::new()))
         || counts(&prev.claude_account_window_retention)
             != counts(&next.claude_account_window_retention)
     {
@@ -906,15 +886,24 @@ fn active_window<'a>(
 
 /// Store has a generic associated transaction type and needs mutable begin;
 /// consequently the brief's `&dyn Store` is not a legal Rust interface.
+#[cfg(test)]
 pub(super) fn hydrate(
     store: &mut impl Store,
     index: &mut ScanIndex,
-    cx: &mut KindCxAccounts,
+    cx: &mut KindCx,
 ) -> Result<()> {
-    cx.ready = false;
     let mut tx = store.begin(TxnMode::Read)?;
+    hydrate_txn(&mut tx, index, cx)?;
+    kinds_census::hydrate_txn(&mut tx, index, cx)
+}
+pub(super) fn hydrate_txn(
+    tx: &mut dyn Transaction,
+    index: &mut ScanIndex,
+    cx: &mut KindCx,
+) -> Result<()> {
+    cx.accounts_ready = false;
     let mut out = ScanIndex::default();
-    let mut staged = KindCxAccounts::default();
+    let mut staged = KindCx::default();
     let mut pointers = BTreeMap::<String, (Option<u64>, u64)>::new();
     let mut slots = BTreeMap::new();
     let mut inventory = BTreeMap::<(String, String, u64), (Option<u64>, u64)>::new();
@@ -939,7 +928,7 @@ pub(super) fn hydrate(
                 let position = *position;
                 let components = decode(key_bytes)?;
                 let family = &components[0];
-                let part = read(&mut tx, &h)?;
+                let part = read(tx, &h)?;
                 part.data.texts(&mut |s| {
                     ensure!(s.len() <= KEY_BYTES, "state_v2_string_admission");
                     Ok(())
@@ -956,7 +945,7 @@ pub(super) fn hydrate(
                 if root {
                     ensure!(state.0.is_none(), "accounts_duplicate_root");
                     state.0 = Some(part.data.children().unwrap_or_else(|| {
-                        if matches!(*kind, "account.absent_members" | "family.requests") {
+                        if *kind == "account.absent_members" {
                             if let Data::Number(n) = part.data {
                                 return n;
                             }
@@ -1040,7 +1029,7 @@ pub(super) fn hydrate(
                             .insert((*m).into(), n);
                     }
                     ("account_window", ["requests", m], Data::Shared(id)) => {
-                        let set = account_set(&mut tx, id)?;
+                        let set = account_set(tx, id)?;
                         active_window(&mut out, &slots, family, position)?
                             .member_requests
                             .insert((*m).into(), set);
@@ -1094,20 +1083,6 @@ pub(super) fn hydrate(
                             .get_mut(*m)
                             .context("accounts_member_missing")?
                             .insert((*r).into(), o);
-                    }
-                    ("family.requests", [], Data::Number(_)) => {
-                        ensure!(
-                            out.claude_usage_family_pending.contains_key(family),
-                            "accounts_usage_missing"
-                        );
-                    }
-                    ("family.requests", [m], Data::Shared(id)) => {
-                        let set = full_set(&mut tx, id)?;
-                        out.claude_usage_family_pending
-                            .get_mut(family)
-                            .context("accounts_usage_missing")?
-                            .member_request_id_hashes
-                            .insert((*m).into(), set);
                     }
                     (
                         "proof.account",
@@ -1179,7 +1154,7 @@ pub(super) fn hydrate(
                         map.insert((*m).into(), fp);
                     }
                     ("proof.usage", ["excluded", m], Data::Shared(id)) => {
-                        let set = full_set(&mut tx, id)?;
+                        let set = full_set(tx, id)?;
                         out.claude_usage_family_witnesses
                             .get_mut(family)
                             .context("accounts_proof_missing")?
@@ -1265,7 +1240,7 @@ pub(super) fn hydrate(
                     "accounts_position_shape"
                 );
                 staged
-                    .rows
+                    .account_rows
                     .entry(((*kind).into(), family.clone()))
                     .or_default()
                     .insert(h.key.clone(), h);
@@ -1283,7 +1258,7 @@ pub(super) fn hydrate(
             ensure!(
                 slots.contains_key(&(family.clone(), *id))
                     && staged
-                        .rows
+                        .account_rows
                         .contains_key(&("account.absent_members".into(), family.clone())),
                 "accounts_current_missing"
             );
@@ -1293,17 +1268,9 @@ pub(super) fn hydrate(
             }
         }
     }
-    for family in out.claude_usage_family_pending.keys() {
-        ensure!(
-            staged
-                .rows
-                .contains_key(&("family.requests".into(), family.clone())),
-            "accounts_requests_missing"
-        );
-    }
     // A projection is a cache of these exact semantic fields, never another
     // authority. Check it after all independent maps have been reconstructed.
-    for ((kind, family), rows) in &staged.rows {
+    for ((kind, family), rows) in &staged.account_rows {
         for h in rows.values() {
             let RowKey::Record {
                 key_bytes,
@@ -1359,10 +1326,12 @@ pub(super) fn hydrate(
         }
     }
     ensure!(
-        staged.rows.contains_key(&(RETENTION.into(), String::new())),
+        staged
+            .account_rows
+            .contains_key(&(RETENTION.into(), String::new())),
         "accounts_retention_missing"
     );
-    staged.ready = true;
+    staged.accounts_ready = true;
     index.claude_account_family_pending = out.claude_account_family_pending;
     index.claude_account_family_witnesses = out.claude_account_family_witnesses;
     index.claude_usage_family_pending = out.claude_usage_family_pending;
@@ -1371,7 +1340,10 @@ pub(super) fn hydrate(
     index.claude_account_deferred_holds = out.claude_account_deferred_holds;
     index.session_account_bindings = out.session_account_bindings;
     index.claude_usage_authority_quarantine = out.claude_usage_authority_quarantine;
-    *cx = staged;
+    cx.account_rows = staged.account_rows;
+    cx.accounts_ready = staged.accounts_ready;
+    cx.families_over_64_windows = staged.families_over_64_windows;
+    cx.buckets_over_target = staged.buckets_over_target;
     Ok(())
 }
 
@@ -1484,8 +1456,8 @@ mod tests {
             fs::create_dir(&dir).unwrap();
             let mut db =
                 sqlite::Sqlite::create_import(&dir.join("index.v2.sqlite.import")).unwrap();
-            db.path_extractor(private_paths);
-            db.reference_extractor(references);
+            db.path_extractor(kinds::private_paths);
+            db.reference_extractor(kinds::references);
             db.control(
                 "identity",
                 &Identity {
@@ -1512,13 +1484,19 @@ mod tests {
         db: &mut impl Store,
         prev: Option<&ScanIndex>,
         next: &ScanIndex,
-        cx: &mut KindCxAccounts,
+        cx: &mut KindCx,
         generation: u64,
     ) {
         let mut tx = db.begin(TxnMode::Write).unwrap();
         match prev {
-            Some(prev) => delta(prev, next, &mut tx, cx).unwrap(),
-            None => populate(next, &mut tx, cx).unwrap(),
+            Some(prev) => {
+                delta(prev, next, &mut tx, cx).unwrap();
+                kinds_census::delta(prev, next, &mut tx, cx).unwrap();
+            }
+            None => {
+                populate(next, &mut tx, cx).unwrap();
+                kinds_census::populate(next, &mut tx, cx).unwrap();
+            }
         }
         assert_eq!(
             tx.commit(generation, generation + 1),
@@ -1672,10 +1650,10 @@ mod tests {
     fn typed_round_trip_preserves_independent_maps_u128_u64_and_optional_empty() {
         let (_scratch, mut db) = Scratch::store();
         let a = graph();
-        let mut cx = KindCxAccounts::default();
+        let mut cx = KindCx::default();
         save(&mut db, None, &a, &mut cx, 0);
         let mut b = ScanIndex::default();
-        hydrate(&mut db, &mut b, &mut KindCxAccounts::default()).unwrap();
+        hydrate(&mut db, &mut b, &mut KindCx::default()).unwrap();
         assert_subset(&a, &b);
     }
     #[test]
@@ -1689,13 +1667,13 @@ mod tests {
             .claude_account_family_pending
             .contains_key("synthetic-family"));
         let (_scratch, mut db) = Scratch::store();
-        save(&mut db, None, &a, &mut KindCxAccounts::default(), 0);
+        save(&mut db, None, &a, &mut KindCx::default(), 0);
         let mut b = ScanIndex::default();
-        hydrate(&mut db, &mut b, &mut KindCxAccounts::default()).unwrap();
+        hydrate(&mut db, &mut b, &mut KindCx::default()).unwrap();
         assert_subset(&a, &b);
     }
-    fn positions(cx: &KindCxAccounts) -> Vec<u64> {
-        let rows = &cx.rows[&("account_window".into(), "family".into())];
+    fn positions(cx: &KindCx) -> Vec<u64> {
+        let rows = &cx.account_rows[&("account_window".into(), "family".into())];
         rows.keys()
             .filter_map(|k| match k {
                 RowKey::Record {
@@ -1715,7 +1693,7 @@ mod tests {
             .get_mut("family")
             .unwrap()
             .previous_windows = vec![window("A"), window("B"), window("C")];
-        let mut cx = KindCxAccounts::default();
+        let mut cx = KindCx::default();
         save(&mut db, None, &a, &mut cx, 0);
         assert_eq!(positions(&cx), [1, 2, 3, 4]);
         let mut b = a.clone();
@@ -1805,7 +1783,7 @@ mod tests {
                 idless_revision: None,
             },
         );
-        let mut cx = KindCxAccounts::default();
+        let mut cx = KindCx::default();
         save(&mut db, None, &a, &mut cx, 0);
         assert_eq!(cx.families_over_64_windows, 1);
         assert_eq!(positions(&cx).len(), 66);
@@ -1818,7 +1796,7 @@ mod tests {
     fn delta_rewrites_only_the_changed_typed_bucket() {
         let (_scratch, mut db) = Scratch::store();
         let a = graph();
-        let mut cx = KindCxAccounts::default();
+        let mut cx = KindCx::default();
         save(&mut db, None, &a, &mut cx, 0);
         let stats = |db: &sqlite::Sqlite| {
             serde_json::to_value(db.maintenance_stats()).unwrap()["row_write_attempts"]
@@ -1838,7 +1816,7 @@ mod tests {
             .current
             .members
             .insert("/opaque/member".into(), 42);
-        let before_rows = cx.rows.clone();
+        let before_rows = cx.account_rows.clone();
         let mut tx = db.begin(TxnMode::Write).unwrap();
         delta(&a, &b, &mut tx, &mut cx).unwrap();
         // Drop the borrow to inspect write attempts, deliberately without a
@@ -1846,7 +1824,7 @@ mod tests {
         drop(tx);
         assert_eq!(stats(&db) - before, 1);
         let changed: Vec<_> = cx
-            .rows
+            .account_rows
             .iter()
             .flat_map(|(owner, rows)| {
                 rows.iter()
@@ -1873,10 +1851,10 @@ mod tests {
         p.member_request_id_hashes = (0..400)
             .map(|n| (format!("member-{n:04}"), BTreeSet::from(["d".repeat(64)])))
             .collect();
-        let mut cx = KindCxAccounts::default();
+        let mut cx = KindCx::default();
         save(&mut db, None, &a, &mut cx, 0);
         assert!(cx
-            .rows
+            .account_rows
             .values()
             .flat_map(BTreeMap::values)
             .all(|h| h.len <= TARGET));
@@ -1919,7 +1897,7 @@ mod tests {
     fn missing_bucket_holds_without_partially_publishing_hydration() {
         let (_scratch, mut db) = Scratch::store();
         let a = graph();
-        let mut cx = KindCxAccounts::default();
+        let mut cx = KindCx::default();
         save(&mut db, None, &a, &mut cx, 0);
         let mut tx = db.begin(TxnMode::Write).unwrap();
         tx.delete(
@@ -1939,7 +1917,7 @@ mod tests {
         let before = b.clone();
         assert!(hydrate(&mut db, &mut b, &mut cx).is_err());
         assert_subset(&before, &b);
-        assert!(!cx.ready);
+        assert!(!cx.accounts_ready);
     }
     #[test]
     fn duplicate_boundaries_update_retire_and_aba_stay_distinct() {
@@ -1952,7 +1930,7 @@ mod tests {
         later.evidence_request_count = 3;
         p.previous_windows = vec![first, window("B")];
         p.current = later;
-        let mut cx = KindCxAccounts::default();
+        let mut cx = KindCx::default();
         save(&mut db, None, &a, &mut cx, 0);
         let mut b = a.clone();
         let p = b.claude_account_family_pending.get_mut("family").unwrap();
@@ -1982,7 +1960,7 @@ mod tests {
         let p = a.claude_account_family_pending.get_mut("family").unwrap();
         p.previous_windows = vec![window("same"), window("B")];
         p.current = window("same");
-        let mut cx = KindCxAccounts::default();
+        let mut cx = KindCx::default();
         save(&mut db, None, &a, &mut cx, 0);
         let mut b = a.clone();
         let p = b.claude_account_family_pending.get_mut("family").unwrap();
@@ -1997,7 +1975,7 @@ mod tests {
         let p = a.claude_account_family_pending.get_mut("family").unwrap();
         p.previous_windows = vec![window("A")];
         p.current = window("B");
-        let mut cx = KindCxAccounts::default();
+        let mut cx = KindCx::default();
         save(&mut db, None, &a, &mut cx, 0);
         let mut b = a.clone();
         let p = b.claude_account_family_pending.get_mut("family").unwrap();
@@ -2025,13 +2003,14 @@ mod tests {
                     .member_request_id_hashes
                     .insert("oversized".into(), hashes);
             }
-            let mut cx = KindCxAccounts::default();
+            let mut cx = KindCx::default();
             let mut tx = db.begin(TxnMode::Write).unwrap();
-            assert!(populate(&a, &mut tx, &mut cx)
+            let result = populate(&a, &mut tx, &mut cx)
+                .and_then(|()| kinds_census::populate(&a, &mut tx, &mut cx));
+            assert!(result
                 .unwrap_err()
                 .to_string()
                 .contains("state_v2_string_admission"));
-            assert!(!cx.ready);
             // The caller drops this unpublished import; no invalid value is committed.
         }
         let (_scratch, mut db) = Scratch::store();
@@ -2041,7 +2020,7 @@ mod tests {
             .unwrap()
             .member_request_id_hashes
             .insert("boundary".into(), BTreeSet::from(["x".repeat(KEY_BYTES)]));
-        let mut cx = KindCxAccounts::default();
+        let mut cx = KindCx::default();
         save(&mut db, None, &a, &mut cx, 0);
         let mut b = ScanIndex::default();
         hydrate(&mut db, &mut b, &mut cx).unwrap();

@@ -1,4 +1,4 @@
-//! Pre-publication pacing and the single seam for the future semantic mapper.
+//! Pre-publication pacing and the Claude semantic mapper boundary.
 use super::*;
 use anyhow::bail;
 use std::path::Path;
@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Pause {
-    MapperPending,
+    PublicationPending,
     UnknownClass,
     Malformed,
     Partial,
@@ -72,9 +72,9 @@ impl Pace {
     }
 }
 
-/// No semantic field/table mapping lives in this framework. The eventual
-/// adapter must preflight original raw shapes before v1 normalization, import
-/// the normalized graph, and prove read-back parity before publication.
+/// Raw inventory and parity proof precede publication. The four semantic
+/// adapters share a transaction and context in `kinds`; this boundary owns
+/// their integration with runtime CAS and external restart custody.
 pub(super) trait Mapper {
     /// Emit ALL private text from key, fixed/header, labels/aliases and raw
     /// holds, as well as packed values. Replacements must retain none silently.
@@ -105,48 +105,64 @@ pub(super) trait Mapper {
     fn merge_cas<T: Transaction>(&self, txn: &mut T, index: &mut ScanIndex) -> Result<()>;
     /// Emit only dirty rows against the resident header map. Before mutating,
     /// bound the proposed page to 5k rows / 32 MiB, shrinking collection pages
-    /// when necessary. TODO mapper: cap 64 account windows per family without
-    /// silently dropping unsettled custody. KEEP persisted shared refs: decode
+    /// when necessary. More than 64 account windows is an alarm, never
+    /// permission to drop unsettled custody. KEEP persisted shared refs: decode
     /// only each changed row's old refs, diff against new refs, adjust/reclaim
     /// in this transaction. Never perform whole-history GC during a save.
     fn delta<T: Transaction>(&self, txn: &mut T, index: &ScanIndex) -> Result<()>;
 }
-pub(super) struct PendingMapper;
-impl Mapper for PendingMapper {
+/// Semantic reads/extractors are integrated. Conversion and writes deliberately
+/// refuse until original-authority inventory, import generation publication,
+/// committable-unit selection and owner-locked R1 callbacks are connected.
+pub(super) struct ClaudeMapper;
+impl Mapper for ClaudeMapper {
     fn references(
-        _: &Header,
-        _: &dyn Value,
-        _: &mut dyn FnMut(&RowKey) -> Result<()>,
+        header: &Header,
+        value: &dyn Value,
+        refs: &mut dyn FnMut(&RowKey) -> Result<()>,
     ) -> Result<()> {
-        bail!(Hold::DbUnavailable)
+        kinds::references(header, value, refs)
     }
     fn private_paths(
-        _: &Header,
-        _: &dyn Value,
-        _: &mut dyn FnMut(&str) -> Result<()>,
+        header: &Header,
+        value: &dyn Value,
+        paths: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<()> {
-        bail!(Hold::DbUnavailable)
+        kinds::private_paths(header, value, paths)
     }
     fn inventory(&self, _: &Path) -> std::result::Result<(), Pause> {
-        Err(Pause::MapperPending)
+        Err(Pause::PublicationPending)
     }
     fn preflight(&self, _: &ScanIndex) -> std::result::Result<(), Pause> {
-        Err(Pause::MapperPending)
+        Err(Pause::PublicationPending)
     }
     fn populate<S: Store>(&self, _: &mut S, _: &ScanIndex) -> Result<()> {
-        bail!(Hold::DbUnavailable)
+        bail!(Pause::PublicationPending)
     }
     fn verify<S: Store>(&self, _: &mut S, _: &ScanIndex) -> Result<()> {
-        bail!(Hold::DbUnavailable)
+        bail!(Pause::PublicationPending)
     }
-    fn hydrate<S: Store>(&self, _: &mut S) -> Result<ScanIndex> {
-        bail!(Hold::DbUnavailable)
+    fn hydrate<S: Store>(&self, store: &mut S) -> Result<ScanIndex> {
+        let mut tx = store.begin(TxnMode::Read)?;
+        let header = tx
+            .get(&RowKey::Meta("identity".into()))?
+            .ok_or(Hold::ForeignBinding)?;
+        anyhow::ensure!(header.len <= CONTROL_BYTES, Hold::DbUnavailable);
+        let mut bytes = Vec::new();
+        tx.read_value(&header, &mut bytes)?;
+        let identity: Identity = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(
+            identity.binding.source == super::super::scan_index_persistence::Source::Claude,
+            Hold::ForeignBinding
+        );
+        let (index, _) = kinds::hydrate_txn(&mut tx, identity.binding)?;
+        Ok(index)
     }
     fn merge_cas<T: Transaction>(&self, _: &mut T, _: &mut ScanIndex) -> Result<()> {
-        bail!(Hold::DbUnavailable)
+        bail!(Pause::PublicationPending)
     }
     fn delta<T: Transaction>(&self, _: &mut T, _: &ScanIndex) -> Result<()> {
-        bail!(Hold::DbUnavailable)
+        bail!(Pause::PublicationPending)
     }
 }
 

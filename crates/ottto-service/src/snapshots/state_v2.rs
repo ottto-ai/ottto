@@ -19,7 +19,10 @@ pub(super) use runtime::{
     after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
     idle, load_locked, save_locked,
 };
+#[cfg(test)]
+mod field_coverage;
 mod interning;
+mod kinds;
 mod kinds_accounts;
 mod kinds_census;
 mod kinds_files;
@@ -27,6 +30,7 @@ mod kinds_misc;
 mod packed;
 mod shape;
 mod sqlite;
+use kinds::KindCx;
 
 /// Runtime-only custody carrier. Only the verified v2 load route may install it.
 /// Environment/sentinel state alone must never activate growth retention.
