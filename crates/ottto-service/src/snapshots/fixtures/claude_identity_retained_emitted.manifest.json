@@ -1,14 +1,173 @@
 {
   "producer_repository": "ottto-ai/ottto",
-  "generated_by_ci_commit": "784e780f5fb01be58413cc1fb7d0c0e4d3c7c225",
+  "generated_by_ci_commit": "78232b4ad01aaa5be7e785483db4fd53d023f551",
   "producer_test": "retained_emitted_wire_goldens_for_the_receiver_contract",
   "producer_path": "crates/ottto-service/src/snapshots/fixtures/claude_identity_retained_emitted.json",
-  "sha256": "ffa9cfec98c534c6849b579ca8ba29b665a6e610a9eda10e1796fe1a5a0e7f76",
+  "sha256": "596ac7e263dab766195ae12f8d817489531c6fa162cd18881a4c7bfe0df955c5",
   "item_bytes": {
-    "marker_closed_rows_open_hour_fresh": 8551,
-    "marker_window": 654853,
-    "marker_with_changed_proof_fresh": 10400,
-    "missing_proof_retag_fit": 6643,
-    "missing_proof_retag_unfit": 13574
+    "contract5_fresh": 3941,
+    "contract5_fresh_proving": 3941,
+    "counted_refusal_after_proof": 3805,
+    "counted_refusal_after_proof_proving": 4250,
+    "login_marker_with_hash": 4663,
+    "login_marker_with_hash_proving": 4250,
+    "marker_closed_rows_open_hour_fresh": 9176,
+    "marker_closed_rows_open_hour_fresh_proving": 12881,
+    "marker_window": 655347,
+    "marker_window_proving": 654097,
+    "marker_with_changed_proof_fresh": 11099,
+    "marker_with_changed_proof_fresh_proving": 12881,
+    "missing_proof_retag_fit": 6952,
+    "missing_proof_retag_fit_proving": 6952,
+    "missing_proof_retag_unfit": 13883,
+    "missing_proof_retag_unfit_proving": 6952,
+    "unpriced_strip_after_proof": 5499,
+    "unpriced_strip_after_proof_proving": 12290
+  },
+  "items": {
+    "marker_closed_rows_open_hour_fresh": {
+      "bodies": [
+        "marker_closed_rows_open_hour_fresh_proving",
+        "marker_closed_rows_open_hour_fresh"
+      ],
+      "contracts": [
+        "claude_request_owned_usage:v1",
+        "claude_request_owned_usage:v1"
+      ],
+      "expected_outcome": "closed proved rows marked, open hour freshly tagged",
+      "bucket_rows": 4,
+      "marker_rows": 3,
+      "marker_rows_with_hash": 0,
+      "fresh_tagged_rows": 1,
+      "request_identity_refusals": 0
+    },
+    "marker_with_changed_proof_fresh": {
+      "bodies": [
+        "marker_with_changed_proof_fresh_proving",
+        "marker_with_changed_proof_fresh"
+      ],
+      "contracts": [
+        "claude_request_owned_usage:v1",
+        "claude_request_owned_usage:v1"
+      ],
+      "expected_outcome": "unchanged closed rows marked; changed-proof row and open hour freshly tagged",
+      "bucket_rows": 4,
+      "marker_rows": 2,
+      "marker_rows_with_hash": 0,
+      "fresh_tagged_rows": 2,
+      "request_identity_refusals": 0
+    },
+    "marker_window": {
+      "bodies": [
+        "marker_window_proving",
+        "marker_window"
+      ],
+      "contracts": [
+        "claude_request_owned_usage:v1",
+        "claude_request_owned_usage:v1"
+      ],
+      "expected_outcome": "recent window within the caps: proved rows marked, newest tagged, rest counted refusals",
+      "bucket_rows": 576,
+      "marker_rows": 216,
+      "marker_rows_with_hash": 0,
+      "fresh_tagged_rows": 214,
+      "request_identity_refusals": 146
+    },
+    "missing_proof_retag_fit": {
+      "bodies": [
+        "missing_proof_retag_fit_proving",
+        "missing_proof_retag_fit"
+      ],
+      "contracts": [
+        "claude_request_owned_usage:v1",
+        "claude_request_owned_usage:v1"
+      ],
+      "expected_outcome": "after retained_proof_missing the bucket re-tags within the caps",
+      "bucket_rows": 2,
+      "marker_rows": 0,
+      "marker_rows_with_hash": 0,
+      "fresh_tagged_rows": 2,
+      "request_identity_refusals": 0
+    },
+    "missing_proof_retag_unfit": {
+      "bodies": [
+        "missing_proof_retag_unfit_proving",
+        "missing_proof_retag_unfit"
+      ],
+      "contracts": [
+        "claude_request_owned_usage:v1",
+        "claude_request_owned_usage:v1"
+      ],
+      "expected_outcome": "after retained_proof_missing the bucket cannot fit: untagged and counted",
+      "bucket_rows": 2,
+      "marker_rows": 0,
+      "marker_rows_with_hash": 0,
+      "fresh_tagged_rows": 1,
+      "request_identity_refusals": 1
+    },
+    "login_marker_with_hash": {
+      "bodies": [
+        "login_marker_with_hash_proving",
+        "login_marker_with_hash"
+      ],
+      "contracts": [
+        "claude_request_owned_usage:v1",
+        "claude_request_owned_usage:v1"
+      ],
+      "expected_outcome": "login-proved closed row marked WITH the ACKed row hash; open hour tagged",
+      "bucket_rows": 2,
+      "marker_rows": 1,
+      "marker_rows_with_hash": 1,
+      "fresh_tagged_rows": 1,
+      "request_identity_refusals": 0
+    },
+    "contract5_fresh": {
+      "bodies": [
+        "contract5_fresh_proving",
+        "contract5_fresh"
+      ],
+      "contracts": [
+        "contract5_only",
+        "contract5_only"
+      ],
+      "expected_outcome": "contract-5-only body with witnessed state: fresh tags, never a marker",
+      "bucket_rows": 2,
+      "marker_rows": 0,
+      "marker_rows_with_hash": 0,
+      "fresh_tagged_rows": 2,
+      "request_identity_refusals": 0
+    },
+    "counted_refusal_after_proof": {
+      "bodies": [
+        "counted_refusal_after_proof_proving",
+        "counted_refusal_after_proof"
+      ],
+      "contracts": [
+        "claude_request_owned_usage:v1",
+        "claude_request_owned_usage:v1"
+      ],
+      "expected_outcome": "changed proof over the byte cap after witnessed proof: untagged counted refusal, no marker; server keeps its proof",
+      "bucket_rows": 2,
+      "marker_rows": 0,
+      "marker_rows_with_hash": 0,
+      "fresh_tagged_rows": 0,
+      "request_identity_refusals": 2
+    },
+    "unpriced_strip_after_proof": {
+      "bodies": [
+        "unpriced_strip_after_proof_proving",
+        "unpriced_strip_after_proof"
+      ],
+      "contracts": [
+        "claude_request_owned_usage:v1",
+        "claude_request_owned_usage:v1"
+      ],
+      "expected_outcome": "r7 unpriced rollup strip after witnessed proof: whole model row untagged, one refusal per bucket row, unpriced_part_untagged=1, no marker",
+      "bucket_rows": 4,
+      "marker_rows": 0,
+      "marker_rows_with_hash": 0,
+      "fresh_tagged_rows": 0,
+      "request_identity_refusals": 4
+    }
   }
 }
