@@ -74,12 +74,13 @@ impl BoundedMemo<[u8; 32]> {
 }
 /// `posted` holds a re-offer on its way to the backend, keyed by SHA-256 of
 /// its body's fingerprint, until a response names that body. An eviction or a
-/// new process loses at most that count. `unstored` holds a body answered
-/// unchanged with nothing stored, which leaves no ACK in the upload ledger.
+/// new process loses at most that count. `unstored` maps a fingerprint to the
+/// exact body answered unchanged with nothing stored, which leaves no ACK in
+/// the upload ledger.
 struct ReofferMemos {
     refused: BoundedMemo<[u8; 32]>,
     posted: BoundedMemo<(IdentityReoffer, u64)>,
-    unstored: BoundedMemo<()>,
+    unstored: BoundedMemo<[u8; 32]>,
 }
 impl ReofferMemos {
     const fn new() -> Self {
@@ -234,6 +235,7 @@ fn edge_bytes(edges: &BTreeMap<String, String>) -> usize {
 /// settles with the upload ledger; a count-only ACK names no entity and counts
 /// nothing.
 pub(crate) fn classify_desktop_identity_reoffers(
+    sent: &[SnapshotItem],
     response: &crate::snapshot_client::SnapshotBatchResponse,
 ) {
     use crate::local_resource_diagnostics::claude_reread::{
@@ -262,8 +264,14 @@ pub(crate) fn classify_desktop_identity_reoffers(
         .iter()
         .filter(|entity| entity.unchanged_basis.is_some());
     for entity in unstored {
-        let key = memo_key(&entity.snapshot_fingerprint);
-        with_reoffer_memos(|memos| memos.unstored.record(key, ()));
+        let body = sent
+            .iter()
+            .find(|item| item.snapshot_fingerprint == entity.snapshot_fingerprint);
+        if let Some(body) = body {
+            let key = memo_key(&entity.snapshot_fingerprint);
+            let witness = memo_key(&snapshot_upload_body_witness(body));
+            with_reoffer_memos(|memos| memos.unstored.record(key, witness));
+        }
     }
 }
 
@@ -510,7 +518,9 @@ impl ScanIndex {
             if own.iter().all(|(fingerprint, witness)| {
                 accepted_bodies.get(*fingerprint) == Some(witness)
                     || with_reoffer_memos(|memos| {
-                        memos.unstored.take(&memo_key(fingerprint)).is_some()
+                        memos
+                            .unstored
+                            .holds(&memo_key(fingerprint), &memo_key(witness))
                     })
             }) {
                 self.record_desktop_identity_latch(&pending.index_key, IdentityLatch::Settled);

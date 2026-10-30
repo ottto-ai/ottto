@@ -195,7 +195,7 @@ impl IdentityFixture {
                 snapshot_upload_body_witness,
             );
             if let Some(response) = backend.response(&run.result.snapshots) {
-                classify_desktop_identity_reoffers(&response);
+                classify_desktop_identity_reoffers(&run.result.snapshots, &response);
             }
             run
         });
@@ -438,8 +438,11 @@ fn desktop_identity_settles_on_this_bodys_ack_never_on_an_older_bodys_fingerprin
     assert_eq!(f.latch(&committed), Some(Pending));
     let cache = || Arc::new(SharedCache::default());
 
-    // The re-offer fails while the upload ledger still ACKs the missing body.
+    // The re-offer fails while the upload ledger still ACKs the missing body,
+    // and an unchanged answer that stored nothing named that older body too.
     let old = ledger(&missing);
+    let bodies = std::slice::from_ref(&missing);
+    classify_desktop_identity_reoffers(bodies, &Backend::Unstored.response(bodies).unwrap());
     let at = "2026-08-02T07:12:00Z";
     let (failed, counts) = f.run_answered(committed.clone(), cache(), at, Backend::Silent);
     assert_eq!(counts, Reoffers::default());
@@ -474,6 +477,7 @@ fn desktop_identity_settles_on_this_bodys_ack_never_on_an_older_bodys_fingerprin
     assert_eq!(f.latch(&working), Some(Settled));
 
     // A refusal is no ACK: pending, and this evidence is not offered again.
+    desktop_identity::reset_refused_memo_for_test();
     let (rejected, counts) = f.run_answered(committed, cache(), at, Backend::Rejected);
     assert_eq!(counts.recovered[2], 1);
     let body = f.child(&rejected).clone();
