@@ -1053,6 +1053,56 @@ mod application_cases {
     }
 
     #[test]
+    fn desktop_inventory_conversion_keeps_original_presence_without_digest_custody() {
+        for inventory in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("a".repeat(64))),
+        ] {
+            let c = Corpus::new();
+            let mut value = serde_json::json!({"schema_version":2,"generation":0,"files":{}});
+            if let Some(inventory) = &inventory {
+                value["claude_desktop_store_inventory"] = inventory.clone();
+            }
+            let bytes = serde_json::to_vec(&value).unwrap();
+            fs::write(&c.path, &bytes).unwrap();
+            let original = Original::read(&c.path).unwrap();
+            assert_eq!(
+                original.presence["claude_desktop_store_inventory"],
+                inventory.is_some()
+            );
+            let mut index = super::super::super::lenient_decode::read(
+                std::io::Cursor::new(&bytes),
+                "load",
+                "unattributed",
+            )
+            .unwrap();
+            let mut db = c.store();
+            let mut cx = KindCx::default();
+            cx.binding = Some(c.binding());
+            cx.presence = original.presence.clone();
+            let mut tx = db.begin(TxnMode::Write).unwrap();
+            kinds::populate(&index, &mut tx, &mut cx).unwrap();
+            assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+            index.generation = 1;
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            let verified = verify_normalized(&mut tx, &index, &original, c.binding()).unwrap();
+            assert_eq!(verified.presence, original.presence);
+            drop(tx);
+            let (restored, loaded) = kinds::hydrate(&mut db, c.binding()).unwrap();
+            assert_eq!(
+                loaded.presence.get("claude_desktop_store_inventory"),
+                original.presence.get("claude_desktop_store_inventory")
+            );
+            assert_eq!(restored.claude_desktop_store_inventory, None);
+            assert_eq!(
+                serde_json::to_vec(&restored).unwrap(),
+                serde_json::to_vec(&index).unwrap()
+            );
+            assert_eq!(fs::read(&c.path).unwrap(), bytes);
+        }
+    }
+    #[test]
     fn duplicate_unknown_and_invalid_escaped_originals_pause_before_baseline() {
         for bytes in [
             br#"{"schema_version":2,"files":{},"future_money":{"n":1}}"#.as_slice(),

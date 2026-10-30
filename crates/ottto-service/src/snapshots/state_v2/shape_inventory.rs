@@ -455,6 +455,7 @@ pub(super) fn named(name: &str) -> Option<Rule> {
                 "claude_money_birth_store",
                 "claude_money_birth_store::BirthStore",
             ),
+            ("claude_desktop_store_inventory", "Option<String>"),
             ("growth_retention", "BTreeMap<String,GrowthRetention>"),
         ]),
         "GrowthRetention" => Rule::Struct(&[

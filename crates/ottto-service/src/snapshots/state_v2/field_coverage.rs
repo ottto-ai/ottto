@@ -1,5 +1,7 @@
 //! Exhaustive declaration-order ownership golden. The original inventory had
 //! 113 fields; growth adds durable debt and one runtime claim-lineage field.
+//! A0 restores the decode-only Desktop inventory slot; its v2 row keeps N
+//! presence with a null value, never the retired H digest.
 use super::*;
 use std::collections::BTreeSet;
 macro_rules! coverage {
@@ -124,12 +126,13 @@ coverage! {
     claude_no_list_policy => ("MISC", "runtime"),
     claude_history_emission => ("MISC", "runtime"),
     claude_money_birth_store => ("MISC", "v1_field.birth_store"),
+    claude_desktop_store_inventory => ("MISC", "v1_field.claude_desktop_store_inventory"),
     growth_retention => ("FILES", "file.growth_retention"),
 }
 #[test]
 fn every_scan_index_field_and_kind_has_one_owner() {
     exhaustive(ScanIndex::default());
-    assert_eq!(FIELDS.len(), 114);
+    assert_eq!(FIELDS.len(), 115);
     let names: BTreeSet<_> = FIELDS.iter().map(|(field, _, _)| *field).collect();
     assert_eq!(names.len(), FIELDS.len());
     let groups = [

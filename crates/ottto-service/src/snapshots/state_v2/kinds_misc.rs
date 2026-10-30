@@ -985,6 +985,10 @@ macro_rules! fields {
         $apply!(upload_ack_retirement_handoff, "accepted.ack_handoff");
         $apply!(held_audit_progress, "scan_state.held_audit_progress");
         $apply!(claude_money_birth_store, "v1_field.birth_store");
+        $apply!(
+            claude_desktop_store_inventory,
+            "v1_field.claude_desktop_store_inventory"
+        );
     };
 }
 
@@ -1051,6 +1055,7 @@ pub(super) const KINDS: &[&str] = &[
     "accepted.ack_handoff",
     "scan_state.held_audit_progress",
     "v1_field.birth_store",
+    "v1_field.claude_desktop_store_inventory",
     "v1_field.repair_provenance",
     "raw_hold.files",
     "raw_hold.claude_account_family_witnesses",
@@ -1181,6 +1186,17 @@ pub(super) fn populate(
     control("schema_version", &index.schema_version, txn, cx)?;
     control("generation", &index.generation, txn, cx)?;
     macro_rules! put {
+        (claude_desktop_store_inventory, $kind:literal) => {
+            // A0 decodes and drops the retired H digest. Only original presence
+            // (N) and an absent optional survive in v2; never save the digest.
+            write_field(
+                &None::<String>,
+                "claude_desktop_store_inventory",
+                $kind,
+                txn,
+                cx,
+            )?
+        };
         (known_configured_scan_roots, $kind:literal) => {
             write_field(
                 &Membership(&index.known_configured_scan_roots),
@@ -1415,6 +1431,17 @@ pub(super) fn delta(
         control("generation", &next.generation, txn, cx)?;
     }
     macro_rules! put {
+        (claude_desktop_store_inventory, $kind:literal) => {
+            if dirty.contains("claude_desktop_store_inventory") {
+                write_field(
+                    &None::<String>,
+                    "claude_desktop_store_inventory",
+                    $kind,
+                    txn,
+                    cx,
+                )?;
+            }
+        };
         (known_configured_scan_roots, $kind:literal) => {
             if dirty.contains("known_configured_scan_roots") {
                 write_field(
@@ -1887,6 +1914,57 @@ mod tests {
             .unwrap(),
             Some(0)
         );
+    }
+    #[test]
+    fn desktop_inventory_keeps_presence_but_never_persists_its_digest() {
+        const FIELD: &str = "claude_desktop_store_inventory";
+        const KIND: &str = "v1_field.claude_desktop_store_inventory";
+        for (present, digest) in [
+            (None, None),
+            (Some(false), None),
+            (Some(true), None),
+            (Some(true), Some("a".repeat(64))),
+        ] {
+            let (_tmp, mut db) = Scratch::store();
+            let index = ScanIndex {
+                claude_desktop_store_inventory: digest,
+                ..Default::default()
+            };
+            let mut cx = KindCx::default();
+            if let Some(present) = present {
+                cx.presence.insert(FIELD.into(), present);
+            }
+            let mut txn = db.begin(TxnMode::Write).unwrap();
+            populate(&index, &mut txn, &mut cx).unwrap();
+            assert_eq!(txn.commit(0, 1), DurableCommitOutcome::Committed(1));
+            let mut restored = ScanIndex::default();
+            let mut loaded = KindCx::default();
+            hydrate(&mut db, &mut restored, &mut loaded).unwrap();
+            assert_eq!(restored.claude_desktop_store_inventory, None);
+            assert_eq!(loaded.presence.get(FIELD).copied(), present);
+            assert!(serde_json::to_value(&restored)
+                .unwrap()
+                .get(FIELD)
+                .is_none());
+
+            let mut next = restored.clone();
+            next.claude_desktop_store_inventory = Some("b".repeat(64));
+            let mut txn = db.begin(TxnMode::Write).unwrap();
+            loaded.plan_delta([FIELD]).unwrap();
+            delta(&restored, &next, &mut txn, &mut loaded).unwrap();
+            let header = txn
+                .get(&RowKey::record(KIND, Vec::new(), 1).unwrap())
+                .unwrap()
+                .unwrap();
+            let mut bytes = Vec::new();
+            txn.read_value(&header, &mut bytes).unwrap();
+            assert_eq!(bytes, b"null", "delta cannot resurrect the digest");
+            assert_eq!(txn.commit(1, 2), DurableCommitOutcome::Committed(2));
+            let mut loaded = KindCx::default();
+            hydrate(&mut db, &mut restored, &mut loaded).unwrap();
+            assert_eq!(restored.claude_desktop_store_inventory, None);
+            assert_eq!(loaded.presence.get(FIELD).copied(), present);
+        }
     }
     #[test]
     fn segmented_unicode_values_and_ordered_queues_reassemble_without_a_second_graph() {
