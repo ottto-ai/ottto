@@ -1,9 +1,3 @@
-#[cfg(feature = "replay-harness")]
-mod loopback_backend;
-/// Isolated, advisory replay of production snapshot pages.
-#[doc(hidden)]
-#[cfg(feature = "replay-harness")]
-pub mod replay_harness;
 #[cfg(test)]
 use crate::snapshots::snapshot_quarantine_witness;
 #[cfg(test)]
@@ -6211,9 +6205,6 @@ fn prepare_sync_source_inner(
         });
         diagnostic.emit();
     }
-    #[cfg(feature = "replay-harness")]
-    let scan_started_at = replay_harness::collection_timestamp().unwrap_or_else(current_rfc3339);
-    #[cfg(not(feature = "replay-harness"))]
     let scan_started_at = current_rfc3339();
     let relay_token = client.issue_status_relay_token(device, device_secret, source)?;
     let mut activity_hint = client.get_activity_hint(&relay_token)?;
@@ -7005,9 +6996,6 @@ fn prepare_continuation_source(
     deadline: Instant,
 ) -> Result<std::result::Result<SourcePreparation, ContinuationRefusal>> {
     let source = SnapshotSource::Codex;
-    #[cfg(feature = "replay-harness")]
-    let scan_started_at = replay_harness::collection_timestamp().unwrap_or_else(current_rfc3339);
-    #[cfg(not(feature = "replay-harness"))]
     let scan_started_at = current_rfc3339();
     let checkpoint_namespace = inputs
         .attribution_context
