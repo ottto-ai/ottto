@@ -1361,6 +1361,11 @@ mod tests {
             shape::inventory(std::io::Cursor::new(bytes)),
             Err(shape::Pause::Unknown)
         );
+        let bytes = br#"{"files":{"/key":{"codex_applied_tier_receipt":{"future":1}}}}"#;
+        assert_eq!(
+            shape::inventory(std::io::Cursor::new(bytes)),
+            Err(shape::Pause::Unknown)
+        );
     }
     #[cfg(unix)]
     fn reference(path: &str, entry: &ScanIndexEntry, generation: u64) -> ResumeCheckpoint {
@@ -1530,7 +1535,14 @@ mod tests {
             .preflight_reserved(&prev, &next, &mut hooks, 1024)
             .unwrap();
         let scratch = Scratch::new();
-        let mut store = scratch.store();
+        // This fixture retries after an aborted transaction. Imports use
+        // journal OFF and must be discarded after any aborted write.
+        let store = scratch.store();
+        let identity = store.read_control::<Identity>("identity").unwrap().unwrap();
+        store.finish_import().unwrap();
+        let mut store =
+            sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
+        store.path_extractor(private_paths);
         let mut txn = store.begin(TxnMode::Write).unwrap();
         next.files
             .get_mut("/synthetic/a")

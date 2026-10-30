@@ -173,6 +173,10 @@ fn f7_off_after_publication_and_ambiguous_commits_cannot_ack_or_fallback() {
     assert!(apply_outcome(&mut index, &mut reload, DurableCommitOutcome::NotPublished).is_err());
     assert!(!reload);
     assert_eq!(index.generation, 1);
+    // EmptyMapper deliberately caches a graph without semantic custody rows.
+    // Use a fresh route so the production mapper must decode those missing rows.
+    let f = Fixture::new();
+    f.published();
     assert!(load_locked(&f.path, None).is_err()); // unmapped published custody holds
 }
 #[test]

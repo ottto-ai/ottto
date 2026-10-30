@@ -711,19 +711,23 @@ fn f8_set_last_reference_reclaims_parts_without_reusing_ids() {
     let id = intern_request_set(&mut tx, &evidence).unwrap();
     assert_eq!(intern_request_set(&mut tx, &evidence).unwrap(), id);
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), None);
     let mut tx = db.begin(TxnMode::Write).unwrap();
     release_request_set(&mut tx, id).unwrap();
     assert!(tx.get(&RowKey::RequestSet(id)).unwrap().is_some());
     release_request_set(&mut tx, id).unwrap();
     assert!(tx.get(&RowKey::RequestSet(id)).unwrap().is_none());
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    // Shared evidence may contain literal private strings. Last-reference
+    // deletion conservatively marks debt even for this synthetic hash stream.
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
     db.validate_parts().unwrap();
     let mut tx = db.begin(TxnMode::Write).unwrap();
     let next = intern_request_set(&mut tx, &evidence).unwrap();
     assert!(next > id);
     assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
-    // These keys/values are N/H only; no PL purge is manufactured.
-    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), None);
+    // Re-interning allocates a new ID without clearing the erasure obligation.
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
 }
 
 #[test]
