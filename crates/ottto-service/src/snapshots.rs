@@ -187,6 +187,11 @@ mod line_delivery_tests;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
 mod restart_restore;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn bounded_restore_tail_items_for_test(source: SnapshotSource) -> Vec<SnapshotItem> {
+    m3_d3_tests::bounded_restore_tail_items(source)
+}
+
 #[cfg(test)]
 pub(crate) use restart_restore::RestartRestoreForTest;
 mod sampled_audit;
@@ -3267,6 +3272,7 @@ pub(crate) fn durable_after_save(
         eprintln!("{}", counters.summary(source, &store));
     }
     cache.durable_alarm(source);
+    cache.durable_rederive_proxies(source);
 }
 
 /// Audit retirement additionally commits its marker CAS only after #865's
@@ -7925,6 +7931,7 @@ struct PendingIndexFinalization {
     diagnostic_reason: FileReason,
     parsed_snapshot_count: usize,
     effective_upload_body_witness_revision: u64,
+    restored_behind_accepted: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -8431,6 +8438,20 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .map(|source_file| !noop_source_files.contains(source_file))
                 .unwrap_or(true)
     });
+
+    // Count publication only after complete-body policy/finalization and
+    // semantic-noop suppression; a restored parser finish alone is no offer.
+    #[cfg(unix)]
+    for pending in &result.pending_finalization {
+        sampled_scan::durable_tail::record_restored_publication(
+            source,
+            pending.parse_complete && pending.restored_behind_accepted,
+            result.snapshots.iter().any(|snapshot| {
+                snapshot.source_file_fingerprint.as_deref()
+                    == Some(pending.source_file_fingerprint.as_str())
+            }),
+        );
+    }
 
     // State-only Codex entities do not have a source-file fingerprint, so they
     // cannot use the file finalization table above. Rebind their durable map to
@@ -31485,6 +31506,7 @@ impl OwnedSourceScan {
                         }
                         let alias_fingerprint = alias.source_file_fingerprint.clone();
                         pending_finalization.push(PendingIndexFinalization {
+                            restored_behind_accepted: false,
                             sampled_audit_verified: false,
                             codex_pending_recovery: index
                                 .files
@@ -31546,6 +31568,9 @@ impl OwnedSourceScan {
                     }
                 }
                 pending_finalization.push(PendingIndexFinalization {
+                    restored_behind_accepted: file_sampling
+                        .as_ref()
+                        .is_some_and(|active| active.restored_behind_accepted),
                     sampled_audit_verified,
                     codex_pending_recovery: index
                         .files
@@ -33840,6 +33865,7 @@ impl OwnedSourceScan {
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
+                            restored_behind_accepted: false,
                             key: local_index_key(&candidate.path),
                             scope,
                             mode,
@@ -34189,7 +34215,7 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         let mut retail_attempt = None;
                         #[cfg(unix)]
-                        let mut restored_claude = false;
+                        let mut restored_durable = false;
                         #[cfg(unix)]
                         let (mut retained, taken_admission, debt) = match retained {
                             None if allow_sample
@@ -34221,7 +34247,7 @@ impl OwnedSourceScan {
                                         lease,
                                     ) => {
                                         preparation_lease = Some(lease);
-                                        restored_claude = restart_restore::enabled() && source == SnapshotSource::ClaudeCode;
+                                        restored_durable = restart_restore::enabled();
                                         retained_offset =
                                             Some(taken.retained.checkpoint.sealed_offset());
                                         let admission = (
@@ -34449,7 +34475,7 @@ impl OwnedSourceScan {
                             sampled_scan::now_seconds(),
                             |checkpoint, file| {
                                 #[cfg(unix)]
-                                if restart_restore::enabled() && restored_claude {
+                                if restart_restore::enabled() && restored_durable && source == SnapshotSource::ClaudeCode {
                                     let accepted_end = durable_accepted.expect("restored floor").end;
                                     match context.cache.begin_retail(
                                         source, &key, checkpoint, file, accepted_end, std::time::Instant::now(),
@@ -34651,8 +34677,24 @@ impl OwnedSourceScan {
                         let continued = taken_admission.filter(|_| {
                             !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
                         });
+                        #[cfg(unix)]
+                        let restored_behind_accepted =
+                            sampled_scan::durable_tail::restored_tail_below_accepted(
+                                source,
+                                restored_durable,
+                                mode,
+                                parser
+                                    .reader
+                                    .acquisition
+                                    .as_ref()
+                                    .map(|p| p.frozen_length()),
+                                index.files.get(&key).map(|e| e.size_bytes),
+                            );
+                        #[cfg(not(unix))]
+                        let restored_behind_accepted = false;
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
+                            restored_behind_accepted,
                             key,
                             scope,
                             mode,
@@ -34725,6 +34767,7 @@ impl OwnedSourceScan {
                         planned_mode = Some((mode, recovered_audit_due));
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
+                            restored_behind_accepted: false,
                             key,
                             scope,
                             mode,
@@ -95569,7 +95612,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; pending_taken, pending_returns, #[cfg(unix)] pending_funding, #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_publication, native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; restored_behind_accepted, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {

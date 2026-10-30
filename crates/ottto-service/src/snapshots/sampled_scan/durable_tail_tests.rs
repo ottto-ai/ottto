@@ -15299,9 +15299,368 @@ fn quiet_restore_has_no_sample_or_content_input_before_decode_on_all_sources() {
                     })
                 });
             assert!(matches!(result, Err(Failure::Resource("rederive_quiet"))));
+            assert_eq!(
+                cache.durable().unwrap().counters.restore_pending_quiet
+                    [diagnostic_source_slot(source)],
+                1
+            );
+            assert_eq!(
+                cache
+                    .durable()
+                    .unwrap()
+                    .counters
+                    .rederive_failed_first_attempt,
+                [0; 3]
+            );
             assert!(samples.is_empty());
             assert_eq!(content_reads, 0);
             lease.release();
         }
     }
+}
+
+// F5/F7: turn over the actual paid map, rather than merely clearing a flag.
+fn evict_failed_replay_pace(cache: &SharedCache, source: SnapshotSource, key: &str) {
+    let digest = full_pace_key(source, key);
+    let now = SystemTime::now();
+    {
+        let mut stores = cache.durable().unwrap();
+        let stamp = stores.retail_full_at.get_mut(&digest).unwrap();
+        stamp.at = SystemTime::UNIX_EPOCH;
+        for n in 0..2 * store::MAX_RECORDS {
+            let other = full_pace_key(source, &format!("pace-turnover-{n}"));
+            if stores.retail_full_at.len() == 2 * store::MAX_RECORDS {
+                break;
+            }
+            stores.retail_full_at.insert(
+                other,
+                FullPace {
+                    at: now + std::time::Duration::from_secs(1),
+                    structural: false,
+                    flags: 0,
+                    head_extent: 0,
+                },
+            );
+        }
+    }
+    assert!(cache.paced_admission(source, "eviction-trigger", now, false, false, true));
+    let mut stores = cache.durable().unwrap();
+    assert!(!stores.retail_full_at.contains_key(&digest));
+    // Let the next call start another turnover; keep the failed key's debt.
+    stores
+        .retail_full_at
+        .remove(&full_pace_key(source, "eviction-trigger"));
+    assert!(stores.key_debt.contains_key(&digest));
+}
+
+#[test]
+fn rederive_failure_full_and_near_cap_allowance_survive_repeated_real_evictions() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let root = crate::test_scratch::ScratchDir::new("full-spend-custody");
+        let path = root.join("source.jsonl");
+        std::fs::write(&path, b"{}\n").unwrap();
+        let file = File::open(&path).unwrap();
+        let key = path.to_str().unwrap();
+        let digest = full_pace_key(source, key);
+        let cache = SharedCache::default();
+        let now = SystemTime::now();
+        cache.durable().unwrap().retail_full_now = Some(now);
+        cache.rederive_gate(source, digest, 2, true, false).unwrap();
+        assert!(cache.rederive_full(source, key, &file, 2, true));
+        evict_failed_replay_pace(&cache, source, key);
+        cache.rederive_gate(source, digest, 2, true, false).unwrap(); // only extra head
+        for _ in 0..4 {
+            assert!(!cache.rederive_full(source, key, &file, 2, false));
+            assert!(!cache.rederive_full(source, key, &file, 2, true));
+            evict_failed_replay_pace(&cache, source, key);
+            assert!(matches!(
+                cache.rederive_gate(source, digest, 2, true, false),
+                Err(Failure::Resource("rederive_paced"))
+            ));
+            assert!(cache.owes_discovery(source, key));
+        }
+        // A sparse file makes the real near-cap metadata branch inexpensive.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(max_jsonl_file_bytes(source))
+            .unwrap();
+        assert!(cache.rederive_full(source, key, &file, 2, false)); // probe is free
+        assert!(cache.rederive_full(source, key, &file, 2, true));
+        for _ in 0..4 {
+            evict_failed_replay_pace(&cache, source, key);
+            let _ = cache.rederive_gate(source, digest, 2, true, false);
+            assert!(!cache.rederive_full(source, key, &file, 2, true));
+        }
+        let stores = cache.durable().unwrap();
+        assert_eq!(
+            stores
+                .counters
+                .resource_full
+                .get("rederive_failure_full.near_cap"),
+            Some(&1)
+        );
+        assert_eq!(stores.key_debt[&digest].full_spend.unwrap().at, now);
+        drop(stores);
+        cache.durable().unwrap().retail_full_now =
+            Some(now + std::time::Duration::from_secs(PACE_SECS));
+        assert!(cache.rederive_full(source, key, &file, 2, true));
+        assert!(
+            !cache.durable().unwrap().key_debt[&digest]
+                .full_spend
+                .unwrap()
+                .near_extra
+        );
+        assert!(owed::key_debt_node_bytes().unwrap() <= 1024);
+    }
+}
+
+#[test]
+fn rederive_process_proxies_count_first_result_only_and_expose_no_identity() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let cache = SharedCache::default();
+        let failed = full_pace_key(source, "PRIVATE-REPLAY-KEY-CANARY");
+        let success = full_pace_key(source, "PRIVATE-SUCCESS-KEY-CANARY");
+        cache.record_first_rederive_result(source, failed, true);
+        cache.record_first_rederive_result(source, failed, true);
+        cache.record_first_rederive_result(source, success, false);
+        cache.record_first_rederive_result(source, success, true);
+        cache.durable().unwrap().retail_full_at.clear();
+        cache.durable().unwrap().clear_rederive_hold(&failed);
+        cache.record_first_rederive_result(source, failed, true);
+        let (_, rows) =
+            crate::local_resource_diagnostics::capture(|| cache.durable_rederive_proxies(source));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["process_id"], std::process::id());
+        assert_eq!(rows[0]["counts"]["rederive_failed_first_attempt"], 1);
+        assert_eq!(rows[0]["counts"]["restore_pending_quiet"], 0);
+        let output = serde_json::to_string(&rows).unwrap();
+        assert!(!output.contains("PRIVATE-"));
+        assert!(!output.contains(
+            &failed
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        // A fresh process cache cannot infer a streak or retain a first result.
+        let fresh = SharedCache::default();
+        let (_, rows) =
+            crate::local_resource_diagnostics::capture(|| fresh.durable_rederive_proxies(source));
+        assert_eq!(rows[0]["counts"]["rederive_failed_first_attempt"], 0);
+    }
+}
+
+#[test]
+fn restored_below_accepted_counts_only_complete_codex_pi_tail_publications() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    use crate::transcript_acquisition::ReadMode;
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        for restored in [false, true] {
+            for mode in [
+                ReadMode::Tail,
+                ReadMode::Unchanged,
+                ReadMode::Full(FullReason::StateMissing),
+            ] {
+                for extent in [99, 100, 101] {
+                    for published in [false, true] {
+                        let behind = restored_tail_below_accepted(
+                            source,
+                            restored,
+                            mode,
+                            Some(extent),
+                            Some(100),
+                        );
+                        let expected = source != SnapshotSource::ClaudeCode
+                            && restored
+                            && mode == ReadMode::Tail
+                            && extent == 99
+                            && published;
+                        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+                            record_restored_publication(source, behind, published)
+                        });
+                        assert_eq!(rows.len(), usize::from(expected));
+                        if expected {
+                            assert_eq!(
+                                rows[0]["counts"]["restored_behind_accepted"]["published"],
+                                1
+                            );
+                            assert_eq!(rows[0]["source"], source.api_slug());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// F4: all certificate edit reasons dominate decode on the production scoped
+// entry. This portable row complements the macOS writer/retirement matrix.
+#[test]
+fn bounded_restore_certificate_edit_reasons_precede_decode_and_count_first_failure() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    use std::io::{Seek, SeekFrom, Write};
+    for reason in [
+        FullReason::Shrunk,
+        FullReason::SameSizeEdit,
+        FullReason::Replaced,
+        FullReason::HeadChanged,
+        FullReason::BoundaryChanged,
+    ] {
+        let root = crate::test_scratch::ScratchDir::new("bounded-certificate-reasons");
+        let path = root.join("source.jsonl");
+        std::fs::write(&path, b"{}\n".repeat(6000)).unwrap();
+        let source = SnapshotSource::Codex;
+        let scope = Scope("certificate-reasons".into());
+        let binding = store::tests::binding("account", "scope", ("fp", None));
+        let expected = Expected {
+            binding: binding.clone(),
+            committed_generation: 1,
+        };
+        let record = store::DurableRecord {
+            wire: None,
+            envelope_audit_debt: None,
+            format: store::FORMAT_V1,
+            index_generation: 1,
+            record: PendingRecord {
+                acquisition: None,
+                binding,
+                certificate: certificate(&path, &scope),
+                body: vec![],
+                allowlist: codec::allowlist_digest(source),
+            },
+        };
+        let original_length = record.record.certificate.length;
+        match reason {
+            FullReason::Shrunk => File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(1)
+                .unwrap(),
+            FullReason::SameSizeEdit => {
+                let file = File::options().write(true).open(&path).unwrap();
+                file.set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(SystemTime::now() + std::time::Duration::from_secs(2)),
+                )
+                .unwrap();
+            }
+            FullReason::Replaced => {
+                std::fs::rename(&path, root.join("old.jsonl")).unwrap();
+                std::fs::write(&path, b"{}\n".repeat(6001)).unwrap();
+            }
+            FullReason::HeadChanged | FullReason::BoundaryChanged => {
+                let mut file = File::options().write(true).open(&path).unwrap();
+                file.seek(SeekFrom::Start(if reason == FullReason::HeadChanged {
+                    0
+                } else {
+                    original_length - 3
+                }))
+                .unwrap();
+                file.write_all(b"[]\n").unwrap();
+                file.seek(SeekFrom::End(0)).unwrap();
+                file.write_all(b"{}\n").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let cache = SharedCache::default();
+        let store::LeaseWait::Granted(mut lease) = cache.acquire_prepared_transfer(source) else {
+            panic!("lease");
+        };
+        let index = ScanIndex::default();
+        let interpretation = Interpretation {
+            accepted: None,
+            identity_contract: String::new(),
+            counting_view: String::new(),
+            namespace: &scope,
+        };
+        let (result, reads) = capture_rederive_reads(|| {
+            cache.durable_restore_record_scoped(
+                source,
+                &record,
+                &expected,
+                &path,
+                &scope,
+                &mut File::open(&path).unwrap(),
+                &mut lease,
+                Some(V3RestoreScope {
+                    index: &index,
+                    interpretation: &interpretation,
+                }),
+            )
+        });
+        assert!(
+            matches!(result, Err(Failure::Certificate(CertificateRefusal::Changed(got))) if got == reason),
+            "{reason:?}"
+        );
+        assert_eq!(reads, 0);
+        assert_eq!(
+            cache
+                .durable()
+                .unwrap()
+                .counters
+                .rederive_failed_first_attempt[1],
+            1
+        );
+        lease.release();
+    }
+}
+
+#[test]
+fn rederive_unfunded_key_custody_keeps_existing_counted_paced_full_fallback() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    let root = crate::test_scratch::ScratchDir::new("rederive-custody-overflow");
+    let path = root.join("source.jsonl");
+    std::fs::write(&path, b"{}\n{}\n").unwrap();
+    let source = SnapshotSource::ClaudeCode;
+    let ds = DurableSource::ClaudeCode;
+    let key = path.to_str().unwrap();
+    let cache = SharedCache::default();
+    for n in 0..store::MAX_RECORDS {
+        cache.durable().unwrap().set_owed(
+            store::key_digest(ds, &format!("held-{n}")),
+            owed::OwedMark::Hold(ds),
+        );
+    }
+    let digest = full_pace_key(source, key);
+    assert!(matches!(
+        cache.rederive_gate(source, digest, 3, false, false),
+        Err(Failure::Resource("rederive_custody"))
+    ));
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.into(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":3, "modified_unix_seconds":1, "source_file_fingerprint":"synthetic"
+        }))
+        .unwrap(),
+    );
+    let held = File::open(&path).unwrap();
+    assert!(matches!(
+        cache.restore_resource_pending(source, "rederive_custody", key, &held, &index),
+        RestoreOutcome::Miss(MissClass::Resource("rederive_custody"))
+    ));
+    assert!(matches!(
+        cache.restore_resource_pending(source, "rederive_custody", key, &held, &index),
+        RestoreOutcome::Pending
+    ));
+    let stores = cache.durable().unwrap();
+    assert_eq!(stores.key_debt.len(), store::MAX_RECORDS);
+    assert!(!stores.key_debt.contains_key(&digest));
+    assert_eq!(
+        stores.counters.resource_full.get("rederive_custody"),
+        Some(&1)
+    );
+    assert!(stores.owed_overflow[ds.slot()]);
 }

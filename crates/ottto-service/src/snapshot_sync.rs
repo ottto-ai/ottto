@@ -23797,6 +23797,88 @@ mod tests {
         assert_eq!(quiet.semantic_noop_count, 2);
         std::fs::remove_dir_all(root).unwrap();
     }
+    // F9/F11: real restored+rederived+Tailed bodies enter the unchanged
+    // exact page/ACK machinery. Linux cannot qualify native decode layout.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bounded_restored_tail_exact_ack_and_saved_ack_skip_transport() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        run_on_scan_worker_stack(|| {
+            for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+                let items = crate::snapshots::bounded_restore_tail_items_for_test(source);
+                assert!(!items.is_empty());
+                let slots: Vec<usize> = (0..items.len()).collect();
+                let mut progress = test_upload_progress();
+                let mut accepted = 0;
+                let mut posts = 0;
+                let scope = unique_poison_scope();
+                attempt_snapshot_page(
+                    &items,
+                    &slots,
+                    &scope,
+                    &mut progress,
+                    &mut accepted,
+                    &|i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
+                    &snapshot_upload_body_witness,
+                    &|i: &SnapshotItem| Some(i.source_session_id.as_str()),
+                    &mut |body| {
+                        posts += 1;
+                        same_source_fixture_ack(body)
+                    },
+                    &mut |_| Ok(()),
+                )
+                .unwrap();
+                assert_eq!(posts, 1);
+                for item in &items {
+                    assert!(progress.contains_body(
+                        &item.snapshot_fingerprint,
+                        &snapshot_upload_body_witness(item)
+                    ));
+                }
+                // Crash after the saved ACK and before index settlement: loading
+                // that exact progress must suppress another POST for the same body.
+                let root = test_dir("bounded-ack-restart");
+                std::fs::create_dir_all(&root).unwrap();
+                let path = root.join("progress.json");
+                progress.save(&path).unwrap();
+                let mut loaded = SnapshotUploadProgress::load(
+                    &path,
+                    &progress.destination_namespace_hash,
+                    test_quarantine_witness(),
+                )
+                .unwrap();
+                attempt_snapshot_page(
+                    &items,
+                    &slots,
+                    &scope,
+                    &mut loaded,
+                    &mut accepted,
+                    &|i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
+                    &snapshot_upload_body_witness,
+                    &|i: &SnapshotItem| Some(i.source_session_id.as_str()),
+                    &mut |_| {
+                        posts += 1;
+                        Err(anyhow!("exact saved ACK must skip POST"))
+                    },
+                    &mut |_| Ok(()),
+                )
+                .unwrap();
+                assert_eq!(posts, 1);
+                // An ordinary entity ACK for a different body cannot credit this
+                // revision. Keep fingerprint fixed to exercise body equality.
+                let mut changed = items.clone();
+                changed[0].output_tokens += 1;
+                assert!(!loaded.contains_body(
+                    &changed[0].snapshot_fingerprint,
+                    &snapshot_upload_body_witness(&changed[0])
+                ));
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        });
+    }
+
     fn same_source_fixture_ack(
         items: Vec<SnapshotItem>,
     ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {

@@ -829,6 +829,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     .unwrap();
     scan.snapshots = vec![snapshot];
     scan.pending_finalization.push(PendingIndexFinalization {
+        restored_behind_accepted: false,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: key.clone(),

@@ -162,6 +162,35 @@ pub(in crate::snapshots) fn record_rederive_refused(source: SnapshotSource, clas
     }
 }
 
+/// Only an actual restored Tail may report this disposition. The extent is
+/// frozen at native preparation, before index mutations or later appends.
+pub(in crate::snapshots) fn restored_tail_below_accepted(
+    source: SnapshotSource,
+    restored: bool,
+    mode: crate::transcript_acquisition::ReadMode,
+    frozen: Option<u64>,
+    accepted: Option<u64>,
+) -> bool {
+    restart_restore::enabled()
+        && matches!(source, SnapshotSource::Codex | SnapshotSource::Pi)
+        && restored
+        && mode == crate::transcript_acquisition::ReadMode::Tail
+        && frozen.zip(accepted).is_some_and(|(end, floor)| end < floor)
+}
+
+pub(in crate::snapshots) fn record_restored_publication(
+    source: SnapshotSource,
+    behind: bool,
+    published: bool,
+) {
+    if behind && published {
+        crate::local_resource_diagnostics::durable_tail_alarm(
+            source.api_slug(),
+            &serde_json::json!({"restored_behind_accepted":{"published":1}}),
+        );
+    }
+}
+
 /// Native consumed input, not certificate samples or BufReader readahead.
 /// Call after each step, including partial/error steps, using its actual plan.
 /// Rederive head input has its own pread observer and is never counted twice.
@@ -245,6 +274,9 @@ const _: () = assert!(PACE_SECS < 86_400);
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Counters {
     pub(crate) restore_attempts: u64,
+    /// Per-process totals, emitted together once at the source pass boundary.
+    rederive_failed_first_attempt: [u64; 3],
+    restore_pending_quiet: [u64; 3],
     pub(crate) restored: u64,
     pub(crate) original_v1_mapped: u64,
     pub(crate) durable_restore_after_selection_clear: u64,
@@ -1903,6 +1935,20 @@ impl SharedCache {
         #[cfg(test)]
         let now = stores.retail_full_now.unwrap_or(now);
         let key = full_pace_key(source, key);
+        // A held replay key keeps its Full spend in never-evicted custody.
+        // The pace stamp remains the overflow fallback for unfunded keys.
+        let full_at = stores
+            .key_debt
+            .get(&key)
+            .and_then(|d| d.full_spend)
+            .map(|spend| spend.at)
+            .or_else(|| {
+                stores
+                    .retail_full_at
+                    .get(&key)
+                    .filter(|stamp| stamp.flags & FULL_SPENT != 0)
+                    .map(|stamp| stamp.at)
+            });
         // Expiry releases the pace without losing structural classification.
         // A no-record publication may already have changed the index binding.
         if stores.retail_full_at.get(&key).is_some_and(|stamp| {
@@ -1912,12 +1958,9 @@ impl SharedCache {
             stores.counters.pace_anomaly += 1;
         }
         let delayed = !near_cap
-            && stores.retail_full_at.get(&key).is_some_and(|stamp| {
-                if stamp.flags & FULL_SPENT == 0 {
-                    return false;
-                }
+            && full_at.is_some_and(|at| {
                 // Backwards and implausibly large forwards jumps both EXPIRE.
-                now.duration_since(stamp.at).is_ok_and(|age| {
+                now.duration_since(at).is_ok_and(|age| {
                     age.as_secs() <= PACE_SANITY_SECS
                         && age < std::time::Duration::from_secs(PACE_SECS)
                 })
@@ -1964,6 +2007,12 @@ impl SharedCache {
                 stamp.at = now;
                 stamp.structural = structural;
                 stamp.flags = (stamp.flags | FULL_SPENT) & !NEAR_EXTRA;
+            }
+            if let Some(debt) = stores.key_debt.get_mut(&key) {
+                debt.full_spend = Some(owed::FullSpend {
+                    at: now,
+                    near_extra: false,
+                });
             }
         }
         if let Some(stamp) = stores.retail_full_at.get_mut(&key).filter(|_| active_bound) {
@@ -3417,6 +3466,13 @@ impl SharedCache {
         record: &store::DurableRecord,
         expected: &Expected,
     ) {
+        // Early metadata/object edit edges can fence-drop before scoped
+        // content replay. They share the same first-attempt observation.
+        self.record_first_rederive_result(
+            source.properties().snapshot,
+            record.record.binding.key,
+            true,
+        );
         let Some(mut stores) = self.durable() else {
             return;
         };
@@ -3524,10 +3580,17 @@ impl SharedCache {
         }
         // Custody is funded independently of pace-node eviction. No synthetic
         // receipt debt: this bit cannot block settlement/upload of other keys.
+        let prior_full = (stamp.flags & FULL_SPENT != 0).then_some(owed::FullSpend {
+            at: stamp.at,
+            near_extra: stamp.flags & NEAR_EXTRA != 0,
+        });
         let Some(debt) = stores.fund_debt(digest) else {
             stores.owed_overflow[ds.slot()] = true;
             return Err(Failure::Resource("rederive_custody"));
         };
+        if debt.full_spend.is_none() {
+            debt.full_spend = prior_full;
+        }
         debt.rederive_hold = Some(ds);
         if input {
             if debt.head_extent == Some(extent) {
@@ -3577,14 +3640,33 @@ impl SharedCache {
         let Some(mut stores) = self.durable() else {
             return false;
         };
-        let Some(stamp) = stores.retail_full_at.get_mut(&full_pace_key(source, key)) else {
-            return false;
-        };
-        if stamp.flags & NEAR_EXTRA != 0 {
+        let digest = full_pace_key(source, key);
+        let spent_extra = stores
+            .key_debt
+            .get(&digest)
+            .and_then(|d| d.full_spend)
+            .map(|spend| spend.near_extra)
+            .or_else(|| {
+                stores
+                    .retail_full_at
+                    .get(&digest)
+                    .map(|stamp| stamp.flags & NEAR_EXTRA != 0)
+            });
+        // Missing spend evidence grants no additional near-cap exception.
+        if spent_extra != Some(false) {
             return false;
         }
         if start {
-            stamp.flags |= NEAR_EXTRA;
+            if let Some(spend) = stores
+                .key_debt
+                .get_mut(&digest)
+                .and_then(|d| d.full_spend.as_mut())
+            {
+                spend.near_extra = true;
+            }
+            if let Some(stamp) = stores.retail_full_at.get_mut(&digest) {
+                stamp.flags |= NEAR_EXTRA;
+            }
             Counters::bump(
                 &mut stores.counters.resource_full,
                 "rederive_failure_full.near_cap",
@@ -4290,6 +4372,34 @@ impl SharedCache {
         lease: &mut store::ActiveLease,
         v3: Option<V3RestoreScope<'_>>,
     ) -> Result<(Checkpoint, CachedJsonlReduction, codec::RederiveReceipt), Failure> {
+        let scoped = v3.is_some();
+        let result =
+            self.restore_record_content(source, record, expected, path, scope, held, lease, v3);
+        // Eligible scoped failures include certificate/fence drops. Quiet is
+        // an observation, not a content attempt. OFF uses the native M1 path.
+        if scoped
+            && !matches!(
+                result,
+                Err(Failure::Resource("rederive_quiet") | Failure::Ineligible(_))
+            )
+        {
+            self.record_first_rederive_result(source, record.record.binding.key, result.is_err());
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn restore_record_content(
+        &self,
+        source: SnapshotSource,
+        record: &store::DurableRecord,
+        expected: &Expected,
+        path: &Path,
+        scope: &Scope,
+        held: &mut File,
+        lease: &mut store::ActiveLease,
+        v3: Option<V3RestoreScope<'_>>,
+    ) -> Result<(Checkpoint, CachedJsonlReduction, codec::RederiveReceipt), Failure> {
         if source == SnapshotSource::Codex {
             refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)
                 .map_err(|_| Failure::NotRederived(Refuse::NotRederivable("compressed")))?;
@@ -4315,6 +4425,9 @@ impl SharedCache {
             <= committed
             && v3.is_some()
         {
+            if let Some(mut stores) = self.durable() {
+                stores.counters.restore_pending_quiet[diagnostic_source_slot(source)] += 1;
+            }
             return Err(Failure::Resource("rederive_quiet"));
         }
         let before =
@@ -4433,6 +4546,46 @@ impl SharedCache {
         }
 
         Ok((checkpoint, reduction, receipt))
+    }
+
+    fn record_first_rederive_result(
+        &self,
+        source: SnapshotSource,
+        digest: store::Digest32,
+        failed: bool,
+    ) {
+        let Some(mut stores) = self.durable() else {
+            return;
+        };
+        let Some(debt) = stores.fund_debt(digest) else {
+            return;
+        };
+        if debt.first_rederive_failed.is_none() {
+            debt.first_rederive_failed = Some(failed);
+            stores.counters.rederive_failed_first_attempt[diagnostic_source_slot(source)] +=
+                u64::from(failed);
+        }
+    }
+
+    /// Aggregate process proxies on the existing carrier, once per source pass.
+    pub(crate) fn durable_rederive_proxies(&self, source: SnapshotSource) {
+        if !restart_restore::enabled() {
+            return;
+        }
+        let Some(stores) = self.durable() else {
+            return;
+        };
+        let slot = diagnostic_source_slot(source);
+        let failed = stores.counters.rederive_failed_first_attempt[slot];
+        let quiet = stores.counters.restore_pending_quiet[slot];
+        drop(stores);
+        crate::local_resource_diagnostics::durable_tail_alarm(
+            source.api_slug(),
+            &serde_json::json!({
+                "rederive_failed_first_attempt": failed,
+                "restore_pending_quiet": quiet,
+            }),
+        );
     }
 
     /// A proved non-singleton class keeps its native owner. No mark or pending

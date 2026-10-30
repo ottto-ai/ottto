@@ -32,10 +32,19 @@ pub(super) struct KeyDebt {
     pub(super) rederive_hold: Option<DurableSource>,
     pub(super) head_extent: Option<u32>,
     pub(super) extra_head: bool,
+    /// Cross-cause Full allowance survives turnover of the paid pace map.
+    pub(super) full_spend: Option<FullSpend>,
+    /// Diagnostic only: the first non-quiet scoped replay result this process.
+    pub(super) first_rederive_failed: Option<bool>,
     pub(super) retire_source: Option<DurableSource>,
     pub(super) retire_sync: bool,
     /// D3: this Claude key's stale predecessor survived a failed write.
     hold: Option<ClaudeHold>,
+}
+#[derive(Clone, Copy)]
+pub(super) struct FullSpend {
+    pub(super) at: std::time::SystemTime,
+    pub(super) near_extra: bool,
 }
 impl KeyDebt {
     pub(super) fn is_empty(&self) -> bool {
@@ -43,6 +52,8 @@ impl KeyDebt {
             && self.hold.is_none()
             && self.rederive_hold.is_none()
             && self.retire_source.is_none()
+            && self.full_spend.is_none()
+            && self.first_rederive_failed.is_none()
     }
 }
 /// Funded nodes per map: owed/hold keys need no more than the RAM cache's

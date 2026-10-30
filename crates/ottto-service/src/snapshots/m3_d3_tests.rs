@@ -1141,9 +1141,16 @@ fn kill_child(root: PathBuf, point: OrderPoint) {
     let _gate = claude_request_money::e2::GateForTest::set(true);
     let mut rig = Rig::open(SnapshotSource::ClaudeCode, root.clone());
     rig.create(SESSION_A, 2);
+    // F11: the killed acquisition must restore real content through (b),
+    // rather than exercising only an obligation-free or RAM Tail.
+    let path = rig.path(SESSION_A);
+    let usage = fs::read_to_string(&path).unwrap();
+    let prompt = json!({"type":"user","sessionId":SESSION_A,"uuid":"crash-content-prompt","message":{"role":"user","content":"Synthetic bounded crash prompt"}}).to_string() + "\n";
+    fs::write(&path, prompt + &usage).unwrap();
     assert_eq!(rig.pass().published(SESSION_A), 1);
     rig.assert_native_record(SESSION_A);
     fs::copy(rig.record(SESSION_A), root.join("a-after-first-pass")).unwrap();
+    rig.restart();
     rig.append(SESSION_A, 1);
     let marker = root.join("point-reached");
     match point {
@@ -1672,4 +1679,35 @@ fn m3_codex_post_read_tier_transition_refuses_a_across_failed_gc_and_restart() {
         !record.exists(),
         "the excluded owner never stages another singleton A"
     );
+}
+
+/// F9's input is a body produced by the native store restore, bounded replay
+/// and ordinary Tail, rather than a hand-built item. Qualified macOS only.
+#[cfg(target_os = "macos")]
+pub(super) fn bounded_restore_tail_items(source: SnapshotSource) -> Vec<SnapshotItem> {
+    let _restart_restore = RestartRestoreForTest::enabled();
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let mut rig = Rig::new(source, "bounded-settlement-body");
+    let session = if source == SnapshotSource::Codex {
+        CODEX_SESSION
+    } else {
+        SESSION_A
+    };
+    let prompt = if source == SnapshotSource::Codex {
+        codex_head(session) + &json!({"type":"event_msg","payload":{"type":"user_message","message":"Synthetic bounded settlement prompt"}}).to_string() + "\n"
+    } else {
+        json!({"type":"user","sessionId":session,"uuid":"bounded-prompt","cwd":"/synthetic/bounded","message":{"role":"user","content":"Synthetic bounded settlement prompt"}}).to_string() + "\n"
+    };
+    fs::write(rig.path(session), prompt).unwrap();
+    rig.append(session, 2);
+    assert_eq!(rig.pass().published(session), 1);
+    rig.assert_native_record(session);
+    rig.restart();
+    rig.append(session, 1);
+    let restored = rig.pass();
+    assert_eq!(restored.published(session), 1);
+    assert_eq!(restored.full(), 0);
+    assert!(rig.counters().0.rederive_head_bytes > 0);
+    assert_eq!(restored.witness(session), Some(rig.cold(session)));
+    restored.snapshots
 }

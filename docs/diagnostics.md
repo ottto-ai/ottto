@@ -1399,6 +1399,23 @@ and unknown survivors remain protected. Retirement never creates an ACK.
 Claude's accepted-floor hold reports `restored_behind_accepted.held` at its
 actual decision edges. The discovery dependency continues to hard-gate the
 production switch; RAM pacing does not establish restart-persistent bounds.
+Codex and Pi report `restored_behind_accepted.published` only when a complete
+restored Tail body below the frozen accepted extent reaches publication.
+
+`rederive_failed_first_attempt{source}` and `restore_pending_quiet{source}` are
+**proxies**, emitted once per source pass as cumulative process totals on the
+existing `durable_tail_alarm` carrier with `process_id`. The first counts keys
+whose first eligible non-quiet (b) restore attempt in this process failed, including
+a fence drop; later failures of the same key do not increment it, and a first
+success followed by failure does not count. Its diagnostic marker shares the
+bounded, never-evicted key custody. If that custody is full, `key_debt_unfunded`
+reports the observation gap; the proxy is then a lower bound. The quiet proxy
+counts metadata-only restores returning Pending with zero transcript input.
+It does not decode obligations and cannot establish `pending_no_obligation`.
+Neither proxy measures a per-key restart streak. Compare process totals using
+`process_id`; they reset on restart and carry no key identity. Full-spend time
+and near-cap use for funded keys also live in key custody, so evicting the paid
+pace node cannot renew either allowance.
 
 ## Codex state-only identity coverage
 

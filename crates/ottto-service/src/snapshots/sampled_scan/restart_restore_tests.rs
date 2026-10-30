@@ -17,8 +17,8 @@ fn off_restart_fixture(require_restore: bool) {
     let root = crate::test_scratch::ScratchDir::new("restart-restore-off-m1");
     let lock = crate::locked_state_dir::test_locks::hold(&root);
     let path = root.join("source.jsonl");
-    // A first prompt requires main's native parser. M3's typed workspace-only
-    // extractor deliberately refuses it, so this also detects wrong routing.
+    // A first prompt exercises main's native M1 replay. OFF must never enter
+    // the bounded M3 content replay or its custody/proxy accounting.
     std::fs::write(&path, concat!(
         "{\"type\":\"user\",\"cwd\":\"/synthetic/workspace\",\"message\":{\"role\":\"user\",\"content\":\"synthetic prompt\"}}\n",
         "{\"type\":\"assistant\",\"sessionId\":\"11111111-2222-4333-8444-555555555555\",\"timestamp\":\"2026-10-07T10:00:00Z\",\"requestId\":\"request\",\"message\":{\"id\":\"message\",\"model\":\"fixture-model\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10}}}\n"
@@ -191,7 +191,12 @@ fn off_restart_fixture(require_restore: bool) {
     assert!(stores.retail_spent.is_empty());
     assert!(stores.key_debt.is_empty());
     assert!(stores.restore_pending.is_empty());
+    assert_eq!(stores.counters.rederive_failed_first_attempt, [0; 3]);
+    assert_eq!(stores.counters.restore_pending_quiet, [0; 3]);
     drop(stores);
+    let (_, events) =
+        crate::local_resource_diagnostics::capture(|| cache.durable_rederive_proxies(source));
+    assert!(events.is_empty());
     let (counters, store) = cache.durable_counters(source).unwrap();
     assert_eq!(store.records_written, 0);
     assert!(counters
