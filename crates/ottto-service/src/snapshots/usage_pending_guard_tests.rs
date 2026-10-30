@@ -454,6 +454,41 @@ fn phase1_held_member_growth_keeps_siblings_and_rewindows_after_resolution() {
 }
 
 #[test]
+fn unread_scope_marks_clear_on_recorded_growth_and_saturate_conservatively() {
+    let (mut index, root, items) = held_family_index();
+    assert!(usage_pending_guard::unread_scope(&index, CARRY_RETRY).is_empty());
+    let parent = index
+        .files
+        .keys()
+        .find(|key| {
+            claude_index_path_member_ref(Path::new(key))
+                .is_some_and(|member| member.root == root && member.subagent_stem.is_none())
+        })
+        .cloned()
+        .unwrap();
+    index.usage_guard_full_blocked(Path::new(&parent));
+    assert!(usage_pending_guard::unread_scope(&index, CARRY_RETRY).contains(&root));
+    // A projection install keeps the mark while the family stays held.
+    index.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
+    assert!(usage_pending_guard::unread_scope(&index, CARRY_RETRY).contains(&root));
+    // The parent's growth reaching its held slot is what reads it.
+    accumulate_guarded(&mut index, &items[..1]);
+    assert!(usage_pending_guard::unread_scope(&index, CARRY_RETRY).is_empty());
+    // Past the per-family bound the family stays unread until the hold ends.
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        for n in 0..=usage_pending_guard::HELD_UNREAD_KEYS_PER_FAMILY {
+            let key = carry_key(&root, Some(&format!("agent-{n:04}")));
+            index.usage_guard_full_blocked(Path::new(&key));
+        }
+    });
+    assert!(rows
+        .iter()
+        .any(|row| row["counts"]["held_unread_saturated"] == 1));
+    accumulate_guarded(&mut index, &items[1..]);
+    assert!(usage_pending_guard::unread_scope(&index, CARRY_RETRY).contains(&root));
+}
+
+#[test]
 fn phase1_held_growth_is_offered_to_the_prover_as_current_pending() {
     // A missing witness resolves only from this window's complete held
     // growth; the prover sees it as ordinary current-window pending.

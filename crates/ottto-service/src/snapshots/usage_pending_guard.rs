@@ -177,12 +177,22 @@ pub(super) struct Runtime {
     audited: BTreeSet<String>,
     // The loaded index file this custody belongs to, if any.
     custody: Option<String>,
-    // Held files whose read was refused or paced (index key -> family root):
-    // their unread data keeps the family's coverage incomplete until a read
-    // of that key completes (Lead B unread-scope veto).
-    unread: BTreeMap<String, String>,
+    // Held files whose read was refused or paced, by family root: their
+    // unread data keeps the family's coverage incomplete until that member's
+    // growth is recorded (Lead B unread-scope veto).
+    unread: BTreeMap<String, UnreadKeys>,
 }
 crate::heap_layout_bound::fields!(Runtime; slots, slot_occurrences, paced, withheld, audited, custody, unread);
+
+/// One held family's refused keys. Past the bound the family is saturated:
+/// it stays unread (vetoing conservatively) until the hold itself ends.
+#[derive(Clone, Debug, Default)]
+struct UnreadKeys {
+    keys: BTreeSet<String>,
+    saturated: bool,
+}
+crate::heap_layout_bound::fields!(UnreadKeys; keys, saturated);
+pub(super) const HELD_UNREAD_KEYS_PER_FAMILY: usize = 64;
 
 /// The daemon reloads its ScanIndex every sync cycle, so runtime custody
 /// lives for the process, like the RAM checkpoint cache, keyed by index file.
@@ -313,6 +323,16 @@ impl Holds {
             },
         );
         runtime.slot_occurrences = next;
+        // The member's data reached its slot: its refused keys are read.
+        if let Some(unread) = runtime.unread.get_mut(root) {
+            unread.keys.retain(|key| {
+                claude_index_path_member_ref(Path::new(key))
+                    .map_or(true, |at| at.into_owned().1 != member)
+            });
+            if unread.keys.is_empty() && !unread.saturated {
+                runtime.unread.remove(root);
+            }
+        }
         crate::local_resource_diagnostics::traversal_point(
             "claude_usage_held_member_growth",
             SnapshotSource::ClaudeCode.api_slug(),
@@ -675,7 +695,10 @@ impl ScanIndex {
         // A family whose pending proof is gone (retired or vanished) has no
         // window left to rejoin; its held growth goes with it.
         let pending = &self.claude_usage_family_pending;
-        runtime.unread.retain(|_, root| pending.contains_key(root));
+        // Unread marks live only while their family is held.
+        runtime
+            .unread
+            .retain(|root, _| pending.contains_key(root) && holds.holds(root));
         if runtime
             .slots
             .values()
@@ -754,16 +777,6 @@ impl ScanIndex {
             return;
         };
         let held = self.usage_guard_holds.holds(member.root);
-        // A completed Tail read the file to its end: its data is read.
-        if self
-            .usage_guard_holds
-            .runtime
-            .unread
-            .remove(&local_index_key(path))
-            .is_some()
-        {
-            stash(&self.usage_guard_holds.runtime);
-        }
         if held {
             crate::local_resource_diagnostics::traversal_point(
                 "claude_usage_held_member_growth",
@@ -798,11 +811,31 @@ impl ScanIndex {
         let Some(member) = claude_index_path_member_ref(path) else {
             return;
         };
-        if self.usage_guard_holds.holds(member.root) {
-            let root = member.root.to_owned();
-            let runtime = &mut self.usage_guard_holds.runtime;
-            runtime.unread.insert(local_index_key(path), root);
-            stash(runtime);
+        if !self.usage_guard_holds.holds(member.root) {
+            return;
+        }
+        // Custody reaches the process owner at the next projection install;
+        // a refusal never clones the runtime.
+        let key = local_index_key(path);
+        let unread = self
+            .usage_guard_holds
+            .runtime
+            .unread
+            .entry(member.root.to_owned())
+            .or_default();
+        if unread.saturated || unread.keys.contains(&key) {
+            return;
+        }
+        if unread.keys.len() >= HELD_UNREAD_KEYS_PER_FAMILY {
+            unread.keys = BTreeSet::new();
+            unread.saturated = true;
+            crate::local_resource_diagnostics::traversal_point(
+                "claude_usage_held_unread_scope",
+                SnapshotSource::ClaudeCode.api_slug(),
+                &json!({"held_unread_saturated":1}),
+            );
+        } else {
+            unread.keys.insert(key);
         }
     }
 }
@@ -818,8 +851,10 @@ pub(super) fn unread_scope(index: &ScanIndex, window: &str) -> BTreeSet<String> 
     if holds.global() {
         return scope;
     }
-    for (key, root) in &holds.runtime.unread {
-        if holds.holds(root) && index.files.contains_key(key) {
+    for (root, unread) in &holds.runtime.unread {
+        if holds.holds(root)
+            && (unread.saturated || unread.keys.iter().any(|key| index.files.contains_key(key)))
+        {
             scope.insert(root.clone());
         }
     }
@@ -1011,11 +1046,10 @@ impl ScanIndex {
     /// stamp are satisfied for this process, so the next visit can Tail.
     pub(super) fn usage_guard_mark_audited(&mut self, key: &str) {
         let runtime = &mut self.usage_guard_holds.runtime;
-        runtime.unread.remove(key);
         if runtime.paced.contains_key(key) {
             runtime.audited.insert(key.to_owned());
+            stash(runtime);
         }
-        stash(runtime);
     }
     pub(super) fn usage_guard_audit_satisfied(&self, key: &str, due_unix_seconds: u64) -> bool {
         let runtime = &self.usage_guard_holds.runtime;
