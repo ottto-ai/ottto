@@ -90,7 +90,8 @@ fn terminal_off_on_scan(
     context: &str,
     revision: u64,
 ) -> SourceScanResult {
-    index.activate_upload_context(context.into());
+    assert!(crate::snapshots::claude_terminal_off());
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, context.into());
     index.activate_effective_upload_body_witness_revision(revision);
     index.adopt_effective_upload_body_witness_revision_monotonically();
     // This fixed-clock classifier driver requests the next bounded history
@@ -123,9 +124,30 @@ fn settle(
         .map(|item| item.snapshot_fingerprint.clone())
         .collect();
     let mut settled = index.committable_subset(previous, &accepted, &BTreeMap::new());
+    if crate::snapshots::ClaudeTerminalOffForTest::active() {
+        terminal_off_on_accept_context(&mut settled, &scan.snapshots);
+    }
     let path = home.join("scan-index.json");
     settled.save(&path).unwrap();
     ScanIndex::load(&path).unwrap()
+}
+
+// Mirror the driver's existing exact acceptance for per-file #901 custody.
+fn terminal_off_on_accept_context(index: &mut ScanIndex, items: &[SnapshotItem]) {
+    let candidates = index.file_upload_context_ack_candidates(items);
+    let fresh_acks = items.iter().map(|item| (
+        item.snapshot_fingerprint.clone(), snapshot_upload_body_witness(item),
+    )).collect();
+    index.accept_file_upload_context_acks(&candidates, &fresh_acks);
+}
+
+// Same scheduling criterion as C1b: retained traversal, directories drained,
+// and no census-member candidates; this grants no completion or authority.
+fn terminal_off_on_walk_ended(index: &ScanIndex) -> bool {
+    index.traversal.as_ref().is_some_and(|walk| {
+        walk.pending_directories.is_empty()
+            && walk.pending_candidates.iter().all(|path| !path.census_member)
+    })
 }
 
 fn support(name: &str) -> crate::test_scratch::ScratchDir {
@@ -765,7 +787,7 @@ fn terminal_off_on_revision_bump_rereads_every_stamped_file_paced_then_stops() {
             .count()
     };
     let page = |index: &mut ScanIndex, revision: u64| {
-        index.activate_upload_context("ctx-1".into());
+        index.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-1".into());
         index.activate_effective_upload_body_witness_revision(revision);
         index.adopt_effective_upload_body_witness_revision_monotonically();
         let mut result = scan_source_roots_with_limit(
@@ -785,6 +807,7 @@ fn terminal_off_on_revision_bump_rereads_every_stamped_file_paced_then_stops() {
             .map(|item| item.snapshot_fingerprint.clone())
             .collect();
         index.record_accepted_snapshot_fingerprints(&accepted);
+        terminal_off_on_accept_context(index, &result.snapshots);
         result
     };
     let mut index = ScanIndex::default();
@@ -795,9 +818,12 @@ fn terminal_off_on_revision_bump_rereads_every_stamped_file_paced_then_stops() {
         loop {
             stamp_pages += 1;
             assert!(stamp_pages <= 12, "the stamped corpus settles");
+            if stamp_pages == 1 || terminal_off_on_walk_ended(&index) {
+                expire_terminal_off_discovery_for_test(&index);
+            }
             let result = page(&mut index, 2);
             walk_reads += result.scanned_file_count;
-            if result.census_complete {
+            if terminal_off_on_walk_ended(&index) {
                 if walk_reads == 0 {
                     break;
                 }
@@ -823,6 +849,9 @@ fn terminal_off_on_revision_bump_rereads_every_stamped_file_paced_then_stops() {
                     "every file upgrades: {receipts:?}"
                 );
                 let before = index.clone();
+                if terminal_off_on_walk_ended(&index) {
+                    expire_terminal_off_discovery_for_test(&index);
+                }
                 let result = page(&mut index, 3);
                 let bytes = index
                     .files
@@ -861,8 +890,11 @@ fn terminal_off_on_revision_bump_rereads_every_stamped_file_paced_then_stops() {
             let mut after = Vec::new();
             while complete < 2 {
                 assert!(after.len() < 8, "the walks complete: {after:?}");
+                if terminal_off_on_walk_ended(&index) {
+                    expire_terminal_off_discovery_for_test(&index);
+                }
                 let result = page(&mut index, 3);
-                complete += usize::from(result.census_complete);
+                complete += usize::from(terminal_off_on_walk_ended(&index));
                 after.push((result.scanned_file_count, result.snapshots.len()));
             }
             assert!(
@@ -3769,6 +3801,7 @@ fn terminal_off_on_copies_read_under_a_closed_duplicate_fence_settle_after_one_w
     // One page of two files: scan, fold, finalize, and accept every body
     // the page sends, as the server does.
     let page = |index: &mut ScanIndex| {
+        index.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-1".into());
         minute.set(minute.get() + 1);
         let at = format!(
             "2026-08-20T{:02}:{:02}:00Z",
@@ -3801,6 +3834,7 @@ fn terminal_off_on_copies_read_under_a_closed_duplicate_fence_settle_after_one_w
             .map(|item| item.snapshot_fingerprint.clone())
             .collect();
         index.record_accepted_snapshot_fingerprints(&fingerprints);
+        terminal_off_on_accept_context(index, &result.snapshots);
         let mut accepted = accepted.borrow_mut();
         for item in &result.snapshots {
             accepted.insert(
@@ -3823,6 +3857,9 @@ fn terminal_off_on_copies_read_under_a_closed_duplicate_fence_settle_after_one_w
         while done.len() < count {
             pages += 1;
             assert!(pages <= 8 * count, "the walks complete: {done:?}");
+            if current.pages == 0 {
+                expire_terminal_off_discovery_for_test(index);
+            }
             let result = page(index);
             current.reads += result.scanned_file_count;
             current.pages += 1;
@@ -3831,7 +3868,7 @@ fn terminal_off_on_copies_read_under_a_closed_duplicate_fence_settle_after_one_w
                     .sent
                     .insert(item.source_session_id.clone(), item.input_tokens);
             }
-            if result.census_complete {
+            if terminal_off_on_walk_ended(index) {
                 done.push(std::mem::take(&mut current));
             }
         }
