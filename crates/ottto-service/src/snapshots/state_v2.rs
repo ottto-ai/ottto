@@ -813,3 +813,9 @@ impl StorageLimits {
 pub(crate) mod ack;
 // OPS-only maintenance and counts/bytes/times diagnostics seams.
 pub(super) use runtime::before_collection;
+// Growth receipts attest confirmed DB custody, independently of the root fence.
+pub(super) use runtime::confirmed_growth_stamp;
+
+pub(super) fn growth_claim_refused(reason: &'static str) {
+    telemetry::event("growth_claim_refused", &reason);
+}
