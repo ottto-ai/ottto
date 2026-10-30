@@ -5511,7 +5511,9 @@ fn terminal_off_on_withheld_new_file_retries_from_retained_read(grow: bool, samp
             &line(COPY, "root", AT, 10),
             "2026-08-02T07:03:00Z",
         );
-        let mut first = c.raw(&scanner, prior.clone(), 100, sampled, &[]);
+        let mut first = crate::snapshots::with_terminal_off_audit_now_for_test(at, || {
+            c.raw(&scanner, prior.clone(), 100, sampled, &[])
+        });
         crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
             first.enrich(&c);
         });

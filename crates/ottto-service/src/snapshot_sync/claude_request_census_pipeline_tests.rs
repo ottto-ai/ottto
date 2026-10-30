@@ -462,7 +462,10 @@ fn terminal_off_on_census_pre_hold_bodies(
 ) -> CensusPreHoldBodies {
     let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
     let mut index = ScanIndex::load(&fixture.index_path).expect("preview index");
-    index.activate_upload_context(cycle.upload_context.to_owned());
+    assert!(crate::snapshots::claude_terminal_off());
+    let mut context_progress = test_upload_progress();
+    activate_source_upload_context(SnapshotSource::ClaudeCode,
+        cycle.upload_context.to_owned(), &mut index, &mut context_progress);
     let mut reset_owed_members = 0;
     if cycle.historical_replay {
         let before = index.claude_authority_record_for_test(PIPELINE_SESSIONS[2]);
@@ -492,7 +495,8 @@ fn terminal_off_on_census_pre_hold_bodies(
     index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
         SnapshotSource::ClaudeCode,
     ));
-    let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+    let audit_now = OffsetDateTime::parse(collected_at, &Rfc3339).unwrap().unix_timestamp() as u64;
+    let mut scan = crate::snapshots::with_terminal_off_audit_now_for_test(audit_now, || crate::snapshots::scan_source_roots_with_test_limit(
         SnapshotSource::ClaudeCode,
         std::slice::from_ref(&fixture.root),
         &mut index,
@@ -501,7 +505,7 @@ fn terminal_off_on_census_pre_hold_bodies(
         PIPELINE_PAGE_FILES,
         true,
     )
-    .expect("preview bounded page");
+    .expect("preview bounded page"));
     let (mut disposition, _, _) =
         apply_claude_local_evidence_to_scan(&fixture.support, &mut scan, &mut index);
     if let Some(owner) = cycle.proven_owner_session {
