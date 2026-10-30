@@ -327,7 +327,6 @@ impl Serialize for ScanIndex {
             claude_money_birth_store,
             claude_money_birth_store::BirthStore::is_empty
         );
-        field!(claude_desktop_store_inventory, Option::is_none);
         map.end()
     }
 }
@@ -419,7 +418,6 @@ pub(super) const FIELDS: &[&str] = &[
     "upload_ack_retirement_handoff",
     "held_audit_progress",
     "claude_money_birth_store",
-    "claude_desktop_store_inventory",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1767,9 +1765,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "claude_desktop_store_cursor" => {
                             index.claude_desktop_store_cursor = self.typed(value)?
-                        }
-                        "claude_desktop_store_inventory" => {
-                            index.claude_desktop_store_inventory = self.typed(value)?
                         }
                         "claude_desktop_store_upper_bound" => {
                             index.claude_desktop_store_upper_bound = self.typed(value)?
