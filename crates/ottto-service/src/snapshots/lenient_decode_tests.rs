@@ -4884,7 +4884,7 @@ fn restored_behind_accepted_counts_pi_offers_or_index_regressions() {
     let mut body = tests::sample_session_artifact_item();
     body.source_file_fingerprint = Some("source".into());
     let mut index = fixture();
-    let mut finalize = |extent: Option<u64>, body: Option<&SnapshotItem>, previous: (_, _)| {
+    let mut finalize = |extent, body: Option<&SnapshotItem>, previous: (_, _), complete| {
         let mut empty_index = ScanIndex::default();
         let mut scan = scan_source_roots_with_test_limit(
             SnapshotSource::Pi,
@@ -4904,7 +4904,7 @@ fn restored_behind_accepted_counts_pi_offers_or_index_regressions() {
             source_file_fingerprint: "source".into(),
             previous_snapshot_fingerprint: previous.0,
             previous_upload_body_witness: previous.1,
-            parse_complete: true,
+            parse_complete: complete,
             diagnostic_reason: FileReason::Complete,
             parsed_snapshot_count: 1,
             effective_upload_body_witness_revision: 0,
@@ -4925,18 +4925,38 @@ fn restored_behind_accepted_counts_pi_offers_or_index_regressions() {
         )
     };
     let none = || (None, None);
-    assert_eq!(finalize(None, Some(&body), none()).0, 0, "not flagged");
-    let (count, offered, group, witness) = finalize(Some(0), Some(&body), none());
-    assert_eq!((count, offered), (1, 1), "the offered body");
-    let (count, offered, ..) = finalize(Some(0), Some(&body), (group, witness));
-    assert_eq!((count, offered), (0, 0), "semantic no-op, nothing offered");
     assert_eq!(
-        finalize(Some(0), None, none()).0,
+        finalize(None, Some(&body), none(), true).0,
+        0,
+        "not flagged"
+    );
+    let (count, offered, group, witness) = finalize(Some(0), Some(&body), none(), true);
+    assert_eq!((count, offered), (1, 1), "the offered body");
+    let (count, offered, group, witness) = finalize(Some(0), Some(&body), (group, witness), true);
+    assert_eq!((count, offered), (0, 0), "semantic no-op, nothing offered");
+    let (count, offered, ..) = finalize(Some(u64::MAX), Some(&body), (group, witness), true);
+    assert_eq!(
+        (count, offered),
+        (1, 0),
+        "complete no-op still counts an index regression"
+    );
+    assert_eq!(
+        finalize(Some(u64::MAX), Some(&body), none(), false).0,
+        0,
+        "incomplete reconstruction counts neither an offer nor an index regression"
+    );
+    assert_eq!(
+        finalize(Some(u64::MAX), None, none(), false).0,
+        0,
+        "an index regression alone cannot bypass complete finalization"
+    );
+    assert_eq!(
+        finalize(Some(0), None, none(), true).0,
         0,
         "no body for this file"
     );
     assert_eq!(
-        finalize(Some(u64::MAX), None, none()).0,
+        finalize(Some(u64::MAX), None, none(), true).0,
         1,
         "a smaller committed index selection counts even without an offer"
     );

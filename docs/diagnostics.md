@@ -1285,7 +1285,8 @@ counts and bytes only, with no file names, response ids or content.
 `restored_behind_accepted.published` on `durable_tail_alarm` with source `pi`
 counts a durable-restored Tail or Unchanged read ending strictly below the
 frozen indexed accepted extent when it offers a complete body after policy and
-semantic no-op suppression, or commits a smaller index extent. Pi has no
+semantic no-op suppression, or commits a smaller index extent. Both cases
+require a complete parse. Pi has no
 accepted-body floor. A semantic no-op still counts if index size moves down.
 A Full or RAM-retained read does not count. Upload retries count again. The
 same signal uses source `codex` for surviving restored Tail offers and source

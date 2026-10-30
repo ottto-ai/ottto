@@ -283,13 +283,10 @@ fn moved_ledger_allowance_is_scoped_to_one_pi_body() {
         );
     }
     let mut other = pi.clone();
-    other
-        .accumulator
-        .provider_skills
-        .insert("synthetic-skill".into());
+    other.accumulator.claude_fork_parent = Some("synthetic-parent".into());
     assert_eq!(
         body(&other),
-        Err(Refuse::NonEmpty("SnapshotAccumulator.provider_skills"))
+        Err(Refuse::NonEmpty("SnapshotAccumulator.claude_fork_parent"))
     );
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let mut other = pi.clone();
