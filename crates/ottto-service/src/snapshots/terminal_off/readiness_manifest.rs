@@ -21,7 +21,6 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned", "proof-grant"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_superseded_revision_ack_never_drains_the_current_revision", "APC-F1/R2"),
     ("snapshot_sync/authority_proof_correction_pipeline_tests.rs", "terminal_off_on_unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant", "proof-grant"),
-    ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_nonblocking_bound_member_reads_at_six_hours_not_every_page", "NBF"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_account_deferred_hold_lets_a_bounded_claude_traversal_converge", "NBF"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_full_tombstone_set_keeps_the_excess_family_and_holds_both_returns", "completion-fold"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_real_rejected_page_records_account_hold_across_reload_and_reparses_next_generation", "R8"),
@@ -145,7 +144,7 @@ fn terminal_off_on_readiness_ignores_equal_the_checked_in_manifest() {
     assert_eq!(expected, sorted, "keep the manifest sorted");
     assert_eq!(ignored_for_readiness(), expected);
     // The count is the ON gate: it must reach 0 before ON anywhere.
-    assert_eq!(READINESS_MANIFEST.len(), 91);
+    assert_eq!(READINESS_MANIFEST.len(), 90);
 }
 
 #[test]

@@ -7236,25 +7236,34 @@ fn terminal_off_nonblocking_held_keys_read_at_six_hours_not_every_page() {
     nonblocking_held_key_reads_at_six_hours_not_every_page(false);
 }
 
-/// The same NBF control for a bound committed-family member. At 6b2bbe477 its
-/// +6 h round read 0: no targeted cause re-enqueues the floored member, and
-/// the round's walk read nothing. Open: a relist/hint premise (L5 F-C1) or a
-/// floored bound member that nothing re-enqueues.
+/// The same NBF control for a bound committed-family member. A suppressing
+/// walk skips its unchanged stat and its targeted token stays deduplicated, so
+/// only the floor-expiry re-offer reads it at +6 h: exactly once, still held.
 #[test]
-#[ignore = "terminal-off ON-readiness: NBF"]
 #[serial(source_manifests)]
 fn terminal_off_nonblocking_bound_member_reads_at_six_hours_not_every_page() {
     nonblocking_held_key_reads_at_six_hours_not_every_page(true);
 }
 
 /// Both non-progressing hold forms keep their original accepted custody
-/// throughout.
+/// throughout. A new hold may be read twice in its first six hours (Lead B),
+/// counted by `nbf_initial_retry_reads`; a floor-expiry read never counts.
 fn nonblocking_held_key_reads_at_six_hours_not_every_page(bound: bool) {
     let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
     assert!(crate::snapshots::claude_terminal_off());
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _manifests = SourceManifestTestGuard::new();
+    let held_reads = |reads: &std::collections::BTreeMap<std::path::PathBuf, usize>| {
+        reads
+            .iter()
+            .filter(|(path, _)| {
+                path.file_stem().and_then(|stem| stem.to_str()) == Some(PIPELINE_HELD_SESSION)
+            })
+            .map(|(_, reads)| reads)
+            .sum::<usize>()
+    };
+    let early_before = crate::snapshots::nbf_initial_retry_reads_for_test();
     let (fixture, baseline, initial, minute) = if bound {
         let (fixture, baseline, first, last) = terminal_bound_hold_traversal(
             "nbf-bound-committed-member",
@@ -7269,7 +7278,18 @@ fn nonblocking_held_key_reads_at_six_hours_not_every_page(bound: bool) {
         let fixture = PipelineFixture::new("nbf-account-deferred");
         let baseline = fixture.baseline();
         fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
-        let mut pages = fixture.traversal(9, &PIPELINE_HOLD_CYCLE);
+        let early = crate::snapshots::nbf_initial_retry_reads_for_test();
+        let (mut pages, reads) =
+            crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+                fixture.traversal(9, &PIPELINE_HOLD_CYCLE)
+            });
+        // Every read of the new hold after its first is an early retry: <= 2.
+        let initial_reads = held_reads(&reads);
+        assert!((1..=2).contains(&initial_reads), "{initial_reads}");
+        assert_eq!(
+            crate::snapshots::nbf_initial_retry_reads_for_test() - early,
+            initial_reads as u64 - 1
+        );
         assert!(pages
             .iter()
             .any(|page| !page.held.is_empty() && !page.progress_blocking));
@@ -7305,6 +7325,8 @@ fn nonblocking_held_key_reads_at_six_hours_not_every_page(bound: bool) {
         }
     };
     assert_custody(&initial);
+    let early_initial = crate::snapshots::nbf_initial_retry_reads_for_test() - early_before;
+    assert!(early_initial <= 1, "at most one extra early read per new hold");
     // +6 h, +6 h + 300 s and +12 h after the last initial page.
     for (hour, offset, expected) in [(15, 0, 1), (15, 5, 0), (21, 0, 1)] {
         let at = format!("{hour:02}:{:02}:00", minute + offset);
@@ -7312,15 +7334,13 @@ fn nonblocking_held_key_reads_at_six_hours_not_every_page(bound: bool) {
             crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
                 fixture.page(&format!("2026-08-02T{at}Z"), &cycle, PipelineUpload::Accept)
             });
-        let held_reads = reads
-            .iter()
-            .filter(|(path, _)| {
-                path.file_stem().and_then(|stem| stem.to_str()) == Some(PIPELINE_HELD_SESSION)
-            })
-            .map(|(_, reads)| reads)
-            .sum::<usize>();
-        assert_eq!(held_reads, expected, "bound={bound}/{at}");
+        assert_eq!(held_reads(&reads), expected, "bound={bound}/{at}");
         assert_custody(&page);
         assert!(page.uploaded.is_empty(), "held body must never upload");
     }
+    assert_eq!(
+        crate::snapshots::nbf_initial_retry_reads_for_test() - early_before,
+        early_initial,
+        "floor-expiry reads are never early"
+    );
 }
