@@ -1194,6 +1194,59 @@ impl ApcFixture {
         panic!("a complete census follows the terminal authority hold");
     }
 
+    /// The premise of the R2 and F1 regressions at the production E2 gate
+    /// (ON). A request-owned body never demotes, so no terminal hold grants a
+    /// correction at that gate: in production an owed correction is one an
+    /// older build persisted before the flip. Two accepting generations prove
+    /// the family and deliver its bodies. A later note on agent a then changes
+    /// its body (last activity) but no request evidence, so the proof stays.
+    /// The persisted index gets that build's owed correction under the proof
+    /// (`bind_pre_flip_claude_correction_for_test`) and reloads intact.
+    fn pre_flip_grant(&self) -> ApcGrant {
+        let family = apc_family_sessions();
+        for hour in 8..10 {
+            self.generation(hour, |_| ApcUpload::Accept);
+        }
+        let mut index = ScanIndex::load(&self.index_path).expect("load the delivered index");
+        for (member, head) in Self::family_heads(&index) {
+            let head = head.unwrap_or_else(|| panic!("{member} has a current head"));
+            assert!(
+                index.accepted_snapshot_fingerprint_recorded(&head),
+                "{member}'s request-owned head is accepted"
+            );
+        }
+        assert!(
+            index.claude_authority_record_for_test(APC_ROOT).is_none(),
+            "no record forms at the E2 gate"
+        );
+        let witness = index
+            .claude_usage_family_witness_digest_for_test(APC_ROOT)
+            .expect("the family is proven");
+        Self::append(
+            &self.member_path(Some(APC_AGENTS[0])),
+            &apc_note_line(APC_ROOT, 0),
+        );
+        index.bind_pre_flip_claude_correction_for_test(APC_ROOT);
+        index.save(&self.index_path).expect("save the pre-flip index");
+        let seeded = ScanIndex::load(&self.index_path).expect("reload the pre-flip index");
+        assert_eq!(self.quarantined_index_count(), 0, "the seeded index is valid");
+        let record = seeded
+            .claude_authority_record_for_test(APC_ROOT)
+            .expect("the pre-flip record reloads");
+        let (proof, owed) = record.correction.clone().expect("it owes a correction");
+        assert_eq!(record.contract, "claude_usage_authority_quarantine:v2");
+        assert!(record.bound_to_retained_witness && record.terminal);
+        assert_eq!(proof, witness, "the correction is owed under the proof");
+        assert_eq!(owed, family, "every family member owes the correction");
+        ApcGrant {
+            hour: 9,
+            proof,
+            record,
+            owed,
+            held: BTreeSet::new(),
+        }
+    }
+
     /// Classify one page's correction change and check it against SOURCE:
     /// drains only on an exact ACK or a proven no-op of a current body, never
     /// a fresh grant without a genuinely new complete proof, the record clears
@@ -3301,23 +3354,25 @@ fn apc_r2_redrain(
     }
 }
 
-/// R2 on main at the production default, shed seam. A write to the root's
+/// [regress] R2 on main, shed seam, at the production E2 gate (ON) on an owed
+/// pre-flip correction (`ApcFixture::pre_flip_grant`). A write to the root's
 /// API sidecar that adds no evidence moves every member's revision with no
 /// body or proof change. On the next shed page the owed members with
 /// unchanged accepted bodies no-op-drain on the working index, and the
 /// partial checkpoint keeps their committed entries: each stays owed with its
 /// pre-page pair, through restart, with proof, counter and deadline unchanged.
 /// The next clean generation re-drains each at its current revision.
+/// Fails on main (no `restore_unselected_claude_proof_body_drains`): the
+/// checkpoint saves the drain beside the kept entry, so `apc_r2_drained_pairs`
+/// panics "drained at a revision its saved entry ... does not have".
 #[test]
 #[serial(source_manifests)]
 // A shed page records RatelimitBackoff in the shared client_report counters.
 #[serial(client_report)]
 fn r2_sidecar_only_revision_move_then_a_shed_page_keeps_no_op_members_owed() {
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-r2-shed", false);
-    let (_, grant) = fixture.reach_grant();
+    let grant = fixture.pre_flip_grant();
     let granted = ScanIndex::load(&fixture.index_path).expect("load the granted index");
     let entities = ApcFixture::family_entities(&granted);
     fixture.touch_api_sidecar();
@@ -3359,22 +3414,24 @@ fn r2_sidecar_only_revision_move_then_a_shed_page_keeps_no_op_members_owed() {
     apc_r2_redrain(&fixture, grant.hour + 2, &reverted, &entities);
 }
 
-/// R2 on main at the production default, held seam: the same sidecar-only
+/// [regress] R2 on main, held seam, at the production E2 gate (ON) on an owed
+/// pre-flip correction (`ApcFixture::pre_flip_grant`): the same sidecar-only
 /// revision move, then a Deferred page that holds an account-deferred owed
 /// member. The finish selection keeps the committed entries of the unsettled
 /// keys, so the no-op-drained members stay owed with their pre-page pairs;
 /// the next clean generation re-drains them at their current revisions.
+/// Fails on main (no `restore_unselected_claude_proof_body_drains`): the
+/// finish saves the drain beside the kept entry, so `apc_r2_drained_pairs`
+/// panics "drained at a revision its saved entry ... does not have".
 #[test]
 #[serial(source_manifests)]
 #[serial(client_report)]
 fn r2_sidecar_only_revision_move_then_a_held_page_keeps_no_op_members_owed() {
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-r2-held", true);
-    let (_, grant) = fixture.reach_grant();
+    let grant = fixture.pre_flip_grant();
     let held_member = apc_member_session(Some(APC_AGENTS[1]));
     assert!(grant.owed.contains(&held_member), "{:?}", grant.owed);
     let entities = ApcFixture::family_entities(
@@ -3571,26 +3628,28 @@ fn apc_f1_redrain(
     }
 }
 
-/// F1 (review-942), last owed member, exact ACK. The owed member's committed
-/// account hold is released on a settled page and its corrected body is
+/// [regress] F1 (review-942), last owed member, exact ACK. The owed
+/// member's committed account hold is released on a settled page and its corrected body is
 /// ACKed, which drains the last owed member. The production account-audit
 /// release then finds no retained custody: it clears the member's saved
 /// revision and queues a retry. The save keeps the record with the member
 /// owed under the same proof and its pre-drain pair, never a cleared record
 /// beside an unselected drained revision. The retry drains it again at the
 /// revision its saved entry has, offering at most the same exact body.
+/// At the production E2 gate (ON), on an owed pre-flip correction
+/// (`ApcFixture::pre_flip_grant`). Fails without 2015e841f: the restore runs
+/// before the release, carries the drain and clears the record, so
+/// `apc_f1_released_members_stay_owed` panics "the record is kept".
 #[test]
 #[serial(source_manifests)]
 fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-f1-last", true);
-    let (_, grant) = fixture.reach_grant();
-    // Agent a's requests after the establishing generation changed its body,
-    // so its correction needs an exact ACK.
+    let grant = fixture.pre_flip_grant();
+    // Agent a's note after the delivery changed its body, so its correction
+    // needs an exact ACK.
     let held = BTreeSet::from([apc_member_session(Some(APC_AGENTS[0]))]);
     let (pages, release) =
         apc_f1_hold_then_release(&fixture, &grant, &held, &held, ApcUpload::Accept);
@@ -3626,21 +3685,23 @@ fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
     );
 }
 
-/// F1 (review-942), proven no-op, with another member still owed. Agent b's
-/// corrected body is its accepted body, so its release page no-op-drains it
+/// [regress] F1 (review-942), proven no-op, with another member still
+/// owed. Agent b's corrected body is its accepted body, so its release page no-op-drains it
 /// without an upload, and the account-audit release then clears its saved
 /// revision. It stays owed with its pre-drain pair beside the held root, and
 /// drains again once the retry re-reads it.
+/// At the production E2 gate (ON), on an owed pre-flip correction
+/// (`ApcFixture::pre_flip_grant`). Fails without 2015e841f: the restore runs
+/// before the release and carries agent b's drain, so
+/// `apc_f1_released_members_stay_owed` panics "stays owed".
 #[test]
 #[serial(source_manifests)]
 fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_one() {
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-f1-owed", true);
-    let (_, grant) = fixture.reach_grant();
+    let grant = fixture.pre_flip_grant();
     let released = BTreeSet::from([apc_member_session(Some(APC_AGENTS[1]))]);
     let still_held = apc_member_session(None);
     let held = released
@@ -3696,12 +3757,16 @@ fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_
     assert_eq!(owed, BTreeSet::from([still_held]));
 }
 
-/// F1 (review-942), D1: the released member's body is permanently refused on
-/// a fully settled page, so the post-selection settlement (D1) drains the
+/// [regress] F1 (review-942), D1: the released member's body is
+/// permanently refused on a fully settled page, so the post-selection settlement (D1) drains the
 /// last owed member. The account-audit release then clears its saved
 /// revision. D1's drain joins the finish restore: the member stays owed with
 /// its pre-drain pair, and drains again at the revision its saved entry has
 /// once the retry re-reads it.
+/// At the production E2 gate (ON), on an owed pre-flip correction
+/// (`ApcFixture::pre_flip_grant`). Fails without 2015e841f: D1's drain never
+/// reaches the restore and clears the record, so
+/// `apc_f1_released_members_stay_owed` panics "the record is kept".
 #[test]
 #[serial(source_manifests)]
 // A rejected entity records Poisoned in the shared client_report counters.
@@ -3709,11 +3774,9 @@ fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_
 fn f1_released_account_hold_audit_clear_keeps_a_permanent_refusal_drain_owed() {
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-f1-permanent", true);
-    let (_, grant) = fixture.reach_grant();
+    let grant = fixture.pre_flip_grant();
     // Agent a's changed body is offered, so the server can refuse it.
     let held = BTreeSet::from([apc_member_session(Some(APC_AGENTS[0]))]);
     let (pages, release) = apc_f1_hold_then_release(
