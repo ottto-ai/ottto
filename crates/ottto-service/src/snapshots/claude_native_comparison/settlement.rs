@@ -358,6 +358,12 @@ impl Completion {
         scan: &SourceScanResult,
         index: &mut ScanIndex,
     ) -> Result<Option<ClaudeNativeObservations>, crate::source_rotation::LocalRefusal> {
+        if !index.persistence_available() {
+            return Err(crate::source_rotation::LocalRefusal(
+                "scan_index_map_unavailable",
+            ));
+        }
+
         let active = self.fallback.is_some()
             || !self.target_charges.revisions.is_empty()
             || self
@@ -1216,6 +1222,11 @@ impl SelectedFallback {
         index: &mut ScanIndex,
         previous: &ScanIndex,
     ) -> Result<(), &'static str> {
+        if !index.persistence_available() || !previous.persistence_available() {
+            index.retain_persistence_baseline_from(previous);
+            return Err("scan_index_map_unavailable");
+        }
+
         let empty_advances = index.claude_empty_map_advances(previous);
         let mut affected_fingerprints = BTreeSet::new();
         for key in &self.withheld_keys {
