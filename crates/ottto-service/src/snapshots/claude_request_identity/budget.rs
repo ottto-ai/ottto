@@ -423,18 +423,13 @@ fn fits(
     prior_refusals: u64,
 ) -> Option<usize> {
     for (row, groups) in item.model_usage.iter().zip(&selection.top) {
-        if groups
-            .values()
-            .filter(|amount| amount.amount.counts != [0; 8])
-            .any(|amount| {
-                row_costs(row)
-                    .iter()
-                    .enumerate()
-                    .any(|(field, cost)| cost.is_none() && amount.amount.wire(field).is_some())
-            })
-        {
-            return None;
+        let mut total = Amounts::default();
+        for group in groups.values() {
+            if group.amount.counts != [0; 8] {
+                total.merge_wire(&group.amount)?;
+            }
         }
+        reproduces(row, &total).ok()?;
     }
     fits_caps(selection, base_bytes, prior_refusals)
 }

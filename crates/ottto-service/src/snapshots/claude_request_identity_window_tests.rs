@@ -1599,7 +1599,6 @@ fn sticky_price_fixture(item: &mut SnapshotItem, proof: &mut [Contribution]) {
                 output: money[2],
                 cache_read: money[3],
                 cache_creation: money[4],
-                ..Default::default()
             };
         }
     }

@@ -1088,15 +1088,18 @@ fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::
         }
         for (row, group) in rows {
             let prior = accepted.row_shares(start, row);
-            if prior.is_empty() {
-                continue;
-            } // A genuinely always-missing sibling has no prior share.
             let current = group
                 .by_key
                 .iter()
                 .filter(|(_, amount)| amount.counts != [0; 8])
                 .map(|(key, _)| key.as_ref().map(accepted::authority_hash))
                 .collect::<BTreeSet<_>>();
+            // An always-missing sibling remains untagged without a refusal.
+            // New tagged shares in an accepted bucket were never accepted;
+            // their absence from the fingerprint must not authorize a retag.
+            if prior.is_empty() && current.iter().all(Option::is_none) {
+                continue;
+            }
             let changed = current != prior;
             if !changed {
                 continue;
@@ -1143,7 +1146,7 @@ fn cap_counts(
     budget::Counts {
         retained_buckets: measurement.map_or(retained, |m| m.accepted_retained),
         refused_new_buckets: measurement.map_or(0, |m| m.refused_recent_buckets),
-        accepted_state_unknown: u64::from(accepted.is_none_or(|known| known.incomplete)),
+        accepted_state_unknown: u64::from(accepted.map_or(true, |known| known.incomplete)),
         accepted_share_changed: grouping.accepted_share_changed.len() as u64,
         accepted_overflow: measurement
             .map_or_else(Default::default, |m| m.accepted_overflow.clone()),
