@@ -16040,31 +16040,67 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// [regress] published custody authenticates before damaged progress containment.
+    /// [format] damaged custody or a stat error holds before progress containment or transcript reads.
     #[test]
     fn published_custody_authenticates_before_damaged_progress_containment() {
-        let root = crate::test_scratch::private_dir("v2-route-before-progress");
-        let namespace = root.join("snapshots/destinations").join("b".repeat(64));
-        std::fs::create_dir_all(&namespace).unwrap();
-        let index_path = namespace.join("claude_code-scan-index-v3.json");
-        let progress_path = snapshot_upload_progress_path(&index_path);
-        std::fs::write(&index_path, b"{broken-fence").unwrap();
-        std::fs::write(index_path.with_extension("json.v2.sqlite"), b"untrusted-db").unwrap();
-        std::fs::write(&progress_path, b"{broken-progress").unwrap();
-        let error = load_source_checkpoints(
-            &index_path,
-            &progress_path,
-            SnapshotSource::ClaudeCode,
-            &root,
-            &"b".repeat(64),
-            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-        )
-        .expect_err("unauthenticated custody must hold");
-        assert!(error.to_string().contains("state_v2_fence_lost"));
-        assert_eq!(std::fs::read(&progress_path).unwrap(), b"{broken-progress");
-        assert_eq!(std::fs::read(&index_path).unwrap(), b"{broken-fence");
-        assert!(!progress_path.with_extension("lock").exists());
-        std::fs::remove_dir_all(root).unwrap();
+        for stat_error in [false, true] {
+            let root = crate::test_scratch::private_dir("v2-route-before-progress");
+            let namespace = root.join("snapshots/destinations").join("b".repeat(64));
+            std::fs::create_dir_all(&namespace).unwrap();
+            let index_path = namespace.join("claude_code-scan-index-v3.json");
+            let progress_path = snapshot_upload_progress_path(&index_path);
+            std::fs::write(&index_path, b"{broken-fence").unwrap();
+            std::fs::write(index_path.with_extension("json.v2.sqlite"), b"untrusted-db").unwrap();
+            std::fs::write(&progress_path, b"{broken-progress").unwrap();
+            let evidence = if stat_error {
+                let kept = root.join("kept");
+                std::fs::rename(&namespace, &kept).unwrap();
+                std::os::unix::fs::symlink(&namespace, &namespace).unwrap();
+                assert_eq!(
+                    std::fs::symlink_metadata(index_path.with_extension("json.v2.sqlite"))
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(libc::ELOOP)
+                );
+                kept
+            } else {
+                namespace
+            };
+            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+            let (result, records) = crate::local_resource_diagnostics::capture(|| {
+                load_source_checkpoints(
+                    &index_path,
+                    &progress_path,
+                    SnapshotSource::ClaudeCode,
+                    &root,
+                    &"b".repeat(64),
+                    snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+                )
+            });
+            let counts = scope.finish();
+            assert_eq!(counts, Default::default(), "no transcript acquisition");
+            let error = result.expect_err("unauthenticated custody must hold");
+            assert!(error.to_string().contains(if stat_error {
+                "state_v2_db_unavailable"
+            } else {
+                "state_v2_fence_lost"
+            }));
+            assert!(records.iter().any(|r| r["stage"] == "claude_state_v2"
+                && r["counts"]["latest"]["hold"]
+                    == if stat_error {
+                        "db_unavailable"
+                    } else {
+                        "fence_lost"
+                    }));
+            let kept_progress = evidence.join(progress_path.file_name().unwrap());
+            assert_eq!(std::fs::read(&kept_progress).unwrap(), b"{broken-progress");
+            assert_eq!(
+                std::fs::read(evidence.join(index_path.file_name().unwrap())).unwrap(),
+                b"{broken-fence"
+            );
+            assert!(!kept_progress.with_extension("lock").exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     fn test_quarantine_witness() -> SnapshotQuarantineWitness {

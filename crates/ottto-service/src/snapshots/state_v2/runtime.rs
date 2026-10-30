@@ -177,7 +177,7 @@ fn route_needed(path: &Path, switched: bool) -> Result<bool> {
             .lock()
             .map_err(|_| Hold::DbUnavailable)?
             .contains_key(path)
-        || fence::evidence(path)?)
+        || held(fence::evidence(path))?)
 }
 /// Probe custody without admitting a v1 path to the route registry or decoding
 /// its index. A paused, unpublished import does not change progress ordering.
@@ -195,7 +195,7 @@ pub(in super::super) fn published(path: &Path) -> Result<bool> {
             return Ok(true);
         }
     }
-    fence::evidence(path)
+    held(fence::evidence(path))
 }
 /// Priority belongs only to an already adopted Claude runtime. This lookup
 /// never admits a route, probes disk/switches, or adds an OFF-path failure.

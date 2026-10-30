@@ -319,7 +319,7 @@ pub(super) fn cleanup_unpublished(path: &Path, latched: bool) -> Result<u64> {
 }
 
 pub(super) fn evidence(path: &Path) -> Result<bool> {
-    Ok(exists(&sibling(path, ".v2.sqlite"))? || !matches!(read(path), Ok(None)))
+    Ok(exists(&sibling(path, ".v2.sqlite"))? || read(path)?.is_some())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
