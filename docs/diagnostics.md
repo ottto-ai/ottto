@@ -1176,12 +1176,21 @@ sent them after policy, so a restored copy can publish them without reading the
 prompt. Two counters watch those stored copies, both on the same line and with
 the same scope:
 
-- `pi_uploaded_literal_purged` counts records deleted because a setting that
-  gates a stored value is now off. The sweep runs once per upload context, when
-  a pass begins, so a revoked setting erases the copies before that pass saves.
+- `pi_uploaded_literal_purged` counts records deleted because their stored
+  literals belong to a retired upload context, including a consent generation
+  before a setting turned off. A content-free journal remembers every observed
+  off transition even without a locked scan. Turning the setting back on does
+  not restore the old generation. The sweep runs when a pass begins and before
+  a post-save write; deletion requires the state-directory writer lock.
 - `pi_uploaded_literal_key_changed` counts stored first-prompt sets dropped
   because the upload HMAC key changed: at that sweep, or at restore if a record
   reaches it. The file reads Full on its next growth instead.
+
+When all first-prompt and title gates were off, the Pi section records only that
+nothing was uploaded; it carries neither literals nor a first-prompt obligation.
+That copy can continue by Tail under the same policy. Re-enabling a field changes
+the upload context and requires a fresh Full capture. Deferred and prepared
+writes recheck consent and capture context before storing literals.
 
 The tag-1 audit-safe bootstrap core is a hard release pair with the grouped
 custody and stored-representation binding completion. The first part preserves
