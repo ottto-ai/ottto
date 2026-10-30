@@ -2773,6 +2773,9 @@ pub(super) fn retain_held(index: &mut ScanIndex, candidate: &super::CandidateFil
 /// old unverified hold solely as an exclusion/retry obligation until a fully
 /// finalized, verified Full replaces it.
 pub(crate) fn invalidate_claude_request_census(index: &mut ScanIndex, path: &Path) {
+    // Every Claude read refusal passes here; its unread data feeds the
+    // source-wide fork-lineage gate until a complete parse is published.
+    index.usage_guard_mark_refused(path);
     if !index.persistence_available() {
         return;
     }
@@ -2810,6 +2813,7 @@ pub(crate) fn settle_claude_request_census_terminal(
     let vanished = index
         .claude_request_census
         .retain_keys(|key| files.contains_key(key) || observed_index_keys.contains(key));
+    index.usage_guard_prune_refused(observed_index_keys);
     let window = rfc3339_unix_seconds(census_window_end).unwrap_or_default();
     let aged = retire_claude_transcript_records(index, window);
     note_transcript_retirements(aged, vanished);

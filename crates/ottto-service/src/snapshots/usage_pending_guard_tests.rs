@@ -1494,3 +1494,94 @@ fn phase1_replay_frozen_scan_index_guard_comparison() {
     );
     assert_eq!(known_diffs, 0, "known guard differences; counts only");
 }
+
+#[test]
+fn census_prefix_peak_budget_charges_live_cloned_baseline_before_scratch() {
+    let mut index = ScanIndex::default();
+    let _ = index.claude_request_census_mut_for_test().insert(
+        carry_key(CARRY_OTHER, None),
+        claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+            &"a".repeat(64), 1,
+            claude_request_census::ClaudeRequestCensusShape::Exact,
+            (0..8192).collect(),
+        ),
+    );
+    // One build fits; two array pairs alone do not. Keep the exact normal
+    // sync preparation ownership: the committed ScanIndex baseline is cloned.
+    usage_census_prefix::with_cap_for_test(120_000, || {
+        let first = index.refresh_claude_census_prefix(CARRY_FAILED, false);
+        assert!(!first.unknown());
+        assert!(first.bytes() > 90_000);
+        drop(first);
+        let baseline = index.clone();
+        let (next, rows) = crate::local_resource_diagnostics::capture(||
+            index.refresh_claude_census_prefix(CARRY_RETRY, false));
+        assert!(next.unknown(), "baseline allocation remains charged");
+        assert!(index.usage_guard_holds.global());
+        assert!(rows.iter().any(|r| r["counts"]["census_prefix_overflow"] == 1));
+        assert!(!baseline.usage_guard_census_prefix().unwrap().unknown());
+        drop(next);
+        drop(baseline);
+        // A new complete pass retries admission after the last owner releases.
+        assert!(!index.refresh_claude_census_prefix(CARRY_RETRY, true).unknown());
+    });
+    let (small, rows) = crate::local_resource_diagnostics::capture(||
+        usage_census_prefix::CensusPrefixIndex::build_within(&index, 1));
+    assert!(small.unknown());
+    assert_eq!(small.bytes(), 0);
+    assert!(rows.iter().any(|r| r["counts"]["census_prefix_build_peak_bytes"].as_u64().unwrap_or(0) > 1));
+}
+
+#[cfg(unix)]
+#[test]
+fn unheld_production_open_refusal_blocks_unrelated_retirement_with_or_without_pending() {
+    for with_pending in [false, true] {
+        let dir = temp_dir("unheld-open-refusal");
+        let family = if with_pending { CARRY_ROOT } else { "pending-free-copy" };
+        let path = dir.join(format!("{family}.jsonl"));
+        fs::write(&path, "{}\n").unwrap();
+        let mut index = carry_index();
+        retry_under_way(&mut index);
+        index.claude_usage_family_pending.remove(CARRY_UNWITNESSED);
+        carry_family(&mut index, CARRY_OTHER, &[None], true);
+        if with_pending {
+            // Same Match family and complete indexed membership, now at the
+            // actual selected file path; stale proof cannot see unread growth.
+            let entry = index.files.remove(&carry_key(CARRY_ROOT, None)).unwrap();
+            index.files.insert(local_index_key(&path), entry);
+        }
+        index.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
+        assert!(!index.usage_guard_holds.holds(family));
+        assert!(!usage_pending_guard::fork_lineage_incomplete(&index));
+        let mut state = OwnedSourceScan::new(
+            SnapshotSource::ClaudeCode, std::slice::from_ref(&dir), index,
+            CARRY_RETRY, BACKFILL_WINDOW_DAYS, 16, true, None, &[], false, true,
+        );
+        assert!(state.identified_candidates.iter().any(|c| c.path == path));
+        // Selection/stat succeeded; the production no-follow open must fail.
+        // Unlike chmod, this remains deterministic for privileged CI users.
+        fs::remove_file(&path).unwrap();
+        let target = dir.join("target");
+        fs::write(&target, "{}\n").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let mut reached = false;
+        for _ in 0..32 {
+            state = match state.step(None) {
+                OwnedSourceScanStep::Pending(next) => next,
+                OwnedSourceScanStep::Complete { .. } => panic!("open failure not observed"),
+            };
+            if state.census.unreadable_path_count > 0 {
+                reached = true;
+                assert!(!state.index.usage_guard_holds.holds(family));
+                assert!(usage_pending_guard::fork_lineage_incomplete(&state.index));
+                let counts = retirement_attempt(&mut state.index);
+                assert!(counts["retire_refused"]["fork_lineage_unknown"]["families"].as_u64().unwrap() >= 1);
+                assert_eq!(counts["retired"]["families"], 0);
+                assert!(state.index.claude_usage_family_pending.contains_key(CARRY_OTHER));
+                break;
+            }
+        }
+        assert!(reached, "real unheld acquisition failure reached the gate");
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

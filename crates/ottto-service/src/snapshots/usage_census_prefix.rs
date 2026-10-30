@@ -72,30 +72,67 @@ pub(crate) struct CensusPrefixIndex {
 }
 crate::heap_layout_bound::fields!(CensusPrefixIndex; prefixes, ids, roots, pending, unknown, bytes);
 
-fn string_bytes<'a>(strings: impl IntoIterator<Item = &'a str>) -> Option<usize> {
-    strings.into_iter().try_fold(0_usize, |n, s| {
-        n.checked_add(std::mem::size_of::<String>())?
-            .checked_add(s.len())
+// Track allocations, not Arc reference counts: cloned committed baselines and
+// older generations can retain an index after the working cache drops it.
+// Fixed storage, and one lock across admission/build/registration; no I/O.
+const LIVE_INDEX_SLOTS: usize = 64;
+type LiveIndexes = [Option<std::sync::Weak<CensusPrefixIndex>>; LIVE_INDEX_SLOTS];
+#[cfg(not(test))]
+static LIVE_INDEXES: Mutex<LiveIndexes> = Mutex::new([const { None }; LIVE_INDEX_SLOTS]);
+#[cfg(test)]
+thread_local! {
+    static LIVE_INDEXES: std::cell::RefCell<LiveIndexes> =
+        const { std::cell::RefCell::new([const { None }; LIVE_INDEX_SLOTS]) };
+}
+
+fn with_live_indexes<T>(run: impl FnOnce(&mut LiveIndexes) -> T) -> T {
+    #[cfg(test)]
+    return LIVE_INDEXES.with(|live| run(&mut live.borrow_mut()));
+    #[cfg(not(test))]
+    run(&mut LIVE_INDEXES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+fn build_shared(index: &ScanIndex) -> Arc<CensusPrefixIndex> {
+    with_live_indexes(|live| {
+        let mut retained = std::mem::size_of::<LiveIndexes>();
+        for slot in live.iter_mut() {
+            if let Some(built) = slot.as_ref().and_then(std::sync::Weak::upgrade) {
+                retained = retained.saturating_add(built.bytes());
+            } else {
+                *slot = None;
+            }
+        }
+        let free = live.iter().position(Option::is_none);
+        let allowance = if free.is_some() {
+            budget().saturating_sub(retained)
+        } else {
+            0
+        };
+        let built = Arc::new(CensusPrefixIndex::build_within(index, allowance));
+        if !built.unknown() {
+            live[free.expect("successful build has an admitted registry slot")] =
+                Some(Arc::downgrade(&built));
+        }
+        built
     })
 }
 
 impl CensusPrefixIndex {
-    /// One build within the full byte budget (no other index alive).
+    #[cfg(test)]
     pub(crate) fn build(index: &ScanIndex) -> Self {
         Self::build_within(index, budget())
     }
 
-    /// One walk of the census, then a k-way merge of the records' already
-    /// sorted hash slices straight into the two arrays (no sort scratch).
-    /// Retired records (past the census horizon) contribute nothing, by the
-    /// census rule. Unknown, holding nothing, when a pending-free record is
-    /// over budget or the build would pass `budget` bytes.
+    /// First count using borrowed census rows and no scratch allocation.
+    /// Admit all vector capacities, owned strings, merge scratch and Arc
+    /// metadata BEFORE reserving any of them. The merge uses sorted slices;
+    /// no map nodes or sorting scratch are allocated.
     pub(crate) fn build_within(index: &ScanIndex, budget: usize) -> Self {
         let mut out = Self::default();
         let (mut over_budget, mut overflow) = (0_u64, 0_u64);
-        let mut roots = BTreeMap::<&str, u32>::new();
-        let mut sources = Vec::<(&[u64], u32)>::new();
-        let mut total = 0_usize;
+        let (mut records, mut total, mut root_chars) = (0_usize, 0_usize, 0_usize);
         for (key, record) in index.claude_request_census.records() {
             let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
                 continue;
@@ -105,49 +142,46 @@ impl CensusPrefixIndex {
             {
                 continue;
             }
+            let root = member.root;
             if record.over_budget() {
-                // Its hashes were dropped: absence here proves nothing.
                 over_budget += 1;
-                continue;
+            } else if !record.request_hashes().is_empty() {
+                records = records.saturating_add(1);
+                total = total.saturating_add(record.request_hashes().len());
+                root_chars = root_chars.saturating_add(root.len());
             }
-            let hashes = record.request_hashes();
-            if hashes.is_empty() {
-                continue;
-            }
-            let next = u32::try_from(roots.len()).unwrap_or(u32::MAX);
-            let id = *roots.entry(member.root).or_insert(next);
-            if sources.try_reserve(1).is_err() {
-                overflow = 1;
-                break;
-            }
-            sources.push((hashes, id));
-            total = total.saturating_add(hashes.len());
         }
-        // Peak bytes: both arrays, root and pending metadata, the id map and
-        // the merge scratch (sources and heap).
-        let entry = std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
-        let scratch = sources.capacity().saturating_mul(
-            std::mem::size_of::<(&[u64], u32)>() + std::mem::size_of::<(u64, usize, usize)>(),
-        );
+        let pending_chars = index
+            .claude_usage_family_pending
+            .keys()
+            .fold(0_usize, |n, root| n.saturating_add(root.len()));
+        let per_record = std::mem::size_of::<&str>()
+            + std::mem::size_of::<(&[u64], u32)>()
+            + std::mem::size_of::<std::cmp::Reverse<(u64, usize, usize)>>()
+            + std::mem::size_of::<String>();
+        // Count duplicate root strings too: conservative before dedup.
         let peak = total
-            .checked_mul(entry)
-            .zip(string_bytes(roots.keys().copied()))
-            .zip(string_bytes(
-                index.claude_usage_family_pending.keys().map(String::as_str),
-            ))
-            .and_then(|((arrays, roots_bytes), pending_bytes)| {
-                arrays
-                    .checked_add(roots_bytes.checked_mul(3)?)?
-                    .checked_add(pending_bytes)?
-                    .checked_add(scratch)
+            .checked_mul(12)
+            .and_then(|n| n.checked_add(records.checked_mul(per_record)?))
+            .and_then(|n| n.checked_add(root_chars))
+            .and_then(|n| {
+                n.checked_add(
+                    index
+                        .claude_usage_family_pending
+                        .len()
+                        .checked_mul(std::mem::size_of::<String>())?,
+                )
+            })
+            .and_then(|n| n.checked_add(pending_chars))
+            .and_then(|n| {
+                n.checked_add(std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>())
             });
-        if over_budget == 0 && overflow == 0 && peak.is_some_and(|peak| peak <= budget) {
-            overflow = u64::from(out.fill(index, &roots, &sources, total).is_none());
+        if over_budget == 0 && peak.is_some_and(|n| n <= budget) {
+            overflow = u64::from(out.fill(index, records, total, budget).is_none());
         } else if over_budget == 0 {
             overflow = 1;
         }
         if over_budget != 0 || overflow != 0 {
-            // Never a partial answer: an Unknown index holds nothing.
             out = Self {
                 unknown: true,
                 ..Self::default()
@@ -156,8 +190,8 @@ impl CensusPrefixIndex {
         crate::local_resource_diagnostics::traversal_point(
             "claude_census_prefix_veto",
             SnapshotSource::ClaudeCode.api_slug(),
-            &json!({"census_prefix_records":sources.len(),"census_prefix_entries":out.prefixes.len(),
-                "census_prefix_bytes":out.bytes,
+            &json!({"census_prefix_records":records,"census_prefix_entries":out.prefixes.len(),
+                "census_prefix_bytes":out.bytes,"census_prefix_build_peak_bytes":peak,
                 "census_prefix_over_budget_records":over_budget,"census_prefix_overflow":overflow,
                 "census_prefix_unknown":u64::from(out.unknown)}),
         );
@@ -167,25 +201,52 @@ impl CensusPrefixIndex {
     fn fill(
         &mut self,
         index: &ScanIndex,
-        roots: &BTreeMap<&str, u32>,
-        sources: &[(&[u64], u32)],
+        records: usize,
         total: usize,
+        budget: usize,
     ) -> Option<()> {
+        let mut roots = Vec::<&str>::new();
+        roots.try_reserve_exact(records).ok()?;
+        let mut sources = Vec::<(&[u64], u32)>::new();
+        sources.try_reserve_exact(records).ok()?;
+        let mut heap = std::collections::BinaryHeap::new();
+        heap.try_reserve_exact(records).ok()?;
         self.prefixes.try_reserve_exact(total).ok()?;
         self.ids.try_reserve_exact(total).ok()?;
-        self.roots.try_reserve_exact(roots.len()).ok()?;
-        self.roots.resize(roots.len(), String::new());
-        for (root, id) in roots {
-            self.roots[*id as usize] = (*root).to_owned();
-        }
-        let mut pending = Vec::new();
-        pending
+        self.roots.try_reserve_exact(records).ok()?;
+        self.pending
             .try_reserve_exact(index.claude_usage_family_pending.len())
             .ok()?;
-        pending.extend(index.claude_usage_family_pending.keys().cloned());
-        self.pending = pending;
-        let mut heap = std::collections::BinaryHeap::new();
-        heap.try_reserve_exact(sources.len()).ok()?;
+        for (key, record) in index.claude_request_census.records() {
+            let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
+                continue;
+            };
+            if !index.claude_usage_family_pending.contains_key(member.root)
+                && record.retired().is_none()
+                && !record.request_hashes().is_empty()
+            {
+                roots.push(member.root);
+            }
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        self.roots
+            .extend(roots.iter().map(|root| (*root).to_owned()));
+        self.pending
+            .extend(index.claude_usage_family_pending.keys().cloned());
+        for (key, record) in index.claude_request_census.records() {
+            let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
+                continue;
+            };
+            if index.claude_usage_family_pending.contains_key(member.root)
+                || record.retired().is_some()
+                || record.request_hashes().is_empty()
+            {
+                continue;
+            }
+            let id = u32::try_from(roots.binary_search(&member.root).ok()?).ok()?;
+            sources.push((record.request_hashes(), id));
+        }
         for (at, (hashes, _)) in sources.iter().enumerate() {
             heap.push(std::cmp::Reverse((hashes[0], at, 0_usize)));
         }
@@ -202,15 +263,26 @@ impl CensusPrefixIndex {
         self.bytes = self
             .prefixes
             .capacity()
-            .checked_mul(std::mem::size_of::<u64>())?
+            .checked_mul(8)?
+            .checked_add(self.ids.capacity().checked_mul(4)?)?
             .checked_add(
-                self.ids
+                self.roots
                     .capacity()
-                    .checked_mul(std::mem::size_of::<u32>())?,
+                    .checked_mul(std::mem::size_of::<String>())?,
             )?
-            .checked_add(string_bytes(self.roots.iter().map(String::as_str))?)?
-            .checked_add(string_bytes(self.pending.iter().map(String::as_str))?)?;
-        Some(())
+            .checked_add(
+                self.pending
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<String>())?,
+            )?
+            .checked_add(
+                self.roots
+                    .iter()
+                    .chain(&self.pending)
+                    .try_fold(0_usize, |n, root| n.checked_add(root.capacity()))?,
+            )?
+            .checked_add(std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>())?;
+        (self.bytes <= budget).then_some(())
     }
 
     /// Retained bytes, for the overlap budget of a build beside this one.
@@ -282,14 +354,9 @@ pub(crate) fn pending_hash_prefix(hash: &str) -> Option<u64> {
 /// The index for this pass: the cached one while still current, or a fresh
 /// build (not cached).
 pub(crate) fn current(index: &ScanIndex) -> Arc<CensusPrefixIndex> {
-    let cached = index.usage_guard_census_prefix();
-    match cached {
+    match index.usage_guard_census_prefix() {
         Some(built) if !built.stale(index) => built,
-        // A stale cached index stays alive beside this build: budget both.
-        cached => Arc::new(CensusPrefixIndex::build_within(
-            index,
-            budget().saturating_sub(cached.map_or(0, |built| built.bytes())),
-        )),
+        _ => build_shared(index),
     }
 }
 
@@ -325,10 +392,10 @@ impl ScanIndex {
                 return built;
             }
         }
-        // Release the old index (and its process-custody copy) first, so a
-        // rebuild never holds two within the byte budget.
+        // Drop the working/custody owners. The allocation registry still charges
+        // every surviving baseline or caller, including older generations.
         self.usage_guard_drop_census_prefix();
-        let built = Arc::new(CensusPrefixIndex::build(self));
+        let built = build_shared(self);
         self.usage_guard_set_census_prefix(census_window_end, census_complete, built.clone());
         built
     }

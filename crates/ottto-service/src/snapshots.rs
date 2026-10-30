@@ -32156,6 +32156,9 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     Err(()) => {
+                        if source == SnapshotSource::ClaudeCode {
+                            index.usage_guard_mark_refused(&candidate.path);
+                        }
                         census.record_unreadable(UnreadableCause::Reduction, 1);
                         pending!();
                     }
@@ -32175,6 +32178,7 @@ impl OwnedSourceScan {
             let verification_rescue =
                 sampled_audit::progress_debt(index, &rescue_key, sampled_scan::now_seconds())
                     .is_some();
+            let unreadable_before = census.unreadable_path_count;
             let Some((mut candidate, opened_file)) = open_and_identify_scan_candidate_with_rescue(
                 source,
                 candidate,
@@ -32192,6 +32196,13 @@ impl OwnedSourceScan {
                         &rescue_key,
                         sampled_scan::now_seconds(),
                     );
+                }
+                // An open refusal (not a vanish or a window exit) leaves the
+                // file unread: source-wide fork-lineage mark.
+                if source == SnapshotSource::ClaudeCode
+                    && census.unreadable_path_count != unreadable_before
+                {
+                    index.usage_guard_mark_refused(Path::new(&rescue_key));
                 }
                 pending!();
             };
@@ -33502,6 +33513,9 @@ impl OwnedSourceScan {
                             Err(_) => {
                                 context.admission.prepare_failed =
                                     context.admission.prepare_failed.saturating_add(1);
+                                if source == SnapshotSource::ClaudeCode {
+                                    index.usage_guard_mark_refused(&candidate.path);
+                                }
                                 census.record_unreadable(UnreadableCause::Reduction, 1);
                                 pending!();
                             }
@@ -56234,116 +56248,249 @@ mod tests {
         exercise_claude_partial_census_recovery(true, true);
     }
 
-    /// Lead B money condition (round 10): a witnessless family is B3-held
-    /// from its second traversal on, yet each pass in which its file grew
-    /// still emits a usage body equal to a cold Full parse of that file.
-    /// This drives the plain scan path; the sampled acquisition path (RAM
-    /// checkpoint, planned Tail, withheld Full) has no Claude harness yet,
-    /// see the ignored fixture below.
-    #[test]
-    fn held_no_witness_family_growing_file_uploads_usage_under_file_birth_posture() {
-        let root = temp_dir("held-no-witness-growing");
-        let path = root.join("held-growing.jsonl");
-        let line = |n: u32| {
-            format!(
-                "{{\"timestamp\":\"2026-08-20T10:{n:02}:00Z\",\"sessionId\":\"held-growing\",\"type\":\"assistant\",\"requestId\":\"req_{n}\",\"message\":{{\"id\":\"msg_{n}\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":{},\"output_tokens\":2}}}}}}\n",
-                100 + n
-            )
-        };
-        fs::write(&path, line(0)).expect("seed transcript");
-        let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
-        let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
-        // The money-bearing body: tokens, request count, the per-model usage
-        // the server prices, and any collector cost.
-        let totals = |items: &[SnapshotItem]| {
-            items
-                .iter()
-                .filter(|item| item.source_session_id == "held-growing")
-                .map(|item| {
-                    (
-                        item.request_count,
-                        item.input_tokens,
-                        item.output_tokens,
-                        item.cache_read_tokens,
-                        serde_json::to_value(&item.model_usage).expect("model usage"),
-                        item.cost.clone(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        let mut index = ScanIndex::default();
-        let mut held_passes = 0;
-        for generation in 0..4_u32 {
-            if generation > 0 {
-                let mut file = fs::OpenOptions::new()
-                    .append(true)
-                    .open(&path)
-                    .expect("grow transcript");
-                std::io::Write::write_all(&mut file, line(generation).as_bytes()).expect("append");
-            }
-            let started = format!("2026-08-20T11:{:02}:00Z", generation * 2);
-            if index
-                .claude_usage_family_pending
-                .get("held-growing")
-                .is_some_and(|pending| pending.census_window_end != started)
-                && matches!(
-                    usage_pending_guard::verdict(&index, "held-growing"),
-                    usage_pending_guard::Verdict::Unknown(
-                        usage_pending_guard::Unknown::MissingWitness
-                    )
-                )
-            {
-                held_passes += 1;
-            }
-            let mut scan = scan_source_roots_with_limit(
-                SnapshotSource::ClaudeCode,
-                std::slice::from_ref(&root),
-                &mut index,
-                &started,
-                BACKFILL_WINDOW_DAYS,
-                16,
-                true,
-            )
-            .expect("bounded page");
-            apply_claude_reported_usage_with_index(
-                &mut scan.snapshots,
-                &api,
-                &trace,
-                &mut index,
-                scan.census_complete,
-                &scan.census_window_end,
-            );
-            let cold = parse_claude_code_jsonl_file(&path, &started, "source".to_string())
-                .expect("cold Full parse");
-            assert_eq!(
-                totals(&scan.snapshots),
-                totals(&cold),
-                "pass {generation}: the grown file's body equals a cold Full"
-            );
-            let body = totals(&scan.snapshots);
-            assert!(
-                body.len() == 1
-                    && body[0].1 > 0
-                    && body[0].4.as_array().is_some_and(|m| !m.is_empty()),
-                "pass {generation}: the grown file uploads tokens and priced model usage"
-            );
-            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
-        }
-        assert!(held_passes >= 1, "the witnessless family was B3-held");
-        let _ = fs::remove_dir_all(root);
+    fn held_money_line(n: u32, at: &str) -> String {
+        format!(
+            "{}\n",
+            json!({"timestamp":at,"sessionId":"held-growing",
+            "type":"assistant","requestId":format!("req_{n}"),"message":{
+                "id":format!("msg_{n}"),"model":"claude-opus-4-8",
+                "usage":{"input_tokens":100+n,"output_tokens":2}}})
+        )
     }
 
-    /// Lead B money condition (round 10), second fixture. A held file with no
-    /// retained checkpoint takes a paced withheld Full that publishes
-    /// nothing; the next pass continues as a planned Tail from the
-    /// checkpoint that read rebuilt, and must upload the growth with bodies
-    /// equal to a cold Full. Those reads exist only on the sampled
-    /// acquisition path (RAM checkpoint cache), for which the tree has no
-    /// Claude test harness; this records the obligation until one exists.
+    fn held_money_seed(label: &str) -> (PathBuf, PathBuf, ScanIndex, String) {
+        let root = temp_dir(label);
+        let path = root.join("held-growing.jsonl");
+        let at = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}",
+                json!({"timestamp":at,
+            "sessionId":"held-growing","type":"user","parentUuid":null,
+            "isCompactSummary":false,"message":{"role":"user","content":"hello"}}),
+                held_money_line(0, &at)
+            ),
+        )
+        .unwrap();
+        let mut index = ScanIndex::default();
+        let mut baseline = scan_source_roots_with_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            &at,
+            BACKFILL_WINDOW_DAYS,
+            16,
+            false,
+        )
+        .unwrap();
+        apply_claude_reported_usage_with_index(
+            &mut baseline.snapshots,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut index,
+            baseline.census_complete,
+            &baseline.census_window_end,
+        );
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut baseline, &mut index);
+        assert_eq!(baseline.snapshots.len(), 1, "baseline emits a body");
+        assert!(index.files.contains_key(&local_index_key(&path)));
+        // Deliberately retain witnessless STALE pending; a complete ordinary
+        // baseline alone cleans current pending and never reaches B3.
+        accumulate_claude_usage_family_pending_with_limit(
+            &baseline.snapshots,
+            &mut index.claude_usage_family_pending,
+            "2000-01-01T00:00:00Z",
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        );
+        assert!(!index.claude_usage_family_pending["held-growing"]
+            .member_occurrences
+            .is_empty());
+        assert!(!index
+            .claude_usage_family_witnesses
+            .contains_key("held-growing"));
+        (root, path, index, at)
+    }
+
+    fn held_money_page(
+        root: &Path,
+        index: &mut ScanIndex,
+        at: &str,
+        cache: Option<Arc<sampled_scan::SharedCache>>,
+    ) -> SourceScanResult {
+        let mut state = OwnedSourceScan::new(
+            SnapshotSource::ClaudeCode,
+            &[root.to_owned()],
+            std::mem::take(index),
+            at,
+            BACKFILL_WINDOW_DAYS,
+            16,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        );
+        // Assert the INSTALLED projection that the production acquisition
+        // consumes, not just a dynamic verdict before the scan starts.
+        assert_eq!(
+            state.index.usage_guard_reason("held-growing"),
+            Some(usage_pending_guard::Unknown::MissingWitness)
+        );
+        assert!(state.index.usage_guard_holds.holds("held-growing"));
+        if let Some(cache) = cache {
+            state = state.with_sampled_acquisition(
+                cache,
+                crate::transcript_acquisition::Scope("held-money-fixture".into()),
+            );
+        }
+        loop {
+            match state.step(None) {
+                OwnedSourceScanStep::Pending(next) => state = next,
+                OwnedSourceScanStep::Complete {
+                    index: completed,
+                    scan,
+                    ..
+                } => {
+                    *index = completed;
+                    assert!(index.usage_guard_holds.holds("held-growing"));
+                    return scan;
+                }
+            }
+        }
+    }
+
+    fn assert_held_money_emission(
+        scan: &mut SourceScanResult,
+        index: &mut ScanIndex,
+        path: &Path,
+        at: &str,
+    ) {
+        apply_claude_reported_usage_with_index(
+            &mut scan.snapshots,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            index,
+            scan.census_complete,
+            &scan.census_window_end,
+        );
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, scan, index);
+        // Finalized selection is serialized with SnapshotItem's wire serde,
+        // AFTER history/decode/no-op emission gates. No pre-gate totals pass.
+        assert_eq!(
+            scan.snapshots.len(),
+            1,
+            "MONEY FREEZE: held growth must emit"
+        );
+        assert_eq!(
+            scan.snapshots[0].claude_file_birth_verdict(),
+            Some(ClaudeFileBirthVerdict::Admitted),
+            "file-birth posture is admitted"
+        );
+        let selected = serde_json::to_value(&scan.snapshots).unwrap();
+        let cold = serde_json::to_value(
+            parse_claude_code_jsonl_file(path, at, "cold-independent-full".into()).unwrap(),
+        )
+        .unwrap();
+        let money = |body: &serde_json::Value| {
+            [
+                "request_count",
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_creation_5m_tokens",
+                "cache_creation_1h_tokens",
+                "model_usage",
+                "cost",
+            ]
+            .into_iter()
+            .map(|key| (key, body[0][key].clone()))
+            .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            money(&selected),
+            money(&cold),
+            "MONEY FREEZE: final serialized held usage must equal independent cold Full"
+        );
+        assert!(selected[0]["input_tokens"].as_u64().unwrap() > 0);
+        assert!(selected[0]["model_usage"]
+            .as_array()
+            .is_some_and(|m| !m.is_empty()));
+        assert!(index.usage_guard_holds.holds("held-growing"));
+    }
+
+    /// Lead B round 11: every intended pass has retained stale witnessless
+    /// pending, an installed B3 hold, and nonempty FINAL money bodies.
     #[test]
-    #[ignore = "needs a sampled Claude scan harness (RAM checkpoint cache, planned Tail); none exists yet"]
+    fn held_no_witness_family_growing_file_uploads_usage_under_file_birth_posture() {
+        let (root, path, mut index, at) = held_money_seed("held-no-witness-growing");
+        let mut held_passes = 0;
+        for generation in 1..=4_u32 {
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            std::io::Write::write_all(&mut file, held_money_line(generation, &at).as_bytes())
+                .unwrap();
+            let started = (OffsetDateTime::parse(&at, &Rfc3339).unwrap()
+                + time::Duration::minutes(i64::from(generation)))
+            .format(&Rfc3339)
+            .unwrap();
+            let mut scan = held_money_page(&root, &mut index, &started, None);
+            held_passes += 1;
+            assert_held_money_emission(&mut scan, &mut index, &path, &started);
+        }
+        assert_eq!(held_passes, 4, "all four growth passes are actually held");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Lead B P1-b: fresh RAM cache, no usable checkpoint. A counted,
+    /// non-publishing Full rebuilds it; subsequent held growth takes Tail and
+    /// the final serialized body equals cold Full. Native heap admission is
+    /// supported on macOS only; Linux compiles but cannot exercise this path.
+    #[test]
     fn held_file_without_checkpoint_withheld_full_then_tail_uploads_growth() {
-        unimplemented!("sampled Claude scan harness required");
+        if !crate::heap_layout_bound::layout_supported() {
+            return;
+        }
+        let (root, path, mut index, at) = held_money_seed("held-withheld-full-tail");
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let key = local_index_key(&path);
+        assert!(cache.claude_checkpoint(&key).unwrap().is_none());
+        let committed = index.files[&key].clone();
+        for n in 1..=2_u32 {
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            std::io::Write::write_all(&mut file, held_money_line(n, &at).as_bytes()).unwrap();
+            let started = (OffsetDateTime::parse(&at, &Rfc3339).unwrap()
+                + time::Duration::minutes(i64::from(n)))
+            .format(&Rfc3339)
+            .unwrap();
+            let (mut scan, rows) = crate::local_resource_diagnostics::capture(|| {
+                held_money_page(&root, &mut index, &started, Some(cache.clone()))
+            });
+            if n == 1 {
+                assert!(scan.snapshots.is_empty(), "withheld Full never publishes");
+                assert!(rows
+                    .iter()
+                    .any(|r| r["counts"]["withheld_full_missing_witness"] == 1));
+                assert!(rows
+                    .iter()
+                    .any(|r| r["counts"]["withheld_full_checkpoint_retained"] == 1));
+                assert!(cache.claude_checkpoint(&key).unwrap().is_some());
+                finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+                assert!(scan.snapshots.is_empty());
+                assert_eq!(
+                    index.files[&key].source_file_fingerprint,
+                    committed.source_file_fingerprint
+                );
+                assert_eq!(index.files[&key].size_bytes, committed.size_bytes);
+            } else {
+                assert!(
+                    rows.iter().any(|r| r["counts"]["unknown_held_tail"] == 1),
+                    "growth continues through the counted held Tail"
+                );
+                assert!(!rows.iter().any(|r| r["counts"]["withheld_full"] == 1));
+                assert_held_money_emission(&mut scan, &mut index, &path, &started);
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// The stable session's family holds stale (older-window) proof that B3

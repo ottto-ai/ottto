@@ -937,20 +937,11 @@ impl ScanIndex {
     /// and the file's data stays unread for the unread-scope veto.
     pub(super) fn usage_guard_full_blocked(&mut self, path: &Path) {
         full_blocked(path);
+        // Source-wide first: the fork-lineage gate covers every family.
+        self.usage_guard_mark_refused(path);
         let Some(member) = claude_index_path_member_ref(path) else {
             return;
         };
-        // Source-wide first: the fork-lineage gate covers every family.
-        let runtime = &mut self.usage_guard_holds.runtime;
-        let key = local_index_key(path);
-        if !runtime.refused_saturated && !runtime.refused.contains(&key) {
-            if runtime.refused.len() >= FORK_LINEAGE_REFUSED_KEYS {
-                runtime.refused = BTreeSet::new();
-                runtime.refused_saturated = true;
-            } else {
-                runtime.refused.insert(key);
-            }
-        }
         if !self.usage_guard_holds.holds(member.root) {
             return;
         }
@@ -983,6 +974,39 @@ impl ScanIndex {
 }
 
 impl ScanIndex {
+    /// Source-wide fork-lineage mark: an attempted read of this Claude file
+    /// (any family, held or not, with or without usage pending) ended without
+    /// a published complete parse: open, parser, reduction, durable or pace
+    /// refusal. Its unread data may hide a copy, so no family retires until
+    /// a complete parse of the key is published or the key vanishes. Bounded;
+    /// past the bound it saturates (fails closed) until the process restarts.
+    pub(super) fn usage_guard_mark_refused(&mut self, path: &Path) {
+        if claude_index_path_member_ref(path).is_none() {
+            return;
+        }
+        let runtime = &mut self.usage_guard_holds.runtime;
+        let key = local_index_key(path);
+        if runtime.refused_saturated || runtime.refused.contains(&key) {
+            return;
+        }
+        if runtime.refused.len() >= FORK_LINEAGE_REFUSED_KEYS {
+            runtime.refused = BTreeSet::new();
+            runtime.refused_saturated = true;
+        } else {
+            runtime.refused.insert(key);
+        }
+    }
+
+    /// Complete terminal: a refused key neither indexed nor walked this
+    /// generation has vanished and can hide nothing.
+    pub(super) fn usage_guard_prune_refused(&mut self, walked: &BTreeSet<String>) {
+        let files = &self.files;
+        self.usage_guard_holds
+            .runtime
+            .refused
+            .retain(|key| files.contains_key(key) || walked.contains(key));
+    }
+
     /// A complete parse of this exact refused key was published to the page.
     pub(super) fn usage_guard_note_read(&mut self, path: &Path) {
         let Some(member) = claude_index_path_member_ref(path) else {
@@ -1068,10 +1092,7 @@ pub(super) fn fork_lineage_incomplete(index: &ScanIndex) -> bool {
         || index.usage_guard_census_prefix_unknown()
         || !runtime.slots.is_empty()
         || runtime.refused_saturated
-        || runtime
-            .refused
-            .iter()
-            .any(|key| index.files.contains_key(key))
+        || !runtime.refused.is_empty()
         || source_wide_missing_sibling(index, current.as_deref().unwrap_or_default())
 }
 
