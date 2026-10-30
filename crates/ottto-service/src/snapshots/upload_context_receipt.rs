@@ -274,9 +274,12 @@ impl ScanIndex {
             return false;
         }
         if !self.file_upload_context_enabled || self.confirmed_empty_files.contains(key) {
-            // A suppressed/empty result has no ACK receipt. Keep its existing
-            // census-context gate so a new policy can make it uploadable.
-            return self.upload_context_fingerprint != self.active_upload_context_fingerprint;
+            // Only a complete empty projection in THIS Claude context may
+            // suppress its redundant read. Other sources and unknown debt keep
+            // their existing gate; no delivery receipt or proof is minted.
+            return !(self.file_upload_context_enabled
+                && self.mixed_context_view.claude
+                && terminal_off_empty_context_seen(self, key));
         }
         !self.mixed_terminal_context_settled(key)
             && self

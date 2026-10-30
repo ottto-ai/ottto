@@ -284,6 +284,92 @@ fn claude_terminal_rewind(traversal: &mut ScanTraversalCheckpoint) {
     }
 }
 
+// Empty projections cannot earn delivery receipts. This bounded process memo
+// suppresses only their redundant UploadContext read, never another read cause.
+// Hashes bind the exact path/context/source witness; eviction/restart permits
+// another ordinary read and grants no ACK, absence, settlement or proof credit.
+const TERMINAL_OFF_EMPTY_CONTEXT_KEYS: usize = 4096;
+#[derive(Default)]
+struct TerminalOffEmptyContexts {
+    keys: BTreeSet<[u8; 32]>,
+    order: VecDeque<[u8; 32]>,
+    evictions: u64,
+}
+impl TerminalOffEmptyContexts {
+    fn remember(&mut self, key: [u8; 32]) {
+        if self.keys.contains(&key) {
+            return;
+        }
+        if self.keys.len() == TERMINAL_OFF_EMPTY_CONTEXT_KEYS {
+            let oldest = self.order.pop_front().expect("bounded memo has an owner");
+            self.keys.remove(&oldest);
+            self.evictions = self.evictions.saturating_add(1);
+            eprintln!("upload_context_empty_memo_evicted evictions={} capacity={TERMINAL_OFF_EMPTY_CONTEXT_KEYS}", self.evictions);
+        }
+        self.keys.insert(key);
+        self.order.push_back(key);
+    }
+}
+#[cfg(test)]
+thread_local! {
+    static TERMINAL_OFF_EMPTY_CONTEXTS: std::cell::RefCell<TerminalOffEmptyContexts> =
+        std::cell::RefCell::new(TerminalOffEmptyContexts::default());
+    static TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+fn with_terminal_off_empty_contexts<T>(f: impl FnOnce(&mut TerminalOffEmptyContexts) -> T) -> T {
+    #[cfg(not(test))]
+    {
+        static MEMO: std::sync::OnceLock<std::sync::Mutex<TerminalOffEmptyContexts>> =
+            std::sync::OnceLock::new();
+        f(&mut MEMO
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+    #[cfg(test)]
+    TERMINAL_OFF_EMPTY_CONTEXTS.with(|memo| f(&mut memo.borrow_mut()))
+}
+fn terminal_off_empty_context_key(index: &ScanIndex, key: &str) -> Option<[u8; 32]> {
+    if !claude_terminal_off() || !index.confirmed_empty_files.contains(key) {
+        return None;
+    }
+    let entry = index.files.get(key)?;
+    if entry.source_file_fingerprint.is_empty() {
+        return None; // Genuine cleared/unknown debt can never reuse the memo.
+    }
+    let mut digest = Sha256::new();
+    for value in [
+        "terminal-off-empty-context:v1",
+        key,
+        index.active_upload_context_fingerprint.as_deref()?,
+        &entry.source_file_fingerprint,
+        index
+            .historical_replay_generation
+            .as_deref()
+            .unwrap_or("none"),
+    ] {
+        update_length_prefixed(&mut digest, value.as_bytes());
+    }
+    digest.update(index.context_curve_replay_epoch.to_be_bytes());
+    Some(digest.finalize().into())
+}
+fn terminal_off_empty_context_seen(index: &ScanIndex, key: &str) -> bool {
+    terminal_off_empty_context_key(index, key)
+        .is_some_and(|key| with_terminal_off_empty_contexts(|memo| memo.keys.contains(&key)))
+}
+fn note_terminal_off_empty_context(index: &ScanIndex, key: &str, parsed_fingerprint: &str) {
+    if !index
+        .files
+        .get(key)
+        .is_some_and(|entry| entry.source_file_fingerprint == parsed_fingerprint)
+    {
+        return;
+    }
+    if let Some(key) = terminal_off_empty_context_key(index, key) {
+        with_terminal_off_empty_contexts(|memo| memo.remember(key));
+    }
+}
+
 // Scheduling only: ordinary ScanIndex reloads must not reset the cadence.
 // Fixed-size hashed scopes retain no transcript/path strings. Eviction and a
 // process restart fail toward one metadata rewalk, never toward proof.
@@ -428,15 +514,23 @@ fn refresh_terminal_off_discovery(
         .values()
         .any(|key| !sampled_audit::candidate_open_blocked(key, now))
         || index.files.iter().any(|(key, entry)| {
-            let needs_service = (index.file_upload_context_requires_adoption(key)
-                && !index.file_upload_context_waits_for_retry(key))
+            // No receipt can discharge an empty or body-witness-less key.
+            // Those keys keep ordinary discovery cadence and independent debt.
+            let receipt_mintable = entry.last_upload_body_witness.is_some()
+                && index
+                    .file_snapshot_fingerprints
+                    .get(key)
+                    .is_some_and(|members| !members.is_empty());
+            let needs_service = (receipt_mintable
+                && ((index.file_upload_context_requires_adoption(key)
+                    && !index.file_upload_context_waits_for_retry(key))
+                    || index.effective_upload_body_witness_revision_requires_adoption(key)))
                 || entry.source_file_fingerprint.is_empty()
                 || (!entry.has_unverified_source()
                     && entry.scan_identity_version.as_deref()
                         != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION))
                 || sampled_audit::debt_for_key(index, key, now)
-                    .is_some_and(|debt| now >= debt.due_unix_seconds)
-                || index.effective_upload_body_witness_revision_requires_adoption(key);
+                    .is_some_and(|debt| now >= debt.due_unix_seconds);
             // Keep D, but a forbidden open cannot authorize a whole-corpus
             // rewalk. This is metadata-only: #903's same-stat backoff/park
             // remains authoritative, while a changed stat wakes this key.

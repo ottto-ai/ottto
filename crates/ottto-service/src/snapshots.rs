@@ -8247,6 +8247,15 @@ pub fn finalize_scan_after_policy_with_body_witness(
             index
                 .confirmed_empty_files
                 .insert(pending.index_key.clone());
+            if source == SnapshotSource::ClaudeCode {
+                // Complete post-policy empty parse only; held/partial files
+                // returned above and cannot create this process-local hint.
+                note_terminal_off_empty_context(
+                    index,
+                    &pending.index_key,
+                    &pending.source_file_fingerprint,
+                );
+            }
         } else {
             index
                 .file_snapshot_fingerprints
@@ -32771,6 +32780,8 @@ impl OwnedSourceScan {
                     .confirmed_empty_files
                     .contains(&local_index_key(&candidate.path))
             {
+                #[cfg(test)]
+                TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST.with(|count| count.set(count.get() + 1));
                 eprintln!(
                     "upload_context_confirmed_empty_reparse files=1 source={}",
                     source.api_slug()

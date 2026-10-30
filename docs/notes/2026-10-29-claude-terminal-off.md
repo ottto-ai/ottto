@@ -361,3 +361,27 @@ followed by three zero-body walks, and a context move on a parked path followed
 by stat recovery. Existing real-cadence unhinted-append, selected/reloaded Scope
 and backoff controls remain. Compilation or portable CI cannot replace native
 Scope evidence on macOS.
+
+
+### Round 23: empty projections do not force repeated context walks
+
+Only files with nonempty entity incidence and an upload-body witness force
+context or body-witness adoption discovery. Empty and held-history files keep
+ordinary metadata cadence and all independent clear, identity, audit and retry
+obligations. This changes no admission, proof, ACK or money rule.
+
+A complete post-policy Claude empty finalization records a process-only hashed
+(path, context, source fingerprint) hint, also bound to the existing replay
+state. The hint suppresses only redundant UploadContext selection. It is not a
+receipt, never serialized, and cannot survive a genuine cleared source witness.
+The FIFO memo is capped at4096 keys, with counted evictions. Restart or eviction
+may cost one extra ordinary read; nothing is dropped or credited. Other sources
+keep their existing selection policy. Empty files remain eligible for ordinary
+changed-file, privacy-context and other independent work.
+
+Controls use one nonzero-byte empty file plus three ordinary files, real ACKs,
+three quiet preparations, one empty reread on context change, and three further
+quiet preparations. A held-history file retains its zero body witness/revision
+debt without forcing rediscovery. Separate controls cover bounded eviction and
+refusal to memoize before finalization or reuse cleared debt. Native tests and
+pins are unchanged by this patch.

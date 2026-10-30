@@ -2295,3 +2295,224 @@ fn terminal_off_context_mismatch_cannot_wake_parked_key_until_stat_change() {
     );
     sampled_audit::reset_open_backoff_for_test();
 }
+
+fn b1_quiet_preparations(f: &mut Fixture, now: u64) {
+    let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
+    let body = TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get);
+    let reparses = TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST.with(std::cell::Cell::get);
+    for offset in 1..=3 {
+        f.uploader.prepare_for_scan(
+            f.source,
+            f.index.active_upload_context_fingerprint.clone().unwrap(),
+            &mut f.index,
+        );
+        let previous = f.index.clone();
+        let ((scan, bytes), reads) = terminal_contract_retry::source_acquisitions(|| {
+            sampled_scan::with_test_now(now + offset, || f.walk(true))
+        });
+        assert_eq!(
+            START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get),
+            samples,
+            "no walk samples"
+        );
+        assert_eq!(
+            TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get),
+            body,
+            "no Full/body bytes"
+        );
+        assert_eq!(
+            TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST.with(std::cell::Cell::get),
+            reparses,
+            "no confirmed_empty_reparse"
+        );
+        assert_eq!(bytes, 0);
+        assert!(reads.is_empty(), "no transcript parser stepped");
+        assert_eq!(scan.scanned_file_count, 0);
+        assert!(!scan.census_complete);
+        let posts = f.uploader.posts.len();
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap();
+        assert_eq!(f.uploader.posts.len(), posts, "no POST without new bodies");
+    }
+}
+
+#[test]
+fn terminal_off_empty_and_three_normal_files_stay_quiet_then_context_rereads_empty_once() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    f.index.upload_context_fingerprint = None; // Actual fresh source-wide context.
+    let empty = f.root.join("019fa111-2222-7333-8444-888888888888.jsonl");
+    fs::write(
+        &empty,
+        "{\"type\":\"user\",\"message\":{\"content\":\"no usage\"}}\n",
+    )
+    .unwrap();
+    let key = local_index_key(&empty);
+    let original = fs::read_to_string(&f.path).unwrap();
+    for session in [
+        "019fa111-2222-7333-8444-666666666666",
+        "019fa111-2222-7333-8444-777777777777",
+    ] {
+        fs::write(
+            f.root.join(format!("{session}.jsonl")),
+            original.replace(SESSION, session),
+        )
+        .unwrap();
+    }
+    let now = sampled_scan::now_seconds();
+    f.uploader
+        .prepare_for_scan(f.source, "d".repeat(64), &mut f.index);
+    let previous = f.index.clone();
+    let (scan, _) = sampled_scan::with_test_now(now, || f.walk(true));
+    assert_eq!(
+        scan.scanned_file_count, 4,
+        "1 nonzero-byte empty + N=3 ordinary files"
+    );
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        3
+    );
+    assert!(f.index.confirmed_empty_files.contains(&key));
+    assert!(f.index.files[&key].last_upload_body_witness.is_none());
+    assert!(
+        f.index.files[&key].upload_context_receipt.is_none(),
+        "no fake empty receipt"
+    );
+    assert!(terminal_off_empty_context_seen(&f.index, &key));
+    assert!(!f.index.file_upload_context_requires_adoption(&key));
+    b1_quiet_preparations(&mut f, now);
+    // Even an independent forced metadata walk/cadence cannot reparse it for context.
+    expire_terminal_off_discovery_for_test(&f.index);
+    let (_, _, saved_evictions) = with_terminal_off_empty_contexts(|memo| {
+        (memo.keys.len(), memo.order.len(), memo.evictions)
+    });
+    let reparses = TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST.with(std::cell::Cell::get);
+    let (same, _) = sampled_scan::with_test_now(now + 5, || f.walk(true));
+    assert_eq!(same.scanned_file_count, 0);
+    assert_eq!(
+        TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST.with(std::cell::Cell::get),
+        reparses
+    );
+    f.uploader
+        .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
+    assert!(!terminal_off_empty_context_seen(&f.index, &key));
+    let previous = f.index.clone();
+    let ((changed, _), reads) = terminal_contract_retry::source_acquisitions(|| {
+        sampled_scan::with_test_now(now + 6, || f.walk(true))
+    });
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|(path, _)| path == &empty)
+            .map(|(_, count)| count)
+            .sum::<usize>(),
+        1,
+        "one empty read under E"
+    );
+    assert_eq!(
+        TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST.with(std::cell::Cell::get) - reparses,
+        1
+    );
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &changed.snapshots)
+            .unwrap()
+            .0,
+        3
+    );
+    b1_quiet_preparations(&mut f, now + 6);
+    assert!(
+        f.index.upload_context_fingerprint.is_none(),
+        "source context still unadopted"
+    );
+    assert!(f.index.files[&key].upload_context_receipt.is_none());
+    assert!(!changed.census_complete);
+    assert_eq!(
+        with_terminal_off_empty_contexts(|memo| memo.evictions),
+        saved_evictions
+    );
+}
+
+#[test]
+fn terminal_off_held_history_without_body_witness_does_not_force_rediscovery() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    f.index.upload_context_fingerprint = None;
+    f.index.activate_effective_upload_body_witness_revision(2);
+    f.index
+        .adopt_effective_upload_body_witness_revision_monotonically();
+    f.index.claude_no_list_policy = claude_history_upgrade::NoListPolicy::HoldUnverified;
+    f.index.claude_history_cutoff_unix_seconds = Some(u64::MAX);
+    let now = sampled_scan::now_seconds();
+    f.uploader
+        .prepare_for_scan(f.source, "d".repeat(64), &mut f.index);
+    let (scan, _) = sampled_scan::with_test_now(now, || f.walk(true));
+    assert_eq!(scan.scanned_file_count, 1);
+    assert!(
+        scan.snapshots.is_empty(),
+        "ordinary history privacy gate still withholds bodies"
+    );
+    assert!(f.entry().last_upload_body_witness.is_none());
+    assert!(
+        !f.index.confirmed_empty_files.contains(&f.key()),
+        "held local bodies are not proven empty"
+    );
+    assert!(
+        f.index
+            .effective_upload_body_witness_revision_requires_adoption(&f.key()),
+        "witness debt is retained"
+    );
+    assert!(
+        f.index.file_upload_context_requires_adoption(&f.key()),
+        "no fake receipt/empty memo"
+    );
+    assert!(!terminal_off_empty_context_seen(&f.index, &f.key()));
+    b1_quiet_preparations(&mut f, now);
+    assert!(f.entry().upload_context_receipt.is_none());
+    assert_eq!(
+        f.entry().effective_upload_body_witness_revision,
+        0,
+        "hold never stamped"
+    );
+}
+
+#[test]
+fn terminal_off_empty_memo_requires_finalization_and_cannot_mask_cleared_debt() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    fs::write(
+        &f.path,
+        "{\"type\":\"user\",\"message\":{\"content\":\"no usage\"}}\n",
+    )
+    .unwrap();
+    let (mut scan, _) = f.walk(false);
+    assert_eq!(scan.scanned_file_count, 1);
+    assert!(
+        !terminal_off_empty_context_seen(&f.index, &f.key()),
+        "parse alone did not finalize policy"
+    );
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    assert!(terminal_off_empty_context_seen(&f.index, &f.key()));
+    assert!(f.entry().upload_context_receipt.is_none());
+    let persisted = serde_json::to_value(&f.index).unwrap();
+    let loaded: ScanIndex = serde_json::from_value(persisted.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&loaded).unwrap(),
+        persisted,
+        "no memo field in persisted state"
+    );
+    let key = f.key();
+    f.index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    assert!(!terminal_off_empty_context_seen(&f.index, &key));
+    assert!(
+        f.index.file_upload_context_requires_adoption(&key),
+        "genuine cleared debt is unchanged"
+    );
+    assert!(f.entry().source_file_fingerprint.is_empty());
+}

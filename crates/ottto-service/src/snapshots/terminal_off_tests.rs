@@ -1326,3 +1326,26 @@ fn terminal_off_captured_audit_clock_survives_yields_and_owns_rediscovery_deadli
         "next page captures a new due clock"
     );
 }
+
+#[test]
+fn terminal_off_empty_context_memo_is_bounded_counts_eviction_and_never_grants_credit() {
+    let mut memo = TerminalOffEmptyContexts::default();
+    let first = [0u8; 32];
+    memo.remember(first);
+    for n in 1..=TERMINAL_OFF_EMPTY_CONTEXT_KEYS {
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&(n as u64).to_be_bytes());
+        memo.remember(key);
+    }
+    assert_eq!(memo.keys.len(), TERMINAL_OFF_EMPTY_CONTEXT_KEYS);
+    assert_eq!(memo.order.len(), TERMINAL_OFF_EMPTY_CONTEXT_KEYS);
+    assert_eq!(memo.evictions, 1);
+    assert!(
+        !memo.keys.contains(&first),
+        "eviction permits another ordinary context read"
+    );
+    memo.remember(first);
+    assert!(memo.keys.contains(&first));
+    assert_eq!(memo.evictions, 2);
+    assert_eq!(memo.keys.len(), TERMINAL_OFF_EMPTY_CONTEXT_KEYS);
+}
