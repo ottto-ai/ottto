@@ -586,31 +586,6 @@ pub(crate) fn expire_terminal_off_discovery_for_test(index: &ScanIndex) {
     }
 }
 
-// A counterfactual preview must not consume the real page owner's process
-// scheduling turn. Restore only the test-local memo, including on unwind.
-#[cfg(test)]
-pub(crate) struct TerminalOffDiscoveryPreviewForTest {
-    saved: BTreeMap<String, u64>,
-    _walks: terminal_off_discovery::Preview,
-    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-#[cfg(test)]
-impl TerminalOffDiscoveryPreviewForTest {
-    pub(crate) fn begin() -> Self {
-        Self {
-            saved: TERMINAL_OFF_REDISCOVERY.with(|memo| memo.borrow().clone()),
-            _walks: terminal_off_discovery::Preview::begin(),
-            _thread: std::marker::PhantomData,
-        }
-    }
-}
-#[cfg(test)]
-impl Drop for TerminalOffDiscoveryPreviewForTest {
-    fn drop(&mut self) {
-        TERMINAL_OFF_REDISCOVERY.with(|memo| *memo.borrow_mut() = std::mem::take(&mut self.saved));
-    }
-}
-
 fn terminal_off_rediscovery_scope(index: &ScanIndex) -> Option<String> {
     terminal_off_traversal_scope(index.traversal.as_ref()?)
 }

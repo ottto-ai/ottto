@@ -336,28 +336,7 @@ pub(crate) struct Uploader {
     pub policy: SnapshotUploadPolicy,
 }
 impl Uploader {
-    pub(crate) fn terminal_off_on_new(source: SnapshotSource) -> Self {
-        Self {
-            progress: SnapshotUploadProgress::new(
-                "a".repeat(64),
-                snapshot_quarantine_witness(source),
-            ),
-            scratch: crate::test_scratch::ScratchDir::new("context-real-uploader"),
-            posts: Vec::new(),
-            received_item_bytes: 0,
-            received_catchup_bytes: 0,
-            received_resend_bytes: 0,
-            not_stored: false,
-            refuse: false,
-            fail_after: None,
-            policy: SnapshotUploadPolicy::default(),
-        }
-    }
-
     pub(crate) fn new(source: SnapshotSource) -> Self {
-        if crate::snapshots::ClaudeTerminalOffForTest::active() {
-            return Self::terminal_off_on_new(source);
-        }
         Self {
             progress: SnapshotUploadProgress::new(
                 "a".repeat(64),

@@ -1302,33 +1302,6 @@ fn terminal_off_idle_cadence_never_parks_already_owed_read_work() {
     }
 }
 
-/// [behaviour] Containment contract: counterfactual preview preserves the actual discovery turn.
-#[test]
-fn terminal_off_counterfactual_preview_preserves_the_actual_discovery_turn() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-preview-turn");
-    let mut index = off_index();
-    ensure_bounded_traversal(
-        SnapshotSource::ClaudeCode,
-        &[scratch.to_path_buf()],
-        &mut index,
-        W1,
-        183,
-    );
-    let scope = terminal_off_rediscovery_scope(&index).unwrap();
-    expire_terminal_off_discovery_for_test(&index);
-    {
-        let _preview = TerminalOffDiscoveryPreviewForTest::begin();
-        assert!(terminal_off_rediscovery_due(scope.clone(), 100, false));
-        assert!(!terminal_off_rediscovery_due(scope.clone(), 101, false));
-    }
-    assert!(
-        terminal_off_rediscovery_due(scope, 100, false),
-        "the control clone did not consume the real owner's turn"
-    );
-}
-
 /// [behaviour] Containment contract: unhinted append waits for real cadence then is discovered.
 #[test]
 fn terminal_off_unhinted_append_waits_for_real_cadence_then_is_discovered() {

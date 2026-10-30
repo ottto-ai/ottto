@@ -218,20 +218,6 @@ fn service_token(
     }
     h.finalize().into()
 }
-#[cfg(test)]
-pub(super) struct Preview(BTreeMap<String, Walk>);
-#[cfg(test)]
-impl Preview {
-    pub(super) fn begin() -> Self {
-        Self(with_walks(|m| m.clone()))
-    }
-}
-#[cfg(test)]
-impl Drop for Preview {
-    fn drop(&mut self) {
-        with_walks(|m| *m = std::mem::take(&mut self.0));
-    }
-}
 
 /// A watcher is an immediate key hint, never evidence of a completed walk.
 pub(super) fn hint_allowed(traversal: &ScanTraversalCheckpoint, path: &Path) -> bool {
