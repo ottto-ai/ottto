@@ -1,9 +1,11 @@
 //! E1's transport/mapping controls. E5 owns the eight native Pi capture cases.
 use super::*;
-use sampled_scan::durable_tail::{
-    Degraded, DegradedCause, FinishAcquisition, HeldCause, NotPersisted, Unprepared,
-    UnpreparedDisposition, WriteOutcome,
+pub(crate) use sampled_scan::durable_tail::{
+    Degraded, DegradedCause, HeldCause, NotPersisted, Unprepared, UnpreparedDisposition,
+    WriteOutcome,
 };
+
+use sampled_scan::durable_tail::FinishAcquisition;
 
 fn acquisition() -> FinishAcquisition {
     FinishAcquisition::Uncertified(DurableCustody::default())
@@ -168,4 +170,76 @@ fn held_decision_survives_later_publishing_siblings_and_empty_page_transport() {
             "publication transport must reach a completed page"
         );
     }
+}
+
+// Typed e4 inputs at the native consumer boundary. Receipt cases use the real
+// store; injected non-receipt outcomes discard the actual private stage and
+// run the same production disposition/custody mapping before any body effect.
+pub(crate) enum E4Outcome {
+    Write(WriteOutcome),
+    Unprepared(UnpreparedDisposition),
+}
+thread_local! {
+    static OBSERVED: std::cell::RefCell<Option<Vec<(String, NativePublication)>>> = const { std::cell::RefCell::new(None) };
+    static SETTLEMENT: std::cell::RefCell<Option<(String, E4Outcome)>> = const { std::cell::RefCell::new(None) };
+}
+pub(crate) struct SettlementGuard;
+impl Drop for SettlementGuard {
+    fn drop(&mut self) {
+        SETTLEMENT.with(|slot| *slot.borrow_mut() = None);
+        OBSERVED.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+pub(crate) fn inject_settlement(key: String, outcome: E4Outcome) -> SettlementGuard {
+    OBSERVED.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    SETTLEMENT.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some((key, outcome));
+    });
+    SettlementGuard
+}
+pub(super) fn take_outcome(key: &str) -> Option<E4Outcome> {
+    SETTLEMENT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|(target, _)| target == key) {
+            slot.take().map(|(_, outcome)| outcome)
+        } else {
+            None
+        }
+    })
+}
+pub(super) fn map_settlement(
+    cache: &sampled_scan::SharedCache,
+    acquisition: &mut FinishAcquisition,
+    source: SnapshotSource,
+    candidate: Option<&sampled_scan::durable_tail::RecordIdentity>,
+    outcome: E4Outcome,
+) -> (NativePublication, bool) {
+    match outcome {
+        E4Outcome::Write(outcome) => {
+            write_disposition(cache, acquisition, source, outcome, candidate)
+        }
+        E4Outcome::Unprepared(outcome) => {
+            unprepared_disposition(cache, acquisition, source, outcome)
+        }
+    }
+}
+pub(crate) fn assert_settlement_consumed() {
+    SETTLEMENT.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "actual native settlement must be reached"
+        )
+    });
+}
+
+pub(super) fn observe_settlement(key: &str, publication: Option<NativePublication>) {
+    OBSERVED.with(|slot| {
+        if let Some(trace) = slot.borrow_mut().as_mut() {
+            trace.push((key.to_owned(), publication.expect("native e4 decision")));
+        }
+    });
+}
+pub(crate) fn observed_settlements() -> Vec<(String, NativePublication)> {
+    OBSERVED.with(|slot| slot.borrow().as_ref().expect("scoped e4 trace").clone())
 }

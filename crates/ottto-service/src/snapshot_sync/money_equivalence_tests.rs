@@ -1070,6 +1070,7 @@ fn pi_seed() -> String {
 
 struct PiProof {
     sampled: bool,
+    durable: bool,
     bodies: Vec<ReceiptBody>,
 }
 
@@ -1089,9 +1090,15 @@ impl PiProof {
     fn finish(self, c: &Corpus, disk: &Disk) {
         let name = c.base.file_name().unwrap().to_str().unwrap();
         receipt(name, &self.bodies);
-        assert_eq!(disk.records(), 0, "Pi-a has no durable store");
-        println!("MONEY_EQUIVALENCE_PI_CAPABILITY {name} UNSUPPORTED");
-        println!("MONEY_EQUIVALENCE_DISK {name} UNSUPPORTED");
+        if self.durable {
+            assert!(disk.records() > 0, "native Pi receipt must survive");
+            println!("MONEY_EQUIVALENCE_PI_CAPABILITY {name} SUPPORTED");
+            println!("MONEY_EQUIVALENCE_DISK {name} VERIFIED");
+        } else {
+            assert_eq!(disk.records(), 0, "base has no durable Pi receipt");
+            println!("MONEY_EQUIVALENCE_PI_CAPABILITY {name} UNSUPPORTED");
+            println!("MONEY_EQUIVALENCE_DISK {name} UNSUPPORTED");
+        }
     }
 }
 
@@ -1118,12 +1125,12 @@ fn pi_disk_corpus(
         if sampled { (1, 0, 0) } else { (0, 0, 0) },
         "head must exercise sampled Pi; base must exercise cold Full"
     );
-    assert!(scanner.cache.durable_counters(SnapshotSource::Pi).is_none());
     assert!(!scan.snapshots.is_empty());
     let prior = disk.commit(&scanner.cache, SnapshotSource::Pi, &mut index);
-    assert_eq!(disk.records(), 0);
+    let durable = disk.records() > 0;
     let mut proof = PiProof {
         sampled,
+        durable,
         bodies: Vec::new(),
     };
     proof.capture(&scan);
@@ -1294,16 +1301,29 @@ fn pi_pages_checked(
     let (disk_index, restored, mode) = page(restart, disk_prior);
     assert_eq!(
         mode,
-        if proof.sampled {
+        if proof.durable {
+            disk_mode
+        } else if proof.sampled {
             (disk_mode.0 + disk_mode.1, 0, disk_mode.2)
         } else {
             (0, 0, 0)
         },
         "Pi disk acquisition"
     );
-    // Restart is still recordless: its changed files read Full on head.
-    let _ = restores;
-    assert!(restart.cache.durable_counters(SnapshotSource::Pi).is_none());
+    if proof.durable {
+        assert_eq!(
+            restart
+                .cache
+                .durable_counters(SnapshotSource::Pi)
+                .unwrap()
+                .0
+                .restored,
+            restores,
+            "actual Pi disk restores"
+        );
+    } else {
+        assert!(restart.cache.durable_counters(SnapshotSource::Pi).is_none());
+    }
     for scan in [&tail, &restored] {
         assert_eq!(
             scan.dropped_usage_record_count,
@@ -1933,7 +1953,7 @@ fn pi_downgrade_then_reupgrade() {
     proof.capture(&scan);
     down.save(&disk.index).unwrap();
     let committed = ScanIndex::load(&disk.index).unwrap();
-    assert_eq!(disk.records(), 0);
+    assert_eq!(disk.records(), usize::from(proof.durable));
     pi_grow(
         &path,
         pi_turn(
@@ -1943,6 +1963,8 @@ fn pi_downgrade_then_reupgrade() {
             "2026-10-27T06:02:00Z",
         ),
     );
+    // Format 3 preserves this valid prefix across the index-only downgrade.
+    // The appended suffix catches up with the accepted extent by Tail.
     let reupgraded = disk.owner(SnapshotSource::Pi);
     let ([tail, full, mut restored], _) = pi_pages(
         &mut proof,
@@ -1951,8 +1973,8 @@ fn pi_downgrade_then_reupgrade() {
         &reupgraded,
         [committed.clone(), committed.clone(), committed],
         (0, 1, 0),
-        (1, 0, 0),
-        0,
+        (0, 1, 0),
+        1,
     );
     let next = disk.commit(&reupgraded.cache, SnapshotSource::Pi, &mut restored);
     pi_grow(

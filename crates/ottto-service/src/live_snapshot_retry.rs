@@ -220,7 +220,11 @@ impl LiveRetryOwner {
     ) -> bool {
         if !self.enabled
             || source != SnapshotSource::Pi
-            || native_publication.is_some_and(|completion| !completion.publishes())
+            || match native_publication {
+                Some(completion) => !completion.publishes(),
+                // RAM-only acquisitions carry no e4 decision.
+                None => false,
+            }
             || working.legacy_settlement_ledger_needs_migration()
             || committed.legacy_settlement_ledger_needs_migration()
             || live.destination() != progress.destination_namespace_hash

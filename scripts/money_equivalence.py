@@ -18,7 +18,7 @@ def output(args):
     return subprocess.check_output(args, text=True).strip()
 
 
-PI_DURABLE_EXPECTED = False
+PI_DURABLE_EXPECTED = True
 # Flip to True once the comparison base contains Pi-a (the release after Pi-a, or Pi-b2).
 PI_RAM_IN_BASE = False
 

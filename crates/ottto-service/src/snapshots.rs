@@ -143,7 +143,7 @@ mod m3_layout_tests;
 #[cfg(all(test, unix))]
 mod m3_native_tests;
 #[cfg(all(test, unix))]
-mod native_publication_tests;
+pub(crate) mod native_publication_tests;
 #[cfg(test)]
 pub(crate) use codex_counting_version::TestCutover;
 #[cfg(test)]
@@ -30046,7 +30046,7 @@ impl OwnedSourceScan {
                     }),
                 };
                 // M3 G1 and D3: ordinary plain singleton completions stage
-                // before publication for both durable sources. Codex must
+                // before publication for all durable sources. Codex must
                 // observe a store failure before ACK to enforce strict rebind.
                 // Group/member, proof, side and comparison keep their owners. The held descriptor is
                 // duplicated, never read, before the parser is consumed: the
@@ -30063,14 +30063,14 @@ impl OwnedSourceScan {
                             Some(&parser.reader.reader),
                         ));
                 #[cfg(unix)]
-                // E5-PI-B2-SEAM: Pi activation awaits the e4 publication decision
-                // at snapshot_sync::capture_after_shed; M3 keeps it private here.
                 let m3_route = sampling
                     .as_ref()
                     .zip(file_sampling.as_ref())
                     .filter(|_| {
-                        matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex)
-                            && !comparison_target
+                        matches!(
+                            source,
+                            SnapshotSource::ClaudeCode | SnapshotSource::Codex | SnapshotSource::Pi
+                        ) && !comparison_target
                             && side_origin.is_none()
                             && aliases.is_empty()
                             && applied_receipts.values().all(Option::is_none)
@@ -30125,6 +30125,11 @@ impl OwnedSourceScan {
                                 expected_opened_object_identity: &candidate.opened_object_identity,
                                 committed_index: index,
                             },
+                        );
+                        #[cfg(test)]
+                        native_publication_tests::observe_settlement(
+                            &active.key,
+                            settled.publication,
                         );
                         NativePublication::carry(&mut native_publication, settled.publication);
                         completed_acquisition = settled.completed;
@@ -36561,38 +36566,56 @@ fn settle_native_attempt(
                 }
                 // Each outcome is computed (fences consumed) before the
                 // acquisition is borrowed again to bind or owe it.
-                Ok(fences) => match staged {
-                    PrepareOutcome::Prepared(prepared) => {
-                        let outcome = cache.commit_prepared(prepared, fences);
-                        write_disposition(
+                Ok(fences) => 'settlement: {
+                    #[cfg(test)]
+                    if let Some(outcome) = native_publication_tests::take_outcome(fence.key) {
+                        assert!(
+                            matches!(staged, PrepareOutcome::Prepared(_)),
+                            "native private stage premise"
+                        );
+                        let outcome = native_publication_tests::map_settlement(
                             cache,
                             &mut acquisition,
                             fence.source,
-                            outcome,
                             candidate.as_ref(),
-                        )
-                    }
-                    PrepareOutcome::StoreFailed(failure) => {
-                        let outcome = cache.resolve_failed_preparation(failure, fences);
-                        write_disposition(
-                            cache,
-                            &mut acquisition,
-                            fence.source,
                             outcome,
-                            candidate.as_ref(),
-                        )
+                        );
+                        discard_staging(cache, staged);
+                        break 'settlement outcome;
                     }
-                    PrepareOutcome::NotPersisted(reason) => {
-                        let outcome =
-                            cache.resolve_unprepared(Unprepared::NotPersisted(reason), fences);
-                        unprepared_disposition(cache, &mut acquisition, fence.source, outcome)
-                    }
-                    PrepareOutcome::Degraded(reason) => {
-                        let outcome =
-                            cache.resolve_unprepared(Unprepared::Degraded(reason), fences);
-                        unprepared_disposition(cache, &mut acquisition, fence.source, outcome)
-                    }
-                },
+                    break 'settlement match staged {
+                        PrepareOutcome::Prepared(prepared) => {
+                            let outcome = cache.commit_prepared(prepared, fences);
+                            write_disposition(
+                                cache,
+                                &mut acquisition,
+                                fence.source,
+                                outcome,
+                                candidate.as_ref(),
+                            )
+                        }
+                        PrepareOutcome::StoreFailed(failure) => {
+                            let outcome = cache.resolve_failed_preparation(failure, fences);
+                            write_disposition(
+                                cache,
+                                &mut acquisition,
+                                fence.source,
+                                outcome,
+                                candidate.as_ref(),
+                            )
+                        }
+                        PrepareOutcome::NotPersisted(reason) => {
+                            let outcome =
+                                cache.resolve_unprepared(Unprepared::NotPersisted(reason), fences);
+                            unprepared_disposition(cache, &mut acquisition, fence.source, outcome)
+                        }
+                        PrepareOutcome::Degraded(reason) => {
+                            let outcome =
+                                cache.resolve_unprepared(Unprepared::Degraded(reason), fences);
+                            unprepared_disposition(cache, &mut acquisition, fence.source, outcome)
+                        }
+                    };
+                }
             };
             (Some(publication), strict_rebind)
         }
