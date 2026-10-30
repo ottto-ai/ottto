@@ -1179,26 +1179,6 @@ the limit of 64 per page), or one first-match reason in
 `families_unevaluated_member_budget` counts families left for a later page, which
 are not in `families_evaluated`.
 
-**Child finalization partition.** `family_child_finalize_eligible` and
-`family_child_finalize_blocked` are a separate partition of a separate
-population, and a family in it also keeps its strict reason. A candidate has a
-valid account proof that names no outside member, a live root bound at its
-current tuple, no stale bound child, at least one unfinalized child, and every
-member's current revision attested; a family with no live root is blocked
-`root_absent`. Candidates can include `held`, `membership_unknown` and
-`refused_read_unattributed` families, so the total can exceed the `evidence`
-count. Blocked causes are first-match, in this order: `root_absent`,
-`witness_missing`, `witness_conflict`, `witness_held`, `shared_parent`,
-`native_ownership_conflict`, `cross_family_unknown`,
-`identity_contract_changed`, `twin_set`, `sticky_veto`, `enumeration_open`,
-`uniqueness_unknown`, `window_moved`, `policy_changed`.
-
-`family_child_finalize_eligible` is an UPPER BOUND, not a finalization
-certificate. The per-session owner binding cannot be read at the scan step, and
-cross-family dependencies only a terminal census derives are not visible: a
-member's parent reference, a request shared with a family not yet censused, and
-request overlap with another family's pending proof. No code consumes this count.
-
 **Freshness.** `pending_census_members` describes the skipped set: `count`
 (queue plus replay entries), `replay`, `replay_repeat`, `oldest_age_s`,
 `over_24h`, `tracked`, `unqueued_unresolved`, `pace_evicted` and `stamped_for_s`.
@@ -1214,23 +1194,21 @@ them again. Attestations and vetoes also reset with each new traversal generatio
 `member_keys_visited` is range advances of the member lookups, at most 16,384.
 Under `cost`: `root_index_keys_processed` is keys the uniqueness pass consumed,
 at most 8,192, plus one check per parse; the merged loop may also peek up to 2
-keys it does not count. `cross_family_entries_visited` is outer-map entries of the
-cross-family records, not the owner references flattened from them, and is zero
-on a page with no candidate. `rotation_keys_visited`, `queue_entries_visited` (two
+keys it does not count. `rotation_keys_visited`, `queue_entries_visited` (two
 passes over the queue, not bounded by a constant) and `history_gates_visited`
 count entries. `predicate_cpu_us` is thread CPU, and excludes mutex wait.
 `families_evaluated`, `attested_keys`, `attestations_evicted` and
 `runtime_heap_bytes` (retained shadow state after the page, excluding page
 transients) are gauges. `root_index_restarted`, `root_index_complete`,
-`root_index_overflowed`, `queued_roots_overflowed`, `history_gates_overflowed`
-and `cross_family_overflowed` are flags. At the top level, `shadow_decision_calls`
+`root_index_overflowed`, `queued_roots_overflowed` and `history_gates_overflowed`
+are flags. At the top level, `shadow_decision_calls`
 and `shadow_attest_micros` measure this page's equality attestation, and
 `attest_capped` counts Skips past the limit of 4,096 per page, not attested.
 
 **Zero and unavailable.** A zero count is a real zero for that page. An absent
 record means the page had no traversal state or was not Claude. Uniqueness is
 unavailable while `cost.root_index_complete` is false, and families then count
-`path_not_unique`, or `uniqueness_unknown` among child candidates.
+`path_not_unique`.
 
 ## Compressed Codex reader refusals
 
@@ -1402,67 +1380,62 @@ overwrite; backend authority rules independently govern successor acceptance.
 
 ### Money freshness (Claude queue and replay)
 
-`money_freshness` uses the existing family census skipped view and bounded
-`FirstPending` stamps. `money_freshness_alarm` carries the same aggregate payload
-when observed changed files remain positive across observed passes for **more
-than 21,600 seconds**. It includes unread count and age. These observations never
-select a file, release a hold, or change uploads. No transcript read or metadata
-stat is added. Codex and Pi are outside this Claude census adapter.
+The default-ON Claude shadow and freshness gauges share one
+`claude_family_census_shadow` emission. Gauges are flattened into
+`counts.pending_census_members`: the existing `oldest_age_s`, `over_24h`, `tracked`
+and `unqueued_unresolved` describe the bounded pending stamps; no duplicate
+oldest-skipped or skipped-tracked fields or second queue traversal is added.
+`count` includes queue/replay occurrences, while age thresholds count retained
+unique queued files. `tracked` also includes unresolved files no longer queued.
+All ages are process-local LOWER BOUNDS, never inputs to decisions.
 
-`skipped_tracked_files` counts unique stamped files in queue plus replay;
-`oldest_skipped_age_seconds` and `pending_over_24h_tracked_files` measure pending
-age, **not file mtime or time since last physical read**. A file without an indexed
-scan and outside replay contributes to `discovered_unread_tracked_files`,
-`oldest_discovered_unread_age_seconds` and
-`discovered_unread_over_24h_tracked_files`; indexed held work and replay contribute
-to `indexed_or_replay_tracked_files`. An index may be rebuilt or pruned, so
-"unread" here means no retained indexed scan, not proof of never having opened
-that physical file. A replay occurrence excludes that file from unread even if
-it also occurs in the queue. All ages are process-local lower bounds, reset on
-restart; `ages_are_process_local_lower_bounds` states this explicitly.
+A regular file `money_freshness_disabled` in the normal support directory turns
+BOTH the shadow and gauges OFF. Missing marker, directories and symlinks leave
+them ON. Policy is read once per process; restart after adding/removing the
+marker. OFF skips Touched allocation, equality attestation, page observation and
+metadata observation before any tracker mutex, clone or candidate decision. It
+emits neither shadow nor freshness data. The ordinary scan and skipped-file audit
+count continue unchanged. Fixtures use thread-local guards and never consult the
+host marker.
 
-`skipped_untracked_entries` and `discovered_unread_untracked_entries` disclose
-coverage lost at the existing 16,384-stamp bound. These are queue/replay entry
-counts, potentially overlapping, rather than invented unique-file counts.
-Tracked file counts and age thresholds are lower bounds on the full discovered
-population. Files outside the skipped view and directories not yet enumerated
-are not covered.
+`discovered_unread_tracked_files`, `oldest_discovered_unread_age_seconds` and
+`discovered_unread_over_24h_tracked_files` cover unindexed, non-replay queued work.
+Indexed or replay work is counted separately. No retained index is not proof a
+physical file has never been read. Queue/replay overlaps are deduplicated among
+retained stamps. `skipped_untracked_entries` and
+`discovered_unread_untracked_entries` disclose lost coverage at the existing
+16,384-stamp bound; they are occurrences, not invented distinct-file counts.
+Directories not yet enumerated and files outside the skipped view are uncovered.
 
-Size/mtime observations already available to selection update the metadata fields
-of an **existing** stamp. They do not admit new stamps or perform a stat.
-`changed_since_scan_files` and `unchanged_since_scan_files` compare those samples
-with the current indexed size and second/nanosecond mtime. A new key, an unindexed
-file, or a stamp without this pass's sample contributes to
-`changed_since_scan_unknown_files`, not unchanged. The first pending page can
-therefore have entirely unknown change coverage. `metadata_observed_files`
-reports sample coverage; `changed_since_scan_complete_count` is null when any
-tracked or untracked change coverage is unknown, including no prior scan.
+`changed_since_scan_files` and `unchanged_since_scan_files` compare metadata
+already observed on the opened candidate with indexed size and second/nanosecond
+mtime. No transcript read or extra candidate stat is added. Missing or stale
+samples and files without an indexed scan count as
+`changed_since_scan_unknown_files`; `changed_since_scan_complete_count` is null
+when coverage is incomplete. The first page may have only unknown coverage.
+These counters are folded into the existing FirstPending traversal and bounded
+stamp work, with no third queue pass or second map.
 
-The alarm tracks positive **observed** changed counts in this scope. Zero
-observed positives (including unknown-only passes), scope change, process restart
-or a backwards clock breaks continuity. A long interval between passes is not
-proof of uninterrupted filesystem state: the alarm describes sampled passes.
-`changed_episode_open`, `changed_episode_age_seconds` and `tracker_initialized`
-expose the episode boundary. The existing carrier provides `process_id`, so a
-log observer can correlate process changes with previously open episodes.
-`restart_started_with_open_condition` is a **proxy**, emitted once on the first
-completed observation per process/source/scope: 1 if that observation already has
-an observed changed-skipped count >0, otherwise 0. Later rows omit the field.
-The existing `process_id` and source on `money_freshness` let server/log readers
-sum these startup observations across restarts. This counts restarts that began
-with a positive observed condition; it does not prove the previous process had
-an open episode. A restart during a positive condition that clears before the
-first pass is not counted. Missing metadata on that first pass also cannot prove
-a positive condition. No prior logs or persisted episode state are read.
-A fixed process-local ledger remembers at most 64 scope hashes (1 KiB inline),
-including scopes switched away from, so returning to a scope never emits twice.
-A hash collision can suppress a new scope's count. If all slots are occupied,
-new scopes omit the proxy and set `restart_scope_tracking_full`; existing scopes
-still never re-emit. Scope hashes are never logged. The nested family-shadow row
-omits the freshness payload so the proxy appears on only one carrier row.
+`changed_over_6h_alarm` is true after observed changed positives on consecutive
+passes span **more than 21,600 seconds**; the same row includes unread count and
+age. There is no second alarm emission. Zero/unknown-only observations, scope
+reset, restart or clock rollback break the episode. Inter-pass continuity is a
+sampled condition, not proof of continuous filesystem state.
 
-Memory: the existing bounded stamp grows from 16 to 48 bytes (at most 512 KiB
-additional retained heap). It is included in `cost.runtime_heap_bytes` and the
-retained worst-case bound. Freshness adds at most 16 KiB transient dedup storage
-and one queue pass plus one bounded stamp pass. Enlarged stamp transients add at
-most 1.6 MiB during the existing stamp update. There is no second per-file map.
+The restart proxy is DERIVED server/log-side from this same emission:
+`tracker_initialized && changed_since_scan_files > 0`, correlated with its
+`process_id` and source. `tracker_initialized` is claimed by an independent
+process-wide atomic at completed emission, so it is true AT MOST ONCE per process.
+Tracker resets, index reloads, scope/path changes and kill-switch toggles never
+re-arm it. No per-scope ledger, restart_* payload field or persisted evidence is
+needed. This counts starts with an observed positive condition; it does not prove
+a prior episode. A positive condition cleared before the first completed pass,
+or hidden by unknown initial metadata, is not counted. A disabled process emits
+nothing and does not claim a first observation.
+
+Memory remains bounded by the existing 16,384 stamps (48 bytes each, +512 KiB
+versus the original shadow), accounted by runtime_heap_bytes and its retained
+bound. Classification is transient in the existing bounded heap/vector; there
+is no separate gauge dedup allocation or scope ledger. Enlarged stamp transients
+are conservatively bounded by an additional 4 MiB. No child-finalize eligibility
+measurement, dormant family-consumer API or money/read/census decision is added.

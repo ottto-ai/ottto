@@ -26723,11 +26723,12 @@ impl OwnedSourceScan {
             causes,
             ..ScanCensus::default()
         };
-        let claude_family_shadow = (source == SnapshotSource::ClaudeCode).then(|| {
-            Box::new(claude_family_census_shadow::Touched::from_paths(
-                pending_paths.iter().map(|pending| pending.path.as_path()),
-            ))
-        });
+        let claude_family_shadow =
+            (source == SnapshotSource::ClaudeCode && money_freshness::enabled()).then(|| {
+                Box::new(claude_family_census_shadow::Touched::from_paths(
+                    pending_paths.iter().map(|pending| pending.path.as_path()),
+                ))
+            });
         let codex_selected_flags =
             if source == SnapshotSource::Codex || index.file_upload_context_enabled {
                 pending_paths
@@ -31285,7 +31286,7 @@ impl OwnedSourceScan {
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
                 // E7-8a: count-only per-family completion, from the page's
                 // settled state before any terminal effect. Acts on nothing.
-                if source == SnapshotSource::ClaudeCode {
+                if source == SnapshotSource::ClaudeCode && money_freshness::enabled() {
                     claude_family_census_shadow::observe_page(
                         index,
                         &claude_family_shadow,
@@ -31442,8 +31443,13 @@ impl OwnedSourceScan {
                     })
                     .unwrap_or_default()
                     .saturating_add(index.claude_stale_family_carry.replay.len());
-                let skipped_file_count_due_to_limit =
-                    claude_family_census_shadow::skipped_census_member_count(index);
+                let skipped_file_count_due_to_limit = index
+                    .traversal
+                    .iter()
+                    .flat_map(|traversal| traversal.pending_candidates.iter())
+                    .filter(|path| path.census_member)
+                    .count()
+                    + index.claude_stale_family_carry.replay.len();
                 let restart_after_hints =
                     traversal_discovery_done && traversal_healthy && !clean_frozen_generation;
                 let terminal_unhealthy = traversal_discovery_done && !traversal_healthy;
@@ -31836,9 +31842,6 @@ impl OwnedSourceScan {
                     terminal_native_traversal,
                 });
             };
-            if source == SnapshotSource::ClaudeCode {
-                claude_family_census_shadow::observe_freshness_metadata(&candidate, &sampling);
-            }
             // Reject budget debt before opening/constructing any body parser.
             // Requeue the original census membership; absence/completion stays owed.
             if index.context_only_read(&candidate)
@@ -31923,7 +31926,7 @@ impl OwnedSourceScan {
             if verification_rescue {
                 sampled_audit::progress_opened(index, &rescue_key);
             }
-            if source == SnapshotSource::ClaudeCode {
+            if source == SnapshotSource::ClaudeCode && money_freshness::enabled() {
                 claude_family_census_shadow::observe_freshness_metadata(&candidate, &sampling);
             }
             if preflight_source_file_fingerprint
@@ -32272,7 +32275,10 @@ impl OwnedSourceScan {
                     }
                     // E7-8a: the ordinary equality Skip attests this revision
                     // for the shadow family census. Counts only.
-                    if source == SnapshotSource::ClaudeCode && parse_reason.is_none() {
+                    if source == SnapshotSource::ClaudeCode
+                        && parse_reason.is_none()
+                        && money_freshness::enabled()
+                    {
                         claude_family_census_shadow::attest_equality_skip(
                             index, &candidate, &sampling, audit_now,
                         );

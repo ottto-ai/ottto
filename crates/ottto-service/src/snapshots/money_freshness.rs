@@ -1,19 +1,19 @@
 //! Count-only Claude freshness, using the existing queue/replay and bounded
-//! FirstPending stamps. Never grants a read, alters a hold, or performs I/O.
-use super::{claude_family_census_shadow as shadow, CandidateFile, ScanIndex};
+//! FirstPending stamps. Tracking never grants a read, alters a hold or performs
+//! I/O; startup policy probes only its support-directory sentinel once.
+use super::CandidateFile;
 use serde::Serialize;
 
-const DAY: u64 = 24 * 60 * 60;
 const ALARM_AFTER: u64 = 6 * 60 * 60;
 
 /// Extra fields in the existing bounded stamp, not another per-file map.
 /// An epoch binds the observation to this page; older observations are unknown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Metadata {
-    epoch: u64,
-    size: u64,
-    seconds: u64,
-    nanos: u64,
+    pub(super) epoch: u64,
+    pub(super) size: u64,
+    pub(super) seconds: u64,
+    pub(super) nanos: u64,
 }
 impl Metadata {
     pub(super) fn new(candidate: &CandidateFile, epoch: u64) -> Self {
@@ -29,12 +29,7 @@ impl Metadata {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub(super) struct Counts {
     pub(super) ages_are_process_local_lower_bounds: bool,
-    /// Unique stamped files in queue + replay. Unstamped entry multiplicity
-    /// is unknown: report it separately rather than invent a distinct count.
-    pub(super) skipped_tracked_files: u64,
     pub(super) skipped_untracked_entries: u64,
-    pub(super) oldest_skipped_age_seconds: u64,
-    pub(super) pending_over_24h_tracked_files: u64,
     /// No indexed scan and not a replay: separate from indexed held work.
     pub(super) discovered_unread_tracked_files: u64,
     pub(super) discovered_unread_untracked_entries: u64,
@@ -52,82 +47,6 @@ pub(super) struct Counts {
     pub(super) changed_episode_age_seconds: u64,
     pub(super) changed_over_6h_alarm: bool,
     pub(super) tracker_initialized: bool,
-    /// Startup-condition proxy, emitted on the first completed observation
-    /// of this process/source/scope only. It does not prove a prior episode.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) restart_started_with_open_condition: Option<u64>,
-    pub(super) restart_scope_tracking_full: bool,
-}
-
-/// One queue pass plus one bit per EXISTING stamp. O(queue × log(stamps)),
-/// <=16,384 bytes of transient dedup state; zero stat/open/read calls.
-pub(super) fn measure(
-    index: &ScanIndex,
-    stamps: &shadow::FirstPending,
-    epoch: u64,
-    now: u64,
-) -> Counts {
-    let mut row = Counts {
-        ages_are_process_local_lower_bounds: true,
-        ..Counts::default()
-    };
-    let mut seen = vec![0_u8; stamps.len()];
-    for entry in shadow::skipped_view(index) {
-        let key = entry.path.path.to_string_lossy();
-        let indexed = index.files.get(key.as_ref());
-        let unread = indexed.is_none() && !entry.replay;
-        let hash = shadow::hash64(entry.path.path.as_os_str().as_encoded_bytes());
-        let Some((position, since, metadata)) = stamps.stamp(hash) else {
-            row.skipped_untracked_entries += 1;
-            row.discovered_unread_untracked_entries += u64::from(unread);
-            continue;
-        };
-        if seen[position] != 0 {
-            // A replay occurrence proves this is not never-read work even
-            // when the queue occurrence came first and its index was dropped.
-            if entry.replay {
-                seen[position] = 2;
-            }
-            continue;
-        }
-        seen[position] = if unread { 1 } else { 2 };
-        row.skipped_tracked_files += 1;
-        let age = now.saturating_sub(since);
-        row.oldest_skipped_age_seconds = row.oldest_skipped_age_seconds.max(age);
-        row.pending_over_24h_tracked_files += u64::from(age > DAY);
-        if metadata.epoch == epoch {
-            row.metadata_observed_files += 1;
-        }
-        if let Some(indexed) = indexed.filter(|_| metadata.epoch == epoch) {
-            let changed = indexed.size_bytes != metadata.size
-                || indexed.modified_unix_seconds != metadata.seconds
-                || indexed
-                    .modified_unix_nanos
-                    .is_some_and(|nanos| nanos != metadata.nanos);
-            row.changed_since_scan_files += u64::from(changed);
-            row.unchanged_since_scan_files += u64::from(!changed);
-        } else {
-            // Includes unindexed files: no last scan to compare against.
-            row.changed_since_scan_unknown_files += 1;
-        }
-    }
-    for (position, kind) in seen.iter().enumerate() {
-        match kind {
-            1 => {
-                let age = now.saturating_sub(stamps.since_at(position));
-                row.discovered_unread_tracked_files += 1;
-                row.oldest_discovered_unread_age_seconds =
-                    row.oldest_discovered_unread_age_seconds.max(age);
-                row.discovered_unread_over_24h_tracked_files += u64::from(age > DAY);
-            }
-            2 => row.indexed_or_replay_tracked_files += 1,
-            _ => {}
-        }
-    }
-    row.changed_since_scan_complete_count = (row.changed_since_scan_unknown_files == 0
-        && row.skipped_untracked_entries == 0)
-        .then_some(row.changed_since_scan_files);
-    row
 }
 
 /// Scalar state in the existing scope-local shadow runtime. Restart, scope
@@ -146,7 +65,6 @@ impl Episode {
     }
 
     pub(super) fn update(&mut self, row: &mut Counts, now: u64) {
-        row.tracker_initialized = self.last.is_none();
         if self.last.is_some_and(|last| now < last) {
             self.since = None;
         }
@@ -162,62 +80,58 @@ impl Episode {
     }
 }
 
-/// Fixed process-local scope ledger, not a per-file map. Keep it outside
-/// Runtime so switching away from a scope and back cannot count it twice.
-/// Hash collisions or exhausted coverage can suppress a count, never duplicate it.
-struct ScopeStarts {
-    scopes: [Option<u64>; 64],
-}
-impl ScopeStarts {
-    const fn new() -> Self {
-        Self { scopes: [None; 64] }
+/// Claimed only at a completed emission. No tracker/scope/policy owns or
+/// resets this process-wide bit; Relaxed swap gives exactly one true caller.
+pub(super) fn first_observation() -> bool {
+    #[cfg(not(test))]
+    {
+        static OBSERVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        !OBSERVED.swap(true, std::sync::atomic::Ordering::Relaxed)
     }
-
-    fn observe(&mut self, scope: u64, row: &mut Counts) {
-        row.restart_started_with_open_condition = None;
-        row.restart_scope_tracking_full = false;
-        if self.scopes.contains(&Some(scope)) {
-            return;
-        }
-        if let Some(slot) = self.scopes.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(scope);
-            row.restart_started_with_open_condition =
-                Some(u64::from(row.changed_since_scan_files > 0));
-        } else {
-            row.restart_scope_tracking_full = true;
-        }
-    }
+    #[cfg(test)]
+    FIRST_OBSERVED.with(|seen| !seen.replace(true))
 }
-
-#[cfg(not(test))]
-static STARTS: std::sync::Mutex<ScopeStarts> = std::sync::Mutex::new(ScopeStarts::new());
 #[cfg(test)]
 thread_local! {
-    static STARTS: std::cell::RefCell<ScopeStarts> = const { std::cell::RefCell::new(ScopeStarts::new()) };
-}
-
-pub(super) fn observe_start(scope: &str, row: &mut Counts) {
-    let scope = shadow::hash64(scope.as_bytes());
-    #[cfg(not(test))]
-    STARTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .observe(scope, row);
-    #[cfg(test)]
-    STARTS.with(|starts| starts.borrow_mut().observe(scope, row));
-}
-
-pub(super) fn emit(row: &Counts) {
-    crate::local_resource_diagnostics::traversal_point("money_freshness", "claude_code", row);
-    if row.changed_over_6h_alarm {
-        crate::local_resource_diagnostics::traversal_point(
-            "money_freshness_alarm",
-            "claude_code",
-            row,
-        );
-    }
+    static FIRST_OBSERVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
 #[path = "money_freshness_tests.rs"]
 mod tests;
+
+/// Default ON, sampled once per process like restart_restore/#899 policy.
+pub(super) fn enabled() -> bool {
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| enabled_at(&ottto_core::default_support_dir()))
+    }
+    #[cfg(test)]
+    ENABLED.with(std::cell::Cell::get)
+}
+fn enabled_at(support: &std::path::Path) -> bool {
+    !std::fs::symlink_metadata(support.join("money_freshness_disabled"))
+        .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+}
+#[cfg(test)]
+thread_local! {
+    static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+#[cfg(test)]
+pub(super) struct DisabledForTest(bool, std::marker::PhantomData<std::rc::Rc<()>>);
+#[cfg(test)]
+impl DisabledForTest {
+    pub(super) fn new() -> Self {
+        Self(
+            ENABLED.with(|slot| slot.replace(false)),
+            std::marker::PhantomData,
+        )
+    }
+}
+#[cfg(test)]
+impl Drop for DisabledForTest {
+    fn drop(&mut self) {
+        ENABLED.with(|slot| slot.set(self.0));
+    }
+}
