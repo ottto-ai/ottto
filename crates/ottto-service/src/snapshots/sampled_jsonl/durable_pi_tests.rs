@@ -37,7 +37,7 @@ fn ledger() -> BTreeMap<String, PiUsageDedupState> {
 
 fn reduction(keys: BTreeMap<String, PiUsageDedupState>) -> CachedJsonlReduction {
     let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Pi);
-    accumulator.seen_pi_usage_keys = keys;
+    *accumulator.seen_pi_usage_keys = keys;
     CachedJsonlReduction {
         accumulator,
         report: JsonlReadReport::default(),

@@ -40,7 +40,7 @@ pub(in crate::snapshots) fn put_body(
     if acc.source != SnapshotSource::Pi {
         return Err(Refuse::NotRederivable("SnapshotAccumulator.source"));
     }
-    let keys = &acc.seen_pi_usage_keys;
+    let keys = acc.seen_pi_usage_keys.usage_keys();
     if keys.len() > PI_LEDGER_MAX_KEYS {
         // Not an E field: only this static class leaves the codec.
         return Err(Refuse::NonEmpty(PI_LEDGER_CAP));
@@ -83,7 +83,7 @@ pub(crate) fn take_body(d: &mut Dec<'_>) -> Result<Decoded, Corrupt> {
     if reduction.accumulator.source != SnapshotSource::Pi {
         return Err(Corrupt);
     }
-    reduction.accumulator.seen_pi_usage_keys = take_ledger(d)?;
+    *reduction.accumulator.seen_pi_usage_keys = take_ledger(d)?;
     d.refilled_section();
     d.ended()?;
     Ok(Decoded {

@@ -18167,7 +18167,7 @@ struct SnapshotAccumulator {
     // repeated same-shape occurrences remain distinct. Keeping the multiset is
     // required because transitional writers may reuse one response id for more
     // than one paired occurrence.
-    seen_pi_usage_keys: BTreeMap<String, PiUsageDedupState>,
+    seen_pi_usage_keys: PiLedger,
     // Positive usage observations deliberately refused because their activity
     // timestamp could not produce a truthful hourly bucket.
     dropped_usage_record_count: u64,
@@ -18383,7 +18383,7 @@ impl SnapshotAccumulator {
             claude_money: None,
             tool_usage_counts: BTreeMap::new(),
             tool_usage_truncated: false,
-            seen_pi_usage_keys: BTreeMap::new(),
+            seen_pi_usage_keys: PiLedger::default(),
             dropped_usage_record_count: 0,
             claude_last_user_ts: None,
             peak_context_fill_tokens: 0,
@@ -41148,7 +41148,7 @@ enum PiUsageRecordShape {
 }
 
 #[derive(Debug, Clone, Default)]
-struct PiUsageDedupState {
+pub(crate) struct PiUsageDedupState {
     message: BTreeMap<String, usize>,
     message_end: BTreeMap<String, usize>,
     paired_digests: BTreeSet<String>,
@@ -41190,6 +41190,44 @@ impl PiUsageDedupState {
                     .chain(self.message_end.keys())
                     .any(|digest| !self.paired_digests.contains(digest)))
     }
+}
+
+/// The accumulator's Pi-only state: the usage dedup ledger. A labelled `E`
+/// field (`durable_tail_codec::PI_ONLY_E_LABELS`): Claude and Codex leave it
+/// empty and never persist it; Pi persists it only in the Pi record section.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PiLedger {
+    usage_keys: BTreeMap<String, PiUsageDedupState>,
+}
+
+impl PiLedger {
+    pub(crate) fn usage_keys(&self) -> &BTreeMap<String, PiUsageDedupState> {
+        &self.usage_keys
+    }
+}
+
+impl std::ops::Deref for PiLedger {
+    type Target = BTreeMap<String, PiUsageDedupState>;
+    fn deref(&self) -> &Self::Target {
+        &self.usage_keys
+    }
+}
+
+impl std::ops::DerefMut for PiLedger {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.usage_keys
+    }
+}
+
+impl crate::durable_tail_codec::DurableEmpty for PiLedger {
+    fn durable_empty(&self) -> bool {
+        self.usage_keys.is_empty()
+    }
+}
+
+impl crate::durable_tail_codec::PiOnlyDurable for PiLedger {
+    const FIELD: &'static str = "SnapshotAccumulator.seen_pi_usage_keys";
+    type Label = BTreeMap<String, PiUsageDedupState>;
 }
 
 fn pi_ms_timestamp(value: Option<&Value>) -> Option<String> {
@@ -94924,6 +94962,7 @@ crate::heap_layout_bound::fields!(OwnedJsonlParser; pending_taken, pending_retur
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_publication, native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
+crate::heap_layout_bound::fields!(PiLedger; usage_keys);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {
     U model: String,
@@ -95164,7 +95203,7 @@ crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
     E claude_money: Option<Box<claude_request_money::e2::FileFold>>,
     U tool_usage_counts: BTreeMap<String, u64>,
     N tool_usage_truncated: bool,
-    E seen_pi_usage_keys: BTreeMap<String, PiUsageDedupState>,
+    E seen_pi_usage_keys: PiLedger as BTreeMap<String, PiUsageDedupState>,
     N dropped_usage_record_count: u64,
     N claude_last_user_ts: Option<String>,
     N peak_context_fill_tokens: u64,
