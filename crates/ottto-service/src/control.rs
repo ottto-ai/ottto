@@ -27445,6 +27445,14 @@ for line in sys.stdin:
             .open(record)
             .unwrap();
         file.write_all(&body).unwrap();
+        // F8: the support collector must also omit transient replay input,
+        // including raw-value magic keys and malformed-selector material.
+        std::fs::write(support.join("bounded-replay-private.jsonl"), format!(
+            "{{\"$serde_json::private::RawValue\":\"{CANARY}\"}}\n{{\"selector\":{{\"model\":[\"{CANARY}\"]}},\"content\":\"{CANARY}\"}}\n"
+        )).unwrap();
+        let canaries =
+            crate::snapshots::test_replay_privacy_artifacts(&support.join("bounded-replay-input"));
+        assert_eq!(canaries[0], CANARY);
         CANARY
     }
 
@@ -27480,6 +27488,13 @@ for line in sys.stdin:
         assert!(response.ok, "{response:?}");
         let payload = response.payload.expect("payload");
         assert!(!serde_json::to_string(&payload).unwrap().contains(canary));
+        for private in [
+            "PRIVATE_REPLAY_HEAD_CANARY_20261030",
+            "PRIVATE_REPLAY_PROMPT_CANARY_20261030",
+            "PRIVATE_REPLAY_LABEL_CANARY_20261030",
+        ] {
+            assert!(!serde_json::to_string(&payload).unwrap().contains(private));
+        }
         assert!(payload
             .get("bundle_id")
             .and_then(|value| value.as_str())
@@ -27651,6 +27666,14 @@ for line in sys.stdin:
         assert!(body.contains("\"support_claim_provided\":true"));
         assert!(!body.contains("support_123"));
         assert!(!body.contains(canary));
+        for private in [
+            "PRIVATE_REPLAY_HEAD_CANARY_20261030",
+            "PRIVATE_REPLAY_PROMPT_CANARY_20261030",
+            "PRIVATE_REPLAY_LABEL_CANARY_20261030",
+        ] {
+            assert!(!body.contains(private));
+            assert!(!payload_json.contains(private));
+        }
         assert!(!payload_json.contains(canary));
     }
 

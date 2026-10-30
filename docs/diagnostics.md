@@ -1356,13 +1356,92 @@ the same cause with a `near_cap` annotation. Source caps predate this path:
 512 MiB Claude, 256 MiB Pi, 2 GiB Codex. Above the cap the existing oversized-file
 rejection/disclosure still applies; near-cap admission does not expand it.
 
-Workspace re-derivation captures at most 4096 bytes per selected field and
-requires the original digest. Unsupported first-prompt, title, agent-label
-and session-start obligations remain `rederive_unfunded`. Capture/hash/read
-refusals are counted as `not_rederived`; no altered value is published.
-`rederive_input_bytes` counts each actual physical read, including bytes read
-before a later capture/hash refusal. Success receipts count successful restores
-separately; do not add the two byte counters together.
+With restart restore enabled, content re-derivation runs only after growth
+past the committed extent. Quiet files return Pending before certificate samples
+or content input. Grown files validate the existing certificate samples before
+any decode, support, pacing or allocation refusal, so those refusals cannot hide
+prefix edits. The native M1 route remains active when the switch is OFF.
+
+The replay reads at most a 1 MiB head and one title line of at most 1 MiB.
+An enforced seeded JSON builder admits at most 8,388,608 bytes of Value-owned
+requested allocations per line, prepaid on the existing active lease. Decoded
+raw-value magic keys refuse to the counted growth Full; no partial parse is
+adopted. Shared native content helpers rebuild the projection, and all recorded
+content digests must match before any fields move. `rederive_fence_mismatch`
+is an alarm: any nonzero value needs investigation. No content enters diagnostics.
+
+`rederive_head_reads` and `rederive_head_bytes` are process totals; the latter
+includes title input and partial reads. Use daily byte deltas for replay cost.
+`rederive_line_peak_bytes` records exact metered line high-water, alongside the
+active-lease high-water (which survives refunds) and stage footprint samples.
+`rederive_refused` counts failures after input by content class.
+`rederive_unsupported` names fixed boundary/mark/title refusal classes.
+`resource_full.decode` keeps decode refusals separate from certificate edits.
+Success receipts count successful restores separately from physical input;
+do not add the two byte counters together.
+
+A replay attempt is remembered by predecessor extent, not exact generation.
+A new extent resets only the head attempt; the cross-cause Full spend remains.
+Re-derive failures take at most one growth Full per key per six hours, plus at
+most one extra near the source cap, counted `rederive_failure_full.near_cap`.
+This exception avoids losing discovery when a held file grows beyond its source
+cap. Budget contention waits without a Full; after six hours its counted
+`rederive_budget_aged` fallback uses the same Full pacing. The paid pace map's
+overflow permits at most one extra head per evicted extent and alarms
+`pace_evicted`. Discovery custody survives pace eviction independently.
+
+Fence and certificate-edit retirement is bound to a verified predecessor.
+`rederive_retire.{retired,superseded,retry}` describes writer outcomes; missing
+binding authority is counted as `rederive_retire_unproven` or
+`rederive_retire_unfunded` and never grants deletion. Unlink's directory-sync
+obligation survives an absent path and is retried at saves. Pending receipts
+and unknown survivors remain protected. Retirement never creates an ACK.
+Missing retirement authority also emits `retire_exact_held{edge}`, where `edge`
+is `metadata`, `accepted_object`, `independent_edit` or `scoped_certificate`.
+The predecessor and discovery hold remain. `retire_exact_held_exit` names an
+existing exit: `revalidated_retire_exact` means a later eligible verified read
+can reacquire the witness for the post-save writer; `native_replacement_receipt`
+means a later native acquisition must commit its exact replacement receipt
+(`receipt_acquisition`/`discharge_owed`, which release restore-pending discovery).
+Conflicting retained predecessors also require their existing writer/receipt
+settlement before another witness can be installed. A failed stat/read is never
+proven absence; unlink's pending directory sync stays in key custody.
+
+`retire_exact_held_first_attempt{source}` is a **process proxy**, emitted with
+`process_id` on the same per-source pass carrier. It counts keys whose first
+retirement attempt in this process lacked authority; a first success followed
+by a later hold does not count. It resets on restart and stores no restart
+streak. Alarm on the server/log side when this proxy is non-zero across more
+than three consecutive starts. It cannot identify a repeated key. If a first
+observation cannot be funded or is reclaimed, the process latches
+`retire_exact_first_attempt_tracking_closed` and stops enrolling first attempts;
+the cumulative total is then a lower bound and a returning key cannot count
+twice. These observations use the existing bounded key custody and do not
+change any persisted format.
+Claude's accepted-floor hold reports `restored_behind_accepted.held` at its
+actual decision edges. The discovery dependency continues to hard-gate the
+production switch; RAM pacing does not establish restart-persistent bounds.
+Codex and Pi report `restored_behind_accepted.published` only when a complete
+restored Tail body below the frozen accepted extent reaches publication.
+
+`rederive_failed_first_attempt{source}` and `restore_pending_quiet{source}` are
+**proxies**, emitted once per source pass as cumulative process totals on the
+existing `durable_tail_alarm` carrier with `process_id`. The first counts keys
+whose first eligible non-quiet (b) restore attempt in this process failed, including
+a fence drop; later failures of the same key do not increment it, and a first
+success followed by failure does not count. Its diagnostic marker shares the
+bounded key custody. Under capacity pressure, idle diagnostic observations and
+expired pacing can be reclaimed; live receipt, discovery and retirement custody
+remain protected. If any first-result marker is forgotten or cannot be funded,
+`rederive_first_attempt_tracking_closed` latches true and no more first results
+are enrolled for this process. The first-failure total is then a lower bound;
+returning keys cannot be counted twice, and diagnostics cannot pin write capacity. The quiet proxy
+counts metadata-only restores returning Pending with zero transcript input.
+It does not decode obligations and cannot establish `pending_no_obligation`.
+Neither proxy measures a per-key restart streak. Compare process totals using
+`process_id`; they reset on restart and carry no key identity. Full-spend time
+and near-cap use for funded keys also live in key custody, so evicting the paid
+pace node cannot renew either allowance.
 
 ## Codex state-only identity coverage
 

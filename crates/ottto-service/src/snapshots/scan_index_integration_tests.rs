@@ -608,6 +608,7 @@ fn recovery_emission_boundaries(
     scan.snapshots = items;
     scan.census_complete = true;
     scan.pending_finalization.push(PendingIndexFinalization {
+        restored_behind_accepted: false,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: "synthetic-file".into(),
@@ -815,4 +816,54 @@ fn integrated_no_store_true_first_install_still_initializes_without_transcript_r
     assert!(reads.is_empty());
     let observations = crate::local_resource_diagnostics::take_scan_index_storage_observations();
     assert_eq!(observations.iter().map(|(_, _, n)| n).sum::<u64>(), 0);
+}
+
+// F10: count surviving complete offers at the real post-policy finalizer.
+// Parser completion and an equal body suppressed as a semantic noop are not
+// publication. This runs portably; production Pi registration remains E5's.
+#[test]
+fn restored_behind_accepted_publication_waits_for_policy_and_noop_suppression() {
+    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
+        for complete in [false, true] {
+            for equal in [false, true] {
+                let mut item = cache_adapter_tests::cache_fixture_item();
+                item.snapshot_fingerprint = snapshot_fingerprint(source, &item);
+                let file = item.source_file_fingerprint.clone().unwrap();
+                let entities = BTreeSet::from([item.snapshot_fingerprint.clone()]);
+                let witnesses = BTreeSet::from([snapshot_upload_body_witness(&item)]);
+                let mut index = ScanIndex::default();
+                let mut scan = SourceScanResult::empty(source);
+                scan.snapshots.push(item);
+                scan.pending_finalization.push(PendingIndexFinalization {
+                    restored_behind_accepted: true,
+                    sampled_audit_verified: false,
+                    codex_pending_recovery: false,
+                    index_key: "synthetic-finalized-replay".into(),
+                    source_file_fingerprint: file,
+                    previous_snapshot_fingerprint: equal
+                        .then(|| snapshot_file_entity_set_hex(&entities)),
+                    previous_upload_body_witness: equal
+                        .then(|| snapshot_file_upload_body_set_hex(&witnesses)),
+                    parse_complete: complete,
+                    diagnostic_reason: FileReason::Complete,
+                    parsed_snapshot_count: 1,
+                    effective_upload_body_witness_revision: 0,
+                });
+                let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+                    finalize_scan_after_policy(source, &mut scan, &mut index)
+                });
+                let published: u64 = rows
+                    .iter()
+                    .filter_map(|row| {
+                        row["counts"]["restored_behind_accepted"]["published"].as_u64()
+                    })
+                    .sum();
+                assert_eq!(
+                    published,
+                    u64::from(complete && !equal),
+                    "{source:?}/{complete}/{equal}"
+                );
+            }
+        }
+    }
 }

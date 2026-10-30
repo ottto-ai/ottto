@@ -6931,6 +6931,7 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
         index.extend_codex_blocked_attribution(&index_key, blocked);
     }
     targets.pending_finalization.push(PendingIndexFinalization {
+        restored_behind_accepted: false,
         sampled_audit_verified: false,
         codex_pending_recovery: index
             .files

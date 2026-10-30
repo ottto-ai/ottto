@@ -5,9 +5,9 @@
 //! The body holds the allowlisted fields (`N`/`H`/`U`/`L`/`PL`, see
 //! `durable_tail_codec`) and, for each re-derived content field, the digest of
 //! its value. The marks (`DurableMarks`, `SessionStartState::content_end`) say
-//! where in the file each was last assigned. Production restore funds the
-//! bounded typed workspace extractor before input. Other content obligations
-//! still refuse before input. Empty obligations move the paid decoded graph.
+//! where in the file each was last assigned. Growth-only M3 restore prepays a
+//! bounded native content replay and fences every X field before adoption.
+//! Empty obligations move the paid decoded graph.
 //! The native parser also serves the default-OFF M1 warm-restore route.
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -22,6 +22,8 @@ use crate::durable_tail_codec::{Corrupt, Dec, Durable, Enc, Refuse, Shape};
 /// Head re-parse bound for re-derived first-write-wins fields (Amendment 1,
 /// C-4).
 pub(crate) const HEAD_BOUND: u64 = 1024 * 1024;
+/// Runtime bound only: outside the persisted allowlist digest.
+pub(crate) const TITLE_LINE_BOUND: u64 = 1024 * 1024;
 
 /// At most this many named lines are pread per entry (Amendment 1). M1 uses
 /// one: the title.
@@ -371,6 +373,25 @@ pub(crate) struct RederiveReceipt {
 }
 
 impl Decoded {
+    /// Persist a deliberately inconsistent H in an otherwise native fixture.
+    #[cfg(test)]
+    pub(in crate::snapshots) fn test_fence_body(mut self, class: usize) -> Vec<u8> {
+        let digest = match class {
+            0 => &mut self.rederive.first_prompt,
+            1 => &mut self.rederive.title,
+            2 => &mut self.rederive.agent_label,
+            3 => &mut self.rederive.session_start,
+            4 => &mut self.rederive.workspace,
+            _ => unreachable!(),
+        };
+        *digest = Some([0; 32]);
+        Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
+            self.reduction.put(e)?;
+            self.rederive.put(e)
+        })
+        .unwrap()
+    }
+
     pub(in crate::snapshots) fn permits_skill_labels(&self, enabled: bool) -> bool {
         enabled
             || self.reduction.accumulator.provider_skills.is_empty()
@@ -389,6 +410,8 @@ impl SnapshotAccumulator {
         self.codex_counting.as_deref().map(|c| c.durable_contract())
     }
 }
+#[cfg(unix)]
+mod bounded_value;
 #[cfg(unix)]
 mod content;
 
@@ -608,6 +631,20 @@ pub(crate) fn rederive_parser(
 mod tests;
 
 #[cfg(test)]
+pub(crate) fn test_replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
+    tests::replay_privacy_artifacts(root)
+}
+
+#[cfg(test)]
+pub(in crate::snapshots) fn test_finish_items(
+    parser: OwnedJsonlParser,
+    path: &Path,
+    source: SnapshotSource,
+) -> Value {
+    tests::items(parser, path, source)
+}
+
+#[cfg(test)]
 pub(crate) fn store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -> Vec<u8> {
     let reduction = CachedJsonlReduction {
         accumulator: SnapshotAccumulator::new(source),
@@ -642,3 +679,31 @@ pub(crate) fn store_skill_fixture_body() -> Vec<u8> {
     )
     .unwrap()
 }
+
+/// Exercise the real encoding, scratch replay, hash fence and content adoption
+/// with an independently owned accumulator from the frozen admission oracle.
+#[cfg(test)]
+pub(in crate::snapshots) fn test_rederive_codex_accumulator(
+    accumulator: &SnapshotAccumulator,
+    file: &File,
+    corrupt_prompt_fence: bool,
+) -> Result<SnapshotAccumulator, Refuse> {
+    let reduction = CachedJsonlReduction {
+        accumulator: accumulator.clone(),
+        report: JsonlReadReport::default(),
+        recognized_usage_drop_count: 0,
+        positive_recognized_usage_count: 0,
+        positive_usage_evidence: false,
+    };
+    let body = encode(&reduction, 16 * 1024 * 1024, 1024 * 1024)?;
+    let decoded = decode(&body, SnapshotSource::Codex).expect("fixture decode");
+    let decoded = if corrupt_prompt_fence {
+        decode(&decoded.test_fence_body(0), SnapshotSource::Codex).expect("fence fixture")
+    } else {
+        decoded
+    };
+    decoded.rederive_content(file).map(|(r, _)| r.accumulator)
+}
+
+#[cfg(test)]
+pub(in crate::snapshots) use content::test_codex_content_scratch;

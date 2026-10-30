@@ -96,7 +96,8 @@ pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 256
 /// M3 per-key maps outside the A0-h custody node, each with its own prepaid
 /// capacity of `MAX_RECORDS` nodes (plus the retained root) of <=1024 bytes:
 /// the receipt-debt/D3-hold map (`owed::KeyDebt`) and the P1-1 restore-pending
-/// map. Neither evicts; each overflow fails toward its existing safe path.
+/// map. Neither evicts live custody; debt pressure can reclaim idle diagnostics
+/// and expired pacing. Live-capacity overflow keeps the existing safe path.
 pub(crate) const KEY_RESERVE_BYTES: usize = 2 * (store::MAX_RECORDS + 1) * 1024;
 const _: () = assert!(KEY_RESERVE_BYTES == 526_336);
 
@@ -112,7 +113,7 @@ const RESTORE_PENDING_KEYS: usize = store::MAX_RECORDS;
 /// Past it a restore takes the existing counted, paced resource path.
 const REDERIVE_PASS_BYTES: u64 =
     2 * crate::transcript_acquisition::SAMPLE_BYTES as u64 * store::MAX_RECORDS as u64;
-const _: () = assert!(REDERIVE_PASS_BYTES >= codec::HEAD_BOUND);
+const _: () = assert!(REDERIVE_PASS_BYTES >= codec::HEAD_BOUND + codec::TITLE_LINE_BOUND);
 
 #[cfg(test)]
 thread_local! {
@@ -134,6 +135,9 @@ const _: () = assert!(RECOVERY_PACE_SECONDS < 24 * 3600);
 /// miss only, so the census pass line reports it beside the guard's own
 /// counters (SOURCE N1).
 static REDERIVE_HEAD_BYTES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static REDERIVE_HEAD_READS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static REDERIVE_LINE_PEAK: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static REDERIVE_FENCE: [[AtomicU64; 5]; 3] = [const { [const { AtomicU64::new(0) }; 5] }; 3];
 // Diagnostic-only fixed storage: no keys, allocation, admission or new cause.
 // Order matches the summary label, not any persisted/source-admission enum.
 static REDERIVE_REFUSED: [[AtomicU64; 5]; 3] = [const { [const { AtomicU64::new(0) }; 5] }; 3];
@@ -159,6 +163,35 @@ pub(in crate::snapshots) fn record_rederive_refused(source: SnapshotSource, clas
     }
 }
 
+/// Only an actual restored Tail may report this disposition. The extent is
+/// frozen at native preparation, before index mutations or later appends.
+pub(in crate::snapshots) fn restored_tail_below_accepted(
+    source: SnapshotSource,
+    restored: bool,
+    mode: crate::transcript_acquisition::ReadMode,
+    frozen: Option<u64>,
+    accepted: Option<u64>,
+) -> bool {
+    restart_restore::enabled()
+        && matches!(source, SnapshotSource::Codex | SnapshotSource::Pi)
+        && restored
+        && mode == crate::transcript_acquisition::ReadMode::Tail
+        && frozen.zip(accepted).is_some_and(|(end, floor)| end < floor)
+}
+
+pub(in crate::snapshots) fn record_restored_publication(
+    source: SnapshotSource,
+    behind: bool,
+    published: bool,
+) {
+    if behind && published {
+        crate::local_resource_diagnostics::durable_tail_alarm(
+            source.api_slug(),
+            &serde_json::json!({"restored_behind_accepted":{"published":1}}),
+        );
+    }
+}
+
 /// Native consumed input, not certificate samples or BufReader readahead.
 /// Call after each step, including partial/error steps, using its actual plan.
 /// Rederive head input has its own pread observer and is never counted twice.
@@ -180,6 +213,29 @@ pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
     REDERIVE_HEAD_BYTES[diagnostic_source_slot(source)].load(Ordering::Relaxed)
 }
 
+#[cfg(test)]
+thread_local! { static REDERIVE_READ_CALLS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(in crate::snapshots) fn record_rederive_read_call() {
+    REDERIVE_READ_CALLS.with(|count| {
+        if let Some(n) = count.get() {
+            count.set(Some(n + 1));
+        }
+    });
+}
+#[cfg(test)]
+pub(in crate::snapshots) fn capture_rederive_reads<T>(run: impl FnOnce() -> T) -> (T, u64) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REDERIVE_READ_CALLS.set(None);
+        }
+    }
+    assert!(REDERIVE_READ_CALLS.replace(Some(0)).is_none());
+    let _reset = Reset;
+    let result = run();
+    (result, REDERIVE_READ_CALLS.get().unwrap())
+}
 /// Actual physical class-X bytes, including a later capture/hash refusal.
 /// The success receipt is separate; never hide input behind a refusal label.
 pub(in crate::snapshots) fn record_rederive_input(source: SnapshotSource, bytes: u64) {
@@ -190,16 +246,69 @@ pub(in crate::snapshots) fn record_rederive_input(source: SnapshotSource, bytes:
     );
 }
 
+pub(in crate::snapshots) fn record_rederive_line_peak(source: SnapshotSource, bytes: u64) {
+    REDERIVE_LINE_PEAK[diagnostic_source_slot(source)].fetch_max(bytes, Ordering::Relaxed);
+    crate::local_resource_diagnostics::durable_tail_alarm(
+        source.api_slug(),
+        &serde_json::json!({"rederive_line_peak_bytes":bytes}),
+    );
+}
+pub(in crate::snapshots) fn record_rederive_fence(source: SnapshotSource, classes: [bool; 5]) {
+    for (count, mismatch) in REDERIVE_FENCE[diagnostic_source_slot(source)]
+        .iter()
+        .zip(classes)
+    {
+        count.fetch_add(u64::from(mismatch), Ordering::Relaxed);
+    }
+    crate::local_resource_diagnostics::durable_tail_alarm(
+        source.api_slug(),
+        &serde_json::json!({"rederive_fence_mismatch":classes.map(u64::from)}),
+    );
+}
+#[derive(Clone, Copy)]
+enum RetirementEdge {
+    Metadata,
+    AcceptedObject,
+    IndependentEdit,
+    ScopedCertificate,
+}
+impl RetirementEdge {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::AcceptedObject => "accepted_object",
+            Self::IndependentEdit => "independent_edit",
+            Self::ScopedCertificate => "scoped_certificate",
+        }
+    }
+}
+
 const PACE_SECS: u64 = 6 * 3600;
 // Sleep and implausible clock changes must fail toward reading.
 const PACE_SANITY_SECS: u64 = 7 * 86_400;
 const _: () = assert!(PACE_SECS < 86_400);
+
+fn full_pace_delayed(at: SystemTime, now: SystemTime) -> bool {
+    // Backwards and implausibly large forwards jumps both EXPIRE.
+    now.duration_since(at).is_ok_and(|age| {
+        age.as_secs() <= PACE_SANITY_SECS && age < std::time::Duration::from_secs(PACE_SECS)
+    })
+}
 
 /// Content-free outcome counts, by class. Field paths are static names; no
 /// id, path or value is ever counted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Counters {
     pub(crate) restore_attempts: u64,
+    /// Per-process totals, emitted together once at the source pass boundary.
+    rederive_failed_first_attempt: [u64; 3],
+    /// Missing authority at the closed set of retirement decision edges.
+    pub(crate) retire_exact_held: BTreeMap<&'static str, u64>,
+    /// Process proxy only: no persisted key identity or restart streak.
+    retire_exact_held_first_attempt: [u64; 3],
+    retire_exact_first_attempt_tracking_closed: bool,
+    rederive_first_attempt_tracking_closed: bool,
+    restore_pending_quiet: [u64; 3],
     pub(crate) restored: u64,
     pub(crate) original_v1_mapped: u64,
     pub(crate) durable_restore_after_selection_clear: u64,
@@ -281,6 +390,11 @@ impl Counters {
         let native_phase = NATIVE_PHASE_BYTES[diagnostic_slot]
             .each_ref()
             .map(|value| value.load(Ordering::Relaxed));
+        let head_reads = REDERIVE_HEAD_READS[diagnostic_slot].load(Ordering::Relaxed);
+        let line_peak = REDERIVE_LINE_PEAK[diagnostic_slot].load(Ordering::Relaxed);
+        let fence = REDERIVE_FENCE[diagnostic_slot]
+            .each_ref()
+            .map(|n| n.load(Ordering::Relaxed));
         let input_head = rederive_head_bytes_total(source);
         let switch = if restart_restore::enabled() {
             "on"
@@ -302,7 +416,7 @@ impl Counters {
              d3_hold[growth_bytes,released_write,released_content,unfunded]={:?} \
              store_write_after_save_failed[files]={} \
              store_write_failed_restart_full[files,bytes]={:?} \
-             rederive_refused[first_prompt,title,agent_label,session_start,workspace]={rederive_refused:?} \
+             rederive_refused[first_prompt,title,agent_label,session_start,workspace]={rederive_refused:?} rederive_head_reads={head_reads} rederive_line_peak_bytes={line_peak} rederive_fence_mismatch={fence:?} \
              native_input_bytes[head,tail,full]=[{input_head},{},{}]",
             source.api_slug(),
             self.original_v1_mapped,
@@ -514,7 +628,14 @@ impl Slot {
 struct FullPace {
     at: std::time::SystemTime,
     structural: bool,
+    flags: u8,
+    head_extent: u32,
 }
+const HEAD_USED: u8 = 1;
+const FULL_SPENT: u8 = 2;
+const DEFERRED: u8 = 4;
+const NEAR_EXTRA: u8 = 8;
+const _: () = assert!(size_of::<FullPace>() <= 24);
 fn full_pace_key(source: SnapshotSource, key: &str) -> store::Digest32 {
     match durable_source(source) {
         Some(ds) => store::key_digest(ds, key),
@@ -682,6 +803,7 @@ impl Stores {
     /// A write or receipt whose certificate reaches the pending high water
     /// makes the zero-old-byte grant moot: a later restore starts there.
     pub(super) fn release_restore_pending(&mut self, key: &store::Digest32, length: u64) {
+        self.clear_rederive_hold(key);
         if self
             .restore_pending
             .get(key)
@@ -1845,6 +1967,20 @@ impl SharedCache {
         #[cfg(test)]
         let now = stores.retail_full_now.unwrap_or(now);
         let key = full_pace_key(source, key);
+        // A held replay key keeps its Full spend in never-evicted custody.
+        // The pace stamp remains the overflow fallback for unfunded keys.
+        let full_at = stores
+            .key_debt
+            .get(&key)
+            .and_then(|d| d.full_spend)
+            .map(|spend| spend.at)
+            .or_else(|| {
+                stores
+                    .retail_full_at
+                    .get(&key)
+                    .filter(|stamp| stamp.flags & FULL_SPENT != 0)
+                    .map(|stamp| stamp.at)
+            });
         // Expiry releases the pace without losing structural classification.
         // A no-record publication may already have changed the index binding.
         if stores.retail_full_at.get(&key).is_some_and(|stamp| {
@@ -1853,14 +1989,7 @@ impl SharedCache {
         }) {
             stores.counters.pace_anomaly += 1;
         }
-        let delayed = !near_cap
-            && stores.retail_full_at.get(&key).is_some_and(|stamp| {
-                // Backwards and implausibly large forwards jumps both EXPIRE.
-                now.duration_since(stamp.at).is_ok_and(|age| {
-                    age.as_secs() <= PACE_SANITY_SECS
-                        && age < std::time::Duration::from_secs(PACE_SECS)
-                })
-            });
+        let delayed = !near_cap && full_at.is_some_and(|at| full_pace_delayed(at, now));
         if !delayed && !start {
             return true;
         }
@@ -1894,13 +2023,21 @@ impl SharedCache {
             if crate::heap_layout_bound::tree_node_bytes::<store::Digest32, FullPace>()
                 .is_some_and(|n| n <= 1024)
             {
-                stores.retail_full_at.insert(
-                    key,
-                    FullPace {
-                        at: now,
-                        structural,
-                    },
-                );
+                let stamp = stores.retail_full_at.entry(key).or_insert(FullPace {
+                    at: now,
+                    structural,
+                    flags: 0,
+                    head_extent: 0,
+                });
+                stamp.at = now;
+                stamp.structural = structural;
+                stamp.flags = (stamp.flags | FULL_SPENT) & !NEAR_EXTRA;
+            }
+            if let Some(debt) = stores.key_debt.get_mut(&key) {
+                debt.full_spend = Some(owed::FullSpend {
+                    at: now,
+                    near_extra: false,
+                });
             }
         }
         if let Some(stamp) = stores.retail_full_at.get_mut(&key).filter(|_| active_bound) {
@@ -3099,7 +3236,7 @@ impl SharedCache {
                 if floor_behind {
                     return RestoreOutcome::FloorHeld;
                 }
-                if matches!(phase, "decode" | "input" | "certificate_scope") {
+                if matches!(phase, "input" | "certificate_scope") {
                     self.restore_active_bound(snapshot_source, key, held, index)
                 } else {
                     self.restore_resource_pending(snapshot_source, phase, key, held, index)
@@ -3200,8 +3337,17 @@ impl SharedCache {
         held: &File,
         index: &ScanIndex,
     ) -> RestoreOutcome {
-        let full = phase != "active_wait"
-            && if source == SnapshotSource::Codex {
+        let rederive = phase.starts_with("rederive_") || phase == "decode";
+        let full = !matches!(phase, "active_wait" | "rederive_quiet" | "rederive_budget")
+            && if rederive {
+                self.rederive_full(
+                    source,
+                    key,
+                    held,
+                    index.files.get(key).map_or(0, |e| e.size_bytes),
+                    source != SnapshotSource::Codex,
+                )
+            } else if source == SnapshotSource::Codex {
                 grown(held, index, key)
                     && held.metadata().is_ok_and(|m| {
                         self.paced_admission(
@@ -3278,7 +3424,12 @@ impl SharedCache {
         accepted_end: u64,
         phase: &'static str,
     ) -> bool {
-        if !self.paced_growth_full(source, key, file, accepted_end, SystemTime::now(), phase) {
+        let granted = if phase.starts_with("rederive_") || phase == "decode" {
+            self.rederive_full(source, key, file, accepted_end, true)
+        } else {
+            self.paced_growth_full(source, key, file, accepted_end, SystemTime::now(), phase)
+        };
+        if !granted {
             return false;
         }
         if phase == "capacity" {
@@ -3362,6 +3513,285 @@ impl SharedCache {
             );
         }
         granted
+    }
+
+    /// Missing authority preserves the predecessor and discoverability. The
+    /// named existing exits are revalidation followed by writer retire_exact,
+    /// or a later native replacement's exact receipt; no absence is inferred.
+    fn hold_rederive_retirement(
+        &self,
+        source: DurableSource,
+        key: store::Digest32,
+        edge: RetirementEdge,
+        exit: &'static str,
+    ) {
+        if let Some(mut stores) = self.durable() {
+            Counters::bump(&mut stores.counters.retire_exact_held, edge.label());
+            if let Some(debt) = stores.fund_debt(key) {
+                debt.rederive_hold = Some(source);
+            } else {
+                stores.owed_overflow[source.slot()] = true;
+            }
+        }
+        self.record_first_retire_result(source, key, true);
+        crate::local_resource_diagnostics::durable_tail_alarm(
+            source.properties().snapshot.api_slug(),
+            &serde_json::json!({"retire_exact_held":{(edge.label()):1}, "retire_exact_held_exit":exit}),
+        );
+    }
+
+    fn record_first_retire_result(&self, source: DurableSource, key: store::Digest32, held: bool) {
+        let Some(mut stores) = self.durable() else {
+            return;
+        };
+        if stores.counters.retire_exact_first_attempt_tracking_closed {
+            return;
+        }
+        if stores.fund_debt(key).is_none() {
+            stores.counters.retire_exact_first_attempt_tracking_closed = true;
+            return;
+        }
+        if stores.counters.retire_exact_first_attempt_tracking_closed {
+            return;
+        }
+        let debt = stores.key_debt.get_mut(&key).expect("funded");
+        if debt.first_retire_held.is_none() {
+            debt.first_retire_held = Some(held);
+            stores.counters.retire_exact_held_first_attempt
+                [diagnostic_source_slot(source.properties().snapshot)] += u64::from(held);
+        }
+    }
+
+    /// Per-edge original binding must already be eligible. Failure to retain
+    /// authority holds safely; it never manufactures a deletion witness.
+    fn queue_rederive_retirement(
+        &self,
+        source: DurableSource,
+        record: &store::DurableRecord,
+        expected: &Expected,
+        edge: RetirementEdge,
+    ) {
+        #[cfg(test)]
+        super::test_hooks::fire(super::test_hooks::Point::BeforeRetireWitness);
+        // Early metadata/object edit edges can fence-drop before scoped
+        // content replay. They share the same first-attempt observation.
+        self.record_first_rederive_result(
+            source.properties().snapshot,
+            record.record.binding.key,
+            true,
+        );
+        let Some(mut stores) = self.durable() else {
+            return;
+        };
+        let key = record.record.binding.key;
+        let proof = stores.slot(source).as_mut().and_then(|slot| {
+            slot.store.authorize(record, expected);
+            slot.store.mutation_witness(record, expected)
+        });
+        let Some(proof) = proof else {
+            Counters::bump(&mut stores.counters.ineligible, "rederive_retire_unproven");
+            drop(stores);
+            self.hold_rederive_retirement(source, key, edge, "revalidated_retire_exact");
+            return;
+        };
+        if !stores.fund_key(key) || stores.fund_debt(key).is_none() {
+            Counters::bump(&mut stores.counters.ineligible, "rederive_retire_unfunded");
+            drop(stores);
+            self.hold_rederive_retirement(source, key, edge, "native_replacement_receipt");
+            return;
+        }
+        let custody = stores.retail_spent.get_mut(&key).expect("funded");
+        // Never overwrite an outstanding migration/original predecessor.
+        if custody.original.is_none() {
+            custody.original = Some(proof);
+        } else if !custody
+            .original
+            .as_ref()
+            .is_some_and(|p| p.same_predecessor(&proof))
+        {
+            Counters::bump(&mut stores.counters.ineligible, "rederive_retire_unproven");
+            drop(stores);
+            self.hold_rederive_retirement(source, key, edge, "native_replacement_receipt");
+            return;
+        }
+        let debt = stores.fund_debt(key).expect("funded");
+        debt.retire_source = Some(source);
+        debt.rederive_hold = Some(source);
+        drop(stores);
+        self.record_first_retire_result(source, key, false);
+    }
+
+    /// Head-once is an extent discriminator, never predecessor authority.
+    /// Existing debt custody owns discovery and the one overflow retry.
+    fn rederive_gate(
+        &self,
+        source: SnapshotSource,
+        digest: store::Digest32,
+        extent: u64,
+        input: bool,
+        deferred: bool,
+    ) -> Result<(), Failure> {
+        let Some(ds) = durable_source(source) else {
+            return Ok(());
+        };
+        let mut stores = self
+            .durable()
+            .ok_or(Failure::Resource("stores_unavailable"))?;
+        if stores
+            .key_debt
+            .get(&digest)
+            .is_some_and(|debt| debt.retire_source == Some(ds))
+        {
+            return Err(Failure::Certificate(CertificateRefusal::Changed(
+                FullReason::HeadChanged,
+            )));
+        }
+        let now = SystemTime::now();
+        #[cfg(test)]
+        let now = stores.retail_full_now.unwrap_or(now);
+        let extent =
+            u32::try_from(extent).map_err(|_| Failure::Resource("rederive_unsupported"))?;
+        let absent = !stores.retail_full_at.contains_key(&digest);
+        if absent && stores.retail_full_at.len() >= 2 * store::MAX_RECORDS {
+            if let Some(oldest) = stores
+                .retail_full_at
+                .iter()
+                .min_by_key(|(_, p)| p.at)
+                .map(|(k, _)| *k)
+            {
+                stores.retail_full_at.remove(&oldest);
+                stores.counters.pace_evicted[diagnostic_source_slot(source)] += 1;
+                crate::local_resource_diagnostics::durable_tail_alarm(
+                    source.api_slug(),
+                    &serde_json::json!({"pace_evicted":1}),
+                );
+            }
+        }
+        let stamp = stores.retail_full_at.entry(digest).or_insert(FullPace {
+            at: now,
+            structural: false,
+            flags: 0,
+            head_extent: extent,
+        });
+        if stamp.head_extent != extent {
+            stamp.head_extent = extent;
+            stamp.flags &= !(HEAD_USED | DEFERRED);
+        }
+        if stamp.flags & HEAD_USED != 0 {
+            return Err(Failure::Resource("rederive_paced"));
+        }
+        if stamp.flags & DEFERRED != 0
+            && now
+                .duration_since(stamp.at)
+                .map_or(true, |age| age.as_secs() >= PACE_SECS)
+        {
+            return Err(Failure::Resource("rederive_budget_aged"));
+        }
+        if deferred {
+            if stamp.flags & (DEFERRED | FULL_SPENT) == 0 {
+                stamp.at = now;
+            }
+            stamp.flags |= DEFERRED;
+        }
+        // Custody is funded independently of pace-node eviction. No synthetic
+        // receipt debt: this bit cannot block settlement/upload of other keys.
+        let prior_full = (stamp.flags & FULL_SPENT != 0).then_some(owed::FullSpend {
+            at: stamp.at,
+            near_extra: stamp.flags & NEAR_EXTRA != 0,
+        });
+        let Some(debt) = stores.fund_debt(digest) else {
+            stores.owed_overflow[ds.slot()] = true;
+            return Err(Failure::Resource("rederive_custody"));
+        };
+        if debt.full_spend.is_none() {
+            debt.full_spend = prior_full;
+        }
+        debt.rederive_hold = Some(ds);
+        if input {
+            if debt.head_extent == Some(extent) {
+                if debt.extra_head {
+                    return Err(Failure::Resource("rederive_paced"));
+                }
+                debt.extra_head = true;
+            } else {
+                debt.head_extent = Some(extent);
+                debt.extra_head = false;
+            }
+            let stamp = stores.retail_full_at.get_mut(&digest).expect("enrolled");
+            stamp.flags |= HEAD_USED;
+            stamp.flags &= !DEFERRED;
+            REDERIVE_HEAD_READS[diagnostic_source_slot(source)].fetch_add(1, Ordering::Relaxed);
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                source.api_slug(),
+                &serde_json::json!({"rederive_head_reads":1}),
+            );
+        }
+        Ok(())
+    }
+
+    /// Re-derive failures share the cross-cause Full stamp, with at most one
+    /// extra near-cap read per six-hour window (rotation can remove discovery).
+    fn rederive_full(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        file: &File,
+        accepted_end: u64,
+        start: bool,
+    ) -> bool {
+        let Ok(meta) = file.metadata() else {
+            return false;
+        };
+        if meta.len() <= accepted_end {
+            return false;
+        }
+        let now = SystemTime::now();
+        if self.paced_admission(source, key, now, false, false, start) {
+            return true;
+        }
+        if !near_source_cap(source, meta.len()) {
+            return false;
+        }
+        let Some(mut stores) = self.durable() else {
+            return false;
+        };
+        let digest = full_pace_key(source, key);
+        let spent_extra = stores
+            .key_debt
+            .get(&digest)
+            .and_then(|d| d.full_spend)
+            .map(|spend| spend.near_extra)
+            .or_else(|| {
+                stores
+                    .retail_full_at
+                    .get(&digest)
+                    .map(|stamp| stamp.flags & NEAR_EXTRA != 0)
+            });
+        // Missing spend evidence grants no additional near-cap exception.
+        if spent_extra != Some(false) {
+            return false;
+        }
+        if start {
+            if let Some(spend) = stores
+                .key_debt
+                .get_mut(&digest)
+                .and_then(|d| d.full_spend.as_mut())
+            {
+                spend.near_extra = true;
+            }
+            if let Some(stamp) = stores.retail_full_at.get_mut(&digest) {
+                stamp.flags |= NEAR_EXTRA;
+            }
+            Counters::bump(
+                &mut stores.counters.resource_full,
+                "rederive_failure_full.near_cap",
+            );
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                source.api_slug(),
+                &serde_json::json!({"rederive_failure_full":{"near_cap":1}}),
+            );
+        }
+        true
     }
 
     /// P2: reserves `bytes` of this pass's restored head budget before input.
@@ -3565,6 +3995,12 @@ impl SharedCache {
                         full_reason_class(reason),
                     );
                 }
+                self.queue_rederive_retirement(
+                    source,
+                    &record,
+                    &original_expected,
+                    RetirementEdge::Metadata,
+                );
                 return Err(MissClass::RealEdit(reason).into());
             }
         }
@@ -3592,11 +4028,32 @@ impl SharedCache {
                         "s2_skipped_real_edit.replaced",
                     );
                 }
+                if original_matches {
+                    self.queue_rederive_retirement(
+                        source,
+                        &record,
+                        &original_expected,
+                        RetirementEdge::AcceptedObject,
+                    );
+                } else if let Some(mut stores) = self.durable() {
+                    Counters::bump(&mut stores.counters.ineligible, "rederive_retire_unproven");
+                    drop(stores);
+                    self.hold_rederive_retirement(
+                        source,
+                        store_key,
+                        RetirementEdge::AcceptedObject,
+                        "native_replacement_receipt",
+                    );
+                }
                 return Err(MissClass::RealEdit(FullReason::Replaced).into());
             }
             if a.behind(metadata.len()) {
                 if let Some(mut stores) = self.durable() {
                     Counters::bump(&mut stores.counters.ineligible, "accepted_body_floor");
+                    crate::local_resource_diagnostics::durable_tail_alarm(
+                        snapshot_source.api_slug(),
+                        &serde_json::json!({"restored_behind_accepted":{"held":1}}),
+                    );
                 }
                 return Err(MissClass::AcceptedFloor.into());
             }
@@ -3686,6 +4143,26 @@ impl SharedCache {
                                                     full_reason_class(edit),
                                                 );
                                             }
+                                            if original_matches {
+                                                self.queue_rederive_retirement(
+                                                    source,
+                                                    &record,
+                                                    &original_expected,
+                                                    RetirementEdge::IndependentEdit,
+                                                );
+                                            } else if let Some(mut stores) = self.durable() {
+                                                Counters::bump(
+                                                    &mut stores.counters.ineligible,
+                                                    "rederive_retire_unproven",
+                                                );
+                                                drop(stores);
+                                                self.hold_rederive_retirement(
+                                                    source,
+                                                    store_key,
+                                                    RetirementEdge::IndependentEdit,
+                                                    "native_replacement_receipt",
+                                                );
+                                            }
                                             return Err(MissClass::Failure(Failure::Certificate(
                                                 CertificateRefusal::Changed(edit),
                                             ))
@@ -3754,6 +4231,23 @@ impl SharedCache {
                 interpretation,
             }),
         );
+        if matches!(
+            restored,
+            Err(Failure::Certificate(CertificateRefusal::Changed(
+                FullReason::HeadChanged
+                    | FullReason::BoundaryChanged
+                    | FullReason::Shrunk
+                    | FullReason::SameSizeEdit
+                    | FullReason::Replaced
+            )))
+        ) {
+            self.queue_rederive_retirement(
+                source,
+                &record,
+                &expected,
+                RetirementEdge::ScopedCertificate,
+            );
+        }
         // Registry probes include allowlist hashing; keep them outside Stores.
         let owed = if matches!(restored, Err(Failure::Ineligible(store::Ineligible::Scope))) {
             unregistered_scope(
@@ -3819,11 +4313,17 @@ impl SharedCache {
                 return Err(MissClass::Failure(class).into());
             }
         };
+        #[cfg(test)]
+        super::test_hooks::fire(super::test_hooks::Point::AfterRestoredContent);
         if interpretation
             .accepted
             .is_some_and(|a| held.metadata().map_or(true, |m| a.behind(m.len())))
         {
             Counters::bump(&mut stores.counters.ineligible, "accepted_body_floor");
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                snapshot_source.api_slug(),
+                &serde_json::json!({"restored_behind_accepted":{"held":1}}),
+            );
             return Err(MissClass::AcceptedFloor.into());
         }
         if let Some(slot) = stores.slot(source).as_mut() {
@@ -3971,6 +4471,8 @@ impl SharedCache {
             .charge((2 * FILE_CONTENT_SAMPLE_BYTES + 128) as u64)
             .ok()?;
         let position = held.stream_position().ok()?;
+        #[cfg(test)]
+        super::test_hooks::fire(super::test_hooks::Point::BeforeRestoredIdentity);
         let identity = opened_object_identity(snapshot_source, held);
         held.seek(SeekFrom::Start(position)).ok()?;
         let identity = identity.ok()?;
@@ -4019,6 +4521,34 @@ impl SharedCache {
         lease: &mut store::ActiveLease,
         v3: Option<V3RestoreScope<'_>>,
     ) -> Result<(Checkpoint, CachedJsonlReduction, codec::RederiveReceipt), Failure> {
+        let scoped = v3.is_some();
+        let result =
+            self.restore_record_content(source, record, expected, path, scope, held, lease, v3);
+        // Eligible scoped failures include certificate/fence drops. Quiet is
+        // an observation, not a content attempt. OFF uses the native M1 path.
+        if scoped
+            && !matches!(
+                result,
+                Err(Failure::Resource("rederive_quiet") | Failure::Ineligible(_))
+            )
+        {
+            self.record_first_rederive_result(source, record.record.binding.key, result.is_err());
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn restore_record_content(
+        &self,
+        source: SnapshotSource,
+        record: &store::DurableRecord,
+        expected: &Expected,
+        path: &Path,
+        scope: &Scope,
+        held: &mut File,
+        lease: &mut store::ActiveLease,
+        v3: Option<V3RestoreScope<'_>>,
+    ) -> Result<(Checkpoint, CachedJsonlReduction, codec::RederiveReceipt), Failure> {
         if source == SnapshotSource::Codex {
             refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)
                 .map_err(|_| Failure::NotRederived(Refuse::NotRederivable("compressed")))?;
@@ -4029,6 +4559,26 @@ impl SharedCache {
             .certificate
             .check_metadata(held)
             .map_err(Failure::Certificate)?;
+        let committed = v3
+            .and_then(|v| {
+                v.index
+                    .files
+                    .get(path.to_string_lossy().as_ref())
+                    .map(|e| e.size_bytes)
+            })
+            .unwrap_or(record.record.certificate.length);
+        if held
+            .metadata()
+            .map_err(|_| Failure::Certificate(CertificateRefusal::ReadError))?
+            .len()
+            <= committed
+            && v3.is_some()
+        {
+            if let Some(mut stores) = self.durable() {
+                stores.counters.restore_pending_quiet[diagnostic_source_slot(source)] += 1;
+            }
+            return Err(Failure::Resource("rederive_quiet"));
+        }
         let before =
             crate::transcript_acquisition::FileStamp::capture(held.metadata().map_err(|_| {
                 Failure::Certificate(CertificateRefusal::Changed(FullReason::Replaced))
@@ -4040,7 +4590,7 @@ impl SharedCache {
         let (checkpoint, _) = record
             .record
             .certificate
-            .restore(held, scope.clone())
+            .restore_grown(held, scope.clone())
             .map_err(Failure::Certificate)?;
         let decoded = codec::decode_bounded(&record.record.body, source, lease).map_err(
             |reason| match reason {
@@ -4080,24 +4630,49 @@ impl SharedCache {
         {
             return Err(Failure::Ineligible(store::Ineligible::Scope));
         }
-        // Metadata and bounded certificate samples precede every repeatable
-        // resource refusal. Fund b4's content-only extractor before its input.
-        let charge = decoded
-            .content_charge()
-            .map_err(|_| Failure::Resource("rederive_unfunded"))?;
-        lease
-            .charge(charge)
-            .map_err(|_| Failure::Resource("rederive_unfunded"))?;
-        if charge > 0 {
-            // The exact head extent the extractor reads, from the pass budget.
-            let head = decoded
-                .head_end()
-                .map_err(|_| Failure::Resource("rederive_unfunded"))?;
-            self.reserve_rederive(source, head)?;
+        let digest = record.record.binding.key;
+        let extent = record.record.certificate.length;
+        let content = decoded.has_content();
+        if content {
+            self.rederive_gate(source, digest, extent, false, false)?;
         }
-        let (reduction, receipt) = decoded
-            .rederive_content(held)
-            .map_err(Failure::NotRederived)?;
+        let plan = decoded.rederive_plan().map_err(|reason| {
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                source.api_slug(),
+                &serde_json::json!({"rederive_unsupported":{(reason):1}}),
+            );
+            Failure::Resource("rederive_unsupported")
+        })?;
+        lease
+            .charge(plan.charge)
+            .map_err(|_| Failure::Resource("rederive_unfunded"))?;
+        if content {
+            if let Err(failure) = self.reserve_rederive(source, plan.input_bytes()) {
+                self.rederive_gate(source, digest, extent, false, true)?;
+                return Err(failure);
+            }
+            self.rederive_gate(source, digest, extent, true, false)?;
+        }
+        let classes = decoded.content_classes();
+        let (reduction, receipt, retained) = decoded
+            .rederive_content_planned(held, &plan)
+            .map_err(|error| {
+                if matches!(error, Refuse::NotRederivable("content_fence")) {
+                    Failure::Certificate(CertificateRefusal::Changed(FullReason::HeadChanged))
+                } else {
+                    record_rederive_refused(source, classes);
+                    Failure::Resource("rederive_refused")
+                }
+            })?;
+        if content {
+            lease
+                .refund(
+                    plan.charge
+                        .checked_sub(retained)
+                        .ok_or(Failure::Resource("rederive_unfunded"))?,
+                )
+                .map_err(|_| Failure::Resource("rederive_unfunded"))?;
+        }
         if source == SnapshotSource::Codex
             && v3.is_some_and(|inputs| {
                 !codex_counting_version::reusable_under_view(
@@ -4113,13 +4688,68 @@ impl SharedCache {
                 Failure::Certificate(CertificateRefusal::Changed(FullReason::Replaced))
             })?)
             .map_err(|_| Failure::Certificate(CertificateRefusal::Changed(FullReason::Replaced)))?;
-        if !before.same_content(&after) {
+        if !crate::transcript_acquisition::append_compatible(&before, &after) {
             return Err(Failure::Certificate(CertificateRefusal::Changed(
                 FullReason::Replaced,
             )));
         }
 
         Ok((checkpoint, reduction, receipt))
+    }
+
+    fn record_first_rederive_result(
+        &self,
+        source: SnapshotSource,
+        digest: store::Digest32,
+        failed: bool,
+    ) {
+        let Some(mut stores) = self.durable() else {
+            return;
+        };
+        if stores.counters.rederive_first_attempt_tracking_closed {
+            return;
+        }
+        if stores.fund_debt(digest).is_none() {
+            stores.close_first_rederive_tracking();
+            return;
+        }
+        // Funding may have reclaimed an idle diagnostic marker.
+        if stores.counters.rederive_first_attempt_tracking_closed {
+            return;
+        }
+        let debt = stores.key_debt.get_mut(&digest).expect("funded");
+        if debt.first_rederive_failed.is_none() {
+            debt.first_rederive_failed = Some(failed);
+            stores.counters.rederive_failed_first_attempt[diagnostic_source_slot(source)] +=
+                u64::from(failed);
+        }
+    }
+
+    /// Aggregate process proxies on the existing carrier, once per source pass.
+    pub(crate) fn durable_rederive_proxies(&self, source: SnapshotSource) {
+        if !restart_restore::enabled() {
+            return;
+        }
+        let Some(stores) = self.durable() else {
+            return;
+        };
+        let slot = diagnostic_source_slot(source);
+        let failed = stores.counters.rederive_failed_first_attempt[slot];
+        let quiet = stores.counters.restore_pending_quiet[slot];
+        let retire_held = stores.counters.retire_exact_held_first_attempt[slot];
+        let retire_tracking_closed = stores.counters.retire_exact_first_attempt_tracking_closed;
+        let stores_tracking_closed = stores.counters.rederive_first_attempt_tracking_closed;
+        drop(stores);
+        crate::local_resource_diagnostics::durable_tail_alarm(
+            source.api_slug(),
+            &serde_json::json!({
+                "rederive_failed_first_attempt": failed,
+                "restore_pending_quiet": quiet,
+                "rederive_first_attempt_tracking_closed": stores_tracking_closed,
+                "retire_exact_held_first_attempt": retire_held,
+                "retire_exact_first_attempt_tracking_closed": retire_tracking_closed,
+            }),
+        );
     }
 
     /// A proved non-singleton class keeps its native owner. No mark or pending
@@ -4754,6 +5384,42 @@ impl SharedCache {
                 stores.release_idle_custody(&digest);
             }
         }
+        {
+            let stores = &mut *stores;
+            let mut attempts = 0;
+            for (digest, debt) in stores.key_debt.iter_mut() {
+                if attempts >= store::MAX_BATCH {
+                    break;
+                }
+                if debt.retire_source != Some(source) || offered.contains_key(digest) {
+                    continue;
+                }
+                let Some(custody) = stores.retail_spent.get_mut(digest) else {
+                    continue;
+                };
+                let Some(proof) = custody.original.as_ref() else {
+                    continue;
+                };
+                attempts += 1;
+                let Some(slot) = stores.slots[source.slot()].as_mut() else {
+                    break;
+                };
+                let outcome = slot
+                    .store
+                    .retire_exact(writer, proof, &mut debt.retire_sync);
+                let class = match outcome {
+                    store::RetireOutcome::Retry => "rederive_retire.retry",
+                    store::RetireOutcome::Retired => "rederive_retire.retired",
+                    store::RetireOutcome::Superseded => "rederive_retire.superseded",
+                };
+                Counters::bump(&mut stores.counters.ineligible, class);
+                if !matches!(outcome, store::RetireOutcome::Retry) {
+                    debt.retire_source = None;
+                    custody.original = None;
+                }
+            }
+            stores.retail_spent.retain(|_, c| c.has_authority());
+        }
         let slot = stores.slot(source).as_mut()?;
         if !invalidate.is_empty() {
             let _ = slot.store.remove_keys(writer, &invalidate);
@@ -4791,7 +5457,7 @@ impl SharedCache {
                 return None;
             }
         };
-        if source == DurableSource::ClaudeCode {
+        {
             let stores = &mut *stores;
             for digest in offered.keys() {
                 if let Some(c) = stores.retail_spent.get_mut(digest) {
@@ -4805,6 +5471,10 @@ impl SharedCache {
                         stores.counters.migration[3] +=
                             u64::from(c.original.as_ref().is_some_and(|p| p.is_migration()));
                         c.original = None;
+                        if let Some(debt) = stores.key_debt.get_mut(digest) {
+                            debt.retire_source = None;
+                            debt.retire_sync = false;
+                        }
                     }
                 }
                 stores.release_idle_custody(digest);

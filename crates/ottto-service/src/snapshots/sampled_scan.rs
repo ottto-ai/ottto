@@ -581,6 +581,8 @@ crate::heap_layout_bound::fields!(Context; cache, namespace, audit_metadata_supp
 pub(super) struct Active {
     /// Structural fallback keeps cursor/scope metadata but retains no graph.
     pub(super) no_record: bool,
+    /// Frozen observation only; never participates in admission or settlement.
+    pub(super) restored_behind_accepted: bool,
     pub(super) key: String,
     pub(super) scope: Scope,
     pub(super) mode: ReadMode,
@@ -599,7 +601,7 @@ pub(super) struct Active {
     pub(super) retained_usage: Option<u64>,
     pub(super) reinsertion: crate::local_resource_diagnostics::claude_reread::Reinsertion,
 }
-crate::heap_layout_bound::fields!(Active; no_record, key, scope, mode, audit_due, retained_hint,
+crate::heap_layout_bound::fields!(Active; no_record, restored_behind_accepted, key, scope, mode, audit_due, retained_hint,
     retained_finalization_charge, retained_usage, reinsertion);
 
 impl Context {
@@ -1943,6 +1945,13 @@ pub(super) mod test_hooks {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(in crate::snapshots) enum Point {
+        BeforeRetireWitness,
+        /// A bounded restore is decoded, immediately before identity sampling.
+        BeforeRestoredIdentity,
+        /// The first opened-object identity sample has actually been read.
+        AfterIdentityHead,
+        /// Content replay succeeded, before its final accepted-floor check.
+        AfterRestoredContent,
         /// After revalidation, before `retain_reduction`.
         BeforeRetain,
         /// `retain_reduction`'s deferred path, before the stamp gate.

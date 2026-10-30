@@ -5065,3 +5065,231 @@ fn m1_blocked_group_leaves_earlier_corrupt_member_recoverable() {
     assert_eq!(reader.full_guard(&a.key, true, true, &[0; 32]), Ok(None));
     assert_eq!(reader.counters().t14_rebuild_full_started, 0);
 }
+
+#[test]
+fn exact_retirement_retries_unlink_and_absent_path_directory_barrier() {
+    use crate::snapshots::sampled_scan::transition_fixture::{fail_store_at, CrashPoint};
+    for point in [CrashPoint::BeforeRetireUnlink, CrashPoint::BeforeRetireSync] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("retire.jsonl", b"{}\n");
+        let b = binding("account", "scope", ("fp", None));
+        let mut store = scratch.store();
+        assert_eq!(
+            store
+                .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+                .unwrap()
+                .written,
+            1
+        );
+        // Cold process: failure-side authorization cannot rely on restore success.
+        drop(store);
+        let mut store = scratch.store();
+        let record = found(store.read(&b.key));
+        let expected = Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        };
+        store.authorize(&record, &expected);
+        let proof = store.mutation_witness(&record, &expected).unwrap();
+        store.begin_pass();
+        store.durable.clear(); // writer custody outlives memo/permission turnover
+        let mut sync_due = false;
+        let fault = fail_store_at(point, 1);
+        assert!(matches!(
+            store.retire_exact(&lock, &proof, &mut sync_due),
+            RetireOutcome::Retry
+        ));
+        assert_eq!(fault.hits(), 1);
+        assert_eq!(store.counters.records_invalidated, 0);
+        assert_eq!(sync_due, point == CrashPoint::BeforeRetireSync);
+        drop(fault);
+        if sync_due {
+            assert!(!record_file(&store, &b.key).exists());
+            // The second attempt must still run the actual barrier even though
+            // the canonical path is absent; another barrier error retains it.
+            let fault = fail_store_at(CrashPoint::BeforeRetireSync, 1);
+            assert!(matches!(
+                store.retire_exact(&lock, &proof, &mut sync_due),
+                RetireOutcome::Retry
+            ));
+            assert_eq!(fault.hits(), 1);
+            assert!(sync_due);
+            drop(fault);
+        }
+        assert!(matches!(
+            store.retire_exact(&lock, &proof, &mut sync_due),
+            RetireOutcome::Retired
+        ));
+        assert!(!sync_due);
+        assert!(!record_file(&store, &b.key).exists());
+        assert_eq!(store.counters.records_invalidated, 1);
+    }
+}
+
+#[test]
+fn exact_retirement_verifies_changed_survivor_and_never_deletes_unknown_bytes() {
+    for unknown in [false, true] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("retire.jsonl", b"{}\n");
+        let b = binding("account", "scope", ("fp", None));
+        let mut store = scratch.store();
+        assert_eq!(
+            store
+                .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+                .unwrap()
+                .written,
+            1
+        );
+        let record = found(store.read(&b.key));
+        let expected = Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        };
+        store.authorize(&record, &expected);
+        let proof = store.mutation_witness(&record, &expected).unwrap();
+        let disk = record_file(&store, &b.key);
+        if unknown {
+            fs::write(&disk, b"unknown survivor").unwrap();
+        } else {
+            assert_eq!(
+                store
+                    .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
+                    .unwrap()
+                    .written,
+                1
+            );
+        }
+        let before = fs::read(&disk).unwrap();
+        let outcome = store.retire_exact(&lock, &proof, &mut false);
+        assert!(if unknown {
+            matches!(outcome, RetireOutcome::Retry)
+        } else {
+            matches!(outcome, RetireOutcome::Superseded)
+        });
+        assert_eq!(fs::read(&disk).unwrap(), before);
+    }
+}
+
+// F11: an exact retirement witness never converts a pending successor or a
+// retained exact completion into absence/ACK credit for its predecessor.
+#[test]
+fn exact_retirement_preserves_pending_and_retained_receipt_successors() {
+    let _reset = ResetFaults;
+    for retained_receipt in [false, true] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("pending-retire.jsonl", b"{}\n");
+        let b = binding("pending-retire", "scope", ("fp", None));
+        let mut store = scratch.store();
+        store
+            .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+            .unwrap();
+        let record = found(store.read(&b.key));
+        let expected = Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        };
+        store.authorize(&record, &expected);
+        let proof = store.mutation_witness(&record, &expected).unwrap();
+        let dir = store.dir().to_owned();
+        test_hooks::set_before_dir_sync(Some(Box::new(move |path| {
+            if path == dir {
+                Err(io::Error::other("synthetic pending successor sync"))
+            } else {
+                Ok(())
+            }
+        })));
+        let failed = store
+            .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
+            .unwrap();
+        test_hooks::set_before_dir_sync(None);
+        assert_eq!(failed.written, 0);
+        assert!(store.pending.contains_key(&b.key));
+        if retained_receipt {
+            let ReconcileOutcome::Receipted(receipt) =
+                store.reconcile_pending(&lock, &b.key).unwrap()
+            else {
+                panic!("exact successor receipt");
+            };
+            let completed_stamp = receipt.stamp;
+            store.retain_receipt(receipt).unwrap();
+            assert_eq!(store.pending[&b.key].completed, Some(completed_stamp));
+            assert!(
+                !store.receipt_pending(&b.key),
+                "matching completed stamp has no unresolved I/O"
+            );
+        }
+        let before = fs::read(record_file(&store, &b.key)).unwrap();
+        let invalidated = store.counters().records_invalidated;
+        assert!(matches!(
+            store.retire_exact(&lock, &proof, &mut false),
+            RetireOutcome::Retry
+        ));
+        assert_eq!(fs::read(record_file(&store, &b.key)).unwrap(), before);
+        assert_eq!(store.counters().records_invalidated, invalidated);
+        assert!(store.pending.contains_key(&b.key));
+        // A cold reader sees the published successor; the old witness cannot
+        // delete it even when process-local pending custody is gone.
+        drop(store);
+        let mut cold = scratch.store();
+        assert!(matches!(
+            cold.retire_exact(&lock, &proof, &mut false),
+            RetireOutcome::Superseded
+        ));
+        assert_eq!(fs::read(record_file(&cold, &b.key)).unwrap(), before);
+    }
+}
+
+#[test]
+fn exact_retirement_stat_io_error_is_retry_and_never_proven_absence() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let transcript = scratch.transcript("retire-stat.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp", None));
+    let mut store = scratch.store();
+    assert_eq!(
+        store
+            .write_after_save(
+                &lock,
+                1,
+                0,
+                vec![pending(b.clone(), certificate(&transcript), 1)]
+            )
+            .unwrap()
+            .written,
+        1
+    );
+    let record = found(store.read(&b.key));
+    let expected = Expected {
+        binding: b.clone(),
+        committed_generation: 1,
+    };
+    let proof = store.mutation_witness(&record, &expected).unwrap();
+    let path = record_file(&store, &b.key);
+    let saved_dir = scratch.root.join("saved-record-dir");
+    fs::rename(store.dir(), &saved_dir).unwrap();
+    // A regular file as the parent returns ENOTDIR at stamp_at, not ENOENT.
+    fs::write(store.dir(), b"blocked parent").unwrap();
+    assert!(stamp_at(&path).is_err());
+    let mut sync_due = true;
+    assert!(matches!(
+        store.retire_exact(&lock, &proof, &mut sync_due),
+        RetireOutcome::Retry
+    ));
+    assert!(
+        sync_due,
+        "a stat error cannot discharge directory-sync custody"
+    );
+    assert_eq!(store.counters.records_invalidated, 0);
+    fs::remove_file(store.dir()).unwrap();
+    fs::rename(&saved_dir, store.dir()).unwrap();
+    assert!(path.exists());
+    assert!(matches!(
+        store.retire_exact(&lock, &proof, &mut sync_due),
+        RetireOutcome::Retired
+    ));
+    assert!(!sync_due);
+    assert_eq!(store.counters.records_invalidated, 1);
+}
