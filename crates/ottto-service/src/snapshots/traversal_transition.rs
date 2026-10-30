@@ -928,6 +928,11 @@ mod tests {
             "shared_process_cpu_delta_us",
             "process_lifetime_max_rss_bytes",
             "process_lifetime_max_rss_before_bytes",
+            "stage_peak_footprint_bytes",
+            "stage_start_footprint_bytes",
+            "stage_end_footprint_bytes",
+            "footprint_samples",
+            "footprint_sample_failures",
         ] {
             assert!(row["observation"][field].is_null());
         }

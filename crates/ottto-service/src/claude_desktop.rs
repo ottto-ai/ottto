@@ -4,34 +4,79 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MAX_ROOTS: usize = 64;
-const MAX_DISCOVERY_ENTRIES: usize = 4096;
+pub(crate) const MAX_ROOTS: usize = 64;
+pub(crate) const MAX_DISCOVERY_ENTRIES: usize = 4096;
+
+#[derive(Debug)]
+pub(crate) struct Discovery {
+    pub(crate) roots: Vec<PathBuf>,
+    pub(crate) capped: bool,
+    pub(crate) error: bool,
+}
 
 pub(crate) fn support_roots(home: &Path) -> Vec<PathBuf> {
+    discover_support_roots(home).roots
+}
+
+pub(crate) fn discover_support_roots(home: &Path) -> Discovery {
     let support = home.join("Library/Application Support");
     // Preserve the default root even without config.json: older installs can
     // have session metadata alone, and detection already supports that case.
-    let mut roots = vec![support.join("Claude")];
-    let Ok(entries) = fs::read_dir(&support) else {
-        return roots;
+    let mut discovery = Discovery {
+        roots: vec![support.join("Claude")],
+        capped: false,
+        error: false,
     };
-    let mut siblings = BTreeSet::new();
-    for entry in entries.take(MAX_DISCOVERY_ENTRIES).flatten() {
-        if !entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.starts_with("Claude-"))
-            || !entry.file_type().is_ok_and(|kind| kind.is_dir())
-        {
-            continue;
-        }
-        let root = entry.path();
-        if root.join("config.json").is_file() {
-            siblings.insert(root);
-        }
+    match fs::read_dir(&support) {
+        Ok(entries) => discovery.collect(entries),
+        Err(error) => discovery.error = error.kind() != std::io::ErrorKind::NotFound,
     }
-    roots.extend(siblings.into_iter().take(MAX_ROOTS - 1));
-    roots
+    discovery
+}
+
+impl Discovery {
+    fn collect(&mut self, entries: impl Iterator<Item = std::io::Result<fs::DirEntry>>) {
+        let mut siblings = BTreeSet::new();
+        let mut inspected = 0;
+        for entry in entries.take(MAX_DISCOVERY_ENTRIES) {
+            inspected += 1;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    self.error = true;
+                    continue;
+                }
+            };
+            if !entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("Claude-"))
+            {
+                continue;
+            }
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => {}
+                Ok(_) => continue,
+                Err(_) => {
+                    self.error = true;
+                    continue;
+                }
+            }
+            let root = entry.path();
+            match fs::metadata(root.join("config.json")) {
+                Ok(metadata) if metadata.is_file() => {
+                    siblings.insert(root);
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => self.error = true,
+            }
+        }
+        // At the exact entry cap we cannot prove exhaustion without exceeding
+        // the read budget. Keep that boundary conservative, too.
+        self.capped = inspected == MAX_DISCOVERY_ENTRIES || siblings.len() > MAX_ROOTS - 1;
+        self.roots.extend(siblings.into_iter().take(MAX_ROOTS - 1));
+    }
 }
 
 #[cfg(test)]
@@ -80,5 +125,54 @@ mod tests {
             roots[MAX_ROOTS - 1],
             support.join(format!("Claude-{:03}", MAX_ROOTS - 2))
         );
+    }
+    #[test]
+    fn discovery_marks_only_root_overflow_incomplete() {
+        let home = crate::test_scratch::ScratchDir::new("desktop-root-coverage");
+        let support = home.join("Library/Application Support");
+        for i in 0..MAX_ROOTS {
+            let root = support.join(format!("Claude-{i:03}"));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("config.json"), "{}").unwrap();
+            if i >= MAX_ROOTS - 3 {
+                let discovery = discover_support_roots(&home);
+                assert_eq!(discovery.capped, i == MAX_ROOTS - 1);
+                assert!(!discovery.error);
+                assert_eq!(discovery.roots.len(), (i + 2).min(MAX_ROOTS));
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_entry_budget_includes_exact_cap() {
+        let home = crate::test_scratch::ScratchDir::new("desktop-entry-coverage");
+        let support = home.join("Library/Application Support");
+        fs::create_dir_all(&support).unwrap();
+        for i in 0..MAX_DISCOVERY_ENTRIES + 1 {
+            fs::write(support.join(format!("other-{i:04}")), "").unwrap();
+            if i >= MAX_DISCOVERY_ENTRIES - 2 {
+                let discovery = discover_support_roots(&home);
+                assert_eq!(discovery.capped, i + 1 >= MAX_DISCOVERY_ENTRIES);
+                assert!(!discovery.error);
+                assert_eq!(discovery.roots, vec![support.join("Claude")]);
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_distinguishes_absence_open_and_iterator_errors() {
+        let home = crate::test_scratch::ScratchDir::new("desktop-discovery-errors");
+        let missing = discover_support_roots(&home);
+        assert!(!missing.error && !missing.capped);
+        fs::create_dir_all(home.join("Library")).unwrap();
+        fs::write(home.join("Library/Application Support"), "not a directory").unwrap();
+        let failed = discover_support_roots(&home);
+        assert!(failed.error && !failed.capped);
+        let mut interrupted = missing;
+        interrupted.collect(std::iter::once(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "synthetic enumeration error",
+        ))));
+        assert!(interrupted.error && !interrupted.capped);
     }
 }

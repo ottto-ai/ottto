@@ -1611,7 +1611,8 @@ fn census_records_are_charged_with_the_scan_index_and_leave_entries_alone() {
     // re-read rule rebuilds the scan fingerprint from the ctime so a
     // ctime-only change never re-reads, and only for the same object
     // generation, bound by its exact birth (owner-approved 464 -> 472 -> 480).
-    const SCAN_INDEX_ENTRY_BYTES: usize = 480;
+    // Optional context receipt adds 80 inline bytes; its three H digests are heap-charged.
+    const SCAN_INDEX_ENTRY_BYTES: usize = 560;
     assert_eq!(
         std::mem::size_of::<ScanIndexEntry>(),
         SCAN_INDEX_ENTRY_BYTES
