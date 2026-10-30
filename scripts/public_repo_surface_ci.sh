@@ -235,6 +235,7 @@ run_step P "validate public schemas and generated registry" \
   bash -c 'jq empty connectors/registry.generated.json schemas/*.schema.json'
 run_step P "shellcheck public scripts" bash -c 'shellcheck scripts/*.sh'
 run_step P "test local autoreview helper" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_autoreview.py
+run_step P "test money equivalence decoded-body comparison" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_money_equivalence.py
 run_step P "test PR merge guard" bash scripts/test_pr_merge_when_mac_green.sh
 
 run_step P "test public export check" bash scripts/test_public_repo_export_check.sh
