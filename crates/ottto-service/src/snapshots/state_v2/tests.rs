@@ -1294,3 +1294,27 @@ fn f6_backward_clock_does_not_grant_a_restart_purge_attempt() {
     drop(db);
     assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_err());
 }
+
+#[test]
+fn growth_retention_follows_runtime_custody_through_clones_subsets_and_baselines() {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+    let mut committed = super::super::ScanIndex::default();
+    assert!(!state_v2_growth_retention_active(&committed));
+    let v1_bytes = serde_json::to_vec(&committed).unwrap();
+    committed.persistence_v2 = Some(Arc::new(Runtime { active: true }));
+    assert!(state_v2_growth_retention_active(&committed));
+    assert_eq!(v1_bytes, serde_json::to_vec(&committed).unwrap());
+    let working = committed.clone();
+    assert!(Arc::ptr_eq(
+        working.persistence_v2.as_ref().unwrap(),
+        committed.persistence_v2.as_ref().unwrap()
+    ));
+    let subset = working.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
+    assert!(state_v2_growth_retention_active(&subset));
+    let mut baseline = super::super::ScanIndex::default();
+    baseline.retain_persistence_baseline_from(&subset);
+    assert!(state_v2_growth_retention_active(&baseline));
+    baseline.retain_persistence_baseline_from(&super::super::ScanIndex::default());
+    assert!(!state_v2_growth_retention_active(&baseline));
+}

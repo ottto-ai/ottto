@@ -3,6 +3,7 @@
 //!
 //! Keep the engine boundary here: callers must not depend on SQLite handles,
 //! statements, SQL, or checkpoint tuples.
+use super::ScanIndex;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -11,6 +12,20 @@ mod interning;
 mod packed;
 mod shape;
 mod sqlite;
+
+/// Runtime-only custody carrier. Only the verified v2 load route may install it.
+/// Environment/sentinel state alone must never activate growth retention.
+#[derive(Debug)]
+pub(super) struct Runtime {
+    active: bool,
+}
+crate::heap_layout_bound::fields!(Runtime; active);
+
+/// Stable seam shared with selection and census retention. Derived/subset
+/// indices carry the committed route; switch changes do not erase custody.
+pub(crate) fn state_v2_growth_retention_active(index: &ScanIndex) -> bool {
+    index.persistence_v2.as_ref().is_some_and(|runtime| runtime.active)
+}
 
 const FORMAT: u32 = 1;
 
