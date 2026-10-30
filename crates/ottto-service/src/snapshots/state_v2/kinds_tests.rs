@@ -490,9 +490,9 @@ fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
     }
 }
 
-/// [format] on open runs after complete hydration and per file stage exclusion retains progress.
+/// [money] an R1 exclusion discards every speculative settlement and preserves owed custody.
 #[test]
-fn on_open_runs_after_complete_hydration_and_per_file_stage_exclusion_retains_progress() {
+fn stage_exclusion_discards_settlement_and_preserves_owed_custody() {
     #[derive(Default)]
     struct Hooks {
         opened: bool,
@@ -513,7 +513,8 @@ fn on_open_runs_after_complete_hydration_and_per_file_stage_exclusion_retains_pr
             next: &ScanIndex,
             current: &BTreeMap<String, resume::ResumeCheckpoint>,
         ) -> Result<resume::StagedCheckpoints> {
-            self.stage(prev, next, current)
+            let _ = (prev, next, current);
+            Ok(Default::default())
         }
         fn stage(
             &mut self,
@@ -528,7 +529,9 @@ fn on_open_runs_after_complete_hydration_and_per_file_stage_exclusion_retains_pr
         }
     }
     let (_scratch, mut db) = Scratch::live_store();
-    let prev = fixture();
+    let mut prev = fixture();
+    prev.accepted_rebuild_incidence
+        .insert("synthetic-file".into(), BTreeSet::from(["owed".into()]));
     commit_populate(&mut db, &prev);
     let mut tx = db.begin(TxnMode::Read).unwrap();
     let mut hooks = Hooks::default();
@@ -537,28 +540,66 @@ fn on_open_runs_after_complete_hydration_and_per_file_stage_exclusion_retains_pr
     assert!(hooks.opened);
     let mut next = prev.clone();
     next.generation += 1;
-    next.files.get_mut("synthetic-file").unwrap().size_bytes += 1;
+    next.file_snapshot_fingerprints.insert(
+        "synthetic-file".into(),
+        BTreeSet::from(["unpublished".into()]),
+    );
+    next.accepted_snapshot_fingerprints
+        .insert("unpublished".into());
+    next.snapshot_activity_at
+        .insert("unpublished".into(), Some("2026-10-31T00:00:00Z".into()));
+    next.accepted_rebuild_incidence.clear();
+    next.claude_account_family_pending.clear();
+    next.claude_owned_start_census.insert("unpublished-session".into(), serde_json::from_value(serde_json::json!({
+        "marker_source_file_fingerprint":"unpublished", "verified_source_file_fingerprint":"unpublished",
+        "emitted_source_file_fingerprint":"unpublished"
+    })).unwrap());
+    next.upload_ack_retirement_handoff = Some(super::super::super::UploadAckRetirementHandoff {
+        destination_namespace_hash: Scratch::binding().namespace_hash,
+        committed_generation: next.generation,
+        bodies: BTreeMap::from([("unpublished".into(), "body".into())]),
+        pending_bodies: BTreeMap::new(),
+    });
     next.upload_context_fingerprint = Some("independent-change".into());
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
-    save_graph(&mut db, &identity, &prev, &mut next, &mut cx, &mut hooks).unwrap();
+    let error = save_graph(&mut db, &identity, &prev, &mut next, &mut cx, &mut hooks).unwrap_err();
+    assert!(error.is::<resume::StageExcluded>());
     assert_eq!(
-        serde_json::to_vec(&next.files["synthetic-file"]).unwrap(),
-        serde_json::to_vec(&prev.files["synthetic-file"]).unwrap()
+        serde_json::to_vec(&next).unwrap(),
+        serde_json::to_vec(&prev).unwrap()
     );
-    assert_eq!(
-        serde_json::to_vec(&next.claude_request_census).unwrap(),
-        serde_json::to_vec(&prev.claude_request_census).unwrap()
-    );
-    assert_eq!(next.growth_retention, prev.growth_retention);
-    assert_eq!(
-        next.upload_context_fingerprint.as_deref(),
-        Some("independent-change")
-    );
-    let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert!(cx.ambiguous);
+    let (restored, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
     assert_eq!(
         serde_json::to_vec(&restored).unwrap(),
-        serde_json::to_vec(&next).unwrap()
+        serde_json::to_vec(&prev).unwrap()
     );
+    // Independent work can commit from a fresh durable graph on the next pass.
+    let mut selected = restored.clone();
+    selected.upload_context_fingerprint = Some("independent-change".into());
+    save_graph(
+        &mut db,
+        &identity,
+        &restored,
+        &mut selected,
+        &mut cx,
+        &mut SaveHooks::default(),
+    )
+    .unwrap();
+    let (reopened, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(
+        reopened.upload_context_fingerprint.as_deref(),
+        Some("independent-change")
+    );
+    assert_eq!(
+        reopened.accepted_rebuild_incidence,
+        prev.accepted_rebuild_incidence
+    );
+    assert_eq!(
+        serde_json::to_value(&reopened.claude_account_family_pending).unwrap(),
+        serde_json::to_value(&prev.claude_account_family_pending).unwrap()
+    );
+    assert!(reopened.upload_ack_retirement_handoff.is_none());
 }
 
 /// [format] census evidence larger than the projected row cap roundtrips.

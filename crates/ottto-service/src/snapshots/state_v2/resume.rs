@@ -172,7 +172,7 @@ pub(crate) struct StagedCheckpoints {
     /// Actual immutable record bytes fsynced by R1, including replaced records.
     /// The owner reserves these bytes during committable-unit admission.
     pub bytes: u64,
-    /// Per-file staging failures keep their prior committed ref and progress.
+    /// Any excluded key aborts this save; the next selection holds that key.
     pub excluded: BTreeSet<String>,
     pub replacements: BTreeMap<String, ResumeCheckpoint>,
     pub finished: BTreeMap<String, FinishProof>,
@@ -242,11 +242,20 @@ impl ResumeHooks for NoResumeHooks {
         anyhow::bail!(import::Pause::R1StagingNotInstalled)
     }
 }
+/// Carries only selection keys to the existing route owner, never to diagnostics.
+#[derive(Debug)]
+pub(super) struct StageExcluded(pub BTreeSet<String>);
+impl std::fmt::Display for StageExcluded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("state_v2_resume_stage_excluded")
+    }
+}
+impl std::error::Error for StageExcluded {}
+
 pub(super) struct Prepared {
     pub(super) generation: u64,
     pub(super) signature: [u8; 32],
     pub(super) checkpoints: BTreeMap<String, ResumeCheckpoint>,
-    excluded: BTreeSet<String>,
 }
 
 impl KindCx {
@@ -260,63 +269,11 @@ impl KindCx {
             .context("state_v2_resume_preflight_required")?;
         let planned = planned.context("state_v2_resume_plan_required")?;
         ensure!(
-            prepared
-                .checkpoints
-                .iter()
-                .filter(|(key, _)| !prepared.excluded.contains(*key))
-                .eq(planned
-                    .iter()
-                    .filter(|(key, _)| !prepared.excluded.contains(*key))),
+            &prepared.checkpoints == planned,
             "state_v2_resume_plan_changed"
         );
         Ok(())
     }
-    pub(super) fn retain_excluded(&mut self, prev: &ScanIndex, next: &mut ScanIndex) -> Result<()> {
-        let Some(prepared) = &mut self.prepared else {
-            return Ok(());
-        };
-        for path in &prepared.excluded {
-            macro_rules! restore_map {
-                ($field:ident) => {
-                    match prev.$field.get(path) {
-                        Some(value) => {
-                            next.$field.insert(path.clone(), value.clone());
-                        }
-                        None => {
-                            next.$field.remove(path);
-                        }
-                    }
-                };
-            }
-            next.claude_request_census.remove(path);
-            if let Some(record) = prev.claude_request_census.storage_records().get(path) {
-                ensure!(
-                    next.claude_request_census
-                        .storage_insert(path.clone(), record.clone()),
-                    "state_v2_resume_excluded_census"
-                );
-            }
-            restore_map!(files);
-            restore_map!(file_snapshot_fingerprints);
-            restore_map!(terminal_jsonl_dispositions);
-            restore_map!(growth_retention);
-            restore_map!(claude_desktop_title_files);
-            if prev.confirmed_empty_files.contains(path) {
-                next.confirmed_empty_files.insert(path.clone());
-            } else {
-                next.confirmed_empty_files.remove(path);
-            }
-        }
-        if !prepared.excluded.is_empty() {
-            telemetry::event(
-                "v2_resume_stage_excluded",
-                &(prepared.excluded.len() as u64),
-            );
-        }
-        prepared.signature = files_signature(next)?;
-        Ok(())
-    }
-
     pub(super) fn prepared_checkpoints(&self) -> Option<&BTreeMap<String, ResumeCheckpoint>> {
         self.prepared.as_ref().map(|p| &p.checkpoints)
     }
@@ -342,6 +299,9 @@ impl KindCx {
         );
         self.require_preflight = true;
         let staged = hooks.stage(prev, next, &self.committed)?;
+        if !staged.excluded.is_empty() {
+            return self.prepare_checkpoints(prev, next, staged);
+        }
         ensure!(
             staged.bytes <= reserved_staging_bytes
                 && (staged.replacements.is_empty() || staged.bytes > 0),
@@ -366,13 +326,10 @@ impl KindCx {
         next: &ScanIndex,
         staged: StagedCheckpoints,
     ) -> Result<()> {
-        ensure!(
-            staged
-                .excluded
-                .iter()
-                .all(|p| !staged.replacements.contains_key(p) && !staged.finished.contains_key(p)),
-            "state_v2_resume_excluded_proof"
-        );
+        if !staged.excluded.is_empty() {
+            telemetry::event("v2_resume_stage_excluded", &(staged.excluded.len() as u64));
+            return Err(StageExcluded(staged.excluded).into());
+        }
         let binding = self.binding.as_ref().context("state_v2_resume_binding")?;
         let mut checkpoints = self.committed.clone();
         let finished_paths: BTreeSet<_> = staged.finished.keys().cloned().collect();
@@ -415,12 +372,7 @@ impl KindCx {
             checkpoints.insert(path, checkpoint);
         }
         for (path, checkpoint) in &checkpoints {
-            let source = if staged.excluded.contains(path) {
-                prev
-            } else {
-                next
-            };
-            let entry = source
+            let entry = next
                 .files
                 .get(path)
                 .context("state_v2_resume_finish_required")?;
@@ -428,9 +380,6 @@ impl KindCx {
         }
         // R1 must cover every changed, still-active file, including first admission.
         for (path, entry) in &next.files {
-            if staged.excluded.contains(path) {
-                continue;
-            }
             if prev.files.get(path).map(publication).transpose()? != Some(publication(entry)?) {
                 ensure!(
                     checkpoints.contains_key(path) || finished_paths.contains(path),
@@ -442,7 +391,6 @@ impl KindCx {
             generation: next.generation,
             signature: files_signature(next)?,
             checkpoints,
-            excluded: staged.excluded,
         });
         Ok(())
     }

@@ -142,6 +142,38 @@ fn post_commit_cleanup_receipt_binds_latest_db_generation_and_refuses_rollback()
     assert_eq!(std::fs::read(&path).unwrap(), cleaned);
 }
 
+/// [regress] v1 progress created with umask 022 seals unchanged; companions stay private.
+#[test]
+fn v1_readable_progress_seals_without_rewriting_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-v1-permissions");
+    let parent = scratch.join("a".repeat(64));
+    std::fs::create_dir(&parent).unwrap();
+    let index = parent.join("claude_code-synthetic-scan-index.json");
+    let path = parent.join("claude_code-synthetic-scan-index-upload-progress.json");
+    let bytes = serde_json::to_vec(&serde_json::json!({"schema_version":3,
+        "destination_namespace_hash":"a".repeat(64),"generation":1}))
+    .unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let original = OriginalProgress::capture(&index).unwrap();
+    let binding = ProgressRecovery::synthetic(&index, &"a".repeat(64), 1);
+    assert!(original
+        .retry_identity(binding.scope.identity.clone())
+        .is_ok());
+    ProgressRecovery::seal_import(binding.scope.identity.clone(), 1, &index, Some(&bytes)).unwrap();
+    binding.recover(&path).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    let companion = fence::sibling(&index, ".v2-ack-receipt");
+    assert_eq!(
+        std::fs::metadata(&companion).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+    assert!(OriginalProgress::capture(&index).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
 /// [money] obsolete unpublished seal preserves custody then retries after v1 advances.
 #[test]
 fn obsolete_unpublished_seal_preserves_custody_then_retries_after_v1_advances() {

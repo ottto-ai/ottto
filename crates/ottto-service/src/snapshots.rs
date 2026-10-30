@@ -26866,6 +26866,9 @@ impl OwnedSourceScan {
             };
         let mut files = pending_paths
             .into_iter()
+            .filter(|pending| {
+                !state_v2::resume_selection_held(index, &local_index_key(&pending.path))
+            })
             .filter_map(|pending| {
                 candidate_from_traversal_path_with_growth(
                     source,

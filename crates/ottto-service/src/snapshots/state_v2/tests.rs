@@ -1554,9 +1554,9 @@ fn external_owner_lock_is_counted_without_clearing_overdue_debt() {
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(1));
 }
 
-/// [format] failed idle purge recovers before collection even inside the deadline.
+/// [regress] an ordinary failed idle purge retains debt without stopping collection or spinning.
 #[test]
-fn failed_idle_purge_recovers_before_collection_even_inside_the_deadline() {
+fn failed_idle_purge_keeps_paced_debt_without_stopping_collection() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     db.control("erasure_pending", &1_u64).unwrap();
@@ -1564,14 +1564,53 @@ fn failed_idle_purge_recovers_before_collection_even_inside_the_deadline() {
     {
         let _full = sqlite::space_for_test(Some(0));
         db.maintenance(true).unwrap();
-        assert!(db.before_collection().is_err());
+        let failures = db.read_control::<u64>("erasure_failures").unwrap();
+        assert!(failures.is_some_and(|n| n > 0));
+        for _ in 0..4 {
+            db.before_collection().unwrap();
+            db.maintenance(true).unwrap();
+        }
+        assert_eq!(
+            db.read_control::<u64>("erasure_failures").unwrap(),
+            failures
+        );
+        assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(1));
     }
-    // Space recovery takes precedence over the recent failure's retry clock.
+    // Under-deadline space recovery does not turn the idle failure into a
+    // blocking wake recovery, and it still respects the saved retry clock.
     db.before_collection().unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(1));
+    // Once due, a successful bounded opportunity can clear the same debt.
+    drop(db);
+    let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
+    db.control("erasure_attempt", &0_u64).unwrap();
+    db.maintenance(true).unwrap();
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
+}
+
+/// [regress] repeated failed overdue recovery has bounded pauses and keeps its alarm/debt.
+#[test]
+fn repeated_overdue_recovery_failure_cannot_stop_collection_indefinitely() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    db.control("erasure_pending", &1_u64).unwrap();
+    age_erasure(&mut db, 25 * 3600);
+    let _full = sqlite::space_for_test(Some(0));
+    assert!(
+        db.before_collection().is_err(),
+        "overdue startup tries recovery first"
+    );
+    assert!((0..8).any(|_| db.before_collection().is_ok()));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(1));
     assert_eq!(
-        serde_json::to_value(db.maintenance_stats()).unwrap()["erasure_late_completions"],
-        0
+        serde_json::to_value(db.maintenance_stats()).unwrap()["erasure_overdue"],
+        true
+    );
+    let failures = db.read_control::<u64>("erasure_failures").unwrap();
+    db.before_collection().unwrap();
+    assert_eq!(
+        db.read_control::<u64>("erasure_failures").unwrap(),
+        failures
     );
 }
 

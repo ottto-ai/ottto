@@ -1081,3 +1081,39 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     assert_eq!(fs::read(&f.path).unwrap(), before_fence);
     assert_eq!(fs::read(&progress_path).unwrap(), progress);
 }
+
+/// [regress] reloading after R1 staging failure preserves exclusion before transcript parsing.
+#[test]
+fn resume_exclusion_survives_reload_and_skips_transcript_before_parse() {
+    let f = Fixture::new();
+    f.published();
+    let roots = f.support.join("transcripts");
+    fs::create_dir(&roots).unwrap();
+    let transcript = roots.join("held.jsonl");
+    fs::write(&transcript, b"invalid json\n").unwrap();
+    let key = super::super::super::local_index_key(&transcript);
+    let _index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    with_state(&f.path, |state| {
+        state
+            .resume_excluded
+            .insert(key.clone(), Instant::now() + Duration::from_secs(60));
+        state.cached = None;
+        Ok(())
+    })
+    .unwrap();
+    let mut index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    let scan = super::super::super::scan_source_roots_with_test_limit(
+        super::super::super::SnapshotSource::ClaudeCode,
+        &[roots],
+        &mut index,
+        "2026-10-31T12:00:00Z",
+        30,
+        10,
+        false,
+    )
+    .unwrap();
+    assert!(scan.snapshots.is_empty());
+    assert_eq!(scan.scanned_file_count, 0);
+    assert_eq!(scan.malformed_json_line_count, 0);
+    assert!(!index.files.contains_key(&key));
+}
