@@ -518,11 +518,16 @@ fn retained_golden_cases() -> Value {
     assert_eq!(unpriced.request_identity_refusals, 4);
     cases.insert("unpriced_strip_after_proof_proving", sticky_wire(unpriced_first));
     cases.insert("unpriced_strip_after_proof", sticky_wire(unpriced));
-    for case in cases.values() {
+    serde_json::to_value(cases).unwrap()
+}
+
+/// Wire bound and the receiver presence rule on every emitted item.
+fn retained_assert_golden_shape(cases: &Value) {
+    for (name, case) in cases.as_object().unwrap() {
         let item = &case["snapshots"][0];
-        assert!(serde_json::to_vec(item).unwrap().len() <= identity::MAX_ITEM_BYTES);
-        // Receiver presence rule at both levels: a part carries exactly the
-        // costs its row carries.
+        let bytes = serde_json::to_vec(item).unwrap().len();
+        assert!(bytes <= identity::MAX_ITEM_BYTES, "{name}: {bytes}");
+        // A part carries exactly the costs its row carries, at both levels.
         let bucket_rows = item["usage_buckets"].as_array().unwrap().iter();
         let rows = item["model_usage"]
             .as_array()
@@ -538,12 +543,11 @@ fn retained_golden_cases() -> Value {
                     "cache_read_cost_usd",
                     "cache_creation_cost_usd",
                 ] {
-                    assert_eq!(part[cost].is_null(), row[cost].is_null(), "{cost}");
+                    assert_eq!(part[cost].is_null(), row[cost].is_null(), "{name}: {cost}");
                 }
             }
         }
     }
-    serde_json::to_value(cases).unwrap()
 }
 
 #[test]
@@ -563,8 +567,10 @@ fn retained_emitted_wire_goldens_for_the_receiver_contract() {
             "E2_RETAINED_GOLDEN_GZIP_BASE64={}",
             base64::engine::general_purpose::STANDARD.encode(gzip.finish().unwrap())
         );
+        retained_assert_golden_shape(&actual);
         panic!("emitted retained-marker goldens changed; regenerate from the CI receipt");
     }
+    retained_assert_golden_shape(&actual);
     let manifest: Value = serde_json::from_str(include_str!(
         "fixtures/claude_identity_retained_emitted.manifest.json"
     ))
