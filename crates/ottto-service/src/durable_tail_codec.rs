@@ -184,10 +184,11 @@ impl<'a> Enc<'a> {
             sink: Sink::Hash(Box::new(hasher)),
         }
     }
-    /// One record's Pi body may omit exactly this E field. Drop clears the
+    /// One record body may move the named E field. Drop clears the
     /// allowance on success, refusal and unwind, including a reused encoder.
-    pub(crate) fn with_pi_ledger<T>(
+    pub(crate) fn with_moved_field<T>(
         &mut self,
+        path: &'static str,
         put: impl FnOnce(&mut Enc) -> Result<T, Refuse>,
     ) -> Result<T, Refuse> {
         struct Guard<'a, 'b>(&'a mut Enc<'b>);
@@ -196,7 +197,7 @@ impl<'a> Enc<'a> {
                 self.0.moved_field = None;
             }
         }
-        self.moved_field = Some("SnapshotAccumulator.seen_pi_usage_keys");
+        self.moved_field = Some(path);
         let guard = Guard(self);
         put(guard.0)
     }

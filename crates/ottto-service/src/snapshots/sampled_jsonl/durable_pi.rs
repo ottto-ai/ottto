@@ -45,7 +45,7 @@ pub(in crate::snapshots) fn put_body(
         // Not an E field: only this static class leaves the codec.
         return Err(Refuse::NonEmpty(PI_LEDGER_CAP));
     }
-    e.with_pi_ledger(|e| {
+    e.with_moved_field("SnapshotAccumulator.seen_pi_usage_keys", |e| {
         acc.put(e)?;
         report.put(e)?;
         scalars.0.put(e)?;

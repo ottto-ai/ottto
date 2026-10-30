@@ -85,7 +85,10 @@ fn section(keys: &BTreeMap<String, PiUsageDedupState>) -> Vec<u8> {
 /// a section whose zeroed u64 length was patched after its bytes. No cap.
 fn back_patched(reduction: &CachedJsonlReduction) -> Vec<u8> {
     let mut e = Enc::bytes(RECORD_BYTES);
-    e.with_pi_ledger(|e| reduction.put(e)).unwrap();
+    e.with_moved_field("SnapshotAccumulator.seen_pi_usage_keys", |e| {
+        reduction.put(e)
+    })
+    .unwrap();
     Rederive::default().put(&mut e).unwrap();
     let mut out = e.into_bytes();
     out.push(1);
@@ -261,14 +264,14 @@ fn moved_ledger_allowance_is_scoped_to_one_pi_body() {
         match exit {
             0 => put(&mut e, &pi, &Rederive::default()).unwrap(),
             1 => assert_eq!(
-                e.with_pi_ledger(|e| {
+                e.with_moved_field("SnapshotAccumulator.seen_pi_usage_keys", |e| {
                     pi.put(e)?;
                     Err::<(), _>(Refuse::TooLarge)
                 }),
                 Err(Refuse::TooLarge)
             ),
             _ => assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = e.with_pi_ledger::<()>(|e| {
+                let _ = e.with_moved_field::<()>("SnapshotAccumulator.seen_pi_usage_keys", |e| {
                     pi.put(e)?;
                     panic!("synthetic unwind")
                 });
