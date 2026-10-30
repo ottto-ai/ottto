@@ -242,6 +242,11 @@ pub(crate) struct DesktopMetadata {
     /// SOURCE Addendum 7: a legacy/re-upgrade child with no latch entry.
     #[serde(skip_serializing_if = "AdoptionReoffer::is_empty")]
     pub(crate) desktop_identity_adoption_reoffer: AdoptionReoffer,
+    /// E1 option (A): every refused re-offer of either kind, so this equals
+    /// `desktop_identity_recovered_reoffer.refused` plus
+    /// `desktop_identity_adoption_reoffer.refused`.
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) desktop_identity_reoffer_refused: u64,
 }
 /// One finalized identity re-offer. `posted`/`sent` is a new body carrying the
 /// child's own complete disposition; `unchanged` matched the stored body;
@@ -296,6 +301,7 @@ pub(crate) fn desktop_identity_reoffer(adoption: bool, outcome: IdentityReoffere
         IdentityReoffered::Refused => (0, 0, 1),
     };
     let mut counts = Counts::default();
+    counts.desktop_metadata.desktop_identity_reoffer_refused = refused;
     if adoption {
         counts.desktop_metadata.desktop_identity_adoption_reoffer = AdoptionReoffer {
             sent: posted,
@@ -366,6 +372,9 @@ impl DesktopMetadata {
             .merge(other.desktop_identity_recovered_reoffer);
         self.desktop_identity_adoption_reoffer
             .merge(other.desktop_identity_adoption_reoffer);
+        self.desktop_identity_reoffer_refused = self
+            .desktop_identity_reoffer_refused
+            .saturating_add(other.desktop_identity_reoffer_refused);
         self.lineage_selector_drops = self
             .lineage_selector_drops
             .saturating_add(other.lineage_selector_drops);

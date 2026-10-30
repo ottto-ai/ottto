@@ -832,7 +832,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
         sampled_audit_verified: false,
         lineage_edge_reoffer_bytes: None,
         desktop_identity_reoffer: None,
-        desktop_identity_resolved: false,
+        desktop_identity_evidence: None,
         codex_pending_recovery: false,
         index_key: key.clone(),
         source_file_fingerprint: "source".into(),

@@ -10,11 +10,13 @@ const CREATED: &str = "2026-08-01T00:00:00Z";
 // After collection: the creation-proof downgrade always applies.
 const CREATED_LATE: &str = "2026-08-02T08:00:00Z";
 
-/// `recovered` = [posted, unchanged, refused, bytes]; `adoption` = [sent, ...].
+/// `recovered` = [posted, unchanged, refused, bytes]; `adoption` = [sent, ...];
+/// `refused` = the flat `desktop_identity_reoffer_refused` total.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Reoffers {
     recovered: [u64; 4],
     adoption: [u64; 4],
+    refused: u64,
 }
 
 struct IdentityFixture {
@@ -32,8 +34,14 @@ impl IdentityFixture {
         fs::rename(&native.path, &path).unwrap();
         native.path = path;
         fs::remove_dir_all(old).unwrap();
-        // The child's own account/organization come from its store location.
-        let store = home
+        let fixture = Self { home, native };
+        fixture.write_store(created_at, "first");
+        fixture
+    }
+    /// The child's own account/organization come from its store location.
+    fn write_store(&self, created_at: &str, title: &str) {
+        let store = self
+            .home
             .join("Library/Application Support/Claude/claude-code-sessions")
             .join(ACCOUNT)
             .join(ORG);
@@ -41,12 +49,12 @@ impl IdentityFixture {
         fs::write(
             store.join("child.json"),
             json!({
-                "cliSessionId": native.session, "sessionId": "local_child", "createdAt": created_at
+                "cliSessionId": self.native.session, "sessionId": "local_child",
+                "createdAt": created_at, "title": title, "titleSource": "user"
             })
             .to_string(),
         )
         .unwrap();
-        Self { home, native }
     }
     fn key(&self) -> String {
         local_index_key(&self.native.path)
@@ -98,6 +106,12 @@ impl IdentityFixture {
         let counts = Reoffers {
             recovered: ["posted", "unchanged", "refused", "bytes"].map(|f| sum(recovered, f)),
             adoption: ["sent", "unchanged", "refused", "bytes"].map(|f| sum(adoption, f)),
+            refused: rows
+                .iter()
+                .filter_map(|row| {
+                    row["counts"]["desktop_metadata"]["desktop_identity_reoffer_refused"].as_u64()
+                })
+                .sum(),
         };
         (run, counts)
     }
@@ -273,46 +287,153 @@ fn desktop_identity_complete_flaps_and_restarts_never_reoffer() {
 }
 
 #[test]
-fn desktop_identity_downgraded_emission_never_latches_pending_and_reoffers_at_most_once() {
+fn desktop_identity_downgraded_emission_never_latches_and_recovers_when_evidence_completes() {
     // E1: the creation-proof downgrade wins over a complete own disposition.
-    // That missing body is not census-caused: it settles without a re-offer.
+    // Nothing persists, and the read itself memoizes this evidence, so the
+    // same evidence costs no second read and no refused re-offer.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let f = IdentityFixture::new(CREATED_LATE);
-    let (first, counts) = f.run(ScanIndex::default(), COLLECTED);
+    let cache = Arc::new(SharedCache::default());
+    let (first, counts) = f.run_with(ScanIndex::default(), cache.clone(), COLLECTED);
     assert_eq!(disposition(f.child(&first)), Some("missing"));
     assert_eq!(counts, Reoffers::default());
     let index = ack(first);
     assert_eq!(
         f.latch(&index),
-        Some(Settled),
-        "a downgrade is never pending"
+        None,
+        "the latch means settled complete only"
     );
-    f.quiet(
-        f.restart(index),
-        &["2026-08-02T07:12:00Z", "2026-08-02T07:13:00Z"],
-    );
-    // Census-caused missing that is also downgraded: the one recovery
-    // re-offer is refused (Lead B: settled, no retry), then quiet.
+    let index = f.quiet(f.restart(index), &["2026-08-02T07:12:00Z"]);
+    let (retained, counts) = f.run_with(index, cache.clone(), "2026-08-02T07:12:30Z");
+    assert!(retained.result.snapshots.is_empty());
+    assert_eq!((retained.native_bytes, counts), (0, Reoffers::default()));
+    // A new process forgets the memo: adoption stays cache-only, so one
+    // refused re-offer from RAM where a reduction is retained, 0 bytes.
+    desktop_identity::reset_refused_memo_for_test();
+    let supported = u64::from(crate::heap_layout_bound::layout_supported());
+    let (refused, counts) = f.run_with(ack(retained), cache.clone(), "2026-08-02T07:13:00Z");
+    assert!(refused.result.snapshots.is_empty());
+    assert_eq!(refused.native_bytes, 0);
+    assert_eq!(counts.adoption, [0, 0, supported, 0]);
+    assert_eq!(counts.refused, supported);
+    let index = ack(refused);
+    assert_eq!(f.latch(&index), None, "a refusal never settles");
+    let (quiet, counts) = f.run_with(index, cache, "2026-08-02T07:14:00Z");
+    assert!(quiet.result.snapshots.is_empty());
+    assert_eq!((quiet.native_bytes, counts), (0, Reoffers::default()));
+    // The cause clears: the child's own complete identity is not lost.
+    f.write_store(CREATED, "creation proof recovered");
+    let (recovered, _) = f.run(ack(quiet), "2026-08-02T07:15:00Z");
+    assert_eq!(disposition(f.child(&recovered)), Some("complete"));
+    let index = ack(recovered);
+    assert_eq!(f.latch(&index), Some(Settled));
+    f.quiet(f.restart(index), &["2026-08-02T07:16:00Z"]);
+}
+
+#[test]
+fn desktop_identity_refused_reoffer_once_per_process_then_complete_evidence_recovers() {
+    // Census-caused missing that the creation proof also downgrades. Runs on
+    // every platform: a pending child is read, not served from the RAM cache.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let f = IdentityFixture::new(CREATED_LATE);
     let (first, _) = f.run(f.loaded_incomplete("2026-08-02T07:11:00Z"), COLLECTED);
     assert_eq!(disposition(f.child(&first)), Some("missing"));
     let index = ack(first);
     assert_eq!(f.latch(&index), Some(Pending));
-    let (refused, counts) = f.run(f.restart(index), "2026-08-02T07:12:00Z");
-    assert!(
-        refused.result.snapshots.is_empty(),
-        "the unchanged missing body is never posted again"
-    );
-    assert_eq!(counts.recovered, [0, 0, 1, f.len()]);
-    let index = ack(refused);
-    assert_eq!(f.latch(&index), Some(Settled));
-    f.quiet(
+    let refused_once = |index: ScanIndex, at: &str| {
+        let (refused, counts) = f.run(f.restart(index), at);
+        assert!(
+            refused.result.snapshots.is_empty(),
+            "the unchanged missing body is never posted again"
+        );
+        assert_eq!(
+            counts,
+            Reoffers {
+                recovered: [0, 0, 1, f.len()],
+                refused: 1,
+                ..Reoffers::default()
+            },
+            "{at}"
+        );
+        let index = ack(refused);
+        assert_eq!(f.latch(&index), Some(Pending), "a refusal never settles");
+        index
+    };
+    // Exactly one refused re-offer, then quiet for N passes and a save/load.
+    let index = refused_once(index, "2026-08-02T07:12:00Z");
+    let index = f.quiet(
         f.restart(index),
         &[
             "2026-08-02T07:13:00Z",
             "2026-08-02T07:14:00Z",
             "2026-08-02T07:15:00Z",
         ],
+    );
+    // The real cap evicts this child: at most one extra counted refusal.
+    desktop_identity::fill_refused_memo_for_test();
+    let index = refused_once(index, "2026-08-02T07:16:00Z");
+    let index = f.quiet(index, &["2026-08-02T07:17:00Z", "2026-08-02T07:18:00Z"]);
+    // A new process: at most one per process, and no unbounded loop.
+    desktop_identity::reset_refused_memo_for_test();
+    let index = refused_once(index, "2026-08-02T07:19:00Z");
+    let index = f.quiet(index, &["2026-08-02T07:20:00Z"]);
+    // The evidence becomes complete: exactly one body, latched complete.
+    f.write_store(CREATED, "creation proof recovered");
+    let (recovered, _) = f.run(index, "2026-08-02T07:21:00Z");
+    assert_eq!(disposition(f.child(&recovered)), Some("complete"));
+    assert_eq!(recovered.native_bytes, f.len());
+    let index = ack(recovered);
+    assert_eq!(f.latch(&index), Some(Settled));
+    f.quiet(
+        f.restart(index),
+        &["2026-08-02T07:22:00Z", "2026-08-02T07:23:00Z"],
+    );
+}
+
+#[test]
+fn desktop_identity_recovery_reads_its_settled_e2_path_twin_and_publishes() {
+    // Without the page-start prepass only the pending path is read: E2 holds
+    // a session whose known twin is absent from the page, so it never settles.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    let f = IdentityFixture::new(CREATED);
+    let copy = f.native.dir.join("other-project");
+    fs::create_dir_all(&copy).unwrap();
+    let copy = copy.join(format!("{}.jsonl", f.native.session));
+    fs::write(&copy, fs::read(&f.native.path).unwrap()).unwrap();
+    let (first, _) = f.run(f.loaded_incomplete("2026-08-02T07:11:00Z"), COLLECTED);
+    assert!(first.result.snapshots.iter().all(|item| {
+        item.source_session_id == f.native.session && disposition(item) == Some("missing")
+    }));
+    let mut index = ack(first);
+    // E2 may publish one body for both paths: recover the path that owns it.
+    let (pending, twin) = {
+        let keys = [f.key(), local_index_key(&copy)];
+        let owner = keys
+            .iter()
+            .position(|key| index.claude_desktop_identity_latches.get(key) == Some(&Pending))
+            .expect("the path carrying the missing body is pending");
+        (keys[owner].clone(), keys[1 - owner].clone())
+    };
+    index
+        .claude_desktop_identity_latches
+        .insert(twin.clone(), Settled);
+    let (recovered, counts) = f.run(index, "2026-08-02T07:12:00Z");
+    assert_eq!(
+        recovered.native_bytes,
+        2 * f.len(),
+        "the settled twin is read with the recovering path"
+    );
+    assert!(!recovered.result.snapshots.is_empty(), "E2 withheld it");
+    assert!(recovered.result.snapshots.iter().all(|item| {
+        item.source_session_id == f.native.session && disposition(item) == Some("complete")
+    }));
+    assert_eq!(counts.recovered, [1, 0, 0, f.len()]);
+    let index = ack(recovered);
+    assert_eq!(index.claude_desktop_identity_latches[&pending], Settled);
+    assert_eq!(index.claude_desktop_identity_latches[&twin], Settled);
+    f.quiet(
+        f.restart(index),
+        &["2026-08-02T07:13:00Z", "2026-08-02T07:14:00Z"],
     );
 }
 

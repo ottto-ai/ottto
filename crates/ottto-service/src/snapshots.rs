@@ -7717,9 +7717,9 @@ struct PendingIndexFinalization {
     lineage_edge_reoffer_bytes: Option<u64>,
     /// Selected only by the Desktop identity latch, with its native bytes.
     desktop_identity_reoffer: Option<(desktop_identity::IdentityReoffer, u64)>,
-    /// The child's own live disposition was complete when read: a missing
-    /// emission is then a downgrade the latch cannot recover.
-    desktop_identity_resolved: bool,
+    /// Digest of the child's own live evidence when it resolved complete at
+    /// read time: a non-complete emission is then a downgrade, memoized in RAM.
+    desktop_identity_evidence: Option<[u8; 32]>,
     codex_pending_recovery: bool,
     index_key: String,
     source_file_fingerprint: String,
@@ -30547,17 +30547,6 @@ impl OwnedSourceScan {
                 };
                 #[cfg(not(unix))]
                 let reprobed_due: Option<u64> = None;
-                let desktop_identity_resolved = source == SnapshotSource::ClaudeCode
-                    && candidate
-                        .path
-                        .file_stem()
-                        .and_then(|value| value.to_str())
-                        .is_some_and(|session| {
-                            claude_title_metadata
-                                .session_account_evidence(session)
-                                .identity_disposition
-                                == Some("complete")
-                        });
                 if parse_complete && !aliases.is_empty() {
                     for alias in &aliases {
                         if alias.path == candidate.path {
@@ -30568,7 +30557,15 @@ impl OwnedSourceScan {
                             sampled_audit_verified: false,
                             lineage_edge_reoffer_bytes: None,
                             desktop_identity_reoffer: None,
-                            desktop_identity_resolved,
+                            desktop_identity_evidence: (source == SnapshotSource::ClaudeCode)
+                                .then(|| {
+                                    desktop_identity::identity_evidence(
+                                        &claude_title_metadata,
+                                        &alias.path,
+                                        &alias_fingerprint,
+                                    )
+                                })
+                                .flatten(),
                             codex_pending_recovery: index
                                 .files
                                 .get(&local_index_key(&alias.path))
@@ -30675,7 +30672,15 @@ impl OwnedSourceScan {
                     sampled_audit_verified,
                     lineage_edge_reoffer_bytes,
                     desktop_identity_reoffer,
-                    desktop_identity_resolved,
+                    desktop_identity_evidence: (source == SnapshotSource::ClaudeCode)
+                        .then(|| {
+                            desktop_identity::identity_evidence(
+                                &claude_title_metadata,
+                                &candidate.path,
+                                &source_file_fingerprint,
+                            )
+                        })
+                        .flatten(),
                     codex_pending_recovery: index
                         .files
                         .get(&index_key)
@@ -92233,7 +92238,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, desktop_identity_reoffers, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; lineage_edge_reoffer_bytes, desktop_identity_reoffer, desktop_identity_resolved, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; lineage_edge_reoffer_bytes, desktop_identity_reoffer, desktop_identity_evidence, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {
