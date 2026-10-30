@@ -899,3 +899,376 @@ fn stale_carry_batch_diagnostics_discard_failed_larger_attempts() {
     );
     assert_eq!(diagnostics.eligible_before_funding, 1);
 }
+
+
+#[test]
+#[ignore = "terminal-off ON-readiness: R13"]
+fn terminal_off_on_oversized_singleton_keeps_runnable_debt_and_later_siblings_after_reload() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let mut fixture = retry_durable_fixture(0, 3);
+    let root = fixture
+        ._scratch
+        .join("p".repeat(200))
+        .join("q".repeat(200))
+        .join("r".repeat(200));
+    std::fs::create_dir_all(&root).unwrap();
+    let list = ReemissionExclusions::path(&root.join("support"));
+    std::fs::create_dir_all(list.parent().unwrap()).unwrap();
+    std::fs::write(list, b"").unwrap();
+    // One real root file plus stale synthetic missing members. The missing
+    // members are ordinary runnable open opportunities, never fake ACKs.
+    let old_files = std::mem::take(&mut fixture.index.files);
+    let old_heads = std::mem::take(&mut fixture.index.file_snapshot_fingerprints);
+    for (old, entry) in old_files {
+        let path = root.join(Path::new(&old).file_name().unwrap());
+        std::fs::write(&path, b"{}\n").unwrap();
+        let key = local_index_key(&path);
+        fixture.index.files.insert(key.clone(), entry);
+        fixture
+            .index
+            .file_snapshot_fingerprints
+            .insert(key, old_heads[&old].clone());
+    }
+    let owed = fixture.roots[0].clone();
+    let real = local_index_key(&root.join(format!("{owed}.jsonl")));
+    let template = fixture.index.files[&real].clone();
+    for number in 0..6000 {
+        let path = root
+            .join(&owed)
+            .join("subagents")
+            .join(format!("agent-{number:016x}.jsonl"));
+        assert!(path.to_string_lossy().len() >= 700);
+        fixture
+            .index
+            .files
+            .insert(local_index_key(&path), template.clone());
+    }
+    fixture
+        .index
+        .claude_usage_family_pending
+        .get_mut(&owed)
+        .unwrap()
+        .invalid = true;
+    retry_test_context(&mut fixture.index, &root);
+    let singleton = BTreeSet::from([owed.clone()]);
+    assert!(
+        matches!(
+            claude_stream_accepted_retry_carry(&fixture.index, &singleton),
+            Err(ClaudeRetryAdmissionRefusal::Structure)
+        ),
+        "REAL singleton price exceeds the unchanged 8MiB gate"
+    );
+    let before = fixture.index.files[&real].source_file_fingerprint.clone();
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&root),
+        &mut fixture.index,
+        CARRY_RETRY,
+        BACKFILL_WINDOW_DAYS,
+    );
+    // START only records admission; one retained-traversal RESUME runs its batch.
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&root),
+        &mut fixture.index,
+        CARRY_RETRY,
+        BACKFILL_WINDOW_DAYS,
+    );
+    let state = fixture
+        .index
+        .claude_stale_family_carry
+        .origin
+        .as_ref()
+        .unwrap()
+        .admission
+        .as_ref()
+        .unwrap();
+    assert_eq!(state.oversized_root.as_deref(), Some(owed.as_str()));
+    assert!(!state.complete);
+    assert!(!fixture.index.claude_stale_family_carry.contains(&owed));
+    assert_eq!(
+        fixture.index.files[&real].source_file_fingerprint, before,
+        "debt recording does not clear unoffered work"
+    );
+    // No hint or ordinary queue can mask a missing fallback after reload.
+    fixture
+        .index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_directories
+        .clear();
+    fixture
+        .index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_candidates
+        .clear();
+    let path = fixture._scratch.join("oversized-index.json");
+    let loaded = retry_test_reload(&mut fixture.index, &path);
+    let (mut index, scan, selected) = retry_test_page(loaded, &root, CARRY_RETRY, 1);
+    assert_eq!(selected, vec![real.clone()]);
+    assert_eq!(
+        scan.scanned_file_count, 1,
+        "the owed real file actually parses"
+    );
+    assert!(!scan.census_complete);
+    assert_ne!(index.files[&real].source_file_fingerprint, before);
+    let state = index
+        .claude_stale_family_carry
+        .origin
+        .as_ref()
+        .unwrap()
+        .admission
+        .as_ref()
+        .unwrap();
+    assert_eq!(state.oversized_after_path.as_deref(), Some(real.as_str()));
+    assert!(
+        !state.complete,
+        "unoffered missing members still owe service"
+    );
+    let mut loaded = retry_test_reload(&mut index, &path);
+    // An exhausted/red ordinary checkpoint may leave unoffered fallback
+    // members. The actual next start must advance siblings without dropping it.
+    carry_red(&mut loaded, CARRY_RETRY, 7);
+    loaded.claude_reemission_exclusions =
+        ReemissionExclusions::load(&fixture._scratch.join("support"));
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[root],
+        &mut loaded,
+        CARRY_SECOND_RETRY,
+        BACKFILL_WINDOW_DAYS,
+    );
+    let next = loaded
+        .claude_stale_family_carry
+        .origin
+        .as_ref()
+        .unwrap()
+        .admission
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        next.after_root.as_deref(),
+        Some(fixture.roots[2].as_str()),
+        "the real next start covers both later siblings"
+    );
+    assert_eq!(next.oversized_root.as_deref(), Some(owed.as_str()));
+    assert!(
+        !next.complete,
+        "root iteration is not full coverage while fallback is owed"
+    );
+    eprintln!("retry_scheduling_runtime: test=oversized_singleton_keeps_runnable_debt_and_later_siblings_after_reload elapsed_ms={}", started.elapsed().as_millis());
+}
+
+#[test]
+#[ignore = "terminal-off ON-readiness: R13"]
+fn terminal_off_on_oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let mut fixture = retry_durable_fixture(0, 2);
+    let root = fixture
+        ._scratch
+        .join("p".repeat(200))
+        .join("q".repeat(200))
+        .join("r".repeat(200));
+    std::fs::create_dir_all(&root).unwrap();
+    let list = ReemissionExclusions::path(&root.join("support"));
+    std::fs::create_dir_all(list.parent().unwrap()).unwrap();
+    std::fs::write(list, b"").unwrap();
+    let family = fixture.roots[0].clone();
+    let old = std::mem::take(&mut fixture.index.files);
+    let heads = std::mem::take(&mut fixture.index.file_snapshot_fingerprints);
+    for (key, entry) in old {
+        let path = root.join(Path::new(&key).file_name().unwrap());
+        std::fs::write(&path, b"{}\n").unwrap();
+        let new_key = local_index_key(&path);
+        fixture.index.files.insert(new_key.clone(), entry);
+        fixture
+            .index
+            .file_snapshot_fingerprints
+            .insert(new_key, heads[&key].clone());
+    }
+    let real = local_index_key(&root.join(format!("{family}.jsonl")));
+    let template = fixture.index.files[&real].clone();
+    let members = root.join(&family).join("subagents");
+    std::fs::create_dir_all(&members).unwrap();
+    for number in 0..6000 {
+        let stem = format!("agent-{number:016x}");
+        let path = members.join(format!("{stem}.jsonl"));
+        std::fs::write(&path, b"{}\n").unwrap();
+        let key = local_index_key(&path);
+        assert!(key.len() >= 700);
+        let entity = format!("{:x}", Sha256::digest(key.as_bytes()));
+        fixture.index.files.insert(key.clone(), template.clone());
+        fixture
+            .index
+            .file_snapshot_fingerprints
+            .insert(key, BTreeSet::from([entity.clone()]));
+        fixture.index.accepted_snapshot_fingerprints.insert(entity);
+        fixture
+            .index
+            .claude_usage_family_pending
+            .get_mut(&family)
+            .unwrap()
+            .member_request_id_hashes
+            .insert(format!("{family}_{stem}"), BTreeSet::new());
+    }
+    let healthy = fixture.index.files.keys().cloned().collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    // Bind the synthetic accepted heads to the ACTUAL opened scan identity,
+    // not a path hash. All 6000 physical member files remain unchanged below.
+    for key in &healthy {
+        scoped_retry_accept_member(&mut fixture.index, key);
+        let mut census = ScanCensus::default();
+        let mut candidate = candidate_from_traversal_path(
+            SnapshotSource::ClaudeCode,
+            ScanTraversalPath {
+                scan_root: root.clone(),
+                path: PathBuf::from(key),
+                census_member: true,
+                watcher_hint: false,
+            },
+            &mut census,
+            rfc3339_unix_seconds(CARRY_RETRY),
+            BACKFILL_WINDOW_DAYS,
+            &fixture.index.files,
+        )
+        .unwrap();
+        prepare_owned_scan_candidate(
+            SnapshotSource::ClaudeCode,
+            &mut candidate,
+            &CodexTitleMetadata::default(),
+            &ClaudeTitleMetadata::default(),
+            Some(&root.join("support")),
+        );
+        let (candidate, _) = open_and_identify_scan_candidate(
+            SnapshotSource::ClaudeCode,
+            candidate,
+            &mut census,
+            rfc3339_unix_seconds(CARRY_RETRY),
+            BACKFILL_WINDOW_DAYS,
+            &fixture.index.files,
+        )
+        .unwrap();
+        let entry = fixture.index.files.get_mut(key).unwrap();
+        entry.source_file_fingerprint = candidate.source_file_fingerprint.clone();
+        entry.size_bytes = candidate.size_bytes;
+        entry.modified_unix_seconds = candidate.modified_unix_seconds;
+        entry.modified_unix_nanos = Some(candidate.modified_unix_nanos);
+        let record = scoped_retry_record(
+            key,
+            serde_json::json!({
+                "v": claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,
+                "fp": candidate.source_file_fingerprint,
+                "w": rfc3339_unix_seconds(CARRY_FAILED).unwrap(), "s":"exact", "h":"0000000000000001",
+                "bi":rfc3339_unix_seconds(CARRY_FAILED).unwrap(), "bd":1,"bn":1,
+            }),
+        );
+        fixture
+            .index
+            .claude_request_census
+            .insert(key.clone(), record);
+        candidates.push(candidate);
+    }
+    fixture
+        .index
+        .load_claude_reemission_exclusions(&root.join("support"));
+    retry_test_context(&mut fixture.index, &root);
+    assert!(claude_retry_singleton_storage_only(&fixture.index, &family));
+    assert!(
+        matches!(
+            claude_stream_accepted_retry_carry(&fixture.index, &BTreeSet::from([family.clone()])),
+            Err(ClaudeRetryAdmissionRefusal::Structure)
+        ),
+        "real accepted singleton exceeds the unchanged8MiB gate"
+    );
+    let baseline = fixture
+        .index
+        .healthy_custody_digest_for_test(healthy.iter().map(String::as_str));
+    let path = fixture._scratch.join("accepted-singleton-index.json");
+    let mut index = fixture.index;
+    for tick in 0..3 {
+        let seconds = rfc3339_unix_seconds(CARRY_RETRY).unwrap() + tick * 3601;
+        let at = OffsetDateTime::from_unix_timestamp(seconds as i64)
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap();
+        carry_red(&mut index, CARRY_FAILED, 7);
+        index.load_claude_reemission_exclusions(&root.join("support"));
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            &at,
+            BACKFILL_WINDOW_DAYS,
+        );
+        if tick == 0 {
+            // Run the initial START admission batch on its explicit RESUME.
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            &at,
+            BACKFILL_WINDOW_DAYS,
+        );
+        }
+        let state = index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .unwrap()
+            .admission
+            .as_ref()
+            .unwrap();
+        assert!(state.storage_deferred && !state.complete);
+        assert!(
+            state.oversized_root.is_none(),
+            "storage refusal creates no runnable re-arm"
+        );
+        assert!(
+            !index.claude_stale_family_carry.contains(&family),
+            "no carry or proof granted"
+        );
+        assert_eq!(
+            scoped_retry_full_reads(&index, &candidates),
+            0,
+            "zero cold healthy Full reads, tick{tick}"
+        );
+        let traversal = index.traversal.as_mut().unwrap();
+        traversal.pending_directories.clear();
+        traversal.pending_candidates.clear();
+        // Even explicitly offering a healthy root follows the real unchanged
+        // path. Without the fix the fallback seeds/clears healthy members here.
+        traversal.pending_candidates.push_back(ScanTraversalPath {
+            scan_root: root.clone(),
+            path: PathBuf::from(&real),
+            census_member: true,
+            watcher_hint: false,
+        });
+        let (next, scan, _) = retry_test_page(index, &root, &at, 1);
+        assert_eq!(
+            scan.scanned_file_count, 0,
+            "no actual healthy parse/Full read at tick{tick}"
+        );
+        assert!(!scan.census_complete);
+        index = next;
+        assert_eq!(
+            index.healthy_custody_digest_for_test(healthy.iter().map(String::as_str)),
+            baseline
+        );
+        assert!(index.claude_duplicate_request_witness_overflowed);
+        index = retry_test_reload(&mut index, &path);
+    }
+    eprintln!("retry_scheduling_runtime: test=oversized_complete_accepted_singleton_defers_without_healthy_full_reads elapsed_ms={} members={}", started.elapsed().as_millis(), healthy.len());
+}
