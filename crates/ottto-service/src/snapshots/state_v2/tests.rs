@@ -821,7 +821,7 @@ fn f6_restart_between_vacuum_and_metadata_clear_keeps_pending_debt() {
 }
 
 #[test]
-fn f6_backward_clock_does_not_grant_a_restart_purge_attempt() {
+fn f6_overdue_recovery_overrides_a_future_attempt_clock() {
     use std::time::{SystemTime, UNIX_EPOCH};
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
@@ -838,11 +838,12 @@ fn f6_backward_clock_does_not_grant_a_restart_purge_attempt() {
         .as_secs();
     db.control("erasure_since", &(now - 86401)).unwrap();
     db.control("erasure_attempt", &(now + 3600)).unwrap();
-    db.maintenance(true).unwrap();
+    db.before_collection().unwrap();
     let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
-    assert_eq!(stats["vacuum_attempts"], 0);
-    assert_eq!(stats["erasure_overdue"], true);
-    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    assert_eq!(stats["vacuum_attempts"], 1);
+    assert_eq!(stats["erasure_overdue"], false);
+    assert_eq!(stats["erasure_late_completions"], 1);
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
     drop(db);
     assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_ok());
 }
@@ -950,7 +951,8 @@ fn purge_starts_at_twelve_hours_and_busy_source_pauses_at_twenty() {
         serde_json::to_value(db.maintenance_stats()).unwrap()["maintenance_pauses"],
         1
     );
-    // A new deletion must survive the successful-run cooldown.
+    // A new deletion keeps its debt, but deadline recovery overrides the
+    // normal successful-run cooldown before collection is allowed again.
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, b"new private value");
     assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
@@ -958,12 +960,12 @@ fn purge_starts_at_twelve_hours_and_busy_source_pauses_at_twenty() {
     tx.delete(&key).unwrap();
     assert_eq!(tx.commit(3, 4), DurableCommitOutcome::Committed(4));
     age_erasure(&mut db, 25 * 3600);
-    db.maintenance(true).unwrap();
-    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(4));
-    assert_eq!(
-        serde_json::to_value(db.maintenance_stats()).unwrap()["erasure_overdue"],
-        true
-    );
+    db.before_collection().unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
+    let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
+    assert_eq!(stats["erasure_overdue"], false);
+    assert_eq!(stats["erasure_late_completions"], 1);
+    assert_eq!(stats["erasure_breaches"], 1);
 }
 
 #[test]
@@ -1489,4 +1491,134 @@ fn key_admission_matches_for_cached_and_cold_reads() {
         assert!(tx.get(&exhausted).is_err());
         assert!(tx.get(&RowKey::Meta("unregistered".into())).is_err());
     }
+}
+
+#[test]
+fn overdue_external_reader_is_a_breach_and_recovery_precedes_collection() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = traversal("private".into());
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"private prior value");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let reader = sqlite::reader_for_test(&db);
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"replacement");
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    age_erasure(&mut db, 25 * 3600);
+    assert!(db.before_collection().is_err());
+    let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
+    assert_eq!(stats["erasure_breaches"], 1);
+    assert_eq!(stats["erasure_resume_refusals"], 1);
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    drop(reader);
+    // Recovery does not wait for the failed attempt's one-hour backoff.
+    db.before_collection().unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
+    let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
+    assert_eq!(stats["erasure_late_completions"], 1);
+    assert_eq!(stats["erasure_overdue"], false);
+    assert_eq!(
+        db.checkpoint(CheckpointMode::IdleReclaim).wal_bytes,
+        Some(0)
+    );
+}
+
+#[test]
+fn space_recovery_after_restart_purges_before_collection_despite_recent_failure() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = traversal("private".into());
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"private prior value");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    tx.delete(&key).unwrap();
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    age_erasure(&mut db, 25 * 3600);
+    {
+        let _full = sqlite::space_for_test(Some(0));
+        assert!(db.before_collection().is_err());
+        assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+        assert_eq!(
+            serde_json::to_value(db.maintenance_stats()).unwrap()["free_space_admitted"],
+            false
+        );
+    }
+    drop(db);
+    let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
+    db.path_extractor(test_paths);
+    // A recent persisted failure and reset in-memory timers cannot defer the
+    // first post-recovery acquisition. No file collection precedes this call.
+    db.before_collection().unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
+    assert_eq!(
+        serde_json::to_value(db.maintenance_stats()).unwrap()["erasure_late_completions"],
+        1
+    );
+}
+
+#[test]
+fn external_owner_lock_is_counted_without_clearing_overdue_debt() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    db.control("erasure_pending", &1_u64).unwrap();
+    age_erasure(&mut db, 25 * 3600);
+    db.collection_lock_refused("external_lock");
+    let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
+    assert_eq!(stats["erasure_breaches"], 1);
+    assert_eq!(stats["erasure_vacuum_failed"]["external_lock"], 1);
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(1));
+}
+
+#[test]
+fn failed_idle_purge_recovers_before_collection_even_inside_the_deadline() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    db.control("erasure_pending", &1_u64).unwrap();
+    age_erasure(&mut db, 13 * 3600);
+    {
+        let _full = sqlite::space_for_test(Some(0));
+        db.maintenance(true).unwrap();
+        assert!(db.before_collection().is_err());
+    }
+    // Space recovery takes precedence over the recent failure's retry clock.
+    db.before_collection().unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
+    assert_eq!(
+        serde_json::to_value(db.maintenance_stats()).unwrap()["erasure_late_completions"],
+        0
+    );
+}
+
+#[test]
+fn serial_scan_propagates_maintenance_refusal_without_consuming_custody() {
+    let mut index = ScanIndex {
+        generation: 17,
+        ..Default::default()
+    };
+    index
+        .confirmed_empty_files
+        .insert("synthetic-private-path".into());
+    let route = std::sync::Arc::new(Runtime {
+        active: true,
+        session: std::sync::Mutex::new(None),
+    });
+    index.persistence_v2 = Some(route.clone());
+    let before = serde_json::to_vec(&index).unwrap();
+    let result = super::super::scan_source_roots_with_test_limit(
+        super::super::SnapshotSource::ClaudeCode,
+        &[],
+        &mut index,
+        "2026-10-30T12:00:00Z",
+        30,
+        10,
+        false,
+    );
+    assert!(result.is_err());
+    assert_eq!(before, serde_json::to_vec(&index).unwrap());
+    assert!(std::sync::Arc::ptr_eq(
+        index.persistence_v2.as_ref().unwrap(),
+        &route
+    ));
 }

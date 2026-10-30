@@ -811,3 +811,5 @@ impl StorageLimits {
 
 // ACK recovery owns no routing or import decisions.
 pub(crate) mod ack;
+// OPS-only maintenance and counts/bytes/times diagnostics seams.
+pub(super) use runtime::before_collection;

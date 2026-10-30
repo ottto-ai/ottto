@@ -6299,6 +6299,7 @@ fn prepare_sync_source_inner(
     };
     let (mut index, load_origin) =
         ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
+    crate::snapshots::state_v2_before_collection(&index)?;
     index.require_persistence_available()?;
     let mut upload_progress = match legacy_progress {
         Some(progress) => progress,

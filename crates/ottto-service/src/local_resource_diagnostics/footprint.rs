@@ -307,6 +307,17 @@ fn resident() -> Option<u64> {
     current()
 }
 
+// State-v2 physical footprint never substitutes resident size on failure.
+impl Stage {
+    pub(super) fn begin_phys_footprint() -> Option<Self> {
+        static SAMPLER: OnceLock<Option<Arc<Sampler>>> = OnceLock::new();
+        SAMPLER
+            .get_or_init(|| Sampler::spawn(|| super::state_v2_memory().phys_footprint_bytes))
+            .as_ref()?
+            .begin()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

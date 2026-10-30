@@ -874,3 +874,8 @@ pub(in super::super) fn erase_tree(support: &Path) -> Result<()> {
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod tests;
+
+// OPS maintenance boundary; routing/import/ACK remain owned by their adapters.
+#[path = "runtime_ops.rs"]
+mod ops;
+pub(in super::super) use ops::before_collection;

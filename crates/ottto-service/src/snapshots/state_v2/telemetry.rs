@@ -13,6 +13,10 @@ struct Stats {
     cpu_per_pass_us: Distribution,
     rss_bytes: Rss,
     hydrate_count: u64,
+    stage_memory: BTreeMap<&'static str, MemoryWindow>,
+    retained_heap_bytes: BTreeMap<&'static str, RetainedHeap>,
+    decoded_per_pass: Decoded,
+    bytes_written_per_pass: Option<u64>,
     import_peak_rss_bytes: Option<u64>,
     v1_load_peak_rss_bytes: Option<u64>,
     import_exceeds_v1_load: Option<bool>,
@@ -55,6 +59,13 @@ fn stats() -> &'static Mutex<Stats> {
     STATS.get_or_init(|| Mutex::new(Stats::default()))
 }
 pub(super) fn event(name: &'static str, value: &impl Serialize) {
+    if name == "route" {
+        if let Ok(value) = serde_json::to_value(value) {
+            PASS.with(|pass| {
+                pass.borrow_mut().active = matches!(value.as_str(), Some("v2" | "v2_cached"))
+            });
+        }
+    }
     if let Ok(mut stats) = stats().lock() {
         let count = stats.events.entry(name).or_default();
         *count = count.saturating_add(1);
@@ -86,6 +97,10 @@ pub(in super::super) struct Stage {
 }
 impl Stage {
     pub(super) fn new(kind: Kind) -> Self {
+        if matches!(kind, Kind::Hydrate) {
+            PASS.with(|pass| pass.borrow_mut().active = true);
+            initialize_pass();
+        }
         Self {
             kind,
             probe: crate::local_resource_diagnostics::StateV2Probe::begin(),
@@ -111,7 +126,7 @@ impl Stage {
             return;
         }
         self.finished = true;
-        let (cpu, steady, peak) = self.probe.finish();
+        let (_cpu, steady, peak) = self.probe.finish();
         if let Ok(mut stats) = stats().lock() {
             if matches!(self.kind, Kind::Hydrate) {
                 stats.hydrate_count = stats.hydrate_count.saturating_add(1);
@@ -134,12 +149,20 @@ impl Stage {
                     };
                 }
                 Kind::Save | Kind::Hydrate => {
-                    if let Some(cpu) = cpu {
-                        stats.cpu_per_pass_us.observe(cpu);
-                    }
                     stats.rss_bytes.steady = steady;
                     stats.rss_bytes.peak = stats.rss_bytes.peak.into_iter().chain(peak).max();
                 }
+            }
+            if matches!(self.kind, Kind::Save | Kind::Hydrate) {
+                let (current, peak) = self.probe.memory();
+                stats.stage_memory.insert(
+                    if matches!(self.kind, Kind::Save) {
+                        "save"
+                    } else {
+                        "hydrate"
+                    },
+                    MemoryWindow { current, peak },
+                );
             }
             crate::local_resource_diagnostics::claude_state_v2(&*stats);
         }
@@ -196,5 +219,395 @@ pub(super) fn process_written_bytes() -> Option<u64> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         None
+    }
+}
+
+#[derive(Clone, Copy, Default, Serialize)]
+struct Decoded {
+    rows: u64,
+    headers: u64,
+    chunks: u64,
+}
+#[derive(Default)]
+struct Pass {
+    active: bool,
+    cpu_start: Option<u64>,
+    written_start: Option<u64>,
+    decoded: Decoded,
+    acquire_sampled: bool,
+    cached_sampled: bool,
+    initialized: bool,
+}
+thread_local! {
+    static PASS: std::cell::RefCell<Pass> = std::cell::RefCell::new(Pass::default());
+}
+pub(in super::super) fn pass_start() {
+    PASS.with(|pass| {
+        *pass.borrow_mut() = Pass {
+            cpu_start: crate::local_resource_diagnostics::state_v2_cpu_us(),
+            written_start: process_written_bytes(),
+            ..Default::default()
+        }
+    });
+}
+pub(super) fn sample_cached_graph() -> bool {
+    PASS.with(|pass| !std::mem::replace(&mut pass.borrow_mut().cached_sampled, true))
+}
+pub(in super::super) fn phase(name: &'static str) {
+    if !PASS.with(|pass| pass.borrow().active) {
+        return;
+    }
+    initialize_pass();
+    let memory = crate::local_resource_diagnostics::state_v2_memory();
+    if let Ok(mut stats) = stats().lock() {
+        stats.stage_memory.insert(
+            name,
+            MemoryWindow {
+                current: memory,
+                peak: Default::default(),
+            },
+        );
+        crate::local_resource_diagnostics::claude_state_v2(&*stats);
+    }
+}
+pub(in super::super) fn acquired(index: &ScanIndex) {
+    if !super::state_v2_growth_retention_active(index) {
+        return;
+    }
+    let first = PASS.with(|pass| {
+        let mut pass = pass.borrow_mut();
+        pass.active = true;
+        !std::mem::replace(&mut pass.acquire_sampled, true)
+    });
+    if first {
+        phase("acquire");
+    }
+}
+pub(in super::super) fn retained_pass_end(index: &ScanIndex) {
+    if super::state_v2_growth_retention_active(index) {
+        retained(index, "active_graph");
+    }
+}
+pub(in super::super) fn plateau() {
+    if !PASS.with(|pass| pass.borrow().active) {
+        return;
+    }
+    phase("post_pass_plateau");
+    PASS.with(|pass| {
+        let mut pass = pass.borrow_mut();
+        if !pass.active {
+            return;
+        }
+        if let Ok(mut stats) = stats().lock() {
+            if let Some(cpu) = pass
+                .cpu_start
+                .take()
+                .zip(crate::local_resource_diagnostics::state_v2_cpu_us())
+                .and_then(|(a, b)| b.checked_sub(a))
+            {
+                stats.cpu_per_pass_us.observe(cpu);
+            }
+            stats.bytes_written_per_pass = pass
+                .written_start
+                .take()
+                .zip(process_written_bytes())
+                .and_then(|(a, b)| b.checked_sub(a));
+            stats.decoded_per_pass = pass.decoded;
+            crate::local_resource_diagnostics::claude_state_v2(&*stats);
+        }
+        pass.active = false;
+    });
+}
+/// Successful physical decodes, including repeated reads for checks/encoding.
+/// Thread-local counters never carry record keys and reset at prepare.
+pub(super) fn decoded(rows: u64, headers: u64, chunks: u64) {
+    PASS.with(|pass| {
+        let mut pass = pass.borrow_mut();
+        pass.decoded.rows = pass.decoded.rows.saturating_add(rows);
+        pass.decoded.headers = pass.decoded.headers.saturating_add(headers);
+        pass.decoded.chunks = pass.decoded.chunks.saturating_add(chunks);
+    });
+}
+
+#[derive(Default, Serialize)]
+struct RetainedHeap {
+    account_pending: Option<u64>,
+    usage_pending: Option<u64>,
+    #[serde(rename = "family.requests")]
+    family_requests: Option<u64>,
+    census: Option<u64>,
+    side_maps: Option<u64>,
+    files: Option<u64>,
+}
+/// Existing requested-layout accounting, excluding inline stack slots. Shared
+/// Arc buffers are conservatively charged to each owning graph. No JSON size
+/// is substituted for heap, and opaque/unsupported layouts remain unavailable.
+fn heap<T: crate::heap_layout_bound::HeapLayoutBound>(value: &T) -> Option<u64> {
+    crate::heap_layout_bound::completed_bound(value, usize::MAX)?
+        .checked_sub(std::mem::size_of_val(value))?
+        .try_into()
+        .ok()
+}
+pub(super) fn retained(index: &ScanIndex, owner: &'static str) {
+    initialize_pass();
+    let observation = retained_heap(index);
+    if let Ok(mut stats) = stats().lock() {
+        stats.retained_heap_bytes.insert(owner, observation);
+        crate::local_resource_diagnostics::claude_state_v2(&*stats);
+    }
+}
+fn retained_heap(index: &ScanIndex) -> RetainedHeap {
+    let family_requests = index
+        .claude_usage_family_pending
+        .values()
+        .try_fold(0_u64, |sum, p| {
+            sum.checked_add(heap(&p.member_request_id_hashes)?)
+        });
+    let usage_pending = heap(&index.claude_usage_family_pending)
+        .zip(family_requests)
+        .and_then(|(all, requests)| all.checked_sub(requests));
+    RetainedHeap {
+        account_pending: heap(&index.claude_account_family_pending),
+        usage_pending,
+        family_requests,
+        census: heap(&index.claude_request_census),
+        files: heap(&index.files),
+        side_maps: side_maps(index),
+    }
+}
+fn side_maps(index: &ScanIndex) -> Option<u64> {
+    let mut bytes = 0_u64;
+    bytes = bytes.checked_add(heap(&index.growth_retention)?)?;
+    bytes = bytes.checked_add(heap(&index.persistence_legacy_recovery)?)?;
+    bytes = bytes.checked_add(heap(&index.persistence_root)?)?;
+    bytes = bytes.checked_add(heap(&index.persistence_unavailable)?)?;
+    bytes = bytes.checked_add(heap(&index.persistence_controls)?)?;
+    bytes = bytes.checked_add(heap(&index.decode_holds)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_account_window_retention)?)?;
+    bytes = bytes.checked_add(heap(&index.schema_version)?)?;
+    bytes = bytes.checked_add(heap(&index.generation)?)?;
+    bytes = bytes.checked_add(heap(&index.upload_ack_retirement_handoff)?)?;
+    bytes = bytes.checked_add(heap(&index.upload_context_fingerprint)?)?;
+    bytes = bytes.checked_add(heap(&index.session_account_bindings)?)?;
+    bytes = bytes.checked_add(heap(&index.terminal_jsonl_dispositions)?)?;
+    bytes = bytes.checked_add(heap(&index.known_configured_scan_roots)?)?;
+    bytes = bytes.checked_add(heap(&index.legacy_unresolved_root_file_witnesses)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_state_only_snapshot_fingerprints)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_state_only_blocked_session_ids)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_state_only_blocked_by_file)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_state_only_blocked_unattributed)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_state_only_blocked_legacy)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_state_only_blocked_attributed)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_parent_ownership_refs)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_parent_ownership_ledgers)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_parent_side_requests)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_parent_side)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_parent_side_generation)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_parent_proof_wrap_epoch)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_parent_prefix_proofs)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_parent_proof_cursor)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_parent_side_cursor)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_parent_proof_seq)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_proof_index_incarnation)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_proof_index_minted)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_parent_proof_parents_live)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_desktop_title_files)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_account_family_witnesses)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_usage_family_witnesses)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_request_census_shadow)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_usage_authority_quarantine)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_retired_family_tombstones)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_retired_family_tombstones_initialized)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_retired_family_tombstones_uncertain)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_duplicate_request_owners)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_duplicate_request_witness_overflowed)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_owned_start_census)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_account_deferred_holds)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_duplicate_fence_rearm_attempt)?)?;
+    bytes = bytes.checked_add(heap(
+        &index.claude_duplicate_fence_next_full_rearm_unix_seconds,
+    )?)?;
+    bytes = bytes.checked_add(heap(&index.claude_full_rearm_progress)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_request_identity_contract)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_request_identity_contract_changed)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_desktop_store_cursor)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_desktop_store_upper_bound)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_desktop_store_sweep_had_errors)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_desktop_identity_census_complete)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_desktop_lineage_census_complete)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_desktop_census_witness)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_desktop_store_retry_attempt)?)?;
+    bytes = bytes.checked_add(heap(
+        &index.claude_desktop_store_retry_not_before_unix_seconds,
+    )?)?;
+    bytes = bytes.checked_add(heap(&index.resume_after_path)?)?;
+    bytes = bytes.checked_add(heap(&index.resume_upper_bound_path)?)?;
+    bytes = bytes.checked_add(heap(&index.resume_census_window_end)?)?;
+    bytes = bytes.checked_add(heap(&index.bounded_sweep_had_unsettled_upload)?)?;
+    bytes = bytes.checked_add(heap(&index.bounded_sweep_unsettled_causes)?)?;
+    bytes = bytes.checked_add(heap(&index.traversal)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_stale_family_carry)?)?;
+    bytes = bytes.checked_add(heap(&index.scan_residue_witness)?)?;
+    bytes = bytes.checked_add(heap(&index.historical_replay_generation)?)?;
+    bytes = bytes.checked_add(heap(&index.context_curve_capability_enabled)?)?;
+    bytes = bytes.checked_add(heap(&index.context_curve_replay_epoch)?)?;
+    bytes = bytes.checked_add(heap(&index.completed_context_curve_replay_generation)?)?;
+    bytes = bytes.checked_add(heap(&index.confirmed_empty_files)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_counting_moved_evidence)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_counting_tombstones)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_counting_evicted_legacy)?)?;
+    bytes = bytes.checked_add(heap(&index.codex_counting_evictions)?)?;
+    bytes = bytes.checked_add(heap(&index.file_snapshot_fingerprints)?)?;
+    bytes = bytes.checked_add(heap(&index.snapshot_activity_at)?)?;
+    bytes = bytes.checked_add(heap(&index.accepted_snapshot_fingerprints)?)?;
+    bytes = bytes.checked_add(heap(&index.accepted_snapshot_fingerprint_ledger_version)?)?;
+    bytes = bytes.checked_add(heap(&index.legacy_settlement_reconcile_after_fingerprint)?)?;
+    bytes = bytes.checked_add(heap(&index.quarantined_snapshot_fingerprints)?)?;
+    bytes = bytes.checked_add(heap(&index.active_quarantine_witness)?)?;
+    bytes = bytes.checked_add(heap(&index.active_upload_context_fingerprint)?)?;
+    bytes = bytes.checked_add(heap(&index.file_upload_context_enabled)?)?;
+    bytes = bytes.checked_add(heap(&index.context_read_counts)?)?;
+    bytes = bytes.checked_add(heap(&index.active_effective_upload_body_witness_revision)?)?;
+    bytes = bytes.checked_add(heap(
+        &index.active_effective_upload_body_witness_revision_monotone,
+    )?)?;
+    bytes = bytes.checked_add(heap(
+        &index.effective_upload_body_witness_revision_excluded_source_files,
+    )?)?;
+    bytes = bytes.checked_add(heap(&index.claude_reemission_exclusions)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_history_cutoff_unix_seconds)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_history_gate_loaded)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_history_move_not_full)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_history_move_released)?)?;
+    bytes = bytes.checked_add(heap(&index.accepted_incidence_pending_census)?)?;
+    bytes = bytes.checked_add(heap(&index.accepted_rebuild_incidence)?)?;
+    bytes = bytes.checked_add(heap(&index.accepted_rebuild_pending_since_unix_seconds)?)?;
+    bytes = bytes.checked_add(heap(&index.accepted_rebuild_last_alarm_unix_seconds)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_no_list_policy)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_history_emission)?)?;
+    bytes = bytes.checked_add(heap(&index.reason_reoffer_retries)?)?;
+    bytes = bytes.checked_add(heap(&index.terminal_contract_retries)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_history_unverified_in_process)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_rebuild_read_load_eligible)?)?;
+    bytes = bytes.checked_add(heap(&index.reason_reoffer_cooldowns)?)?;
+    bytes = bytes.checked_add(heap(&index.retired_reread_guard)?)?;
+    bytes = bytes.checked_add(heap(&index.held_audit_progress)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_money_birth_store)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_desktop_store_inventory)?)?;
+    Some(bytes)
+}
+
+#[derive(Serialize)]
+struct MemoryWindow {
+    current: crate::local_resource_diagnostics::StateV2Memory,
+    peak: crate::local_resource_diagnostics::StateV2Memory,
+}
+/// RAII stage window; fixed label, two bounded shared samplers, no identifiers.
+pub(in super::super) struct Window {
+    name: &'static str,
+    probe: crate::local_resource_diagnostics::StateV2Probe,
+}
+impl Window {
+    pub(in super::super) fn begin(name: &'static str) -> Option<Self> {
+        if !PASS.with(|p| p.borrow().active) {
+            return None;
+        }
+        initialize_pass();
+        Some(Self {
+            name,
+            probe: crate::local_resource_diagnostics::StateV2Probe::begin(),
+        })
+    }
+}
+impl Drop for Window {
+    fn drop(&mut self) {
+        let (current, peak) = self.probe.memory();
+        if let Ok(mut stats) = stats().lock() {
+            stats
+                .stage_memory
+                .insert(self.name, MemoryWindow { current, peak });
+            crate::local_resource_diagnostics::claude_state_v2(&*stats);
+        }
+    }
+}
+fn initialize_pass() {
+    let first = PASS.with(|pass| !std::mem::replace(&mut pass.borrow_mut().initialized, true));
+    if first {
+        if let Ok(mut stats) = stats().lock() {
+            stats.stage_memory.clear();
+            stats.retained_heap_bytes.clear();
+        }
+    }
+}
+
+pub(in super::super) fn acquire_window(index: &ScanIndex) -> Option<Window> {
+    if !super::state_v2_growth_retention_active(index) || PASS.with(|p| p.borrow().acquire_sampled)
+    {
+        return None;
+    }
+    Window::begin("acquire")
+}
+
+#[cfg(test)]
+mod ops_tests {
+    use super::*;
+
+    #[test]
+    fn pass_reset_is_thread_local_and_off_windows_have_no_probe() {
+        PASS.with(|p| {
+            let mut p = p.borrow_mut();
+            p.active = true;
+            p.decoded.rows = 19;
+            p.acquire_sampled = true;
+        });
+        pass_start();
+        PASS.with(|p| {
+            let p = p.borrow();
+            assert!(!p.active);
+            assert_eq!(p.decoded.rows, 0);
+            assert!(!p.acquire_sampled);
+        });
+        assert!(Window::begin("finish").is_none());
+        decoded(2, 3, 4);
+        PASS.with(|p| {
+            let p = p.borrow();
+            assert_eq!(
+                (p.decoded.rows, p.decoded.headers, p.decoded.chunks),
+                (2, 3, 4)
+            );
+        });
+    }
+
+    #[test]
+    fn family_requests_heap_is_separate_and_diagnostics_never_contain_its_text() {
+        let mut index = ScanIndex::default();
+        index.claude_usage_family_pending.insert(
+            "synthetic-private-family".into(),
+            super::super::super::ClaudeUsageFamilyPending {
+                census_window_end: "synthetic-window".into(),
+                member_request_id_hashes: BTreeMap::from([(
+                    "synthetic-private-member".into(),
+                    std::collections::BTreeSet::from(["synthetic-private-request".repeat(256)]),
+                )]),
+                member_occurrences: BTreeMap::new(),
+                invalid: false,
+                idless_revision: None,
+            },
+        );
+        let observation = retained_heap(&index);
+        if crate::heap_layout_bound::layout_supported() {
+            assert!(observation.family_requests.unwrap() > 4096);
+            assert!(observation.usage_pending.unwrap() > 0);
+            assert_eq!(
+                observation.usage_pending.unwrap() + observation.family_requests.unwrap(),
+                heap(&index.claude_usage_family_pending).unwrap()
+            );
+        } else {
+            assert!(observation.usage_pending.is_none());
+            assert!(observation.family_requests.is_none());
+        }
+        let json = serde_json::to_string(&observation).unwrap();
+        assert!(!json.contains("synthetic-private"));
+        assert!(json.contains("family.requests"));
     }
 }

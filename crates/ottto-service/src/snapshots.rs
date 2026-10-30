@@ -25619,6 +25619,7 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
     context_curve_enabled: bool,
 ) -> Result<SourceScanResult> {
     index.require_persistence_available()?;
+    state_v2::before_collection(index)?;
 
     let mut state = OwnedSourceScan::new(
         source,
@@ -25634,6 +25635,12 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         context_curve_enabled,
     );
     loop {
+        // A refusal is terminal for this attempt, not cooperative progress.
+        // Restore the resident graph before returning through the Result API.
+        if let Err(error) = state_v2::before_collection(&state.index) {
+            *index = state.index;
+            return Err(error);
+        }
         match state.step(attribution_context) {
             OwnedSourceScanStep::Pending(next) => state = next,
             OwnedSourceScanStep::Complete {
@@ -26370,6 +26377,9 @@ impl OwnedSourceScan {
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
     ) -> Self {
+        let _select_window = state_v2::state_v2_growth_retention_active(&owned_index)
+            .then(|| state_v2::telemetry::Window::begin("select"))
+            .flatten();
         let file_limit = state_v2::collection_page_limit(&owned_index, file_limit);
         if !owned_index.persistence_available() {
             // No inventory, selection or provider I/O for an unavailable index.
@@ -27106,6 +27116,9 @@ impl OwnedSourceScan {
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
         credit: &mut Option<crate::source_rotation::PaidReservation>,
     ) -> Result<OwnedSourceScanStep, crate::source_rotation::LocalRefusal> {
+        state_v2::before_collection(&self.index).map_err(|_| {
+            crate::source_rotation::LocalRefusal("state_v2_maintenance_before_collection")
+        })?;
         self.step_with_capture_credit(attribution_context, Some(credit))
     }
 
@@ -27117,7 +27130,13 @@ impl OwnedSourceScan {
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
             self.source == SnapshotSource::ClaudeCode,
         );
+        let _acquire_window = state_v2::telemetry::acquire_window(&self.index);
         let mut result = self.step_with_capture_credit_inner(attribution_context, capture_credit);
+        match &result {
+            Ok(OwnedSourceScanStep::Pending(scan)) => state_v2::telemetry::acquired(&scan.index),
+            Ok(OwnedSourceScanStep::Complete { index, .. }) => state_v2::telemetry::acquired(index),
+            Err(_) => {}
+        }
         let counts = diagnostics.finish();
         if let Ok(OwnedSourceScanStep::Pending(scan)) = &mut result {
             scan.resource_probe.page_events.merge(counts);
@@ -44423,10 +44442,15 @@ fn take_codex_parse_reason_lines_for_test() -> Vec<String> {
 
 struct CheckpointLock {
     file: File,
+    path: PathBuf,
+    maintenance: bool,
 }
 
 impl CheckpointLock {
     fn acquire(path: &Path) -> Result<Self> {
+        Self::acquire_mode(path, false)
+    }
+    fn acquire_mode(path: &Path, maintenance: bool) -> Result<Self> {
         let lock_path = path.with_extension("lock");
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent)
@@ -44439,6 +44463,15 @@ impl CheckpointLock {
             .truncate(false)
             .open(&lock_path)
             .context("open local snapshot checkpoint lock")?;
+        // Serialize registration with a pending maintenance request. Only the
+        // due Claude source uses priority; ordinary flock behavior is preserved.
+        let mut owners = checkpoint_owners()
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checkpoint_owner_registry"))?;
+        if !maintenance && owners.maintenance.contains(path) {
+            anyhow::bail!("state_v2_maintenance_pause");
+        }
         #[cfg(unix)]
         {
             let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -44447,15 +44480,28 @@ impl CheckpointLock {
                     .context("local snapshot checkpoint is owned by another daemon");
             }
         }
-        Ok(Self { file })
+        owners.owned.insert(path.to_owned());
+        Ok(Self {
+            file,
+            path: path.to_owned(),
+            maintenance,
+        })
     }
 }
 
 impl Drop for CheckpointLock {
     fn drop(&mut self) {
+        let mut owners = checkpoint_owners().0.lock().ok();
         #[cfg(unix)]
         unsafe {
             libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+        if let Some(owners) = owners.as_mut() {
+            owners.owned.remove(&self.path);
+            if self.maintenance {
+                owners.maintenance.remove(&self.path);
+            }
+            checkpoint_owners().1.notify_all();
         }
     }
 }
@@ -47989,6 +48035,9 @@ impl ScanIndex {
         read_limit: Option<usize>,
         claim_only: bool,
     ) -> Result<()> {
+        let _save_window = state_v2::state_v2_growth_retention_active(self)
+            .then(|| state_v2::telemetry::Window::begin("save"))
+            .flatten();
         self.require_persistence_available()?;
         lenient_decode::retain_persistence_claims(self);
         if !claim_only {
@@ -92643,7 +92692,9 @@ pub(crate) fn erase_claude_state_v2_artifacts(support: &Path) -> Result<()> {
     state_v2::erase_tree(support)
 }
 pub(crate) fn maintain_state_v2_idle(path: &Path, index: &ScanIndex, quiet: bool) -> Result<()> {
-    state_v2::idle(path, index, quiet)
+    let result = state_v2::idle(path, index, quiet);
+    state_v2::telemetry::retained_pass_end(index);
+    result
 }
 pub(crate) fn state_v2_side_effect_guard(
     path: &Path,
@@ -92726,3 +92777,131 @@ fn candidate_from_traversal_path_at(
 
 // Opaque v2-only companion for the unchanged upload-progress store.
 pub(crate) use state_v2::ack::ProgressRecovery;
+// OPS diagnostics bridges; the private storage module stays private.
+pub(crate) fn state_v2_pass_start() {
+    state_v2::telemetry::pass_start();
+}
+pub(crate) fn state_v2_prepare_observed() {
+    state_v2::telemetry::phase("prepare");
+}
+pub(crate) fn state_v2_finish_window() -> Option<impl Drop> {
+    state_v2::telemetry::Window::begin("finish")
+}
+pub(crate) fn state_v2_post_pass_observed() {
+    state_v2::telemetry::plateau();
+}
+
+pub(crate) fn state_v2_before_collection(index: &ScanIndex) -> Result<()> {
+    state_v2::before_collection(index)
+}
+
+#[derive(Default)]
+struct CheckpointOwners {
+    owned: BTreeSet<PathBuf>,
+    maintenance: BTreeSet<PathBuf>,
+}
+fn checkpoint_owners() -> &'static (Mutex<CheckpointOwners>, std::sync::Condvar) {
+    static OWNERS: std::sync::OnceLock<(Mutex<CheckpointOwners>, std::sync::Condvar)> =
+        std::sync::OnceLock::new();
+    OWNERS.get_or_init(|| {
+        (
+            Mutex::new(CheckpointOwners::default()),
+            std::sync::Condvar::new(),
+        )
+    })
+}
+impl CheckpointLock {
+    /// Reserve the next lock turn before waiting for this process's owner.
+    /// New normal work yields; another process's flock is a counted failure.
+    fn acquire_for_maintenance(path: &Path) -> Result<Self> {
+        let registry = checkpoint_owners();
+        let mut owners = registry
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checkpoint_owner_registry"))?;
+        anyhow::ensure!(
+            owners.maintenance.insert(path.to_owned()),
+            "state_v2_own_maintenance_busy"
+        );
+        registry.1.notify_all();
+        struct Reservation<'a>(&'a Path);
+        impl Drop for Reservation<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut owners) = checkpoint_owners().0.lock() {
+                    owners.maintenance.remove(self.0);
+                    checkpoint_owners().1.notify_all();
+                }
+            }
+        }
+        let reservation = Reservation(path);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while owners.owned.contains(path) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                drop(owners);
+                anyhow::bail!("state_v2_own_lock_busy");
+            }
+            owners = registry
+                .1
+                .wait_timeout(owners, remaining)
+                .map_err(|_| anyhow::anyhow!("checkpoint_owner_registry"))?
+                .0;
+        }
+        drop(owners);
+        let lock = Self::acquire_mode(path, true)?;
+        // The lock's Drop now owns the reservation.
+        std::mem::forget(reservation);
+        Ok(lock)
+    }
+}
+
+#[cfg(test)]
+mod state_v2_maintenance_lock_tests {
+    use super::*;
+
+    #[test]
+    fn maintenance_reserves_the_next_turn_ahead_of_our_normal_work() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-ops-lock-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("index.json");
+        let normal = CheckpointLock::acquire(&path).unwrap();
+        let (entered, acquired) = std::sync::mpsc::channel();
+        let (release, finish) = std::sync::mpsc::channel();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            let maintenance = CheckpointLock::acquire_for_maintenance(&worker_path).unwrap();
+            entered.send(()).unwrap();
+            finish
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            drop(maintenance);
+        });
+        let (owners, _) = checkpoint_owners()
+            .1
+            .wait_timeout_while(
+                checkpoint_owners().0.lock().unwrap(),
+                std::time::Duration::from_secs(1),
+                |owners| !owners.maintenance.contains(&path),
+            )
+            .unwrap();
+        assert!(owners.maintenance.contains(&path));
+        drop(owners);
+        assert!(CheckpointLock::acquire(&path).is_err());
+        drop(normal);
+        acquired
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        assert!(CheckpointLock::acquire(&path).is_err());
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        drop(CheckpointLock::acquire(&path).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+}
