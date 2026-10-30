@@ -12,6 +12,7 @@ pub(crate) mod claude_contract;
 pub(crate) mod claude_reread;
 pub(crate) mod codex_memo_lifecycle;
 pub(crate) mod codex_side_lifecycle;
+mod footprint;
 pub(crate) mod rearm_cause;
 
 #[cfg(not(test))]
@@ -501,6 +502,12 @@ impl Probe {
             index_reuse_skips: std::cell::Cell::new(0),
         }
     }
+    fn stage_observation(&self, footprint: Option<&footprint::Stage>) -> Observation {
+        let mut observation = self.observation();
+        observation.footprint =
+            footprint.map_or_else(footprint::unavailable, footprint::Stage::finish);
+        observation
+    }
     #[cfg(feature = "replay-harness")]
     pub(crate) fn index_reuse_skip(&self) {
         self.index_reuse_skips
@@ -645,6 +652,8 @@ struct Observation {
     shared_process_cpu_delta_us: Option<u64>,
     process_lifetime_max_rss_bytes: Option<u64>,
     process_lifetime_max_rss_before_bytes: Option<u64>,
+    #[serde(flatten)]
+    footprint: footprint::Observation,
 }
 impl Observation {
     fn between(wall: u64, before: Option<ProcessSample>, after: Option<ProcessSample>) -> Self {
@@ -654,6 +663,7 @@ impl Observation {
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: wall,
+            footprint: Default::default(),
             shared_process_cpu_delta_us: before
                 .zip(after)
                 .and_then(|(before, after)| after.cpu_us.checked_sub(before.cpu_us)),
@@ -678,6 +688,23 @@ pub(crate) fn account_hash_changed(session_key: &str) {
     });
 }
 
+/// Local prepare window, including index load/baseline work before page probes.
+/// Return values and errors pass through; unwinding closes sampling silently.
+pub(crate) fn source_prepare<T>(source: &str, inner: impl FnOnce() -> T) -> T {
+    let probe = Probe::start();
+    let footprint = footprint::Stage::begin();
+    let result = inner();
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage: "source_prepare",
+        source: Source::from_slug(source),
+        observation: probe.stage_observation(footprint.as_ref()),
+        counts: BTreeMap::<&str, u64>::new(),
+    });
+    result
+}
+
 /// Observe only a normally returned finish; move its value/error through unchanged.
 /// A panic drops the probe silently. Outcome reporting remains with the caller.
 pub(crate) fn source_finish<T>(
@@ -690,13 +717,14 @@ pub(crate) fn source_finish<T>(
     }
     ACCOUNT_HASH_CHANGED.with(|sessions| sessions.borrow_mut().clear());
     let probe = Probe::start();
+    let footprint = footprint::Stage::begin();
     let result = inner();
     emit(&Record {
         schema_version: SCHEMA_VERSION,
         process_id: std::process::id(),
         stage: "source_finish",
         source: Source::from_slug(source),
-        observation: probe.observation(),
+        observation: probe.stage_observation(footprint.as_ref()),
         counts: Counts {
             account_hash_changed: ACCOUNT_HASH_CHANGED.with(|sessions| {
                 let count = sessions.borrow().len() as u64;
@@ -734,6 +762,7 @@ pub(crate) fn codex_census_fence(
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: 0,
+            footprint: Default::default(),
             shared_process_cpu_delta_us: None,
             process_lifetime_max_rss_bytes: None,
             process_lifetime_max_rss_before_bytes: None,
@@ -916,6 +945,7 @@ pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl S
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: 0,
+            footprint: Default::default(),
             shared_process_cpu_delta_us: None,
             process_lifetime_max_rss_bytes: None,
             process_lifetime_max_rss_before_bytes: None,
@@ -1296,6 +1326,7 @@ pub(crate) fn sampled_audit_comparison(
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: 0,
+            footprint: Default::default(),
             shared_process_cpu_delta_us: None,
             process_lifetime_max_rss_bytes: None,
             process_lifetime_max_rss_before_bytes: None,
@@ -1988,6 +2019,50 @@ mod tests {
     }
 
     #[test]
+    fn footprint_fields_are_stage_only_for_all_native_sources() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (result, records) = capture(|| {
+                source_prepare(source, || {
+                    source_finish(source, || Ok::<_, anyhow::Error>(17))
+                })
+            });
+            assert_eq!(result.unwrap(), 17);
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0]["stage"], "source_finish");
+            assert_eq!(records[1]["stage"], "source_prepare");
+            for record in records {
+                assert_eq!(record["source"], source);
+                assert!(record["observation"]["footprint_sample_failures"].is_u64());
+                let row = &record["observation"];
+                if let Some(peak) = row["stage_peak_footprint_bytes"].as_u64() {
+                    for endpoint in ["stage_start_footprint_bytes", "stage_end_footprint_bytes"] {
+                        if let Some(bytes) = row[endpoint].as_u64() {
+                            assert!(peak >= bytes);
+                        }
+                    }
+                    assert!(row["footprint_samples"].as_u64().unwrap() >= 1);
+                }
+            }
+        }
+        let (_, records) = capture(|| {
+            drop(UploadCall::start("codex"));
+            traversal_point("synthetic", "pi", &BTreeMap::<&str, u64>::new());
+        });
+        let page = serde_json::to_value(Probe::start().observation()).unwrap();
+        for row in records.iter().map(|r| &r["observation"]).chain([&page]) {
+            for field in [
+                "stage_peak_footprint_bytes",
+                "stage_start_footprint_bytes",
+                "stage_end_footprint_bytes",
+                "footprint_samples",
+                "footprint_sample_failures",
+            ] {
+                assert!(row.get(field).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn resource_finish_success_preserves_value_and_contains_batch_window() {
         let value = Box::new(17);
         let original = std::ptr::from_ref(value.as_ref());
@@ -2598,4 +2673,115 @@ mod continuation_tests {
             );
         }
     }
+}
+
+/// Fixed low-cardinality storage observations on the existing #799 envelope.
+pub(crate) fn scan_index_storage(
+    source: &'static str,
+    orphans: u64,
+    reserved: u64,
+    unavailable: [[u64; 6]; 3],
+) {
+    #[cfg(test)]
+    SCAN_INDEX_STORAGE_OBSERVATIONS.with(|v| v.borrow_mut().push((orphans, unavailable, reserved)));
+
+    static TOTAL_ORPHANS: AtomicU64 = AtomicU64::new(0);
+    static ROOT_MISSING_RESERVED_ONLY: AtomicU64 = AtomicU64::new(0);
+    static UNAVAILABLE: [[AtomicU64; 6]; 3] = [const { [const { AtomicU64::new(0) }; 6] }; 3];
+    let add = |counter: &AtomicU64, n: u64| {
+        counter
+            .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(n)))
+            .unwrap_or_else(|v| v)
+            .saturating_add(n)
+    };
+    let reserved_total = add(&ROOT_MISSING_RESERVED_ONLY, reserved);
+    if reserved != 0 {
+        traversal_point(
+            "scan_index_storage",
+            source,
+            &BTreeMap::from([("root_missing_reserved_only", reserved_total)]),
+        );
+    }
+    let total = add(&TOTAL_ORPHANS, orphans);
+    for (map, counts) in unavailable.into_iter().enumerate() {
+        for (cause, n) in counts.into_iter().enumerate() {
+            let count = add(&UNAVAILABLE[map][cause], n);
+            if n != 0 {
+                traversal_point(
+                    "scan_index_storage",
+                    source,
+                    &serde_json::json!({"index_shard_unavailable": {"map": (["account_pending", "usage_pending", "request_census"][map]), "cause": ([crate::snapshots::scan_index_persistence::UnavailableCause::Missing, crate::snapshots::scan_index_persistence::UnavailableCause::Generation, crate::snapshots::scan_index_persistence::UnavailableCause::Digest, crate::snapshots::scan_index_persistence::UnavailableCause::Decode, crate::snapshots::scan_index_persistence::UnavailableCause::Descriptor, crate::snapshots::scan_index_persistence::UnavailableCause::Unsafe][cause].label()), "count": count}}),
+                );
+            }
+        }
+    }
+    if orphans != 0 {
+        traversal_point(
+            "scan_index_storage",
+            source,
+            &BTreeMap::from([("scanindex_orphan_init_discarded", total)]),
+        );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCAN_INDEX_STORAGE_OBSERVATIONS: std::cell::RefCell<Vec<StorageReadObservation>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(test)]
+pub(crate) fn take_scan_index_storage_observations() -> Vec<StorageReadObservation> {
+    SCAN_INDEX_STORAGE_OBSERVATIONS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+#[cfg(test)]
+type StorageReadObservation = (u64, [[u64; 6]; 3], u64);
+
+/// One content-free alarm on entry to a shard-unavailable source episode.
+pub(crate) fn scan_index_shard_alarm(source: &'static str, unavailable: usize, transitions: u64) {
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "index_shard_unavailable_alarm": 1,
+            "unavailable_maps": unavailable,
+            "blocked_sources": 1,
+            "transitions": transitions,
+        }),
+    );
+}
+pub(crate) fn scan_index_manifest_refused(source: &'static str) {
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    let count = TOTAL
+        .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
+        .unwrap_or_else(|v| v)
+        .saturating_add(1);
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "scanindex_manifest_unavailable_refused": count,
+        }),
+    );
+}
+
+/// Per-refused-load counter, independent of the repair blocker's episode alarm.
+/// Only fixed causes and numeric counts; never include the originating error.
+pub(crate) fn scan_index_repair_required(
+    source: &str,
+    cause: crate::snapshots::scan_index_health::RepairCause,
+) {
+    static TOTALS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    let count = TOTALS[cause as usize]
+        .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
+        .unwrap_or_else(|v| v)
+        .saturating_add(1);
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "scan_index_repair_required": {
+                "cause": cause.label(), "delta": 1, "count": count,
+            },
+        }),
+    );
 }

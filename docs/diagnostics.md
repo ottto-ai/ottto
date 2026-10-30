@@ -233,18 +233,36 @@ lifetime memory high-water mark, not a collection/cycle peak or current RSS.
 `process_lifetime_max_rss_before_bytes` preserves the start sample when both
 samples are available and non-regressing; otherwise it is `null`. A rise
 correlates only with a process-wide time window, not allocation ownership.
-Unavailable measurements and regressing CPU deltas are `null`. Unix observation
-time and process id support comparison with an independently measured matching
-process. Never subtract or sum overlapping windows or infer per-stage memory
-use: the finish window contains its batch-call windows.
+`source_prepare` wraps synchronous source preparation (including index load
+and baseline construction); it emits an empty counts object on normal return,
+including errors or no-frame returns. Like `source_finish`, it emits no record
+on panic. Both stages, for Claude Code, Codex and Pi, include
+`stage_peak_footprint_bytes`, `stage_start_footprint_bytes`,
+`stage_end_footprint_bytes` and `footprint_samples` when available. One shared
+background thread samples current process footprint every 50 ms while stages
+are open and parks when idle. Start and end reads also contribute to the peak
+and successful sample count. macOS uses `TASK_VM_INFO.phys_footprint`, falling
+back to resident size; Linux uses resident pages from `/proc/self/statm`.
+These are sampled process-wide peaks during a stage, including concurrent work;
+shorter spikes can be missed. They do not establish allocation ownership.
+Up to 16 overlapping stages have independent bounded counters; overflow or
+thread-start failure leaves the measurements absent. `footprint_sample_failures`
+counts unavailable reads (or one refused sampler/slot attempt). Failed endpoints
+and wholly unavailable measurements are absent, as are all footprint fields
+on unsampled stages. Other unavailable measurements and regressing CPU deltas
+are `null`. Unix observation time and process id support comparison with an
+independently measured matching process. Never subtract or sum overlapping
+windows or infer allocation ownership: the finish window contains its batch-call
+windows.
 
 There is one bounded observation per completed page, batch call and normally
-returned finish, with two OS resource samples per observation, no per-row
-sampling, extra transcript reads or new diagnostic store. Version 2 adds one
-record per finish and removes one text line per sampled page; total log writes
-are not unchanged. Output is a synchronous best-effort write on the calling
-thread under std's stderr lock; errors are ignored, with no retry, queue or
-thread. It may block for the duration of a regular-file write, like existing
+returned prepare or finish, with two CPU/lifetime-RSS samples per observation,
+plus the bounded prepare/finish footprint sampler. There is no per-row sampling,
+extra transcript read or new diagnostic store. Version 2 adds one record per
+finish and removes one text line per sampled page; the footprint gauge adds one
+record per prepare. Output is a synchronous best-effort write on the calling
+thread under std's stderr lock; errors are ignored, with no retry or queue for
+log output. It may block for the duration of a regular-file write, like existing
 service stderr lines. Log output uses existing service retention and may be
 unavailable; diagnostic write errors do not fail collection or upload.
 Status/quota refresh, OTLP reception and independent metadata/discovery work are
@@ -686,6 +704,78 @@ OTLP sources can serve again. A busy approved port can then produce the mismatch
 finding above. Without an approved candidate, the fallback chain applies immediately.
 Startup retains its existing behavior of falling back if the approved port is
 busy.
+
+## Claude Stale Exporter Port
+
+Claude Code keeps its telemetry endpoint for the life of a session. Ottto can
+serve up to two older approved candidate ports on loopback, accepting only
+`POST /v1/logs`, `/v1/metrics` and `/v1/traces` through the same local export
+handler. Control and health routes return 404 on these listeners. A private,
+versioned port record retains the newest two previous approvals. On first
+approval it seeds once from retained Ottto-owned Claude settings backups,
+reading at most the newest ten JSON backups with the existing size and
+no-symlink checks. Ports must be in the current user's relay candidate list;
+seed discovery does not guess ports or connect to them. Busy ports are skipped
+and retried every 60 seconds. Legacy binds first probe IPv4 and dual-stack
+IPv6 wildcard addresses, then bind IPv4 loopback. Successful wildcard probes
+stay bound through the loopback bind and listen, closing that acquisition gap.
+All three binds use `SO_REUSEADDR`: live wildcard or IPv4 loopback listeners veto
+the port, while our connected sockets and TIME_WAIT allow immediate replacement.
+IPv4 remains available when the probe reports that IPv6 is unavailable.
+A port observed as the current approval is removed from legacy ingress; primary
+recovery releases that legacy socket before attempting its bind.
+
+Every legacy export rechecks Claude endpoint approval and the listener's live
+approval generation immediately before capture. Refused exports return 403 and
+store no evidence or successful-request activity. Claude telemetry disable,
+default-approval removal and setup opt-out operations invalidate that generation
+synchronously and wait up to two seconds for the supervisor to persist
+retirement and close sockets. Secondary-account removal
+and browser-login cleanup preserve legacy listeners and default approval;
+acknowledgement waits never hold the Claude settings lock. Each tick captures
+its generation before reading approval, so a concurrent revoke also fences
+sockets created later in that tick. A pending revoke also blocks exports and
+new/refreshed listener activity until retirement is persisted and sockets close.
+Periodic checks retire ports only after two consecutive definite non-approval
+reads. I/O errors, missing
+settings and truncated or unparsable JSON are unknown: that export is refused,
+but listeners/history are preserved and the consecutive-revocation streak resets.
+Idle expiry also retires a port. Retirement survives restarts and prevents
+re-seeding or reopening until that port is explicitly approved again and then
+superseded. The primary listener continues its existing behavior for all sources.
+The optional record is separate from existing daemon formats: older daemons
+ignore it, and missing fields or unknown extra fields decode without error.
+Retirement is persisted before socket closure, with a separate owner-only
+`legacy-relay-retired.json` tombstone protecting against replay of a stale main
+record after a failed write. A write failure closes legacy listeners and attempts
+to remove the stale main record. If both state and tombstone writes fail,
+compatibility supervision stops and logs the failure; retirement may be unknown
+after restart. Existing atomic-file durability guarantees apply.
+
+A legacy entry retires after 24 hours without a successful OTLP request, starting
+when it enters the persisted record even if a busy port never binds. Entry time
+and request activity persist across daemon restarts; activity writes are
+limited to once per 10 minutes, so a crash can lose up to that much recent
+activity and shorten retention. No request content or identity is in the port
+record. The primary relay's `/healthz` response includes process-local counts
+under `legacy_relay`: `otlp_legacy_listener_bound` (current gauge),
+`otlp_legacy_listener_requests`, `otlp_legacy_listener_busy` and
+`otlp_legacy_listener_closed` (cumulative counts since process start). Busy means
+bind attempts skipped. Closed counts only actually open sockets released,
+including on supervisor exit; retiring a never-bound entry adds no close.
+With no open sockets the supervisor waits until its next tick or a command.
+Live sockets drain up to 16 pending connections per turn. Resource-related
+accept failures back off; unusable sockets release for later tick rebind, keeping
+recent request activity. Release checks descriptor ownership before closing. Accept
+error logs are limited to one line per minute per socket.
+
+Canonical health reports `claude_stale_exporter_port` as a `Warning` owned by
+`source`, with runtime authority, while a legacy listener has accepted OTLP
+within the last hour in this process. Restart those Claude Code sessions to
+reload the current telemetry endpoint. The uploaded warning contains no port
+number. It follows blocking account and source findings in the blocker list.
+This restores future local evidence; it cannot recover dropped batches
+and does not change consent, account attribution or money calculations.
 
 ## Common Diagnostics Flow
 
