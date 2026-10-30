@@ -1974,7 +1974,7 @@ mod tests {
 
     #[test]
     fn read_http_request_rejects_over_long_header_line() {
-        for raw in [
+        for (raw, expected) in [
             {
                 let mut raw = String::from("POST /v1/logs HTTP/1.1\r\nX-Big: ");
                 raw.push_str(&"a".repeat(MAX_HEADER_LINE_BYTES + 64));
@@ -2026,9 +2026,21 @@ mod tests {
                 raw.push_str("0\r\n\r\n");
                 raw
             },
-        ] {
+        ]
+        .into_iter()
+        .zip([
+            "read header",
+            "headers too large",
+            "too many request headers",
+            "request body too large",
+            "request body too large",
+            "too many chunks",
+            "chunk framing too large",
+        ]) {
             let mut reader = BufReader::new(raw.as_bytes());
-            read_http_request_from(&mut reader).expect_err("oversized HTTP framing rejected");
+            let error =
+                read_http_request_from(&mut reader).expect_err("oversized HTTP framing rejected");
+            assert!(error.to_string().contains(expected), "{error}");
         }
     }
 
