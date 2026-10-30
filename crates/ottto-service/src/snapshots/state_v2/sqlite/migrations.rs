@@ -4,12 +4,15 @@
 use super::*;
 
 pub(super) const REVISION: u32 = 1;
+pub(super) const WRITER_CAPABILITY: u64 = 1;
 struct Step {
     to: u32,
+    destructive: bool,
     apply: fn(&Connection) -> Result<()>,
 }
 const STEPS: &[Step] = &[Step {
     to: 1,
+    destructive: false,
     apply: revision_one,
 }];
 
@@ -31,11 +34,31 @@ pub(super) fn supported(conn: &Connection) -> Result<u32> {
     }
     Ok(revision)
 }
+/// Independent of DDL revision: value-only upgrades fence old readers/writers.
+pub(super) fn writer_supported(conn: &Connection) -> Result<()> {
+    let minimum =
+        read_json::<u64>(conn, &RowKey::Meta("minimum_writer_capability".into()))?.unwrap_or(0);
+    if minimum > WRITER_CAPABILITY {
+        super::super::telemetry::event("newer_writer_refused", &1);
+        bail!(super::super::Hold::NewerSchema);
+    }
+    ensure!(
+        read_json::<u64>(conn, &RowKey::Meta("reference_drift".into()))?.unwrap_or(0) == 0,
+        super::super::Hold::ReferenceDrift
+    );
+    Ok(())
+}
 /// Used for EVERY explicit write, including N-only maintenance markers.
 pub(super) fn begin_write(conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     match supported(conn) {
-        Ok(REVISION) => Ok(()),
+        Ok(REVISION) => match writer_supported(conn) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        },
         result => {
             let _ = conn.execute_batch("ROLLBACK");
             result?;
@@ -57,9 +80,89 @@ fn revision_one(conn: &Connection) -> Result<()> {
         schema(conn)
     }
 }
+/// Called only with store inode ownership, before a destructive step begins.
+/// Keep failed backups for explicit recovery; never replace or wipe evidence.
+fn verified_backup(conn: &Connection) -> Result<()> {
+    ensure!(
+        read_json::<u64>(conn, &RowKey::Meta("erasure_pending".into()))?.unwrap_or(0) == 0,
+        "state_v2_backup_erasure_pending"
+    );
+    let path = Path::new(conn.path().context("state_v2_backup_path")?);
+    let (busy, log, done): (u64, i64, i64) =
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+    ensure!(
+        busy == 0
+            && log == done
+            && fs::metadata(sidecar(path, "-wal")).map_or(true, |m| m.len() == 0),
+        "state_v2_backup_checkpoint"
+    );
+    private_file(path)?;
+    let target = sidecar(path, ".migration-backup");
+    let mut source = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let mut backup = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&target)?;
+    let before = source.metadata()?;
+    let bytes = io::copy(&mut source, &mut backup)?;
+    backup.sync_all()?;
+    fn digest(file: &mut File) -> Result<[u8; 32]> {
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0))?;
+        let mut hash = sha2::Sha256::new();
+        let mut block = [0_u8; 64 * 1024];
+        loop {
+            let n = file.read(&mut block)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&block[..n]);
+        }
+        Ok(hash.finalize().into())
+    }
+    ensure!(
+        digest(&mut source)? == digest(&mut backup)?,
+        "state_v2_backup_digest"
+    );
+    let after = source.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    ensure!(
+        bytes == before.len()
+            && before.len() == after.len()
+            && before.mtime() == after.mtime()
+            && before.mtime_nsec() == after.mtime_nsec()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
+            && named.dev() == before.dev()
+            && named.ino() == before.ino(),
+        "state_v2_backup_changed"
+    );
+    private_file(&target)?;
+    super::super::super::sync_checkpoint_parent(&target)?;
+    super::super::telemetry::event("migration_backup_count", &1);
+    super::super::telemetry::event("migration_backup_bytes", &bytes);
+    Ok(())
+}
+
 pub(super) fn run(conn: &Connection) -> Result<()> {
-    supported(conn)?;
+    if supported(conn)? > 0 {
+        writer_supported(conn)?;
+    }
     for step in STEPS {
+        if revision(conn)? >= step.to {
+            continue;
+        }
+        if step.destructive {
+            verified_backup(conn).map_err(|_| super::super::Hold::MigrationFailed)?;
+        }
         if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
             super::super::telemetry::event(
                 "migration",
@@ -170,7 +273,7 @@ mod tests {
 
 #[cfg(test)]
 #[test]
-fn busy_migration_is_named_and_preserves_revision() {
+fn busy_writer_preserves_revision_and_leaves_no_transaction() {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
         "v2-migration-busy-{}-{}",
@@ -183,11 +286,14 @@ fn busy_migration_is_named_and_preserves_revision() {
     first.busy_timeout(Duration::from_millis(1)).unwrap();
     other.execute_batch("BEGIN IMMEDIATE").unwrap();
     assert_eq!(
-        run(&first)
+        begin_write(&first)
             .unwrap_err()
-            .downcast_ref::<super::super::Hold>(),
-        Some(&super::super::Hold::MigrationFailed)
+            .downcast_ref::<rusqlite::Error>()
+            .unwrap()
+            .sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy)
     );
+    assert!(first.is_autocommit());
     assert_eq!(revision(&first).unwrap(), 1);
     other.execute_batch("ROLLBACK").unwrap();
     drop(other);
@@ -226,5 +332,36 @@ fn crash_between_ddl_and_revision_bump_rolls_back_on_restart() {
     assert_eq!(revision(&conn).unwrap(), 1);
     validate_schema_revision(&conn, 1).unwrap();
     drop(conn);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn destructive_backup_is_private_verified_and_never_overwritten() {
+    let dir = std::env::temp_dir().join(format!("v2-backup-{}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.join("synthetic.sqlite");
+    let owned = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    lock_owner(&owned).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+    settings(&conn, false).unwrap();
+    run(&conn).unwrap();
+    verified_backup(&conn).unwrap();
+    let backup = sidecar(&path, ".migration-backup");
+    let bytes = fs::read(&backup).unwrap();
+    assert_eq!(bytes, fs::read(&path).unwrap());
+    assert_eq!(fs::metadata(&backup).unwrap().mode() & 0o777, 0o600);
+    assert!(verified_backup(&conn).is_err());
+    assert_eq!(fs::read(&backup).unwrap(), bytes);
+    drop(conn);
+    drop(owned);
     fs::remove_dir_all(dir).unwrap();
 }

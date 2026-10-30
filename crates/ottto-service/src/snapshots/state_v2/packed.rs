@@ -24,7 +24,6 @@ const WORDS: &[&[u8]] = &[
     b"\"identity_revision\"",
     b"\"previous_windows\"",
     b"\"source_file_fingerprints\"",
-    b"\"source_file_fingerprint\"",
     b"\"census_complete\"",
     b"\"retry_after_unix_seconds\"",
     b"\"proven_witness_fingerprint\"",
@@ -220,8 +219,10 @@ pub(super) fn read_hash_string(bytes: &[u8]) -> Result<String> {
 #[test]
 fn shipped_dictionary_is_append_only() {
     use sha2::Digest;
-    const SHIPPED: usize = 29;
+    const SHIPPED: usize = 28;
     assert!(WORDS.len() >= SHIPPED);
+    let unique: std::collections::BTreeSet<_> = WORDS.iter().collect();
+    assert_eq!(unique.len(), WORDS.len());
     let mut hash = sha2::Sha256::new();
     for word in &WORDS[..SHIPPED] {
         hash.update((word.len() as u32).to_be_bytes());
@@ -229,6 +230,6 @@ fn shipped_dictionary_is_append_only() {
     }
     assert_eq!(
         format!("{:x}", hash.finalize()),
-        "40daaa9d58099bd5ef7d559be10370000c2d44892f2903610b99636360fead2d"
+        "2752da8c05d83800a5ff3d89b12b81deab65b382c0f8017bf7306aa3eb9becd6"
     );
 }

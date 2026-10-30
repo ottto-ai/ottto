@@ -1,10 +1,52 @@
 //! Backend implementations of bounded full-value comparison and ref updates.
 use super::*;
 
+/// Daily idle check only. Saves adjust counts for changed rows; they never
+/// enumerate history. The mapper supplies decoding, the store owns comparison.
+pub(super) fn verify_counts(conn: &Connection, extract: ReferenceExtractor) -> Result<()> {
+    let mut expected = BTreeMap::<RowKey, u64>::new();
+    let mut actual = BTreeMap::new();
+    for table in Table::ALL {
+        let mut after = None;
+        loop {
+            let page = scan(conn, RowPrefix { table }, after.as_ref(), PAGE_HEADERS)?;
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().map(|h| h.key.clone());
+            for header in page {
+                if let Fixed::RequestSet { refs, .. } | Fixed::Interned { refs } = header.fixed {
+                    read_value(conn, &header, &mut io::sink())?;
+                    actual.insert(header.key.clone(), refs);
+                } else {
+                    extract(
+                        &header,
+                        &StoredValue {
+                            conn,
+                            header: &header,
+                        },
+                        &mut |key| {
+                            ensure!(
+                                matches!(key, RowKey::RequestSet(_) | RowKey::Interned { .. }),
+                                "state_v2_reference_kind"
+                            );
+                            let count = expected.entry(key.clone()).or_default();
+                            *count = count.checked_add(1).context("state_v2_reference_count")?;
+                            Ok(())
+                        },
+                    )?;
+                }
+            }
+        }
+    }
+    ensure!(actual == expected, super::super::Hold::ReferenceDrift);
+    Ok(())
+}
+
 struct Compare<'a> {
     conn: &'a Connection,
     header: &'a Header,
-    key: Vec<u8>,
+    key_bytes: Vec<u8>,
     part_no: Option<u64>,
     part: Vec<u8>,
     compared: u64,
@@ -35,7 +77,7 @@ impl Compare<'_> {
         } else {
             self.conn.query_row(
                 "SELECT bytes FROM blob_parts WHERE owner=?1 AND key=?2 AND part=?3",
-                params![table_number(table), self.key, number],
+                params![table_number(table), self.key_bytes, number],
                 |row| {
                     let b = row.get_ref(0)?.as_blob()?;
                     if b.len() > PART_BYTES {
@@ -92,7 +134,7 @@ pub(super) fn matches(conn: &Connection, header: &Header, value: &dyn Value) -> 
     let mut compare = Compare {
         conn,
         header,
-        key: owner_key(&header.key)?,
+        key_bytes: owner_key_bytes(&header.key)?,
         part_no: None,
         part: Vec::new(),
         compared: 0,
@@ -110,7 +152,7 @@ pub(super) fn candidates(
 ) -> Result<Vec<Header>> {
     ensure!(limit <= PAGE_HEADERS, "state_v2_header_page_admission");
     let mut stmt = conn
-        .prepare(&format!(
+        .prepare_cached(&format!(
         "SELECT {} FROM request_sets WHERE commitment=?1 AND set_id>?2 ORDER BY set_id LIMIT ?3",
         projection(Table::RequestSets)))?;
     let rows = stmt.query_map(params![commitment, after, limit as u64], |row| {
@@ -155,9 +197,11 @@ pub(super) fn adjust(tx: &mut Txn<'_>, key: &RowKey, delta: i64) -> Result<u64> 
             }
             let mut hash = Hash(digest_start(key, &fixed)?);
             read_value(tx.store.conn()?, &old, &mut hash)?;
+            tx.admit_change(key, 0)?;
+            let digest = integrity(hash.0);
             let mut params = vec![
                 SqlValue::Integer(next as i64),
-                SqlValue::Blob(integrity(hash.0).to_vec()),
+                SqlValue::Blob(digest.to_vec()),
             ];
             params.extend(key.values()?);
             let sql = match key {
@@ -173,6 +217,14 @@ pub(super) fn adjust(tx: &mut Txn<'_>, key: &RowKey, delta: i64) -> Result<u64> 
                 tx.store.conn()?.execute(sql, params_from_iter(params))? == 1,
                 "state_v2_reference_missing"
             );
+            tx.changed.insert(
+                key.clone(),
+                Some(Header {
+                    fixed,
+                    digest,
+                    ..old
+                }),
+            );
         }
         Ok(next)
     })();
@@ -187,7 +239,7 @@ pub(super) fn interned_candidates(
     limit: usize,
 ) -> Result<Vec<Header>> {
     ensure!(limit <= PAGE_HEADERS, "state_v2_header_page_admission");
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM interned WHERE kind=?1 AND ordinal>?2 ORDER BY ordinal LIMIT ?3",
         projection(Table::Interned)
     ))?;

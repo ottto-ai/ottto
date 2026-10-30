@@ -12,6 +12,7 @@ struct Stats {
     latest: BTreeMap<&'static str, serde_json::Value>,
     cpu_per_pass_us: Distribution,
     rss_bytes: Rss,
+    hydrate_count: u64,
     import_peak_rss_bytes: Option<u64>,
     v1_load_peak_rss_bytes: Option<u64>,
     import_exceeds_v1_load: Option<bool>,
@@ -112,6 +113,9 @@ impl Stage {
         self.finished = true;
         let (cpu, steady, peak) = self.probe.finish();
         if let Ok(mut stats) = stats().lock() {
+            if matches!(self.kind, Kind::Hydrate) {
+                stats.hydrate_count = stats.hydrate_count.saturating_add(1);
+            }
             match self.kind {
                 Kind::V1 => {
                     stats.v1_load_peak_rss_bytes = peak;
@@ -162,4 +166,35 @@ pub(super) fn baseline(path: &Path) {
         "baseline_14day_escalation_alarm",
         &age.map(|age| age >= Duration::from_secs(14 * 86400)),
     );
+}
+
+/// Process-attributed physical writes; other daemon work may contribute. No
+/// estimate is substituted when the platform cannot supply a measurement.
+pub(super) fn process_written_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v2>::uninit();
+        if unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V2,
+                usage.as_mut_ptr().cast(),
+            )
+        } == 0
+        {
+            return Some(unsafe { usage.assume_init() }.ri_diskio_byteswritten);
+        }
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/io")
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("write_bytes:")?.trim().parse().ok())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
 }

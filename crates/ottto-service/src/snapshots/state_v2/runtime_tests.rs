@@ -50,8 +50,15 @@ impl Drop for Fixture {
 }
 struct EmptyMapper;
 impl Mapper for EmptyMapper {
+    fn references(
+        _: &Header,
+        _: &dyn Value,
+        _: &mut dyn FnMut(&RowKey) -> Result<()>,
+    ) -> Result<()> {
+        Ok(())
+    }
     fn private_paths(
-        _: &RowKey,
+        _: &Header,
         _: &dyn Value,
         _: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<()> {
@@ -176,6 +183,7 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     let index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
     let mut stale = index.clone();
     for suffix in [
+        ".v2.sqlite.migration-backup",
         ".v1-readonly",
         ".v2.sqlite.import",
         ".v2.sqlite.import-wal",
@@ -187,7 +195,11 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     let shards = fence::sibling(&f.path, ".v1-readonly.shards");
     fs::create_dir(&shards).unwrap();
     fs::write(shards.join("payload"), b"forgotten-path-canary").unwrap();
+    let records = crate::durable_tail_store::store_dir_for_index(&f.path);
+    fs::create_dir(&records).unwrap();
+    fs::write(records.join("synthetic.rec"), b"restart-record").unwrap();
     crate::snapshots::erase_claude_state_v2_artifacts(&f.support).unwrap();
+    assert!(!records.exists());
     for suffix in [
         "",
         ".v2.sqlite",
@@ -196,6 +208,7 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
         ".v2.sqlite.import",
         ".v2.sqlite.import-wal",
         ".v2.sqlite.import-shm",
+        ".v2.sqlite.migration-backup",
         ".v1-readonly",
         ".v1-readonly.shards",
         ".v2-fence.tmp",
@@ -262,4 +275,71 @@ fn damaged_and_oversized_fence_claims_hold_before_v1_containment() {
         assert!(guard_containment_locked(&f.path).is_err());
         assert_eq!(fs::read(&f.path).unwrap(), bytes);
     }
+}
+
+#[test]
+fn unchanged_cycles_reuse_connection_and_committed_graph_then_forget_invalidates() {
+    let f = Fixture::new();
+    f.published();
+    let mut first = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    let runtime = first.persistence_v2.clone().unwrap();
+    let second = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    assert!(Arc::ptr_eq(
+        &runtime,
+        second.persistence_v2.as_ref().unwrap()
+    ));
+    guard_external(&f.path, Some(&runtime), first.generation).unwrap();
+    assert!(save_with(&f.path, &mut first, &EmptyMapper).unwrap());
+    let third = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    assert_eq!(third.generation, 1);
+    assert!(Arc::ptr_eq(
+        &runtime,
+        third.persistence_v2.as_ref().unwrap()
+    ));
+    idle(&f.path, &third, true).unwrap();
+    erase_locked(&f.path, Some(&third)).unwrap();
+    assert!(guard_external(&f.path, Some(&runtime), third.generation).is_err());
+    assert!(load_with(&f.path, false, &EmptyMapper).is_err());
+}
+
+#[test]
+fn generation_and_capability_are_checked_before_external_effects() {
+    for future_writer in [false, true] {
+        let f = Fixture::new();
+        f.published();
+        let index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+        let check = crate::snapshots::state_v2_side_effect_guard(&f.path, &index);
+        check().unwrap();
+        {
+            let mut session = index
+                .persistence_v2
+                .as_ref()
+                .unwrap()
+                .session
+                .lock()
+                .unwrap();
+            let session = session.as_mut().unwrap();
+            if future_writer {
+                sqlite::future_writer_for_test(&mut session.db);
+            } else {
+                session.db.control("generation", &1_u64).unwrap();
+            }
+        }
+        assert!(check().is_err());
+    }
+}
+
+#[test]
+fn another_graph_save_cannot_advance_a_stale_external_guard() {
+    let f = Fixture::new();
+    f.published();
+    let mut first = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    let second = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    let stale = crate::snapshots::state_v2_side_effect_guard(&f.path, &second);
+    stale().unwrap();
+    assert!(save_with(&f.path, &mut first, &EmptyMapper).unwrap());
+    assert_eq!(second.generation, 0);
+    assert_eq!(first.generation, 1);
+    assert!(stale().is_err());
+    crate::snapshots::state_v2_side_effect_guard(&f.path, &first)().unwrap();
 }

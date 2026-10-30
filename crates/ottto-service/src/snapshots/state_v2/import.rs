@@ -76,10 +76,19 @@ impl Pace {
 /// adapter must preflight original raw shapes before v1 normalization, import
 /// the normalized graph, and prove read-back parity before publication.
 pub(super) trait Mapper {
+    /// Emit ALL private text from key, fixed/header, labels/aliases and raw
+    /// holds, as well as packed values. Replacements must retain none silently.
     fn private_paths(
-        key: &RowKey,
+        header: &Header,
         value: &dyn Value,
         paths: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<()>;
+    /// Enumerate the complete reference list packed in this row, including
+    /// repeated edges. Shared values must not reference other shared values.
+    fn references(
+        header: &Header,
+        value: &dyn Value,
+        refs: &mut dyn FnMut(&RowKey) -> Result<()>,
     ) -> Result<()>;
     fn inventory(&self, path: &Path) -> std::result::Result<(), Pause>;
     fn preflight(&self, index: &ScanIndex) -> std::result::Result<(), Pause>;
@@ -87,16 +96,32 @@ pub(super) trait Mapper {
     // Proof mismatch/oversize must return a typed Pause; engine/IO failures
     // remain transient. The framework never guesses from provider text.
     fn verify<S: Store>(&self, store: &mut S, index: &ScanIndex) -> Result<()>;
+    /// Read every semantic row through Transaction::read_value, including
+    /// fixed-only rows: it verifies their checksum while decoding. Never return
+    /// a partially hydrated graph or normalize unknown raw holds away.
     fn hydrate<S: Store>(&self, store: &mut S) -> Result<ScanIndex>;
     /// Uses the SAME claim maxima/hold and repair comparisons as v1; the
     /// adapter streams current custody through txn, without a second graph.
     fn merge_cas<T: Transaction>(&self, txn: &mut T, index: &mut ScanIndex) -> Result<()>;
+    /// Emit only dirty rows against the resident header map. Before mutating,
+    /// bound the proposed page to 5k rows / 32 MiB, shrinking collection pages
+    /// when necessary. TODO mapper: cap 64 account windows per family without
+    /// silently dropping unsettled custody. KEEP persisted shared refs: decode
+    /// only each changed row's old refs, diff against new refs, adjust/reclaim
+    /// in this transaction. Never perform whole-history GC during a save.
     fn delta<T: Transaction>(&self, txn: &mut T, index: &ScanIndex) -> Result<()>;
 }
 pub(super) struct PendingMapper;
 impl Mapper for PendingMapper {
+    fn references(
+        _: &Header,
+        _: &dyn Value,
+        _: &mut dyn FnMut(&RowKey) -> Result<()>,
+    ) -> Result<()> {
+        bail!(Hold::DbUnavailable)
+    }
     fn private_paths(
-        _: &RowKey,
+        _: &Header,
         _: &dyn Value,
         _: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<()> {

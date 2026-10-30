@@ -403,6 +403,7 @@ fn f6_pl_in_values_requires_purge_even_with_hash_only_keys() {
     put(&mut tx, &key, b"replacement");
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    age_erasure(&mut db, 13 * 3600);
     db.maintenance(true).unwrap();
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
     for suffix in ["", "-wal", "-shm"] {
@@ -790,7 +791,7 @@ fn f6_deadline_keeps_writes_live_without_resetting_oldest_purge() {
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, b"third");
     assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
-    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(3));
     assert_eq!(db.read_control::<u64>("erasure_since").unwrap(), since);
     assert_eq!(
         serde_json::to_value(db.maintenance_stats()).unwrap()["vacuum_attempts"]
@@ -801,13 +802,14 @@ fn f6_deadline_keeps_writes_live_without_resetting_oldest_purge() {
     drop(db);
     let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
     db.path_extractor(test_paths);
-    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(3));
     // PASSIVE and idle TRUNCATE alone cannot claim erasure.
     assert_eq!(
         db.checkpoint(CheckpointMode::IdleReclaim).state,
         CheckpointState::Complete
     );
-    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(3));
+    age_erasure(&mut db, 13 * 3600);
     db.maintenance(true).unwrap();
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
     assert_eq!(
@@ -854,6 +856,7 @@ fn f8_vacuum_churn_removes_deleted_keys_and_pl_values() {
         }
     }
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    age_erasure(&mut db, 13 * 3600);
     db.maintenance(true).unwrap();
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
     for suffix in ["", "-wal", "-shm"] {
@@ -1160,6 +1163,7 @@ fn f6_busy_purge_retains_obligation_paces_retry_and_allows_in_deadline_writes() 
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, b"new bytes");
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    age_erasure(&mut db, 13 * 3600);
     db.maintenance(true).unwrap();
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
     let attempted = serde_json::to_value(db.maintenance_stats()).unwrap()["vacuum_attempts"]
@@ -1170,12 +1174,13 @@ fn f6_busy_purge_retains_obligation_paces_retry_and_allows_in_deadline_writes() 
     put(&mut tx, &key, b"still live");
     assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
     drop(reader);
+    age_erasure(&mut db, 13 * 3600);
     db.maintenance(true).unwrap();
     assert_eq!(
         serde_json::to_value(db.maintenance_stats()).unwrap()["vacuum_attempts"],
         attempted
     );
-    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(3));
     // Make the original deadline overdue, while the attempt remains in its
     // cooldown. Neither restart nor ordinary writes may claim erasure.
     let now = SystemTime::now()
@@ -1183,13 +1188,13 @@ fn f6_busy_purge_retains_obligation_paces_retry_and_allows_in_deadline_writes() 
         .unwrap()
         .as_secs();
     db.control("erasure_since", &(now - 86401)).unwrap();
-    assert!(db.maintenance(false).is_err());
-    assert!(db.begin(TxnMode::Write).is_err());
+    db.maintenance(false).unwrap();
+    drop(db.begin(TxnMode::Write).unwrap());
     let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
     assert_eq!(stats["erasure_overdue"], true);
     assert_eq!(stats["vacuum_attempts"], attempted);
     drop(db);
-    assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_err());
+    assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_ok());
 }
 
 #[test]
@@ -1212,6 +1217,7 @@ fn f6_restart_between_vacuum_and_metadata_clear_keeps_pending_debt() {
     let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
     db.path_extractor(test_paths);
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    age_erasure(&mut db, 13 * 3600);
     db.maintenance(true).unwrap();
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
 }
@@ -1296,13 +1302,13 @@ fn f6_backward_clock_does_not_grant_a_restart_purge_attempt() {
         .as_secs();
     db.control("erasure_since", &(now - 86401)).unwrap();
     db.control("erasure_attempt", &(now + 3600)).unwrap();
-    assert!(db.maintenance(true).is_err());
+    db.maintenance(true).unwrap();
     let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
     assert_eq!(stats["vacuum_attempts"], 0);
     assert_eq!(stats["erasure_overdue"], true);
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
     drop(db);
-    assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_err());
+    assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_ok());
 }
 
 #[test]
@@ -1333,12 +1339,19 @@ fn growth_retention_follows_runtime_custody_through_clones_subsets_and_baselines
 }
 
 fn test_paths(
-    key: &RowKey,
+    header: &Header,
     value: &dyn Value,
     paths: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
-    if let RowKey::File(path) | RowKey::Census(path) = key {
+    if let RowKey::File(path) | RowKey::Census(path) = &header.key {
         paths(path)?;
+    }
+    if let Fixed::File {
+        scan_identity: Some(private),
+        ..
+    } = &header.fixed
+    {
+        paths(private)?;
     }
     let mut bytes = Vec::new();
     value.write(&mut bytes)?;
@@ -1456,4 +1469,240 @@ fn census_fixed_column_update_preserves_digest_without_value_comparison() {
         );
     }
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), None);
+}
+
+fn age_erasure(db: &mut sqlite::Sqlite, seconds: u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    db.control("erasure_since", &(now - seconds)).unwrap();
+}
+
+#[test]
+fn clean_checkpoint_is_durable_and_next_write_marks_dirty_before_mutation() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    assert_eq!(db.read_control::<u8>("phase").unwrap(), Some(1));
+    // A second owner cannot certify this owner's live connection clean.
+    assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_err());
+    db.clean_checkpoint().unwrap();
+    assert_eq!(db.read_control::<u8>("phase").unwrap(), Some(0));
+    {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        put(
+            &mut tx,
+            &RowKey::Traversal("uncommitted".into()),
+            b"rollback",
+        );
+    }
+    assert_eq!(db.read_control::<u8>("phase").unwrap(), Some(1));
+    db.clean_checkpoint().unwrap();
+    drop(db);
+    let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
+    assert!(db
+        .begin(TxnMode::Read)
+        .unwrap()
+        .get(&RowKey::Traversal("uncommitted".into()))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn purge_starts_at_twelve_hours_and_busy_source_pauses_at_twenty() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = RowKey::Traversal("private".into());
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"alias-old");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    tx.delete(&key).unwrap();
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    db.maintenance(true).unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_success").unwrap(), None);
+    age_erasure(&mut db, 13 * 3600);
+    db.between_cycles(false).unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_success").unwrap(), None);
+    age_erasure(&mut db, 21 * 3600);
+    db.maintenance(false).unwrap(); // hot paths cannot grant a pause
+    assert_eq!(db.read_control::<u64>("erasure_success").unwrap(), None);
+    db.between_cycles(false).unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
+    assert_eq!(
+        db.read_control::<u64>("erasure_purged_epoch").unwrap(),
+        Some(2)
+    );
+    assert_eq!(
+        serde_json::to_value(db.maintenance_stats()).unwrap()["maintenance_pauses"],
+        1
+    );
+    // A new deletion must survive the successful-run cooldown.
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"new private value");
+    assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    tx.delete(&key).unwrap();
+    assert_eq!(tx.commit(3, 4), DurableCommitOutcome::Committed(4));
+    age_erasure(&mut db, 25 * 3600);
+    db.maintenance(true).unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(4));
+    assert_eq!(
+        serde_json::to_value(db.maintenance_stats()).unwrap()["erasure_overdue"],
+        true
+    );
+}
+
+#[test]
+fn changed_reference_diff_is_atomic_and_daily_drift_holds() {
+    use interning::{intern_request_set, RequestEvidence};
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let id = intern_request_set(
+        &mut tx,
+        &RequestEvidence::Census {
+            hashes: &Bytes(vec![7; PART_BYTES + 1]),
+            hash_count: None,
+        },
+    )
+    .unwrap();
+    let key = RowKey::RequestSet(id);
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        tx.diff_refs(std::slice::from_ref(&key), &[]).unwrap();
+        assert!(tx.get(&key).unwrap().is_none());
+        // Drop restores the shared value and all its chunks.
+    }
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let header = tx.get(&key).unwrap().unwrap();
+    tx.read_value(&header, &mut std::io::sink()).unwrap();
+    drop(tx);
+    fn no_refs(_: &Header, _: &dyn Value, _: &mut dyn FnMut(&RowKey) -> Result<()>) -> Result<()> {
+        Ok(())
+    }
+    db.reference_extractor(no_refs);
+    let error = db.maintenance(true).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::ReferenceDrift));
+    assert_eq!(
+        serde_json::to_value(db.maintenance_stats()).unwrap()["reference_drift"],
+        1
+    );
+    assert!(db.stamp().is_err());
+    assert!(db.begin(TxnMode::Write).is_err());
+    drop(db);
+    assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_err());
+}
+
+#[test]
+fn save_admission_rolls_back_whole_burst_and_resident_headers_follow_commit() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    db.prime_headers().unwrap();
+    let key = RowKey::Traversal("first".into());
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"old");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"new");
+    assert_eq!(value(&mut tx, &tx_header(&key, b"new")), b"new");
+    assert!(tx
+        .put(RowInput {
+            key: &RowKey::Traversal("too-large".into()),
+            fixed: &Fixed::None,
+            value: &Repeat(33 * 1024 * 1024)
+        })
+        .is_err());
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::NotPublished);
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let header = tx.get(&key).unwrap().unwrap();
+    assert_eq!(value(&mut tx, &header), b"old");
+}
+
+fn tx_header(key: &RowKey, bytes: &[u8]) -> Header {
+    preflight(&RowInput {
+        key,
+        fixed: &Fixed::None,
+        value: &Bytes(bytes.to_vec()),
+    })
+    .unwrap()
+}
+
+#[test]
+fn fixed_private_text_and_labels_aliases_and_raw_holds_create_erasure_epochs() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = RowKey::File("/synthetic/private".into());
+    let mut fixed = Fixed::File {
+        size: 0,
+        mtime_s: 0,
+        mtime_ns: None,
+        ctime_ns: 0,
+        birth_ns: 0,
+        witness_rev: 0,
+        flags: 0,
+        source_fp: String::new(),
+        last_snapshot_fp: None,
+        body_witness: None,
+        scan_identity: Some("private-label-alias".into()),
+    };
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    tx.put(RowInput {
+        key: &key,
+        fixed: &fixed,
+        value: &Bytes(vec![]),
+    })
+    .unwrap();
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    if let Fixed::File { scan_identity, .. } = &mut fixed {
+        *scan_identity = Some("replacement".into());
+    }
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    tx.put(RowInput {
+        key: &key,
+        fixed: &fixed,
+        value: &Bytes(vec![]),
+    })
+    .unwrap();
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    let oldest = db.read_control::<u64>("erasure_since").unwrap();
+    let raw = RowKey::Hold {
+        kind: 1,
+        field: "raw".into(),
+        key: "hash-only".into(),
+    };
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(
+        &mut tx,
+        &raw,
+        br#"["private-label","private-alias","raw-private-text"]"#,
+    );
+    assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    tx.delete(&raw).unwrap();
+    assert_eq!(tx.commit(3, 4), DurableCommitOutcome::Committed(4));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(4));
+    assert_eq!(db.read_control::<u64>("erasure_since").unwrap(), oldest);
+}
+
+#[test]
+fn page_admission_reserves_all_commit_markers_before_delta_returns() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    // With the old 64-page reserve, the final user row passed, then four
+    // controls at 18 pages each failed in COMMIT as an opaque NotPublished.
+    sqlite::seed_page_estimate_for_test(&mut tx, 32 * 1024 - 64 - 18);
+    let error = tx
+        .put(RowInput {
+            key: &RowKey::Traversal("last-user-row".into()),
+            fixed: &Fixed::None,
+            value: &Bytes(b"small".to_vec()),
+        })
+        .unwrap_err();
+    assert_eq!(error.to_string(), "state_v2_save_admission");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::NotPublished);
+    assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(0));
 }

@@ -16,7 +16,8 @@ pub(super) mod telemetry;
 pub(super) use runtime::invalidate_tree;
 pub(super) use runtime::Hold;
 pub(super) use runtime::{
-    after_v1_locked, erase_tree, guard_containment_locked, idle, load_locked, save_locked,
+    after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
+    idle, load_locked, save_locked,
 };
 mod interning;
 mod packed;
@@ -268,6 +269,30 @@ pub(super) trait Transaction {
     fn interned_candidates(&mut self, kind: u16, after: u64, limit: usize) -> Result<Vec<Header>>;
     /// Changes only refs and its integrity digest; zero reclaims owner/parts.
     fn adjust_refs(&mut self, key: &RowKey, delta: i64) -> Result<u64>;
+    /// The mapper decodes ONLY the replaced row's old packed reference list.
+    /// New IDs already acquired by interning must be excluded from this diff;
+    /// interning's acquisition is their +1. All changes share the row's txn.
+    fn diff_refs(&mut self, old: &[RowKey], new: &[RowKey]) -> Result<()> {
+        let mut deltas = std::collections::BTreeMap::<RowKey, i64>::new();
+        for (refs, sign) in [(old, -1_i64), (new, 1_i64)] {
+            for key in refs {
+                anyhow::ensure!(
+                    matches!(key, RowKey::RequestSet(_) | RowKey::Interned { .. }),
+                    "state_v2_reference_kind"
+                );
+                let count = deltas.entry(key.clone()).or_default();
+                *count = count
+                    .checked_add(sign)
+                    .ok_or_else(|| anyhow::anyhow!("state_v2_reference_count"))?;
+            }
+        }
+        for (key, delta) in deltas {
+            if delta != 0 {
+                self.adjust_refs(&key, delta)?;
+            }
+        }
+        Ok(())
+    }
     /// Header-only, key-ordered, one bounded page. `after` is exclusive.
     fn scan_prefix(
         &mut self,

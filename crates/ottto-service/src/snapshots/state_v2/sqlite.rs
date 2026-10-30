@@ -7,6 +7,7 @@ use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -482,7 +483,8 @@ fn get(conn: &Connection, key: &RowKey) -> Result<Option<Header>> {
         predicate(table)
     );
     Ok(conn
-        .query_row(&sql, params_from_iter(key.values()?), |r| header(table, r))
+        .prepare_cached(&sql)?
+        .query_row(params_from_iter(key.values()?), |r| header(table, r))
         .optional()?)
 }
 
@@ -496,6 +498,11 @@ pub(super) struct Sqlite {
     stats: MaintenanceStats,
     last_purge_attempt: Option<Instant>,
     paths: PathExtractor,
+    references: Option<ReferenceExtractor>,
+    // flock ownership outlives the connection; Drop never writes a clean marker.
+    owner: File,
+    clean: bool,
+    headers: Option<BTreeMap<RowKey, Header>>,
 }
 pub(super) struct Txn<'a> {
     store: &'a mut Sqlite,
@@ -505,6 +512,9 @@ pub(super) struct Txn<'a> {
     original_paths: BTreeMap<RowKey, BTreeSet<String>>,
     path_bytes: usize,
     failed: bool,
+    changed: BTreeMap<RowKey, Option<Header>>,
+    dirty_bytes: u64,
+    estimated_pages: u64,
 }
 impl Drop for Txn<'_> {
     fn drop(&mut self) {
@@ -521,6 +531,16 @@ impl Drop for Txn<'_> {
             }
         }
     }
+}
+
+// A separate flock on the DB inode covers every phase-marker write, migration,
+// and native connection. SQLite's own fcntl locks still serialize transactions.
+fn lock_owner(file: &File) -> Result<()> {
+    ensure!(
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "state_v2_exclusive_owner_busy"
+    );
+    Ok(())
 }
 
 fn private_file(path: &Path) -> Result<()> {
@@ -575,14 +595,24 @@ fn sqlite_uri(path: &Path) -> Result<String> {
     Ok(uri)
 }
 fn settings(conn: &Connection, import: bool) -> Result<()> {
+    let engine: (String, String) =
+        conn.query_row("SELECT sqlite_version(), sqlite_source_id()", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+    super::telemetry::event(
+        "sqlite_engine",
+        &serde_json::json!({"version":engine.0,"source_id":engine.1}),
+    );
+    conn.set_prepared_statement_cache_capacity(32);
     conn.busy_timeout(BUSY)?;
-    conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA secure_delete=ON; PRAGMA wal_autocheckpoint=0; PRAGMA cache_size=-16384; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA soft_heap_limit=50331648;")?;
+    conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA secure_delete=ON; PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=16777216; PRAGMA cache_size=-16384; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA soft_heap_limit=50331648;")?;
     for (name, expected) in [
         ("synchronous", 2_i64),
         ("fullfsync", 1),
         ("checkpoint_fullfsync", 1),
         ("secure_delete", 1),
         ("wal_autocheckpoint", 0),
+        ("journal_size_limit", 16 * 1024 * 1024),
         ("cache_size", -16384),
         ("mmap_size", 0),
         ("temp_store", 1),
@@ -625,6 +655,7 @@ impl Sqlite {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)?;
         file.sync_all()?;
+        lock_owner(&file)?;
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -643,7 +674,93 @@ impl Sqlite {
             stats: MaintenanceStats::default(),
             last_purge_attempt: None,
             paths: missing_path_extractor,
+            references: None,
+            owner: file,
+            clean: false,
+            headers: None,
         })
+    }
+    fn mark_dirty(&mut self) -> Result<()> {
+        if self.clean {
+            // FULL + fullfsync COMMIT precedes any subsequent graph mutation.
+            self.control("phase", &1_u8)?;
+            self.clean = false;
+        }
+        Ok(())
+    }
+    pub(super) fn clean_checkpoint(&mut self) -> Result<()> {
+        if self.checkpoint(CheckpointMode::IdleReclaim).state == CheckpointState::Complete {
+            self.control("phase", &0_u8)?;
+            self.clean = true;
+        }
+        Ok(())
+    }
+    pub(super) fn stamp(&self) -> Result<(u64, u64)> {
+        migrations::check_current(self.conn()?)?;
+        migrations::writer_supported(self.conn()?)?;
+        let named = fs::symlink_metadata(&self.path)?;
+        let owned = self.owner.metadata()?;
+        ensure!(
+            named.dev() == owned.dev() && named.ino() == owned.ino(),
+            "state_v2_object_changed"
+        );
+        Ok((
+            self.read_control::<u64>("generation")?
+                .context("state_v2_generation_missing")?,
+            self.conn()?
+                .query_row("PRAGMA data_version", [], |r| r.get(0))?,
+        ))
+    }
+    /// Header residency is built once after hydrate, never a second value pass.
+    /// Mapper delta emits dirty keys; unchanged put calls also avoid SQL writes.
+    pub(super) fn prime_headers(&mut self) -> Result<()> {
+        let mut total_parts = 0_u64;
+        let mut headers = BTreeMap::new();
+        let mut rows = 0_u64;
+        let mut files = 0_u64;
+        for table in Table::ALL {
+            let mut after = None;
+            loop {
+                let page = scan(
+                    self.conn()?,
+                    RowPrefix { table },
+                    after.as_ref(),
+                    PAGE_HEADERS,
+                )?;
+                if page.is_empty() {
+                    break;
+                }
+                after = page.last().map(|h| h.key.clone());
+                for header in page {
+                    total_parts = total_parts
+                        .checked_add(u64::from(header.parts))
+                        .context("state_v2_part_count")?;
+                    // Fixed-only rows still authenticate the complete header.
+                    if table == Table::Census {
+                        read_value(self.conn()?, &header, &mut io::sink())?;
+                    }
+                    rows += u64::from(
+                        table != Table::Meta
+                            && table != Table::Interned
+                            && table != Table::RequestSets,
+                    );
+                    files += u64::from(table == Table::Files);
+                    self.stats.max_value_bytes = self.stats.max_value_bytes.max(header.len);
+                    headers.insert(header.key.clone(), header);
+                }
+            }
+        }
+        let actual: u64 = self
+            .conn()?
+            .query_row("SELECT count(*) FROM blob_parts", [], |r| r.get(0))?;
+        ensure!(actual == total_parts, "state_v2_orphan_parts");
+        self.stats.record_rows = rows;
+        self.stats.file_rows = files;
+        self.stats.records_alarm = rows > 200_000;
+        self.stats.files_alarm = files > 50_000;
+        self.stats.value_size_alarm = self.stats.max_value_bytes > 4 * 1024 * 1024;
+        self.headers = Some(headers);
+        Ok(())
     }
     fn conn(&self) -> Result<&Connection> {
         ensure!(!self.reload, "current_index_requires_reload");
@@ -659,7 +776,7 @@ impl Sqlite {
             path,
             identity,
             Duration::from_secs(86400),
-            Duration::from_millis(250),
+            Duration::from_secs(2),
         )
     }
     pub(super) fn probe(path: &Path, identity: &super::Identity) -> Result<()> {
@@ -705,7 +822,13 @@ impl Sqlite {
                 private_file(&p)?;
             }
         }
-        let before = fs::symlink_metadata(path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        lock_owner(&file)?;
+        let before = file.metadata()?;
         Self::probe(path, identity)?;
         private_parent(path)?;
         let conn = Connection::open_with_flags(
@@ -721,6 +844,7 @@ impl Sqlite {
         settings(&conn, false)?;
         migrations::run(&conn)?;
         validate_schema(&conn)?;
+        migrations::writer_supported(&conn)?;
         let generation: u64 = read_json(&conn, &RowKey::Meta("generation".into()))?
             .ok_or_else(|| anyhow::anyhow!("state_v2_generation_missing"))?;
         ensure!(
@@ -728,7 +852,11 @@ impl Sqlite {
             "state_v2_generation_rollback"
         );
         if read_json::<u8>(&conn, &RowKey::Meta("phase".into()))? != Some(0) {
-            quick_check(&conn)?;
+            let pages: u64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+            quick_check(
+                &conn,
+                maintenance::size_budget(before.len().max(pages.saturating_mul(4096)), 10),
+            )?;
         }
         let mut store = Self {
             conn: Some(conn),
@@ -740,9 +868,13 @@ impl Sqlite {
             stats: MaintenanceStats::default(),
             last_purge_attempt: None,
             paths: missing_path_extractor,
+            references: None,
+            owner: file,
+            clean: false,
+            headers: None,
         };
         store.set_purge_policy(deadline, work)?;
-        store.validate_parts()?;
+        // Hydrate reads through read_value, which verifies each checksum once.
         // Reconstruct required maintenance from durable purge metadata/size;
         // a nonzero allocated WAL by itself is not a checkpoint debt.
         store.maintenance(false)?;
@@ -751,7 +883,7 @@ impl Sqlite {
     }
     pub(super) fn finish_import(mut self) -> Result<()> {
         ensure!(self.import, "state_v2_not_import");
-        self.validate_parts()?;
+        // The importer read-back proof verifies values before publication.
         self.control("phase", &0_u8)?;
         self.conn()?.execute_batch("PRAGMA journal_mode=WAL;")?;
         self.import = false;
@@ -764,6 +896,9 @@ impl Sqlite {
         Ok(())
     }
     pub(super) fn control<T: Serialize>(&mut self, name: &str, value: &T) -> Result<()> {
+        if name != "phase" {
+            self.mark_dirty()?;
+        }
         ensure!(!pl(&RowKey::Meta(name.into())), "state_v2_control_class");
         let conn = self.conn()?;
         migrations::begin_write(conn)?;
@@ -776,6 +911,9 @@ impl Sqlite {
                 original_paths: BTreeMap::new(),
                 path_bytes: 0,
                 failed: false,
+                changed: BTreeMap::new(),
+                dirty_bytes: 0,
+                estimated_pages: 0,
             };
             tx.put(RowInput {
                 key: &RowKey::Meta(name.into()),
@@ -784,6 +922,13 @@ impl Sqlite {
             })?;
             tx.store.conn()?.execute_batch("COMMIT")?;
             tx.finished = true;
+            if let Some(headers) = &mut tx.store.headers {
+                for (key, header) in std::mem::take(&mut tx.changed) {
+                    if let Some(header) = header {
+                        headers.insert(key, header);
+                    }
+                }
+            }
             Ok(())
         })();
         result
@@ -801,6 +946,7 @@ impl Sqlite {
             _ => None,
         }
     }
+    #[cfg(test)]
     pub(super) fn validate_parts(&mut self) -> Result<()> {
         let conn = self.conn()?;
         // A bounded row scan verifies all owner lengths/digests. The separate
@@ -838,7 +984,10 @@ impl Store for Sqlite {
     type Txn<'a> = Txn<'a>;
     fn begin(&mut self, mode: TxnMode) -> Result<Txn<'_>> {
         if mode == TxnMode::Write {
+            self.mark_dirty()?;
             self.stats.erasure_pending_marks = 0;
+            self.stats.dirty_rows_per_save = 0;
+            self.stats.encoded_bytes_per_save = 0;
             self.maintenance(false)?;
         }
         if mode == TxnMode::Write {
@@ -854,6 +1003,9 @@ impl Store for Sqlite {
             original_paths: BTreeMap::new(),
             path_bytes: 0,
             failed: false,
+            changed: BTreeMap::new(),
+            dirty_bytes: 0,
+            estimated_pages: 0,
         })
     }
     fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
@@ -951,7 +1103,7 @@ fn scan(
         table.name(),
         values.len()
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let mut rows = stmt.query(params_from_iter(values))?;
     let mut page = Vec::with_capacity(limit);
     while let Some(row) = rows.next()? {
@@ -1002,10 +1154,11 @@ fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> 
             "state_v2_part_shape"
         );
         let owner = table_number(h.key.table());
-        let key = owner_key(&h.key)?;
-        let mut stmt = conn
-            .prepare("SELECT part,bytes FROM blob_parts WHERE owner=?1 AND key=?2 ORDER BY part")?;
-        let mut rows = stmt.query(params![owner, key])?;
+        let key_bytes = owner_key_bytes(&h.key)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT part,bytes FROM blob_parts WHERE owner=?1 AND key=?2 ORDER BY part",
+        )?;
+        let mut rows = stmt.query(params![owner, key_bytes])?;
         let mut part = 0_u16;
         while let Some(row) = rows.next()? {
             let ordinal: u16 = row.get(0)?;
@@ -1049,7 +1202,7 @@ fn table_number(table: Table) -> i64 {
 }
 // Each SQL primary-key component is tagged and length-delimited. Numbers use
 // eight-byte big endian; text is exact UTF-8, blobs are exact bytes.
-fn owner_key(key: &RowKey) -> Result<Vec<u8>> {
+fn owner_key_bytes(key: &RowKey) -> Result<Vec<u8>> {
     let mut out = vec![1];
     out.extend_from_slice(&(table_number(key.table()) as u16).to_be_bytes());
     for component in key.values()? {
@@ -1071,9 +1224,11 @@ fn owner_key(key: &RowKey) -> Result<Vec<u8>> {
 /// emitted, through a bounded sink before allocation. No table field knowledge
 /// belongs here. Missing extractors refuse mutations, never infer privacy.
 pub(super) type PathExtractor =
-    fn(&RowKey, &dyn Value, &mut dyn FnMut(&str) -> Result<()>) -> Result<()>;
+    fn(&Header, &dyn Value, &mut dyn FnMut(&str) -> Result<()>) -> Result<()>;
+pub(super) type ReferenceExtractor =
+    fn(&Header, &dyn Value, &mut dyn FnMut(&RowKey) -> Result<()>) -> Result<()>;
 fn missing_path_extractor(
-    _: &RowKey,
+    _: &Header,
     _: &dyn Value,
     _: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
@@ -1092,19 +1247,65 @@ impl Sqlite {
     pub(super) fn path_extractor(&mut self, paths: PathExtractor) {
         self.paths = paths;
     }
+    pub(super) fn reference_extractor(&mut self, refs: ReferenceExtractor) {
+        self.references = Some(refs);
+    }
 }
 impl Txn<'_> {
+    fn admit_change(&mut self, key: &RowKey, bytes: u64) -> Result<()> {
+        if self.store.import {
+            return Ok(());
+        }
+        let rows = self.changed.len() + usize::from(!self.changed.contains_key(key));
+        // Reserve admission for generation/capability and two erasure markers.
+        // Refuse data in delta, where the next collection page can shrink.
+        let commit_control = matches!(key, RowKey::Meta(name) if matches!(name.as_str(),
+            "generation" | "minimum_writer_capability" | "erasure_pending" | "erasure_since"));
+        let (row_limit, byte_limit, page_limit) = if commit_control {
+            (5_000, 32 * 1024 * 1024, 32 * 1024)
+        } else {
+            // Each old control is <=16KiB; with replacement/key overhead its
+            // estimate is <=26 pages. Four markers fit within 128 pages.
+            (4_996, 32 * 1024 * 1024 - 4096, 32 * 1024 - 128)
+        };
+        self.dirty_bytes = self
+            .dirty_bytes
+            .checked_add(bytes)
+            .and_then(|n| n.checked_add(owner_key_bytes(key).ok()?.len() as u64 + 512))
+            .context("state_v2_save_admission")?;
+        ensure!(
+            rows <= row_limit && self.dirty_bytes <= byte_limit,
+            "state_v2_save_admission"
+        );
+        // Bound estimated pages as well as payload. Include old chunks,
+        // secure-delete, B-tree/index paths and replacement pages. Neither
+        // journal_size_limit nor the 64 MiB alarm is a live WAL cap.
+        let old_bytes = self.get(key)?.map_or(0, |h| h.len);
+        let key_bytes = owner_key_bytes(key)?.len() as u64;
+        let pages = bytes
+            .saturating_add(old_bytes)
+            .saturating_add(key_bytes * 2)
+            .div_ceil(4096)
+            .saturating_mul(2)
+            .saturating_add(16);
+        self.estimated_pages = self.estimated_pages.saturating_add(pages);
+        ensure!(
+            self.estimated_pages <= page_limit,
+            "state_v2_save_admission"
+        );
+        Ok(())
+    }
     fn remember_paths(&mut self, old: &Header) -> Result<()> {
         if !pl(&old.key) || self.original_paths.contains_key(&old.key) {
             return Ok(());
         }
         let mut bytes = self.path_bytes;
         bytes = bytes
-            .checked_add(owner_key(&old.key)?.len() * 2 + 512)
+            .checked_add(owner_key_bytes(&old.key)?.len() * 2 + 512)
             .context("state_v2_path_diff_admission")?;
         let mut paths = BTreeSet::new();
         (self.store.paths)(
-            &old.key,
+            old,
             &StoredValue {
                 conn: self.store.conn()?,
                 header: old,
@@ -1114,22 +1315,24 @@ impl Txn<'_> {
                     bytes = bytes
                         .checked_add(path.len() + 64)
                         .context("state_v2_path_diff_admission")?;
-                    ensure!(bytes <= 8 * 1024 * 1024, "state_v2_path_diff_admission");
+                    ensure!(bytes <= 32 * 1024 * 1024, "state_v2_path_diff_admission");
                     paths.insert(path.to_owned());
                 }
                 Ok(())
             },
         )?;
-        if !paths.is_empty() {
-            self.path_bytes = bytes;
-            self.original_paths.insert(old.key.clone(), paths);
-        }
+        // Remember empty sets too, so repeated changes extract at most once.
+        self.path_bytes = bytes;
+        self.original_paths.insert(old.key.clone(), paths);
         Ok(())
     }
     fn paths_removed(&mut self) -> Result<bool> {
         // Consume the admitted original set. New paths only remove candidates:
         // no second encoded graph/set is allocated during the final diff.
         for (key, mut old) in std::mem::take(&mut self.original_paths) {
+            if old.is_empty() {
+                continue;
+            }
             if self.removed_keys.contains(&key) {
                 return Ok(true);
             }
@@ -1137,7 +1340,7 @@ impl Txn<'_> {
                 return Ok(true);
             };
             (self.store.paths)(
-                &key,
+                &header,
                 &StoredValue {
                     conn: self.store.conn()?,
                     header: &header,
@@ -1189,7 +1392,7 @@ fn read_json<T: serde::de::DeserializeOwned>(conn: &Connection, key: &RowKey) ->
 struct PartWriter<'a> {
     conn: &'a Connection,
     owner: i64,
-    key: Vec<u8>,
+    key_bytes: Vec<u8>,
     part: u16,
     bytes: Vec<u8>,
     len: u64,
@@ -1203,7 +1406,7 @@ impl PartWriter<'_> {
         self.conn
             .execute(
                 "INSERT INTO blob_parts(owner,key,part,bytes) VALUES(?1,?2,?3,?4)",
-                params![self.owner, self.key, self.part, self.bytes],
+                params![self.owner, self.key_bytes, self.part, self.bytes],
             )
             .map_err(|_| io::Error::other("state_v2_part_write"))?;
         self.part += 1;
@@ -1241,6 +1444,13 @@ fn pl(key: &RowKey) -> bool {
             "identity"
                 | "generation"
                 | "phase"
+                | "erasure_success"
+                | "erasure_failures"
+                | "erasure_purged_epoch"
+                | "reference_check_success"
+                | "reference_check_attempt"
+                | "reference_drift"
+                | "minimum_writer_capability"
                 | "erasure_pending"
                 | "erasure_since"
                 | "erasure_attempt"
@@ -1259,6 +1469,12 @@ fn pl(key: &RowKey) -> bool {
 }
 impl Transaction for Txn<'_> {
     fn get(&mut self, key: &RowKey) -> Result<Option<Header>> {
+        if let Some(header) = self.changed.get(key) {
+            return Ok(header.clone());
+        }
+        if let Some(headers) = &self.store.headers {
+            return Ok(headers.get(key).cloned());
+        }
         get(self.store.conn()?, key)
     }
     fn read_value(&mut self, h: &Header, out: &mut dyn Write) -> Result<()> {
@@ -1269,6 +1485,22 @@ impl Transaction for Txn<'_> {
         self.store.stats.row_write_attempts = self.store.stats.row_write_attempts.saturating_add(1);
         let result = (|| {
             let h = preflight(&row)?;
+            if *row.key == RowKey::Meta("minimum_writer_capability".into()) {
+                ensure!(h.len <= 16 * 1024, "state_v2_control_admission");
+                let mut encoded = Vec::new();
+                row.value.write(&mut encoded)?;
+                let mut json = Vec::new();
+                packed::decode(encoded.as_slice(), &mut json)?;
+                let next: u64 = serde_json::from_slice(&json)?;
+                let old = self
+                    .store
+                    .read_control::<u64>("minimum_writer_capability")?
+                    .unwrap_or(0);
+                ensure!(
+                    next >= old && next <= migrations::WRITER_CAPABILITY,
+                    "state_v2_writer_capability_order"
+                );
+            }
             let table = row.key.table();
             let fixed = fixed_values(table, row.fixed)?;
             // Validate all scalar conversions before deleting the old owner.
@@ -1281,17 +1513,21 @@ impl Transaction for Txn<'_> {
                     *row.key != RowKey::Meta("identity".into()),
                     "state_v2_identity_immutable"
                 );
-                if table == Table::Census {
+                if table == Table::Census
+                    || old.fixed != h.fixed
+                    || !references::matches(self.store.conn()?, &old, row.value)?
+                {
                     read_value(self.store.conn()?, &old, &mut io::sink())?;
-                } else if !references::matches(self.store.conn()?, &old, row.value)? {
                     self.remember_paths(&old)?;
                 }
+                self.admit_change(row.key, h.len + serde_json::to_vec(&h.fixed)?.len() as u64)?;
                 self.store.conn()?.execute(
                     "DELETE FROM blob_parts WHERE owner=?1 AND key=?2",
-                    params![table_number(table), owner_key(row.key)?],
+                    params![table_number(table), owner_key_bytes(row.key)?],
                 )?;
                 true
             } else {
+                self.admit_change(row.key, h.len + serde_json::to_vec(&h.fixed)?.len() as u64)?;
                 false
             };
             self.removed_keys.remove(row.key);
@@ -1299,7 +1535,7 @@ impl Transaction for Txn<'_> {
             let mut writer = PartWriter {
                 conn,
                 owner: table_number(table),
-                key: owner_key(row.key)?,
+                key_bytes: owner_key_bytes(row.key)?,
                 part: 0,
                 bytes: Vec::with_capacity(if h.parts == 0 {
                     INLINE_BYTES
@@ -1362,7 +1598,11 @@ impl Transaction for Txn<'_> {
                     table.name()
                 )
             };
-            conn.execute(&sql, params_from_iter(values))?;
+            conn.prepare_cached(&sql)?
+                .execute(params_from_iter(values))?;
+            self.changed.insert(row.key.clone(), Some(h.clone()));
+            self.store.stats.max_value_bytes = self.store.stats.max_value_bytes.max(h.len);
+            self.store.stats.value_size_alarm |= h.len > 4 * 1024 * 1024;
             Ok(h)
         })();
         self.failed |= result.is_err();
@@ -1378,12 +1618,13 @@ impl Transaction for Txn<'_> {
                 "state_v2_identity_immutable"
             );
             if let Some(old) = self.get(key)? {
+                self.admit_change(key, 0)?;
                 self.remember_paths(&old)?;
             }
             let conn = self.store.conn()?;
             conn.execute(
                 "DELETE FROM blob_parts WHERE owner=?1 AND key=?2",
-                params![table_number(key.table()), owner_key(key)?],
+                params![table_number(key.table()), owner_key_bytes(key)?],
             )?;
             let table = key.table();
             let count = conn.execute(
@@ -1392,6 +1633,9 @@ impl Transaction for Txn<'_> {
             )?;
             if count != 0 && self.original_paths.contains_key(key) {
                 self.removed_keys.insert(key.clone());
+            }
+            if count != 0 {
+                self.changed.insert(key.clone(), None);
             }
             Ok(count != 0)
         })();
@@ -1421,6 +1665,29 @@ impl Transaction for Txn<'_> {
         after: Option<&RowKey>,
         limit: usize,
     ) -> Result<Vec<Header>> {
+        if let Some(headers) = &self.store.headers {
+            ensure!(limit <= PAGE_HEADERS, "state_v2_header_page_admission");
+            let mut page = BTreeMap::new();
+            for (key, header) in headers.range((
+                after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+                std::ops::Bound::Unbounded,
+            )) {
+                if key.table() == prefix.table && !self.changed.contains_key(key) {
+                    page.insert(key.clone(), header.clone());
+                    if page.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            for (key, header) in &self.changed {
+                if key.table() == prefix.table && after.map_or(true, |a| key > a) {
+                    if let Some(header) = header {
+                        page.insert(key.clone(), header.clone());
+                    }
+                }
+            }
+            return Ok(page.into_values().take(limit).collect());
+        }
         scan(self.store.conn()?, prefix, after, limit)
     }
     fn commit(mut self, expected: u64, next: u64) -> DurableCommitOutcome {
@@ -1441,24 +1708,34 @@ impl Transaction for Txn<'_> {
                 self.store.stats.erasure_pending_marks =
                     self.store.stats.erasure_pending_marks.saturating_add(1);
             }
-            if purge
-                && self
+            if purge {
+                if self
                     .store
                     .read_control::<u64>("erasure_pending")?
                     .unwrap_or(0)
                     == 0
-            {
-                self.put(RowInput {
-                    key: &RowKey::Meta("erasure_since".into()),
-                    fixed: &Fixed::None,
-                    value: &packed::Json(&SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()),
-                })?;
+                {
+                    self.put(RowInput {
+                        key: &RowKey::Meta("erasure_since".into()),
+                        fixed: &Fixed::None,
+                        value: &packed::Json(
+                            &SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+                        ),
+                    })?;
+                }
+                // Every deleting transaction gets its own epoch. Keep the
+                // oldest timestamp until all captured deletions are purged.
                 self.put(RowInput {
                     key: &RowKey::Meta("erasure_pending".into()),
                     fixed: &Fixed::None,
                     value: &packed::Json(&next),
                 })?;
             }
+            self.put(RowInput {
+                key: &RowKey::Meta("minimum_writer_capability".into()),
+                fixed: &Fixed::None,
+                value: &packed::Json(&migrations::WRITER_CAPABILITY),
+            })?;
             self.put(RowInput {
                 key: &RowKey::Meta("generation".into()),
                 fixed: &Fixed::None,
@@ -1483,6 +1760,31 @@ impl Transaction for Txn<'_> {
                 .stats
                 .commit(&DurableCommitOutcome::Committed(next), Some(latency));
             self.finished = true;
+            self.store.stats.dirty_rows_per_save = self.changed.len() as u64;
+            self.store.stats.encoded_bytes_per_save = self.dirty_bytes;
+            if let Some(headers) = &mut self.store.headers {
+                for (key, header) in std::mem::take(&mut self.changed) {
+                    let delta = i64::from(header.is_some()) - i64::from(headers.contains_key(&key));
+                    if key.table() != Table::Meta
+                        && key.table() != Table::Interned
+                        && key.table() != Table::RequestSets
+                    {
+                        self.store.stats.record_rows =
+                            self.store.stats.record_rows.saturating_add_signed(delta);
+                    }
+                    if key.table() == Table::Files {
+                        self.store.stats.file_rows =
+                            self.store.stats.file_rows.saturating_add_signed(delta);
+                    }
+                    if let Some(header) = header {
+                        headers.insert(key, header);
+                    } else {
+                        headers.remove(&key);
+                    }
+                }
+            }
+            self.store.stats.records_alarm = self.store.stats.record_rows > 200_000;
+            self.store.stats.files_alarm = self.store.stats.file_rows > 50_000;
             // Required checkpoint failure records debt; the completed data
             // commit stands. No caller may infer an ACK from a failed commit.
             let _ = self.store.maintenance(false);
@@ -1530,7 +1832,7 @@ fn validate_schema_revision(conn: &Connection, revision: u32) -> Result<()> {
     // The expected object set comes from the immutable revision fixture, never
     // the current table count/enum ordering. New revisions add their own image.
     fn objects(conn: &Connection) -> Result<BTreeSet<(String, String, String)>> {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT name,type,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
@@ -1550,8 +1852,11 @@ unsafe extern "C" fn progress(raw: *mut std::ffi::c_void) -> std::ffi::c_int {
     let deadline = unsafe { &*(raw.cast::<Instant>()) };
     (Instant::now() >= *deadline) as std::ffi::c_int
 }
-fn quick_check(conn: &Connection) -> Result<()> {
-    let mut deadline = Instant::now() + BUSY;
+fn quick_check(conn: &Connection, budget: Duration) -> Result<()> {
+    let mut deadline = Instant::now()
+        .checked_add(budget)
+        .context("state_v2_work_budget")?;
+    super::telemetry::event("quick_check", &1);
     unsafe {
         rusqlite::ffi::sqlite3_progress_handler(
             conn.handle(),
@@ -1564,8 +1869,15 @@ fn quick_check(conn: &Connection) -> Result<()> {
     unsafe {
         rusqlite::ffi::sqlite3_progress_handler(conn.handle(), 0, None, std::ptr::null_mut());
     }
+    let checked = result.map_err(|error| {
+        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted) {
+            anyhow::Error::from(super::Hold::IntegrityRetry)
+        } else {
+            error.into()
+        }
+    })?;
     ensure!(
-        result? == "ok",
+        checked == "ok",
         "state_v2_integrity_requires_explicit_repair"
     );
     Ok(())
@@ -1626,7 +1938,7 @@ pub(super) fn schema_for_test(db: &Sqlite) -> (SchemaFacts, bool) {
     let mut facts = Vec::new();
     for table in Table::ALL.iter().map(|t| t.name()).chain(["blob_parts"]) {
         let mut stmt = conn
-            .prepare(&format!("PRAGMA table_info({table})"))
+            .prepare_cached(&format!("PRAGMA table_info({table})"))
             .unwrap();
         let columns = stmt
             .query_map([], |r| Ok((r.get(1)?, r.get(2)?)))
@@ -1670,11 +1982,11 @@ pub(super) fn part_count_for_test(db: &Sqlite) -> u64 {
 #[test]
 fn registered_owner_encoding_is_stable() {
     assert_eq!(
-        owner_key(&RowKey::File("/a".into())).unwrap(),
+        owner_key_bytes(&RowKey::File("/a".into())).unwrap(),
         [1, 0, 1, 1, 0, 0, 0, 2, b'/', b'a']
     );
     assert_eq!(
-        owner_key(&RowKey::Interned {
+        owner_key_bytes(&RowKey::Interned {
             kind: 2,
             ordinal: 3
         })
@@ -1685,4 +1997,27 @@ fn registered_owner_encoding_is_stable() {
         Table::ALL.map(table_number),
         [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     );
+}
+
+#[cfg(test)]
+pub(super) fn future_writer_for_test(db: &mut Sqlite) {
+    let key = RowKey::Meta("minimum_writer_capability".into());
+    let value = packed::Json(&(migrations::WRITER_CAPABILITY + 1));
+    let h = preflight(&RowInput {
+        key: &key,
+        fixed: &Fixed::None,
+        value: &value,
+    })
+    .unwrap();
+    let mut bytes = Vec::new();
+    value.write(&mut bytes).unwrap();
+    db.conn().unwrap().execute(
+        "INSERT INTO meta(name,digest,len,parts,inline) VALUES(?1,?2,?3,0,?4) ON CONFLICT(name) DO UPDATE SET digest=excluded.digest,len=excluded.len,parts=0,inline=excluded.inline",
+        params!["minimum_writer_capability", h.digest.as_slice(), h.len, bytes],
+    ).unwrap();
+}
+
+#[cfg(test)]
+pub(super) fn seed_page_estimate_for_test(tx: &mut Txn<'_>, pages: u64) {
+    tx.estimated_pages = pages;
 }

@@ -19,6 +19,9 @@ pub(in super::super) enum Hold {
     NewerSchema,
     MigrationFailed,
     ReloadRequired,
+    IntegrityRetry,
+    SaveAdmission,
+    ReferenceDrift,
 }
 impl std::fmt::Display for Hold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -28,6 +31,9 @@ impl std::fmt::Display for Hold {
             Self::ForeignBinding => "state_v2_foreign_binding",
             Self::NewerSchema => "state_v2_newer_schema_refused",
             Self::MigrationFailed => "state_v2_migration_failed",
+            Self::SaveAdmission => "state_v2_save_admission",
+            Self::IntegrityRetry => "state_v2_integrity_retry",
+            Self::ReferenceDrift => "state_v2_reference_drift",
             Self::ReloadRequired => "current_index_requires_reload",
             Self::FenceLost => "state_v2_fence_lost",
         })
@@ -48,7 +54,14 @@ impl Hold {
             })
             .unwrap_or("integrity_or_io");
         telemetry::event("db_unavailable", &reason);
-        let hold = if error
+        let hold = if error.chain().any(|e| {
+            matches!(
+                e.to_string().as_str(),
+                "state_v2_save_admission" | "state_v2_path_diff_admission"
+            )
+        }) {
+            Self::SaveAdmission
+        } else if error
             .chain()
             .any(|e| e.to_string() == "state_v2_foreign_binding")
         {
@@ -76,6 +89,10 @@ struct RouteState {
     inventory_ready: bool,
     sample_v1: bool,
     runtimes: Vec<std::sync::Weak<Runtime>>,
+    current: Option<Arc<Runtime>>,
+    cached: Option<ScanIndex>,
+    page_limit: usize,
+    pass_written_start: Option<u64>,
 }
 type RouteHandle = Arc<Mutex<RouteState>>;
 fn states() -> &'static Mutex<BTreeMap<PathBuf, RouteHandle>> {
@@ -99,6 +116,10 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     inventory_ready: false,
                     sample_v1: false,
                     runtimes: Vec::new(),
+                    current: None,
+                    cached: None,
+                    page_limit: 250,
+                    pass_written_start: None,
                 }))
             })
             .clone()
@@ -141,7 +162,7 @@ pub(in super::super) struct Session {
     identity: Identity,
     path: PathBuf,
     reload: bool,
-    wrote: bool,
+    stamp: (u64, u64),
 }
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -174,8 +195,9 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
     if !route_needed(path, switched)? {
         return Ok(None);
     }
-    held(with_state(path, |state| {
+    let result = held(with_state(path, |state| {
         state.inventory_ready = false;
+        state.pass_written_start = telemetry::process_written_bytes();
         state.sample_v1 = switched;
         let pair = fence::reconcile(path, &binding, state.latched)?;
         if let Some((identity, db_path)) = pair {
@@ -184,16 +206,44 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
                 telemetry::event("switch_off_ignored", &1);
             }
             telemetry::baseline(path);
+            if let Some(runtime) = state.current.clone() {
+                let mut guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+                if let Some(session) = guard.as_mut() {
+                    let stamp = session.db.stamp()?;
+                    if !session.reload && session.identity == identity && session.stamp == stamp {
+                        if let Some(index) = state.cached.as_ref() {
+                            if index.generation == stamp.0 {
+                                telemetry::event("route", &"v2_cached");
+                                return Ok(Some(index.clone()));
+                            }
+                        }
+                        // A concurrent borrower consumed the graph, so hydrate
+                        // on the same connection; never acquire another owner.
+                        let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
+                        telemetry::event("hydrate_count", &1);
+                        let mut index = mapper.hydrate(&mut session.db)?;
+                        ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+                        index.persistence_v2 = Some(runtime.clone());
+                        state.cached = Some(index.clone());
+                        return Ok(Some(index));
+                    }
+                }
+                // Invalidate every old clone before replacing the connection.
+                guard.take();
+                state.cached = None;
+                state.current = None;
+            }
             let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
+            telemetry::event("hydrate_count", &1);
             let (deadline, work) = purge_policy();
             let mut db = sqlite::Sqlite::open_with_policy(&db_path, &identity, deadline, work)
                 .map_err(Hold::storage)?;
             db.path_extractor(M::private_paths);
-            let generation = db
-                .read_control::<u64>("generation")?
-                .ok_or(Hold::DbUnavailable)?;
+            db.reference_extractor(M::references);
+            let stamp = db.stamp()?;
             let mut index = mapper.hydrate(&mut db)?;
-            ensure!(index.generation == generation, Hold::DbUnavailable);
+            ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+            db.prime_headers()?;
             index.persistence_v2 = Some(Arc::new(Runtime {
                 active: true,
                 session: Mutex::new(Some(Session {
@@ -201,10 +251,11 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
                     identity,
                     path: path.to_owned(),
                     reload: false,
-                    wrote: false,
+                    stamp,
                 })),
             }));
             register(state, &index)?;
+            state.cached = Some(index.clone());
             telemetry::event("route", &"v2");
             return Ok(Some(index));
         }
@@ -236,7 +287,21 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
         }
         telemetry::event("route", &"v1");
         Ok(None)
-    }))
+    }));
+    if result.is_err() {
+        with_state(path, |state| {
+            state.cached = None;
+            if let Some(runtime) = state.current.take() {
+                runtime
+                    .session
+                    .lock()
+                    .map_err(|_| Hold::DbUnavailable)?
+                    .take();
+            }
+            Ok(())
+        })?;
+    }
+    result
 }
 fn pause(state: &mut RouteState, now: Instant, class: Pause) {
     state.inventory_ready = false;
@@ -296,6 +361,7 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             let import = fence::sibling(path, ".v2.sqlite.import");
             let mut db = sqlite::Sqlite::create_import(&import)?;
             db.path_extractor(M::private_paths);
+            db.reference_extractor(M::references);
             db.control("identity", &identity)?;
             db.control("generation", &index.generation)?;
             mapper.populate(&mut db, index)?;
@@ -322,6 +388,9 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
         let mut db = sqlite::Sqlite::open_with_policy(&db_path, &identity, deadline, work)
             .map_err(Hold::storage)?;
         db.path_extractor(M::private_paths);
+        db.reference_extractor(M::references);
+        db.prime_headers()?;
+        let stamp = db.stamp()?;
         index.persistence_v2 = Some(Arc::new(Runtime {
             active: true,
             session: Mutex::new(Some(Session {
@@ -329,7 +398,7 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
                 identity,
                 path: path.to_owned(),
                 reload: false,
-                wrote: false,
+                stamp,
             })),
         }));
         register(state, index)?;
@@ -385,7 +454,7 @@ fn save_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Resul
     if index.persistence_v2.is_none() && !route_needed(path, false)? {
         return Ok(false);
     }
-    held(with_state(path, |state| {
+    let result = held(with_state(path, |state| {
         let pair = fence::reconcile(path, &binding, state.latched)?;
         let Some(runtime) = index.persistence_v2.clone() else {
             ensure!(pair.is_none(), Hold::DbUnavailable);
@@ -401,6 +470,7 @@ fn save_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Resul
         );
         let _gauge = telemetry::Stage::new(telemetry::Kind::Save);
         mapper.preflight(index).map_err(|_| Hold::DbUnavailable)?;
+        state.cached = None;
         let mut tx = session.db.begin(TxnMode::Write)?;
         // Identity is independently authenticated; generation is atomically
         // compared again by commit. Hold comparisons remain mapper-owned.
@@ -411,9 +481,40 @@ fn save_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Resul
         let next = previous.checked_add(1).ok_or(Hold::DbUnavailable)?;
         mapper.delta(&mut tx, index)?;
         apply_outcome(index, &mut session.reload, tx.commit(previous, next))?;
-        session.wrote = true;
+        session.stamp = session.db.stamp()?;
+        // Cache exactly the committed graph, including subset-save outcomes;
+        // never retain an end-of-cycle graph with unsaved semantic mutations.
+        state.cached = Some(index.clone());
         Ok(true)
-    }))
+    }));
+    if let Err(error) = &result {
+        with_state(path, |state| {
+            state.cached = None;
+            // A smaller next collection page retries one atomic save, never
+            // fragments a graph transaction or drops its custody rows.
+            if error.chain().any(|e| {
+                matches!(
+                    e.to_string().as_str(),
+                    "state_v2_save_admission" | "state_v2_path_diff_admission"
+                )
+            }) {
+                state.page_limit = (state.page_limit / 2).max(1);
+                telemetry::event("save_page_reduced", &state.page_limit);
+            }
+            if let Some(runtime) = &state.current {
+                if let Some(session) = runtime
+                    .session
+                    .lock()
+                    .map_err(|_| Hold::DbUnavailable)?
+                    .as_mut()
+                {
+                    session.reload = true;
+                }
+            }
+            Ok(())
+        })?;
+    }
+    result
 }
 fn lenient_check(index: &ScanIndex) -> Result<()> {
     super::super::lenient_decode::check_held_output(index)
@@ -456,6 +557,51 @@ pub(in super::super) fn guard_containment_locked(path: &Path) -> Result<()> {
     }))
 }
 
+/// Caller retains the process-lifetime LockedStateDir. This guard is repeated
+/// at each external boundary; COMMIT fencing alone is too late for uploads.
+pub(in super::super) fn guard_external(
+    path: &Path,
+    runtime: Option<&Arc<Runtime>>,
+    graph_generation: u64,
+) -> Result<()> {
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    let _lock = super::super::CheckpointLock::acquire(path)?;
+    held(with_state(path, |state| {
+        let mut guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+        let session = guard.as_mut().ok_or(Hold::ReloadRequired)?;
+        ensure!(
+            !session.reload && session.path == path,
+            Hold::ReloadRequired
+        );
+        let pair = fence::reconcile(path, &session.identity.binding, state.latched)?;
+        ensure!(
+            pair.is_some_and(|(id, _)| id == session.identity),
+            Hold::FenceLost
+        );
+        let stamp = session.db.stamp()?;
+        ensure!(
+            stamp == session.stamp && stamp.0 == graph_generation,
+            Hold::ReloadRequired
+        );
+        Ok(())
+    }))
+}
+
+pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usize) -> usize {
+    let Some(runtime) = &index.persistence_v2 else {
+        return requested;
+    };
+    let path = runtime
+        .session
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.path.clone()));
+    path.and_then(|p| with_state(&p, |s| Ok(s.page_limit.min(requested))).ok())
+        .unwrap_or(requested.min(250))
+}
+
 pub(super) fn purge_policy() -> (Duration, Duration) {
     let seconds = std::env::var("OTTTO_CLAUDE_STATE_V2_ERASURE_SECONDS")
         .ok()
@@ -463,10 +609,10 @@ pub(super) fn purge_policy() -> (Duration, Duration) {
         .filter(|s| *s > 0)
         .unwrap_or(86400)
         .min(72 * 3600);
-    (Duration::from_secs(seconds), Duration::from_millis(250))
+    (Duration::from_secs(seconds), Duration::from_secs(2))
 }
 
-pub(in super::super) fn idle(path: &Path, index: &ScanIndex) -> Result<()> {
+pub(in super::super) fn idle(path: &Path, index: &ScanIndex, quiet: bool) -> Result<()> {
     let Some(runtime) = &index.persistence_v2 else {
         return Ok(());
     };
@@ -481,9 +627,19 @@ pub(in super::super) fn idle(path: &Path, index: &ScanIndex) -> Result<()> {
             Hold::ForeignBinding
         );
         telemetry::baseline(path);
-        let idle = !session.wrote;
-        session.wrote = false;
-        session.db.maintenance(idle).map_err(Hold::storage)
+        // This hook is between sync cycles even when that cycle saved rows.
+        erasure_inventory(path)?;
+        session.db.between_cycles(quiet).map_err(Hold::storage)?;
+        session.db.clean_checkpoint().map_err(Hold::storage)?;
+        session.stamp = session.db.stamp()?;
+        telemetry::event(
+            "bytes_written_per_pass",
+            &state
+                .pass_written_start
+                .zip(telemetry::process_written_bytes())
+                .and_then(|(a, b)| b.checked_sub(a)),
+        );
+        Ok(())
     }))
 }
 fn register(state: &mut RouteState, index: &ScanIndex) -> Result<()> {
@@ -491,6 +647,55 @@ fn register(state: &mut RouteState, index: &ScanIndex) -> Result<()> {
     ensure!(state.runtimes.len() < 16, Hold::DbUnavailable);
     if let Some(runtime) = &index.persistence_v2 {
         state.runtimes.push(Arc::downgrade(runtime));
+        state.current = Some(runtime.clone());
+    }
+    Ok(())
+}
+
+/// Inventory only: the baseline's explicit single-file erasure exception and
+/// the H/N/L-only restart cache are not covered by a DB VACUUM claim.
+fn erasure_inventory(path: &Path) -> Result<()> {
+    for (class, artifact) in [
+        (
+            "migration_backup_inventory",
+            fence::sibling(path, ".v2.sqlite.migration-backup"),
+        ),
+        (
+            "import_remnant_inventory",
+            fence::sibling(path, ".v2.sqlite.import"),
+        ),
+        ("baseline_inventory", fence::sibling(path, ".v1-readonly")),
+        (
+            "restart_record_inventory",
+            crate::durable_tail_store::store_dir_for_index(path),
+        ),
+    ] {
+        let mut count = 0_u64;
+        let mut bytes = 0_u64;
+        let mut bounded = false;
+        match fs::symlink_metadata(&artifact) {
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {
+                for entry in fs::read_dir(&artifact)?.take(1025) {
+                    let m = entry?.metadata()?;
+                    count += 1;
+                    bytes = bytes.saturating_add(m.len());
+                    if count > 1024 {
+                        bounded = true;
+                        break;
+                    }
+                }
+            }
+            Ok(m) => {
+                count = 1;
+                bytes = m.len();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        telemetry::event(
+            class,
+            &serde_json::json!({"count":count,"bytes":bytes,"bounded":bounded}),
+        );
     }
     Ok(())
 }
@@ -500,6 +705,8 @@ fn invalidate_locked(path: &Path) -> Result<()> {
         state.latched = true;
         state.inventory_ready = false;
         state.sample_v1 = false;
+        state.cached = None;
+        state.current = None;
         for runtime in state.runtimes.drain(..).filter_map(|r| r.upgrade()) {
             runtime
                 .session
@@ -549,6 +756,7 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
         ".v2.sqlite",
         ".v2.sqlite-wal",
         ".v2.sqlite-shm",
+        ".v2.sqlite.migration-backup",
         ".v2.sqlite.import",
         ".v2.sqlite.import-wal",
         ".v2.sqlite.import-shm",
@@ -565,6 +773,15 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
         }
     }
     super::super::sync_checkpoint_parent(path)?;
+    let records = crate::durable_tail_store::store_dir_for_index(path);
+    match fs::symlink_metadata(&records) {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => fs::remove_dir_all(&records)?,
+        Ok(_) => fs::remove_file(&records)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    super::super::sync_checkpoint_parent(path)?;
+    telemetry::event("source_erasure_confirmed", &1);
     // Keep the latch until process exit. Stale clones cannot fall back to v1.
     with_state(path, |state| {
         state.latched = true;
@@ -628,17 +845,7 @@ pub(in super::super) fn erase_tree(support: &Path) -> Result<()> {
             let _lock = super::super::CheckpointLock::acquire(&path)?;
             erase_locked(&path, None)?;
         } else {
-            with_state(&path, |state| {
-                state.latched = true;
-                for runtime in state.runtimes.drain(..).filter_map(|r| r.upgrade()) {
-                    runtime
-                        .session
-                        .lock()
-                        .map_err(|_| Hold::DbUnavailable)?
-                        .take();
-                }
-                Ok(())
-            })?;
+            invalidate_locked(&path)?;
         }
     }
     Ok(())

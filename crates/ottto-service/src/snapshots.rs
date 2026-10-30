@@ -26801,6 +26801,7 @@ impl OwnedSourceScan {
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
     ) -> Self {
+        let file_limit = state_v2::collection_page_limit(&owned_index, file_limit);
         if !owned_index.persistence_available() {
             // No inventory, selection or provider I/O for an unavailable index.
             let mut blocked = Self::new_continuation(
@@ -94067,8 +94068,19 @@ impl ScanIndex {
 pub(crate) fn erase_claude_state_v2_artifacts(support: &Path) -> Result<()> {
     state_v2::erase_tree(support)
 }
-pub(crate) fn maintain_state_v2_idle(path: &Path, index: &ScanIndex) -> Result<()> {
-    state_v2::idle(path, index)
+pub(crate) fn maintain_state_v2_idle(path: &Path, index: &ScanIndex, quiet: bool) -> Result<()> {
+    state_v2::idle(path, index, quiet)
+}
+pub(crate) fn state_v2_side_effect_guard(
+    path: &Path,
+    index: &ScanIndex,
+) -> impl Fn() -> Result<()> {
+    let runtime = index.persistence_v2.clone();
+    // This guard belongs to this graph, not to the mutable shared connection.
+    // After adopting a successful save, construct a new guard for further IO.
+    let graph_generation = index.generation;
+    let path = path.to_owned();
+    move || state_v2::guard_external(&path, runtime.as_ref(), graph_generation)
 }
 
 #[cfg(target_os = "macos")]

@@ -7148,7 +7148,9 @@ fn finish_sync_source(
         }
         Ok(())
     };
+    let state_v2_guard = crate::snapshots::state_v2_side_effect_guard(&index_path, &index);
     let ensure_authority = || {
+        state_v2_guard()?;
         ensure_snapshot_scan_authority(device, source, client, &account_witness, daemon)?;
         ensure_snapshot_destination_current(&upload_destination_namespace)?;
         if let Some(roots) = &claude_scan_roots {
@@ -8368,7 +8370,17 @@ fn finish_sync_source(
             actual_native_conjunction && scan_result.census_complete && upload_fully_settled,
         );
     }
-    crate::snapshots::maintain_state_v2_idle(&index_path, &index)?;
+    // Maintenance is advisory: privacy deadlines alarm without failing an
+    // otherwise committed collection cycle. Never print private engine errors.
+    if crate::snapshots::maintain_state_v2_idle(
+        &index_path,
+        &index,
+        scan_result.snapshots.is_empty(),
+    )
+    .is_err()
+    {
+        eprintln!("local state maintenance deferred for {}", source.api_slug());
+    }
     // A completed cycle is what moves the tier: uploads keep a source warm, a
     // quiet cycle lets it fall to idle and then cold. A conflict pass has still
     // durably committed its accepted siblings, but remains a source failure so

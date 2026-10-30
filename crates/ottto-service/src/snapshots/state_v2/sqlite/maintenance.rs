@@ -12,9 +12,20 @@ impl Default for PurgePolicy {
     fn default() -> Self {
         Self {
             deadline: Duration::from_secs(24 * 60 * 60),
-            work: Duration::from_millis(250),
+            work: Duration::from_secs(2),
         }
     }
+}
+
+/// Budgets scale with allocated bytes, rounded up to a MiB. VM interruption
+/// bounds CPU work; SQLite's busy handler separately bounds lock waits.
+pub(super) fn size_budget(bytes: u64, ms_per_mib: u64) -> Duration {
+    Duration::from_millis(
+        2_000_u64.saturating_add(bytes.div_ceil(1024 * 1024).saturating_mul(ms_per_mib)),
+    )
+}
+fn retry_seconds(failures: u64) -> u64 {
+    3600 * (1_u64 << failures.saturating_sub(1).min(2))
 }
 
 /// Private counts/bytes/times only. None means unavailable, never zero.
@@ -45,6 +56,19 @@ pub(in super::super) struct MaintenanceStats {
     commit_latency_us: CommitLatency,
     cache_used_bytes: Option<u64>,
     db_bytes: Option<u64>,
+    pub(super) encoded_bytes_per_save: u64,
+    pub(super) dirty_rows_per_save: u64,
+    pub(super) max_value_bytes: u64,
+    pub(super) record_rows: u64,
+    pub(super) file_rows: u64,
+    pub(super) records_alarm: bool,
+    pub(super) files_alarm: bool,
+    pub(super) value_size_alarm: bool,
+    db_size_alarm: bool,
+    erasure_breaches: u64,
+    maintenance_pauses: u64,
+    reference_drift: u64,
+    reference_check_failed: u64,
 }
 #[derive(Clone, Default, Debug, Serialize)]
 struct ErasureVacuum {
@@ -212,7 +236,8 @@ impl Sqlite {
         .ok();
         let required = logical
             .zip(fs::metadata(&self.path).ok().map(|m| m.len()))
-            .and_then(|(logical, file)| logical.max(file).checked_mul(2));
+            .and_then(|(logical, file)| logical.max(file).checked_mul(2))
+            .and_then(|n| n.checked_add(1024 * 1024 * 1024));
         let available = free_space(&self.path);
         self.stats.free_space_required_bytes = required;
         self.stats.free_space_available_bytes = available;
@@ -223,8 +248,9 @@ impl Sqlite {
         // saves; neither the 64 MiB alarm nor the work budget is a WAL cap.
         let started = Instant::now();
         self.stats.vacuum_attempts = self.stats.vacuum_attempts.saturating_add(1);
-        self.stats.erasure_vacuum.runs = self.stats.erasure_vacuum.runs.saturating_add(1);
-        let result = limited(self.conn()?, self.purge_policy.work, || {
+
+        let budget = size_budget(logical.unwrap_or(0), 20).max(self.purge_policy.work);
+        let result = limited(self.conn()?, budget, || {
             Ok(self.conn()?.execute_batch("VACUUM")?)
         });
         self.stats.vacuum_latency_ms = u64::try_from(started.elapsed().as_millis()).ok();
@@ -240,9 +266,68 @@ impl Sqlite {
         result
     }
 
+    fn logical_bytes(&self) -> Result<u64> {
+        let pages: u64 = self
+            .conn()?
+            .query_row("PRAGMA page_count", [], |r| r.get(0))?;
+        let size: u64 = self
+            .conn()?
+            .query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        pages.checked_mul(size).context("state_v2_db_size")
+    }
+    fn erasure_complete(&mut self, now: u64, covered_epoch: u64) -> Result<()> {
+        let mut tx = self.begin(TxnMode::Write)?;
+        // Source ownership serializes deletions with VACUUM. Still compare the
+        // captured epoch: a future concurrent scheduler may not clear new debt.
+        let pending = tx
+            .store
+            .read_control::<u64>("erasure_pending")?
+            .unwrap_or(0);
+        for (name, value) in [
+            ("erasure_success", now),
+            ("erasure_failures", 0),
+            ("erasure_purged_epoch", covered_epoch),
+            (
+                "erasure_pending",
+                if pending == covered_epoch { 0 } else { pending },
+            ),
+        ] {
+            tx.put(RowInput {
+                key: &RowKey::Meta(name.into()),
+                fixed: &Fixed::None,
+                value: &packed::Json(&value),
+            })?;
+        }
+        if tx.store.conn()?.execute_batch("COMMIT").is_err() {
+            tx.store.reload = true;
+            bail!("current_index_requires_reload");
+        }
+        tx.finished = true;
+        if let Some(headers) = &mut tx.store.headers {
+            for (key, header) in std::mem::take(&mut tx.changed) {
+                if let Some(header) = header {
+                    headers.insert(key, header);
+                }
+            }
+        }
+        Ok(())
+    }
     pub(in super::super) fn maintenance(&mut self, idle: bool) -> Result<()> {
-        let result = self.maintenance_inner(idle);
-        self.stats.db_bytes = fs::metadata(&self.path).ok().map(|m| m.len());
+        self.maintain(idle.then_some(true))
+    }
+    /// Called only after a source pass, while acquisition is paused. A busy
+    /// source gets a bounded maintenance pause before its deadline.
+    pub(in super::super) fn between_cycles(&mut self, quiet: bool) -> Result<()> {
+        self.maintain(Some(quiet))
+    }
+    fn maintain(&mut self, window: Option<bool>) -> Result<()> {
+        let result = self.maintenance_inner(window);
+        self.stats.db_bytes = self
+            .logical_bytes()
+            .ok()
+            .zip(fs::metadata(&self.path).ok())
+            .map(|(logical, m)| logical.max(m.len()));
+        self.stats.db_size_alarm = self.stats.db_bytes.is_some_and(|n| n > 1_000_000_000);
         self.stats.cache_used_bytes = self.conn().ok().and_then(|conn| {
             let (mut current, mut high) = (0, 0);
             let rc = unsafe {
@@ -263,13 +348,48 @@ impl Sqlite {
         crate::local_resource_diagnostics::claude_state_v2(&self.stats);
         result
     }
-    fn maintenance_inner(&mut self, idle: bool) -> Result<()> {
+    fn maintenance_inner(&mut self, window: Option<bool>) -> Result<()> {
         migrations::check_current(self.conn()?)?;
         if self.import {
             return Ok(());
         }
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let pending = self.read_control::<u64>("erasure_pending")?.unwrap_or(0) != 0;
+        if window == Some(true) {
+            if let Some(extract) = self.references {
+                let last = self.read_control::<u64>("reference_check_success")?;
+                let attempt = self.read_control::<u64>("reference_check_attempt")?;
+                if last.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 86400))
+                    && attempt.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 3600))
+                {
+                    self.control("reference_check_attempt", &now)?;
+                    self.conn()?.execute_batch("BEGIN")?;
+                    let result =
+                        limited(self.conn()?, size_budget(self.logical_bytes()?, 10), || {
+                            references::verify_counts(self.conn()?, extract)
+                        });
+                    self.conn()?.execute_batch("ROLLBACK")?;
+                    match result {
+                        Ok(()) => self.control("reference_check_success", &now)?,
+                        Err(error)
+                            if error.downcast_ref::<super::super::Hold>()
+                                == Some(&super::super::Hold::ReferenceDrift) =>
+                        {
+                            self.stats.reference_drift =
+                                self.stats.reference_drift.saturating_add(1);
+                            super::super::telemetry::event("reference_drift", &1);
+                            self.control("reference_drift", &1_u64)?;
+                            return Err(error);
+                        }
+                        Err(_) => {
+                            self.stats.reference_check_failed =
+                                self.stats.reference_check_failed.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        let epoch = self.read_control::<u64>("erasure_pending")?.unwrap_or(0);
+        let pending = epoch != 0;
         let since = self.read_control::<u64>("erasure_since")?;
         let age = if pending {
             since.and_then(|s| now.checked_sub(s))
@@ -284,40 +404,61 @@ impl Sqlite {
             && age.map_or(true, |age| {
                 Duration::from_secs(age) >= self.purge_policy.deadline
             });
+        if overdue && !self.stats.erasure_overdue {
+            self.stats.erasure_breaches = self.stats.erasure_breaches.saturating_add(1);
+            super::super::telemetry::event("erasure_deadline_breach", &1);
+        }
         self.stats.erasure_overdue = overdue;
         let last = self.read_control::<u64>("erasure_attempt")?;
-        let wall_due = last.map_or(true, |last| {
-            // A clock rollback cannot establish elapsed cooldown across a
-            // restart. Keep the obligation/overdue alarm instead of retrying.
-            now.checked_sub(last)
-                .is_some_and(|age| Duration::from_secs(age) >= self.purge_policy.deadline)
+        let failures = self.read_control::<u64>("erasure_failures")?.unwrap_or(0);
+        let success = self.read_control::<u64>("erasure_success")?;
+        let success_due =
+            success.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 86400));
+        let retry = Duration::from_secs(retry_seconds(failures));
+        let wall_due = last.map_or(true, |s| {
+            now.checked_sub(s).is_some_and(|age| age >= retry.as_secs())
         });
         let monotonic_due = self
             .last_purge_attempt
-            .map_or(true, |last| last.elapsed() >= self.purge_policy.deadline);
-        let mut erased = !pending;
-        if pending && (idle || overdue) && wall_due && monotonic_due {
-            // Persist pacing BEFORE starting work. Crash, timeout, low space or
-            // busy TRUNCATE retains the original generation and first deadline.
-            if self.control("erasure_attempt", &now).is_err() {
-                self.reload = true;
-                bail!("current_index_requires_reload");
+            .map_or(true, |s| s.elapsed() >= retry);
+        // Only this explicit between-cycle idle route may VACUUM. Overdue is
+        // telemetry, never permission to run it during load/save or block them.
+        let deadline = self.purge_policy.deadline.as_secs();
+        let early = age.map_or(true, |a| a >= (deadline / 2).min(12 * 3600));
+        let pause_due = age.map_or(true, |a| a >= (deadline * 5 / 6).min(20 * 3600));
+        let idle = window.is_some();
+        let opportunity = window.is_some_and(|quiet| if quiet { early } else { pause_due });
+        if pending && opportunity && success_due && wall_due && monotonic_due {
+            if window == Some(false) {
+                self.stats.maintenance_pauses = self.stats.maintenance_pauses.saturating_add(1);
             }
+            self.control("erasure_attempt", &now)?;
+            // Crash during work is a failed attempt, with persisted pacing.
+            self.control("erasure_failures", &failures.saturating_add(1))?;
             self.last_purge_attempt = Some(Instant::now());
+            // Backups carry the same PL erasure obligation as the database.
+            let backup = sidecar(&self.path, ".migration-backup");
+            match fs::remove_file(&backup) {
+                Ok(()) => super::super::super::sync_checkpoint_parent(&backup)?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    self.erasure_failed("backup_io");
+                    return Ok(());
+                }
+            }
             let result = self.checkpoint(CheckpointMode::Purge);
             if result.state == CheckpointState::Complete {
-                // Only verified VACUUM + zero-length TRUNCATE authorizes this
-                // durable N-only clear. A crash before it simply retains debt.
-                if self.control("erasure_pending", &0_u64).is_err() {
-                    self.reload = true;
-                    bail!("current_index_requires_reload");
+                // Success and clear must be atomic; a crash cannot grant a
+                // second successful VACUUM in the 24-hour window.
+                self.erasure_complete(now, epoch)?;
+                self.stats.erasure_vacuum.runs = self.stats.erasure_vacuum.runs.saturating_add(1);
+                if self.read_control::<u64>("erasure_pending")? == Some(0) {
+                    self.stats.erasure_overdue = false;
+                    self.stats.erasure_pending_age_s = None;
+                    self.stats.oldest_pending_age_s = None;
                 }
-                erased = true;
-                self.stats.erasure_overdue = false;
-                self.stats.erasure_pending_age_s = None;
-                self.stats.oldest_pending_age_s = None;
             }
-        } else if pending && (idle || overdue) {
+        } else if pending && idle {
             self.stats.vacuum_deferred = self.stats.vacuum_deferred.saturating_add(1);
         }
 
@@ -334,8 +475,34 @@ impl Sqlite {
                 self.debt = false;
             }
         }
-        ensure!(!self.debt, "state_v2_wal_debt");
-        ensure!(!overdue || erased, "state_v2_erasure_overdue");
+        let max_wal = self.logical_bytes()?.max(256 * 1024 * 1024);
+        ensure!(
+            !self.debt
+                || pending && last.is_some()
+                || self.wal_bytes().is_some_and(|b| b < max_wal),
+            "state_v2_wal_debt"
+        );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn size_budgets_and_failed_attempt_backoff_follow_the_ruling() {
+        assert_eq!(size_budget(0, 20), Duration::from_secs(2));
+        assert_eq!(
+            size_budget(224 * 1024 * 1024, 20),
+            Duration::from_millis(6480)
+        );
+        assert_eq!(
+            size_budget(224 * 1024 * 1024, 10),
+            Duration::from_millis(4240)
+        );
+        assert_eq!(
+            [1, 2, 3, 100].map(retry_seconds),
+            [3600, 7200, 14400, 14400]
+        );
     }
 }
