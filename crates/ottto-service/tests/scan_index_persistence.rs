@@ -7,19 +7,23 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const FIELDS: &[&str] = &["files", "accepted_snapshot_fingerprints", "opaque"];
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
+        // Clock granularity can repeat nanos across tests in one process.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "scanindex-reader-{}-{}",
+            "scanindex-reader-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
