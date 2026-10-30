@@ -137,20 +137,35 @@ been performed by this implementation task.
 
 ## Scoped re-read and counts-only estimate
 
-`ottto-service claude-copy-prefix-reread --scope SCOPE.json --support-dir SUPPORT --window-days DAYS --estimate`
+`ottto-service claude-copy-prefix-reread --scope SCOPE.json --index INDEX --support-dir SUPPORT --window-days DAYS --estimate`
 (`--dry-run` is an alias) accepts a private JSON array of absolute affected
 Claude main-file paths, including their earlier proof holders. The money owner
-supplies that explicit cohort from its PLAN; the tool does not infer ownership
-by opening transcripts. It stats only those files, refuses symlink paths,
-requires creation-time metadata, and emits numeric counts/durations only.
-Estimate neither creates a support directory nor changes state or uploads.
-Files/bytes cover the exact scope; runnable files/bytes exclude oversized
-and out-of-window members. The existing Claude 512 MiB per-file limit also
-applies, independently of the 1 GiB page limit. Any blocked member means apply
-refuses the whole request. Required `--window-days` is the ordinary daemon
-scan window, bounded by the existing `BACKFILL_WINDOW_DAYS` policy; it never
-widens scanning. Scope is bounded by the existing 10,000-file scan limit and
-a 4 MiB local request envelope.
+supplies that cohort from its PLAN. INDEX names the exact destination-scoped
+native Claude scan index: filenames alone cannot reveal twins in other projects
+or registered roots. The tool reads index metadata through the read-only
+representation reader, without the daemon loader, checkpoint lock, repair,
+network or state writes. It stats closure members, refuses symlink paths,
+requires creation-time metadata, and never opens transcript bodies.
+
+Apply publishes the FULL estimated closure. A listed path twin forces its
+complete native root family: all main twins and all subagents. Affected
+families with an authority quarantine also expand. Families with neither twins
+nor an authority force retain their listed members. One shared
+`claude_read_closure` function supplies estimate/apply/preparation and native
+forced-family selection. Preparation rejects changed closure membership before
+any re-owe; it never silently expands a previously published request.
+
+Output contains numeric counts/durations only: `listed_files`/`listed_bytes`,
+`closure_files`/`closure_bytes`, `added_by_twins_files`/`added_by_twins_bytes`,
+blocked/runnable files/bytes, pages and pacing seconds. Runnable groups exclude
+oversized or out-of-window members and twins whose combined bytes exceed the
+native page budget. Any blocked member means apply refuses the whole request.
+The existing Claude 512 MiB per-file limit applies independently of the 1 GiB
+page limit. Required `--window-days` is the ordinary daemon scan window, bounded
+by existing `BACKFILL_WINDOW_DAYS` policy; it never widens scanning. Both scope
+and closure remain bounded by the existing 10,000-file scan limit and the 4 MiB
+local request envelope. Estimate creates no support directory and changes no
+state or upload.
 
 After the change is merged and installed, money sign-off and a same-cohort
 PLAN are prerequisites for the authorized operator to replace `--estimate`
@@ -161,7 +176,7 @@ overwritten. Only the ordinary daemon, with the existing local switch ON,
 processes it under its sync lock. No helper or implementing agent runs apply,
 enables the switch or starts this re-read.
 
-The daemon validates every requested file remains indexed, lies inside the
+The daemon rechecks the same closure and validates every member remains indexed, lies inside the
 configured Claude roots and has the same size, creation time and modification
 time. Any mismatch refuses the whole request, with a counts-only refusal.
 It uses `re_owe_effective_upload_body_witness_revision(key, 2)` to lower only
@@ -177,11 +192,12 @@ order, earlier first, ahead of ordinary census/audits within the same selection
 limit. The native history gate still owns admission, protected lists, fences,
 byte/file budgets and ACK settlement. There is no new worker, continuation,
 pace, rate, cap increase or first-file byte exception. The estimate packs
-metadata sizes in creation-time order, next-fit, using the existing
+closure metadata sizes in earliest group creation-time order, next-fit,
+reserving path twins together as the native gate does, using the existing
 `HISTORY_UPGRADE_FILES_PER_PAGE = 2000` and
 `HISTORY_UPGRADE_BYTES_PER_PAGE = 1 GiB`. Runtime stored move-history births can
 refine that order; estimates are metadata-based capacity forecasts rather than
-a guarantee of exact page boundaries under other ordinary work or twins.
+a guarantee of exact page boundaries under other ordinary work or holds.
 
 For `P` forecast pages, pacing-only duration is `(P - 1) * 300` seconds at the
 existing `SNAPSHOT_SYNC_INTERVAL` floor, and `(P - 1) * 1800` seconds at the
@@ -208,7 +224,7 @@ Turning the local switch ON alone must not reacquire unchanged unrelated
 transcripts. Retry pages, quarantine witnesses and ACK candidates retain the
 source-wide mode-qualified context, so stale bodies and ACKs cannot cross a
 local-mode or wire-capability change. Acquisition receipts use a separate
-expected context: the exact requested files, marked by the one-shot bit, use
+expected context: the exact closure members, marked by the one-shot bit, use
 the qualified context; every unrequested file uses the original base context.
 Unchanged unrelated receipts survive ON, capability ON and OFF transitions.
 Already settled legacy entries without per-file receipts recognize only mode
@@ -216,14 +232,16 @@ variants of the same base. A real privacy-policy, destination or attribution
 context change still uses ordinary context adoption. Planning never creates
 an ACK receipt or accepted-upload credit.
 
-The estimate's explicit set is the exact set offered to that narrowed
+The estimate's expanded closure is the exact set offered to that narrowed
 acquisition path. Preparation also requires its size and nanosecond mtime to
 match the indexed extent, so a changed file cannot enter this historical
 cohort under the guise of an unchanged scoped read. The existing native
 history gate may defer listed, fenced or over-budget members; estimate counts
 the requested workload, not guaranteed completions. Actual native scans in
-synthetic regressions open only the requested files, with equal file/byte
-counts to the estimate, while six unrelated files open and emit nothing.
+synthetic regressions open exactly the estimated closure, with equal file/byte
+counts and zero unaffected body reads. Coverage includes one listed twin
+expanding to two mains and a non-twin subagent, unchanged no-twin behavior,
+closure growth refused before re-owe, and existing per-file and page-byte caps.
 
 Release disclosure: missing or expired proof, lost removal metadata and later
 expiry of unrecorded removals can preserve the original overcount. These
