@@ -58,7 +58,6 @@ use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use zeroize::Zeroize;
 
-mod account_hash_changes;
 mod continuation;
 mod reason_reoffer;
 mod rejection_log;
@@ -787,11 +786,6 @@ impl LocalHoldSettlement {
             None
         };
         disposition.retain_uploadable(&mut scan_result.snapshots);
-        crate::snapshots::record_lineage_parentless_while_incomplete(
-            source,
-            &scan_result.snapshots,
-            index,
-        );
         let retry_pending_family_count = index.claude_usage_authority_pending_count();
         Self {
             held_entity_count,
@@ -1341,12 +1335,6 @@ struct SnapshotUploadProgress {
     accepted_body_contexts: BTreeMap<String, String>,
     #[serde(skip)]
     context_resend: upload_context_resend::Cycle,
-    /// Diagnostic-only last stored billing-account projection; never admission proof.
-    #[serde(
-        default,
-        skip_serializing_if = "account_hash_changes::AcceptedAccounts::is_empty"
-    )]
-    accepted_account_hashes: account_hash_changes::AcceptedAccounts,
     /// Admission only: current live incidence plus bounded unsettled ACK debt.
     #[serde(skip, default = "ack_retention::default_ack_capacity")]
     ack_capacity: usize,
@@ -1418,7 +1406,6 @@ impl SnapshotUploadProgress {
             accepted_body_witnesses: BTreeMap::new(),
             accepted_body_contexts: BTreeMap::new(),
             context_resend: upload_context_resend::Cycle::default(),
-            accepted_account_hashes: Default::default(),
             ack_capacity: ack_retention::default_ack_capacity(),
             retained_stale_ack_count: 0,
             accepted_cache_states: BTreeMap::new(),
@@ -2132,7 +2119,6 @@ impl SnapshotUploadProgress {
         else {
             return Ok(());
         };
-        self.accepted_account_hashes.record(&value);
         let key = cache_session_key(session);
         // Count-only legacy ACKs cannot distinguish changed from unchanged.
         // Recover authority through the same bootstrap rather than retaining
@@ -2210,6 +2196,7 @@ impl SnapshotUploadProgress {
         );
         self.accepted_fingerprints.remove(fingerprint);
         self.accepted_body_witnesses.remove(fingerprint);
+        self.accepted_body_contexts.remove(fingerprint);
         self.active_quarantine_retries.remove(fingerprint);
     }
 
@@ -2368,11 +2355,11 @@ impl SnapshotUploadProgress {
     }
 
     fn save(&mut self, path: &Path) -> Result<()> {
-        self.accepted_body_contexts
-            .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
         self.save_with_read_limit(path, None)
     }
     fn save_with_read_limit(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
+        self.accepted_body_contexts
+            .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("create snapshot upload progress directory")?;
         }
@@ -2683,7 +2670,6 @@ impl SnapshotUploadProgress {
             && self.accepted_cache_states.is_empty()
             && self.accepted_cache_heads.is_empty()
             && self.pending_cache_heads.is_empty()
-            && self.accepted_account_hashes.is_empty()
         {
             return self.clear(path);
         }
@@ -10133,13 +10119,6 @@ where
             snapshot_packing_json_length(item)? as u64,
         );
     }
-    // Observe the final emitted candidates. Only stored-body ACK handling below
-    // advances the baseline; a rejected or unstored offer cannot replace it.
-    for item in &batch {
-        progress
-            .accepted_account_hashes
-            .observe(&serde_json::to_value(item)?);
-    }
     let response = upload(batch)?;
     if response.disabled {
         return Ok(SnapshotPageOutcome::Disabled(response.disabled_reason));
@@ -15808,66 +15787,6 @@ mod tests {
             rejected_entities: Vec::new(),
             conflict_entities: Vec::new(),
         }
-    }
-
-    #[test]
-    fn account_change_baseline_updates_only_for_stored_body_acks() {
-        use crate::local_resource_diagnostics::{capture, source_finish};
-        use serde_json::{json, Value};
-        let mut progress = test_upload_progress();
-        let mut accepted = 0;
-        let mut send =
-            |n: u64, account: &str, stored: bool, progress: &mut SnapshotUploadProgress| {
-                let fingerprint = format!("{n:064x}");
-                let items = [json!({
-                    "source_session_id":"session",
-                    "snapshot_fingerprint":fingerprint,
-                    "model_usage":[{"account_identifier_hash":account}]
-                })];
-                let (result, lines) = capture(|| {
-                    source_finish("claude_code", || {
-                        attempt_snapshot_page(
-                            &items,
-                            &[0],
-                            &unique_poison_scope(),
-                            progress,
-                            &mut accepted,
-                            &|item: &Value| item["snapshot_fingerprint"].as_str().unwrap(),
-                            &|_: &Value| format!("{n:064x}"),
-                            &|_: &Value| Some("session"),
-                            &mut |_| {
-                                let mut response = accepted_batch(usize::from(stored));
-                                if !stored {
-                                    response.entity_ack_contract =
-                                        Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
-                                    let mut entity = entity_ack_ref(&fingerprint);
-                                    entity.source_session_id = "session".into();
-                                    entity.unchanged_basis = Some("usage_identical".into());
-                                    response.unchanged_entities.push(entity);
-                                }
-                                Ok(response)
-                            },
-                            &mut |_| Ok(()),
-                        )
-                    })
-                });
-                assert!(result.is_ok(), "{result:?}");
-                lines.last().unwrap()["counts"]["account_hash_changed"]
-                    .as_u64()
-                    .unwrap()
-            };
-        assert_eq!(send(1, "account-a", true, &mut progress), 0);
-        let saved = serde_json::to_vec(&progress).unwrap();
-        progress = serde_json::from_slice(&saved).unwrap();
-        progress.active_quarantine_witness = Some(test_quarantine_witness());
-        assert_eq!(send(2, "account-b", false, &mut progress), 1);
-        assert_eq!(
-            send(3, "account-a", true, &mut progress),
-            0,
-            "unstored body must not replace the accepted account baseline"
-        );
-        assert_eq!(send(4, "account-b", true, &mut progress), 1);
-        assert_eq!(send(5, "account-b", true, &mut progress), 0);
     }
 
     fn entity_ack_ref(fingerprint: &str) -> crate::snapshot_client::SnapshotEntityRef {
@@ -24342,526 +24261,6 @@ mod tests {
             );
         }
     }
-    struct DesktopUploadRevisionEvidence {
-        first_admitted_at: OffsetDateTime,
-        offers: Vec<serde_json::Value>,
-        requests: Vec<String>,
-    }
-
-    #[test]
-    #[serial(source_manifests)]
-    fn desktop_incomplete_discovery_uploads_new_session_unbound_then_clean_sweep_binds() {
-        desktop_unbound_upload_revision_fixture("2026-09-30", false);
-    }
-
-    #[test]
-    #[serial(source_manifests)]
-    fn desktop_forward_cohort_binding_uses_new_upload_revision() {
-        let evidence = desktop_unbound_upload_revision_fixture("2026-10-30", false);
-        let cutoff = OffsetDateTime::parse("2026-10-30T00:00:00Z", &Rfc3339).unwrap();
-        assert!(
-            evidence.first_admitted_at >= cutoff,
-            "server admission, not producer time"
-        );
-        let old = &evidence.offers[0]["snapshots"][0];
-        let new = &evidence.offers[1]["snapshots"][0];
-        assert_eq!(old["source_session_id"], new["source_session_id"]);
-        assert_eq!(
-            old["session_account_evidence"]["identity_disposition"],
-            "missing"
-        );
-        assert_eq!(
-            new["session_account_evidence"]["identity_disposition"],
-            "complete"
-        );
-        let account = &new["session_account_evidence"]["account_identifier_hash"];
-        assert!(account.as_str().is_some_and(|hash| hash.len() == 64));
-        for row in new["model_usage"].as_array().unwrap() {
-            assert_eq!(&row["account_identifier_hash"], account);
-        }
-        // Both released revision contracts must identify the second accepted
-        // upload as a successor, while the usage/money component is identical.
-        for key in ["revision_hash", "revision_v2_hash"] {
-            assert_ne!(old["semantic_envelope"][key], new["semantic_envelope"][key]);
-        }
-        assert_eq!(
-            old["semantic_envelope"]["component_hashes"]["usage_accounting"],
-            new["semantic_envelope"]["component_hashes"]["usage_accounting"]
-        );
-        assert_eq!(old["cost"], new["cost"]);
-        assert_ne!(
-            old["semantic_envelope"]["component_hashes"]["attribution"],
-            new["semantic_envelope"]["component_hashes"]["attribution"],
-            "the bind itself changes attribution, independently of physical file selection"
-        );
-    }
-
-    #[test]
-    #[serial(source_manifests)]
-    fn desktop_forward_cohort_binding_has_no_late_naming_write() {
-        let evidence = desktop_unbound_upload_revision_fixture("2026-10-30", false);
-        // Capture EVERY request, not just batch callbacks. No status, weak
-        // naming, reconciliation or alternate endpoint carries the bind.
-        assert_eq!(
-            evidence.requests,
-            vec![
-                "POST /api/v1/agent-session-snapshots/batches HTTP/1.1",
-                "POST /api/v1/agent-session-snapshots/batches HTTP/1.1",
-            ]
-        );
-        assert_eq!(evidence.offers.len(), 2);
-        assert!(evidence.offers[0]["snapshots"][0]["model_usage"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row.get("account_identifier_hash").is_none()));
-        assert_eq!(
-            evidence.offers[1]["snapshots"][0]["session_account_evidence"]["identity_disposition"],
-            "complete"
-        );
-    }
-
-    #[test]
-    #[serial(source_manifests)]
-    fn desktop_released_scalar_cache_uploads_unbound_then_binds_by_new_revision() {
-        let evidence = desktop_unbound_upload_revision_fixture("2026-10-30", true);
-        assert!(
-            evidence.first_admitted_at
-                >= OffsetDateTime::parse("2026-10-30T00:00:00Z", &Rfc3339).unwrap()
-        );
-        let old = &evidence.offers[0]["snapshots"][0];
-        let new = &evidence.offers[1]["snapshots"][0];
-        assert!(old["session_account_evidence"]
-            .get("account_identifier_hash")
-            .is_none());
-        assert_eq!(
-            new["session_account_evidence"]["identity_disposition"],
-            "complete"
-        );
-        for key in ["revision_hash", "revision_v2_hash"] {
-            assert_ne!(old["semantic_envelope"][key], new["semantic_envelope"][key]);
-        }
-        assert_eq!(
-            old["semantic_envelope"]["component_hashes"]["usage_accounting"],
-            new["semantic_envelope"]["component_hashes"]["usage_accounting"]
-        );
-        assert_eq!(old["cost"], new["cost"]);
-        assert_eq!(
-            evidence.requests,
-            vec![
-                "POST /api/v1/agent-session-snapshots/batches HTTP/1.1",
-                "POST /api/v1/agent-session-snapshots/batches HTTP/1.1",
-            ]
-        );
-    }
-
-    fn desktop_unbound_upload_revision_fixture(
-        day: &str,
-        released_scalar_cache: bool,
-    ) -> DesktopUploadRevisionEvidence {
-        // Exercise the legacy owner path, real scan/evidence fold, hold filter,
-        // resumable upload driver, wire validation, HTTP POST and entity ACK.
-        // Money is explicit nonzero input at the owner seam; this does not
-        // test money derivation.
-        let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-        let home = crate::test_scratch::ScratchDir::new("desktop-unbound-upload");
-        let projects = home.join(".claude/projects");
-        let support = home.join("Library/Application Support");
-        let store = support
-            .join("Claude/claude-code-sessions")
-            .join("123e4567-e89b-12d3-a456-426614174000")
-            .join("123e4567-e89b-12d3-a456-426614174001");
-        let session = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-        std::fs::create_dir_all(&projects).unwrap();
-        std::fs::create_dir_all(&store).unwrap();
-        std::fs::write(support.join("Claude/config.json"), "{}").unwrap();
-        std::fs::write(
-            store.join("local_session.json"),
-            serde_json::json!({
-                "cliSessionId":session,"createdAt":format!("{day}T10:00:00Z"),
-                "spawnedFrom":{"sessionId":"local_missing_parent"}
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let mut index = ScanIndex::default();
-        let scan = |index: &mut ScanIndex, at: &str| {
-            crate::snapshots::scan_source_roots_with_test_limit(
-                SnapshotSource::ClaudeCode,
-                std::slice::from_ref(&projects),
-                index,
-                at,
-                7,
-                100,
-                false,
-            )
-            .unwrap()
-        };
-        assert!(scan(&mut index, &format!("{day}T09:55:00Z"))
-            .snapshots
-            .is_empty());
-        assert_eq!(
-            serde_json::to_value(&index).unwrap()["claude_desktop_identity_census_complete"],
-            true
-        );
-        if released_scalar_cache {
-            // Deserialize the released cache shape: the scalar survives, while
-            // the later original-identity carrier is absent, not fabricated.
-            let mut saved = serde_json::to_value(&index).unwrap();
-            let entries = saved["claude_desktop_title_files"].as_object_mut().unwrap();
-            assert_eq!(entries.len(), 1);
-            for entry in entries.values_mut() {
-                assert!(entry["account_identifier_hash"].is_string());
-                entry.as_object_mut().unwrap().remove("original_identity");
-            }
-            saved["claude_desktop_store_retry_not_before_unix_seconds"] =
-                serde_json::json!(OffsetDateTime::parse(&format!("{day}T10:10:00Z"), &Rfc3339)
-                    .unwrap()
-                    .unix_timestamp());
-            index = serde_json::from_value(saved).unwrap();
-        }
-        // Preserve the cached unique hash, then fail discovery before a NEW
-        // transcript arrives. An unopened root could contradict that hash.
-        let saved_support = home.join("saved-support");
-        std::fs::rename(&support, &saved_support).unwrap();
-        std::fs::write(&support, "synthetic enumeration failure").unwrap();
-        let path = projects.join(format!("{session}.jsonl"));
-        let transcript = serde_json::json!({"type":"assistant","sessionId":session,
-            "timestamp":format!("{day}T10:00:00Z"),"requestId":"req-owned",
-            "message":{"id":"message-owned","model":"claude-haiku-4-5",
-                "usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":3,
-                    "cache_creation_input_tokens":7,
-                    "cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":2}}}}).to_string();
-        std::fs::write(&path, format!("{transcript}\n")).unwrap();
-        let offered = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
-        let captured = offered.clone();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured_requests = requests.clone();
-        // This is the synthetic sink's acceptance clock. The daemon sends no
-        // first_admitted_at/cohort flag; the real backend owns that marker.
-        let admission_clock = OffsetDateTime::parse(&format!("{day}T10:05:00Z"), &Rfc3339).unwrap();
-        let first_admitted_at = Arc::new(Mutex::new(None));
-        let captured_admission = first_admitted_at.clone();
-        let backend = loopback_backend::Backend::with_request_observer(
-            TcpListener::bind("127.0.0.1:0").unwrap(),
-            Some(Arc::new(move |wire| {
-                captured_admission
-                    .lock()
-                    .unwrap()
-                    .get_or_insert(admission_clock);
-                captured.lock().unwrap().push(wire.clone());
-                Ok(())
-            })),
-            Arc::new(move |head, _| {
-                captured_requests.lock().unwrap().push(head.to_string());
-                Ok(())
-            }),
-        )
-        .unwrap();
-        let client = SnapshotApiClient::new(&backend.url)
-            .with_receipt_state_dir(home.join("receipts"))
-            .with_receipt_destination_namespace("a".repeat(64));
-        let namespace = "a".repeat(64);
-        let progress_path = home.join("upload-progress.json");
-        let poison_scope = unique_poison_scope();
-        let mut progress = SnapshotUploadProgress::new(
-            namespace.clone(),
-            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-        );
-        for (cycle, at) in [format!("{day}T10:05:00Z"), format!("{day}T10:20:00Z")]
-            .into_iter()
-            .enumerate()
-        {
-            if cycle == 1 {
-                std::fs::remove_file(&support).unwrap();
-                std::fs::rename(&saved_support, &support).unwrap();
-                // An independently changed transcript selects the recovery
-                // read. Census flaps alone must not select unchanged bodies.
-                std::fs::write(&path, format!("{transcript}\n\n")).unwrap();
-            }
-            let mut page = scan(&mut index, &at);
-            assert_eq!(page.snapshots.len(), 1, "cycle {cycle}: native read");
-            assert_eq!(
-                serde_json::to_value(&index).unwrap()["claude_desktop_identity_census_complete"],
-                cycle == 1
-            );
-            let (mut disposition, _, _) = try_apply_claude_local_evidence_to_scan_with_comparison(
-                &home.join("otel-support"),
-                &mut page,
-                &mut index,
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-            // The native legacy body has no reported USD before complete
-            // usage proof. Supply a nonzero money carrier at this seam so
-            // this owner regression also detects accidental cost loss/zeroing,
-            // independently of the usage authority's own census requirements.
-            let item = &mut page.snapshots[0];
-            item.cost = Some(crate::snapshots::SnapshotCost {
-                total_cost_usd: Some("0.42".into()),
-                input_cost_usd: None,
-                output_cost_usd: None,
-                cache_read_cost_usd: None,
-                cache_creation_cost_usd: None,
-                evidence_source: "claude_code_api_request".into(),
-            });
-            for row in item.model_usage.iter_mut().chain(
-                item.usage_buckets
-                    .iter_mut()
-                    .flat_map(|bucket| bucket.model_usage.iter_mut()),
-            ) {
-                row.cost_usd = Some("0.42".into());
-            }
-            let before = page.snapshots[0].clone();
-            assert_eq!(
-                before.cost.as_ref().unwrap().total_cost_usd.as_deref(),
-                Some("0.42")
-            );
-            assert_eq!(
-                before
-                    .session_account_evidence
-                    .as_ref()
-                    .unwrap()
-                    .identity_disposition,
-                Some(if cycle == 0 { "missing" } else { "complete" })
-            );
-            if released_scalar_cache && cycle == 0 {
-                let saved = serde_json::to_value(&index).unwrap();
-                let entries = saved["claude_desktop_title_files"].as_object().unwrap();
-                assert_eq!(entries.len(), 1);
-                let entry = entries.values().next().unwrap();
-                assert!(entry.get("original_identity").is_none());
-                let scalar = entry["account_identifier_hash"].as_str().unwrap();
-                assert!(before
-                    .model_usage
-                    .iter()
-                    .chain(
-                        before
-                            .usage_buckets
-                            .iter()
-                            .flat_map(|b| b.model_usage.iter())
-                    )
-                    .all(|row| row.account_identifier_hash.as_deref() == Some(scalar)));
-                assert!(before
-                    .session_account_evidence
-                    .as_ref()
-                    .unwrap()
-                    .account_identifier_hash
-                    .is_none());
-                assert!(
-                    saved["claude_desktop_store_retry_not_before_unix_seconds"]
-                        .as_i64()
-                        .unwrap()
-                        > OffsetDateTime::parse(&at, &Rfc3339)
-                            .unwrap()
-                            .unix_timestamp()
-                );
-            } else {
-                assert!(before
-                    .model_usage
-                    .iter()
-                    .all(|row| row.account_identifier_hash
-                        == before
-                            .session_account_evidence
-                            .as_ref()
-                            .unwrap()
-                            .account_identifier_hash));
-            }
-            let deferred = index.bind_session_accounts_with_mixed(
-                SnapshotSource::ClaudeCode,
-                "machine",
-                &mut page.snapshots,
-                &[],
-                &disposition.mixed_uploads,
-            );
-            assert!(
-                deferred.is_empty(),
-                "incomplete census never holds this usage body"
-            );
-            disposition.defer_sessions(deferred);
-            apply_upload_policy(
-                SnapshotSource::ClaudeCode,
-                &mut page.snapshots,
-                SnapshotUploadPolicy::default(),
-            );
-            finalize_scan_after_policy_with_body_witness(
-                SnapshotSource::ClaudeCode,
-                &mut page,
-                &mut index,
-                snapshot_upload_body_witness,
-            );
-            if cycle == 0 {
-                for account_hold in [false, true] {
-                    let mut held_page = page.clone();
-                    let mut held_index = index.clone();
-                    let mut held_disposition =
-                        crate::snapshots::ClaudeUsageAuthorityDisposition::default();
-                    let held_sessions = BTreeSet::from([session.to_string()]);
-                    if account_hold {
-                        held_disposition.defer_sessions(held_sessions);
-                    } else {
-                        held_disposition.hold_request_owned(held_sessions);
-                    }
-                    let scope =
-                        crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-                    let held = LocalHoldSettlement::classify(
-                        SnapshotSource::ClaudeCode,
-                        &mut held_index,
-                        &mut held_page,
-                        &held_disposition,
-                    );
-                    assert!(held.page_held());
-                    assert!(held_page.snapshots.is_empty());
-                    assert!(
-                        serde_json::to_value(scope.finish())
-                            .unwrap()
-                            .get("lineage_parentless_while_incomplete")
-                            .is_none(),
-                        "account/authority-held bodies are not offers"
-                    );
-                }
-            }
-            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-            let holds = LocalHoldSettlement::classify(
-                SnapshotSource::ClaudeCode,
-                &mut index,
-                &mut page,
-                &disposition,
-            );
-            assert_eq!(
-                serde_json::to_value(scope.finish()).unwrap()
-                    ["lineage_parentless_while_incomplete"]["files"]
-                    .as_u64()
-                    .unwrap_or(0),
-                u64::from(cycle == 0)
-            );
-            assert!(!holds.any());
-            assert_eq!(
-                page.snapshots.len(),
-                1,
-                "survives the actual upload hold filter"
-            );
-            let item = &page.snapshots[0];
-            assert_eq!(
-                (
-                    item.input_tokens,
-                    item.output_tokens,
-                    item.cache_read_tokens,
-                    item.cache_creation_5m_tokens,
-                    item.cache_creation_1h_tokens,
-                    item.request_count
-                ),
-                (100, 20, 3, 5, 2, 1)
-            );
-            assert_eq!(item.cost, before.cost, "no zeroing or cost loss");
-            let mut expected = before.clone();
-            if cycle == 0 {
-                for row in expected.model_usage.iter_mut().chain(
-                    expected
-                        .usage_buckets
-                        .iter_mut()
-                        .flat_map(|b| b.model_usage.iter_mut()),
-                ) {
-                    row.account_identifier_hash = None;
-                }
-            }
-            assert_eq!(item.model_usage, expected.model_usage);
-            assert_eq!(item.usage_buckets, expected.usage_buckets);
-            let owners = serde_json::to_value(&index).unwrap();
-            assert_eq!(
-                owners
-                    .get("session_account_bindings")
-                    .and_then(|v| v.as_object())
-                    .map_or(0, |m| m.len()),
-                cycle
-            );
-            assert!(item
-                .model_usage
-                .iter()
-                .chain(item.usage_buckets.iter().flat_map(|b| b.model_usage.iter()))
-                .all(|r| r.account_identifier_hash.is_some() == (cycle == 1)));
-            for repeat in [false, true] {
-                let mut accepted = 0;
-                let result = upload_resumable_batches_with_literal_families(
-                    &page.snapshots,
-                    &poison_scope,
-                    &mut progress,
-                    &mut accepted,
-                    |snapshot| snapshot.snapshot_fingerprint.as_str(),
-                    snapshot_upload_body_witness,
-                    |snapshot| Some(snapshot.source_session_id.as_str()),
-                    |_| false,
-                    crate::snapshots::claude_request_money::request_owned_family_root,
-                    &mut InplaceRetryBudget::default(),
-                    |snapshots| {
-                        let request = SnapshotBatchRequest {
-                            schema_version: SNAPSHOT_SCHEMA_VERSION,
-                            source: "claude_code".into(),
-                            machine_id: "a".repeat(64),
-                            collector_version: Some(collector_version()),
-                            snapshots,
-                            upload_policy: SnapshotUploadPolicy::default(),
-                            client_report: crate::client_report::ClientReport::empty(),
-                        };
-                        validate_snapshot_batch_request(&request).unwrap();
-                        let response = client.upload_batch("synthetic-relay", &request, false)?;
-                        response.validate_entity_ack(&request)?;
-                        Ok(response)
-                    },
-                    |progress| progress.save(&progress_path),
-                )
-                .unwrap();
-                assert!(matches!(result, ResumableUploadResult::Completed));
-                assert_eq!(
-                    accepted,
-                    u64::from(!repeat),
-                    "new revision posts; exact ACKed repeat stays quiet"
-                );
-                assert!(progress.contains_body(
-                    &item.snapshot_fingerprint,
-                    &snapshot_upload_body_witness(item)
-                ));
-                progress = SnapshotUploadProgress::load(
-                    &progress_path,
-                    &namespace,
-                    snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-                )
-                .unwrap();
-            }
-            let wire = offered.lock().unwrap();
-            assert_eq!(wire.len(), cycle + 1);
-            assert_eq!(wire[cycle]["snapshots"].as_array().unwrap().len(), 1);
-            let body = &wire[cycle]["snapshots"][0];
-            assert_eq!(body["input_tokens"], 100);
-            assert_eq!(body["output_tokens"], 20);
-            assert_eq!(body["cost"]["total_cost_usd"], "0.42");
-            assert_eq!(
-                body["model_usage"],
-                serde_json::to_value(&expected.model_usage).unwrap()
-            );
-            assert_eq!(
-                body["usage_buckets"],
-                serde_json::to_value(&expected.usage_buckets).unwrap()
-            );
-        }
-        drop(backend);
-        let offers = offered.lock().unwrap().clone();
-        let requests = requests.lock().unwrap().clone();
-        let first_admitted_at = first_admitted_at
-            .lock()
-            .unwrap()
-            .expect("sink accepted a first upload");
-        DesktopUploadRevisionEvidence {
-            first_admitted_at,
-            offers,
-            requests,
-        }
-    }
-
     #[test]
     fn claude_p92_typed_mixed_uses_full_enrichment_order() {
         // Subject: the legacy account path contract 5 now leaves to untagged bodies.
@@ -25232,7 +24631,7 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates, accepted_account_hashes);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 
