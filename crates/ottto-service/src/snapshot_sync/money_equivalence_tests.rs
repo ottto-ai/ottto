@@ -1005,3 +1005,7 @@ pending!(
     pi,
     "E1 design D1: Pi explicitly remains Full-on-change; no retained Pi reduction on main"
 );
+
+mod state_v2_money_tests {
+    include!("state_v2_money_tests.rs");
+}

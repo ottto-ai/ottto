@@ -12,6 +12,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+#[path = "sqlite/import_peak_probe.rs"]
+pub(super) mod import_peak_probe;
 mod maintenance;
 mod migrations;
 mod references;
@@ -442,6 +445,8 @@ fn settings(conn: &Connection, import: bool) -> Result<()> {
         conn.query_row("PRAGMA page_size", [], |r| r.get::<_, u64>(0))? == 4096,
         "state_v2_page_size_refused"
     );
+    #[cfg(test)]
+    import_peak_probe::register(conn);
     Ok(())
 }
 

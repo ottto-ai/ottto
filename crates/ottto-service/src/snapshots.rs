@@ -93435,3 +93435,6 @@ mod state_v2_maintenance_lock_tests {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+pub(crate) use state_v2::money_test_support::roundtrip as state_v2_money_roundtrip;
