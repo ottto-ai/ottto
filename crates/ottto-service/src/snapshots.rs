@@ -31623,6 +31623,7 @@ impl OwnedSourceScan {
                         index,
                         &claude_family_shadow,
                         &pending_finalization,
+                        &census,
                         &sampling,
                         audit_now,
                     );

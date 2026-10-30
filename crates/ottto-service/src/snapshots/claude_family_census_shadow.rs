@@ -17,9 +17,17 @@
 //! restart loses them: those families re-derive as `presence_only` until
 //! ordinary authorized work attests them again; nothing is inferred.
 //!
+//! The account proof binds the same revision: each member's finalized
+//! `identity_revision` must equal its current source/entity/body tuple, or the
+//! family is `evidence` until ordinary finalization catches up. A subagent's
+//! rows only gain an account from a prior witness or a family proven at a
+//! terminal page, so a fresh multi-member family stays `evidence` mid-walk.
+//!
 //! Runtime state (rotation cursor, root path counts, attestations, sticky
 //! vetoes, `first_pending_at`) is process-local, bounded and charged in
 //! `runtime_heap_bytes`; it is never persisted and never used for a decision.
+//! Per-page work is counted against the caps below in `cost`, and runs outside
+//! the runtime mutex: no page visits the whole corpus.
 use super::*;
 use std::hash::Hasher;
 use std::ops::Bound;
@@ -33,9 +41,15 @@ pub(super) const MAX_TOUCHED_FAMILIES: usize = 1_024;
 const MAX_FOLLOWUP_FAMILIES: usize = 256;
 /// Index keys the rotating cursor may visit per page.
 const MAX_ROTATION_KEYS: usize = 4_096;
-/// Member keys all of one page's lookups may visit. Families past it are
-/// counted `families_unevaluated_member_budget`, not evaluated.
+/// Underlying range advances all of one page's member lookups may make,
+/// before filters and dedup. Families it cannot finish are counted
+/// `families_unevaluated_member_budget`, not evaluated.
 pub(super) const MAX_MEMBER_KEYS_PER_PAGE: usize = 16_384;
+/// Keys one page's uniqueness pass may visit. A corpus larger than this is
+/// counted across pages, and uniqueness stays unknown until the pass ends.
+pub(super) const ROOT_PASS_KEYS_PER_PAGE: usize = 8_192;
+/// History gates the page lookup reads; past it every family counts `held`.
+pub(super) const MAX_HISTORY_GATES: usize = 16_384;
 /// Keys under one family prefix; a larger family is `membership_unknown`.
 pub(super) const MAX_FAMILY_KEYS: usize = 1_024;
 /// `first_pending_at` entries; the oldest stamp is evicted beyond this.
@@ -73,7 +87,8 @@ pub(super) enum Incomplete {
     /// Unreadable, disappeared or directory-cap loss the traversal cannot
     /// attribute to a file: every family, sticky for the generation.
     RefusedReadUnattributed,
-    /// A member has a deferred ownership hold or a decode hold.
+    /// A member has a deferred ownership hold or a decode hold, or a file of
+    /// the root has held history emission. A literal denial is not a hold.
     Held,
     /// The root has an authority quarantine record, or a member an owned-start
     /// census witness.
@@ -82,8 +97,9 @@ pub(super) enum Incomplete {
     Residue,
     /// No valid account proof binds every member at its current revision:
     /// missing or invalid pending, member set mismatch (a new member without
-    /// its own proof), an observed member with no index entry, or an empty
-    /// (changed or re-armed) fingerprint.
+    /// its own proof), an observed member with no index entry, an empty
+    /// (changed or re-armed) fingerprint, or an `identity_revision` that is
+    /// missing, stale or not yet finalized for the current tuple.
     Evidence,
     /// A member's current revision has no attestation from this generation:
     /// presence (observed key, stored fingerprint) is not coverage.
@@ -259,7 +275,8 @@ pub(super) struct FamilyCounts {
     /// Families left for a later page because the member budget ran out.
     #[serde(rename = "families_unevaluated_member_budget")]
     pub(super) unevaluated: u64,
-    /// Index or observed keys the member lookups visited.
+    /// Underlying range advances of the member lookups: duplicates, empties
+    /// and unrelated keys included.
     #[serde(rename = "member_keys_visited")]
     pub(super) member_keys: u64,
 }
@@ -275,103 +292,156 @@ impl FamilyCounts {
     }
 }
 
-/// Global count of member paths per root, over indexed and observed keys,
-/// for the cross-directory uniqueness check. Rebuilt only when its key
-/// population changed: the cache key digests the key sets themselves (a
-/// removal and an addition on one page leave the sizes equal). A hash
-/// collision only merges counts, which fails closed.
+/// Global count of member paths per root, over indexed and observed keys
+/// (confirmed-empty ones too), for the cross-directory uniqueness check.
+///
+/// Counted by a pass over the keys, at most `ROOT_PASS_KEYS_PER_PAGE` a page.
+/// Until a pass ends `paths_of` answers unknown: a partial count is never
+/// published. A pass stays valid while `Population` holds and no page reports
+/// a change that keeps it equal, so an unchanged corpus costs no key visits. A
+/// hash collision only merges counts, which fails closed.
 #[derive(Debug, Default)]
 pub(super) struct RootCounts {
-    key: Option<RootCountsKey>,
+    population: Option<Population>,
+    /// Sorted by root hash; partial while `pass` is set.
     counts: Vec<(u64, u32)>,
+    pass: Option<RootPass>,
     overflowed: bool,
 }
 
+/// What a finished pass counted. The key set can only gain a path through
+/// `observed_index_keys` (its size moves unless a page also removes, which the
+/// page reports) or through a parse outside it (which `evaluate_page` checks).
+/// A loss only over-counts, which fails closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RootCountsKey {
+struct Population {
     generation: u64,
-    files: SetDigest,
-    observed: SetDigest,
-    confirmed_empty: SetDigest,
+    files: usize,
+    observed: usize,
 }
 
-/// Order-free digest of a key set: size, wrapping sum and xor of mixed
-/// key hashes. O(n) hashing, no allocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SetDigest(usize, u64, u64);
-
-impl SetDigest {
-    fn of<'k>(keys: impl Iterator<Item = &'k String>) -> Self {
-        keys.fold(Self(0, 0, 0), |Self(len, sum, xor), key| {
-            let mixed = mix64(hash64(key.as_bytes()));
-            Self(len + 1, sum.wrapping_add(mixed), xor ^ mix64(mixed))
-        })
-    }
+/// Where a counting pass resumes.
+#[derive(Debug, Default)]
+struct RootPass {
+    in_observed: bool,
+    after: Option<String>,
 }
 
 impl RootCounts {
     const fn new() -> Self {
         Self {
-            key: None,
+            population: None,
             counts: Vec::new(),
+            pass: None,
             overflowed: false,
         }
     }
 
-    /// Bring the index up to date with `index`. Returns true when it rebuilt.
-    fn refresh(&mut self, index: &ScanIndex, traversal: &ScanTraversalCheckpoint) -> bool {
-        let key = RootCountsKey {
-            generation: generation_tag(traversal),
-            files: SetDigest::of(index.files.keys()),
-            observed: SetDigest::of(traversal.observed_index_keys.iter()),
-            confirmed_empty: SetDigest::of(index.confirmed_empty_files.iter()),
-        };
-        if self.key.as_ref() == Some(&key) {
-            return false;
-        }
-        *self = Self::build(index, traversal);
-        self.key = Some(key);
-        true
+    /// Forget the count: a page changed the population without moving it.
+    fn invalidate(&mut self) {
+        self.population = None;
     }
 
-    /// Bounded while it collects: past `MAX_ROOT_COUNTS` distinct roots it
-    /// stops and reports itself overflowed.
-    pub(super) fn build(index: &ScanIndex, traversal: &ScanTraversalCheckpoint) -> Self {
-        let keys = index
-            .files
-            .keys()
-            .chain(
-                traversal
-                    .observed_index_keys
-                    .iter()
-                    .filter(|key| !index.files.contains_key(*key)),
-            )
-            .filter(|key| !index.confirmed_empty_files.contains(*key))
-            .filter_map(|key| claude_index_path_member_ref(Path::new(key.as_str())));
-        let mut counts = BTreeMap::<u64, u32>::new();
-        for member in keys {
-            let hash = hash64(member.root.as_bytes());
-            if let Some(count) = counts.get_mut(&hash) {
-                *count = count.saturating_add(1);
-            } else if counts.len() == MAX_ROOT_COUNTS {
-                return Self {
-                    key: None,
-                    counts: Vec::new(),
-                    overflowed: true,
-                };
-            } else {
-                counts.insert(hash, 1);
+    /// Start over if the population moved, then count up to `budget` keys.
+    /// Returns the keys visited and whether the count restarted.
+    fn advance(
+        &mut self,
+        index: &ScanIndex,
+        traversal: &ScanTraversalCheckpoint,
+        budget: usize,
+    ) -> (usize, bool) {
+        let population = Population {
+            generation: generation_tag(traversal),
+            files: index.files.len(),
+            observed: traversal.observed_index_keys.len(),
+        };
+        let restarted = self.population != Some(population);
+        if restarted {
+            self.population = Some(population);
+            self.counts.clear();
+            self.overflowed = false;
+            self.pass = Some(RootPass::default());
+        }
+        let Some(mut pass) = self.pass.take() else {
+            return (0, restarted);
+        };
+        let mut roots = Vec::new();
+        let mut visited = 0;
+        if !pass.in_observed {
+            let keys = index
+                .files
+                .range::<str, _>(after(&pass.after))
+                .map(|(key, _)| key);
+            match count_keys(keys, budget, &mut visited, &mut roots) {
+                Some(stopped) => pass.after = Some(stopped.clone()),
+                None => {
+                    pass = RootPass {
+                        in_observed: true,
+                        after: None,
+                    }
+                }
             }
         }
-        Self {
-            key: None,
-            counts: counts.into_iter().collect(),
-            overflowed: false,
+        let mut finished = false;
+        if pass.in_observed && visited < budget {
+            let keys = traversal
+                .observed_index_keys
+                .range::<str, _>(after(&pass.after));
+            let mut unindexed = Vec::new();
+            let stopped = count_keys(keys, budget, &mut visited, &mut unindexed);
+            roots.extend(
+                unindexed
+                    .into_iter()
+                    .filter(|(key, _)| !index.files.contains_key(*key)),
+            );
+            match stopped {
+                Some(stopped) => pass.after = Some(stopped.clone()),
+                None => finished = true,
+            }
         }
+        self.merge(roots);
+        self.pass = (!finished && !self.overflowed).then_some(pass);
+        (visited, restarted)
     }
 
-    fn paths_of(&self, root: &str) -> Option<u32> {
+    /// Bounded while it merges: past `MAX_ROOT_COUNTS` distinct roots the
+    /// count empties and stays overflowed until the population moves.
+    fn merge(&mut self, roots: Vec<(&str, u64)>) {
+        let mut fresh = Vec::new();
+        for (_, root) in roots {
+            match self.counts.binary_search_by_key(&root, |(hash, _)| *hash) {
+                Ok(position) => {
+                    let count = &mut self.counts[position].1;
+                    *count = count.saturating_add(1);
+                }
+                Err(_) => fresh.push(root),
+            }
+        }
+        fresh.sort_unstable();
+        self.counts.extend(
+            fresh
+                .chunk_by(|left, right| left == right)
+                .map(|run| (run[0], u32::try_from(run.len()).unwrap_or(u32::MAX))),
+        );
+        self.counts.sort_unstable();
+        self.overflowed = self.counts.len() > MAX_ROOT_COUNTS;
         if self.overflowed {
+            self.counts = Vec::new();
+        }
+        self.counts.shrink_to(MAX_ROOT_COUNTS);
+    }
+
+    /// The whole count in one call, for fixtures.
+    #[cfg(test)]
+    pub(super) fn build(index: &ScanIndex, traversal: &ScanTraversalCheckpoint) -> Self {
+        let mut counts = Self::new();
+        counts.advance(index, traversal, usize::MAX);
+        counts
+    }
+
+    /// The root's path count, or `None` while it is unknown.
+    fn paths_of(&self, root: &str) -> Option<u32> {
+        if self.pass.is_some() || self.overflowed || self.population.is_none() {
             return None;
         }
         let hash = hash64(root.as_bytes());
@@ -381,8 +451,47 @@ impl RootCounts {
             .map(|position| self.counts[position].1)
     }
 
+    fn complete(&self) -> bool {
+        self.population.is_some() && self.pass.is_none() && !self.overflowed
+    }
+
     fn heap_bytes(&self) -> usize {
         self.counts.capacity() * size_of::<(u64, u32)>()
+            + self
+                .pass
+                .as_ref()
+                .and_then(|pass| pass.after.as_ref())
+                .map_or(0, String::capacity)
+    }
+}
+
+/// The range bounds after a resume key.
+fn after(key: &Option<String>) -> (Bound<&str>, Bound<&str>) {
+    match key.as_deref() {
+        Some(key) => (Bound::Excluded(key), Bound::Unbounded),
+        None => (Bound::Unbounded, Bound::Unbounded),
+    }
+}
+
+/// Collect each member key's root hash, up to `budget` keys in all. Returns the
+/// last key visited when the budget stopped it, `None` once `keys` ran out.
+fn count_keys<'k>(
+    mut keys: impl Iterator<Item = &'k String>,
+    budget: usize,
+    visited: &mut usize,
+    roots: &mut Vec<(&'k str, u64)>,
+) -> Option<&'k String> {
+    let mut last = None;
+    loop {
+        if *visited >= budget {
+            return last;
+        }
+        let key = keys.next()?;
+        *visited += 1;
+        last = Some(key);
+        if let Some(member) = claude_index_path_member_ref(Path::new(key.as_str())) {
+            roots.push((key.as_str(), hash64(member.root.as_bytes())));
+        }
     }
 }
 
@@ -650,6 +759,34 @@ pub(super) struct View<'a> {
     /// queued.
     queued_roots: BTreeSet<u64>,
     queued_roots_overflowed: bool,
+    /// Sorted hashes of roots with held history, at the root like the
+    /// retirement path: a held new child can be missing from `files`. Past
+    /// `MAX_HISTORY_GATES` gates it overflows and every family counts held.
+    held_history_roots: Vec<u64>,
+    history_gates_overflowed: bool,
+}
+
+/// The shared budget of one page's member lookups, in range advances.
+struct KeyBudget {
+    left: usize,
+    used: u64,
+}
+
+/// A family's keys under `prefix`.
+struct Members<'a> {
+    /// Each member once, in key order: confirmed-empty files hold no requests
+    /// and are not members, as in `complete_claude_family_members`.
+    live: Vec<&'a str>,
+    /// Paths of the family, confirmed-empty ones included.
+    paths: usize,
+}
+
+/// Why a family's key lookup stopped short.
+enum Stopped {
+    /// Over `MAX_FAMILY_KEYS` members.
+    Oversized,
+    /// The page's budget ran out first: the keys seen prove nothing.
+    OutOfBudget,
 }
 
 impl<'a> View<'a> {
@@ -676,6 +813,20 @@ impl<'a> View<'a> {
             }
             queued_roots.insert(hash);
         }
+        let gates = &index.claude_history_emission.files;
+        let history_gates_overflowed = gates.len() > MAX_HISTORY_GATES;
+        let mut held_history_roots: Vec<u64> = if history_gates_overflowed {
+            Vec::new()
+        } else {
+            gates
+                .values()
+                .filter(|gated| gated.held.is_some())
+                .filter_map(|gated| claude_index_path_member_ref(Path::new(&gated.index_key)))
+                .map(|member| hash64(member.root.as_bytes()))
+                .collect()
+        };
+        held_history_roots.sort_unstable();
+        held_history_roots.dedup();
         Self {
             index,
             traversal,
@@ -685,51 +836,75 @@ impl<'a> View<'a> {
             vetoes,
             queued_roots,
             queued_roots_overflowed,
+            held_history_roots,
+            history_gates_overflowed,
         }
     }
 
-    /// Indexed and observed keys of `family`, each once, in key order, or
-    /// `None` past `MAX_FAMILY_KEYS`. Confirmed-empty files hold no requests
-    /// and are not members, as in `complete_claude_family_members`.
-    fn members(&self, family: &FamilyRef) -> Option<Vec<&'a str>> {
-        fn under<'k, V>(
-            keys: impl Iterator<Item = (&'k String, V)>,
+    /// Indexed and observed keys of `family`, charging `budget` every range
+    /// advance before any filter or dedup.
+    fn members(&self, family: &FamilyRef, budget: &mut KeyBudget) -> Result<Members<'a>, Stopped> {
+        fn scan<'k>(
+            mut keys: impl Iterator<Item = &'k str>,
             family: &FamilyRef,
-        ) -> impl Iterator<Item = &'k str> {
-            let bound = family.prefix.clone();
-            let prefix = family.prefix.clone();
-            let root = family.root.clone();
-            keys.map(|(key, _)| key.as_str())
-                .take_while(move |key| key.starts_with(bound.as_str()))
-                .filter(move |key| {
-                    let rest = &key[prefix.len()..];
-                    (rest == ".jsonl" || rest.starts_with('/'))
-                        && claude_index_path_member_ref(Path::new(key))
-                            .is_some_and(|member| member.root == root)
-                })
-                .take(MAX_FAMILY_KEYS + 1)
+            budget: &mut KeyBudget,
+            found: &mut Vec<&'k str>,
+        ) -> Result<(), Stopped> {
+            let mut matched = 0;
+            loop {
+                if budget.left == 0 {
+                    return Err(Stopped::OutOfBudget);
+                }
+                let Some(key) = keys.next() else {
+                    return Ok(());
+                };
+                budget.left -= 1;
+                budget.used += 1;
+                if !key.starts_with(family.prefix.as_str()) {
+                    return Ok(());
+                }
+                let rest = &key[family.prefix.len()..];
+                if (rest == ".jsonl" || rest.starts_with('/'))
+                    && claude_index_path_member_ref(Path::new(key))
+                        .is_some_and(|member| member.root == family.root)
+                {
+                    matched += 1;
+                    if matched > MAX_FAMILY_KEYS {
+                        return Err(Stopped::Oversized);
+                    }
+                    found.push(key);
+                }
+            }
         }
+        let index = self.index;
+        let traversal = self.traversal;
         let start = (Bound::Included(family.prefix.as_str()), Bound::Unbounded);
-        let mut keys = under(self.index.files.range::<str, _>(start), family)
-            .chain(under(
-                self.traversal
-                    .observed_index_keys
-                    .range::<str, _>(start)
-                    .map(|key| (key, ())),
-                family,
-            ))
-            .filter(|key| !self.index.confirmed_empty_files.contains(*key))
-            .collect::<Vec<_>>();
+        let mut keys = Vec::new();
+        let files = index.files.range::<str, _>(start);
+        scan(
+            files.map(|(key, _)| key.as_str()),
+            family,
+            budget,
+            &mut keys,
+        )?;
+        let observed = traversal.observed_index_keys.range::<str, _>(start);
+        scan(observed.map(String::as_str), family, budget, &mut keys)?;
         keys.sort_unstable();
         keys.dedup();
-        (keys.len() <= MAX_FAMILY_KEYS).then_some(keys)
+        if keys.len() > MAX_FAMILY_KEYS {
+            return Err(Stopped::Oversized);
+        }
+        let paths = keys.len();
+        keys.retain(|key| !index.confirmed_empty_files.contains(*key));
+        Ok(Members { live: keys, paths })
     }
 
     /// `None` when `family` is complete in the current window, else its
     /// first-match reason. Pure: no stat, open, read or write.
-    pub(super) fn classify(&self, family: &FamilyRef, members: &[&str]) -> Option<Incomplete> {
+    fn classify(&self, family: &FamilyRef, family_members: &Members) -> Option<Incomplete> {
         let index = self.index;
         let traversal = self.traversal;
+        let members = family_members.live.as_slice();
         if self.vetoes.membership_unknown()
             || members
                 .iter()
@@ -754,9 +929,16 @@ impl<'a> View<'a> {
         if self.vetoes.unattributed {
             return Some(Incomplete::RefusedReadUnattributed);
         }
-        if members.iter().any(|key| {
-            index.claude_account_deferred_holds.contains_key(*key) || index.decode_holds_file(key)
-        }) {
+        if self.history_gates_overflowed
+            || self
+                .held_history_roots
+                .binary_search(&hash64(family.root.as_bytes()))
+                .is_ok()
+            || members.iter().any(|key| {
+                index.claude_account_deferred_holds.contains_key(*key)
+                    || index.decode_holds_file(key)
+            })
+        {
             return Some(Incomplete::Held);
         }
         let names = members
@@ -796,16 +978,29 @@ impl<'a> View<'a> {
                         .map(String::as_str)
                         .eq(name_set.iter().copied())
             });
+        // The proof must have finalized this member's current revision.
         let revisions = members
             .iter()
-            .map(|key| {
-                index
+            .zip(&names)
+            .map(|(key, member)| {
+                let entry = index
                     .files
                     .get(*key)
-                    .map(|entry| entry.source_file_fingerprint.as_str())
-                    .filter(|revision| !revision.is_empty())
+                    .filter(|entry| !entry.source_file_fingerprint.is_empty())?;
+                let finalized = proven?
+                    .member_requests
+                    .get(member)?
+                    .identity_revision
+                    .as_ref()?;
+                let current = claude_account_identity_revision(
+                    &entry.source_file_fingerprint,
+                    entry.last_snapshot_fingerprint.as_deref(),
+                    entry.last_upload_body_witness.as_deref(),
+                )?;
+                (current == *finalized).then_some(entry.source_file_fingerprint.as_str())
             })
-            .collect::<Option<Vec<_>>>();
+            .collect::<Option<Vec<_>>>()
+            .filter(|revisions| revisions.len() == members.len());
         let (Some(pending), Some(revisions)) = (proven, revisions) else {
             return Some(Incomplete::Evidence);
         };
@@ -821,7 +1016,7 @@ impl<'a> View<'a> {
             return Some(Incomplete::NotCurrentWindow);
         }
         if name_set.len() != members.len()
-            || self.roots.paths_of(&family.root) != u32::try_from(members.len()).ok()
+            || self.roots.paths_of(&family.root) != u32::try_from(family_members.paths).ok()
         {
             return Some(Incomplete::PathNotUnique);
         }
@@ -835,21 +1030,31 @@ impl<'a> View<'a> {
         &self,
         families: impl IntoIterator<Item = &'f FamilyRef>,
     ) -> FamilyCounts {
+        self.evaluate_within(families, MAX_MEMBER_KEYS_PER_PAGE)
+    }
+
+    /// `evaluate` with `budget` range advances. A family the budget cannot
+    /// finish is unevaluated, whatever its partial keys would have shown.
+    pub(super) fn evaluate_within<'f>(
+        &self,
+        families: impl IntoIterator<Item = &'f FamilyRef>,
+        budget: usize,
+    ) -> FamilyCounts {
         let mut counts = FamilyCounts::default();
+        let mut budget = KeyBudget {
+            left: budget,
+            used: 0,
+        };
         for family in families {
-            if counts.member_keys >= MAX_MEMBER_KEYS_PER_PAGE as u64 {
-                counts.unevaluated += 1;
-                continue;
-            }
-            let completion = match self.members(family) {
-                None => {
-                    counts.member_keys += MAX_FAMILY_KEYS as u64;
-                    Completion::Incomplete(Incomplete::MembershipUnknown)
+            let completion = match self.members(family, &mut budget) {
+                Err(Stopped::OutOfBudget) => {
+                    counts.unevaluated += 1;
+                    continue;
                 }
-                Some(members) if members.is_empty() => continue,
-                Some(members) => {
-                    counts.member_keys += members.len() as u64;
-                    counts.singletons += u64::from(members.len() == 1);
+                Err(Stopped::Oversized) => Completion::Incomplete(Incomplete::MembershipUnknown),
+                Ok(members) if members.live.is_empty() => continue,
+                Ok(members) => {
+                    counts.singletons += u64::from(members.live.len() == 1);
                     self.classify(family, &members)
                         .map_or(Completion::Complete, Completion::Incomplete)
                 }
@@ -865,6 +1070,7 @@ impl<'a> View<'a> {
                 Completion::Complete => counts.deferred.quantum += 1,
             }
         }
+        counts.member_keys = budget.used;
         counts
     }
 }
@@ -876,6 +1082,7 @@ pub(super) fn rotation(
     index: &ScanIndex,
     cursor: &mut Option<String>,
     exclude: &[&FamilyRef],
+    visited: &mut u64,
 ) -> Vec<FamilyRef> {
     let after = cursor.clone();
     let tail = match after.as_deref() {
@@ -900,6 +1107,7 @@ pub(super) fn rotation(
             break;
         }
         last = Some(key);
+        *visited += 1;
         let Some(family) = FamilyRef::of_key(key) else {
             continue;
         };
@@ -1121,9 +1329,17 @@ impl Runtime {
 pub(super) struct Cost {
     pub(super) predicate_cpu_us: u64,
     pub(super) families_evaluated: u64,
-    pub(super) root_index_rebuilt: bool,
+    /// Keys this page really processed outside the member budget: the
+    /// uniqueness pass with its validation, the rotation, both queue passes.
+    pub(super) root_index_keys_processed: u64,
+    pub(super) rotation_keys_visited: u64,
+    pub(super) queue_entries_visited: u64,
+    pub(super) history_gates_visited: u64,
+    pub(super) root_index_restarted: bool,
+    pub(super) root_index_complete: bool,
     pub(super) root_index_overflowed: bool,
     pub(super) queued_roots_overflowed: bool,
+    pub(super) history_gates_overflowed: bool,
     pub(super) attested_keys: u64,
     pub(super) attestations_evicted: u64,
     /// Heap of all runtime shadow state after this page.
@@ -1152,13 +1368,15 @@ pub(super) struct PageCounts {
 
 /// One Claude page's shadow evaluation, against `runtime`. Reads only `index`
 /// (persisted state and the page's traversal checkpoint) and this page's
-/// `parsed` (key, revision) pairs; writes only `runtime`.
+/// `parsed` (key, revision) pairs; writes only `runtime`. `removed_keys` says
+/// the page removed observed keys.
 #[inline(never)]
 pub(super) fn evaluate_page<'p>(
     runtime: &mut Runtime,
     index: &ScanIndex,
     touched: &Touched,
     parsed: impl IntoIterator<Item = (&'p str, &'p str)>,
+    removed_keys: bool,
     scope: &str,
     now: u64,
 ) -> Option<PageCounts> {
@@ -1170,8 +1388,10 @@ pub(super) fn evaluate_page<'p>(
     runtime.attested.align(generation);
     let meter = std::mem::take(&mut runtime.meter);
     let mut parsed_keys = Vec::new();
+    let mut population_changed = removed_keys;
     for (key, revision) in parsed {
         runtime.attested.record(generation, key, revision);
+        population_changed |= !traversal.observed_index_keys.contains(key);
         parsed_keys.push(key);
     }
     runtime.attested.flush();
@@ -1187,13 +1407,27 @@ pub(super) fn evaluate_page<'p>(
         runtime
             .sticky
             .latch(generation, Vetoes::current(index, traversal), now);
+    if population_changed {
+        runtime.roots.invalidate();
+    }
     // Unknown membership decides every family before uniqueness matters.
-    let root_index_rebuilt =
-        !vetoes.membership_unknown() && runtime.roots.refresh(index, traversal);
+    let (root_keys, root_index_restarted) = if vetoes.membership_unknown() {
+        (0, false)
+    } else {
+        runtime
+            .roots
+            .advance(index, traversal, ROOT_PASS_KEYS_PER_PAGE)
+    };
     let mut excluded = touched.families.iter().chain(&followup).collect::<Vec<_>>();
     excluded.sort_unstable();
     excluded.dedup();
-    let rotated = rotation(index, &mut runtime.cursor, &excluded);
+    let mut rotation_keys_visited = 0;
+    let rotated = rotation(
+        index,
+        &mut runtime.cursor,
+        &excluded,
+        &mut rotation_keys_visited,
+    );
     let view = View::new(index, traversal, &runtime.roots, &runtime.attested, vetoes);
     let followup_only = followup
         .iter()
@@ -1211,14 +1445,30 @@ pub(super) fn evaluate_page<'p>(
         "the reasons partition the incomplete count"
     );
     let queued_roots_overflowed = view.queued_roots_overflowed;
+    let history_gates_overflowed = view.history_gates_overflowed;
+    let queue_entries =
+        traversal.pending_candidates.len() + index.claude_stale_family_carry.replay.len();
+    let history_gates = index.claude_history_emission.files.len();
+    let parsed_count = parsed_keys.len();
     runtime.followup = Touched::from_keys(parsed_keys, MAX_FOLLOWUP_FAMILIES).families;
     let cost = Cost {
         predicate_cpu_us: super::codex_compressed_input::thread_cpu_micros()
             .saturating_sub(started),
         families_evaluated: families.evaluated,
-        root_index_rebuilt,
+        root_index_keys_processed: (root_keys + parsed_count) as u64,
+        rotation_keys_visited,
+        // The stamp pass and the queued-root pass.
+        queue_entries_visited: 2 * queue_entries as u64,
+        history_gates_visited: if history_gates_overflowed {
+            0
+        } else {
+            history_gates as u64
+        },
+        root_index_restarted,
+        root_index_complete: runtime.roots.complete(),
         root_index_overflowed: runtime.roots.overflowed,
         queued_roots_overflowed,
+        history_gates_overflowed,
         attested_keys: runtime.attested.len() as u64,
         attestations_evicted: runtime.attested.evicted,
         runtime_heap_bytes: runtime.heap_bytes() as u64,
@@ -1252,7 +1502,7 @@ pub(super) const RUNTIME_RETAINED_WORST_BYTES: usize = {
         + MAX_ATTESTATIONS * size_of::<u64>()
         + MAX_ROOT_COUNTS * size_of::<(u64, u32)>()
         + MAX_FOLLOWUP_FAMILIES * FOLLOWUP
-        + LONGEST_KEY
+        + 2 * LONGEST_KEY
 };
 
 /// The shadow's process static. It sits OUTSIDE `heap_layout_bound` admission:
@@ -1262,11 +1512,17 @@ pub(super) const RUNTIME_RETAINED_WORST_BYTES: usize = {
 /// Retained heap, worst case, with every cap full (no maps: sorted vectors
 /// only): stamps 16,384 × 16 + attestations 16,384 × 16 + attestation buffer
 /// 1,024 × 16 + since-pass keys 16,384 × 8 + root counts 16,384 × 16 = 933,888
-/// bytes, plus follow-up families 256 × (48 + K + R) and one rotation cursor
-/// K, for key length K and root length R. At K = 4,096 (Linux `PATH_MAX`) and
-/// R = 255 that is 2,064,128 bytes (1.97 MiB) before allocator rounding; at a
-/// typical K = 200, R = 36 it is about 1.0 MiB. Inline: under 512 bytes.
-/// Counts only, so nothing is refused at the bound.
+/// bytes, plus follow-up families 256 × (48 + K + R) and the rotation and
+/// uniqueness cursors 2K, for key length K and root length R. At K = 4,096
+/// (Linux `PATH_MAX`) and R = 255 that is 2,068,224 bytes (1.97 MiB) before
+/// allocator rounding; at a typical K = 200, R = 36 it is about 1.0 MiB. Inline:
+/// under 512 bytes. A page's transients add at most 1.6 MiB more (0.9 MiB at
+/// typical lengths), outside `runtime_heap_bytes`. Counts only, so nothing is
+/// refused at the bound.
+///
+/// `observe_page` takes the state out and works without this lock, so the
+/// lock's hold is one swap there. A concurrent page of another scope would
+/// lose this state, as a scope switch does: coverage only falls.
 #[cfg(not(test))]
 static RUNTIME: Mutex<Runtime> = Mutex::new(Runtime::new());
 
@@ -1334,13 +1590,14 @@ pub(super) fn attest_equality_skip(
     });
 }
 
-/// Evaluate and emit one Claude page's shadow counts. Counts only. Called from
-/// the scan step, like `attest_equality_skip`.
+/// Evaluate and emit one Claude page's shadow counts, outside the runtime
+/// mutex. Counts only. Called from the scan step, like `attest_equality_skip`.
 #[inline(never)]
 pub(super) fn observe_page(
     index: &ScanIndex,
     touched: &Option<Box<Touched>>,
     parsed: &[PendingIndexFinalization],
+    census: &ScanCensus,
     sampling: &Option<sampled_scan::Context>,
     now: u64,
 ) {
@@ -1356,9 +1613,19 @@ pub(super) fn observe_page(
                 finalization.source_file_fingerprint.as_str(),
             )
         });
-    if let Some(counts) =
-        with_runtime(|runtime| evaluate_page(runtime, index, touched, parsed, scope, now))
-    {
+    let removed_keys = !census.removed_index_keys.is_empty();
+    let mut runtime = with_runtime(std::mem::take);
+    let counts = evaluate_page(
+        &mut runtime,
+        index,
+        touched,
+        parsed,
+        removed_keys,
+        scope,
+        now,
+    );
+    with_runtime(|slot| *slot = runtime);
+    if let Some(counts) = counts {
         crate::local_resource_diagnostics::claude_family_census_shadow(&counts);
     }
 }
