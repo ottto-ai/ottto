@@ -231,9 +231,7 @@ fn independent_load_cannot_borrow_claim_generation_even_without_working_debt() {
     });
     assert!(rows
         .iter()
-        .any(|row| row["counts"]["events"]["growth_claim_refused"]
-            .as_u64()
-            .is_some_and(|count| count > 0)));
+        .any(|row| row["counts"]["latest"]["growth_claim_refused"] == "lineage"));
 }
 
 #[test]

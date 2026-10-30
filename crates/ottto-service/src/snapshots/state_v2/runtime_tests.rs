@@ -452,7 +452,7 @@ fn import_without_original_inventory_refuses_publication() {
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
     for (suffix, _, _) in fence::ARTIFACTS
         .iter()
-        .filter(|(_, unpublished, _)| *unpublished)
+        .filter(|(_, cleanup, _)| *cleanup != fence::Cleanup::SourceOnly)
     {
         assert!(!fence::sibling(&f.path, suffix).exists());
     }

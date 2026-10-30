@@ -43,25 +43,56 @@ pub(super) fn sibling(path: &Path, suffix: &str) -> PathBuf {
     name.push(suffix);
     name.into()
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Cleanup {
+    SourceOnly,
+    Unpublished,
+    ObsoleteBackup,
+}
 /// One inventory drives orphan cleanup, explicit erasure and erasure gauges.
 /// Publication must be excluded before deleting any unpublished artifact.
-pub(super) const ARTIFACTS: &[(&str, bool, Option<&str>)] = &[
-    ("", false, None),
-    (".shards", false, None),
-    (".v2.sqlite", false, None),
-    (".v2.sqlite-wal", false, None),
-    (".v2.sqlite-shm", false, None),
+pub(super) const ARTIFACTS: &[(&str, Cleanup, Option<&str>)] = &[
+    ("", Cleanup::SourceOnly, None),
+    (".shards", Cleanup::SourceOnly, None),
+    (".v2.sqlite", Cleanup::SourceOnly, None),
+    (".v2.sqlite-wal", Cleanup::SourceOnly, None),
+    (".v2.sqlite-shm", Cleanup::SourceOnly, None),
     // Cleanup-only names: no writer or recovery/adoption path remains.
-    (".v2.sqlite.migration-backup", false, None),
-    (".v2-recovery", true, None),
-    (".v2.sqlite.import", true, Some("import_remnant_inventory")),
-    (".v2.sqlite.import-wal", true, None),
-    (".v2.sqlite.import-shm", true, None),
-    (".v1-readonly", true, Some("baseline_inventory")),
-    (".v1-readonly.shards", true, None),
-    (".v2-fence.tmp", true, None),
-    (".v2-ack-receipt", false, Some("ack_receipt_inventory")),
+    (".v2.sqlite.migration-backup", Cleanup::ObsoleteBackup, None),
+    (".v2-recovery", Cleanup::ObsoleteBackup, None),
+    (
+        ".v2.sqlite.import",
+        Cleanup::Unpublished,
+        Some("import_remnant_inventory"),
+    ),
+    (".v2.sqlite.import-wal", Cleanup::Unpublished, None),
+    (".v2.sqlite.import-shm", Cleanup::Unpublished, None),
+    (
+        ".v1-readonly",
+        Cleanup::Unpublished,
+        Some("baseline_inventory"),
+    ),
+    (".v1-readonly.shards", Cleanup::Unpublished, None),
+    (".v2-fence.tmp", Cleanup::Unpublished, None),
+    (
+        ".v2-ack-receipt",
+        Cleanup::SourceOnly,
+        Some("ack_receipt_inventory"),
+    ),
 ];
+
+/// Old backup copies still carry private-text debt after their writers are
+/// removed. Delete and fsync them before maintenance clears that obligation.
+pub(super) fn purge_obsolete_backups(path: &Path) -> Result<()> {
+    for (suffix, cleanup, _) in ARTIFACTS {
+        if *cleanup == Cleanup::ObsoleteBackup {
+            remove_artifact(&sibling(path, suffix))?;
+        }
+    }
+    // Also sync on retry when a prior attempt unlinked a name but its parent
+    // fsync failed; absence alone cannot certify that deletion is durable.
+    super::super::sync_checkpoint_parent(path)
+}
 
 pub(super) fn remove_artifact(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
@@ -274,8 +305,8 @@ pub(super) fn cleanup_unpublished(path: &Path, latched: bool) -> Result<u64> {
         Hold::DbUnavailable
     );
     let mut removed = 0;
-    for (suffix, unpublished, _) in ARTIFACTS {
-        if *unpublished && remove_artifact(&sibling(path, suffix))? {
+    for (suffix, cleanup, _) in ARTIFACTS {
+        if *cleanup != Cleanup::SourceOnly && remove_artifact(&sibling(path, suffix))? {
             removed += 1;
         }
     }

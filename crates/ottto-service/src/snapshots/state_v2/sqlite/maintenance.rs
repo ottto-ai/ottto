@@ -491,6 +491,19 @@ impl Sqlite {
             // Crash during work is a failed attempt, with persisted pacing.
             self.control("erasure_failures", &failures.saturating_add(1))?;
             self.last_purge_attempt = Some(Instant::now());
+            if let Some(name) = self
+                .path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_suffix(".v2.sqlite"))
+            {
+                if super::super::fence::purge_obsolete_backups(&self.path.with_file_name(name))
+                    .is_err()
+                {
+                    self.erasure_failed("backup_io");
+                    return Ok(());
+                }
+            }
             let result = self.checkpoint(CheckpointMode::Purge);
             if result.state == CheckpointState::Complete {
                 // Success and epoch clear are atomic. A crash never grants a
