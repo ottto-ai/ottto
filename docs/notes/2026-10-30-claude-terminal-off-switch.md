@@ -152,8 +152,11 @@ These controls need runtime evidence before ON readiness can be claimed.
 NBF (non-blocking hold floors) is BLOCKS-RELEASE until its runtime control
 passes. Account-deferred keys and bound members of committed families now
 register explicit held-key custody in the existing bounded RAM observations.
-Unchanged objects in the same context are read at most once per six hours;
-only an actual acquisition renews the timestamp. The floor crosses traversal
+A fresh hold keeps its one immediate retry (the r26 held-retry contract);
+from its first held re-read on, an unchanged object in the same context is
+read at most once per six hours, and only an actual acquisition renews the
+timestamp. So a new non-blocking hold costs at most two reads in its first
+six hours, then one per six hours. The floor crosses traversal
 starts without changing sweep-held family roots, proof state or disk formats.
 Object/context changes and observation eviction fail toward another read.
 
