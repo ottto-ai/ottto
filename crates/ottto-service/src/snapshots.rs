@@ -18583,6 +18583,13 @@ impl SnapshotAccumulator {
         } else if has_history_base {
             // Paginated forks keep inherited history behind an external
             // history_base reference. Physical records in this file are local.
+            // Only a first physical own header may start the optional creator
+            // sequence. Other AllLocal arms leave this cursor unset.
+            if self.codex_creator_header_id.is_some()
+                && codex_paginated_fork_creation_header(value, meta)
+            {
+                self.codex_ordinal_expected = u64_at(value, &["ordinal"]);
+            }
             CodexOwnershipBoundary::AllLocal
         } else if is_subagent && forked_from_id.is_some() {
             CodexOwnershipBoundary::AwaitingLegacyTrigger
@@ -18672,6 +18679,15 @@ impl SnapshotAccumulator {
                 false
             }
             CodexOwnershipBoundary::AllLocal => {
+                // Validate only the optional creation witness. Usage retains its
+                // existing AllLocal semantics even if this sequence is broken.
+                if self.codex_ordinal_expected.is_some() {
+                    let ordinal = u64_at(value, &["ordinal"]);
+                    if ordinal.is_none() || ordinal != self.codex_ordinal_expected {
+                        self.codex_ordinal_sequence_valid = false;
+                    }
+                    self.codex_ordinal_expected = ordinal.and_then(|at| at.checked_add(1));
+                }
                 self.codex_owned_record_seen = true;
                 true
             }
@@ -20664,12 +20680,17 @@ impl SnapshotAccumulator {
             // Native ordinal forks have their own creation-time creator pair.
             // The first physical header/file/time gates prove its origin;
             // the independently validated boundary still owns usage, not identity.
+            // AllLocal has a cursor only for the exact external paginated own
+            // header; its local sequence and complete acquisition must survive.
             && (!self.codex_is_fork
                 || matches!(
                     self.codex_ownership_boundary,
                     CodexOwnershipBoundary::NativeCreatedThread
                         | CodexOwnershipBoundary::Ordinal { .. }
-                )))
+                )
+                || (self.codex_ownership_boundary == CodexOwnershipBoundary::AllLocal
+                    && self.codex_ordinal_sequence_valid
+                    && self.codex_ordinal_expected.is_some())))
         .then(|| self.codex_creator_evidence.clone())
         .flatten()
         .filter(|evidence| {
@@ -28777,6 +28798,12 @@ impl OwnedSourceScan {
                             plan.mode(),
                             plan.metrics().native_bytes,
                         );
+                        #[cfg(unix)]
+                        context.cache.durable_acquisition_completed(
+                            &local_index_key(&active.candidate.path),
+                            plan.mode(),
+                            plan.metrics().native_bytes,
+                        );
                     }
                 }
                 if active.sampling.as_ref().is_some_and(|acquisition| {
@@ -36470,6 +36497,34 @@ fn codex_session_id_is_native_parent(meta: &Value, session_id: &str) -> bool {
                 .is_some_and(|id| id != parent && id != session_id))
 }
 
+/// The referenced parent history is external: local ordinals begin exactly
+/// where that parent's paginated base ends. This proves only this header's own
+/// creation claim; the caller must still prove first-record/file/stream ownership.
+fn codex_paginated_fork_creation_header(value: &Value, meta: &Value) -> bool {
+    if !string_eq_at(meta, &["history_mode"], "paginated")
+        || string_eq_at(meta, &["thread_source"], "subagent")
+        || string_eq_at(meta, &["thread_source"], "agent_created_thread")
+        || meta.pointer("/source/subagent").is_some()
+        || meta.get("subagent_history_start_ordinal").is_some()
+    {
+        return false;
+    }
+    let Some(id) = resolve_codex_identity_option(codex_identity_at(meta, &["id"])) else {
+        return false;
+    };
+    let Some(parent) = resolve_codex_identity_option(codex_identity_at(meta, &["forked_from_id"]))
+    else {
+        return false;
+    };
+    id != parent
+        && resolve_codex_identity_option(codex_identity_at(meta, &["session_id"])) == Some(id)
+        && resolve_codex_identity_option(codex_identity_at(meta, &["history_base", "thread_id"]))
+            == Some(parent)
+        && u64_at(value, &["ordinal"]).is_some_and(|ordinal| {
+            u64_at(meta, &["history_base", "end_ordinal_exclusive"]) == Some(ordinal)
+        })
+}
+
 /// Capture the first physical header before applying the ownership boundary.
 /// Raw creator fields are accepted only as a complete provider pair/time.
 /// The caller separately proves first physical record and logical-session ownership.
@@ -36481,8 +36536,12 @@ fn codex_creator_header_evidence(value: &Value, meta: &Value) -> Option<SessionA
             return None;
         }
     }
-    // A later physical ordinal cannot prove original logical-session creation.
-    if value.get("ordinal").is_some() && u64_at(value, &["ordinal"]) != Some(0) {
+    // A positive ordinal needs the exact external parent boundary. First
+    // physical record, complete acquisition and local sequence are gated later.
+    if value.get("ordinal").is_some()
+        && u64_at(value, &["ordinal"]) != Some(0)
+        && !codex_paginated_fork_creation_header(value, meta)
+    {
         return None;
     }
     let account_identifier_hash = ottto_core::billing_identity_hash(
@@ -88479,6 +88538,225 @@ mod tests {
                 expected.then_some(id.as_str()),
                 "{name}"
             );
+        }
+    }
+
+    fn codex_paginated_creator_fixture() -> Value {
+        let mut header = codex_creator_header();
+        header["ordinal"] = json!(1361);
+        header["payload"]["thread_source"] = json!("user");
+        header["payload"]["forked_from_id"] = json!("019e253c-2222-7000-9000-bbbbbbbbbbbb");
+        header["payload"]["history_mode"] = json!("paginated");
+        header["payload"]["history_base"] = json!({
+            "thread_id":"019e253c-2222-7000-9000-bbbbbbbbbbbb",
+            "end_ordinal_exclusive":1361,"end_byte_offset":4096});
+        header
+    }
+
+    #[test]
+    fn codex_paginated_fork_own_creation_requires_exact_external_boundary() {
+        let header = codex_paginated_creator_fixture();
+        let id = header["payload"]["id"].as_str().unwrap();
+        let usage = |ordinal| {
+            json!({"timestamp":"2026-09-30T10:01:00Z","ordinal":ordinal,
+            "type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"input_tokens":100,"output_tokens":5},"model":"gpt-5.5"}}})
+        };
+        let mut cases = vec![("external_own_pair", vec![header.clone(), usage(1362)], true)];
+        for (name, pointer, value) in [
+            ("alias", "/payload/session_id", json!("other-session")),
+            ("missing_alias", "/payload/session_id", Value::Null),
+            ("partial_pair", "/payload/creator_user_id", Value::Null),
+            ("missing_pair", "/payload/creator_account_id", json!(" ")),
+            (
+                "wrong_parent",
+                "/payload/history_base/thread_id",
+                json!("other-parent"),
+            ),
+            (
+                "internal_parent",
+                "/payload/history_base/thread_id",
+                json!(id),
+            ),
+            (
+                "wrong_end",
+                "/payload/history_base/end_ordinal_exclusive",
+                json!(1360),
+            ),
+            ("internal_base", "/payload/history_mode", json!("inline")),
+            ("missing_parent", "/payload/forked_from_id", Value::Null),
+            ("subagent", "/payload/thread_source", json!("subagent")),
+            ("subagent_source", "/payload/source", json!({"subagent":{}})),
+            (
+                "future_creation",
+                "/payload/timestamp",
+                json!("2026-09-30T10:02:00Z"),
+            ),
+            ("missing_ordinal", "/ordinal", Value::Null),
+        ] {
+            let mut altered = header.clone();
+            *altered.pointer_mut(pointer).unwrap() = value;
+            cases.push((name, vec![altered, usage(1362)], false));
+        }
+        let mut self_fork = header.clone();
+        self_fork["payload"]["forked_from_id"] = json!(id);
+        self_fork["payload"]["history_base"]["thread_id"] = json!(id);
+        cases.push(("self_fork", vec![self_fork, usage(1362)], false));
+        cases.push((
+            "not_first_record",
+            vec![json!({"type":"turn_context"}), header.clone(), usage(1362)],
+            false,
+        ));
+        let mut zero = header.clone();
+        zero["ordinal"] = json!(0);
+        zero["payload"]["history_base"]["end_ordinal_exclusive"] = json!(0);
+        cases.push(("external_ordinal_zero", vec![zero.clone(), usage(1)], true));
+        zero["payload"]["history_base"] = json!({"cursor":"unproven"});
+        cases.push(("all_local_without_proof", vec![zero, usage(1)], false));
+        let mut conflict = header.clone();
+        conflict["ordinal"] = json!(1362);
+        conflict["payload"]["history_base"]["end_ordinal_exclusive"] = json!(1362);
+        conflict["payload"]["creator_user_id"] = json!("synthetic-conflicting-user");
+        assert!(codex_creator_header_evidence(&conflict, &conflict["payload"]).is_some());
+        cases.push((
+            "own_conflict",
+            vec![header.clone(), conflict, usage(1363)],
+            false,
+        ));
+        let mut parent = codex_creator_header();
+        parent["ordinal"] = json!(1362);
+        parent["payload"]["id"] = header["payload"]["forked_from_id"].clone();
+        parent["payload"]["session_id"] = parent["payload"]["id"].clone();
+        parent["payload"]["creator_user_id"] = json!("synthetic-parent-user");
+        cases.push((
+            "parent_pair_never_inherited",
+            vec![header.clone(), parent, usage(1363)],
+            false,
+        ));
+        cases.push(("ordinal_gap", vec![header.clone(), usage(1363)], false));
+        cases.push((
+            "ordinal_duplicate",
+            vec![header.clone(), usage(1361)],
+            false,
+        ));
+        let mut no_ordinal = usage(1362);
+        no_ordinal.as_object_mut().unwrap().remove("ordinal");
+        cases.push((
+            "local_ordinal_missing",
+            vec![header.clone(), no_ordinal, usage(1363)],
+            false,
+        ));
+        let mut subagent = codex_child_creator_header();
+        subagent["payload"]["forked_from_id"] = subagent["payload"]["session_id"].clone();
+        subagent["payload"]["subagent_history_start_ordinal"] = json!(1);
+        cases.push(("subagent_896_unchanged", vec![subagent, usage(1)], true));
+        for (name, records, expected) in cases {
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+            for record in &records {
+                apply_codex_line(record, &mut accumulator);
+            }
+            assert!(accumulator.codex_usage_accounting_complete(), "{name}");
+            if name != "subagent_896_unchanged" {
+                assert_eq!(
+                    accumulator.codex_ownership_boundary,
+                    CodexOwnershipBoundary::AllLocal,
+                    "{name}"
+                );
+            }
+            let mut items = codex_fork_creator_items(&records, id);
+            assert_eq!(items.len(), 1, "{name}");
+            assert_eq!(
+                (items[0].input_tokens, items[0].output_tokens),
+                (100, 5),
+                "{name}"
+            );
+            assert_eq!(
+                items[0].session_account_evidence.is_some(),
+                expected,
+                "{name}"
+            );
+            let mut legacy_records = records.clone();
+            for record in &mut legacy_records {
+                if let Some(meta) = record.get_mut("payload").and_then(Value::as_object_mut) {
+                    meta.remove("creator_user_id");
+                    meta.remove("creator_account_id");
+                }
+            }
+            let legacy = codex_fork_creator_items(&legacy_records, id);
+            let mut without_creator = serde_json::to_value(&items).unwrap();
+            for item in without_creator.as_array_mut().unwrap() {
+                item.as_object_mut()
+                    .unwrap()
+                    .remove("session_account_evidence");
+            }
+            assert_eq!(
+                without_creator,
+                serde_json::to_value(&legacy).unwrap(),
+                "creator-free {name}"
+            );
+            let mut request = valid_v6_batch_request();
+            request.source = "codex".into();
+            apply_upload_policy(SnapshotSource::Codex, &mut items, request.upload_policy);
+            request.snapshots = items;
+            let expected_pair = expected.then(|| json!({
+                "provider":"openai",
+                "account_identifier_hash":ottto_core::billing_identity_hash("openai", "account", "synthetic-user").unwrap(),
+                "provider_workspace_hash":ottto_core::billing_identity_hash("openai", "workspace", "synthetic-workspace").unwrap(),
+                "identity_hash_scheme":"provider-sha256:v1","evidence_source":"codex_creator_header:v1",
+                "source_created_at":"2026-09-30T10:00:00Z"}));
+            for wire in [
+                serde_json::to_value(&request).unwrap(),
+                serde_json::to_value(request.wire_with_head_cas()).unwrap(),
+            ] {
+                assert_eq!(
+                    wire["snapshots"][0].get("session_account_evidence"),
+                    expected_pair.as_ref(),
+                    "{name}"
+                );
+                assert!(
+                    !wire.to_string().contains("synthetic-"),
+                    "raw creator leaked: {name}"
+                );
+            }
+        }
+        let mut no_base = header.clone();
+        no_base["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("history_base");
+        assert!(codex_creator_header_evidence(&no_base, &no_base["payload"]).is_none());
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+        apply_codex_line(&no_base, &mut accumulator);
+        assert!(accumulator.codex_creator_evidence.is_none());
+        assert!(accumulator.codex_ordinal_expected.is_none());
+        assert!(codex_fork_creator_items(&[no_base, usage(1362)], id).is_empty());
+        assert!(codex_fork_creator_items(
+            &[header, usage(1362)],
+            "019e253c-3333-7000-9000-cccccccccccc"
+        )[0]
+        .session_account_evidence
+        .is_none());
+    }
+
+    #[test]
+    fn codex_paginated_fork_incomplete_acquisition_cannot_certify_creator() {
+        let header = codex_paginated_creator_fixture();
+        let id = header["payload"]["id"].as_str().unwrap();
+        let root = crate::test_scratch::ScratchDir::new("codex-paginated-creator-incomplete");
+        let path = root.join(format!("rollout-2026-09-30T10-00-00-{id}.jsonl"));
+        let usage = json!({"timestamp":"2026-09-30T10:01:00Z","ordinal":1362,
+            "type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"input_tokens":100,"output_tokens":5},"model":"gpt-5.5"}}});
+        for body in [
+            format!("malformed\n{header}\n{usage}\n"),
+            format!("{header}\n{usage}\nmalformed\n"),
+        ] {
+            fs::write(&path, body).unwrap();
+            let items =
+                parse_codex_jsonl_file(&path, "2026-09-30T10:05:00Z", "f".repeat(64)).unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!((items[0].input_tokens, items[0].output_tokens), (100, 5));
+            assert!(items[0].session_account_evidence.is_none());
         }
     }
 
