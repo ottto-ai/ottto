@@ -42236,12 +42236,12 @@ fn ensure_bounded_traversal(
         let semantic_members: BTreeSet<_> = index
             .files
             .iter()
-            .filter_map(|(key, entry)| {
-                (claude_index_path_member_ref(Path::new(key))
+            .filter(|(key, entry)| {
+                claude_index_path_member_ref(Path::new(key))
                     .is_some_and(|m| semantic.contains(m.root))
-                    && !terminal_off_stale_member_can_skip_clear(index, key, entry))
-                .then(|| key.clone())
+                    && !terminal_off_stale_member_can_skip_clear(index, key, entry)
             })
+            .map(|(key, _)| key.clone())
             .collect();
         if !semantic_members.is_empty() || !unacked.is_empty() {
             // Actual destination/identity-contract invalidation remains owed.

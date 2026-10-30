@@ -523,6 +523,11 @@ impl HistoryFixture {
             && cycle
                 .replay_generation
                 .is_some_and(|generation| index.prepare_historical_replay(generation.to_string()));
+        if replay_pending {
+            if let Some(generation) = cycle.replay_generation {
+                progress.prepare_historical_replay(generation);
+            }
+        }
         note_claude_history_cutoff_for_cycle(
             &mut index,
             SnapshotSource::ClaudeCode,
@@ -6295,6 +6300,7 @@ fn terminal_off_held_history_context_change_reads_once_per_context() {
     let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
     assert!(crate::snapshots::claude_terminal_off());
     for listed in [false, true] {
+        crate::snapshots::clear_terminal_off_held_contexts_for_test();
         let fixture = HistoryFixture::new("held-context-once");
         let baseline = fixture.baseline();
         if listed { fixture.install_list(&HISTORY_SESSIONS); }
