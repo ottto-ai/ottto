@@ -40,7 +40,8 @@ impl<S: HeapLayoutBound> HeapLayoutBound for Retained<S> {
     }
 }
 struct Entry<S> {
-    durable: crate::snapshots::DurableCustody,
+    // Empty custody must keep main's node layout; M3 ownership is optional.
+    durable: Option<Box<crate::snapshots::DurableCustody>>,
     retained: Retained<S>,
     used: u64,
     // Validated once at admission; private retained state is immutable until
@@ -214,7 +215,9 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     /// through its own existing HeapLayoutBound admission.
     pub(crate) fn take(&mut self, key: &str) -> Option<Taken<S>> {
         let taken = self.entries.remove(key).map(|entry| Taken {
-            durable: entry.durable,
+            durable: entry
+                .durable
+                .map_or_else(Default::default, |custody| *custody),
             retained: entry.retained,
             modified_hint: entry.modified_hint,
             finalization_charge: entry.finalization_charge,
@@ -632,7 +635,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             key.clone(),
             Entry {
                 retained,
-                durable,
+                durable: (!durable.is_empty()).then(|| Box::new(durable)),
                 modified_hint,
                 finalization_charge,
                 e2_held_new_file,

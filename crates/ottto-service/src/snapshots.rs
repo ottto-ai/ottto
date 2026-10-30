@@ -29806,10 +29806,12 @@ impl OwnedSourceScan {
                                 // audit waits. A byte-zero Full must instead
                                 // reach normal completion and discharge its
                                 // audit, even when RAM retention is unavailable.
-                                !matches!(
-                                    acquisition.mode,
-                                    crate::transcript_acquisition::ReadMode::Full(_)
-                                ) && acquisition.audit_due.is_some()
+                                (!restart_restore::enabled()
+                                    || !matches!(
+                                        acquisition.mode,
+                                        crate::transcript_acquisition::ReadMode::Full(_)
+                                    ))
+                                    && acquisition.audit_due.is_some()
                                     && sampled_audit::progress_debt(
                                         index,
                                         &acquisition.key,
