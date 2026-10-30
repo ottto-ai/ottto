@@ -2617,3 +2617,25 @@ pub(crate) fn scan_index_manifest_refused(source: &'static str) {
         }),
     );
 }
+
+/// Per-refused-load counter, independent of the repair blocker's episode alarm.
+/// Only fixed causes and numeric counts; never include the originating error.
+pub(crate) fn scan_index_repair_required(
+    source: &str,
+    cause: crate::snapshots::scan_index_health::RepairCause,
+) {
+    static TOTALS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    let count = TOTALS[cause as usize]
+        .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
+        .unwrap_or_else(|v| v)
+        .saturating_add(1);
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "scan_index_repair_required": {
+                "cause": cause.label(), "delta": 1, "count": count,
+            },
+        }),
+    );
+}

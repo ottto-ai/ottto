@@ -9,6 +9,43 @@ pub(crate) const SHARD_CODE: &str = "index_shard_unavailable";
 pub(crate) const SHARD_LABEL: &str = "Not collecting: local data needs repair";
 pub(crate) const SHARD_DETAIL: &str = "Ottto paused collection for this app because some saved local data is missing or damaged. Don't delete Ottto's data folder. Contact Ottto support to restore it; collection resumes once it's complete.";
 
+/// Fixed diagnostic causes only; these reuse the existing repair surface.
+#[derive(Clone, Copy)]
+pub(crate) enum RepairCause {
+    PriorState,
+    StorageGeneration,
+}
+impl RepairCause {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::PriorState => "prior_state",
+            Self::StorageGeneration => "storage_generation",
+        }
+    }
+    fn from_error(error: &anyhow::Error) -> Option<Self> {
+        for cause in error.chain() {
+            // The loader preserves this typed refusal after the representation
+            // adapter fails closed. Do not classify arbitrary IO/shape errors.
+            if matches!(
+                cause.downcast_ref::<lenient_decode::Error>(),
+                Some(lenient_decode::Error::Refused(
+                    "storage generation requires repair"
+                ))
+            ) {
+                return Some(Self::StorageGeneration);
+            }
+            match cause.to_string().as_str() {
+                "scan_index_prior_state_requires_repair" => return Some(Self::PriorState),
+                "scan_index_storage_generation_requires_repair" => {
+                    return Some(Self::StorageGeneration);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Reason {
     NewerApp,
@@ -124,7 +161,18 @@ pub(super) fn observe(source: SnapshotSource, loaded: &anyhow::Result<(ScanIndex
             );
         }
         Err(error) if is_version_refusal(error) => set(source, Reason::NewerApp, true, 0),
-        // Missing/quarantined state and IO/shape errors cannot prove recovery.
+        Err(error) => {
+            if let Some(cause) = RepairCause::from_error(error) {
+                crate::local_resource_diagnostics::scan_index_repair_required(
+                    source.api_slug(),
+                    cause,
+                );
+                // The same source blocker and one-per-episode alarm as UNKNOWN.
+                // Zero map count: no unavailable shard inventory was loaded.
+                set(source, Reason::ShardUnavailable, true, 0);
+            }
+        }
+        // Missing/quarantined state and unrelated errors cannot prove recovery.
         _ => {}
     }
 }
@@ -168,4 +216,133 @@ pub(crate) fn shard_transitions(source: SnapshotSource) -> u64 {
 #[cfg(test)]
 pub(crate) fn transitions(source: SnapshotSource) -> u64 {
     with_states(|states| states[slot(source)].transitions)
+}
+
+#[cfg(test)]
+mod repair_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_repair_causes_share_source_blocker_alarm_once_and_clear_on_good_load() {
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            for (label, error) in [
+                (
+                    "prior_state",
+                    anyhow::anyhow!("scan_index_prior_state_requires_repair")
+                        .context("opaque context"),
+                ),
+                (
+                    "storage_generation",
+                    anyhow::anyhow!("scan_index_storage_generation_requires_repair")
+                        .context("opaque context"),
+                ),
+                (
+                    "storage_generation",
+                    anyhow::Error::new(lenient_decode::Error::Refused(
+                        "storage generation requires repair",
+                    ))
+                    .context("opaque context"),
+                ),
+            ] {
+                let scratch = crate::test_scratch::private_dir("repair-refusal-health");
+                let root = scratch.join("index.json");
+                std::fs::write(&root, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
+                let good_load = || {
+                    ScanIndex::load_for_snapshot_source_with_origin(&root, source, &scratch)
+                        .unwrap()
+                };
+                good_load();
+                let before = observations();
+                let failed = Err(error);
+                let (_, records) = crate::local_resource_diagnostics::capture(|| {
+                    observe(source, &failed);
+                    observe(source, &failed);
+                });
+                let blocked = observations();
+                assert!(blocked[1][slot(source)].0.is_some());
+                assert_eq!(blocked[1][slot(source)].1, before[1][slot(source)].1 + 1);
+                assert_eq!(blocked[0], before[0], "never update-app advice");
+                for sibling in 0..3 {
+                    if sibling != slot(source) {
+                        assert_eq!(blocked[1][sibling], before[1][sibling]);
+                    }
+                }
+                let alarms: Vec<_> = records
+                    .iter()
+                    .filter(|r| r["counts"]["index_shard_unavailable_alarm"] == 1)
+                    .collect();
+                assert_eq!(
+                    alarms.len(),
+                    1,
+                    "one alarm per repair episode, not per load"
+                );
+                assert_eq!(alarms[0]["source"], source.api_slug());
+                assert_eq!(alarms[0]["counts"]["unavailable_maps"], 0);
+                let counters: Vec<_> = records
+                    .iter()
+                    .filter(|r| r["counts"].get("scan_index_repair_required").is_some())
+                    .collect();
+                assert_eq!(counters.len(), 2, "counter continues for each refused load");
+                for row in counters {
+                    assert_eq!(row["source"], source.api_slug());
+                    assert_eq!(row["counts"]["scan_index_repair_required"]["cause"], label);
+                    assert_eq!(row["counts"]["scan_index_repair_required"]["delta"], 1);
+                    assert_eq!(
+                        row["counts"]["scan_index_repair_required"]
+                            .as_object()
+                            .unwrap()
+                            .len(),
+                        3
+                    );
+                }
+                let (_, records) = crate::local_resource_diagnostics::capture(|| {
+                    good_load();
+                });
+                assert!(observations()[1][slot(source)].0.is_none());
+                assert_eq!(
+                    observations()[1][slot(source)].1,
+                    before[1][slot(source)].1 + 2
+                );
+                assert!(records
+                    .iter()
+                    .all(|r| r["counts"].get("index_shard_unavailable_alarm").is_none()));
+                let (_, records) = crate::local_resource_diagnostics::capture(|| {
+                    observe(source, &failed);
+                });
+                assert_eq!(
+                    records
+                        .iter()
+                        .filter(|r| r["counts"]["index_shard_unavailable_alarm"] == 1)
+                        .count(),
+                    1,
+                    "restored then damaged is a new episode"
+                );
+                good_load();
+                std::fs::remove_dir_all(scratch).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_errors_and_code_lookalikes_do_not_create_repair_advice() {
+        let source = SnapshotSource::ClaudeCode;
+        let before = observations();
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            for error in [
+                anyhow::anyhow!("scan_index_prior_state_requires_repair_extra"),
+                anyhow::anyhow!("private/scan_index_prior_state_requires_repair"),
+                anyhow::anyhow!("scan_index_storage_generation_requires_repair_extra"),
+                anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                anyhow::Error::new(lenient_decode::Error::Refused("unrelated shape")),
+            ] {
+                observe(source, &Err(error));
+            }
+        });
+        assert_eq!(observations(), before);
+        assert!(records.is_empty());
+    }
 }
