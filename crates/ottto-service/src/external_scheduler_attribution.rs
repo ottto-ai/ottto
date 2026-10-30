@@ -221,24 +221,6 @@ impl ExternalSchedulerInventory {
         }
     }
 
-    /// Whether `normalized_template` could count as a prompt match for
-    /// `source`. Wider than `correlate`: a definition may still miss on time.
-    pub(crate) fn prompt_signature_matches(
-        &self,
-        source: SnapshotSource,
-        normalized_template: &str,
-    ) -> bool {
-        self.definitions.iter().any(|definition| {
-            definition
-                .provider_source
-                .map_or(true, |provider| provider == source)
-                && definition
-                    .prompt_signature
-                    .as_deref()
-                    .is_some_and(|signature| normalized_template.contains(signature))
-        })
-    }
-
     pub(crate) fn correlate(
         &self,
         session: ExternalSchedulerSession<'_>,
