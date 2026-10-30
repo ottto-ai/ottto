@@ -275,7 +275,11 @@ pub fn run(
     )?;
     // Unlike ScanIndex::load this reader takes no checkpoint lock, repairs
     // nothing and creates no state. Invalid/incomplete state fails closed.
-    let index = read_scan_index_representation(index_path, "estimate", "claude_code", None)?;
+    let index = scan_index_integration::read_scan_index_representation_read_only(
+        index_path,
+        "estimate",
+        "claude_code",
+    )?;
     ensure!(
         index.persistence_available() && index.decode_holds.is_empty(),
         "scope index unavailable"
