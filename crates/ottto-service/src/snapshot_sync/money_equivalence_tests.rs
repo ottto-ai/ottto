@@ -1023,3 +1023,64 @@ pending!(
     pi,
     "E1 design D1: Pi explicitly remains Full-on-change; no retained Pi reduction on main"
 );
+
+/// Admission branches omitted by the native-authority sticky fixture. Check
+/// real scanner output against explicit additive totals, without a frozen parser.
+#[test]
+fn codex_admission_branches_preserve_emitted_totals() {
+    if !supported("codex_admission_branches") {
+        return;
+    }
+    let usage = |n: u64| json!({"input_tokens":n,"cached_input_tokens":0,
+        "output_tokens":0,"reasoning_output_tokens":0,"total_tokens":n});
+    let ui = |id: u64, last: Option<u64>, total: u64| {
+        let mut row = json!({"type":"event_msg","timestamp":"2026-10-27T07:00:02Z",
+            "fixture_line":id,"payload":{"type":"token_count","info":{
+                "model":"gpt-5.2","total_token_usage":usage(total)}}});
+        if let Some(last) = last {
+            row["payload"]["info"]["last_token_usage"] = usage(last);
+        }
+        row
+    };
+    let event = |kind: &str, turn: &str| json!({"type":"event_msg",
+        "timestamp":"2026-10-27T07:00:01Z","payload":{"type":kind,"turn_id":turn}});
+    let start = || event("task_started", "a");
+    let close = || event("task_complete", "a");
+    let mut fallback = ui(1, Some(1), 1);
+    fallback["payload"]["info"].as_object_mut().unwrap().remove("model");
+    let mut dropped = ui(1, Some(1), 1);
+    dropped["timestamp"] = json!("invalid");
+    let mut overflow = vec![start()];
+    overflow.extend((1..=66).map(|i| {
+        let mut row = ui(i, Some(1), i);
+        row["payload"]["info"]["model"] = json!(format!("fixture-model-{i}"));
+        row
+    }));
+    overflow.push(close());
+    let repeated = ui(2, Some(1), 1);
+    for (name, legacy, lines, expected) in [
+        ("unbound", false, vec![fallback.clone(), repeated.clone(), repeated], 2),
+        ("base-reset-zero-repeat", false, vec![start(), ui(1,None,5), ui(2,None,7),
+            ui(3,None,2), ui(4,Some(0),2), ui(5,Some(1),3), ui(6,Some(1),3), close()], 3),
+        ("legacy-reset", true, vec![ui(1,None,5),ui(2,None,7),ui(3,None,2),
+            ui(4,Some(0),2),ui(5,Some(1),3),ui(5,Some(1),3)],10),
+        ("closure-mismatch", false, vec![start(),ui(1,Some(1),1),event("task_started","b"),
+            ui(2,Some(1),2),event("task_complete","other")],2),
+        ("dropped-staging", false, vec![start(),dropped,ui(2,Some(1),2),close()],1),
+        ("pending-overflow", false, overflow,66),
+        ("model-fallback", true, vec![fallback,ui(2,Some(1),2)],2),
+    ] {
+        let c = corpus(&format!("codex-admission-{name}"));
+        let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z",
+            "payload":{"id":ROOT,"timestamp":"2026-10-27T07:00:00Z"}});
+        let text = std::iter::once(header).chain(lines).map(|v| v.to_string()+"\n").collect::<String>();
+        let path = c.root.join("rollout.jsonl");
+        std::fs::write(&path, text).unwrap();
+        input_clock(&path);
+        let _cutover = crate::snapshots::TestCutover::set(if legacy { i64::MAX } else { 0 });
+        let (_, scan, _) = other_page(&c, &E2ScanFixture::default(), SnapshotSource::Codex, ScanIndex::default());
+        assert_eq!(scan.snapshots.iter().map(|s| s.input_tokens).sum::<u64>(), expected, "{name}");
+        let wire = other_wire(SnapshotSource::Codex, &scan);
+        assert!(!wire.is_empty(), "{name}: emitted body must validate");
+    }
+}

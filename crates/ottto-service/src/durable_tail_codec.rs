@@ -94,28 +94,16 @@ enum Sink<'a> {
 /// be checked against the digest without storing it.
 pub(crate) struct Enc<'a> {
     sink: Sink<'a>,
-    #[cfg(test)]
-    include_content_bytes: bool,
 }
 
 impl<'a> Enc<'a> {
     pub(crate) fn bytes(limit: usize) -> Self {
         Self {
-            #[cfg(test)]
-            include_content_bytes: false,
             sink: Sink::Bytes {
                 out: Vec::with_capacity(limit),
                 limit,
             },
         }
-    }
-    /// Differential fixtures need actual X bytes as well as persisted classes.
-    /// This never participates in a production encoder or a shape/hash pin.
-    #[cfg(test)]
-    pub(crate) fn full_bytes(limit: usize) -> Self {
-        let mut out = Self::bytes(limit);
-        out.include_content_bytes = true;
-        out
     }
     /// Count and emit through the same field walk. The body allocation is
     /// exact and only happens after every admission/size check succeeds.
@@ -135,8 +123,6 @@ impl<'a> Enc<'a> {
     /// Borrow a sink after counting. Both overrun and underrun refuse the record.
     pub(crate) fn writer(out: &'a mut dyn Write, exact_len: usize) -> Self {
         Self {
-            #[cfg(test)]
-            include_content_bytes: false,
             sink: Sink::Write {
                 out,
                 len: 0,
@@ -153,8 +139,6 @@ impl<'a> Enc<'a> {
     }
     pub(crate) fn count(limit: usize) -> Self {
         Self {
-            #[cfg(test)]
-            include_content_bytes: false,
             sink: Sink::Count { len: 0, limit },
         }
     }
@@ -169,16 +153,11 @@ impl<'a> Enc<'a> {
         hasher.update((domain.len() as u64).to_le_bytes());
         hasher.update(domain.as_bytes());
         Self {
-            #[cfg(test)]
-            include_content_bytes: false,
             sink: Sink::Hash(Box::new(hasher)),
         }
     }
     pub(crate) fn hashing(&self) -> bool {
-        let hashing = matches!(self.sink, Sink::Hash(_));
-        #[cfg(test)]
-        let hashing = hashing || self.include_content_bytes;
-        hashing
+        matches!(self.sink, Sink::Hash(_))
     }
     /// Byte-output position; counting and hashing never record `L` spans.
     #[cfg(test)]
@@ -1730,7 +1709,6 @@ mod tests {
         let mut out = Short(Vec::new());
         {
             let mut e = Enc {
-                include_content_bytes: false,
                 sink: Sink::Write {
                     out: &mut out,
                     len: 0,
@@ -1744,7 +1722,6 @@ mod tests {
         assert_eq!(out.0, b"abc");
         let mut empty = &mut [][..];
         let mut e = Enc {
-            include_content_bytes: false,
             sink: Sink::Write {
                 out: &mut empty,
                 len: 0,
