@@ -1129,8 +1129,6 @@ fn e2_side_call_key_reuse_is_exact_per_utc_hour() {
     }
 }
 
-/// Exercise T4's actual index walk and one metadata probe per twin. Only physical
-/// birth is injected, as in parse(); Linux has no portable set-creation-time API.
 #[test]
 fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
     use crate::snapshots::claude_request_census::{
@@ -1424,6 +1422,8 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// Exercise T4's actual index walk and one metadata probe per twin. Only physical
+/// birth is injected, as in parse(); Linux has no portable set-creation-time API.
 fn stage_twins(index: &mut ScanIndex, paths: &[(&Path, i128)]) {
     let mut page = crate::snapshots::claude_history_upgrade::HistoryPage::default();
     for (path, _) in paths {
