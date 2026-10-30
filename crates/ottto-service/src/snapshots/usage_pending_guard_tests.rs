@@ -529,6 +529,46 @@ fn phase1_held_member_growth_over_cap_takes_the_counted_resource_path() {
 }
 
 #[test]
+fn phase1_runtime_custody_survives_the_per_cycle_index_reload() {
+    let path = Path::new("/synthetic/e7-usage-guard-custody/index.json");
+    let mut index = ScanIndex::default();
+    index.usage_guard_adopt_custody(path);
+    index.usage_guard_pace_for_test(["/paced/key".to_string()]);
+    // Any projection install hands custody to the process owner.
+    index.refresh_usage_guard_holds_at(None);
+    let mut reloaded = ScanIndex::default();
+    reloaded.usage_guard_adopt_custody(path);
+    reloaded.usage_guard_mark_audited("/paced/key");
+    assert!(reloaded.usage_guard_audit_satisfied("/paced/key", 0));
+    // Another index file has its own custody.
+    let mut other = ScanIndex::default();
+    other.usage_guard_adopt_custody(Path::new("/synthetic/e7-usage-guard-custody/other.json"));
+    other.usage_guard_mark_audited("/paced/key");
+    assert!(!other.usage_guard_audit_satisfied("/paced/key", 0));
+}
+
+#[test]
+fn phase1_withheld_growth_over_cap_invalidates_instead_of_dropping_keys() {
+    let (mut index, root, items) = held_family_index();
+    let big = (0..usage_pending_guard::HELD_GROWTH_MAX_OCCURRENCES)
+        .map(|n| (format!("{n:064x}"), carry_occurrence(n as u64, 1)))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        index
+            .usage_guard_holds
+            .record_member_growth("other", "member-big", CARRY_RETRY, big),
+        usage_pending_guard::Growth::Recorded
+    );
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        index.usage_guard_record_withheld(&items[..1], CARRY_RETRY)
+    });
+    assert!(rows
+        .iter()
+        .any(|row| row["counts"]["withheld_full_invalidated_families"] == 1));
+    assert!(index.claude_usage_family_pending[&root].invalid);
+}
+
+#[test]
 fn phase1_withheld_full_needs_real_growth_and_is_paced_per_key() {
     let mut fixture = retry_durable_fixture(0, 1);
     let root = fixture.roots[0].clone();

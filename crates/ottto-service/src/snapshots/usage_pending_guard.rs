@@ -175,8 +175,25 @@ pub(super) struct Runtime {
     // Paced keys whose withheld Full completed: it satisfied every audit due
     // by its pace stamp. The committed entry keeps its audit obligation.
     audited: BTreeSet<String>,
+    // The loaded index file this custody belongs to, if any.
+    custody: Option<String>,
 }
-crate::heap_layout_bound::fields!(Runtime; slots, slot_occurrences, paced, withheld, audited);
+crate::heap_layout_bound::fields!(Runtime; slots, slot_occurrences, paced, withheld, audited, custody);
+
+/// The daemon reloads its ScanIndex every sync cycle, so runtime custody
+/// lives for the process, like the RAM checkpoint cache, keyed by index file.
+/// One entry per loaded Claude index; each entry is bounded as above.
+static CUSTODY: std::sync::Mutex<BTreeMap<String, Runtime>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+fn stash(runtime: &Runtime) {
+    if let Some(path) = &runtime.custody {
+        CUSTODY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.clone(), runtime.clone());
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Growth {
@@ -668,8 +685,23 @@ impl ScanIndex {
                 .map(|slot| slot.occurrences.len())
                 .sum();
         }
+        stash(&runtime);
         holds.runtime = runtime;
         self.usage_guard_holds = holds;
+    }
+    /// Take back this index file's process custody after a reload. A
+    /// withheld admission never outlives its candidate visit.
+    pub(super) fn usage_guard_adopt_custody(&mut self, path: &Path) {
+        let path = path.to_string_lossy().into_owned();
+        let mut runtime = CUSTODY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&path)
+            .cloned()
+            .unwrap_or_default();
+        runtime.withheld.clear();
+        runtime.custody = Some(path);
+        self.usage_guard_holds.runtime = runtime;
     }
     pub(super) fn refresh_usage_guard_after_native_completion(&mut self) {
         if self.usage_guard_holds.dirty {
@@ -825,6 +857,7 @@ impl ScanIndex {
         runtime.paced.insert(key.clone(), now);
         runtime.audited.remove(&key);
         runtime.withheld.insert(key);
+        stash(runtime);
         let mut counts = serde_json::Map::new();
         counts.insert("withheld_full".into(), json!(1));
         counts.insert(format!("withheld_full_{}", reason.label()), json!(1));
@@ -847,6 +880,7 @@ impl ScanIndex {
         let runtime = &mut self.usage_guard_holds.runtime;
         if runtime.paced.contains_key(key) {
             runtime.audited.insert(key.to_owned());
+            stash(runtime);
         }
     }
     pub(super) fn usage_guard_audit_satisfied(&self, key: &str, due_unix_seconds: u64) -> bool {
@@ -867,6 +901,10 @@ impl ScanIndex {
     /// growth slots; nothing reaches the page's published snapshots.
     pub(super) fn usage_guard_record_withheld(&mut self, items: &[SnapshotItem], window: &str) {
         let mut members = 0_u64;
+        // Families whose growth could not be kept lose those request keys:
+        // like the accumulator's cap path, their pending is invalidated so
+        // the duplicate census stays closed for them, never silently open.
+        let mut refused = BTreeSet::new();
         for item in items {
             let root = claude_snapshot_family_root(item);
             let Some(occurrences) = item_occurrences(item) else {
@@ -875,6 +913,7 @@ impl ScanIndex {
                     SnapshotSource::ClaudeCode.api_slug(),
                     &json!({"withheld_full_unrecordable":1}),
                 );
+                refused.insert(root);
                 continue;
             };
             if self.usage_guard_holds.record_member_growth(
@@ -885,12 +924,25 @@ impl ScanIndex {
             ) == Growth::Recorded
             {
                 members += 1;
+            } else {
+                refused.insert(root);
             }
         }
+        for root in &refused {
+            self.usage_guard_holds.take_member_growth(root, "");
+            if let Some(pending) = self.claude_usage_family_pending.get_mut(root) {
+                let mut retained = 0_usize;
+                invalidate_claude_usage_family_pending(pending, &mut retained);
+            }
+        }
+        if !refused.is_empty() {
+            self.usage_guard_holds.invalidate();
+        }
+        stash(&self.usage_guard_holds.runtime);
         crate::local_resource_diagnostics::traversal_point(
             "claude_usage_held_member_growth",
             SnapshotSource::ClaudeCode.api_slug(),
-            &json!({"held_member_growth_members":members}),
+            &json!({"held_member_growth_members":members,"withheld_full_invalidated_families":refused.len()}),
         );
     }
 }

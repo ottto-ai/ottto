@@ -29993,9 +29993,14 @@ impl OwnedSourceScan {
                 if source == SnapshotSource::ClaudeCode
                     && index.usage_guard_take_withheld(&local_index_key(&candidate.path))
                 {
-                    // Only a complete, loss-free parse is proof evidence or
-                    // an audit; anything else is counted and stays owed.
-                    if !parsed_file.complete() {
+                    // Only a certified, loss-free EOF read is proof evidence
+                    // or an audit: no grown prefix, no disclosed terminal
+                    // row loss. Anything else is counted and stays owed.
+                    if !parsed_file.complete()
+                        || claude_grown_prefix
+                        || completed_acquisition.is_none()
+                        || parsed_file.terminal_line_loss_count != 0
+                    {
                         usage_pending_guard::withheld_incomplete();
                         pending!();
                     }
@@ -47711,6 +47716,9 @@ impl ScanIndex {
         };
         let load_origin = ScanIndexLoadOrigin::from(&origin);
         index.settle_claude_index_load(path, load_origin);
+        if source == SnapshotSource::ClaudeCode {
+            index.usage_guard_adopt_custody(path);
+        }
         index.mint_or_reuse_codex_proof_incarnation(path, origin);
         if source == SnapshotSource::ClaudeCode
             && load_origin.is_fresh(&index)
