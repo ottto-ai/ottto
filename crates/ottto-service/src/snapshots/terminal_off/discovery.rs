@@ -745,6 +745,30 @@ pub(super) fn retry_blocked(index: &ScanIndex, key: &str) -> bool {
     })
 }
 
+/// A settlement-held key whose six-hour floor has expired: its custody is
+/// still unread, so it owes exactly one read (targeted re-offer, forced parse).
+pub(super) fn held_retry_due(index: &ScanIndex, key: &str) -> bool {
+    if !claude_terminal_off() {
+        return false;
+    }
+    let Some(scope) = terminal_off_rediscovery_scope(index) else {
+        return false;
+    };
+    let id = digest(key);
+    with_walks(|memo| {
+        let Some(now) = memo.get(&scope).map(|walk| walk.now) else {
+            return false;
+        };
+        memo.values().any(|walk| {
+            walk.observations.get(&id).is_some_and(|o| {
+                o.held_retry
+                    && o.served_at
+                        .is_some_and(|at| now >= at.saturating_add(6 * 3600))
+            })
+        })
+    })
+}
+
 /// Register the keys actually returned by local hold settlement. Querying or
 /// re-enqueueing never renews served_at; only an actual parse can do that.
 /// A fresh hold is still retried once; its held re-read starts the floor.

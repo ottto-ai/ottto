@@ -701,6 +701,34 @@ fn forget_terminal_off_held_context(key: &str) {
     }
 }
 
+// NBF custody: a settlement-held key whose six-hour floor expired is read once
+// even when nothing else selects it (unchanged, context settled); its own
+// settlement then holds or settles it. A floored held key is never left idle.
+fn terminal_off_held_retry_decision(
+    source: SnapshotSource,
+    index: &ScanIndex,
+    candidate: &CandidateFile,
+    audit_now: u64,
+) -> (CandidateDecision, Option<CandidateParseReason>) {
+    let decided = index.candidate_decision_with_reason_at(candidate, audit_now);
+    if source != SnapshotSource::ClaudeCode
+        || decided.0 != CandidateDecision::Skip
+        || !claude_terminal_off()
+        || !terminal_off_discovery::held_retry_due(index, &local_index_key(&candidate.path))
+    {
+        return decided;
+    }
+    crate::local_resource_diagnostics::traversal_point(
+        "terminal_off_held_retry_due_read",
+        SnapshotSource::ClaudeCode.api_slug(),
+        &BTreeMap::from([("keys", 1u64), ("bytes", 0)]),
+    );
+    (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::ActivityOrQuarantineRetry),
+    )
+}
+
 // Scheduling only: ordinary ScanIndex reloads must not reset the cadence.
 // Fixed-size hashed scopes retain no transcript/path strings. Eviction and a
 // process restart fail toward one metadata rewalk, never toward proof.

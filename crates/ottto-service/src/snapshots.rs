@@ -32298,7 +32298,7 @@ impl OwnedSourceScan {
                         CandidateDecision::Parse,
                         Some(CandidateParseReason::ForcedFamily),
                     ),
-                    None => index.candidate_decision_with_reason_at(&candidate, audit_now),
+                    None => terminal_off_held_retry_decision(source, index, &candidate, audit_now),
                 };
             let target_match = native_comparison
                 .as_ref()
