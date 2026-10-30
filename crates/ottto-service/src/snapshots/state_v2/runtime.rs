@@ -102,6 +102,9 @@ struct RouteState {
     page_limit: usize,
     requested_page: usize,
     save_hold: Option<Hold>,
+    // Page-one pressure names the last admitted file, never upload authority.
+    last_read: Option<(String, u64)>,
+    save_retry_completed: bool,
     pass_written_start: Option<u64>,
 }
 impl RouteState {
@@ -115,9 +118,16 @@ impl RouteState {
     fn saved_page(&mut self, over_target: bool, claim_only: bool) {
         // A small claim/CAS-only write cannot resolve an oversized collection
         // delta. Only a normal or local recovery save may lift its fence.
-        if !claim_only {
-            self.save_hold = None;
+        if claim_only {
+            return;
         }
+        // A cursor-only save after a paced skip cannot resolve the held file.
+        if self.save_hold == Some(Hold::SaveOversize) && !self.save_retry_completed {
+            return;
+        }
+        self.save_hold = None;
+        self.last_read = None;
+        self.save_retry_completed = false;
         if over_target {
             self.reduce_page();
         } else {
@@ -153,6 +163,8 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     page_limit: 250,
                     requested_page: 250,
                     save_hold: None,
+                    last_read: None,
+                    save_retry_completed: false,
                     pass_written_start: None,
                 }))
             })
@@ -654,7 +666,10 @@ fn save_with_mode<M: Mapper>(
     if let Err(error) = &result {
         with_state(path, |state| {
             state.cached = None;
-            if matches!(error.downcast_ref::<Hold>(), Some(Hold::SaveCeiling)) {
+            state.save_retry_completed = false;
+            if (!claim_only || state.save_hold != Some(Hold::SaveOversize))
+                && matches!(error.downcast_ref::<Hold>(), Some(Hold::SaveCeiling))
+            {
                 state.save_hold = Some(if state.page_limit == 1 {
                     telemetry::event("save_oversize_alarm", &1);
                     Hold::SaveOversize
@@ -662,7 +677,9 @@ fn save_with_mode<M: Mapper>(
                     state.reduce_page();
                     Hold::SaveCeiling
                 });
-            } else if matches!(error.downcast_ref::<Hold>(), Some(Hold::SaveFull)) {
+            } else if state.save_hold != Some(Hold::SaveOversize)
+                && matches!(error.downcast_ref::<Hold>(), Some(Hold::SaveFull))
+            {
                 state.save_hold = Some(Hold::SaveFull);
             }
             if let Some(runtime) = &state.current {
@@ -801,15 +818,75 @@ fn guard_current(
     }))
 }
 
-pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usize) -> usize {
+fn runtime_path(index: &ScanIndex) -> Result<Option<PathBuf>> {
     let Some(runtime) = &index.persistence_v2 else {
+        return Ok(None);
+    };
+    let guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+    Ok(Some(
+        guard.as_ref().ok_or(Hold::ReloadRequired)?.path.clone(),
+    ))
+}
+
+pub(in super::super) fn save_oversize_active(index: &ScanIndex) -> Result<bool> {
+    let Some(path) = runtime_path(index)? else {
+        return Ok(false);
+    };
+    with_state(&path, |state| {
+        Ok(state.save_hold == Some(Hold::SaveOversize))
+    })
+}
+
+/// Native completion can make a recovery delta safe without advancing an
+/// unACKed file entry. The subsequent successful normal save clears the hold.
+pub(in super::super) fn save_read_completed(index: &ScanIndex, key: &str) -> Result<()> {
+    let Some(path) = runtime_path(index)? else {
+        return Ok(());
+    };
+    with_state(&path, |state| {
+        if state.save_hold == Some(Hold::SaveOversize)
+            && state
+                .last_read
+                .as_ref()
+                .is_some_and(|(held, _)| held == key)
+        {
+            state.save_retry_completed = true;
+        }
+        Ok(())
+    })
+}
+
+/// Gate before transcript samples/reads. Keep the source fence: upload recovery
+/// and accepted progress are source-owned, so a per-file bypass is unsafe here.
+/// Only the page-one file may retry; growth_read_admitted then requires the
+/// existing durable growth Full claim before admitting its payload.
+pub(in super::super) fn save_read_admitted(index: &ScanIndex, key: &str, now: u64) -> Result<bool> {
+    let Some(path) = runtime_path(index)? else {
+        return Ok(true);
+    };
+    with_state(&path, |state| {
+        if state.save_hold == Some(Hold::SaveOversize)
+            && !state.last_read.as_ref().is_some_and(|(held, last)| {
+                held == key
+                    && now >= last.saturating_add(super::super::sampled_audit::GROWTH_FULL_INTERVAL)
+            })
+        {
+            // Unknown key means the delta was not a single file acquisition.
+            return Ok(false);
+        }
+        if state.page_limit == 1 {
+            state.last_read = Some((key.to_owned(), now));
+            state.save_retry_completed = false;
+        }
+        Ok(true)
+    })
+}
+
+pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usize) -> usize {
+    let Some(_) = &index.persistence_v2 else {
         return requested;
     };
-    let path = runtime
-        .session
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|s| s.path.clone()));
+    let path = runtime_path(index).ok().flatten();
     path.and_then(|p| {
         with_state(&p, |s| {
             s.requested_page = requested.max(1);

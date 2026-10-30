@@ -1921,37 +1921,20 @@ pub(super) fn queue_growth_retry(index: &mut ScanIndex, candidate: &CandidateFil
     );
 }
 
-/// Admission can precede this key's bounded reconciliation slot. Until that
-/// slot has revalidated it, its growth status is unknown; never release its
-/// old hashes merely because another file needs capacity first.
+/// Only witnessed growth debt excludes retirement. An undiscovered range or
+/// residue without a growth entry conveys no retention authority.
 pub(super) fn growth_excluded_parts(
     key: &str,
     growth: &BTreeMap<String, GrowthRetention>,
     walk: Option<&ScanTraversalCheckpoint>,
     terminal_residue: Option<&BTreeSet<String>>,
 ) -> bool {
-    growth
-        .get(key)
-        .is_some_and(|state| state.predecessor_size.is_some())
-        || walk.is_some_and(|walk| {
-            let residue = walk.residue.index_keys.contains(key)
-                || terminal_residue.is_some_and(|keys| keys.contains(key));
-            residue
-                && growth
-                    .get(key)
-                    .map_or(true, |state| state.checked_generation.is_none())
-                || walk
-                    .reconciliation_upper_bound
-                    .as_ref()
-                    .is_some_and(|upper| {
-                        key <= upper.as_str()
-                            && walk
-                                .reconciliation_after
-                                .as_ref()
-                                .map_or(true, |after| key > after.as_str())
-                    })
-        })
-        || walk.is_none() && terminal_residue.is_some_and(|keys| keys.contains(key))
+    growth.get(key).is_some_and(|state| {
+        state.predecessor_size.is_some()
+            || state.checked_generation.is_none()
+                && (walk.is_some_and(|walk| walk.residue.index_keys.contains(key))
+                    || terminal_residue.is_some_and(|keys| keys.contains(key)))
+    })
 }
 
 pub(super) fn growth_retirement_excluded(index: &ScanIndex, key: &str) -> bool {
@@ -1963,6 +1946,7 @@ pub(super) fn growth_retirement_excluded(index: &ScanIndex, key: &str) -> bool {
 /// audit retirement and delivery ACKs do not settle source growth.
 pub(super) fn settle_growth(index: &mut ScanIndex, key: &str) {
     if growth_active(index) {
+        let _ = state_v2::save_read_completed(index, key);
         if let Some(state) = index.growth_retention.get_mut(key) {
             state.predecessor_size = None;
             state.uncertain_passes = 0;
@@ -1992,15 +1976,22 @@ pub(super) fn growth_subset(
     debt
 }
 
-const GROWTH_FULL_INTERVAL: u64 = 6 * 60 * 60;
+pub(super) const GROWTH_FULL_INTERVAL: u64 = 6 * 60 * 60;
 
 pub(super) fn prune_growth_retention(index: &mut ScanIndex, now: u64) {
+    let before = index.growth_retention.len();
     index.growth_retention.retain(|key, state| {
         index.files.contains_key(key)
             || state
                 .last_growth_full_unix
                 .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
     });
+    let reclaimed = before - index.growth_retention.len();
+    if reclaimed > 0 && growth_active(index) {
+        crate::local_resource_diagnostics::claude_state_v2(&serde_json::json!({
+            "growth_claim_reclaimed": reclaimed
+        }));
+    }
 }
 
 /// A load lineage shares only the generation of its own claim-only commits.
@@ -2215,9 +2206,13 @@ pub(super) fn growth_read_admitted_at(
     if !growth_active(index) {
         return true;
     }
+    let oversize = match state_v2::save_oversize_active(index) {
+        Ok(held) => held,
+        Err(_) => return false,
+    };
     // A stale graph must not erase committed growth debt and bypass pacing.
     // Authenticate even rewrite Fulls before consulting working-page debt.
-    if index.persistence_v2.is_some() && matches!(mode, ReadMode::Full(_)) {
+    if index.persistence_v2.is_some() && (oversize || matches!(mode, ReadMode::Full(_))) {
         let valid = (|| -> Result<()> {
             let path = &index
                 .growth_claim_context
@@ -2233,7 +2228,8 @@ pub(super) fn growth_read_admitted_at(
         }
     }
     let held = index.decode_holds.contains("growth_retention", &key);
-    if !held
+    if !oversize
+        && !held
         && !index
             .growth_retention
             .get(&key)
@@ -2241,16 +2237,25 @@ pub(super) fn growth_read_admitted_at(
     {
         return true;
     }
-    if matches!(
-        mode,
-        ReadMode::Full(
-            FullReason::StateMissing
-                | FullReason::InvalidCheckpoint
-                | FullReason::UnsupportedIdentity
+    if oversize
+        || matches!(
+            mode,
+            ReadMode::Full(
+                FullReason::StateMissing
+                    | FullReason::InvalidCheckpoint
+                    | FullReason::UnsupportedIdentity
+            )
         )
-    ) {
+    {
         return match claim_growth_full(index, &key, now) {
-            Ok(admitted) => admitted,
+            Ok(admitted) => {
+                if oversize && admitted {
+                    crate::local_resource_diagnostics::claude_state_v2(&serde_json::json!({
+                        "save_oversize_growth_full": 1
+                    }));
+                }
+                admitted
+            }
             Err(_) => {
                 if index.persistence_v2.is_some() {
                     state_v2::growth_claim_refused("publication");
