@@ -30875,6 +30875,22 @@ impl OwnedSourceScan {
                                     || recognized_usage_drop_count > 0
                                     || report.over_line_cap_count > 0,
                                 source_verified,
+                                // Unchanged already checked physical identity and
+                                // acquisition scope against the prior checkpoint.
+                                // Keep census authority separate from Full credit.
+                                unchanged_source: cursor_fragment.is_none()
+                                    && file_sampling.as_ref().is_some_and(|active| {
+                                        active.mode
+                                            == crate::transcript_acquisition::ReadMode::Unchanged
+                                    })
+                                    && completed_acquisition.as_ref().is_some_and(|completed| {
+                                        completed.checkpoint.audit_debt().is_none()
+                                    })
+                                    && sampled_jsonl::loss_free_source_report(
+                                        &report,
+                                        recognized_usage_drop_count,
+                                        dropped_usage_record_count,
+                                    ),
                                 itemless_request_hashes: claude_itemless_request_hashes,
                                 opened_birth: claude_opened_birth,
                                 modified_unix_seconds: candidate.modified_unix_seconds,
