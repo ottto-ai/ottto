@@ -1999,20 +1999,14 @@ mod tests {
                 raw.push_str("\r\n");
                 raw
             },
-            {
-                let raw = format!(
-                    "POST /v1/logs HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
-                    MAX_OTLP_BODY_BYTES + 1
-                );
-                raw
-            },
-            {
-                let raw = format!(
-                    "POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
-                    MAX_OTLP_BODY_BYTES + 1
-                );
-                raw
-            },
+            format!(
+                "POST /v1/logs HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                MAX_OTLP_BODY_BYTES + 1
+            ),
+            format!(
+                "POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                MAX_OTLP_BODY_BYTES + 1
+            ),
             {
                 let mut raw =
                     String::from("POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
