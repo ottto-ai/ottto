@@ -909,14 +909,18 @@ fn e2_bound_trace_case(mode: &str, split_logins: bool, external: bool, accepted_
         }
     }
     // Settle the sidecar; the next page must use B despite the retained A.
-    e2_write_rows(&support, "local-otel/claude-code-trace-ownership", &root, &trace);
-    let (recovered, _, stats) =
-        e2_bound_trace_page(&dir, &support, &root, &mut index, false, accepted);
-    e2_bound_trace_assert_logins(&recovered, &root, Some("b".repeat(64)), Some(child_login));
-    assert_eq!(e2_bound_trace_totals(&recovered), totals, "the deferred usage is not dropped");
-    assert_eq!(stats.trace_discard_no_fallback_requests, 0);
-    assert_eq!(stats.trace_discard_deferred_items, 0);
-    assert!(stats.trace_rows_discarded.is_empty());
+    // Only a discard owes this recovery. The malformed control stops at
+    // main's unhealthy page: re-selection after its repair is main's scanner.
+    if discarded {
+        e2_write_rows(&support, "local-otel/claude-code-trace-ownership", &root, &trace);
+        let (recovered, _, stats) =
+            e2_bound_trace_page(&dir, &support, &root, &mut index, false, accepted);
+        e2_bound_trace_assert_logins(&recovered, &root, Some("b".repeat(64)), Some(child_login));
+        assert_eq!(e2_bound_trace_totals(&recovered), totals, "the deferred usage is not dropped");
+        assert_eq!(stats.trace_discard_no_fallback_requests, 0);
+        assert_eq!(stats.trace_discard_deferred_items, 0);
+        assert!(stats.trace_rows_discarded.is_empty());
+    }
     fs::remove_dir_all(dir).unwrap();
 }
 
