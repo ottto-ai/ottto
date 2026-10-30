@@ -241,9 +241,10 @@ impl Sqlite {
         self.stats.erasure_overdue = overdue;
         let last = self.read_control::<u64>("erasure_attempt")?;
         let wall_due = last.map_or(true, |last| {
-            now.checked_sub(last).map_or(true, |age| {
-                Duration::from_secs(age) >= self.purge_policy.deadline
-            })
+            // A clock rollback cannot establish elapsed cooldown across a
+            // restart. Keep the obligation/overdue alarm instead of retrying.
+            now.checked_sub(last)
+                .is_some_and(|age| Duration::from_secs(age) >= self.purge_policy.deadline)
         });
         let monotonic_due = self
             .last_purge_attempt

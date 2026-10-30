@@ -38,6 +38,9 @@ WAL checkpoint debt. Each VACUUM attempt is paced across restart to at most once
 per deadline window. Failed or incomplete maintenance retains the obligation;
 overdue obligations alarm and refuse further writes until resolved. A completed
 data commit remains completed if later maintenance fails.
+When the clock is behind the persisted last attempt, maintenance cannot prove
+that its cooldown elapsed. It defers VACUUM and retains any overdue alarm across
+restart until the clock or explicit repair resolves the uncertainty.
 
 Admission requires available space of at least twice the larger of the main
 file length and the logical database size, including pages still in WAL.
@@ -53,6 +56,8 @@ verified completion. It excludes retained read-only v1 baselines, temporary-file
 remnants, APFS snapshots and physical SSD erasure. Baseline lifetime requires a
 separate retention policy. No application deletion or money-debt retirement is
 authorized merely by this storage maintenance.
+
+## Active reader behavior
 
 This is the reader component. It reads legacy logical-schema-2 JSON and storage
 format 1, and always writes legacy JSON with the existing semantic serializer.

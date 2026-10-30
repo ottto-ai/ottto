@@ -1205,3 +1205,92 @@ fn f6_restart_between_vacuum_and_metadata_clear_keeps_pending_debt() {
     db.maintenance(true).unwrap();
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
 }
+
+#[test]
+fn f8_corrupted_refcount_cannot_reclaim_evidence_or_commit_sibling_changes() {
+    use interning::{
+        intern_request_set, intern_string, release_request_set, release_string, RequestEvidence,
+        Vocabulary,
+    };
+    for string in [true, false] {
+        let tmp = Scratch::new();
+        let mut db = tmp.live_store();
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        let key = if string {
+            let text = "x".repeat(PART_BYTES + 31);
+            let id = intern_string(&mut tx, Vocabulary::Model, &text).unwrap();
+            assert_eq!(
+                intern_string(&mut tx, Vocabulary::Model, &text).unwrap(),
+                id
+            );
+            RowKey::Interned {
+                kind: 1,
+                ordinal: id,
+            }
+        } else {
+            let payload = Repeat(PART_BYTES as u64 + 31);
+            let evidence = RequestEvidence::Census {
+                hashes: &payload,
+                hash_count: None,
+            };
+            let id = intern_request_set(&mut tx, &evidence).unwrap();
+            assert_eq!(intern_request_set(&mut tx, &evidence).unwrap(), id);
+            RowKey::RequestSet(id)
+        };
+        let before = tx.get(&key).unwrap().unwrap();
+        assert!(matches!(
+            before.fixed,
+            Fixed::Interned { refs: 2 } | Fixed::RequestSet { refs: 2, .. }
+        ));
+        assert!(before.parts > 0);
+        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+        let parts = sqlite::part_count_for_test(&db);
+        sqlite::damage_refs_for_test(&db, &key);
+        let sibling = RowKey::Meta("sibling".into());
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        put(&mut tx, &sibling, b"must roll back");
+        let release = match key {
+            RowKey::Interned { ordinal, .. } => release_string(&mut tx, Vocabulary::Model, ordinal),
+            RowKey::RequestSet(id) => release_request_set(&mut tx, id),
+            _ => unreachable!(),
+        };
+        assert!(
+            release.is_err(),
+            "corrupted fixed columns cannot authorize reclamation"
+        );
+        assert_eq!(tx.commit(1, 2), DurableCommitOutcome::NotPublished);
+        assert_eq!(sqlite::part_count_for_test(&db), parts);
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        assert!(tx.get(&sibling).unwrap().is_none());
+        let retained = tx.get(&key).unwrap().unwrap();
+        assert_eq!(retained.parts, before.parts);
+        assert!(tx.read_value(&retained, &mut std::io::sink()).is_err());
+    }
+}
+
+#[test]
+fn f6_backward_clock_does_not_grant_a_restart_purge_attempt() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = RowKey::Meta("private".into());
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"old");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    tx.delete(&key).unwrap();
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    db.control("erasure_since", &(now - 86401)).unwrap();
+    db.control("erasure_attempt", &(now + 3600)).unwrap();
+    assert!(db.maintenance(true).is_err());
+    let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
+    assert_eq!(stats["vacuum_attempts"], 0);
+    assert_eq!(stats["erasure_overdue"], true);
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    drop(db);
+    assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_err());
+}

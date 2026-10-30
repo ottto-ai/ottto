@@ -1484,3 +1484,30 @@ pub(super) fn schema_for_test(db: &Sqlite) -> (SchemaFacts, bool) {
     let unique: bool = conn.query_row("SELECT \"unique\" FROM pragma_index_list('request_sets') WHERE name='request_sets_commitment'", [], |r| r.get(0)).unwrap();
     (facts, unique)
 }
+
+#[cfg(test)]
+pub(super) fn damage_refs_for_test(db: &Sqlite, key: &RowKey) {
+    assert!(matches!(
+        key,
+        RowKey::RequestSet(_) | RowKey::Interned { .. }
+    ));
+    let table = key.table();
+    db.conn()
+        .unwrap()
+        .execute(
+            &format!(
+                "UPDATE {} SET refs=1 WHERE {}",
+                table.name(),
+                predicate(table)
+            ),
+            params_from_iter(key.values().unwrap()),
+        )
+        .unwrap();
+}
+#[cfg(test)]
+pub(super) fn part_count_for_test(db: &Sqlite) -> u64 {
+    db.conn()
+        .unwrap()
+        .query_row("SELECT count(*) FROM blob_parts", [], |r| r.get(0))
+        .unwrap()
+}

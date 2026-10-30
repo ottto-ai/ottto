@@ -133,6 +133,12 @@ pub(super) fn adjust(tx: &mut Txn<'_>, key: &RowKey, delta: i64) -> Result<u64> 
             .checked_add(i128::from(delta))
             .filter(|n| *n >= 0 && *n <= i128::from(i64::MAX))
             .context("state_v2_reference_count")? as u64;
+        if next == 0 || delta == 0 {
+            // Fixed columns are integrity-protected by the value digest too.
+            // A corrupted refs=1 must never authorize last-owner reclamation.
+            // Nonzero updates below validate while computing the new digest.
+            read_value(tx.store.conn()?, &old, &mut io::sink())?;
+        }
         if next == 0 {
             tx.delete(key)?;
         } else if delta != 0 {
