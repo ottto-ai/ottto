@@ -690,42 +690,74 @@ fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
     );
 }
 
+/// Every source binds the ledger each cycle. The reread copy has no key, and a
+/// rebind that discarded hints is unsaved until the next ACK page.
 #[test]
 fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
+    let hint = serde_json::json!({
+        "source_session_id": "synthetic",
+        "provenance": {"collector": crate::snapshots::claude_request_identity::COLLECTOR},
+        "request_evidence": [{"identity_basis": "telemetry_login"}],
+        "usage_buckets": [{"bucket_start": "2026-09-01T10:00:00Z", "model_usage": [
+            {"model": "claude-synthetic", "evidence_ref": 0, "account_identifier_hash": "a".repeat(64)}
+        ]}],
+    });
+    let cases: [(&str, Option<[u8; 32]>, bool, Option<Option<[u8; 32]>>); 4] = [
+        ("bound with a saved hint", Some([0x42; 32]), true, None),
+        ("bound with no hints", Some([0x42; 32]), false, None),
+        (
+            "rotated key, unsaved",
+            Some([0x41; 32]),
+            true,
+            Some(Some([0x42; 32])),
+        ),
+        (
+            "no key this cycle, unsaved",
+            Some([0x41; 32]),
+            true,
+            Some(None),
+        ),
+    ];
+    let mut refused = Vec::new();
     for cause in [
         UnsettledUploadCause::Shed,
         UnsettledUploadCause::UploadError,
     ] {
-        let f = AckFixture::new(true);
-        let (index, mut progress) = f.load();
-        let ledger = &mut progress.accepted_identity_buckets;
-        ledger.bind_test_key(Some([0x42; 32]));
-        ledger.record(&serde_json::json!({
-            "source_session_id": "synthetic",
-            "provenance": {"collector": crate::snapshots::claude_request_identity::COLLECTOR},
-            "request_evidence": [{"identity_basis": "telemetry_login"}],
-            "usage_buckets": [{"bucket_start": "2026-09-01T10:00:00Z", "model_usage": [
-                {"model": "claude-synthetic", "evidence_ref": 0, "account_identifier_hash": "a".repeat(64)}
-            ]}],
-        }));
-        assert!(!progress.accepted_identity_buckets.is_empty());
-        progress.save(&f.progress_path).unwrap();
-        checkpoint_partial_snapshot_index_with_comparison(
-            &index,
-            &index,
-            &progress,
-            std::slice::from_ref(&f.item),
-            None,
-            &BTreeSet::new(),
-            &f.index_path,
-            &f.progress_path,
-            || Ok(()),
-            None,
-            None,
-            Some(cause),
-        )
-        .unwrap_or_else(|error| panic!("{cause:?} partial checkpoint refused: {error:#}"));
+        for (case, saved_key, record, rebind) in cases {
+            let f = AckFixture::new(true);
+            let (index, mut progress) = f.load();
+            progress.accepted_identity_buckets.bind_test_key(saved_key);
+            if record {
+                progress.accepted_identity_buckets.record(&hint);
+                assert!(!progress.accepted_identity_buckets.is_empty(), "{case}");
+            }
+            progress.save(&f.progress_path).unwrap();
+            if let Some(key) = rebind {
+                progress.accepted_identity_buckets.bind_test_key(key);
+                assert!(progress.accepted_identity_buckets.is_empty(), "{case}");
+            }
+            if let Err(error) = checkpoint_partial_snapshot_index_with_comparison(
+                &index,
+                &index,
+                &progress,
+                std::slice::from_ref(&f.item),
+                None,
+                &BTreeSet::new(),
+                &f.index_path,
+                &f.progress_path,
+                || Ok(()),
+                None,
+                None,
+                Some(cause),
+            ) {
+                refused.push(format!("{cause:?}, {case}: {error:#}"));
+            }
+        }
     }
+    assert!(
+        refused.is_empty(),
+        "partial checkpoints refused: {refused:#?}"
+    );
 }
 
 #[test]
