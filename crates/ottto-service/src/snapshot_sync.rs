@@ -3095,6 +3095,11 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     cause: Option<UnsettledUploadCause>,
     audit_release: Option<AccountAuditRelease<'_>>,
 ) -> Result<ScanIndex> {
+    let proof_body_drains = if crate::snapshots::claude_terminal_off() {
+        index.claude_proof_body_drains(committed_index)
+    } else {
+        Vec::new()
+    };
     let _lock = SnapshotProgressLock::acquire(progress_path)?;
     let mut durable: SnapshotUploadProgress = match match read_limit {
         Some(cap) => crate::snapshot_retry::read_state(progress_path, cap),
@@ -3215,6 +3220,9 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         &progress.fresh_context_body_acks,
     );
     validate_destination()?;
+    if crate::snapshots::claude_terminal_off() {
+        committable.restore_unselected_claude_proof_body_drains(committed_index, proof_body_drains);
+    }
     if let Some(cap) = read_limit {
         committable.save_with_read_limit(index_path, cap)?;
     } else {
@@ -7795,6 +7803,11 @@ fn finish_sync_source(
         );
     }
 
+    let proof_body_drains = if crate::snapshots::claude_terminal_off() {
+        index.claude_proof_body_drains(&committed_index)
+    } else {
+        Vec::new()
+    };
     index.log_claude_proof_correction_debt();
 
     // The server may have accepted new entities even when the final result is a
@@ -8243,6 +8256,11 @@ fn finish_sync_source(
         &upload_progress.context_receipt_candidates,
         &upload_progress.fresh_context_body_acks,
     );
+    // Reconcile after all file/context restores, while the prior index is
+    // still owned here; its early-retirement memory boundary stays intact.
+    if crate::snapshots::claude_terminal_off() {
+        index.restore_unselected_claude_proof_body_drains(&committed_index, proof_body_drains);
+    }
     let retire_prior_index = source == SnapshotSource::ClaudeCode && !comparison_current;
     #[cfg(test)]
     let retire_prior_index = retire_prior_index

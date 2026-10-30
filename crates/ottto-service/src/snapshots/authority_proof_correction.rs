@@ -1,3 +1,14 @@
+// Page-local body drains, reconciled after the final selected-state restore.
+// No serialized state; only the ON save boundaries use this evidence.
+#[derive(Debug)]
+pub(crate) struct ClaudeProofBodyDrain {
+    root: String,
+    member: String,
+    key: String,
+    revision: String,
+    fingerprints: BTreeSet<String>,
+}
+
 #[derive(Debug)]
 struct ClaudeEmptyMapAdvance {
     root: String,
@@ -407,6 +418,134 @@ impl ScanIndex {
                             .member_source_file_fingerprints
                             .remove(&advance.member);
                     }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn claude_proof_body_drains(
+        &self,
+        previous: &ScanIndex,
+    ) -> Vec<ClaudeProofBodyDrain> {
+        if !claude_terminal_off() || !previous.claude_authority_proof_correction_pending() {
+            return Vec::new();
+        }
+        self.file_snapshot_fingerprints
+            .iter()
+            .filter_map(|(key, fingerprints)| {
+                if fingerprints.is_empty() {
+                    return None; // Empty drains and absent-member retirements have their own seams.
+                }
+                let (root, member) = claude_index_path_family_member(Path::new(key))?;
+                let old = previous.claude_usage_authority_quarantine.get(&root)?;
+                let correction = old.proof_correction.as_ref()?;
+                if !correction.owed_member_ids.contains(&member) {
+                    return None;
+                }
+                if let Some(current) = self.claude_usage_authority_quarantine.get(&root) {
+                    let current = current.proof_correction.as_ref()?;
+                    if current.proof_witness_fingerprint != correction.proof_witness_fingerprint
+                        || current.owed_member_ids.contains(&member)
+                    {
+                        return None; // A failure or regrant is not a drain of the old proof.
+                    }
+                }
+                Some(ClaudeProofBodyDrain {
+                    root,
+                    member,
+                    key: key.clone(),
+                    revision: self.files.get(key)?.source_file_fingerprint.clone(),
+                    fingerprints: fingerprints.clone(),
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn restore_unselected_claude_proof_body_drains(
+        &mut self,
+        previous: &ScanIndex,
+        drains: Vec<ClaudeProofBodyDrain>,
+    ) {
+        if !claude_terminal_off() {
+            return;
+        }
+        // Group the captures so a last-member clear can retain the revisions
+        // of carried siblings while re-owing only the unselected members.
+        let mut families = BTreeMap::<String, Vec<ClaudeProofBodyDrain>>::new();
+        for drain in drains {
+            families.entry(drain.root.clone()).or_default().push(drain);
+        }
+        for (root, drains) in families {
+            let Some(old) = previous.claude_usage_authority_quarantine.get(&root) else {
+                continue;
+            };
+            let Some(old_correction) = old.proof_correction.as_ref() else {
+                continue;
+            };
+            let mut restored = match self.claude_usage_authority_quarantine.get(&root) {
+                Some(record) => {
+                    if record.proof_correction.as_ref().is_none_or(|correction| {
+                        correction.proof_witness_fingerprint
+                            != old_correction.proof_witness_fingerprint
+                    }) {
+                        continue;
+                    }
+                    record.clone()
+                }
+                None => {
+                    // A clear leaves the witness intact. Never resurrect a
+                    // correction after the proof itself changed or disappeared.
+                    if !self
+                        .claude_usage_family_witnesses
+                        .get(&root)
+                        .is_some_and(|witness| {
+                            claude_usage_authority_preserves_pending(old, witness)
+                        })
+                    {
+                        continue;
+                    }
+                    let mut record = old.clone();
+                    record
+                        .proof_correction
+                        .as_mut()
+                        .unwrap()
+                        .owed_member_ids
+                        .clear();
+                    record
+                }
+            };
+            let mut reverted = false;
+            for drain in drains {
+                let carried = self
+                    .files
+                    .get(&drain.key)
+                    .is_some_and(|entry| entry.source_file_fingerprint == drain.revision)
+                    && self.file_snapshot_fingerprints.get(&drain.key) == Some(&drain.fingerprints);
+                if carried {
+                    restored
+                        .member_source_file_fingerprints
+                        .insert(drain.member, drain.revision);
+                } else {
+                    restored
+                        .proof_correction
+                        .as_mut()
+                        .unwrap()
+                        .owed_member_ids
+                        .insert(drain.member.clone());
+                    restored.member_source_file_fingerprints.insert(
+                        drain.member.clone(),
+                        old.member_source_file_fingerprints[&drain.member].clone(),
+                    );
+                    reverted = true;
+                }
+            }
+            if reverted {
+                self.claude_usage_authority_quarantine
+                    .insert(root.clone(), restored);
+                if let Some(pending) = previous.claude_usage_family_pending.get(&root) {
+                    self.claude_usage_family_pending
+                        .entry(root)
+                        .or_insert_with(|| pending.clone());
                 }
             }
         }
