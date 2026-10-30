@@ -880,6 +880,7 @@ fn ordinary_durable_continuation_to_eof(
         false,
         &namespace,
         false,
+        true,
     );
     crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
         let mut ordinary = OwnedSourceScan::new(

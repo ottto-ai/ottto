@@ -203,6 +203,10 @@ pub(crate) fn verify_durable_body(
         && (source.properties().verify)(body).is_ok()
 }
 #[cfg(all(test, unix))]
+pub(crate) fn durable_store_fixture_body_with_skill() -> Vec<u8> {
+    sampled_jsonl::durable::store_skill_fixture_body()
+}
+#[cfg(all(test, unix))]
 pub(crate) fn durable_store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -> Vec<u8> {
     sampled_jsonl::durable::store_fixture_body(source, count, sum)
 }
@@ -3215,6 +3219,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for CodexSidePass {
 /// to an index that no longer exists. Removal needs the state-directory
 /// lock; selecting the store and restoring from it need none.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)] // Cycle-owned privacy permission travels with the existing pass inputs.
 pub(crate) fn begin_durable_pass(
     cache: &sampled_scan::SharedCache,
     support_dir: &Path,
@@ -3223,8 +3228,10 @@ pub(crate) fn begin_durable_pass(
     index_fresh: bool,
     namespace: &crate::transcript_acquisition::Scope,
     identity_capture: bool,
+    skill_labels_enabled: bool,
 ) {
     cache.durable_begin_pass(source, index_path, namespace, identity_capture);
+    cache.durable_skill_label_permission(source, skill_labels_enabled);
     if index_fresh {
         if let Some(writer) = crate::locked_state_dir::held_for(support_dir) {
             let _ = cache.durable_remove(writer, source);
@@ -19527,8 +19534,21 @@ impl SnapshotAccumulator {
                 && !skills.iter().any(|seen| seen.eq_ignore_ascii_case(&name))
             {
                 skills.insert(name);
+            } else if !skills.iter().any(|seen| seen.eq_ignore_ascii_case(&name)) {
+                crate::local_resource_diagnostics::skill_label_native_dropped(
+                    self.source.api_slug(),
+                    "activity",
+                    "capacity",
+                );
             }
         });
+        if !named_all {
+            crate::local_resource_diagnostics::skill_label_native_dropped(
+                self.source.api_slug(),
+                "activity",
+                "invalid_signal",
+            );
+        }
         self.skill_detector_incomplete |= !named_all;
     }
 
@@ -20138,6 +20158,16 @@ impl SnapshotAccumulator {
             && self.provider_skills.len() <= crate::session_attribution::MAX_SKILL_FACTS
         {
             self.provider_skills.insert(normalized);
+        } else if !self.provider_skills.contains(&normalized) {
+            crate::local_resource_diagnostics::skill_label_native_dropped(
+                self.source.api_slug(),
+                "provider",
+                if normalized.is_empty() || normalized.len() > 128 {
+                    "invalid_signal"
+                } else {
+                    "capacity"
+                },
+            );
         }
     }
 
@@ -95534,7 +95564,7 @@ crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
     N title_source: Option<String>,
     X first_prompt_title: Option<String>,
     X first_prompt_material: Option<String>,
-    E provider_skills: BTreeSet<String>,
+    PL provider_skills: BTreeSet<String>,
     N started_at: Option<String>,
     N ended_at: Option<String>,
     N last_activity_at: Option<String>,
@@ -95621,7 +95651,7 @@ crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
     L activity_mcp_call_ids: BTreeMap<String, bool>,
     U activity_capability_buckets: BTreeMap<(String, String, String), u64>,
     L seen_claude_capability_tool_uses: crate::owned_heap::OwnedMap<String, ()>,
-    E activity_skills: BTreeSet<String>,
+    PL activity_skills: BTreeSet<String>,
     N skill_detector_incomplete: bool,
     H activity_changed_file_hashes: BTreeSet<String>,
     N activity_patch_operations: u64,

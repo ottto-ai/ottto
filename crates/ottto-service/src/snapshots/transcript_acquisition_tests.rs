@@ -4790,6 +4790,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
             true,
             &namespace,
             identity_capture,
+            true,
         );
         assert_eq!(
             fs::read(&record_path).unwrap(),
@@ -5055,6 +5056,7 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
             true,
             &namespace,
             identity_capture,
+            true,
         );
         assert_eq!(
             fs::read(&record_path).unwrap(),
@@ -5306,6 +5308,7 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
                 true,
                 &namespace,
                 true, // Match production_scan's cfg(test) identity capture.
+                true,
             );
             assert_eq!(
                 fs::read(&record_path).unwrap(),

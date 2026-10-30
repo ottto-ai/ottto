@@ -702,6 +702,13 @@ const RECEIPT_RECONCILE_FAILURES: u8 = 3;
 // A memo entry stays within the 128 bytes per record `STORES_RESIDENT_BOUND` charges.
 const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp, bool))>() <= 128);
 
+/// Counts erasures and unadjudicated records in one privacy pass. No receipt
+/// or per-key state escapes the store; partial progress is always reported.
+pub(crate) struct PrivateLabelPurge {
+    pub(crate) erased: u64,
+    pub(crate) refused: u64,
+}
+
 impl DurableTailStore {
     pub(crate) fn new(dir: PathBuf, source: DurableSource) -> Self {
         Self {
@@ -2117,6 +2124,96 @@ impl DurableTailStore {
             }
         }
         Ok(keys)
+    }
+
+    /// Explicit privacy erasure after the owning cycle's index save. Only
+    /// fully verified records of the current representation are inspected;
+    /// unknown/future records retain their existing protection. This is not
+    /// overwrite authority, a receipt, or settlement of acquisition debt.
+    /// Compact pending receipt metadata stays owed if its record is erased.
+    pub(crate) fn purge_private_labels<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        mut contains: impl FnMut(&[u8]) -> bool,
+    ) -> io::Result<PrivateLabelPurge> {
+        self.check_writer(writer)?;
+        if !self.usable(Some(writer)) {
+            return Err(io::Error::other("privacy erasure store unavailable"));
+        }
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok(PrivateLabelPurge {
+                    erased: 0,
+                    refused: 0,
+                })
+            }
+            Err(e) => return Err(e),
+        };
+        let mut report = PrivateLabelPurge {
+            erased: 0,
+            refused: 0,
+        };
+        // Stream names, holding at most one existing bounded record body.
+        // Consent erasure covers every known record, even after a bad entry.
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    report.refused += 1;
+                    continue;
+                }
+            };
+            let name = entry.file_name();
+            let Some(key) = name
+                .to_str()
+                .and_then(|s| s.strip_suffix(RECORD_SUFFIX))
+                .and_then(parse_hex_digest)
+            else {
+                continue;
+            };
+            let path = self.record_path(&key);
+            let before = match stamp_at(&path) {
+                Ok(stamp) => stamp,
+                Err(_) => {
+                    report.refused += 1;
+                    continue;
+                }
+            };
+            let verified = match self.read_known(&key, Some(writer)) {
+                Ok(Some(verified)) => verified,
+                Ok(None) => continue,
+                Err(Refusal::Unknown | Refusal::NewerFormat) => continue,
+                Err(_) => {
+                    report.refused += 1;
+                    continue;
+                }
+            };
+            if !contains(&verified.record.record.body) {
+                continue;
+            }
+            if before.is_none() || stamp_at(&path).ok() != Some(before) {
+                report.refused += 1;
+                continue;
+            }
+            if remove_if_present(&path).is_err() {
+                report.refused += 1;
+                continue;
+            }
+            // Erasure revokes an undelivered retained completion, not the
+            // candidate's owed work. Reconciliation must subsequently prove
+            // synced absence and return Retired, never deliver that receipt.
+            if let Some(pending) = self.pending.get_mut(&key) {
+                pending.completed = None;
+            }
+            self.durable.remove(&key);
+            report.erased += 1;
+        }
+        // Also sync an empty retry after an earlier failed erasure sync.
+        if self.sync_store().is_err() {
+            report.refused += 1;
+        }
+        Ok(report)
     }
 
     /// Deletes the records of `keys` (held or reverted selections): a stale

@@ -1,6 +1,6 @@
 //! Exact released envelope decoders, test-only. No modern v3 parser is
-//! relabelled as an old reader. The shared unchanged typed body verifier is
-//! the old v202 call target; newer-format refusal precedes that call.
+//! relabelled as an old reader. The old envelope dispatch and pins are frozen:
+//! newer-format or PL allowlist refusal precedes the shared body verifier.
 use super::*;
 
 mod v201 {
@@ -332,18 +332,23 @@ mod v202 {
     pub(super) fn refuses_new_record(bytes: &[u8], allowlist: &Digest32) -> bool {
         matches!(decode(bytes, allowlist), Err(Refusal::NewerFormat))
     }
-    pub(super) fn assert_original_v1(
-        bytes: &[u8],
-        expected: &super::super::PendingRecord,
-        generation: u64,
-    ) {
-        let record = decode(bytes, &expected.allowlist)
-            .unwrap_or_else(|e| panic!("released v1 control: {e:?}"));
-        assert_eq!(record.record.binding, expected.binding);
-        assert_eq!(record.record.certificate, expected.certificate);
-        assert_eq!(record.record.body, expected.body);
-        assert_eq!(record.record.allowlist, expected.allowlist);
-        assert_eq!(record.index_generation, generation);
+    pub(super) fn assert_repin_refused(bytes: &[u8], allowlist: &Digest32) {
+        match decode(bytes, allowlist) {
+            Err(Refusal::Unknown) => {}
+            Ok(record) => {
+                // Consume every frozen-decoder output field without exposing
+                // its values; acceptance itself is the regression.
+                let _ = (
+                    record.record.binding,
+                    record.record.certificate,
+                    record.record.body,
+                    record.record.allowlist,
+                    record.index_generation,
+                );
+                panic!("released reader accepted the PL re-pin");
+            }
+            Err(reason) => panic!("expected PL allowlist refusal, got {reason:?}"),
+        }
     }
 }
 
@@ -354,7 +359,7 @@ pub(super) fn assert_old_readers_refuse_native_v3(
 ) {
     let v1 = super::tests::pinned_v1_bytes(original, generation);
     v201::assert_original_v1(&v1, original, generation);
-    v202::assert_original_v1(&v1, original, generation);
+    v202::assert_repin_refused(&v1, &original.allowlist);
     assert!(v201::refuses_new_record(bytes, &original.allowlist));
     assert!(v202::refuses_new_record(bytes, &original.allowlist));
 }

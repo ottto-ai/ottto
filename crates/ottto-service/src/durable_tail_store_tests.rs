@@ -10,7 +10,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 /// Real compiled v1 body/allowlist; arbitrary test-only representations are U.
 pub(super) fn placeholder_allowlist() -> Digest32 {
-    parse_hex_digest("8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c").unwrap()
+    parse_hex_digest("95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2").unwrap()
 }
 pub(super) fn placeholder_body(count: u64, sum: u64) -> Vec<u8> {
     crate::snapshots::durable_store_fixture_body(
@@ -2726,10 +2726,7 @@ fn pinned_v1_scope_replay_and_header_goldens() {
         assert_eq!(&encode(&DurableRecord {
         wire: None,
         envelope_audit_debt: None,record: pending.clone(), index_generation: 9, format: 1})[..HEADER_BYTES], golden);
-        let decoded = decode_header(&golden, &[1; 32], source).unwrap();
-        assert_eq!(decoded.record.binding, pending.binding);
-        assert_eq!(decoded.generation, 9);
-        assert_eq!(decoded.record.certificate.audit_debt_unix_seconds, None);
+        assert!(matches!(decode_header(&golden, &[1; 32], source), Err(Refusal::Unknown)), "the single PL switch-over refuses the historical allowlist");
     }
 }
 
@@ -3520,8 +3517,14 @@ fn full_v1_writer_goldens_preserve_zero_and_nonzero_debt() {
         let scratch = Scratch::new();
         let lock = LockedStateDir::acquire(&scratch.root).unwrap();
         let mut store = DurableTailStore::new(store_dir_for_index(&scratch.index_path()), source);
-        assert_eq!(store.write_after_save(&lock, 9, 0, vec![pending]).unwrap().written, 1);
-        assert_eq!(fs::read(record_file(&store, &[1; 32])).unwrap(), golden, "complete current writer output");
+        assert_eq!(store.write_after_save(&lock, 9, 0, vec![pending]).unwrap().written, 0);
+        assert_eq!(store.counters().store_write_skipped[0], 1);
+        assert!(!record_file(&store, &[1; 32]).exists(), "historical records are refused, never written under the new codec");
+        let file = record_file(&store, &[1; 32]);
+        put_record(&file, &golden);
+        assert!(matches!(store.read(&[1;32]), ReadOutcome::Refused(Refusal::Unknown)));
+        assert_eq!(store.counters().format_hold[Refusal::Unknown as usize],1);
+        assert_eq!(fs::read(&file).unwrap(),golden,"refusal never misreads or rewrites historical bytes");
     }
 }
 
@@ -4370,7 +4373,7 @@ fn delayed_t14_receipt_allows_clean_then_changed_offer_without_second_rebuild() 
             let mut record = pending(b.clone(), certificate(&transcript), n);
             // Existing source-tag2 v1 pin; no private codec module access.
             record.allowlist = parse_hex_digest(
-                "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+                "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0",
             )
             .unwrap();
             record.body = crate::snapshots::durable_store_fixture_body(
@@ -4775,4 +4778,124 @@ fn atomic_write_reports_double_failure_only_after_both_cleanup_boundaries_fail()
             }
         }
     }
+}
+
+#[test]
+fn private_label_purge_erases_known_labelled_records_without_receipt_or_money_credit() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("policy-on", "scope", ("fp", None));
+    let mut store = scratch.store();
+    let mut item = pending(b.clone(), certificate(&path), 1);
+    item.body = crate::snapshots::durable_store_fixture_body_with_skill();
+    store.write_after_save(&lock, 1, 0, vec![item]).unwrap();
+    let before = store.counters();
+    // The source-specific caller supplies the no-allocation record predicate.
+    let purged = store
+        .purge_private_labels(&lock, |body| {
+            body.windows("syntheticpurgelabel".len())
+                .any(|s| s == b"syntheticpurgelabel")
+        })
+        .unwrap();
+    assert_eq!(purged.erased, 1);
+    assert_eq!(purged.refused, 0);
+    assert!(matches!(store.read(&b.key), ReadOutcome::Missing));
+    assert_eq!(
+        store.counters().durable_write_failed_published,
+        before.durable_write_failed_published
+    );
+    assert!(
+        matches!(
+            store.reconcile_pending(&lock, &b.key).unwrap(),
+            ReconcileOutcome::NoPending
+        ),
+        "privacy erasure never manufactures a receipt"
+    );
+    let empty = binding("policy-off", "scope", ("fp-empty", None));
+    store
+        .write_after_save(
+            &lock,
+            2,
+            0,
+            vec![pending(empty.clone(), certificate(&path), 1)],
+        )
+        .unwrap();
+    assert_eq!(
+        store.purge_private_labels(&lock, |_| false).unwrap().erased,
+        0
+    );
+    assert!(matches!(store.read(&empty.key), ReadOutcome::Found(_)));
+}
+
+#[test]
+fn private_label_purge_continues_past_corruption_and_reports_partial_progress() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let bad = binding("bad", "scope", ("bad", None));
+    let good = binding("good", "scope", ("good", None));
+    let make = |binding| {
+        let mut item = pending(binding, certificate(&path), 1);
+        item.body = crate::snapshots::durable_store_fixture_body_with_skill();
+        item
+    };
+    store
+        .write_after_save(&lock, 1, 0, vec![make(bad.clone()), make(good.clone())])
+        .unwrap();
+    let file = record_file(&store, &bad.key);
+    let mut corrupt = fs::read(&file).unwrap();
+    *corrupt.last_mut().unwrap() ^= 1;
+    put_record(&file, &corrupt);
+    let report = store.purge_private_labels(&lock, |_| true).unwrap();
+    assert_eq!(report.erased, 1);
+    assert_eq!(report.refused, 1);
+    assert!(!record_file(&store, &good.key).exists());
+    assert_eq!(
+        fs::read(&file).unwrap(),
+        corrupt,
+        "corruption never licenses erasing unknown bytes"
+    );
+}
+
+#[test]
+fn private_label_purge_revokes_retained_completion_but_keeps_candidate_owed() {
+    let _reset = ResetFaults;
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let b = binding("pending", "scope", ("fp", None));
+    let mut item = pending(b.clone(), certificate(&path), 1);
+    item.body = crate::snapshots::durable_store_fixture_body_with_skill();
+    // First establish/repair the store before faulting the canonical sync.
+    store
+        .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 0)])
+        .unwrap();
+    test_hooks::set_before_dir_sync(Some(Box::new(|_| Err(io::Error::other("late sync")))));
+    let _ = store.write_after_save(&lock, 2, 0, vec![item]);
+    test_hooks::set_before_dir_sync(None);
+    let ReconcileOutcome::Receipted(proof) = store.reconcile_pending(&lock, &b.key).unwrap() else {
+        panic!("exact completion")
+    };
+    store.retain_receipt(proof).unwrap();
+    let candidate = store.pending[&b.key].candidate;
+    let before = store.counters().receipt_reconciled;
+    assert!(store.pending[&b.key].completed.is_some());
+    assert_eq!(
+        store.purge_private_labels(&lock, |_| true).unwrap().erased,
+        1
+    );
+    assert!(
+        store.pending.contains_key(&b.key),
+        "privacy erasure cannot settle owed work"
+    );
+    assert!(store.pending[&b.key].completed.is_none());
+    let ReconcileOutcome::Retired(retired) = store.reconcile_pending(&lock, &b.key).unwrap() else {
+        panic!("synced absence, never a receipt")
+    };
+    assert_eq!(retired.candidate, candidate);
+    assert_eq!(store.counters().receipt_reconciled, before);
+    assert!(store.disabled().is_none());
 }

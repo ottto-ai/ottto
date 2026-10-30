@@ -186,6 +186,16 @@ fn restore(
     decoded.rederive(parser, &mut File::open(path).unwrap(), line_cap())
 }
 
+/// A later skill reference must not also create an unsupported opening-call
+/// obligation: close the native opening window with three ordinary user turns.
+fn skill_fixture_lines() -> Vec<String> {
+    let mut lines = claude_lines(1, 1);
+    for n in 4..7 {
+        lines.push(json!({"type":"user","sessionId":CLAUDE_SESSION,"uuid":format!("skill-window-{n}"),"timestamp":format!("2026-10-20T10:00:0{n}Z"),"message":{"role":"user","content":"synthetic later turn"}}).to_string());
+    }
+    lines
+}
+
 /// `pad` filler lines of about `width` bytes each.
 fn claude_filler(from: usize, pad: usize, width: usize) -> Vec<String> {
     (from..from + pad)
@@ -413,8 +423,8 @@ const CODEX_IDS: [&str; 3] = ["call_CANARYL1cx", "call_CANARYL2cx", "call_CANARY
 
 /// The canary matrix: plain sessions, private instruction text on both
 /// sources (its reversible `ConfigDigest` included), and an email context
-/// with an org marker. Artifacts and skill names are `E` (Full, never
-/// stored): `e_class_canaries_never_persist`.
+/// with an org marker. Artifacts remain E; approved skill labels use PL-retained.
+/// `e_content_refuses_and_approved_mid_file_skills_persist` covers both.
 fn cases() -> Vec<Case> {
     const CODEX_CONTENT: &[&str] = &[
         "CANARY_PROMPT_cx",
@@ -663,10 +673,9 @@ fn org_marker_email_is_stored_only_as_a_domain_separated_digest() {
     assert_eq!(occurrences(&body, &separated).len(), 1);
 }
 
-/// F4 matrix, `E` classes: an artifact or a skill name refuses the record
-/// (the entry reads Full), so neither is ever stored.
+/// Other E content still refuses; the approved mid-file skill label now persists.
 #[test]
-fn e_class_canaries_never_persist() {
+fn e_content_refuses_and_approved_mid_file_skills_persist() {
     let scratch = Scratch::new("artifact");
     let path = scratch.write("t.jsonl", &claude_lines(1, 1));
     let (mut reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
@@ -683,7 +692,7 @@ fn e_class_canaries_never_persist() {
         .err(),
         Some(Refuse::NonEmpty("SnapshotAccumulator.artifacts"))
     );
-    let mut skill = claude_lines(1, 1);
+    let mut skill = skill_fixture_lines();
     skill.push(
         json!({"type":"assistant","sessionId":CLAUDE_SESSION,"uuid":"u-9","parentUuid":"u-3",
             "timestamp":"2026-10-20T10:00:09Z","requestId":"req_skill",
@@ -698,14 +707,14 @@ fn e_class_canaries_never_persist() {
     let scratch = Scratch::new("skill");
     let path = scratch.write("t.jsonl", &skill);
     let (reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
-    assert_eq!(
+    assert!(
         encode(
             &reduction,
             crate::durable_tail_store::RECORD_BYTES,
             line_cap()
         )
-        .err(),
-        Some(Refuse::NonEmpty("SnapshotAccumulator.activity_skills"))
+        .is_ok(),
+        "a native mid-file SKILL.md label is now PL-retained"
     );
 }
 
@@ -850,7 +859,18 @@ fn restore_rederives_the_exact_retained_copy() {
 /// finishes to the same upload items as a cold Full of the grown file.
 #[test]
 fn restore_then_tail_matches_cold_full() {
-    for case in cases() {
+    let mut corpus = cases();
+    let mut skill = skill_fixture_lines();
+    skill.push(serde_json::json!({"type":"assistant","sessionId":CLAUDE_SESSION,"uuid":"skill-mid","timestamp":"2026-10-20T10:00:09Z","attributionSkill":"Review","message":{"id":"skill-mid","role":"assistant","model":"claude-opus-4-1","content":[{"type":"tool_use","id":"toolu-mid","name":"Read","input":{"file_path":"/synthetic/skills/Review/SKILL.md"}}],"usage":{"input_tokens":1,"output_tokens":1}}}).to_string());
+    corpus.push(Case {
+        source: SnapshotSource::ClaudeCode,
+        lines: skill,
+        appended: claude_lines(2, 2),
+        content: &[],
+        provider_ids: &[],
+        survivors: &[],
+    });
+    for case in corpus {
         let scratch = Scratch::new("tail");
         let path = scratch.write("t.jsonl", &case.lines);
         let (reduction, checkpoint) = full_read(&path, case.source);
@@ -884,6 +904,44 @@ fn restore_then_tail_matches_cold_full() {
             .unwrap();
         assert_eq!(mode, ReadMode::Tail, "{:?}", case.source);
         while !continued.step().unwrap() {}
+        let (cold_reduction, _) = full_read(&path, case.source);
+        assert_eq!(
+            serde_json::to_vec(&continued.accumulator.activity_summary()).unwrap(),
+            serde_json::to_vec(&cold_reduction.accumulator.activity_summary()).unwrap()
+        );
+        if case.source == SnapshotSource::ClaudeCode {
+            let attribution =
+                crate::session_attribution::SessionAttributionContext::from_activity_hint(
+                    case.source,
+                    &scratch.0,
+                    true,
+                    Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                    Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+                )
+                .unwrap();
+            let grouping = |acc: &SnapshotAccumulator| {
+                serde_json::to_vec(&attribution.grouping_facts(
+                    crate::session_attribution::SessionAttributionGroupingInput {
+                        source: case.source,
+                        origin: Some(&acc.origin),
+                        source_session_id: CLAUDE_SESSION,
+                        observed_at: COLLECTED,
+                        source_version: case.source.parser_version(),
+                        first_prompt: acc.first_prompt_material.as_deref(),
+                        provider_skills: &acc.provider_skills,
+                        activity_skills: &acc.activity_skills,
+                        repository_hash: None,
+                        source_started_at: acc.started_at.as_deref(),
+                        transcript_path: &path,
+                    },
+                ))
+                .unwrap()
+            };
+            assert_eq!(
+                grouping(&continued.accumulator),
+                grouping(&cold_reduction.accumulator)
+            );
+        }
         assert_eq!(
             items(continued, &path, case.source),
             cold_items(&path, case.source),
@@ -965,7 +1023,10 @@ fn edits_after_the_checkpoint_refuse_restore() {
         .sum::<u64>();
     let record = |scratch: &Scratch| {
         let path = scratch.write("t.jsonl", &lines);
-        let (reduction, checkpoint) = full_read(&path, source);
+        let (mut reduction, checkpoint) = full_read(&path, source);
+        reduction
+            .accumulator
+            .note_activity_skills("/synthetic/skills/HeadLabel/SKILL.md");
         let body = encode(
             &reduction,
             crate::durable_tail_store::RECORD_BYTES,
@@ -1042,11 +1103,11 @@ fn edits_after_the_checkpoint_refuse_restore() {
 const ALLOWLIST_PINS: [(SnapshotSource, &str); 2] = [
     (
         SnapshotSource::ClaudeCode,
-        "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
+        "95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2",
     ),
     (
         SnapshotSource::Codex,
-        "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+        "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0",
     ),
 ];
 
@@ -1078,8 +1139,8 @@ fn allowlist_digest_binds_source_and_field_classes() {
         "X title",
         "X first_prompt_material",
         "X workspace_path",
-        "E provider_skills",
-        "E activity_skills",
+        "PL provider_skills",
+        "PL activity_skills",
         "I codex_turn_traces",
         "D activity_call_tools",
         "L activity_mcp_call_ids",
@@ -1249,11 +1310,11 @@ fn h_fields_are_audited() {
 }
 
 /// Full-fallback classes on a synthetic corpus, by the refusing field: a
-/// skill reference (E) and a first prompt past the 1 MiB head bound (not
-/// re-derivable) each read Full; plain sessions persist.
+/// approved skill references persist alongside plain sessions; a first prompt
+/// past the 1 MiB head bound still refuses toward native Full.
 #[test]
 fn fallback_classes_over_the_synthetic_corpus() {
-    let mut skill = claude_lines(1, 1);
+    let mut skill = skill_fixture_lines();
     skill.push(
         json!({"type":"assistant","sessionId":CLAUDE_SESSION,"uuid":"u-9","parentUuid":"u-3",
             "timestamp":"2026-10-20T10:00:09Z","requestId":"req_skill",
@@ -1296,8 +1357,7 @@ fn fallback_classes_over_the_synthetic_corpus() {
     assert_eq!(
         tally,
         BTreeMap::from([
-            ("persisted", 2),
-            ("SnapshotAccumulator.activity_skills", 1),
+            ("persisted", 3),
             ("SnapshotAccumulator.first_prompt_material", 1),
         ])
     );
@@ -2154,4 +2214,157 @@ fn bounded_pi_workspace_enforces_cap_and_refuses_nonheader_cwd() {
         decoded.rederive_content(&File::open(&path).unwrap()),
         Err(Refuse::NotRederivable("workspace_digest"))
     ));
+}
+
+#[test]
+fn skill_label_bounds_and_consent_preserve_the_whole_native_state() {
+    let scratch = Scratch::new("label-bounds");
+    let path = scratch.write("t.jsonl", &claude_lines(1, 1));
+    let (base, _) = full_read(&path, SnapshotSource::ClaudeCode);
+    for label in [
+        "x".repeat(97),
+        "é".into(),
+        "a/b".into(),
+        "a\\b".into(),
+        "a\0b".into(),
+    ] {
+        let mut record = base.clone();
+        record.accumulator.note_provider_skill(Some(label));
+        let native = record.accumulator.provider_skills.clone();
+        assert_eq!(
+            encode_permitted(&record, usize::MAX, line_cap(), true).err(),
+            Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=provider}"))
+        );
+        assert_eq!(
+            record.accumulator.provider_skills, native,
+            "no filtering, truncation or recasing at persistence"
+        );
+    }
+    let mut record = base.clone();
+    record
+        .accumulator
+        .note_provider_skill(Some(format!("  {}  ", "A".repeat(96))));
+    record.accumulator.note_activity_skills(
+        "/synthetic/skills/FirstSpelling/SKILL.md /synthetic/skills/firstspelling/SKILL.md",
+    );
+    assert_eq!(
+        record.accumulator.provider_skills,
+        BTreeSet::from(["a".repeat(96)])
+    );
+    assert_eq!(
+        record.accumulator.activity_skills,
+        BTreeSet::from(["FirstSpelling".into()])
+    );
+    let body = encode_permitted(&record, usize::MAX, line_cap(), true).unwrap();
+    assert!(body_has_skill_labels(&body).unwrap());
+    let decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
+    assert!(
+        !decoded.permits_skill_labels(false),
+        "consent off never resurrects old labels"
+    );
+    assert!(decoded.permits_skill_labels(true));
+    assert_eq!(
+        encode_permitted(&record, usize::MAX, line_cap(), false).err(),
+        Some(Refuse::NonEmpty("skill_label_consent_off"))
+    );
+    assert!(
+        encode_permitted(&base, usize::MAX, line_cap(), false).is_ok(),
+        "empty sets need no label permission"
+    );
+    assert!(
+        encode_permitted(&record, usize::MAX, line_cap(), true).is_ok(),
+        "turn-on permits the next native save without a forced read"
+    );
+    record.accumulator.activity_skills.insert("bad/path".into());
+    assert_eq!(
+        encode_permitted(&record, usize::MAX, line_cap(), true).err(),
+        Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=activity}"))
+    );
+}
+
+#[test]
+fn skill_labels_retain_native_33_entry_sentinel_and_drop_34th() {
+    let scratch = Scratch::new("label-cap");
+    let path = scratch.write("t.jsonl", &claude_lines(1, 1));
+    let (mut record, _) = full_read(&path, SnapshotSource::ClaudeCode);
+    for n in 0..33 {
+        record
+            .accumulator
+            .note_provider_skill(Some(format!("Provider{n:02}")));
+        record
+            .accumulator
+            .note_activity_skills(&format!("/synthetic/skills/Activity{n:02}/SKILL.md"));
+    }
+    record
+        .accumulator
+        .note_provider_skill(Some("Aardvark".into()));
+    record
+        .accumulator
+        .note_activity_skills("/synthetic/skills/Aardvark/SKILL.md");
+    assert!(!record.accumulator.provider_skills.contains("aardvark"));
+    assert!(!record.accumulator.activity_skills.contains("Aardvark"));
+    assert_eq!(record.accumulator.provider_skills.len(), 33);
+    assert_eq!(record.accumulator.activity_skills.len(), 33);
+    assert!(!record.accumulator.provider_skills.contains("provider33"));
+    assert!(!record.accumulator.activity_skills.contains("Activity33"));
+    let body = encode_permitted(&record, usize::MAX, line_cap(), true).unwrap();
+    let decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
+    assert_eq!(
+        decoded.reduction.accumulator.provider_skills,
+        record.accumulator.provider_skills
+    );
+    assert_eq!(
+        decoded.reduction.accumulator.activity_skills,
+        record.accumulator.activity_skills
+    );
+    record.accumulator.provider_skills.insert("extra".into());
+    assert_eq!(
+        encode_permitted(&record, usize::MAX, line_cap(), true).err(),
+        Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=provider}"))
+    );
+}
+
+#[test]
+fn pl_scope_is_closed_and_every_other_e_field_stays_refusing() {
+    let shape = shape_text();
+    let paths = |class: &str| {
+        h_paths(&shape.replace("H ", "digest ").replace(class, "H "))
+            .into_iter()
+            .map(|path| path.split(':').next().unwrap().to_owned())
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        paths("PL "),
+        BTreeSet::from([
+            "SnapshotAccumulator.activity_skills".into(),
+            "SnapshotAccumulator.provider_skills".into()
+        ])
+    );
+    assert_eq!(
+        paths("E "),
+        [
+            "CodexPrelude.skills_body",
+            "OpeningCall.files",
+            "OrgMarkers.home",
+            "SelectorCapture.context.attribution",
+            "SnapshotAccumulator.codex_tier_replay",
+            "SnapshotAccumulator.claude_desktop_identity",
+            "SnapshotAccumulator.claude_desktop_spawn_lineage",
+            "SnapshotAccumulator.codex_parent_signatures",
+            "SnapshotAccumulator.codex_parent_prefix_proof",
+            "SnapshotAccumulator.codex_parent_proof_used",
+            "SnapshotAccumulator.codex_parent_proof_refusal",
+            "SnapshotAccumulator.codex_legacy_bootstrap_buffer",
+            "SnapshotAccumulator.artifacts",
+            "SnapshotAccumulator.claude_usage_request_ids",
+            "SnapshotAccumulator.claude_usage_occurrences",
+            "SnapshotAccumulator.cache_observations",
+            "SnapshotAccumulator.claude_fork_parent",
+            "SnapshotAccumulator.claude_money",
+            "SnapshotAccumulator.seen_pi_usage_keys",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+    );
 }

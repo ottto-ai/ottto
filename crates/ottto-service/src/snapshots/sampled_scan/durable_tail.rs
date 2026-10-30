@@ -403,6 +403,10 @@ struct Slot {
     /// The pass's sampled scope and identity-capture mode.
     namespace: Scope,
     identity_capture: bool,
+    /// Reset on every pass; supplied only by the owning sync cycle.
+    skill_labels_enabled: bool,
+    /// A completed OFF purge stays valid until this slot permits labels again.
+    skill_label_purge_complete: bool,
     /// Keys held (U) by this source, and the totals the last alarm reported:
     /// [held, t14_rebuild, mode_repaired, disabled, rebuild_full,
     /// upgrade_state_missing, old_binding_no_match, retail_exhausted[3], stale_full[3]].
@@ -2074,6 +2078,44 @@ impl SharedCache {
     /// under the pass's sampled scope (`namespace`) and identity-capture
     /// mode. An index at another path (a destination or account switch) gets
     /// a fresh store; the old directory is left to its own index's GC.
+    pub(in crate::snapshots) fn durable_skill_label_permission(
+        &self,
+        source: SnapshotSource,
+        enabled: bool,
+    ) {
+        if let (Some(ds), Some(mut stores)) = (durable_source(source), self.durable()) {
+            if let Some(slot) = stores.slot(ds).as_mut() {
+                slot.skill_labels_enabled = enabled;
+                if enabled {
+                    slot.skill_label_purge_complete = false;
+                }
+            }
+        }
+    }
+    #[inline(never)]
+    pub(in crate::snapshots) fn skill_labels_enabled(&self, source: SnapshotSource) -> bool {
+        durable_source(source)
+            .and_then(|ds| {
+                self.durable().and_then(|mut stores| {
+                    stores
+                        .slot(ds)
+                        .as_ref()
+                        .map(|slot| slot.skill_labels_enabled)
+                })
+            })
+            .unwrap_or(false)
+    }
+    #[inline(never)]
+    pub(in crate::snapshots) fn note_skill_label_refusal(&self, reason: Refuse) {
+        if let Refuse::NonEmpty(class) = reason {
+            if class.starts_with("skill_label_") {
+                if let Some(mut stores) = self.durable() {
+                    Counters::bump(&mut stores.counters.not_persisted, class);
+                }
+            }
+        }
+    }
+
     pub(crate) fn durable_begin_pass(
         &self,
         source: SnapshotSource,
@@ -2111,6 +2153,7 @@ impl SharedCache {
             current.index_path = index_path.to_owned();
             current.namespace = namespace.clone();
             current.identity_capture = identity_capture;
+            current.skill_labels_enabled = false;
         } else {
             if let Some(old) = slot.as_mut().filter(|s| s.store.has_pending()) {
                 old.store.disable("namespace_pending");
@@ -2123,6 +2166,8 @@ impl SharedCache {
                 decided: BTreeMap::new(),
                 namespace: namespace.clone(),
                 identity_capture,
+                skill_labels_enabled: false,
+                skill_label_purge_complete: false,
                 held: 0,
                 old_binding_no_match: 0,
                 reported: [0; 22],
@@ -3929,6 +3974,11 @@ impl SharedCache {
                 crate::durable_tail_codec::DecodeFailure::Integrity => Failure::Corrupt,
             },
         )?;
+        if !decoded.permits_skill_labels(self.skill_labels_enabled(source)) {
+            return Err(Failure::NotRederived(Refuse::NonEmpty(
+                "skill_label_consent_off",
+            )));
+        }
         if record.format == store::FORMAT_V3 {
             let inputs = v3.ok_or(Failure::Ineligible(store::Ineligible::Scope))?;
             let counting = decoded.immutable_counting().map_err(|_| Failure::Corrupt)?;
@@ -4358,6 +4408,45 @@ impl SharedCache {
         ) else {
             return None;
         };
+        // The index save has already committed. Consent erasure neither
+        // advances an ACK nor clears custody/owed metadata. A missing record
+        // subsequently follows the native recovery path on natural growth.
+        let purge_needed = self
+            .durable()
+            .and_then(|mut stores| {
+                stores
+                    .slot(durable_source(snapshot_source)?)
+                    .as_ref()
+                    .map(|slot| !slot.skill_labels_enabled && !slot.skill_label_purge_complete)
+            })
+            .unwrap_or(false);
+        if purge_needed {
+            let mut stores = self.durable()?;
+            let slot = stores.slot(durable_source(snapshot_source)?).as_mut()?;
+            match slot.store.purge_private_labels(writer, |body| {
+                codec::body_has_skill_labels(body).unwrap_or(false)
+            }) {
+                Ok(report) => {
+                    slot.skill_label_purge_complete = report.refused == 0;
+                    *stores
+                        .counters
+                        .not_persisted
+                        .entry("skill_label_purged")
+                        .or_default() += report.erased;
+                    *stores
+                        .counters
+                        .not_persisted
+                        .entry("skill_label_purge_failed")
+                        .or_default() += report.refused;
+                }
+                Err(_) => {
+                    Counters::bump(
+                        &mut stores.counters.not_persisted,
+                        "skill_label_purge_failed",
+                    );
+                }
+            }
+        }
         let service = std::time::Instant::now();
         let result = self.write_after_save_active(writer, snapshot_source, index);
         let micros = service.elapsed().as_micros().min(u64::MAX as u128) as u64;
@@ -4414,6 +4503,7 @@ impl SharedCache {
         let mut not_persisted = Vec::new();
         let mut invalidate = BTreeSet::new();
         let mut peak = 0_u64;
+        let skill_labels_enabled = self.skill_labels_enabled(snapshot_source);
         {
             let cache = self.retained().ok()?;
             for key in touched {
@@ -4496,10 +4586,11 @@ impl SharedCache {
                     later.insert(key);
                     continue;
                 }
-                match codec::encode(
+                match codec::encode_permitted(
                     &retained.state,
                     budget.min(store::BODY_BYTES),
                     jsonl_line_cap() as u64,
+                    skill_labels_enabled,
                 ) {
                     Ok(body) => {
                         budget = budget.saturating_sub(body.len());

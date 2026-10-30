@@ -622,15 +622,22 @@ impl SharedCache {
                 view.positive_usage_evidence,
             ),
             view.line_cap,
+            self.skill_labels_enabled(chain.source()),
         ) {
             Ok(plan) => plan,
-            Err(_) => return PrepareOutcome::NotPersisted(NotPersisted::Codec),
+            Err(reason) => {
+                self.note_skill_label_refusal(reason);
+                return PrepareOutcome::NotPersisted(NotPersisted::Codec);
+            }
         };
         let limit = store::BODY_BYTES - (store::HEADER_V3_BYTES - store::HEADER_BYTES);
         let body_len = match plan.count(limit) {
             Ok(len) => len,
             Err(Refuse::TooLarge) => return PrepareOutcome::NotPersisted(NotPersisted::EntryCap),
-            Err(_) => return PrepareOutcome::NotPersisted(NotPersisted::Codec),
+            Err(reason) => {
+                self.note_skill_label_refusal(reason);
+                return PrepareOutcome::NotPersisted(NotPersisted::Codec);
+            }
         };
         let scratch = self.durable().and_then(|mut stores| {
             stores

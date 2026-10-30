@@ -3289,6 +3289,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                         true,
                         &namespace,
                         false,
+                        true,
                     );
                     let claude = source == SnapshotSource::ClaudeCode;
                     assert_eq!(
@@ -14958,4 +14959,66 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
         assert_eq!(records(), saved, "restore cannot change durable authority");
     }
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write() {
+    let root = crate::test_scratch::private_dir("skill-consent-save");
+    let lock = test_locks::hold(&root);
+    let source = SnapshotSource::ClaudeCode;
+    let path = root.join("synthetic.jsonl");
+    native_fixture(&path);
+    let scope = Scope("skill-consent".into());
+    let index_path = root.join("index.json");
+    let mut index = ScanIndex::default();
+    index.save(&index_path).unwrap();
+    let before_index = std::fs::read(&index_path).unwrap();
+    let key = store::key_digest(DurableSource::ClaudeCode, "synthetic");
+    let mut disk = DurableTailStore::new(
+        store::store_dir_for_index(&index_path),
+        DurableSource::ClaudeCode,
+    );
+    disk.write_after_save(
+        lock,
+        index.generation,
+        0,
+        vec![PendingRecord {
+            acquisition: None,
+            binding: Binding {
+                source: DurableSource::ClaudeCode,
+                key,
+                context: [1; 32],
+                scope: [2; 32],
+                entry: [3; 32],
+            },
+            certificate: certificate(&path, &scope),
+            body: crate::snapshots::durable_store_fixture_body_with_skill(),
+            allowlist: codec::allowlist_digest(source),
+        }],
+    )
+    .unwrap();
+    assert!(matches!(disk.read(&key), ReadOutcome::Found(_)));
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &scope, false);
+    cache.durable_skill_label_permission(source, false);
+    cache.durable_write_after_save(lock, source, &index);
+    assert!(matches!(disk.read(&key), ReadOutcome::Missing));
+    let (counts, _) = cache.durable_counters(source).unwrap();
+    assert_eq!(counts.not_persisted.get("skill_label_purged"), Some(&1));
+    assert_eq!(
+        std::fs::read(&index_path).unwrap(),
+        before_index,
+        "privacy erasure changes no committed money/ACK state"
+    );
+    cache.durable_skill_label_permission(source, true);
+    cache.durable_write_after_save(lock, source, &index);
+    assert!(
+        matches!(disk.read(&key), ReadOutcome::Missing),
+        "consent enablement alone cannot create a record or force a transcript read"
+    );
+    cache.durable_begin_pass(source, &index_path, &scope, false);
+    assert!(
+        !cache.skill_labels_enabled(source),
+        "a new cycle defaults fail-closed until its owner supplies policy"
+    );
 }

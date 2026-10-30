@@ -2,7 +2,7 @@
 //! `CachedJsonlReduction` (CONTRACT.md M1; SOURCE field ruling and Amendment
 //! 1), and the re-derivation of the content fields the body never carries.
 //!
-//! The body holds the allowlisted fields (`N`/`H`/`U`/`L`, see
+//! The body holds the allowlisted fields (`N`/`H`/`U`/`L`/`PL`, see
 //! `durable_tail_codec`) and, for each re-derived content field, the digest of
 //! its value. The marks (`DurableMarks`, `SessionStartState::content_end`) say
 //! where in the file each was last assigned. Production restore funds the
@@ -142,6 +142,7 @@ fn rederive_digests(acc: &SnapshotAccumulator, line_cap: u64) -> Result<Rederive
 
 /// The record body for a retained reduction, or why it is not persisted.
 /// Only Claude Code and Codex entries are persisted in M1.
+#[cfg(test)]
 pub(crate) fn encode(
     reduction: &CachedJsonlReduction,
     limit: usize,
@@ -153,6 +154,7 @@ pub(crate) fn encode(
     (source.properties().encode)(reduction, limit, line_cap)
 }
 
+#[cfg(test)]
 pub(in crate::snapshots) fn encode_body(
     reduction: &CachedJsonlReduction,
     limit: usize,
@@ -191,7 +193,21 @@ impl<'a> BodyEncoding<'a> {
         report: &'a JsonlReadReport,
         scalars: (usize, usize, bool),
         line_cap: u64,
+        skill_labels_enabled: bool,
     ) -> Result<Self, Refuse> {
+        if !skill_labels_enabled
+            && (!accumulator.activity_skills.is_empty() || !accumulator.provider_skills.is_empty())
+        {
+            return Err(Refuse::NonEmpty("skill_label_consent_off"));
+        }
+        pl_text::validate_skill_labels(
+            &accumulator.provider_skills,
+            "SnapshotAccumulator.provider_skills",
+        )?;
+        pl_text::validate_skill_labels(
+            &accumulator.activity_skills,
+            "SnapshotAccumulator.activity_skills",
+        )?;
         // Reuse source registration; no additional Claude/Codex dispatch table.
         super::super::sampled_scan::durable_tail::durable_source(accumulator.source)
             .ok_or(Refuse::NotRederivable("SnapshotAccumulator.source"))?;
@@ -227,6 +243,7 @@ impl<'a> BodyEncoding<'a> {
 }
 
 // Same field order as CachedJsonlReduction::put, for retained and live callers.
+#[cfg(test)]
 pub(in crate::snapshots) fn encode_parts(
     acc: &SnapshotAccumulator,
     report: &JsonlReadReport,
@@ -234,11 +251,36 @@ pub(in crate::snapshots) fn encode_parts(
     limit: usize,
     line_cap: u64,
 ) -> Result<Vec<u8>, Refuse> {
-    let plan = BodyEncoding::new(acc, report, scalars, line_cap)?;
+    let plan = BodyEncoding::new(acc, report, scalars, line_cap, true)?;
     let len = plan.count(limit)?;
     let mut out = Vec::with_capacity(len);
     plan.write(&mut out, len)?;
     Ok(out)
+}
+
+/// Production encoding always receives the effective cycle-owned permission.
+pub(in crate::snapshots) fn encode_permitted(
+    reduction: &CachedJsonlReduction,
+    limit: usize,
+    line_cap: u64,
+    enabled: bool,
+) -> Result<Vec<u8>, Refuse> {
+    let (acc, report, scalars) = reduction.finish_view();
+    let plan = BodyEncoding::new(acc, report, scalars, line_cap, enabled)?;
+    let len = plan.count(limit)?;
+    let mut out = Vec::with_capacity(len);
+    plan.write(&mut out, len)?;
+    Ok(out)
+}
+
+/// No allocation or transcript input: locate literals in a verified record body.
+pub(in crate::snapshots) fn body_has_skill_labels(body: &[u8]) -> Result<bool, Corrupt> {
+    let mut d = Dec::new(body);
+    CachedJsonlReduction::verify(&mut d)?;
+    Rederive::verify(&mut d)?;
+    let present = d.has_pl_labels();
+    d.finish()?;
+    Ok(present)
 }
 
 /// Structural body verification only: no reduction, re-derivation or live
@@ -330,6 +372,14 @@ pub(crate) struct RederiveReceipt {
     pub(crate) head_bytes: u64,
     pub(crate) named_lines: u64,
     pub(crate) line_bytes: u64,
+}
+
+impl Decoded {
+    pub(in crate::snapshots) fn permits_skill_labels(&self, enabled: bool) -> bool {
+        enabled
+            || self.reduction.accumulator.provider_skills.is_empty()
+                && self.reduction.accumulator.activity_skills.is_empty()
+    }
 }
 
 impl CachedJsonlReduction {
@@ -576,6 +626,25 @@ pub(crate) fn store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -
     };
     encode(
         &reduction,
+        crate::durable_tail_store::RECORD_BYTES,
+        1024 * 1024,
+    )
+    .unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn store_skill_fixture_body() -> Vec<u8> {
+    let mut decoded = decode(
+        &store_fixture_body(SnapshotSource::ClaudeCode, 1, 7),
+        SnapshotSource::ClaudeCode,
+    )
+    .unwrap();
+    decoded
+        .reduction
+        .accumulator
+        .note_provider_skill(Some("SyntheticPurgeLabel".into()));
+    encode(
+        &decoded.reduction,
         crate::durable_tail_store::RECORD_BYTES,
         1024 * 1024,
     )

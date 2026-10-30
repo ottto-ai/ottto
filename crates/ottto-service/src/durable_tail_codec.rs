@@ -237,6 +237,7 @@ pub(crate) struct Dec<'a> {
     at: usize,
     allowance: Option<&'a mut dyn FnMut(u64) -> bool>,
     refused: bool,
+    pl_labels_nonempty: bool,
 }
 
 impl<'a> Dec<'a> {
@@ -246,6 +247,7 @@ impl<'a> Dec<'a> {
             at: 0,
             allowance: None,
             refused: false,
+            pl_labels_nonempty: false,
         }
     }
     pub(crate) fn bounded(bytes: &'a [u8], allowance: &'a mut dyn FnMut(u64) -> bool) -> Self {
@@ -254,6 +256,7 @@ impl<'a> Dec<'a> {
             at: 0,
             allowance: Some(allowance),
             refused: false,
+            pl_labels_nonempty: false,
         }
     }
     fn reserve(&mut self, bytes: Option<usize>) -> Result<(), Corrupt> {
@@ -269,7 +272,7 @@ impl<'a> Dec<'a> {
     fn slots<T>(&mut self, len: usize) -> Result<(), Corrupt> {
         self.reserve(len.checked_mul(std::mem::size_of::<T>()))
     }
-    fn tree<K, V>(&mut self, len: usize) -> Result<(), Corrupt> {
+    pub(crate) fn tree<K, V>(&mut self, len: usize) -> Result<(), Corrupt> {
         self.reserve(
             len.checked_add(1)
                 .and_then(|n| n.checked_mul(crate::heap_layout_bound::tree_node_bytes::<K, V>()?)),
@@ -333,6 +336,12 @@ impl<'a> Dec<'a> {
         }
         std::str::from_utf8(self.raw(len)?).map_err(|_| Corrupt)
     }
+    pub(crate) fn note_pl_labels(&mut self, len: usize) {
+        self.pl_labels_nonempty |= len != 0;
+    }
+    pub(crate) fn has_pl_labels(&self) -> bool {
+        self.pl_labels_nonempty
+    }
     pub(crate) fn remaining(&self) -> usize {
         self.bytes.len() - self.at
     }
@@ -390,7 +399,7 @@ pub(crate) trait Durable: Sized {
 /// String and arbitrary Durable values cannot be labelled PL by the macro.
 /// Each use still needs its field-specific consent, lifetime and single-use rule.
 pub(crate) trait PlLiteral: Durable {
-    fn put_pl(&self, e: &mut Enc) -> Result<(), Refuse> {
+    fn put_pl(&self, e: &mut Enc, _path: &'static str) -> Result<(), Refuse> {
         self.put(e)
     }
     fn take_pl(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
@@ -1293,7 +1302,7 @@ macro_rules! durable_field {
     };
     (put PL, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
         let value: &$ty = $f;
-        $crate::durable_tail_codec::PlLiteral::put_pl(value, $e)?;
+        $crate::durable_tail_codec::PlLiteral::put_pl(value, $e, $path)?;
     }};
     (put L, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
         let value: &$ty = $f;

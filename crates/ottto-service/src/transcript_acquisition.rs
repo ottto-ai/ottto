@@ -2033,7 +2033,7 @@ mod tests {
             let key = store::key_digest(source, "certificate-roundtrip");
             // The store preserves unknown shapes, so use the shipped v1
             // Codex allowlist and its existing real-codec fixture body.
-            let pin = "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1";
+            let pin = "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0";
             let allowlist =
                 std::array::from_fn(|i| u8::from_str_radix(&pin[2 * i..2 * i + 2], 16).unwrap());
             let mut disk = store::DurableTailStore::new(state.0.join("cache"), source);

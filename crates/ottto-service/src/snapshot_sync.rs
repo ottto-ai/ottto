@@ -6482,6 +6482,7 @@ fn prepare_sync_source_inner(
         claude_index_loaded_fresh,
         &sampled_scope,
         request_identity_capture,
+        upload_policy.session_attribution_labels_enabled,
     );
     let mut scan = crate::snapshots::OwnedSourceScan::new_with_durable_cache(
         source,

@@ -15,6 +15,28 @@ pub(crate) mod codex_side_lifecycle;
 mod footprint;
 pub(crate) mod rearm_cause;
 
+/// Native label losses only, never label text. Twelve fixed u64 cells (96 B),
+/// no per-key state. Invalid activity signals count inputs, since the existing
+/// detector deliberately does not expose the unnamed/dropped labels.
+#[inline(never)]
+pub(crate) fn skill_label_native_dropped(source: &str, set: &'static str, reason: &'static str) {
+    static COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+    let source_slot = match source {
+        "claude_code" => 0,
+        "codex" => 1,
+        "pi" => 2,
+        _ => return,
+    };
+    let slot = source_slot * 4
+        + usize::from(set == "activity") * 2
+        + usize::from(reason == "invalid_signal");
+    let total = COUNTS[slot].fetch_add(1, Relaxed).saturating_add(1);
+    durable_tail_alarm(
+        source,
+        &serde_json::json!({"skill_label_native_dropped": {(set): {(reason): total}}}),
+    );
+}
+
 /// Closed, content-free refusal labels; cumulative process counters on #799.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub(crate) enum CodexZstCause {
