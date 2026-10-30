@@ -646,6 +646,51 @@ impl AcceptedBuckets {
     /// a positive tag; later positive proof replaces it. Marker and untagged
     /// rows keep the server-held proof. `retained_proof_missing` buckets lose
     /// their marked rows, so a later revision re-tags them if proof remains.
+    /// Before an upload: a row this body freshly tags with a different proof
+    /// may replace the server's retained proof even if the ACK is lost, so the
+    /// superseded entry must leave first. Returns whether anything changed;
+    /// the caller persists before the request. Independent of the capability.
+    pub(crate) fn invalidate_replaced(&mut self, body: &Value) -> bool {
+        if body["provenance"]["collector"].as_str() != Some(COLLECTOR) {
+            return false;
+        }
+        let Some(session) = body["source_session_id"].as_str() else {
+            return false;
+        };
+        let Some(entry) = self.session_mut(session) else {
+            return false;
+        };
+        if entry.proved.is_empty() {
+            return false;
+        }
+        let key = entry.bound_key().clone();
+        let mut replaced = BTreeSet::new();
+        for bucket in body["usage_buckets"].as_array().into_iter().flatten() {
+            let Some(start) = bucket["bucket_start"].as_str().and_then(bucket_key) else {
+                continue;
+            };
+            for row in bucket["model_usage"].as_array().into_iter().flatten() {
+                let (Some(row_key), Some(proof)) = (
+                    wire_row_key(row),
+                    row_proof(&key, row, &body["request_evidence"]),
+                ) else {
+                    continue;
+                };
+                let row_hash = proved_row_hash(&key, &row_key);
+                if entry
+                    .proved
+                    .iter()
+                    .any(|held| held.bucket == start && held.row == row_hash && held.proof != proof)
+                {
+                    replaced.insert((start, row_hash));
+                }
+            }
+        }
+        entry
+            .proved
+            .retain(|held| !replaced.contains(&(held.bucket, held.row)));
+        !replaced.is_empty()
+    }
     pub(crate) fn record_proved(&mut self, body: &Value, witnessed: bool, missing: &[String]) {
         if body["provenance"]["collector"].as_str() != Some(COLLECTOR) {
             return;
@@ -1224,6 +1269,15 @@ mod retained_tests {
             state.record_proved(&body(untagged), true, &[]);
             assert_eq!(proof(&state), Some(second), "server keeps proof");
         }
+        // A replacement upload drops a different held proof before the POST;
+        // equal proof, markers and untagged rows never do.
+        let mut sent = state.clone();
+        assert!(!sent.invalidate_replaced(&b));
+        assert!(!sent.invalidate_replaced(&body(
+            json!({"model":"claude-synthetic","request_count":1,"identity_retained":true})
+        )));
+        assert!(sent.invalidate_replaced(&a));
+        assert_eq!(sent.proved_rows_for_test("synthetic"), Some((0, 0)));
         // retained_proof_missing removes only rows this body marked.
         state.record_proved(&b, true, &["2026-09-01T10:00:00Z".into()]);
         assert_eq!(proof(&state), Some(second));

@@ -10173,10 +10173,19 @@ where
     }
     // Observe the final emitted candidates. Only stored-body ACK handling below
     // advances the baseline; a rejected or unstored offer cannot replace it.
+    let mut replaced_retained_proof = false;
     for item in &batch {
-        progress
-            .accepted_account_hashes
-            .observe(&serde_json::to_value(item)?);
+        let value = serde_json::to_value(item)?;
+        progress.accepted_account_hashes.observe(&value);
+        replaced_retained_proof |= progress
+            .accepted_identity_buckets
+            .invalidate_replaced(&value);
+    }
+    // Option (ii): the server may store a replacement proof even if this
+    // reply is lost; drop the superseded one durably so no later marker can
+    // preserve the replacement in its place.
+    if replaced_retained_proof {
+        persist(progress)?;
     }
     let response = upload(batch)?;
     if response.disabled {
