@@ -385,3 +385,30 @@ quiet preparations. A held-history file retains its zero body witness/revision
 debt without forcing rediscovery. Separate controls cover bounded eviction and
 refusal to memoize before finalization or reuse cleared debt. Native tests and
 pins are unchanged by this patch.
+
+### Round 24: park restoration and production-shaped fixture adapters
+
+Restoring a held plain-v2 entry to its unverified marker preserves the bounded
+failed-open record, including the same-stat park and original numeric deadline.
+Only actual source verification or entry removal retires that record. Stat
+changes retain the existing wake behavior; marker restoration grants no credit.
+The regression is `restoring_held_marker_preserves_same_stat_park_and_original_due`;
+the existing context-mismatch/park/stat-change control is unchanged.
+
+Reader fixture drivers now deliver actual transcript path hints after their
+writes, rather than treating a later census timestamp as an audit-clock tick.
+The production 300-second unhinted-append control is unchanged. Legacy pipeline
+drivers activate the current context, validate exact offered-body ACKs, and
+accept receipts only on the selected index before save. Refusal controls perform
+the next real prepare to rebuild retry and mixed-context views.
+
+Class-(b), NEEDS LEAD B OK: two permanent-finish controls expect zero context
+rereads after actual #901 acceptance (old: one). Two numeric-debt controls use a
+checkpoint earned by an actual read/commit; #906 selects Unchanged/Tail rather
+than the obsolete debt-only Full(AuditDue). Original D, hold, save/reload and
+verification checks remain. Money, token, request, exact ACK and body-equality
+assertions are unchanged. P1–P7 expectation proposals await separate review.
+R6 queue refill, R12 held-offer pacing and R13 start-versus-resume admission are
+separate diagnosis items; no liveness policy or page bound changes here. Changed
+layout-dependent drivers need branch Mac evidence; Linux compilation cannot
+supply it. No new persisted field, receipt shortcut or source-context adoption.

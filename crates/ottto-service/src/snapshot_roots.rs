@@ -282,7 +282,7 @@ mod tests {
         assert!(repeated.snapshots.is_empty());
         let first = &roots[0];
         write_session(first, "session-0", 15);
-        let changed = crate::snapshots::scan_source_roots_with_attribution_and_hints(
+        let mut changed = crate::snapshots::scan_source_roots_with_attribution_and_hints(
             SnapshotSource::ClaudeCode,
             &roots,
             &mut restarted,
@@ -294,6 +294,11 @@ mod tests {
             false,
         )
         .unwrap();
+        crate::snapshots::finalize_scan_after_policy(
+            SnapshotSource::ClaudeCode,
+            &mut changed,
+            &mut restarted,
+        );
         assert_eq!(changed.snapshots.len(), 1);
         assert_eq!(changed.snapshots[0].input_tokens, 15);
     }

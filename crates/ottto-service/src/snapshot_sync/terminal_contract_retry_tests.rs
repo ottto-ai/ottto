@@ -680,7 +680,7 @@ impl ReadBudgetFixture {
     }
 
     fn scan_root(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
-        crate::snapshots::scan_source_roots_with_attribution_and_hints(
+        let mut scan = crate::snapshots::scan_source_roots_with_attribution_and_hints(
             SnapshotSource::ClaudeCode,
             &[root.to_owned()],
             index,
@@ -694,7 +694,9 @@ impl ReadBudgetFixture {
                 .collect::<Vec<_>>(),
             false,
         )
-        .unwrap()
+        .unwrap();
+        crate::snapshots::finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, index);
+        scan
     }
 
     fn scan(&self, index: &ScanIndex) -> BTreeMap<PathBuf, usize> {
