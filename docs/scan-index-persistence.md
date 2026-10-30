@@ -495,6 +495,10 @@ progress owners exclude changes through capture and publication; copying the WAL
 avoids imposing a TRUNCATE on each save. A private atomic current pointer switches
 only after the replacement descriptor and every member pass read-back. Superseded
 bundles are reclaimed afterward; a failed replacement keeps the prior seal.
+Failed unpublished copies are reclaimed before retrying, while the current verified
+bundle stays protected. Interrupted restoration completes a matching base with its
+verified WAL before checking the restored generation; newer receipts still refuse
+stale recovery before any pair completion.
 Source erasure, forget and uninstall remove every generation immediately, including
 interrupted replacements. Scheduled private-text purge also removes backup custody
 before clearing its erasure obligation. Destructive migrations require a verified

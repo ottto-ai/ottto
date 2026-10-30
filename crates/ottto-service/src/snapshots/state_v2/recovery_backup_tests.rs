@@ -217,7 +217,17 @@ fn exact_rec_predecessor_is_protected_until_replacement_bundle_verifies() {
             // Live GC cannot invalidate the exact predecessor's independent copy.
             fs::remove_file(records.join("synthetic.1.attempt.rec")).unwrap();
             ottto_core::write_owner_only_file_atomic(&source, b"bad-record").unwrap();
-            assert!(roll(&f.path, &mut db, &identity).is_err());
+            for _ in 0..3 {
+                assert!(roll(&f.path, &mut db, &identity).is_err());
+                assert_eq!(
+                    fs::read_dir(root(&f.path))
+                        .unwrap()
+                        .filter(|e| e.as_ref().unwrap().file_type().unwrap().is_dir())
+                        .count(),
+                    1,
+                    "failed replacement retained database/baseline copies"
+                );
+            }
             let old = read(&f.path).unwrap();
             assert_eq!(
                 active_dir(&f.path).unwrap(),
@@ -274,6 +284,20 @@ fn rolling_db_wal_pair_restores_without_forcing_a_source_checkpoint() {
         fs::remove_file(&wal).unwrap();
     }
     fs::remove_file(&f.path).unwrap();
+    // A previous restore copied only the exact older base before crashing.
+    // Receipt reconciliation must not mistake that incomplete pair for a newer
+    // or conflicting DB and refuse before completing its verified WAL.
+    let descriptor = read(&f.path).unwrap();
+    let database_member = descriptor
+        .artifacts
+        .iter()
+        .position(|a| matches!(a.role, Role::Database))
+        .unwrap();
+    fence::preserve_file(
+        &member(&active_dir(&f.path).unwrap(), database_member),
+        &db_path,
+    )
+    .unwrap();
     restore(&f.path).unwrap();
     let restored = sqlite::Sqlite::open(&db_path, &identity).unwrap();
     assert_eq!(restored.stamp().unwrap().0, 1);

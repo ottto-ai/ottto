@@ -179,6 +179,46 @@ fn check(descriptor: &Descriptor, dir: &Path) -> Result<()> {
     }
     Ok(())
 }
+/// A failure before pointer publication has no recovery authority. Reclaim
+/// only this attempt; once pointer replacement starts its outcome may be durable.
+struct PendingBundle {
+    dir: PathBuf,
+    pointer_started: bool,
+}
+impl Drop for PendingBundle {
+    fn drop(&mut self) {
+        if !self.pointer_started && fs::remove_dir_all(&self.dir).is_ok() {
+            let _ = super::super::sync_checkpoint_parent(&self.dir);
+            telemetry::event("recovery_backup_unpublished_reclaimed", &1);
+        }
+    }
+}
+fn reclaim_unpublished(path: &Path) -> Result<()> {
+    let parent = root(path);
+    let current = active_dir(path)?;
+    let current_verified = read(path).is_ok();
+    for entry in fs::read_dir(&parent)? {
+        let entry = entry?;
+        if entry.path() == current {
+            continue;
+        }
+        let name = entry.file_name();
+        if name.to_str().is_some_and(|s| s.starts_with("generation-")) {
+            let metadata = fs::symlink_metadata(entry.path())?;
+            ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "state_v2_backup_private"
+            );
+            // A damaged pointer/current seal cannot authorize deleting another
+            // sealed candidate. Incomplete copies have no descriptor/authority.
+            if current_verified || !fence::exists(&entry.path().join("descriptor.json"))? {
+                fs::remove_dir_all(entry.path())?;
+                telemetry::event("recovery_backup_unpublished_reclaimed", &1);
+            }
+        }
+    }
+    super::super::sync_checkpoint_parent(&parent.join("current.json"))
+}
 /// Called after import close/fsync while checkpoint and progress owners remain
 /// held. Descriptor publication is the final fsync; no fence replacement may
 /// start until the independently read-back bundle passes verification.
@@ -191,6 +231,7 @@ fn persist(path: &Path, set: ack::RecoverySet, database: &Path) -> Result<()> {
         fs::DirBuilder::new().mode(0o700).create(&parent)?;
     }
     check_dir(&parent)?;
+    reclaim_unpublished(path)?;
     let name = format!(
         "generation-{}-{}",
         std::process::id(),
@@ -200,6 +241,10 @@ fn persist(path: &Path, set: ack::RecoverySet, database: &Path) -> Result<()> {
     );
     let dir = parent.join(&name);
     fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let mut pending = PendingBundle {
+        dir: dir.clone(),
+        pointer_started: false,
+    };
     let mut descriptor = Descriptor {
         version: if database == fence::sibling(path, ".v2.sqlite") {
             2
@@ -298,6 +343,7 @@ fn persist(path: &Path, set: ack::RecoverySet, database: &Path) -> Result<()> {
     // The old CURRENT and all exact .rec/receipt/baseline copies stay valid
     // until the replacement's independent read-back has completed.
     let pointer = parent.join("current.json");
+    pending.pointer_started = true;
     ottto_core::write_owner_only_file_atomic(&pointer, &serde_json::to_vec(&name)?)?;
     super::super::sync_checkpoint_parent(&pointer)?;
     ensure!(
@@ -417,7 +463,7 @@ pub(super) fn restore(path: &Path) -> Result<()> {
             .iter()
             .position(|a| matches!(a.role, Role::Receipt))
             .context("state_v2_backup_receipt")?;
-        descriptor.set.reconcile_before_restore(
+        descriptor.set.reconcile_receipt_before_restore(
             path,
             progress_path,
             &member(&active_dir(path)?, receipt),
@@ -449,6 +495,14 @@ pub(super) fn restore(path: &Path) -> Result<()> {
                 open(&target)?.sync_all()?;
             }
         }
+        // The exact base may expose an older generation until its verified
+        // WAL has been restored. Check generation only after completing the
+        // pair; newer external receipts were already reconciled/refused above.
+        descriptor.set.reconcile_before_restore(
+            path,
+            progress_path,
+            &member(&active_dir(path)?, receipt),
+        )?;
         // Independent stored fence bytes are restored last, after every exact
         // member is durable. Never derive a witness from the candidate DB.
         let (n, artifact) = descriptor

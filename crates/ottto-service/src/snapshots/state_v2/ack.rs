@@ -651,7 +651,7 @@ impl RecoverySet {
         }
         Ok(checkpoints)
     }
-    pub(super) fn reconcile_before_restore(
+    pub(super) fn reconcile_receipt_before_restore(
         &self,
         index_path: &Path,
         progress_path: &Path,
@@ -686,6 +686,15 @@ impl RecoverySet {
                 && digest(&bytes) == self.receipt_digest,
             "backup_newer_receipt",
         )?;
+        Ok(())
+    }
+    pub(super) fn reconcile_before_restore(
+        &self,
+        index_path: &Path,
+        progress_path: &Path,
+        backup_receipt: &Path,
+    ) -> Result<()> {
+        self.reconcile_receipt_before_restore(index_path, progress_path, backup_receipt)?;
         let db_path = fence::sibling(index_path, ".v2.sqlite");
         if fence::exists(&db_path)? {
             require(

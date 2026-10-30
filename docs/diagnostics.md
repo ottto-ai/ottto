@@ -1523,7 +1523,8 @@ retry. Only an intact current grouping can enter the cap allocator.
 The default-OFF Claude state-v2 route also emits `growth_claim_refused` with fixed
 lineage/publication labels and `recovery_backup_verified` / `recovery_backup_restored`
 counts, plus `recovery_backup_superseded` after a verified replacement switches
-the current pointer. These counters describe rolling artifact protection, without
+the current pointer. `recovery_backup_unpublished_reclaimed` counts cleanup of
+failed attempts. These counters describe rolling artifact protection, without
 claiming runtime/native restore qualification or enabling conversion.
 Selected saves retain `unit_selected`, `unit_deferred`, charge rows/bytes/pages,
 `unit_oversize_alarm`, retained-account-window counts and `save_page_reduced`.
