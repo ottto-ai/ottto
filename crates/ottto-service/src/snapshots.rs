@@ -42211,7 +42211,10 @@ fn ensure_bounded_traversal(
             BTreeSet::new()
         } else {
             let served = terminal_off_stale_clear_served(index, &context_fingerprint, &stale);
-            stale.difference(&served).cloned().collect()
+            claude_terminal_semantic_stale_roots(index, &stale)
+                .difference(&served)
+                .cloned()
+                .collect()
         };
         if !semantic.is_empty() || !unacked.is_empty() {
             // Actual destination/identity-contract invalidation remains owed.

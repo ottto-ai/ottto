@@ -350,6 +350,29 @@ fn claude_terminal_stale_roots(index: &ScanIndex, window: &str) -> BTreeSet<Stri
         .collect()
 }
 
+// Main parity (`stale_pending_roots`): a family whose authority quarantine is
+// bound to its retained witness keeps its own retry gate, so a start never
+// re-arms it. Only the semantic clear uses this; B-P2's unACKed heads and the
+// B-P5 memo stay over the full stale set.
+fn claude_terminal_semantic_stale_roots(
+    index: &ScanIndex,
+    stale: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    stale
+        .iter()
+        .filter(|root| {
+            !index
+                .claude_usage_authority_quarantine
+                .get(*root)
+                .zip(index.claude_usage_family_witnesses.get(*root))
+                .is_some_and(|(quarantine, witness)| {
+                    claude_usage_authority_preserves_pending(quarantine, witness)
+                })
+        })
+        .cloned()
+        .collect()
+}
+
 fn claude_terminal_unproven(index: &ScanIndex, window: &str) {
     if !claude_terminal_off() {
         return;

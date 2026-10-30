@@ -2526,6 +2526,96 @@ fn terminal_off_on_terminal_family_never_committed_members_let_the_claude_census
     }
 }
 
+/// R7 (Lead B Q1): under ON, a traversal start never re-arms a family whose
+/// authority quarantine is bound to its retained witness, as main's
+/// `stale_pending_roots` keeps it. The family's accepted, unchanged root is
+/// not re-read or held; only its never-committed members are.
+#[test]
+#[serial(source_manifests)]
+fn terminal_off_on_witness_bound_terminal_family_root_is_not_rearmed_by_a_start() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let _source_manifests = SourceManifestTestGuard::new();
+    let (fixture, baseline) =
+        PipelineFixture::terminal_family("terminal-off-r7-witness-bound-family");
+    let before = ScanIndex::load(&fixture.index_path).expect("load scan index");
+    let root_key = PipelineFixture::key(&before, TERMINAL_FAMILY_ROOT);
+    let record = before
+        .claude_authority_record_for_test(TERMINAL_FAMILY_ROOT)
+        .expect("terminal record");
+    // The premise: a retained family pending from an older window, so the
+    // context-changing start below sees the family as stale.
+    assert!(record.terminal && record.bound_to_retained_witness);
+    assert!(record.family_pending_retained);
+
+    let (pages, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+        fixture.traversal(10, &TERMINAL_FAMILY_CYCLE)
+    });
+    let reads_of = |name: &str| {
+        reads
+            .iter()
+            .filter(|(path, _)| path.file_name().is_some_and(|file| file == name))
+            .map(|(_, count)| *count)
+            .sum::<usize>()
+    };
+    assert_eq!(
+        reads_of(&format!("{TERMINAL_FAMILY_ROOT}.jsonl")),
+        0,
+        "the witness-bound family's unchanged root is never re-read"
+    );
+    // Every held body is a never-committed member read on that page; the
+    // root adds none (2 held, not 3).
+    let member_prefix = format!("{TERMINAL_FAMILY_ROOT}_agent-");
+    let mut held_members = BTreeSet::new();
+    for page in &pages {
+        assert!(!page.parsed.contains(TERMINAL_FAMILY_ROOT));
+        let members = page
+            .parsed
+            .iter()
+            .filter(|session| session.starts_with(&member_prefix))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(page.held.len(), members.len());
+        held_members.extend(members);
+    }
+    assert_eq!(
+        held_members,
+        TERMINAL_FAMILY_AGENTS
+            .iter()
+            .copied()
+            .map(terminal_family_member)
+            .collect::<BTreeSet<_>>()
+    );
+    let last = pages.last().expect("terminal page");
+    for index in [&before, &last.index] {
+        assert_eq!(
+            index.files[&root_key].source_file_fingerprint,
+            baseline.files[&root_key].source_file_fingerprint
+        );
+        assert_eq!(
+            index.files[&root_key].last_snapshot_fingerprint,
+            baseline.files[&root_key].last_snapshot_fingerprint
+        );
+    }
+    // The quarantine keeps its witness binding, members and retained pending.
+    let after = last
+        .index
+        .claude_authority_record_for_test(TERMINAL_FAMILY_ROOT)
+        .expect("terminal record");
+    assert!(after.terminal && after.bound_to_retained_witness);
+    assert!(after.family_pending_retained);
+    assert_eq!(
+        after.proven_witness_fingerprint,
+        record.proven_witness_fingerprint
+    );
+    assert_eq!(
+        last.index
+            .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT),
+        before.bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
+    );
+    assert_eq!(last.index.claude_usage_authority_pending_count(), 0);
+}
+
 /// Controls for the same production shape: a RetryPending family elsewhere
 /// withholds the census but (since the path-(a) bridge) no longer blocks the
 /// bound members' delivery-free entries; a historical replay reset (no
