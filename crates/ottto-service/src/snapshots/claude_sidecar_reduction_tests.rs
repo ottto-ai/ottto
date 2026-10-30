@@ -1801,3 +1801,6 @@ fn desktop_inventory_backoff_keeps_growing_native_prefix_and_cold_body_parity() 
         u64::from(crate::heap_layout_bound::layout_supported())
     );
 }
+
+#[path = "desktop_lineage_tests.rs"]
+mod desktop_lineage_tests;

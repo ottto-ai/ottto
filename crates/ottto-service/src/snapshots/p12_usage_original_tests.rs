@@ -164,6 +164,7 @@ impl Family {
                 let old = &previous.files[key];
                 PendingIndexFinalization {
                     sampled_audit_verified: false,
+                    lineage_edge_reoffer_bytes: None,
                     codex_pending_recovery: false,
                     index_key: key.clone(),
                     source_file_fingerprint: item

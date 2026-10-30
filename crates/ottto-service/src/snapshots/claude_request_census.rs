@@ -1413,8 +1413,9 @@ pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
 
 /// Derive positional slots from Serde's own field metadata rather than pinning
 /// offsets to ScanIndex's declaration order. JSON struct sequences are accepted
-/// by the old reader too; they need the same evidence bounds as object fields.
-fn sequence_fields() -> (usize, usize, usize) {
+/// by the old reader too; census and selectors need the same optional evidence
+/// bounds as object fields.
+fn sequence_fields() -> [usize; 5] {
     struct Fields<'a>(&'a mut Option<&'static [&'static str]>);
     impl<'de> Deserializer<'de> for Fields<'_> {
         type Error = serde::de::value::Error;
@@ -1436,7 +1437,7 @@ fn sequence_fields() -> (usize, usize, usize) {
             tuple_struct map enum identifier ignored_any
         }
     }
-    static SLOTS: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
+    static SLOTS: std::sync::OnceLock<[usize; 5]> = std::sync::OnceLock::new();
     *SLOTS.get_or_init(|| {
         let mut fields = None;
         let _ = ScanIndex::deserialize(Fields(&mut fields));
@@ -1452,11 +1453,13 @@ fn sequence_fields() -> (usize, usize, usize) {
                 .position(|field| *field == name)
                 .expect("census field")
         };
-        (
+        [
             slot("claude_request_census"),
             slot("claude_request_census_shadow"),
             slot("reread_guard"),
-        )
+            slot("claude_desktop_completed_lineage"),
+            slot("claude_desktop_lineage_file_edges"),
+        ]
     })
 }
 
@@ -1476,7 +1479,7 @@ struct CensusRead<R> {
     depth: usize,
     root_array: bool,
     array_index: usize,
-    sequence_fields: (usize, usize, usize),
+    sequence_fields: [usize; 5],
     retired_guard: bool,
     quoted: bool,
     escaped: bool,
@@ -1487,6 +1490,7 @@ struct CensusRead<R> {
     duplicate_shadow: bool,
     shadow_key: bool,
     shadow_state: bool,
+    desktop_selector: Option<&'static str>,
     capture: bool,
     syntax_only: bool,
     #[cfg(test)]
@@ -1515,6 +1519,7 @@ impl<R: std::io::Read> CensusRead<R> {
             duplicate_shadow: false,
             shadow_key: false,
             shadow_state: false,
+            desktop_selector: None,
             capture: false,
             syntax_only: false,
             #[cfg(test)]
@@ -1542,7 +1547,7 @@ impl<R: std::io::Read> CensusRead<R> {
     }
 
     /// Buffer only enough of a root key to recognize every escaped spelling
-    /// of our two names. Long ordinary keys continue streaming unchanged.
+    /// of the optional evidence names. Long ordinary keys stream unchanged.
     fn root_key(&mut self) -> std::io::Result<Vec<u8>> {
         let mut key = vec![b'"'];
         self.quoted = true;
@@ -1563,6 +1568,7 @@ impl<R: std::io::Read> CensusRead<R> {
         }
         self.shadow_key = false;
         self.retired_guard = false;
+        self.desktop_selector = None;
         if !self.quoted {
             if let Ok(name) = serde_json::from_slice::<String>(&key) {
                 let duplicate = match name.as_str() {
@@ -1586,6 +1592,16 @@ impl<R: std::io::Read> CensusRead<R> {
                         self.shadow_key = true;
                         self.retired_guard = true;
                         return Ok(b"\"_ignored_retired_reread_guard\"".to_vec());
+                    }
+                    "claude_desktop_completed_lineage" => {
+                        self.shadow_key = true;
+                        self.desktop_selector = Some("claude_desktop_completed_lineage");
+                        false
+                    }
+                    "claude_desktop_lineage_file_edges" => {
+                        self.shadow_key = true;
+                        self.desktop_selector = Some("claude_desktop_lineage_file_edges");
+                        false
                     }
                     _ => false,
                 };
@@ -1624,13 +1640,18 @@ impl<R: std::io::Read> CensusRead<R> {
         // boundary. The syntax-only pass substitutes null without buffering
         // or interpreting census records, even before header controls run.
         let mut overflow = self.syntax_only || self.retired_guard;
+        let max_bytes = if self.desktop_selector.is_some() {
+            super::desktop_lineage::MAX_DECODE_BYTES as usize
+        } else {
+            MAX_RAW_BYTES
+        };
         while let Some(byte) = self.byte()? {
             if !quoted && depth == 0 && matches!(byte, b',' | b'}' | b']') {
                 self.replay = Some(byte);
                 break;
             }
             if !overflow {
-                if bytes.len() == MAX_RAW_BYTES {
+                if bytes.len() == max_bytes {
                     bytes = Vec::new();
                     overflow = true;
                 } else {
@@ -1659,6 +1680,36 @@ impl<R: std::io::Read> CensusRead<R> {
                     _ => {}
                 }
             }
+        }
+        if self.syntax_only {
+            // The original-input gate already checked admitted grammar. This
+            // final grammar pass must drain selectors too, without counting a
+            // second loss or parsing discarded nesting into a library stack.
+            return Ok(b"null".to_vec());
+        }
+        if let Some(field) = self.desktop_selector {
+            // Bounded/CAS normalization runs before the whole-document shape
+            // gate. Normalize malformed/deep selectors to a typed default here
+            // and count once; the subsequent reader sees a valid empty value.
+            macro_rules! selector {
+                ($ty:ty) => {{
+                    let decoded = if overflow {
+                        None
+                    } else {
+                        serde_json::from_slice::<$ty>(&bytes).ok()
+                    };
+                    let state = decoded.unwrap_or_else(|| {
+                        super::desktop_lineage::dropped();
+                        <$ty>::default()
+                    });
+                    serde_json::to_vec(&state.0).expect("Desktop selector serialization")
+                }};
+            }
+            return Ok(if field == "claude_desktop_completed_lineage" {
+                selector!(super::desktop_lineage::Projection)
+            } else {
+                selector!(super::desktop_lineage::FileEdges)
+            });
         }
         if overflow {
             return Ok(b"null".to_vec());
@@ -1705,12 +1756,17 @@ impl<R: std::io::Read> CensusRead<R> {
             && !self.quoted
             && !byte.is_ascii_whitespace()
             && !matches!(byte, b',' | b']')
-            && (self.array_index == self.sequence_fields.0
-                || self.array_index == self.sequence_fields.1
-                || self.array_index == self.sequence_fields.2)
+            && self.sequence_fields.contains(&self.array_index)
         {
-            self.shadow_state = self.array_index == self.sequence_fields.1;
-            self.retired_guard = self.array_index == self.sequence_fields.2;
+            self.shadow_state = self.array_index == self.sequence_fields[1];
+            self.retired_guard = self.array_index == self.sequence_fields[2];
+            self.desktop_selector = if self.array_index == self.sequence_fields[3] {
+                Some("claude_desktop_completed_lineage")
+            } else if self.array_index == self.sequence_fields[4] {
+                Some("claude_desktop_lineage_file_edges")
+            } else {
+                None
+            };
             self.replay = Some(byte);
             self.output = std::io::Cursor::new(self.evidence()?);
             return self.next();

@@ -830,6 +830,10 @@ impl ScanIndex {
         mut carry: ScanIndex,
     ) -> std::result::Result<(), lenient_decode::Error> {
         self.session_account_bindings = carry.session_account_bindings;
+        // Local selectors survive capture/Repair without inheriting a complete
+        // census or granting identity authority. Missing stays unknown.
+        self.claude_desktop_completed_lineage = carry.claude_desktop_completed_lineage;
+        self.claude_desktop_lineage_file_edges = carry.claude_desktop_lineage_file_edges;
         self.claude_account_deferred_holds = carry.claude_account_deferred_holds;
         self.claude_request_identity_contract = carry.claude_request_identity_contract;
         self.claude_request_identity_contract_changed = true;
