@@ -26274,7 +26274,7 @@ fn finish_claude_retry_selection(
     index: &mut ScanIndex,
     pending_paths: &mut Vec<ScanTraversalPath>,
     retry_service_end: usize,
-    census_window_end: &str,
+    collected_at: &str,
 ) {
     if claude_request_money::e2::enabled() {
         claude_request_money::e2::defer_roots_of_queued_families(
@@ -26284,7 +26284,7 @@ fn finish_claude_retry_selection(
     }
     let offered_end = retry_service_end.min(pending_paths.len());
     if offered_end > 0 {
-        claude_retry_note_offered(index, &pending_paths[..offered_end], census_window_end);
+        claude_retry_note_offered(index, &pending_paths[..offered_end], collected_at);
     }
 }
 
@@ -27152,11 +27152,13 @@ impl OwnedSourceScan {
         let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
         let causes = traversal.counts.causes.page(census_unix_seconds);
         if source == SnapshotSource::ClaudeCode {
+            // Credit service at this observation, within the admission horizon.
+            // The retained census clock stays frozen for proof and completeness.
             finish_claude_retry_selection(
                 index,
                 &mut pending_paths,
                 retry_service_end,
-                &census_window_end,
+                collected_at,
             );
         }
         index.resume_census_window_end = Some(census_window_end.clone());
