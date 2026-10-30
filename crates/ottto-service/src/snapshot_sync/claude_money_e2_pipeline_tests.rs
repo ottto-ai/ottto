@@ -3902,7 +3902,26 @@ fn org_shares(item: &SnapshotItem) -> BTreeMap<String, u64> {
 /// marker in the invalidated row tags it fresh. Money never changes.
 #[test]
 fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
-    for retained in [false, true] {
+    copy_lent_fixture(&[false, true], 6);
+}
+// DIAGNOSTIC (temporary): CI reports failing test names only; these locate
+// the failing stage and mode, then fold back into the single test above.
+#[test]
+fn diag_copy_lent_stage1_off_ack() { copy_lent_fixture(&[false, true], 1); }
+#[test]
+fn diag_copy_lent_stage2_today() { copy_lent_fixture(&[false, true], 2); }
+#[test]
+fn diag_copy_lent_stage3_first_pass() { copy_lent_fixture(&[false, true], 3); }
+#[test]
+fn diag_copy_lent_stage4_second_pass() { copy_lent_fixture(&[false, true], 4); }
+#[test]
+fn diag_copy_lent_stage5_own_early() { copy_lent_fixture(&[false, true], 5); }
+#[test]
+fn diag_copy_lent_mode_909_only() { copy_lent_fixture(&[false], 6); }
+#[test]
+fn diag_copy_lent_mode_retained_only() { copy_lent_fixture(&[true], 6); }
+fn copy_lent_fixture(modes: &[bool], upto: u8) {
+    for &retained in modes {
         with_e2(|| {
             use crate::snapshots::claude_request_identity::{take_identity_counts, AcceptedBuckets};
             let mut c = Corpus::new("e2-pipeline-copy-derived-identity");
@@ -3936,6 +3955,7 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
                 }
             };
             ack(&mut ledger, stored);
+            if upto == 1 { return; }
             // The 07:00 row X lent, the 08:00 row B proves, and money per row.
             let rows = |item: &SnapshotItem| item.usage_buckets.iter()
                 .map(|bucket| {
@@ -3951,6 +3971,7 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
                 rows(body(&page, COPY).unwrap())
             };
             assert_eq!(today.iter().map(|row| row.4).collect::<Vec<_>>(), [false, true]);
+            if upto == 2 { return; }
             let pass = |c: &Corpus, ledger: &mut AcceptedBuckets| {
                 let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
                 take_identity_counts();
@@ -3958,9 +3979,10 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
                 let copy = body(&page, COPY).expect("the own turns publish").clone();
                 let counts = serde_json::to_value(take_identity_counts()).unwrap();
                 assert_eq!(copy.request_identity_refusals, 0, "never a refusal");
-                assert_eq!(counts["identity_cap"]["accepted_share_changed"], json!(0));
-                let invalidated = counts["identity_cap"]["copy_derived_proof_invalidated"].as_u64();
-                (copy, invalidated.unwrap_or(0))
+                // `identity_cap` and zero option-(ii) counters are omitted.
+                let count = |key: &str| counts["identity_cap"][key].as_u64().unwrap_or(0);
+                assert_eq!(count("accepted_share_changed"), 0);
+                (copy, count("copy_derived_proof_invalidated"))
             };
             for once in [1, 0] {
                 let (copy, invalidated) = pass(&c, &mut ledger);
@@ -3971,6 +3993,7 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
                     (&today[1].0, today[1].1, today[1].2, &today[1].3));
                 assert!(got[1].4 || got[1].5, "the row B proves keeps its accepted identity");
                 assert_eq!(org_shares(&copy).get(&x), None);
+                if upto == 3 || (upto == 4 && once == 0) { return; }
             }
             // The invalidated row reads as never accepted: own evidence tags it fresh.
             let (copy, _) = pass(&c, &mut ledger);
@@ -3983,6 +4006,7 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
             let row = &copy.usage_buckets[0].model_usage[0];
             assert!(!row.identity_retained && row.identity_parts.is_some(), "fresh own tags");
             assert_eq!(org_shares(&copy).get(&x), None);
+            if upto == 5 { return; }
             // A copied marker never lent B's row: its own later change is #909's.
             text += &switched("33333333-3333-4333-8333-333333333333");
             text += &line_by(COPY, "own-late", "2026-08-02T08:20:00Z", 10, RESUME_WRITER);
