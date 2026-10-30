@@ -1249,6 +1249,21 @@ mod retained_tests {
             !restored.retained_enabled(),
             "capability is never persisted"
         );
+        let compact: Value = serde_json::from_slice(&encoded).unwrap();
+        let session = compact.as_object().unwrap().values().next().unwrap();
+        assert_eq!(session["proved"].as_str().unwrap().len(), 80);
+        for corrupt in [json!("0".repeat(79)), json!("G".repeat(80)), json!([1])] {
+            let mut bad = compact.clone();
+            for state in bad.as_object_mut().unwrap().values_mut() {
+                state["proved"] = corrupt.clone();
+            }
+            let mut dropped: AcceptedBuckets = serde_json::from_value(bad).unwrap();
+            dropped.bind_test_key(Some([0x42; 32]));
+            assert!(
+                dropped.is_empty(),
+                "malformed proved rows drop only the hint"
+            );
+        }
         let mut rotated: AcceptedBuckets = serde_json::from_slice(&encoded).unwrap();
         rotated.bind_test_key(Some([0x43; 32]));
         assert!(rotated.is_empty(), "a rotated key drops proved rows too");
