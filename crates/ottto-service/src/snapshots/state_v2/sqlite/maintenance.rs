@@ -67,6 +67,8 @@ pub(in super::super) struct MaintenanceStats {
     db_size_alarm: bool,
     erasure_breaches: u64,
     maintenance_pauses: u64,
+    erasure_late_completions: u64,
+    erasure_resume_refusals: u64,
     reference_drift: u64,
     reference_check_failed: u64,
 }
@@ -165,6 +167,10 @@ fn limited<T>(conn: &Connection, work: Duration, f: impl FnOnce() -> Result<T>) 
 }
 
 fn free_space(path: &Path) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(space) = TEST_SPACE.with(|s| *s.borrow()) {
+        return space;
+    }
     let file = File::open(path.parent()?).ok()?;
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // fstatvfs initializes the struct only on success; no paths enter gauges.
@@ -316,10 +322,72 @@ impl Sqlite {
     pub(in super::super) fn maintenance(&mut self, idle: bool) -> Result<()> {
         self.maintain(idle.then_some(true))
     }
-    /// Called only after a source pass, while acquisition is paused. A busy
-    /// source gets a bounded maintenance pause before its deadline.
+    /// Acquisition yields our connection and transactions at this boundary.
+    /// Own work never takes priority over a due privacy maintenance pause.
     pub(in super::super) fn between_cycles(&mut self, quiet: bool) -> Result<()> {
         self.maintain(Some(quiet))
+    }
+    /// Run before each collection continuation, including the first after sleep
+    /// or disk recovery. Never resume normal collection with overdue debt.
+    pub(in super::super) fn collection_pause_due(&self) -> Result<bool> {
+        if self.read_control::<u64>("erasure_pending")?.unwrap_or(0) == 0 {
+            return Ok(false);
+        }
+        let age = self
+            .read_control::<u64>("erasure_since")?
+            .and_then(|since| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()?
+                    .as_secs()
+                    .checked_sub(since)
+            });
+        Ok(age.map_or(true, |age| {
+            age >= (self.purge_policy.deadline.as_secs() * 5 / 6).min(20 * 3600)
+        }))
+    }
+    pub(in super::super) fn before_collection(&mut self) -> Result<()> {
+        if !self.collection_pause_due()? {
+            return Ok(());
+        }
+        self.maintain(Some(false))?;
+        if self.stats.erasure_overdue {
+            self.stats.erasure_resume_refusals =
+                self.stats.erasure_resume_refusals.saturating_add(1);
+            crate::local_resource_diagnostics::claude_state_v2(&self.stats);
+            bail!("state_v2_erasure_before_collection");
+        }
+        Ok(())
+    }
+    pub(in super::super) fn collection_lock_refused(&mut self, reason: &'static str) {
+        let pending = self
+            .read_control::<u64>("erasure_pending")
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+            != 0;
+        let age = self
+            .read_control::<u64>("erasure_since")
+            .ok()
+            .flatten()
+            .and_then(|since| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()?
+                    .as_secs()
+                    .checked_sub(since)
+            });
+        if pending && age.map_or(true, |age| age >= self.purge_policy.deadline.as_secs()) {
+            if !self.stats.erasure_overdue {
+                self.stats.erasure_breaches = self.stats.erasure_breaches.saturating_add(1);
+                super::super::telemetry::event("erasure_deadline_breach", &1);
+            }
+            self.stats.erasure_overdue = true;
+            self.stats.erasure_resume_refusals =
+                self.stats.erasure_resume_refusals.saturating_add(1);
+            self.erasure_failed(reason);
+            crate::local_resource_diagnostics::claude_state_v2(&self.stats);
+        }
     }
     fn maintain(&mut self, window: Option<bool>) -> Result<()> {
         let result = self.maintenance_inner(window);
@@ -355,6 +423,107 @@ impl Sqlite {
             return Ok(());
         }
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let epoch = self.read_control::<u64>("erasure_pending")?.unwrap_or(0);
+        let pending = epoch != 0;
+        let since = self.read_control::<u64>("erasure_since")?;
+        let age = if pending {
+            since.and_then(|s| now.checked_sub(s))
+        } else {
+            None
+        };
+        self.stats.erasure_pending_age_s = age;
+        self.stats.oldest_pending_age_s = age;
+        // A missing/future clock cannot establish that the privacy deadline is
+        // still open. Keep custody and use the conservative overdue posture.
+        let overdue = pending
+            && age.map_or(true, |age| {
+                Duration::from_secs(age) >= self.purge_policy.deadline
+            });
+        if overdue && !self.stats.erasure_overdue {
+            self.stats.erasure_breaches = self.stats.erasure_breaches.saturating_add(1);
+            super::super::telemetry::event("erasure_deadline_breach", &1);
+        }
+        self.stats.erasure_overdue = overdue;
+        let last = self.read_control::<u64>("erasure_attempt")?;
+        let failures = self.read_control::<u64>("erasure_failures")?.unwrap_or(0);
+        let success = self.read_control::<u64>("erasure_success")?;
+        let success_due =
+            success.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 86400));
+        let retry = Duration::from_secs(age.map_or(retry_seconds(failures), |age| {
+            retry_seconds(failures)
+                .min((self.purge_policy.deadline.as_secs().saturating_sub(age) / 2).max(1))
+        }));
+        let wall_due = last.map_or(true, |s| {
+            now.checked_sub(s).is_some_and(|age| age >= retry.as_secs())
+        });
+        let monotonic_due = self
+            .last_purge_attempt
+            .map_or(true, |s| s.elapsed() >= retry);
+        // Only an explicit acquisition pause may VACUUM. Ordinary writes do
+        // not acquire this permission. On recovery, overdue debt overrides the
+        // normal successful-run cadence and failed-attempt backoff: erasure
+        // must precede resuming collection, even just after a failed attempt.
+        let deadline = self.purge_policy.deadline.as_secs();
+        let early = age.map_or(true, |a| a >= (deadline / 2).min(12 * 3600));
+        let pause_due = age.map_or(true, |a| a >= (deadline * 5 / 6).min(20 * 3600));
+        let idle = window.is_some();
+        let opportunity =
+            window.is_some_and(|quiet| overdue || if quiet { early } else { pause_due });
+        // A forced pause may override successful-run cadence, but ordinary
+        // failures still back off within the remaining deadline. After the
+        // deadline, recovery attempts take precedence over both cooldowns.
+        if pending
+            && opportunity
+            && (overdue || (success_due || pause_due) && wall_due && monotonic_due)
+        {
+            if window == Some(false) {
+                self.stats.maintenance_pauses = self.stats.maintenance_pauses.saturating_add(1);
+            }
+            self.control("erasure_attempt", &now)?;
+            // Crash during work is a failed attempt, with persisted pacing.
+            self.control("erasure_failures", &failures.saturating_add(1))?;
+            self.last_purge_attempt = Some(Instant::now());
+            // Backups carry the same PL erasure obligation as the database.
+            let backup = sidecar(&self.path, ".migration-backup");
+            match fs::remove_file(&backup) {
+                Ok(()) => super::super::super::sync_checkpoint_parent(&backup)?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    self.erasure_failed("backup_io");
+                    return Ok(());
+                }
+            }
+            let result = self.checkpoint(CheckpointMode::Purge);
+            if result.state == CheckpointState::Complete {
+                // Success and epoch clear are atomic. A crash never grants a
+                // false completion; recovery may override normal cadence.
+                let completed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                let late = overdue
+                    || since
+                        .and_then(|s| completed_at.checked_sub(s))
+                        .map_or(true, |age| age >= self.purge_policy.deadline.as_secs());
+                if late && !self.stats.erasure_overdue {
+                    self.stats.erasure_overdue = true;
+                    self.stats.erasure_breaches = self.stats.erasure_breaches.saturating_add(1);
+                    super::super::telemetry::event("erasure_deadline_breach", &1);
+                }
+                self.erasure_complete(completed_at, epoch)?;
+                self.stats.erasure_vacuum.runs = self.stats.erasure_vacuum.runs.saturating_add(1);
+                if late {
+                    self.stats.erasure_late_completions =
+                        self.stats.erasure_late_completions.saturating_add(1);
+                    super::super::telemetry::event("erasure_late_completion_alarm", &1);
+                }
+                if self.read_control::<u64>("erasure_pending")? == Some(0) {
+                    self.stats.erasure_overdue = false;
+                    self.stats.erasure_pending_age_s = None;
+                    self.stats.oldest_pending_age_s = None;
+                }
+            }
+        } else if pending && idle {
+            self.stats.vacuum_deferred = self.stats.vacuum_deferred.saturating_add(1);
+        }
+
         if window == Some(true) {
             if let Some(extract) = self.references {
                 let last = self.read_control::<u64>("reference_check_success")?;
@@ -389,80 +558,6 @@ impl Sqlite {
                 }
             }
         }
-        let epoch = self.read_control::<u64>("erasure_pending")?.unwrap_or(0);
-        let pending = epoch != 0;
-        let since = self.read_control::<u64>("erasure_since")?;
-        let age = if pending {
-            since.and_then(|s| now.checked_sub(s))
-        } else {
-            None
-        };
-        self.stats.erasure_pending_age_s = age;
-        self.stats.oldest_pending_age_s = age;
-        // A missing/future clock cannot establish that the privacy deadline is
-        // still open. Keep custody and use the conservative overdue posture.
-        let overdue = pending
-            && age.map_or(true, |age| {
-                Duration::from_secs(age) >= self.purge_policy.deadline
-            });
-        if overdue && !self.stats.erasure_overdue {
-            self.stats.erasure_breaches = self.stats.erasure_breaches.saturating_add(1);
-            super::super::telemetry::event("erasure_deadline_breach", &1);
-        }
-        self.stats.erasure_overdue = overdue;
-        let last = self.read_control::<u64>("erasure_attempt")?;
-        let failures = self.read_control::<u64>("erasure_failures")?.unwrap_or(0);
-        let success = self.read_control::<u64>("erasure_success")?;
-        let success_due =
-            success.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 86400));
-        let retry = Duration::from_secs(retry_seconds(failures));
-        let wall_due = last.map_or(true, |s| {
-            now.checked_sub(s).is_some_and(|age| age >= retry.as_secs())
-        });
-        let monotonic_due = self
-            .last_purge_attempt
-            .map_or(true, |s| s.elapsed() >= retry);
-        // Only this explicit between-cycle idle route may VACUUM. Overdue is
-        // telemetry, never permission to run it during load/save or block them.
-        let deadline = self.purge_policy.deadline.as_secs();
-        let early = age.map_or(true, |a| a >= (deadline / 2).min(12 * 3600));
-        let pause_due = age.map_or(true, |a| a >= (deadline * 5 / 6).min(20 * 3600));
-        let idle = window.is_some();
-        let opportunity = window.is_some_and(|quiet| if quiet { early } else { pause_due });
-        if pending && opportunity && success_due && wall_due && monotonic_due {
-            if window == Some(false) {
-                self.stats.maintenance_pauses = self.stats.maintenance_pauses.saturating_add(1);
-            }
-            self.control("erasure_attempt", &now)?;
-            // Crash during work is a failed attempt, with persisted pacing.
-            self.control("erasure_failures", &failures.saturating_add(1))?;
-            self.last_purge_attempt = Some(Instant::now());
-            // Backups carry the same PL erasure obligation as the database.
-            let backup = sidecar(&self.path, ".migration-backup");
-            match fs::remove_file(&backup) {
-                Ok(()) => super::super::super::sync_checkpoint_parent(&backup)?,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(_) => {
-                    self.erasure_failed("backup_io");
-                    return Ok(());
-                }
-            }
-            let result = self.checkpoint(CheckpointMode::Purge);
-            if result.state == CheckpointState::Complete {
-                // Success and clear must be atomic; a crash cannot grant a
-                // second successful VACUUM in the 24-hour window.
-                self.erasure_complete(now, epoch)?;
-                self.stats.erasure_vacuum.runs = self.stats.erasure_vacuum.runs.saturating_add(1);
-                if self.read_control::<u64>("erasure_pending")? == Some(0) {
-                    self.stats.erasure_overdue = false;
-                    self.stats.erasure_pending_age_s = None;
-                    self.stats.oldest_pending_age_s = None;
-                }
-            }
-        } else if pending && idle {
-            self.stats.vacuum_deferred = self.stats.vacuum_deferred.saturating_add(1);
-        }
-
         let bytes = self.wal_bytes();
         self.stats.observe_wal(bytes);
         let required = self.debt || bytes.map_or(true, |bytes| bytes >= WAL_PASSIVE_BYTES);
@@ -506,4 +601,19 @@ mod tests {
             [3600, 7200, 14400, 14400]
         );
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SPACE: std::cell::RefCell<Option<Option<u64>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(in super::super) fn space_for_test(space: Option<u64>) -> impl Drop {
+    struct Reset(Option<Option<u64>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_SPACE.with(|s| *s.borrow_mut() = self.0);
+        }
+    }
+    Reset(TEST_SPACE.with(|s| s.replace(Some(space))))
 }

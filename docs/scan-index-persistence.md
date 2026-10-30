@@ -6,14 +6,11 @@ The private state-v2 backend is not yet routed from application load/save. The
 reader and legacy-write behavior below remains the active behavior. The backend
 alone does not provide conversion, publication, recovery or a runtime switch.
 
-Its format-1 schema has 14 tables and 108 columns. Census records contain fixed
-columns and a 16-byte integrity digest, with no duplicate variable payload.
-Unsigned clocks/extents use exact eight-byte big-endian blobs; account evidence
-counts use sixteen bytes. Window strings keep their spelling, including malformed
-values. Hash strings have a tagged literal or canonical lowercase binary encoding;
-optional absence remains distinct from empty text. Unchunked keys and strings
-have a checked 4 KiB fallback cap. Variable values use at most 256 parts of
-256 KiB each, or inline storage up to 512 bytes.
+Its format-1 schema uses four physical tables: control, records, shared_values
+and value_chunks. Typed per-kind headers project bounded selection fields;
+values preserve presence, spelling and exact accounting evidence. Variable
+values use at most 256 parts of 256 KiB each, or inline storage up to 512 bytes.
+Unchunked keys and strings have a checked 4 KiB fallback cap.
 
 Request-set lookup commitments are nonunique. Reuse requires streamed equality
 of the complete evidence tuple, including encoding, payload, full fingerprint,
@@ -32,30 +29,49 @@ deadline. `secure_delete` and TRUNCATE alone cannot establish erasure: stale tex
 may remain in gaps in live pages. Completion requires in-place VACUUM, successful
 TRUNCATE with a measured zero-length WAL, and a durable metadata-only clear.
 
-The backend defaults to a configurable 24-hour deadline and prefers an idle
-pass. Normal writes remain possible before the deadline, subject to ordinary
-WAL checkpoint debt. Each VACUUM attempt is paced across restart to at most once
-per deadline window. Failed or incomplete maintenance retains the obligation;
-overdue obligations alarm and refuse further writes until resolved. A completed
-data commit remains completed if later maintenance fails.
-When the clock is behind the persisted last attempt, maintenance cannot prove
-that its cooldown elapsed. It defers VACUUM and retains any overdue alarm across
-restart until the clock or explicit repair resolves the uncertainty.
+SOURCE wording: "Deleted private text is not readable through Ottto's store files within 24 h of deletion while the Mac is awake and has enough free disk. If that is not possible, it is erased at the first moment the Mac is awake with enough disk, before normal collection resumes, and the late erasure is counted and alerted."
+
+The default deadline is 24 hours; shorter deadlines are allowed. A longer
+policy requires SOURCE approval and is capped at 72 hours; erasure is never
+disabled. That cap is a policy limit, never a grace period for overdue debt.
+Idle attempts start around 12 hours. At 20 hours (scaled down for shorter
+policies), a maintenance pause takes precedence over Ottto's own acquisition
+work and locks. The pause reserves the next checkpoint-lock turn before waiting
+up to two seconds for an existing Ottto owner; new normal work yields to it.
+Own-lock failure remains a failure and an overdue breach. Another process's lock is a counted breach if it prevents
+completion within the deadline. Failed attempts retain debt and back off within
+the remaining deadline. Successful runs normally have a 24-hour cadence, which
+yields to the forced maintenance pause and overdue recovery.
+
+Preparation and every acquisition continuation check maintenance before normal
+collection. After sleep or space recovery, overdue VACUUM plus verified TRUNCATE
+runs before collection resumes, overriding retry and successful-run cooldowns.
+If it cannot complete, collection remains paused and debt remains visible;
+previously committed data remains committed. A missing or regressed deletion
+clock uses the same conservative overdue posture, rather than postponing purge.
+Privacy work precedes optional daily reference verification.
 
 Admission requires available space of at least twice the larger of the main
 file length and the logical database size, including pages still in WAL.
-Unknown space refuses the attempt. VACUUM has a configurable VM work budget
-(250 ms by default) plus the existing bounded busy wait. This is interruptible
-work, not a hard latency guarantee. A large database can require a larger budget
+An additional 1 GiB is reserved; unknown space refuses the attempt. VACUUM has a
+configurable VM work budget (2 seconds minimum, with 20 ms per MiB plus 2 seconds)
+plus the existing bounded busy wait. This is interruptible work, not a hard latency guarantee. A large database can require a larger budget
 to finish. Its WAL may grow approximately with database size; the 64 MiB WAL
 alarm is not a cap. System SQLite temporary-file behavior and maintenance cost
 still require platform qualification before routing or enabling conversion.
 
-The erasure claim covers bytes readable through the current DB/WAL/SHM after
-verified completion. It excludes retained read-only v1 baselines, temporary-file
-remnants, APFS snapshots and physical SSD erasure. Baseline lifetime requires a
-separate retention policy. No application deletion or money-debt retirement is
-authorized merely by this storage maintenance.
+Verified completion covers the current DB/WAL/SHM and the removed migration
+backup. The retained read-only v1 baseline is an explicit policy exception:
+it is never used to resurrect a forgotten file, and its 14-day hard age raises
+an escalation alarm. Forget, uninstall and source removal immediately delete
+that source's DB/WAL/SHM, v1-readonly and private remnants under their existing
+exclusive cleanup owner. Temporary remnants and external restart records have
+separate inventory/cleanup owners; a DB VACUUM does not certify their erasure.
+APFS snapshots and physical SSD erasure are outside the promise. No application
+deletion or money-debt retirement is authorized merely by this storage maintenance.
+
+There is no rebuild; old restart records are re-pinned lazily by M3 only when a file grows.
+Conversion does not add a re-pin admission gate or require transcript re-read hours.
 
 ## Active reader behavior
 

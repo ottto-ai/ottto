@@ -168,9 +168,11 @@ fn header(table: Table, row: &rusqlite::Row<'_>) -> rusqlite::Result<Header> {
         );
         Ok(h)
     }
-    convert(table, row).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, error.into())
-    })
+    convert(table, row)
+        .inspect(|_| super::telemetry::decoded(0, 1, 0))
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, error.into())
+        })
 }
 fn predicate(table: Table) -> String {
     table
@@ -974,6 +976,7 @@ fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> 
             "state_v2_control_checksum"
         );
         out.write_all(&bytes)?;
+        super::telemetry::decoded(1, 0, 0);
         return Ok(());
     }
     ensure!(row_checksum(h)? == h.row_checksum, "state_v2_row_checksum");
@@ -1019,6 +1022,7 @@ fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> 
                 "state_v2_short_part"
             );
             consume(bytes)?;
+            super::telemetry::decoded(0, 0, 1);
             part += 1;
         }
         ensure!(part == h.parts, "state_v2_missing_parts");
@@ -1027,6 +1031,7 @@ fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> 
         len == h.len && integrity(hash) == h.digest,
         "state_v2_value_digest"
     );
+    super::telemetry::decoded(1, 0, 0);
     Ok(())
 }
 
@@ -1761,3 +1766,6 @@ fn quick_check(conn: &Connection, budget: Duration) -> Result<()> {
 mod fixtures;
 #[cfg(test)]
 pub(super) use fixtures::*;
+
+#[cfg(test)]
+pub(super) use maintenance::space_for_test;

@@ -808,3 +808,6 @@ impl StorageLimits {
         }
     }
 }
+
+// OPS-only maintenance and counts/bytes/times diagnostics seams.
+pub(super) use runtime::before_collection;
