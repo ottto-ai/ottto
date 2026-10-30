@@ -906,11 +906,11 @@ fn desktop_identity_natural_complete_refusal_cannot_settle_whole_or_partial_save
                 &BTreeMap::new(),
                 &quarantine,
             );
-            assert_eq!(
-                f.latch(&f.restart(working.clone())),
-                Some(Pending),
-                "whole-index save"
-            );
+            // Independent save alternatives need independent CAS destinations.
+            let whole_path = f.home.join("whole-index.json");
+            working.clone().save(&whole_path).unwrap();
+            let whole = ScanIndex::load(&whole_path).unwrap();
+            assert_eq!(f.latch(&whole), Some(Pending), "whole-index save");
             let accepted = old_acks.keys().cloned().collect();
             let partial = working.committable_subset(&committed, &accepted, &quarantine);
             assert_eq!(

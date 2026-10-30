@@ -354,6 +354,23 @@ fn settle(mut run: Run) -> ScanIndex {
         .iter()
         .map(|s| s.snapshot_fingerprint.clone())
         .collect();
+    let accepted_bodies = run
+        .result
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.snapshot_fingerprint.clone(),
+                snapshot_upload_body_witness(item),
+            )
+        })
+        .collect();
+    run.index.settle_desktop_identity_reoffers(
+        &run.result,
+        &accepted_bodies,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    );
     run.index.record_accepted_snapshot_fingerprints(&accepted);
     run.index
 }

@@ -2782,7 +2782,7 @@ fn returning_tombstoned_family_that_grew_reproves_in_a_fresh_window() {
 fn desktop_identity_real_sync_rejected_body_stays_pending_exact_acked_retry_settles() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _manifests = SourceManifestTestGuard::new();
-    let start = 2_000_000_000;
+    let start = current_unix_seconds();
     let mut pipeline = ReofferPipeline::new(
         "desktop-identity-exact-ack",
         Answer::Refuse(ORIGINAL_PAIR),
