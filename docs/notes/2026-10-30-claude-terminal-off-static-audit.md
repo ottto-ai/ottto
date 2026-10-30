@@ -249,3 +249,37 @@ first-duplicate behavior now matches main's original `.find()`.
 | 192 | [snapshots/upload_context_receipt.rs:299](../../crates/ottto-service/src/snapshots/upload_context_receipt.rs#L299)<br>`@@ -116,3 +299,5 @@` | gated / neutral | OFF adoption has a literal main fallback. Mixed context view is empty/false in OFF, including stale-view query protection; memo and retry-hold narrowing are ON-only. Main per-ACK receipt format/validation/context policies are untouched. |
 | 193 | [snapshots/upload_context_receipt.rs:311](../../crates/ottto-service/src/snapshots/upload_context_receipt.rs#L311)<br>`@@ -125,0 +311,6 @@` | gated / neutral | OFF adoption has a literal main fallback. Mixed context view is empty/false in OFF, including stale-view query protection; memo and retry-hold narrowing are ON-only. Main per-ACK receipt format/validation/context policies are untouched. |
 | 194 | [snapshots/upload_context_receipt.rs:329](../../crates/ottto-service/src/snapshots/upload_context_receipt.rs#L329)<br>`@@ -138,3 +329,10 @@` | gated / neutral | OFF adoption has a literal main fallback. Mixed context view is empty/false in OFF, including stale-view query protection; memo and retry-hold narrowing are ON-only. Main per-ACK receipt format/validation/context policies are untouched. |
+
+
+## L1 ON-readiness delta: selected body-drain reconciliation
+
+Audited `f7dd3fe6c` → `0add39ad2` (R2 production): **6 additional
+production hunks in 2 paths, +157/−0**. This is a delta against the frozen
+inventory above; integration must regenerate the full main-relative inventory.
+Every new execution path checks `claude_terminal_off()`; OFF captures no drains
+and performs no reconciliation. The page-local evidence has no serde field or
+persisted representation. Empty drains and absent-member retirement keep their
+existing settlement mechanisms.
+
+| Delta | Source / hunk | Classification | OFF identity and ON behavior |
+| --- | --- | --- | --- |
+| L1-1 | `snapshots/authority_proof_correction.rs:1`, `@@ -0,0 +1,11 @@` | inert type | Page-local body-drain evidence, reachable only through the gated capture/restore pair; no serialized state. |
+| L1-2 | `snapshots/authority_proof_correction.rs:426`, `@@ -414,0 +426,128 @@` | gated | Capture only prior owed body members drained under the same proof. Re-owe any selected revision/entity-set mismatch with the prior record pair. A last-member clear restores the record and retained family pending; carried siblings keep their drained revisions. Different-proof grants and failed corrections are excluded. Both methods return immediately in OFF. |
+| L1-3 | `snapshot_sync.rs:3098`, `@@ -3097,0 +3098,5 @@` | gated | Capture before partial-checkpoint selection. OFF uses an empty vector without calling the capture helper. |
+| L1-4 | `snapshot_sync.rs:3223`, `@@ -3217,0 +3223,3 @@` | gated | Reconcile immediately before partial-checkpoint save, after fallback, audit release, ACK handoff and context rearm. OFF skips the call. |
+| L1-5 | `snapshot_sync.rs:7806`, `@@ -7797,0 +7806,5 @@` | gated | Capture immediately after exact pre-selection settlement for finish outcomes. OFF uses an empty vector. |
+| L1-6 | `snapshot_sync.rs:8259`, `@@ -8245,0 +8259,5 @@` | gated | Reconcile after native selected-state restore, audit release, ACK handoff and context rearm, before prior-index retirement and finish save. Preserves the existing prior-index lifetime boundary. OFF skips the call. |
+
+Line references for L1-2 are at the production commit; the subsequent cfg(test)
+candidate constructor shifts that helper to line 448 without changing production
+bytes. The Claude parse-counter capture and forced-trigger trace are cfg(test)
+only. No production diagnostic bytes, pacing or forced-family admission changed.
+The restored debt may cause one existing `forced_family` family-unit re-read on
+the member's next page; the pipeline fixture counts it explicitly.
+
+R3 is relabelled **SHIP-WITH-DISCLOSURE for M4 ON only**. Its ON twin requires the
+exact page-0 non-held drain set and the exact counted family burst, keeping the
+money, ACK, hold, no-drop and final-settlement checks. It leaves the ignore
+manifest but remains in the separate `FLEET_GATE` list beside that manifest.
+Before default-ON for everyone, the real boundedness fix and strict original
+separate-pages assertion remain required. This delta does not authorize ON.
