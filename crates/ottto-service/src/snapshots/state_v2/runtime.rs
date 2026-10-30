@@ -803,6 +803,10 @@ fn register(state: &mut RouteState, index: &ScanIndex) -> Result<()> {
 fn erasure_inventory(path: &Path) -> Result<()> {
     for (class, artifact) in [
         (
+            "owner_lock_inventory",
+            fence::sibling(path, ".v2.sqlite.owner"),
+        ),
+        (
             "migration_backup_inventory",
             fence::sibling(path, ".v2.sqlite.migration-backup"),
         ),
@@ -911,6 +915,7 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
         ".v2.sqlite",
         ".v2.sqlite-wal",
         ".v2.sqlite-shm",
+        ".v2.sqlite.owner",
         ".v2.sqlite.migration-backup",
         ".v2.sqlite.import",
         ".v2.sqlite.import-wal",

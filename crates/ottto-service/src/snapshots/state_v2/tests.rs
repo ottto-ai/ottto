@@ -235,6 +235,70 @@ fn f6_import_is_journal_off_and_has_no_import_wal() {
 }
 
 #[test]
+fn owner_sidecar_allows_sqlite_init_migration_publication_and_reopen() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let tmp = Scratch::new();
+    fs::set_permissions(&tmp.0, fs::Permissions::from_mode(0o700)).unwrap();
+    // As in runtime, CheckpointLock spans connection close, rename and reopen.
+    let _checkpoint = super::super::CheckpointLock::acquire(&tmp.0.join("index.json")).unwrap();
+    let published = tmp.0.join("index.v2.sqlite");
+    let owner_path = tmp.0.join("index.v2.sqlite.owner");
+    // The real create path runs journal_mode=OFF and migrations with ownership
+    // held. A DB-inode flock fails here with SQLITE_BUSY on Darwin.
+    let db = tmp.store();
+    let owner = fs::symlink_metadata(&owner_path).unwrap();
+    assert_eq!(owner.mode() & 0o777, 0o600);
+    assert_eq!(owner.nlink(), 1);
+    assert_ne!(owner.ino(), fs::metadata(tmp.path()).unwrap().ino());
+    assert_eq!(sqlite::schema_for_test(&db).0.len(), 4);
+    assert_eq!(
+        sqlite::Sqlite::create_import(&tmp.path())
+            .err()
+            .unwrap()
+            .to_string(),
+        "state_v2_exclusive_owner_busy"
+    );
+    db.finish_import().unwrap();
+    fs::rename(tmp.path(), &published).unwrap();
+    let mut db = sqlite::Sqlite::open(&published, &tmp.identity()).unwrap();
+    assert_eq!(db.stamp().unwrap().0, 0);
+    assert_eq!(fs::metadata(&owner_path).unwrap().ino(), owner.ino());
+    assert_eq!(
+        sqlite::Sqlite::open(&published, &tmp.identity())
+            .err()
+            .unwrap()
+            .to_string(),
+        "state_v2_exclusive_owner_busy"
+    );
+    db.clean_checkpoint().unwrap();
+    drop(db);
+    let db = sqlite::Sqlite::open(&published, &tmp.identity()).unwrap();
+    assert_eq!(db.stamp().unwrap().0, 0);
+}
+
+#[test]
+fn owner_sidecar_rejects_symlinks_and_hardlinks_before_db_creation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for symlink in [true, false] {
+        let tmp = Scratch::new();
+        let target = tmp.0.join("target");
+        fs::write(&target, b"unchanged").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let owner = tmp.0.join("index.v2.sqlite.owner");
+        if symlink {
+            std::os::unix::fs::symlink(&target, &owner).unwrap();
+        } else {
+            fs::hard_link(&target, &owner).unwrap();
+        }
+        assert!(sqlite::Sqlite::create_import(&tmp.path()).is_err());
+        assert!(!tmp.path().exists());
+        assert_eq!(fs::read(target).unwrap(), b"unchanged");
+    }
+}
+
+#[test]
 fn f5_independent_identity_mismatch_refuses_before_wal_mutation() {
     let tmp = Scratch::new();
     let db = tmp.store();

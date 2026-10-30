@@ -351,7 +351,7 @@ fn destructive_backup_is_private_verified_and_never_overwritten() {
         .mode(0o600)
         .open(&path)
         .unwrap();
-    lock_owner(&owned).unwrap();
+    let owner_lock = lock_owner(&path).unwrap();
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
     settings(&conn, false).unwrap();
@@ -364,6 +364,7 @@ fn destructive_backup_is_private_verified_and_never_overwritten() {
     assert!(verified_backup(&conn).is_err());
     assert_eq!(fs::read(&backup).unwrap(), bytes);
     drop(conn);
+    drop(owner_lock);
     drop(owned);
     fs::remove_dir_all(dir).unwrap();
 }
