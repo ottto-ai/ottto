@@ -15185,6 +15185,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn pi_live_prepare_ledger_cap_counts_codec_refusal_once() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::ScratchDir::new("pi-live-ledger-cap");
     let _lock = test_locks::hold(&root);
     let path = root.join("fixture.jsonl");

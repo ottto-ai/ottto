@@ -4877,7 +4877,7 @@ fn o3_ambiguous_negative_evidence_refuses_through_every_reader() {
 /// flag and needs either an offer or a smaller committed index selection.
 /// These facts are independent of the native layout a restore needs.
 #[test]
-fn pi_restored_behind_accepted_counts_an_offer_or_an_index_regression() {
+fn restored_behind_accepted_counts_pi_offers_or_index_regressions() {
     use crate::local_resource_diagnostics::capture;
     let scratch = crate::test_scratch::ScratchDir::new("lenient-pi-behind-accepted");
     let key = "/synthetic/0.jsonl".to_string();

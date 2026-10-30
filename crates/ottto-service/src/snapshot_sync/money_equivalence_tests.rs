@@ -1455,6 +1455,7 @@ fn pi_ledger_splits(
 
 #[test]
 fn pi() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi") {
         return;
     }
@@ -1475,6 +1476,7 @@ fn pi() {
 
 #[test]
 fn pi_tool_turn() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_tool_turn") {
         return;
     }
@@ -1499,6 +1501,7 @@ fn pi_tool_turn() {
 
 #[test]
 fn pi_summary_usage() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_summary_usage") {
         return;
     }
@@ -1542,6 +1545,7 @@ fn pi_summary_usage() {
 
 #[test]
 fn pi_usage_entry_kinds() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_usage_entry_kinds") {
         return;
     }
@@ -1565,6 +1569,7 @@ fn pi_usage_entry_kinds() {
 
 #[test]
 fn pi_ledger_seal_boundaries() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_ledger_seal_boundaries") {
         return;
     }
@@ -1626,6 +1631,7 @@ fn pi_ledger_seal_boundaries() {
 
 #[test]
 fn pi_divergent_pair_quarantine() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_divergent_pair_quarantine") {
         return;
     }
@@ -1660,6 +1666,7 @@ fn pi_divergent_pair_quarantine() {
 
 #[test]
 fn pi_no_response_id() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_no_response_id") {
         return;
     }
@@ -1677,6 +1684,7 @@ fn pi_no_response_id() {
 
 #[test]
 fn pi_selector_across_seal() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_selector_across_seal") {
         return;
     }
@@ -1713,6 +1721,7 @@ fn pi_selector_across_seal() {
 
 #[test]
 fn pi_time_and_invalid_evidence() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_time_and_invalid_evidence") {
         return;
     }
@@ -1757,6 +1766,7 @@ fn pi_time_and_invalid_evidence() {
 
 #[test]
 fn pi_error_zero_requests() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_error_zero_requests") {
         return;
     }
@@ -1776,6 +1786,7 @@ fn pi_error_zero_requests() {
 
 #[test]
 fn pi_cli_fork_preserves_double_count() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_cli_fork_preserves_double_count") {
         return;
     }
@@ -1826,6 +1837,7 @@ fn pi_cli_fork_preserves_double_count() {
 
 #[test]
 fn pi_version_rewrite_after_tail() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_version_rewrite_after_tail") {
         return;
     }
@@ -1889,6 +1901,7 @@ fn pi_version_rewrite_after_tail() {
 
 #[test]
 fn pi_restart_between_pages() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_restart_between_pages") {
         return;
     }
@@ -1905,6 +1918,7 @@ fn pi_restart_between_pages() {
 
 #[test]
 fn pi_upgrade_without_semantic_revision() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_upgrade_without_semantic_revision") {
         return;
     }
@@ -1940,6 +1954,7 @@ fn pi_upgrade_without_semantic_revision() {
 
 #[test]
 fn pi_downgrade_then_reupgrade() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_downgrade_then_reupgrade") {
         return;
     }
@@ -2005,6 +2020,7 @@ fn pi_downgrade_then_reupgrade() {
 #[cfg(unix)]
 #[test]
 fn pi_acquisition_metadata_changes() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("pi_acquisition_metadata_changes") {
         return;
     }

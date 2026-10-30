@@ -8457,7 +8457,11 @@ pub fn finalize_scan_after_policy_with_body_witness(
         sampled_scan::durable_tail::record_restored_publication(
             source,
             true,
-            (pending.parse_complete && offered) || regressed,
+            if source == SnapshotSource::Pi {
+                offered || regressed
+            } else {
+                pending.parse_complete && offered
+            },
         );
     }
 
