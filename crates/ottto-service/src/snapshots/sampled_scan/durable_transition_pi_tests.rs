@@ -1679,6 +1679,101 @@ fn pi_consent_revoked_purges_counts_and_never_resurrects() {
     whole_body(&cold, &reread);
 }
 
+/// Revocation is observed without a locked store pass. Returning to the
+/// original policy still retires its old literals under the new generation.
+#[test]
+fn pi_consent_off_and_on_without_a_locked_off_pass_purges_the_old_copy() {
+    if !supported("pi_transition_consent_generation") {
+        return;
+    }
+    let mut f = PiDriver::warm("transition-pi-generation", &pi_seed());
+    let old = store_records(&f.disk);
+    let off = SnapshotUploadPolicy {
+        session_titles_enabled: false,
+        ..SnapshotUploadPolicy::default()
+    };
+    crate::snapshots::observe_pi_upload_consent(&f.disk.dir, off).unwrap();
+    assert_eq!(
+        store_records(&f.disk),
+        old,
+        "no store mutation in the off period"
+    );
+    let owner = f.disk.owner(SOURCE);
+    let (_, counts) = cache_lifecycle::observe(|| {
+        crate::snapshots::begin_pi_upload_gates(
+            &owner.cache,
+            &f.disk.dir,
+            &f.prior,
+            SnapshotUploadPolicy::default(),
+            None,
+        );
+    });
+    assert_eq!(counts.pi_uploaded_literal_purged, 1);
+    assert!(store_records(&f.disk).is_empty());
+    f.restart();
+    f.grow(&[pi_turn(
+        "message",
+        Some("fresh-capture"),
+        20,
+        "2026-10-27T06:02:00Z",
+    )]);
+    let cold = f.emit_bodies(Mode::ColdFull);
+    let restored = f.emit_bodies(Mode::Restart);
+    assert_eq!((restored.modes, restored.restored), ((1, 0, 0), 0));
+    whole_body(&cold, &restored);
+}
+
+/// A retained copy queued by a byte-budget deferral cannot be persisted after
+/// an independently observed policy flip, even if that owner has no new pass.
+#[test]
+fn pi_deferred_post_save_write_rechecks_consent_and_capture_context() {
+    if !supported("pi_transition_deferred_consent") {
+        return;
+    }
+    let mut f = PiDriver::warm("transition-pi-deferred-consent", &pi_seed());
+    f.grow(&[pi_turn(
+        "message",
+        Some("deferred"),
+        20,
+        "2026-10-27T06:02:00Z",
+    )]);
+    f.emit_bodies(Mode::Ram);
+    let cache = f.pages[&Mode::Ram].cache.clone();
+    crate::snapshots::set_pi_test_write_bytes(Some(0));
+    let _reset = Reset(|| crate::snapshots::set_pi_test_write_bytes(None));
+    f.save_gc(Mode::Ram);
+    let before = cache.durable_counters(SOURCE).unwrap().0.write_deferred;
+    assert!(before > 0, "an actual post-save deferral");
+    let off = SnapshotUploadPolicy {
+        session_titles_enabled: false,
+        ..SnapshotUploadPolicy::default()
+    };
+    crate::snapshots::observe_pi_upload_consent(&f.disk.dir, off).unwrap();
+    crate::snapshots::set_pi_test_write_bytes(None);
+    let (_, counts) = cache_lifecycle::observe(|| {
+        let mut index = f.prior.clone();
+        f.disk.commit(&cache, SOURCE, &mut index);
+    });
+    assert_eq!(counts.pi_uploaded_literal_purged, 1);
+    assert!(
+        store_records(&f.disk).is_empty(),
+        "the deferred literals were not rewritten"
+    );
+    assert_eq!(
+        cache
+            .durable_counters(SOURCE)
+            .unwrap()
+            .0
+            .not_persisted
+            .get("pi_upload_policy"),
+        Some(&1)
+    );
+    // Returning to on still cannot rebind the queued copy to the old context.
+    crate::snapshots::observe_pi_upload_consent(&f.disk.dir, SnapshotUploadPolicy::default())
+        .unwrap();
+    assert!(store_records(&f.disk).is_empty());
+}
+
 /// Condition 4 and Addendum extra 3: a rewritten head that keeps the first 96
 /// bytes of the prompt keeps its upload label, and that proves nothing: the
 /// record is dropped by the identity check, never restored as evidence.

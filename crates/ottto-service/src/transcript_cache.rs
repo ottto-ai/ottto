@@ -240,6 +240,12 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             }
         }
     }
+    /// Evict a source's copies when its upload policy changes.
+    pub(crate) fn remove_where(&mut self, mut remove: impl FnMut(&S) -> bool) {
+        self.entries
+            .retain(|_, entry| !remove(&entry.retained.state));
+    }
+
     pub(crate) fn clear(&mut self) {
         add(Event::ClearEntriesReleased, self.entries.len() as u64);
         self.entries.clear();
