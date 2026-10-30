@@ -1621,11 +1621,11 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
     use base64::Engine;
     use std::io::Write;
     let mut cases = BTreeMap::new();
-    let (mut mixed, mut proof) = sticky_session(3);
+    let (mut mixed, mut proof) = sticky_session(4);
     sticky_price_fixture(&mut mixed, &mut proof);
     // All eight counters, and independent presence of all five cost fields.
     for c in &mut proof {
-        c.usage.output_tokens = 2;
+        c.usage.output_tokens = 8;
         c.usage.cache_read_tokens = 3;
         c.usage.cache_creation_5m_tokens = 4;
         c.usage.cache_creation_1h_tokens = 5;
@@ -1634,7 +1634,7 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
     }
     for bucket in &mut mixed.usage_buckets {
         let row = &mut bucket.model_usage[0];
-        row.output_tokens = 6;
+        row.output_tokens = 24;
         row.cache_read_tokens = 9;
         row.cache_creation_5m_tokens = 12;
         row.cache_creation_1h_tokens = 15;
@@ -1642,12 +1642,12 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
         row.unattributed_total_tokens = 21;
     }
     let row = &mut mixed.model_usage[0];
-    row.output_tokens = 18;
-    row.cache_read_tokens = 27;
-    row.cache_creation_5m_tokens = 36;
-    row.cache_creation_1h_tokens = 45;
-    row.reasoning_output_tokens = 54;
-    row.unattributed_total_tokens = 63;
+    row.output_tokens = 96;
+    row.cache_read_tokens = 36;
+    row.cache_creation_5m_tokens = 48;
+    row.cache_creation_1h_tokens = 60;
+    row.reasoning_output_tokens = 72;
+    row.unattributed_total_tokens = 84;
     sticky_apply(&mut mixed, &proof, &identity::AcceptedBuckets::default()).unwrap();
     sticky_assert_reconciled(&mixed);
     cases.insert("mixed_presence", sticky_wire(mixed));
@@ -1664,6 +1664,9 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
     original.session_display_name = Some("x".into());
     original.workspace_display_label = Some("x".into());
     original.repository_label = Some("x".into());
+    original.session_display_name_source = Some("session_index".into());
+    original.workspace_label_source = Some("user_approved".into());
+    original.repository_label_source = Some("user_approved".into());
     sticky_price_fixture(&mut original, &mut original_proof);
     let mut tagged = original.clone();
     let mut accepted = identity::AcceptedBuckets::default();
