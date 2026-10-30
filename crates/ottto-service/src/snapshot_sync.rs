@@ -2810,8 +2810,9 @@ impl SnapshotUploadProgress {
     }
 }
 
-struct SnapshotProgressLock {
+pub(crate) struct SnapshotProgressLock {
     file: std::fs::File,
+    path: PathBuf,
 }
 
 impl SnapshotProgressLock {
@@ -2835,7 +2836,10 @@ impl SnapshotProgressLock {
                     .context("snapshot upload progress is owned by another daemon");
             }
         }
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            path: path.to_owned(),
+        })
     }
 }
 
@@ -3188,7 +3192,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     cause: Option<UnsettledUploadCause>,
     audit_release: Option<AccountAuditRelease<'_>>,
 ) -> Result<ScanIndex> {
-    let _lock = SnapshotProgressLock::acquire(progress_path)?;
+    let progress_owner = SnapshotProgressLock::acquire(progress_path)?;
     let mut durable: SnapshotUploadProgress = match match read_limit {
         Some(cap) => crate::snapshot_retry::read_state(progress_path, cap),
         None => std::fs::read(progress_path),
@@ -3312,11 +3316,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         &progress.fresh_context_body_acks,
     );
     validate_destination()?;
-    if let Some(cap) = read_limit {
-        committable.save_with_read_limit(index_path, cap)?;
-    } else {
-        committable.save(index_path)?;
-    }
+    committable.save_with_progress_owner(index_path, read_limit, &progress_owner)?;
     if let Some(scan) = correction_scan {
         context_rearms.emit(scan.source);
     }
@@ -11836,9 +11836,15 @@ pub(crate) fn recover_state_v2_progress(
     index_path: &Path,
     recovery: &crate::snapshots::ProgressRecovery,
 ) -> Result<()> {
-    let path = snapshot_upload_progress_path(index_path);
-    let _lock = SnapshotProgressLock::acquire(&path)?;
-    recovery.recover(&path)
+    with_state_v2_progress_owner(index_path, None, |_, path| recovery.recover(path))
+}
+
+pub(crate) fn recover_state_v2_progress_locked(
+    index_path: &Path,
+    recovery: &crate::snapshots::ProgressRecovery,
+    owner: &SnapshotProgressLock,
+) -> Result<()> {
+    with_state_v2_progress_owner(index_path, Some(owner), |_, path| recovery.recover(path))
 }
 
 /// Import only inspects original bytes under the same progress owner as CAS.
@@ -11847,9 +11853,27 @@ pub(crate) fn with_state_v2_progress_lock<T>(
     index_path: &Path,
     action: impl FnOnce(&Path) -> Result<T>,
 ) -> Result<T> {
+    with_state_v2_progress_owner(index_path, None, |_, path| action(path))
+}
+
+/// A borrowed owner cannot outlive its flock. Verify its path before reusing it;
+/// partial settlement retains this same owner from subset CAS through COMMIT.
+pub(crate) fn with_state_v2_progress_owner<T>(
+    index_path: &Path,
+    owner: Option<&SnapshotProgressLock>,
+    action: impl FnOnce(&SnapshotProgressLock, &Path) -> Result<T>,
+) -> Result<T> {
     let path = snapshot_upload_progress_path(index_path);
-    let _lock = SnapshotProgressLock::acquire(&path)?;
-    action(&path)
+    match owner {
+        Some(owner) => {
+            anyhow::ensure!(owner.path == path, "state_v2_progress_owner_path");
+            action(owner, &path)
+        }
+        None => {
+            let owner = SnapshotProgressLock::acquire(&path)?;
+            action(&owner, &path)
+        }
+    }
 }
 
 pub(crate) fn validate_state_v2_original_progress(bytes: &[u8], namespace: &str) -> Result<()> {

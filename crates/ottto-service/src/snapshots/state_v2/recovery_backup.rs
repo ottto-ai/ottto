@@ -415,10 +415,28 @@ fn read_dir(dir: &Path) -> Result<Descriptor> {
 /// through descriptor publication. The exact DB/WAL pair is copied while the
 /// same Sqlite owner excludes writes. Failure retains the previous bundle.
 pub(super) fn roll(path: &Path, db: &mut sqlite::Sqlite, identity: &Identity) -> Result<()> {
+    roll_with_owner(path, db, identity, None)
+}
+
+pub(super) fn roll_locked(
+    path: &Path,
+    db: &mut sqlite::Sqlite,
+    identity: &Identity,
+    owner: &crate::snapshot_sync::SnapshotProgressLock,
+) -> Result<()> {
+    roll_with_owner(path, db, identity, Some(owner))
+}
+
+fn roll_with_owner(
+    path: &Path,
+    db: &mut sqlite::Sqlite,
+    identity: &Identity,
+    owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
+) -> Result<()> {
     if !fence::exists(&fence::sibling(path, ".v2-ack-receipt"))? {
         return Ok(());
     }
-    crate::snapshot_sync::with_state_v2_progress_lock(path, |progress| {
+    crate::snapshot_sync::with_state_v2_progress_owner(path, owner, |_, progress| {
         let generation = db.stamp()?.0;
         let recovery = ack::ProgressRecovery::for_backup(identity.clone(), generation, path);
         let set = {

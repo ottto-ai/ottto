@@ -67,3 +67,43 @@ pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> ScanIndex {
 }
 
 use import::Mapper;
+
+/// Install synthetic custody without lifting the production conversion/R1 gate.
+/// All subsequent loads, saves, receipt replay and backups use the real route.
+pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIndex {
+    let binding = super::super::scan_index_integration::scan_index_storage_binding(path).unwrap();
+    let identity = Identity {
+        format: FORMAT,
+        db_id: "synthetic-partial-checkpoint".into(),
+        binding: binding.clone(),
+        fence_generation: index.generation + 1,
+    };
+    let mut db = sqlite::Sqlite::create_import(&fence::sibling(path, ".v2.sqlite.import")).unwrap();
+    db.path_extractor(import::ClaudeMapper::private_paths);
+    db.reference_extractor(import::ClaudeMapper::references);
+    db.control("identity", &identity).unwrap();
+    db.control("generation", &index.generation).unwrap();
+    let mut cx = KindCx::default();
+    cx.binding = Some(binding);
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    kinds::populate(index, &mut tx, &mut cx).unwrap();
+    assert_eq!(
+        tx.commit(index.generation, identity.fence_generation),
+        DurableCommitOutcome::Committed(identity.fence_generation)
+    );
+    db.finish_import().unwrap();
+    ottto_core::write_owner_only_file_atomic(
+        &fence::sibling(path, ".v1-readonly"),
+        &serde_json::to_vec(index).unwrap(),
+    )
+    .unwrap();
+    ack::ProgressRecovery::seal_import(
+        identity.clone(),
+        identity.fence_generation,
+        path,
+        Some(progress),
+    )
+    .unwrap();
+    fence::publish(path, &identity, &mut false).unwrap();
+    ScanIndex::load(path).unwrap()
+}

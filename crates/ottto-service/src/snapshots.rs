@@ -48294,19 +48294,28 @@ impl ScanIndex {
     }
 
     pub fn save(&mut self, path: &Path) -> Result<()> {
-        self.save_internal(path, None, false)
+        self.save_internal(path, None, false, None)
     }
     pub(crate) fn save_with_read_limit(&mut self, path: &Path, cap: usize) -> Result<()> {
-        self.save_internal(path, Some(cap), false)
+        self.save_internal(path, Some(cap), false, None)
+    }
+    pub(crate) fn save_with_progress_owner(
+        &mut self,
+        path: &Path,
+        read_limit: Option<usize>,
+        owner: &crate::snapshot_sync::SnapshotProgressLock,
+    ) -> Result<()> {
+        self.save_internal(path, read_limit, false, Some(owner))
     }
     fn save_growth_claim(&mut self, path: &Path) -> Result<()> {
-        self.save_internal(path, None, true)
+        self.save_internal(path, None, true, None)
     }
     fn save_internal(
         &mut self,
         path: &Path,
         read_limit: Option<usize>,
         claim_only: bool,
+        progress_owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
     ) -> Result<()> {
         let _save_window = state_v2::state_v2_growth_retention_active(self)
             .then(|| state_v2::telemetry::Window::begin("save"))
@@ -48331,7 +48340,7 @@ impl ScanIndex {
         let _lock = CheckpointLock::acquire(path)?;
         #[cfg(test)]
         pause_scan_index_cas_if_requested_for_test();
-        if state_v2::save_locked(path, self, claim_only)? {
+        if state_v2::save_locked(path, self, claim_only, progress_owner)? {
             return Ok(());
         }
         if path.exists() {
@@ -93456,3 +93465,6 @@ mod state_v2_maintenance_lock_tests {
 
 #[cfg(test)]
 pub(crate) use state_v2::money_test_support::roundtrip as state_v2_money_roundtrip;
+
+#[cfg(test)]
+pub(crate) use state_v2::money_test_support::publish as publish_state_v2_for_test;

@@ -354,6 +354,23 @@ impl ProgressRecovery {
         crate::snapshot_sync::recover_state_v2_progress(path, &recovery)
     }
 
+    pub(super) fn recover_route_locked(
+        identity: &Identity,
+        generation: u64,
+        path: &Path,
+        owner: &crate::snapshot_sync::SnapshotProgressLock,
+    ) -> Result<()> {
+        let recovery = Self {
+            scope: Scope {
+                identity: identity.clone(),
+                generation,
+            },
+            path: fence::sibling(path, ".v2-ack-receipt"),
+            db_path: Some(fence::sibling(path, ".v2.sqlite")),
+        };
+        crate::snapshot_sync::recover_state_v2_progress_locked(path, &recovery, owner)
+    }
+
     /// Caller holds the source owner; called before progress decoding/containment.
     /// OFF/v1 and Codex/Pi perform no extra reads, writes or normalization.
     pub(crate) fn for_index(index: &ScanIndex, index_path: &Path) -> Result<Option<Self>> {

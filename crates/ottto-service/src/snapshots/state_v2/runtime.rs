@@ -525,18 +525,20 @@ pub(in super::super) fn save_locked(
     path: &Path,
     index: &mut ScanIndex,
     claim_only: bool,
+    progress_owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
 ) -> Result<bool> {
-    save_with_mode(path, index, &ClaudeMapper, claim_only)
+    save_with_mode(path, index, &ClaudeMapper, claim_only, progress_owner)
 }
 #[cfg(test)]
 fn save_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Result<bool> {
-    save_with_mode(path, index, mapper, false)
+    save_with_mode(path, index, mapper, false, None)
 }
 fn save_with_mode<M: Mapper>(
     path: &Path,
     index: &mut ScanIndex,
     mapper: &M,
     claim_only: bool,
+    progress_owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
 ) -> Result<bool> {
     let Some(binding) = binding(path) else {
         ensure!(index.persistence_v2.is_none(), Hold::ForeignBinding);
@@ -572,50 +574,57 @@ fn save_with_mode<M: Mapper>(
         if claim_generation.is_some() {
             index.generation = previous.generation;
         }
-        super::ack::ProgressRecovery::recover_route(&identity, session.stamp.0, path)?;
-        super::recovery_backup::roll(path, &mut session.db, &identity)?;
-        let selected = if claim_only {
-            M::selected_claim_save
-        } else {
-            M::selected_save
-        };
-        let save_result = selected(
-            mapper,
-            &mut session.db,
-            &identity,
-            &previous,
-            index,
-            &mut session.cx,
-        );
-        // A subset save can commit and then return SaveAdmission. Protect that
-        // exact generation before propagating its collection hold.
-        if session.db.stamp()?.0 != previous.generation {
-            super::recovery_backup::roll(path, &mut session.db, &identity)?;
-        }
-        if save_result? {
+        crate::snapshot_sync::with_state_v2_progress_owner(path, progress_owner, |owner, _| {
+            super::ack::ProgressRecovery::recover_route_locked(
+                &identity,
+                session.stamp.0,
+                path,
+                owner,
+            )?;
+            super::recovery_backup::roll_locked(path, &mut session.db, &identity, owner)?;
+            let selected = if claim_only {
+                M::selected_claim_save
+            } else {
+                M::selected_save
+            };
+            let save_result = selected(
+                mapper,
+                &mut session.db,
+                &identity,
+                &previous,
+                index,
+                &mut session.cx,
+            );
+            // A subset save can commit and then return SaveAdmission. Protect that
+            // exact generation before propagating its collection hold.
+            if session.db.stamp()?.0 != previous.generation {
+                super::recovery_backup::roll_locked(path, &mut session.db, &identity, owner)?;
+            }
+            if save_result? {
+                session.stamp = session.db.stamp()?;
+                state.cached = Some(index.clone());
+                return Ok(true);
+            }
+            mapper.preflight(index).map_err(|_| Hold::DbUnavailable)?;
+            state.cached = None;
+            let mut tx = session.db.begin(TxnMode::Write)?;
+            // Identity is independently authenticated; generation is atomically
+            // compared again by commit. Hold comparisons remain mapper-owned.
+            mapper.merge_cas(&mut tx, index)?;
+            if !claim_only {
+                index.retire_committed_claude_account_pending_windows();
+            }
+            lenient_check(index)?;
+            let previous = index.generation;
+            let next = previous.checked_add(1).ok_or(Hold::DbUnavailable)?;
+            mapper.delta(&mut tx, index, None)?;
+            apply_outcome(index, &mut session.reload, tx.commit(previous, next))?;
             session.stamp = session.db.stamp()?;
+            // Cache exactly the committed graph, including subset-save outcomes;
+            // never retain an end-of-cycle graph with unsaved semantic mutations.
             state.cached = Some(index.clone());
-            return Ok(true);
-        }
-        mapper.preflight(index).map_err(|_| Hold::DbUnavailable)?;
-        state.cached = None;
-        let mut tx = session.db.begin(TxnMode::Write)?;
-        // Identity is independently authenticated; generation is atomically
-        // compared again by commit. Hold comparisons remain mapper-owned.
-        mapper.merge_cas(&mut tx, index)?;
-        if !claim_only {
-            index.retire_committed_claude_account_pending_windows();
-        }
-        lenient_check(index)?;
-        let previous = index.generation;
-        let next = previous.checked_add(1).ok_or(Hold::DbUnavailable)?;
-        mapper.delta(&mut tx, index, None)?;
-        apply_outcome(index, &mut session.reload, tx.commit(previous, next))?;
-        session.stamp = session.db.stamp()?;
-        // Cache exactly the committed graph, including subset-save outcomes;
-        // never retain an end-of-cycle graph with unsaved semantic mutations.
-        state.cached = Some(index.clone());
-        Ok(true)
+            Ok(true)
+        })
     }));
     if let Err(error) = &result {
         with_state(path, |state| {

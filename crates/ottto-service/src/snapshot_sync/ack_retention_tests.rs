@@ -2623,3 +2623,139 @@ fn v2_bound_invalid_progress_holds_without_legacy_quarantine_or_reset() {
     .is_err());
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
 }
+
+#[test]
+fn published_v2_partial_checkpoint_reuses_progress_owner_through_commit_and_backups() {
+    for stop in ["transport", "shed", "capacity"] {
+        for read_limit in [None, Some(crate::snapshot_retry::RESPONSE_BYTES)] {
+            let f = AckFixture::new(false);
+            AckFixture::write_source(&f.sources, "sibling");
+            AckFixture::write_source(&f.sources, "owed");
+            let mut scanned = ScanIndex::default();
+            let scan = AckFixture::scan(&f.sources, &mut scanned);
+            assert_eq!(scan.snapshots.len(), 3);
+            let parent = f.scratch.join("snapshots/destinations").join(&f.namespace);
+            std::fs::create_dir_all(&parent).unwrap();
+            let index_path = parent.join("claude_code-partial-scan-index.json");
+            let progress_path = snapshot_upload_progress_path(&index_path);
+            let mut progress = SnapshotUploadProgress::new(
+                f.namespace.clone(),
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            );
+            progress.save(&progress_path).unwrap();
+            let committed = crate::snapshots::publish_state_v2_for_test(
+                &scanned,
+                &index_path,
+                &std::fs::read(&progress_path).unwrap(),
+            );
+            let mut working = committed.clone();
+            progress.ack_recovery =
+                crate::snapshots::ProgressRecovery::for_index(&committed, &index_path).unwrap();
+            // Two exact sibling ACKs followed by a real uploader stop. No file
+            // publication changes: R1's activation/staging guard stays intact.
+            let upload = |items: &[SnapshotItem],
+                          progress: &mut SnapshotUploadProgress,
+                          response: &mut dyn FnMut(
+                Vec<SnapshotItem>,
+            ) -> Result<
+                crate::snapshot_client::SnapshotBatchResponse,
+            >| {
+                upload_resumable_batches_with_body_witness(
+                    items,
+                    &unique_poison_scope(),
+                    progress,
+                    &mut 0,
+                    |item| item.snapshot_fingerprint.as_str(),
+                    snapshot_upload_body_witness,
+                    response,
+                    |state| state.save(&progress_path),
+                )
+            };
+            upload(&scan.snapshots[..2], &mut progress, &mut exact_ack).unwrap();
+            let accepted = progress.accepted_body_witnesses.clone();
+            assert_eq!(accepted.len(), 2);
+            if stop == "capacity" {
+                progress.ack_capacity = 2;
+            }
+            let stopped = upload(&scan.snapshots[2..], &mut progress, &mut |_| match stop {
+                "transport" => Err(anyhow!("synthetic transport failure")),
+                "shed" => Err(anyhow::Error::new(UploadShed {
+                    status: 503,
+                    retry_after: None,
+                    code: None,
+                })),
+                "capacity" => panic!("capacity stop must precede POST"),
+                _ => unreachable!(),
+            });
+            assert!(stopped.is_err());
+            if stop == "capacity" {
+                assert!(stopped
+                    .unwrap_err()
+                    .downcast_ref::<ack_retention::AckSettlementRequired>()
+                    .is_some());
+            }
+            working.mark_bounded_sweep_unsettled();
+            let saved = checkpoint_partial_snapshot_index_with_comparison(
+                &working,
+                &committed,
+                &progress,
+                &scan.snapshots,
+                None,
+                &BTreeSet::new(),
+                &index_path,
+                &progress_path,
+                || {
+                    assert!(
+                        SnapshotProgressLock::acquire(&progress_path).is_err(),
+                        "subset verification retains its CAS owner"
+                    );
+                    Ok(())
+                },
+                read_limit,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(saved.generation > committed.generation);
+            let restored = ScanIndex::load(&index_path).unwrap();
+            assert_eq!(restored.generation, saved.generation);
+            for item in &scan.snapshots[..2] {
+                assert!(restored.accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint));
+                assert_eq!(
+                    progress
+                        .accepted_body_witnesses
+                        .get(&item.snapshot_fingerprint),
+                    Some(&snapshot_upload_body_witness(item))
+                );
+            }
+            assert!(!restored
+                .accepted_snapshot_fingerprint_recorded(&scan.snapshots[2].snapshot_fingerprint));
+            let handoff = restored.upload_ack_retirement_handoff.as_ref().unwrap();
+            assert_eq!(
+                handoff.bodies, accepted,
+                "only saved exact bodies may retire"
+            );
+            assert_eq!(
+                std::fs::read(&progress_path).unwrap(),
+                serde_json::to_vec(&progress).unwrap()
+            );
+            progress
+                .release_acks_after_partial_index_save(
+                    &progress_path,
+                    &committed,
+                    &restored,
+                    &BTreeSet::new(),
+                    false,
+                )
+                .unwrap();
+            assert!(progress.accepted_body_witnesses.is_empty());
+            let reloaded = SnapshotUploadProgress::load(
+                &progress_path,
+                &f.namespace,
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            )
+            .unwrap();
+            assert!(reloaded.accepted_fingerprints.is_empty());
+        }
+    }
+}
