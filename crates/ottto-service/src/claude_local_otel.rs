@@ -30,6 +30,8 @@ pub(crate) mod support_health;
 mod bounded_read;
 #[cfg(test)]
 mod decoder_tests;
+#[cfg(test)]
+mod trace_read_bound_tests;
 
 pub(crate) const STORE_DIR: &str = "local-otel/claude-code-effort";
 const TRACE_STORE_DIR: &str = "local-otel/claude-code-trace-ownership";
@@ -343,6 +345,32 @@ pub struct ClaudeTraceOwnershipLoadReport {
     pub invalid_session_rows: u64,
     pub missing_request_ids: u64,
     pub conflicting_request_ids: BTreeSet<String>,
+    pub rows_discarded: ClaudeTraceRowsDiscarded,
+}
+
+/// Strict trace reads whose decoded rows were dropped, by reason. Each such
+/// read also counts as an oversized file, so the report is never complete.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ClaudeTraceRowsDiscarded {
+    /// Reads that found bytes past the opened length (the file grew).
+    pub cap: u64,
+    /// Reads whose opened file or path changed generation while read.
+    pub generation: u64,
+    pub cap_rows: u64,
+    pub generation_rows: u64,
+}
+
+impl ClaudeTraceRowsDiscarded {
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub(crate) fn add(&mut self, other: &Self) {
+        self.cap += other.cap;
+        self.generation += other.generation;
+        self.cap_rows += other.cap_rows;
+        self.generation_rows += other.generation_rows;
+    }
 }
 
 impl ClaudeTraceOwnershipLoadReport {
@@ -1259,15 +1287,41 @@ pub fn load_claude_trace_ownership_evidence(
             report.oversized_files += 1;
             continue;
         }
-        let Ok(file) = File::open(&path) else {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // A stat/open race to a FIFO must refuse without blocking at open.
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let Ok(file) = options.open(&path) else {
             report.unreadable_lines += 1;
             continue;
         };
         #[cfg(test)]
         TRACE_READ_RECEIPT.with(|count| count.set(count.get() + 1));
+        let Ok(opened) = file.metadata() else {
+            report.unreadable_lines += 1;
+            continue;
+        };
+        if !opened.is_file() || opened.len() >= MAX_EVIDENCE_FILE_BYTES {
+            report.oversized_files += 1;
+            continue;
+        }
+        // A concurrent writer must not extend the read past the opened
+        // length; one extra byte is the growth sentinel.
+        let limit = opened.len() + 1;
+        #[cfg(test)]
+        TRACE_BEFORE_READ.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook(&path);
+            }
+        });
+        let mut reader = BufReader::new((&file).take(limit));
         let mut decoder = TraceSidecarDecoder::new(&session_id, Vec::new());
         decoder.report = report;
-        for line in BufReader::new(file).lines() {
+        for line in reader.by_ref().lines() {
             let line = match line {
                 Ok(line) => line,
                 Err(_) => {
@@ -1276,6 +1330,30 @@ pub fn load_claude_trace_ownership_evidence(
                 }
             };
             decoder.push_line(line.as_bytes());
+        }
+        let bytes = limit - reader.get_ref().limit();
+        #[cfg(test)]
+        TRACE_BYTES_FOR_TEST.with(|count| count.set(count.get() + bytes));
+        let generation = api_file_generation(&opened);
+        let unchanged = file.metadata().ok().and_then(|m| api_file_generation(&m)) == generation
+            && fs::metadata(&path)
+                .ok()
+                .and_then(|m| api_file_generation(&m))
+                == generation;
+        // A grown or replaced file is neither complete evidence nor a
+        // trustworthy prefix: drop its rows and fail the read's health.
+        if bytes >= limit || !unchanged {
+            let rows = decoder.rows.len() as u64;
+            let discarded = &mut decoder.report.rows_discarded;
+            if bytes >= limit {
+                discarded.cap += 1;
+                discarded.cap_rows += rows;
+            } else {
+                discarded.generation += 1;
+                discarded.generation_rows += rows;
+            }
+            decoder.rows.clear();
+            decoder.report.oversized_files += 1;
         }
         decoder.finish_eof(None);
         let (rows, decoded_report) = decoder.into_output();
@@ -1358,7 +1436,21 @@ impl<'a> TraceSidecarDecoder<'a> {
 }
 
 #[cfg(test)]
-thread_local! { static TRACE_READ_RECEIPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+type TraceBeforeReadHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+thread_local! {
+    static TRACE_BYTES_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TRACE_BEFORE_READ: std::cell::RefCell<Option<TraceBeforeReadHook>> =
+        const { std::cell::RefCell::new(None) };
+    static TRACE_READ_RECEIPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `hook` once on this thread, after the next strict trace read opens
+/// its file and before it reads, to stage a concurrent writer.
+#[cfg(test)]
+pub(crate) fn before_next_trace_read_for_test(hook: impl FnOnce(&Path) + 'static) {
+    TRACE_BEFORE_READ.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
 
 #[cfg(test)]
 pub(crate) fn reset_evidence_read_counts_for_test() {
@@ -3916,7 +4008,8 @@ crate::heap_layout_bound::fields!(ClaudeLocalOtelEvidence; capture_revision, fin
 crate::heap_layout_bound::fields!(ClaudeRequestIdentityEvidence; identity_hash_scheme, account, organization, disposition);
 crate::heap_layout_bound::fields!(ClaudeIdentityAttributeEvidence; origin, disposition, resource_hash, log_record_hash);
 crate::heap_layout_bound::fields!(ClaudeTraceOwnershipEvidence; capture_revision, fingerprint, session_id, request_id, client_request_id, agent_id, parent_agent_id, workflow_run_id, observed_at);
-crate::heap_layout_bound::fields!(ClaudeTraceOwnershipLoadReport; evidence, missing_files, malformed_lines, unreadable_lines, oversized_files, invalid_session_rows, missing_request_ids, conflicting_request_ids);
+crate::heap_layout_bound::fields!(ClaudeTraceOwnershipLoadReport; evidence, missing_files, malformed_lines, unreadable_lines, oversized_files, invalid_session_rows, missing_request_ids, conflicting_request_ids, rows_discarded);
+crate::heap_layout_bound::fields!(ClaudeTraceRowsDiscarded; cap, generation, cap_rows, generation_rows);
 
 impl crate::heap_layout_bound::HeapLayoutBound for ClaudeIdentityDisposition {
     const INLINE_ONLY: bool = true;

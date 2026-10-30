@@ -2984,6 +2984,24 @@ fn hold_copies(item: &mut SnapshotItem, reason: &'static str) {
     }
 }
 
+/// This page discarded the family's strict trace read (cap or generation
+/// race), so no account can be decided for it: every member is withheld like
+/// an undecided copy. No new revision replaces the accepted one; the next
+/// clean page decides it. Returns the items withheld.
+pub(crate) fn hold_trace_discarded(items: &mut [SnapshotItem], roots: &BTreeSet<String>) -> u64 {
+    let mut held = 0;
+    for item in items {
+        if !roots.contains(claude_snapshot_family_root_ref(item)) {
+            continue;
+        }
+        if let Some(fold) = item.claude_money.as_deref_mut() {
+            fold.entity.held = true;
+            held += 1;
+        }
+    }
+    held
+}
+
 /// Decided: `uncovered` (and every id-less copy) counts, disclosed.
 fn restore_uncovered(item: &mut SnapshotItem, uncovered: &[String]) {
     let SnapshotItem {

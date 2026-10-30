@@ -2566,9 +2566,11 @@ pub(crate) struct RequestAccounts {
     reconciled: bool,
     /// Root start known, but the native Unknown grains are not filled yet.
     root_fallback_pending: bool,
+    /// This page discarded the family trace; no account may fill its shares.
+    trace_discard_no_fallback: bool,
 }
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
-crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending);
+crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, trace_discard_no_fallback);
 
 /// One account policy for E2. Never use a later marker for an earlier request.
 /// A conflict fills missing shares; trusted own/earlier org runs stay intact.
@@ -2733,6 +2735,9 @@ pub(crate) fn request_accounts(
 
 impl RequestAccounts {
     pub(crate) fn account(&self, sequence: u64) -> AccountPartition {
+        if self.trace_discard_no_fallback {
+            return None;
+        }
         if self.subagent {
             return self.starting.clone().or_else(|| {
                 (!self.root_fallback_pending)
@@ -2917,8 +2922,12 @@ impl RequestAccounts {
 /// Own exact telemetry uses the existing request classifier, with the same
 /// standing as an own credential_org. Only missing evidence inherits an
 /// earlier own request, then the start/binding; every such fill is counted.
-pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &ScanEvidence<'_>) {
+pub(crate) fn reconcile_request_accounts(
+    items: &mut [SnapshotItem],
+    evidence: &ScanEvidence<'_>,
+) -> u64 {
     use super::claude_request_money::e2::place_request_identity;
+    let mut no_fallback_requests = 0;
     for item in items {
         let Some(mut fold) = item.claude_money.take() else {
             continue;
@@ -2930,6 +2939,37 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
         if accounts.reconciled {
             fold.accounts = Some(accounts);
             item.claude_money = Some(fold);
+            continue;
+        }
+        if evidence
+            .trace_discarded_roots
+            .contains(super::claude_snapshot_family_root_ref(item))
+        {
+            // API attachment already placed reported money. Collapse accounts
+            // in place so tokens, costs, side calls and id-less shares survive.
+            no_fallback_requests += fold
+                .entity
+                .grains
+                .values()
+                .map(|grain| grain.requests)
+                .sum::<u64>();
+            fold.entity.repartition(None);
+            accounts.trace_discard_no_fallback = true;
+            accounts.starting = None;
+            accounts.fallback = None;
+            accounts.inherited = 0;
+            accounts.skipped_inherited = 0;
+            accounts.reconciled = true;
+            for occurrence in item.claude_usage_occurrences.values_mut() {
+                occurrence.e2_inherited = Some(false);
+            }
+            fold.accounts = Some(accounts);
+            item.claude_money = Some(fold);
+            // Emission preserves a uniform wire account even for billing rows
+            // that bypass final identity grouping. Discard suppresses it too.
+            if super::set_claude_account_hash(item, None) {
+                item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+            }
             continue;
         }
         let native = accounts.clone();
@@ -3111,6 +3151,7 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
         fold.accounts = Some(accounts);
         item.claude_money = Some(fold);
     }
+    no_fallback_requests
 }
 
 /// Read retained creator bindings using the same machine/session key as the
@@ -3185,7 +3226,7 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
         else {
             continue;
         };
-        if accounts.subagent {
+        if accounts.subagent || accounts.trace_discard_no_fallback {
             continue;
         }
         let first = item
@@ -3258,6 +3299,9 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
         let Some(accounts) = fold.accounts.as_deref_mut() else {
             continue;
         };
+        if accounts.trace_discard_no_fallback {
+            continue;
+        }
         if accounts.subagent {
             accounts.starting = match roots.get(&root) {
                 Some(root) => root.starting.clone(),
@@ -3539,6 +3583,8 @@ pub(crate) struct ScanEvidence<'a> {
     request_roots: std::cell::OnceCell<Vec<(&'a str, Option<&'a str>)>>,
     /// Roots whose sidecar reads were incomplete in this pass.
     pub(crate) unhealthy_roots: BTreeSet<String>,
+    /// Cap/generation discards only; other unhealthy reads retain their policy.
+    pub(crate) trace_discarded_roots: BTreeSet<String>,
     /// Roots with a qualified witness that their telemetry writer is healthy
     /// NOW, the precondition for `Refusal::Pending`. A complete paired-sidecar
     /// load proves only what was already written, not a live writer, and no
@@ -3627,6 +3673,11 @@ impl<'a> ScanEvidence<'a> {
             }
         }
         evidence
+    }
+
+    pub(crate) fn with_trace_discarded_roots(mut self, roots: BTreeSet<String>) -> Self {
+        self.trace_discarded_roots = roots;
+        self
     }
 
     pub(crate) fn with_accepted_buckets(mut self, accepted: Option<&'a AcceptedBuckets>) -> Self {
@@ -4841,7 +4892,11 @@ fn keeps_markerless_account(item: &SnapshotItem) -> bool {
             .claude_money
             .as_deref()
             .and_then(|fold| fold.accounts.as_deref())
-            .is_some_and(|accounts| accounts.starting.is_some() && !accounts.conflict)
+            .is_some_and(|accounts| {
+                !accounts.trace_discard_no_fallback
+                    && accounts.starting.is_some()
+                    && !accounts.conflict
+            })
 }
 
 fn tag_item(
