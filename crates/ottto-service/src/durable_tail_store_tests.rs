@@ -4099,11 +4099,22 @@ fn property_table_keeps_both_historical_v1_envelopes_byte_identical() {
     use crate::snapshots::SnapshotSource;
     let scratch = Scratch::new();
     let path = scratch.transcript("synthetic.jsonl", b"{}\n");
-    assert_eq!(SOURCES.len(), 2);
-    assert_eq!(DurableSource::from_snapshot(SnapshotSource::Pi), None);
+    // Claude and Codex keep their historical v1 envelopes; Pi (tag 3, slot 2)
+    // writes format 3 only and has no v1 representation.
+    assert_eq!(SOURCES.len(), 3);
+    let pi = &SOURCES[2];
+    assert_eq!(pi.source, DurableSource::Pi);
+    assert_eq!(pi.source.slot(), 2);
+    assert_eq!((pi.tag, pi.write_format), (3, 3));
+    assert!(pi.representation(FORMAT_V1, &pi.allowlist()).is_none());
+    assert_eq!(
+        DurableSource::from_snapshot(SnapshotSource::Pi),
+        Some(DurableSource::Pi)
+    );
+    assert_eq!(DurableSource::from_tag(3), Some(DurableSource::Pi));
     assert_eq!(DurableSource::from_tag(0), None);
-    assert_eq!(DurableSource::from_tag(3), None);
-    for (ordinal, row) in SOURCES.iter().enumerate() {
+    assert_eq!(DurableSource::from_tag(4), None);
+    for (ordinal, row) in SOURCES[..2].iter().enumerate() {
         assert_eq!(row.source.slot(), ordinal);
         assert_eq!(row.source.properties().source, row.source);
         assert_eq!(DurableSource::from_snapshot(row.snapshot), Some(row.source));
