@@ -3556,6 +3556,28 @@ impl SharedCache {
         }
     }
 
+    fn retire_or_hold(
+        &self,
+        original_matches: bool,
+        source: DurableSource,
+        record: &store::DurableRecord,
+        expected: &Expected,
+        edge: RetirementEdge,
+    ) {
+        if original_matches {
+            self.queue_rederive_retirement(source, record, expected, edge);
+        } else if let Some(mut stores) = self.durable() {
+            Counters::bump(&mut stores.counters.ineligible, "rederive_retire_unproven");
+            drop(stores);
+            self.hold_rederive_retirement(
+                source,
+                record.record.binding.key,
+                edge,
+                "native_replacement_receipt",
+            );
+        }
+    }
+
     /// Per-edge original binding must already be eligible. Failure to retain
     /// authority holds safely; it never manufactures a deletion witness.
     fn queue_rederive_retirement(
@@ -3603,9 +3625,8 @@ impl SharedCache {
             .as_ref()
             .is_some_and(|p| p.same_predecessor(&proof))
         {
-            Counters::bump(&mut stores.counters.ineligible, "rederive_retire_unproven");
             drop(stores);
-            self.hold_rederive_retirement(source, key, edge, "native_replacement_receipt");
+            self.retire_or_hold(false, source, record, expected, edge);
             return;
         }
         let debt = stores.fund_debt(key).expect("funded");
@@ -4022,23 +4043,13 @@ impl SharedCache {
                         "s2_skipped_real_edit.replaced",
                     );
                 }
-                if original_matches {
-                    self.queue_rederive_retirement(
-                        source,
-                        &record,
-                        &original_expected,
-                        RetirementEdge::AcceptedObject,
-                    );
-                } else if let Some(mut stores) = self.durable() {
-                    Counters::bump(&mut stores.counters.ineligible, "rederive_retire_unproven");
-                    drop(stores);
-                    self.hold_rederive_retirement(
-                        source,
-                        store_key,
-                        RetirementEdge::AcceptedObject,
-                        "native_replacement_receipt",
-                    );
-                }
+                self.retire_or_hold(
+                    original_matches,
+                    source,
+                    &record,
+                    &original_expected,
+                    RetirementEdge::AcceptedObject,
+                );
                 return Err(MissClass::RealEdit(FullReason::Replaced).into());
             }
             if a.behind(metadata.len()) {
@@ -4137,26 +4148,13 @@ impl SharedCache {
                                                     full_reason_class(edit),
                                                 );
                                             }
-                                            if original_matches {
-                                                self.queue_rederive_retirement(
-                                                    source,
-                                                    &record,
-                                                    &original_expected,
-                                                    RetirementEdge::IndependentEdit,
-                                                );
-                                            } else if let Some(mut stores) = self.durable() {
-                                                Counters::bump(
-                                                    &mut stores.counters.ineligible,
-                                                    "rederive_retire_unproven",
-                                                );
-                                                drop(stores);
-                                                self.hold_rederive_retirement(
-                                                    source,
-                                                    store_key,
-                                                    RetirementEdge::IndependentEdit,
-                                                    "native_replacement_receipt",
-                                                );
-                                            }
+                                            self.retire_or_hold(
+                                                original_matches,
+                                                source,
+                                                &record,
+                                                &original_expected,
+                                                RetirementEdge::IndependentEdit,
+                                            );
                                             return Err(MissClass::Failure(Failure::Certificate(
                                                 CertificateRefusal::Changed(edit),
                                             ))
