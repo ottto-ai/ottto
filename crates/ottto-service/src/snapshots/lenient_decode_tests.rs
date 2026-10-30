@@ -2203,6 +2203,60 @@ fn desktop_inventory_key_is_decoded_ignored_and_never_saved() {
     }
 }
 
+#[test]
+fn desktop_inventory_production_load_save_drops_key_with_exact_bytes_and_counts() {
+    let scratch = crate::test_scratch::ScratchDir::new("desktop-inventory-load-save");
+    let path = scratch.as_ref().join("index.json");
+    let seed = fixture();
+    let without = serde_json::to_string(&seed).unwrap();
+    let load_and_save = |input: &str, inventory: Option<&str>| {
+        fs::write(&path, input).unwrap();
+        let before = claude_absence_counters_for_test().tombstone_decode_drops;
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        let drops = claude_absence_counters_for_test().tombstone_decode_drops - before;
+        assert_eq!(fs::read(&path).unwrap(), input.as_bytes());
+        assert!(loaded.decode_holds.is_empty());
+        assert_eq!(loaded.generation, seed.generation);
+        assert_eq!(loaded.claude_desktop_store_inventory.as_deref(), inventory);
+        loaded.save(&path).unwrap();
+        let saved = fs::read(&path).unwrap();
+        let value: Value = serde_json::from_slice(&saved).unwrap();
+        assert!(value.get(DESKTOP_INVENTORY).is_none());
+        (saved, drops)
+    };
+    let (baseline, drops) = load_and_save(&without, None);
+    assert_eq!(drops, 0);
+    let digest = "a".repeat(64);
+    for (case, fields, inventory, expected_drops) in [
+        (
+            "valid",
+            format!("\"{DESKTOP_INVENTORY}\":\"{digest}\""),
+            Some(digest.as_str()),
+            0,
+        ),
+        (
+            "wrong-length",
+            format!("\"{DESKTOP_INVENTORY}\":\"{}\"", "a".repeat(63)),
+            None,
+            1,
+        ),
+        (
+            "duplicate",
+            format!(
+                "\"{DESKTOP_INVENTORY}\":\"{digest}\",\"{DESKTOP_INVENTORY}\":\"{}\"",
+                "b".repeat(64)
+            ),
+            Some(digest.as_str()),
+            1,
+        ),
+    ] {
+        let input = format!("{{{fields},{}", &without[1..]);
+        let (saved, drops) = load_and_save(&input, inventory);
+        assert_eq!(saved, baseline, "{case}: production save bytes");
+        assert_eq!(drops, expected_drops, "{case}: one count per dropped value");
+    }
+}
+
 /// This key was unknown to the last release, so no value of it may refuse.
 #[test]
 fn bad_desktop_inventory_is_dropped_and_counted_never_refused() {
