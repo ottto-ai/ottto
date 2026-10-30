@@ -588,14 +588,19 @@ fn blocked_due_debt_does_not_resample_neighbours_and_stat_change_wakes_recovery(
                 .unwrap()
         };
         let walk = |index: &mut ScanIndex, at: &str| {
-            let mut scan = scan_source_roots(
-                SnapshotSource::ClaudeCode,
-                std::slice::from_ref(&root.0.to_path_buf()),
-                index,
-                at,
-                183,
-            )
-            .unwrap();
+            let mut scan = super::super::sampled_scan::with_test_now(
+                rfc3339_unix_seconds(at).unwrap(),
+                || {
+                    scan_source_roots(
+                        SnapshotSource::ClaudeCode,
+                        std::slice::from_ref(&root.0.to_path_buf()),
+                        index,
+                        at,
+                        183,
+                    )
+                    .unwrap()
+                },
+            );
             finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, index);
             scan
         };

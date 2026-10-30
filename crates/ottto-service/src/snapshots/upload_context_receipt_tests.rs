@@ -2151,3 +2151,147 @@ fn c1_hold_count_uses_prepared_cooldown_and_lease_views() {
         "no credit from a gauge"
     );
 }
+
+#[test]
+fn terminal_off_receipt_context_move_uses_paced_catchup_then_three_quiet_walks() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let original = fs::read_to_string(&f.path).unwrap();
+    for session in [
+        "019fa111-2222-7333-8444-666666666666",
+        "019fa111-2222-7333-8444-777777777777",
+    ] {
+        fs::write(
+            f.root.join(format!("{session}.jsonl")),
+            original.replace(SESSION, session),
+        )
+        .unwrap();
+    }
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    assert_eq!(scan.scanned_file_count, 3);
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        3
+    );
+    f.assert_quiet();
+    let limit = fs::metadata(&f.path).unwrap().len();
+    let mut posted = 0;
+    for _ in 0..3 {
+        f.uploader
+            .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
+        let previous = f.index.clone();
+        let ((scan, bytes), reads) = upload_context_read::with_read_limit(limit, || f.walk(true));
+        assert_eq!(
+            scan.scanned_file_count, 1,
+            "one file fits the catch-up native allowance"
+        );
+        assert_eq!(reads.len(), 1);
+        assert!(
+            bytes <= limit,
+            "context catch-up never bypasses the reader allowance"
+        );
+        let (files, _) = f
+            .uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap();
+        assert_eq!(files, 1, "one newly ACKed file per pass");
+        posted += files;
+        assert!(!scan.census_complete);
+    }
+    assert_eq!(posted, 3);
+    assert!(f.index.files.values().all(|entry| entry
+        .upload_context_receipt
+        .as_ref()
+        .is_some_and(|r| r.context_fingerprint == "e".repeat(64))));
+    let posts = f.uploader.posts.len();
+    f.assert_quiet();
+    assert_eq!(f.uploader.posts.len(), posts);
+    assert_eq!(
+        f.index.upload_context_fingerprint.as_deref(),
+        Some("c".repeat(64).as_str())
+    );
+}
+
+#[test]
+fn terminal_off_context_mismatch_cannot_wake_parked_key_until_stat_change() {
+    sampled_audit::reset_open_backoff_for_test();
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    assert_eq!(f.adopt().files, 1);
+    f.assert_quiet();
+    let key = f.key();
+    let now = sampled_scan::now_seconds();
+    let due = now - 1;
+    f.index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(
+            &key,
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &"ab".repeat(32),
+                0,
+                ClaudeRequestCensusShape::IdentityIncomplete,
+                vec![1],
+            )
+            .with_unverified_for_test(true),
+        );
+    f.index.held_audit_progress = Some(sampled_audit::HeldAuditProgress {
+        key: key.clone(),
+        due,
+        attempted: false,
+    });
+    for _ in 0..8 {
+        sampled_audit::progress_open_failed(&mut f.index, &key, now);
+    }
+    assert!(sampled_audit::candidate_open_blocked(&key, now));
+    let failed = sampled_audit::held_audit_open_failed(now);
+    let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
+    for _ in 0..3 {
+        f.uploader
+            .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
+        let (scan, bytes) = sampled_scan::with_test_now(now, || f.walk(true));
+        assert_eq!((scan.scanned_file_count, bytes), (0, 0));
+        assert_eq!(
+            START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get),
+            samples
+        );
+        assert_eq!(sampled_audit::held_audit_open_failed(now), failed);
+        assert_eq!(sampled_audit::failed_open_debt(&key, now), Some(due));
+        assert_eq!(
+            f.entry()
+                .upload_context_receipt
+                .as_ref()
+                .unwrap()
+                .context_fingerprint,
+            "d".repeat(64)
+        );
+        assert!(!scan.census_complete);
+    }
+    let mut file = fs::OpenOptions::new().append(true).open(&f.path).unwrap();
+    use std::io::Write;
+    file.write_all(b"{\"type\":\"user\",\"message\":{\"content\":\"stat wake\"}}\n")
+        .unwrap();
+    drop(file);
+    f.uploader
+        .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
+    let previous = f.index.clone();
+    let (scan, _) = sampled_scan::with_test_now(now, || f.walk(true));
+    assert_eq!(
+        scan.scanned_file_count, 1,
+        "only stat change clears the blocked open"
+    );
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    assert_eq!(
+        f.entry()
+            .upload_context_receipt
+            .as_ref()
+            .unwrap()
+            .context_fingerprint,
+        "e".repeat(64)
+    );
+    sampled_audit::reset_open_backoff_for_test();
+}

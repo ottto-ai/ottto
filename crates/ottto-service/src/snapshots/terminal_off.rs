@@ -384,10 +384,10 @@ fn terminal_off_rediscovery_scope(index: &ScanIndex) -> Option<String> {
 fn refresh_terminal_off_discovery(
     index: &mut ScanIndex,
     roots: &[PathBuf],
-    at: &str,
+    now: u64,
     overflow: bool,
 ) {
-    let now = rfc3339_unix_seconds(at).unwrap_or_default();
+    // The selecting page owns this clock, including all cooperative yields.
     // Revalidate configured targets EVERY pass, before selecting retained
     // paths, even when the readdir cadence is not due. A retargeted symlink
     // must not leave its old canonical target authorized for collection.

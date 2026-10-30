@@ -26849,7 +26849,7 @@ impl OwnedSourceScan {
             index.record_started_claude_request_identity_contract(claude_request_identity_capture);
         }
         if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
-            refresh_terminal_off_discovery(index, roots, collected_at, watcher_overflowed);
+            refresh_terminal_off_discovery(index, roots, audit_now, watcher_overflowed);
         }
         let next_generation_hints;
         {
@@ -27406,7 +27406,8 @@ impl OwnedSourceScan {
 
         // Only pure context debt moves behind ordinary work. Preserve relative
         // order of all authority, recovery, new and changed family members.
-        identified_candidates.sort_by_cached_key(|candidate| index.context_only_read(candidate));
+        identified_candidates
+            .sort_by_cached_key(|candidate| index.context_only_read(candidate, audit_now));
         if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
             index.claude_full_rearm_progress.terminal_off_admitted = identified_candidates
                 .iter()
@@ -27833,7 +27834,7 @@ impl OwnedSourceScan {
                                 && group
                                     .members
                                     .iter()
-                                    .all(|member| index.context_only_read(member)),
+                                    .all(|member| index.context_only_read(member, audit_now)),
                             !*own,
                             !sampled_scan::codex_cursor::census_member(
                                 &codex_selected_flags,
@@ -27993,15 +27994,19 @@ impl OwnedSourceScan {
                             && group
                                 .members
                                 .iter()
-                                .all(|member| index.context_only_read(member));
+                                .all(|member| index.context_only_read(member, audit_now));
                         let waiting_ordinary = if context_group {
                             *ordinary_singleton_slots.get_or_insert_with(|| {
                                 identified_candidates
                                     .iter()
                                     .filter(|candidate| {
                                         !grouped_paths.contains(&local_index_key(&candidate.path))
-                                            && !index.context_only_read(candidate)
-                                            && index.candidate_decision(candidate)
+                                            && !index.context_only_read(candidate, audit_now)
+                                            && index
+                                                .candidate_decision_with_reason_at(
+                                                    candidate, audit_now,
+                                                )
+                                                .0
                                                 != CandidateDecision::Skip
                                     })
                                     .count()
@@ -28127,8 +28132,10 @@ impl OwnedSourceScan {
                             .file_upload_context_enabled
                             .then(|| {
                                 let disposable = |candidate: &CandidateFile| {
-                                    index.context_only_read(candidate)
-                                        || index.candidate_decision(candidate)
+                                    index.context_only_read(candidate, audit_now)
+                                        || index
+                                            .candidate_decision_with_reason_at(candidate, audit_now)
+                                            .0
                                             == CandidateDecision::Skip
                                 };
                                 identified_candidates
@@ -28178,7 +28185,7 @@ impl OwnedSourceScan {
                             group
                                 .members
                                 .iter()
-                                .all(|candidate| index.context_only_read(candidate))
+                                .all(|candidate| index.context_only_read(candidate, audit_now))
                         });
                 }
                 codex_join_prepared = true;
@@ -28598,8 +28605,10 @@ impl OwnedSourceScan {
                         && (!codex_page.continuation() || codex_parent_identities.census_valid())
                         && (!index.file_upload_context_enabled
                             || !identified_candidates.iter().any(|candidate| {
-                                !index.context_only_read(candidate)
-                                    && index.candidate_decision_with_reason(candidate).0
+                                !index.context_only_read(candidate, audit_now)
+                                    && index
+                                        .candidate_decision_with_reason_at(candidate, audit_now)
+                                        .0
                                         == CandidateDecision::Parse
                             }))
                         && (!index.file_upload_context_enabled
@@ -28607,7 +28616,7 @@ impl OwnedSourceScan {
                                 group
                                     .members
                                     .iter()
-                                    .any(|candidate| !index.context_only_read(candidate))
+                                    .any(|candidate| !index.context_only_read(candidate, audit_now))
                             }))
                         && codex_page.claim_resume()
                 }) {
@@ -28640,7 +28649,7 @@ impl OwnedSourceScan {
                         },
                     ) {
                         sampled_scan::codex_cursor::Resumed::Active(job, lease) => {
-                            if index.context_only_read(&job.candidate) {
+                            if index.context_only_read(&job.candidate, audit_now) {
                                 let admitted = if job.aliases.is_empty() {
                                     context_read_budget.admit(
                                         source,
@@ -28708,7 +28717,7 @@ impl OwnedSourceScan {
                         || group
                             .members
                             .iter()
-                            .all(|candidate| index.context_only_read(candidate)))
+                            .all(|candidate| index.context_only_read(candidate, audit_now)))
                         && !sampled_scan::codex_cursor::census_member(
                             &codex_selected_flags,
                             group.members.iter().map(|member| member.path.as_path()),
@@ -28725,11 +28734,13 @@ impl OwnedSourceScan {
                     group
                         .members
                         .iter()
-                        .all(|candidate| index.context_only_read(candidate))
+                        .all(|candidate| index.context_only_read(candidate, audit_now))
                 })
                 && identified_candidates.iter().any(|candidate| {
-                    !index.context_only_read(candidate)
-                        && index.candidate_decision_with_reason(candidate).0
+                    !index.context_only_read(candidate, audit_now)
+                        && index
+                            .candidate_decision_with_reason_at(candidate, audit_now)
+                            .0
                             == CandidateDecision::Parse
                 });
             if active_file.is_none() && !rereads_wait() && !context_group_waits {
@@ -28738,7 +28749,7 @@ impl OwnedSourceScan {
                         && group
                             .members
                             .iter()
-                            .all(|candidate| index.context_only_read(candidate))
+                            .all(|candidate| index.context_only_read(candidate, audit_now))
                         && !context_read_budget.admit_unit(
                             source,
                             index,
@@ -32297,7 +32308,7 @@ impl OwnedSourceScan {
             };
             // Reject budget debt before opening/constructing any body parser.
             // Requeue the original census membership; absence/completion stays owed.
-            if index.context_only_read(&candidate)
+            if index.context_only_read(&candidate, audit_now)
                 && !context_read_budget.admit(source, index, &candidate, &snapshots)
             {
                 context_read_budget.defer(candidate);
@@ -33020,7 +33031,7 @@ impl OwnedSourceScan {
                 {
                     pending!();
                 }
-                if index.context_only_read(&candidate) {
+                if index.context_only_read(&candidate, audit_now) {
                     context_read_budget.charge_cursor_ordinary(&mut codex_page);
                 }
                 match context.cache.cursor_plan_paced(

@@ -119,14 +119,13 @@ money, request-count and exact-ACK contracts are not weakened to call the branch
 green. The paired receipt change must use source-wide mismatch AND no matching
 receipt, including SOURCE's current-context ACK/re-send requirements.
 
-C1 is also pending. A mixed terminal file cannot earn the approved all-entities
-ACK receipt, and current persisted accepted fingerprints do not distinguish a
-byte-identical C ACK from a fresh D ACK. The source-general receipt PR owns the
-approved ACK-context state needed for the terminal once-rearm/quiet exit. This
-branch adds no receipt/context field or unconditional mixed skip. After that
-state merges, implement the mixed backoff, immediate privacy reduction,
-terminal exit, counters and all three real-flow fixtures; preserve confirmed
-empty Claude/Codex context-loop disclosure until measured and contained.
+C1 is composed after the source-general receipt change landed. A mixed file
+still cannot mint a partial all-entities receipt. Its temporary selection hold
+uses only the existing exact current-context ACK/body ledger and current
+quarantine witness. Missing or old-context stamps cannot suppress a destination
+or privacy change. No new persisted field is added by this change. Confirmed
+empty Claude/Codex context reparses remain counted and disclosed.
+
 
 
 Round 14 keeps current cohorts unproven and preserves old-reader proof/owed
@@ -322,9 +321,9 @@ remain Unchanged, with no ScopeChanged Full. No new persisted state, authority,
 body-read cause or budget is introduced. Native Scope execution remains a
 branch-Mac obligation.
 
-### Local receipt composition: mixed-file selection
+### Receipt composition: mixed-file selection
 
-The local receipt composition derives RAM selection hints from the existing
+The receipt composition derives RAM selection hints from the existing
 per-ACK context/body ledger. Every use rechecks context, replay epoch, source,
 body set, exact member incidence and quarantine witness. Missing stamps or
 cleared source debt cannot hold a new destination's projection. No partial file
@@ -338,4 +337,27 @@ candidate gates retain independent audit/history/correction authority. Eligible 
 holds are counted at preparation, including the quiet path with no candidates; confirmed-empty context reparses are counted
 separately and remain a disclosed limitation. Context-only rediscovery consumes
 the receipt API so accepted files and non-due mixed holds do not force a corpus
-walk. These changes remain local until the source-general receipt PR merges.
+walk. The source-general receipt change is now on main; its ACK format and
+read/wire budgets remain authoritative.
+
+
+### Round 22: compose landed receipts and the captured audit clock
+
+Main's context receipt, context read budgets, bounded marker admission and
+account-release audit handling are retained. Only the containment-specific
+fixture/C1 commits are replayed; the earlier local receipt history is not merged.
+All completion effects remain behind the existing terminal veto. The pending
+absence-retirement integration seam stays open; no new proof is inferred.
+
+Metadata rediscovery, candidate classification and context-only ordering use the
+page's captured audit clock through cooperative yields, as do the existing due,
+held-slot and progress gates. Census timestamps do not start the metadata clock.
+Current receipts stop context force-wakes; pending catch-up stays on the landed
+read/wire budget. Same-stat backed-off or parked paths keep their original due
+and cannot force neighbour samples. A stat change restores ordinary selection.
+
+Controls exercise a clock advancing mid-page, three one-file catch-up batches
+followed by three zero-body walks, and a context move on a parked path followed
+by stat recovery. Existing real-cadence unhinted-append, selected/reloaded Scope
+and backoff controls remain. Compilation or portable CI cannot replace native
+Scope evidence on macOS.

@@ -32,6 +32,15 @@ fn off_line(member: &str, request: &str) -> String {
     format!("{prefix}\n{owned}\n")
 }
 
+fn refresh_terminal_off_discovery_at_test(
+    index: &mut ScanIndex,
+    roots: &[PathBuf],
+    at: &str,
+    overflow: bool,
+) {
+    refresh_terminal_off_discovery(index, roots, rfc3339_unix_seconds(at).unwrap(), overflow);
+}
+
 fn off_scan(index: &mut ScanIndex, root: &Path, at: &str, limit: usize) -> SourceScanResult {
     assert!(
         claude_terminal_off(),
@@ -41,16 +50,18 @@ fn off_scan(index: &mut ScanIndex, root: &Path, at: &str, limit: usize) -> Sourc
     if index.active_upload_context_fingerprint.is_none() {
         index.activate_upload_context("settled-destination".into());
     }
-    let mut result = scan_source_roots_with_limit(
-        SnapshotSource::ClaudeCode,
-        &[root.to_owned()],
-        index,
-        at,
-        BACKFILL_WINDOW_DAYS,
-        limit,
-        true,
-    )
-    .unwrap();
+    let mut result = sampled_scan::with_test_now(rfc3339_unix_seconds(at).unwrap(), || {
+        scan_source_roots_with_limit(
+            SnapshotSource::ClaudeCode,
+            &[root.to_owned()],
+            index,
+            at,
+            BACKFILL_WINDOW_DAYS,
+            limit,
+            true,
+        )
+        .unwrap()
+    });
     let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
     let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
     let disposition = apply_claude_reported_usage_with_index(
@@ -382,7 +393,7 @@ fn terminal_off_offline_create_overflow_and_cadence_discover_without_restart() {
             // The process memo, not the skipped diagnostic scalar, owns time.
             expire_terminal_off_discovery_for_test(&index);
         }
-        refresh_terminal_off_discovery(&mut index, &[scratch.to_path_buf()], W2, overflow);
+        refresh_terminal_off_discovery_at_test(&mut index, &[scratch.to_path_buf()], W2, overflow);
         let result = off_scan(&mut index, &scratch, W2, 10);
         assert_eq!(result.scanned_file_count, 1);
         assert!(index.files.contains_key(&local_index_key(&path)));
@@ -944,7 +955,7 @@ fn terminal_off_rediscovery_deadline_survives_two_save_load_cycles() {
             0
         );
         let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
-        refresh_terminal_off_discovery(&mut index, &[scratch.to_path_buf()], at, false);
+        refresh_terminal_off_discovery_at_test(&mut index, &[scratch.to_path_buf()], at, false);
         assert!(
             index
                 .traversal
@@ -963,7 +974,7 @@ fn terminal_off_rediscovery_deadline_survives_two_save_load_cycles() {
             due
         );
     }
-    refresh_terminal_off_discovery(
+    refresh_terminal_off_discovery_at_test(
         &mut index,
         &[scratch.to_path_buf()],
         "2026-08-20T10:07:00Z",
@@ -980,7 +991,7 @@ fn terminal_off_rediscovery_deadline_survives_two_save_load_cycles() {
         .unwrap()
         .pending_directories
         .clear();
-    refresh_terminal_off_discovery(
+    refresh_terminal_off_discovery_at_test(
         &mut index,
         &[scratch.to_path_buf()],
         "2026-08-20T10:07:01Z",
@@ -998,7 +1009,7 @@ fn terminal_off_rediscovery_deadline_survives_two_save_load_cycles() {
         .pending_directories
         .clear();
     index.activate_upload_context("different-destination".into());
-    refresh_terminal_off_discovery(
+    refresh_terminal_off_discovery_at_test(
         &mut index,
         &[scratch.to_path_buf()],
         "2026-08-20T10:07:02Z",
@@ -1089,7 +1100,7 @@ fn terminal_off_idle_cadence_never_parks_already_owed_read_work() {
     let first = off_scan(&mut settled, &scratch, W1, 10);
     off_accept(&mut settled, &first);
     let at = "2026-08-20T10:03:00Z";
-    refresh_terminal_off_discovery(&mut settled, &[scratch.to_path_buf()], at, false);
+    refresh_terminal_off_discovery_at_test(&mut settled, &[scratch.to_path_buf()], at, false);
     assert!(settled
         .traversal
         .as_ref()
@@ -1102,7 +1113,7 @@ fn terminal_off_idle_cadence_never_parks_already_owed_read_work() {
         .get_mut(&key)
         .unwrap()
         .set_unverified_deadline(rfc3339_unix_seconds(at).unwrap() + 100);
-    refresh_terminal_off_discovery(&mut future, &[scratch.to_path_buf()], at, false);
+    refresh_terminal_off_discovery_at_test(&mut future, &[scratch.to_path_buf()], at, false);
     assert!(
         future
             .traversal
@@ -1152,7 +1163,7 @@ fn terminal_off_idle_cadence_never_parks_already_owed_read_work() {
             }
             _ => unreachable!(),
         }
-        refresh_terminal_off_discovery(&mut index, &[scratch.to_path_buf()], at, false);
+        refresh_terminal_off_discovery_at_test(&mut index, &[scratch.to_path_buf()], at, false);
         assert_eq!(
             index.traversal.as_ref().unwrap().pending_directories.len(),
             1,
@@ -1211,7 +1222,7 @@ fn terminal_off_unhinted_append_waits_for_real_cadence_then_is_discovered() {
     let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
     let bytes = TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get);
     // No watcher notification, memo expiry shortcut or source re-arm. Only
-    // the normal collected_at clock can discover this physical append.
+    // the normal captured audit clock can discover this physical append.
     let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
     use std::io::Write;
     file.write_all(off_line(OFF_ROOT, "Y").as_bytes()).unwrap();
@@ -1235,4 +1246,83 @@ fn terminal_off_unhinted_append_waits_for_real_cadence_then_is_discovered() {
     assert_ne!(index.files[&key].source_file_fingerprint, before);
     assert!(TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get) > bytes);
     assert!(!changed.census_complete);
+}
+
+#[test]
+fn terminal_off_captured_audit_clock_survives_yields_and_owns_rediscovery_deadline() {
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-page-clock");
+    let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
+    fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
+    let mut index = off_index();
+    let first = off_scan(&mut index, &scratch, W1, 10);
+    off_accept(&mut index, &first);
+    let now = rfc3339_unix_seconds(W1).unwrap() + 1;
+    index
+        .files
+        .get_mut(&local_index_key(&path))
+        .unwrap()
+        .set_unverified_deadline(now + 1);
+    expire_terminal_off_discovery_for_test(&index);
+    // Deliberately unrelated census time: it cannot own audit scheduling.
+    let page = sampled_scan::with_test_now(now, || {
+        OwnedSourceScan::new(
+            SnapshotSource::ClaudeCode,
+            &[scratch.to_path_buf()],
+            index,
+            W2,
+            BACKFILL_WINDOW_DAYS,
+            10,
+            true,
+            None,
+            &[],
+            false,
+            false,
+        )
+    });
+    assert_eq!(page.audit_now, now);
+    let scope = terminal_off_rediscovery_scope(&page.index).unwrap();
+    assert_eq!(
+        TERMINAL_OFF_REDISCOVERY.with(|memo| memo.borrow()[&scope]),
+        now + 300
+    );
+    let result = sampled_scan::with_test_now(now + 400, || {
+        let mut page = page;
+        loop {
+            assert_eq!(
+                page.audit_now, now,
+                "cooperative steps retain the page clock"
+            );
+            match page.step(None) {
+                OwnedSourceScanStep::Pending(next) => page = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => break (index, scan),
+            }
+        }
+    });
+    assert_eq!(
+        result.1.scanned_file_count, 0,
+        "future audit was not due at selection"
+    );
+    assert_eq!(
+        result.0.files[&local_index_key(&path)]
+            .audit_obligation(now)
+            .unwrap()
+            .due_unix_seconds,
+        now + 1
+    );
+    assert!(!result.1.census_complete);
+    let mut index = result.0;
+    let due = sampled_scan::with_test_now(now + 400, || {
+        scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            &[scratch.to_path_buf()],
+            &mut index,
+            W2,
+            BACKFILL_WINDOW_DAYS,
+        )
+        .unwrap()
+    });
+    assert_eq!(
+        due.scanned_file_count, 1,
+        "next page captures a new due clock"
+    );
 }
