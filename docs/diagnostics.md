@@ -1508,3 +1508,10 @@ The one-time estimated cohort is at most 326 files / approximately 195 MB
 (256 Claude, 70 Codex), about 11 minutes at 1 GiB per hour; actual cadence depends
 on pass caps and pacing. A single file larger than the per-pass byte cap stays
 carried with the age alarm; the cap never permits an oversized first read.
+
+### Durable store occupancy
+
+`disk_bytes` on the existing per-source `durable_tail_alarm` snapshot is the
+store-bytes gauge, refreshed by the store inventory after writes or GC.
+`store_bytes_alarm` is true above 512 MiB. This threshold is observational: it
+does not refuse acquisitions, evict active records or persist capacity debt.
