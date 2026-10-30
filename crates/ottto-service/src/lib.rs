@@ -5532,7 +5532,8 @@ mod tests {
         let ledger_value = serde_json::to_value(&ledger).unwrap();
         let compact = ledger_value.as_object().unwrap().values().next().unwrap()["proved"]
             .as_str()
-            .unwrap();
+            .unwrap()
+            .to_owned();
         let progress_path =
             support.join("snapshots/destinations/synthetic/claude-upload-progress.json");
         std::fs::create_dir_all(progress_path.parent().unwrap()).unwrap();
