@@ -779,6 +779,11 @@ impl LocalHoldSettlement {
             None
         };
         disposition.retain_uploadable(&mut scan_result.snapshots);
+        crate::snapshots::record_lineage_parentless_while_incomplete(
+            source,
+            &scan_result.snapshots,
+            index,
+        );
         let retry_pending_family_count = index.claude_usage_authority_pending_count();
         Self {
             held_entity_count,
@@ -849,6 +854,20 @@ fn settle_completed_upload(
         index,
         fully_settled: false,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn classify_holds_for_test(
+    source: SnapshotSource,
+    index: &mut ScanIndex,
+    scan: &mut SourceScanResult,
+) {
+    LocalHoldSettlement::classify(
+        source,
+        index,
+        scan,
+        &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+    );
 }
 
 #[cfg(test)]
