@@ -29,7 +29,7 @@ fn capacity_debt_survives_save_restart_and_keeps_idle_growth_discoverable() {
         SnapshotSource::Pi,
     ] {
         assert!(recovery.requires(source, &path, 3));
-        // No timestamp/age check can turn this outstanding obligation off.
+        // Discovery preserves debt until complete-census retirement decides it.
         assert!(recovery.requires(source, &path, 9));
     }
     // Revalidate an idle file beyond the activity window at BOTH discovery
@@ -62,6 +62,160 @@ fn capacity_debt_survives_save_restart_and_keeps_idle_growth_discoverable() {
     .is_some());
     let _off = RestartRestoreForTest::disabled();
     assert!(!recovery.requires(SnapshotSource::Codex, &path, 3));
+}
+
+#[cfg(unix)]
+fn capacity_scan(index: &mut ScanIndex, root: &Path, limit: usize) -> SourceScanResult {
+    let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+    scan_source_roots_with_limit(
+        SnapshotSource::Pi,
+        &[root.to_path_buf()],
+        index,
+        &now,
+        BACKFILL_WINDOW_DAYS,
+        limit,
+        false,
+    )
+    .unwrap()
+}
+
+#[cfg(unix)]
+fn capacity_cleared(alarms: &[Value], reason: &str) -> u64 {
+    alarms
+        .iter()
+        .filter_map(|alarm| alarm["counts"]["tail_capacity_debt_cleared"][reason].as_u64())
+        .sum()
+}
+
+#[test]
+#[cfg(unix)]
+fn capacity_deleted_file_clears_only_on_complete_census_without_reading() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let _on = RestartRestoreForTest::enabled();
+    for delivery_entry in [false, true] {
+        let root = crate::test_scratch::ScratchDir::new("capacity-deleted");
+        let path = root.join("deleted.jsonl");
+        fs::write(&path, b"{}\n").unwrap();
+        let key = local_index_key(&path);
+        let mut index = ScanIndex::default();
+        if delivery_entry {
+            index
+                .files
+                .insert(key.clone(), tests::manifest_index_entry(None));
+        }
+        index.tail_capacity_debt.insert(key.clone(), 3);
+        fs::remove_file(&path).unwrap();
+        let ((scan, alarms), bytes) = sampled_scan::transition_fixture::observe_consumed(|| {
+            crate::local_resource_diagnostics::capture(|| {
+                capacity_scan(&mut index, &root, MAX_BACKFILL_FILES_PER_SOURCE)
+            })
+        });
+        assert!(scan.census_complete);
+        assert_eq!(scan.scanned_file_count, 0);
+        assert_eq!(bytes, 0, "absence must not read transcript bytes");
+        assert!(!index.tail_capacity_debt.contains_key(&key));
+        assert!(!index.files.contains_key(&key));
+        assert_eq!(capacity_cleared(&alarms, "absent"), 1);
+        assert_eq!(capacity_cleared(&alarms, "aged"), 0);
+        let index_path = root.join("index.json");
+        index.save(&index_path).unwrap();
+        assert!(ScanIndex::load(&index_path)
+            .unwrap()
+            .tail_capacity_debt
+            .is_empty());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn capacity_incomplete_census_retains_deleted_file_debt() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let _on = RestartRestoreForTest::enabled();
+    let root = crate::test_scratch::ScratchDir::new("capacity-incomplete");
+    let path = root.join("deleted.jsonl");
+    fs::write(&path, b"{}\n").unwrap();
+    let key = local_index_key(&path);
+    let mut index = ScanIndex::default();
+    index.tail_capacity_debt.insert(key.clone(), 3);
+    fs::remove_file(path).unwrap();
+    for name in ["a.jsonl", "b.jsonl"] {
+        fs::write(root.join(name), b"{}\n").unwrap();
+    }
+    let (scan, alarms) =
+        crate::local_resource_diagnostics::capture(|| capacity_scan(&mut index, &root, 1));
+    assert!(!scan.census_complete);
+    assert_eq!(index.tail_capacity_debt.get(&key), Some(&3));
+    assert_eq!(capacity_cleared(&alarms, "absent"), 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn capacity_idle_aging_uses_current_mtime_and_the_existing_35_day_cutoff() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let _on = RestartRestoreForTest::enabled();
+    for days in [34, 36] {
+        let root = crate::test_scratch::ScratchDir::new("capacity-aged");
+        let path = root.join("source.jsonl");
+        fs::write(&path, b"{}\n").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(days * 86_400))
+            .unwrap();
+        let key = local_index_key(&path);
+        let mut index = ScanIndex::default();
+        // The delivery entry alone would age both cases. Current source
+        // metadata must preserve the 34-day file's obligation.
+        index
+            .files
+            .insert(key.clone(), tests::manifest_index_entry(None));
+        index.tail_capacity_debt.insert(key.clone(), 3);
+        let (scan, alarms) = crate::local_resource_diagnostics::capture(|| {
+            capacity_scan(&mut index, &root, MAX_BACKFILL_FILES_PER_SOURCE)
+        });
+        assert!(scan.census_complete);
+        assert_eq!(index.tail_capacity_debt.contains_key(&key), days == 34);
+        assert_eq!(capacity_cleared(&alarms, "aged"), u64::from(days == 36));
+        assert_eq!(capacity_cleared(&alarms, "absent"), 0);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn capacity_replacement_counts_only_a_released_obligation_and_off_is_inert() {
+    let _on = RestartRestoreForTest::enabled();
+    let mut index = ScanIndex::default();
+    index.tail_capacity_debt.insert("synthetic".into(), 3);
+    let (_, alarms) = crate::local_resource_diagnostics::capture(|| {
+        index.clear_tail_capacity_debt(SnapshotSource::Codex, "synthetic", "replaced");
+        index.clear_tail_capacity_debt(SnapshotSource::Codex, "synthetic", "replaced");
+    });
+    assert!(index.tail_capacity_debt.is_empty());
+    assert_eq!(capacity_cleared(&alarms, "replaced"), 1);
+    index.tail_capacity_debt.insert("synthetic".into(), 3);
+    for dependency_refused in [false, true] {
+        let _off = if dependency_refused {
+            RestartRestoreForTest::requested_without_dependency()
+        } else {
+            RestartRestoreForTest::disabled()
+        };
+        let (_, alarms) = crate::local_resource_diagnostics::capture(|| {
+            index.clear_tail_capacity_debt(SnapshotSource::Codex, "synthetic", "replaced");
+        });
+        assert_eq!(index.tail_capacity_debt.get("synthetic"), Some(&3));
+        assert_eq!(capacity_cleared(&alarms, "replaced"), 0);
+        assert!(serde_json::to_value(&index)
+            .unwrap()
+            .get("tail_capacity_debt")
+            .is_none());
+    }
 }
 
 #[test]

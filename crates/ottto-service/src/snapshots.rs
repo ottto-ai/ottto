@@ -30566,7 +30566,7 @@ impl OwnedSourceScan {
                                     }
                                 }
                                 Some(false) => {
-                                    index.tail_capacity_debt.remove(&active.key);
+                                    index.clear_tail_capacity_debt(source, &active.key, "replaced");
                                 }
                                 None => {}
                             }
@@ -33905,7 +33905,8 @@ impl OwnedSourceScan {
                 ) {
                     match context.cache.reconcile_receipt(source, &key) {
                         sampled_scan::durable_tail::ReconcileOutcome::Receipted(receipt) => {
-                            index.tail_capacity_debt.remove(&key);
+                            index.clear_tail_capacity_debt(source, &key, "replaced");
+                            index.report_tail_capacity(source);
                             Some(receipt)
                         }
                         sampled_scan::durable_tail::ReconcileOutcome::Held(cause) => {
@@ -45009,7 +45010,18 @@ fn ensure_bounded_traversal(
         codex_rollout_paths: BTreeSet::new(),
         codex_join_directory_census: (source == SnapshotSource::Codex)
             .then(codex_file_join::DirectoryCensus::new),
-        reconciliation_upper_bound: index.files.keys().next_back().cloned(),
+        reconciliation_upper_bound: index
+            .files
+            .keys()
+            .next_back()
+            .into_iter()
+            .chain(
+                restart_restore::enabled()
+                    .then(|| index.tail_capacity_debt.keys().next_back())
+                    .flatten(),
+            )
+            .max()
+            .cloned(),
         reconciliation_after: None,
         reconciliation_started: false,
         watcher_hint_seen: false,
@@ -45901,20 +45913,40 @@ fn reconcile_missing_index_entries_with_side(
     };
     let after = snapshot.reconciliation_after.clone();
     let lower_bound = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-    let page = index
+    // Debt may outlive withheld delivery entries. Merge at most two bounded
+    // pages so those keys share the existing reconciliation cursor and proof.
+    let mut page = index
         .files
-        .range((lower_bound, std::ops::Bound::Included(upper_bound.clone())))
+        .range((
+            lower_bound.clone(),
+            std::ops::Bound::Included(upper_bound.clone()),
+        ))
         .take(limit)
         .map(|(key, _)| key.clone())
-        .collect::<Vec<_>>();
+        .collect::<BTreeSet<_>>();
+    if restart_restore::enabled() {
+        page.extend(
+            index
+                .tail_capacity_debt
+                .range((lower_bound, std::ops::Bound::Included(upper_bound.clone())))
+                .take(limit)
+                .map(|(key, _)| key.clone()),
+        );
+    }
+    let page = page.into_iter().take(limit).collect::<Vec<_>>();
     if page.is_empty() {
         return true;
     }
+    let mut capacity_debt_cleared = false;
     for key in &page {
         let observed = index
             .traversal
             .as_ref()
             .is_some_and(|traversal| traversal.observed_index_keys.contains(key));
+        // This path runs only after the same healthy, frozen, complete walk
+        // that admits vanished-entry pruning. Debt is not finish/ACK authority:
+        // releasing it leaves every other custody and history guard intact.
+        capacity_debt_cleared |= index.retire_tail_capacity_debt(source, key, observed);
         if !observed && index.claude_account_deferred_holds.contains_key(key) {
             index.retire_absent_account_hold(key);
             if !index.files.contains_key(key) {
@@ -45975,6 +46007,9 @@ fn reconcile_missing_index_entries_with_side(
             index.claude_account_deferred_holds.remove(key);
             index.drop_codex_proof_items(key, codex_side_drop);
         }
+    }
+    if capacity_debt_cleared {
+        index.report_tail_capacity(source);
     }
     let done = page.last() == Some(&upper_bound) || page.len() < limit;
     if let Some(traversal) = index.traversal.as_mut() {
@@ -47234,6 +47269,66 @@ fn canonicalize_codex_identity_map<T: PartialEq>(values: &mut BTreeMap<String, T
 }
 
 impl ScanIndex {
+    fn clear_tail_capacity_debt(
+        &mut self,
+        source: SnapshotSource,
+        key: &str,
+        reason: &'static str,
+    ) -> bool {
+        if restart_restore::enabled()
+            && self.persistence_available()
+            && self.tail_capacity_debt.remove(key).is_some()
+        {
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                source.api_slug(),
+                &serde_json::json!({"tail_capacity_debt_cleared": {reason: 1}}),
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Called by complete-census reconciliation, including keys whose delivery
+    /// entry was withheld. Never opens or reads source content.
+    fn retire_tail_capacity_debt(
+        &mut self,
+        source: SnapshotSource,
+        key: &str,
+        observed: bool,
+    ) -> bool {
+        if !restart_restore::enabled()
+            || !self.persistence_available()
+            || !self.tail_capacity_debt.contains_key(key)
+        {
+            return false;
+        }
+        let Some(walk) = self.traversal.as_ref() else {
+            return false;
+        };
+        if !observed && sampled_audit::proven_absent(Path::new(key), &walk.scan_roots) {
+            return self.clear_tail_capacity_debt(source, key, "absent");
+        }
+        // Reuse transcript retirement's strict 35-day mtime cutoff. Current
+        // metadata prevents a stale delivery entry from aging recent growth;
+        // unknown timestamps, links and I/O failures retain the obligation.
+        let cutoff = rfc3339_unix_seconds(&walk.census_window_end)
+            .unwrap_or_default()
+            .saturating_sub(claude_request_census::CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
+        if observed
+            && fs::symlink_metadata(key).is_ok_and(|metadata| {
+                metadata.is_file()
+                    && metadata
+                        .modified()
+                        .ok()
+                        .and_then(unix_seconds)
+                        .is_some_and(|modified| modified > 0 && modified < cutoff)
+            })
+        {
+            return self.clear_tail_capacity_debt(source, key, "aged");
+        }
+        false
+    }
+
     fn report_tail_capacity(&self, source: SnapshotSource) {
         if restart_restore::enabled() {
             crate::local_resource_diagnostics::durable_tail_alarm(
