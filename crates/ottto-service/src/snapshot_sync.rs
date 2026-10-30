@@ -8806,6 +8806,10 @@ fn claude_evidence_root_session_ids(snapshots: &[SnapshotItem]) -> Vec<String> {
         .collect()
 }
 
+fn trace_discard_count_is_zero(count: &u64) -> bool {
+    *count == 0
+}
+
 /// Apply the exact local Claude API/trace evidence path used by production.
 ///
 /// Kept as one shared derivation so privacy-safe offline audits cannot drift
@@ -8818,6 +8822,16 @@ pub struct ClaudeLocalEvidenceStats {
     pub complete_sidecar_root_count: usize,
     pub api_incomplete_root_count: usize,
     pub trace_incomplete_root_count: usize,
+    /// Strict trace reads dropped as grown or replaced; absent while empty.
+    #[serde(skip_serializing_if = "crate::claude_local_otel::ClaudeTraceRowsDiscarded::is_empty")]
+    pub trace_rows_discarded: crate::claude_local_otel::ClaudeTraceRowsDiscarded,
+    /// Requests placed Unknown because this page discarded their strict trace.
+    #[serde(skip_serializing_if = "trace_discard_count_is_zero")]
+    pub trace_discard_no_fallback_requests: u64,
+    /// Items whose upload this page deferred because it discarded their
+    /// family's strict trace read.
+    #[serde(skip_serializing_if = "trace_discard_count_is_zero")]
+    pub trace_discard_deferred_items: u64,
     pub api_evidence_row_count: usize,
     pub trace_evidence_row_count: usize,
     pub exact_request_set_root_count: usize,
@@ -9205,6 +9219,32 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
     apply_claude_local_evidence_to_scan_with_prepared(support_dir, scan_result, index, None)
 }
 
+/// The production evidence stage with this cycle's accepted-identity ledger.
+#[cfg(test)]
+pub(crate) fn apply_claude_local_evidence_to_scan_with_accepted_for_test(
+    support_dir: &Path,
+    scan_result: &mut crate::snapshots::SourceScanResult,
+    index: &mut ScanIndex,
+    accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
+) -> (
+    crate::snapshots::ClaudeUsageAuthorityDisposition,
+    bool,
+    ClaudeLocalEvidenceStats,
+) {
+    try_apply_claude_local_evidence_to_scan_with_comparison(
+        support_dir,
+        scan_result,
+        index,
+        None,
+        None,
+        None,
+        None,
+        accepted_identity_buckets,
+        None,
+    )
+    .expect("evidence fixture has no resource refusal")
+}
+
 fn apply_claude_local_evidence_to_scan_with_prepared(
     support_dir: &Path,
     scan_result: &mut crate::snapshots::SourceScanResult,
@@ -9471,6 +9511,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // E2: roots whose strict API and trace reads were both healthy. A healthy
     // sidecar may hold no rows for the root, so evidence keys cannot say this.
     let mut strict_healthy_roots = BTreeSet::new();
+    let mut trace_discarded_roots = BTreeSet::new();
     for root_session_id in usage_roots {
         let mut api = api_read.take_strict_report(support_dir, &root_session_id);
         let mut trace = match prepared.as_mut() {
@@ -9485,6 +9526,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         }
         if !trace.is_complete() {
             stats.trace_incomplete_root_count += 1;
+        }
+        stats.trace_rows_discarded.add(&trace.rows_discarded);
+        if !trace.rows_discarded.is_empty() {
+            trace_discarded_roots.insert(root_session_id.clone());
         }
         if !api.health.is_complete() || !trace.is_complete() {
             if crate::snapshots::claude_terminal_off() {
@@ -9570,6 +9615,14 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // A side-call census walk past its deadline decided nothing for its
         // families: the same seam keeps their owed history for a later page.
         index.hold_claude_history_for_unhealthy_telemetry_roots(&side_calls_unresolved);
+        // A discarded strict trace read defers the family's bodies through the
+        // E2 withhold: the accepted revision stays, delayed one pass, never
+        // replaced by an untagged one.
+        stats.trace_discard_deferred_items =
+            crate::snapshots::claude_request_money::e2::hold_trace_discarded(
+                &mut scan_result.snapshots,
+                &trace_discarded_roots,
+            );
     }
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
@@ -9580,6 +9633,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             identity_unhealthy_roots,
             crate::snapshots::claude_request_identity::desktop_census(index),
         )
+        .with_trace_discarded_roots(trace_discarded_roots)
         .with_status_coverage(crate::claude_status_coverage::snapshot())
         .with_native_originals(&originals)
         .with_accepted_buckets(accepted_identity_buckets)
@@ -9616,10 +9670,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     }
     if crate::snapshots::claude_request_money::e2::enabled() {
         if let Some(evidence) = &identity_evidence {
-            crate::snapshots::claude_request_identity::reconcile_request_accounts(
-                &mut scan_result.snapshots,
-                evidence,
-            );
+            stats.trace_discard_no_fallback_requests =
+                crate::snapshots::claude_request_identity::reconcile_request_accounts(
+                    &mut scan_result.snapshots,
+                    evidence,
+                );
         }
     }
     let request_owned_activity = identity_evidence.as_ref().map(|evidence| {
