@@ -64,12 +64,26 @@ a test-only reference. A real cap-crossing producer fixture asserts consumed
 bytes equal the initial opened length plus one, with no complete evidence.
 Per-pass strict-cohort pacing remains ON-only. This is the explicit shared
 correctness exception in the hunk audit, not an OFF terminal-policy change.
+The shared trace bound moves to its own main PR (`t1/trace-reader-bound`);
+#899 will merge main after it lands and keeps its copy of the change until then.
 
 ## Readiness and known ON residuals
 
-OFF merge still requires R6/R12, the empty-context B1 control, missing-ACK B-P2,
-re-arm-loop B-P5, OFF identity, Linux and branch Mac. B-P2/B-P5 are the next
-separate fix round; this switch does not waive them.
+OFF merge still requires R6/R12, the empty-context B1 control, OFF identity,
+Linux and the merge-queue Mac. Two ON blockers are fixed here, both gated on
+`claude_terminal_off()` and with no persisted field:
+
+- **B-P2 (missing ACK):** a stale family member whose committed head carries a
+  body the server never accepted (and no refusal quarantine owns) is never
+  covered by the redundant stale-clear suppression. It stays Parse and its
+  head is offered again; ACKed members keep the suppressed clear (Skip).
+- **B-P5 (re-arm loop):** under containment neither the contract latch nor
+  source-wide context adoption discharges, so the semantic stale clear used to
+  re-arm every stale family at every red-retry or floor start. A bounded RAM
+  memo (16,384 hashed keys, FIFO, eviction diagnostic) now serves it once per
+  family and generation (traversal context, upload context pair, contract,
+  latch). A cleared member stays cleared until it is read; eviction or a
+  restart costs at most one more re-read, never proof, ACK or settlement.
 
 ## OFF proof and the ON-readiness manifest
 
