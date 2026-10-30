@@ -168,6 +168,36 @@ fn configured_root_symlink_uses_the_same_resolved_scope_as_discovery() {
 }
 
 #[test]
+fn combined_context_and_revision_debt_never_reads_past_native_page_budget() {
+    let (home, root, mut index, _) = setup("copy-prefix-combined-budget");
+    let _on = claude_request_money::e2::ResumedPrefixForTest::set(true);
+    let support = home.join("support");
+    run(&home.join("scope.json"), &support, true).unwrap();
+    activate_mode(&mut index, "ctx-1", true, false);
+    let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
+    assert_eq!(pending.len(), 3);
+    with_body_witness_adoption_page_budget(1, || {
+        let (_, scan, opened) = walk(&root, index.clone(), &pending);
+        assert_eq!(opened, vec![pending[0].clone()]);
+        assert_eq!(scan.scanned_file_count, 1);
+    });
+    let limit = fs::metadata(&pending[0]).unwrap().len();
+    with_body_witness_adoption_byte_budget(limit, || {
+        let (_, scan, opened) = walk(&root, index, &pending);
+        assert_eq!(opened, vec![pending[0].clone()]);
+        assert_eq!(scan.scanned_file_count, 1);
+        assert!(
+            opened
+                .iter()
+                .map(|p| fs::metadata(p).unwrap().len())
+                .sum::<u64>()
+                <= limit
+        );
+    });
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn estimate_is_metadata_only_and_changes_no_files_or_index() {
     let (home, _, index, _) = setup("copy-prefix-estimate");
     let support = home.join("never-created-support");

@@ -3269,6 +3269,24 @@ fn e2_pipeline_resumed_switch_counts_removed_partial_dollars_and_own_turns() {
 }
 
 #[test]
+fn corrected_family_counter_excludes_history_vetoed_literals() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-copy-counter-history-veto");
+        let prior = demo_family(&mut c, &mut e2_progress());
+        std::fs::write(
+            c.support.join("snapshots/claude_code-reemission-exclusions.txt"),
+            format!("{:x}\n", Sha256::digest(THIRD.as_bytes())),
+        ).unwrap();
+        append(&c.root.join(file(THIRD)), &line_by(THIRD, "new-own", "2026-08-02T07:07:00Z", 10, RESUME_WRITER));
+        e2::take_diag();
+        let mut page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        assert_eq!(copy_diag(&["copy_prefix_families_corrected"]), [0]);
+        page.finish();
+        assert!(body(&page, THIRD).is_none(), "listed literal is vetoed");
+    });
+}
+
+#[test]
 fn e2_pipeline_resumed_old_writer_family_counts_each_request_once() {
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-copy-family-demo");

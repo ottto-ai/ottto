@@ -4077,7 +4077,6 @@ pub(crate) fn finish_page(
         })
         .collect::<BTreeMap<_, _>>();
     let mut withheld = BTreeSet::new();
-    let mut corrected_families = BTreeSet::new();
     items.retain_mut(|item| {
         if item.claude_money.is_none() {
             return true;
@@ -4092,9 +4091,6 @@ pub(crate) fn finish_page(
         // its fold gets its own entity back (moved out above).
         let emitted = super::emit::apply(item, &entity);
         if emitted {
-            if corrected_sessions.contains(&item.source_session_id) {
-                corrected_families.insert(claude_snapshot_family_root_ref(item).to_owned());
-            }
             if let Some(marked) = item.copy_unproven_counts {
                 let mut counts = Counts::default();
                 counts.0[19] = marked.rows;
@@ -4123,6 +4119,20 @@ pub(crate) fn finish_page(
         }
         true
     });
+    // Literal guards inspect the final request-owned bodies, after apply.
+    // A locally rebuilt body vetoed by history is not a corrected family.
+    let guard = index.claude_literal_guard(items);
+    let corrected_families = items
+        .iter()
+        .filter(|item| {
+            telemetry == TelemetryRead::Loaded
+                && !super::super::claude_reemission_stop_latched()
+                && !withheld.contains(&item.source_session_id)
+                && corrected_sessions.contains(&item.source_session_id)
+                && index.claude_history_emission.permits(item, &guard)
+        })
+        .map(|item| claude_snapshot_family_root_ref(item).to_owned())
+        .collect::<BTreeSet<_>>();
     if !corrected_families.is_empty() {
         let mut counts = Counts::default();
         counts.0[23] = corrected_families.len() as u64;

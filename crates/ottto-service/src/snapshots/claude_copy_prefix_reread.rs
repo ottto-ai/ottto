@@ -298,5 +298,23 @@ pub(super) fn select(
     }
 }
 
+/// A scoped unchanged revision re-read also owes its qualified context. That
+/// second debt must not turn a history-budget hold into an ordinary read.
+/// Real changes and independent audit/authority reasons keep their rules.
+pub(super) fn unchanged_requested(index: &ScanIndex, candidate: &CandidateFile) -> bool {
+    let key = local_index_key(&candidate.path);
+    claude_request_money::e2::resumed_prefix_enabled()
+        && index
+            .claude_money_birth_store
+            .money_marks(claude_money_birth_store::location_key(&key))
+            & REOWED
+            != 0
+        && index.files.get(&key).is_some_and(|entry| {
+            entry.size_bytes == candidate.size_bytes
+                && entry.modified_unix_seconds == candidate.modified_unix_seconds
+                && entry.modified_unix_nanos == Some(candidate.modified_unix_nanos)
+        })
+}
+
 #[cfg(test)]
 mod tests;

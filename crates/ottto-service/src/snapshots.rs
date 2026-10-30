@@ -32540,7 +32540,9 @@ impl OwnedSourceScan {
             // keep the adoption-only page budget.
             if decision == CandidateDecision::Parse {
                 let adoption_only = parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
-                    && index.candidate_requires_only_body_witness_adoption(&candidate, audit_now);
+                    && (index.candidate_requires_only_body_witness_adoption(&candidate, audit_now)
+                        || (source == SnapshotSource::ClaudeCode
+                            && claude_copy_prefix_reread::unchanged_requested(index, &candidate)));
                 let history = if source == SnapshotSource::ClaudeCode {
                     index.claude_history_upgrade_decision(
                         &candidate,
