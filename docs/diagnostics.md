@@ -1171,6 +1171,19 @@ collection, so it appears only on `process_retained_cache_lifecycle_totals`
 (source `unknown`), from the next page's line. It is a count only, with no file
 names, response ids or content.
 
+A Pi durable record carries its first prompt's uploaded values (prefix label,
+template id, skill id and label) and the uploaded title, exactly as one upload
+sent them after policy, so a restored copy can publish them without reading the
+prompt. Two counters watch those stored copies, both on the same line and with
+the same scope:
+
+- `pi_uploaded_literal_purged` counts records deleted because a setting that
+  gates a stored value is now off. The sweep runs once per upload context, when
+  a pass begins, so a revoked setting erases the copies before that pass saves.
+- `pi_uploaded_literal_key_changed` counts stored first-prompt sets dropped
+  because the upload HMAC key changed: at that sweep, or at restore if a record
+  reaches it. The file reads Full on its next growth instead.
+
 The tag-1 audit-safe bootstrap core is a hard release pair with the grouped
 custody and stored-representation binding completion. The first part preserves
 main's narrower current-representation binding formula. Grouped Codex members

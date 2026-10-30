@@ -86,6 +86,11 @@ counters! {
     // A restored Pi Tail below the accepted extent offered for upload (Pi has
     // no accepted floor). Counted at post-policy finalization.
     pi_restored_behind_accepted: PiRestoredBehindAccepted,
+    // SOURCE conditions on the Pi record's uploaded first-prompt copies: a
+    // stored copy purged after its setting turned off, and a stored set dropped
+    // because the upload HMAC key changed. Counts only, never a value.
+    pi_uploaded_literal_purged: PiUploadedLiteralPurged,
+    pi_uploaded_literal_key_changed: PiUploadedLiteralKeyChanged,
     retention_no_plan: RetentionNoPlan,
     retention_unsealed_eof: RetentionUnsealedEof,
     retention_clone_bound_refused: RetentionCloneBoundRefused,
