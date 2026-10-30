@@ -2318,3 +2318,238 @@ fn production_ack_retirement_cannot_apply_a_plain_set() {
     }
     assert_eq!(minted_by, BTreeSet::from(["stage_selected_ack_retirement"]));
 }
+
+// M7: synthetic persisted ACKs only; no live source/provider/account state.
+fn bound_progress(
+    index_path: &Path,
+    progress_path: &Path,
+    namespace: &str,
+) -> SnapshotUploadProgress {
+    let mut progress = SnapshotUploadProgress::new(
+        namespace.into(),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    );
+    let recovery = crate::snapshots::ProgressRecovery::synthetic(index_path, namespace, 0);
+    recovery.adopt_synthetic(None);
+    progress.ack_recovery = Some(recovery);
+    progress.save(progress_path).unwrap();
+    progress
+}
+fn load_bound_progress(
+    progress: &SnapshotUploadProgress,
+    path: &Path,
+    namespace: &str,
+) -> SnapshotUploadProgress {
+    progress
+        .ack_recovery
+        .as_ref()
+        .unwrap()
+        .recover(path)
+        .unwrap();
+    let mut loaded = SnapshotUploadProgress::load(
+        path,
+        namespace,
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .unwrap();
+    loaded.ack_recovery = progress.ack_recovery.clone();
+    loaded
+}
+#[test]
+fn v2_receipt_first_crash_restores_exact_ack_without_duplicate_accepted_upload() {
+    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-upload-crash");
+    let index_path = scratch.join("index");
+    let path = scratch.join("progress");
+    let namespace = "a".repeat(64);
+    let mut progress = bound_progress(&index_path, &path, &namespace);
+    let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    let old = std::fs::read(&path).unwrap();
+    progress.record_body(
+        &item.snapshot_fingerprint,
+        &snapshot_upload_body_witness(&item),
+    );
+    progress.generation += 1;
+    let new = serde_json::to_vec_pretty(&progress).unwrap();
+    progress
+        .ack_recovery
+        .as_ref()
+        .unwrap()
+        .before_progress_save(Some(&old), &new)
+        .unwrap();
+    // Crash before progress rename and before any v2 accepted-state commit.
+    assert_eq!(std::fs::read(&path).unwrap(), old);
+    let mut loaded = load_bound_progress(&progress, &path, &namespace);
+    let mut accepted = 0;
+    let mut posts = 0;
+    upload_resumable_batches_with_body_witness(
+        &[item],
+        &unique_poison_scope(),
+        &mut loaded,
+        &mut accepted,
+        |item| item.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
+        |batch| {
+            posts += 1;
+            exact_ack(batch)
+        },
+        |state| state.save(&path),
+    )
+    .unwrap();
+    assert_eq!((posts, accepted), (0, 0));
+}
+#[test]
+fn v2_db_first_crash_retires_only_the_committed_exact_handoff() {
+    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-db-first");
+    let index_path = scratch.join("index");
+    let path = scratch.join("progress");
+    let namespace = "a".repeat(64);
+    let fp = "b".repeat(64);
+    let body = "c".repeat(64);
+    let mut progress = bound_progress(&index_path, &path, &namespace);
+    progress.record_body(&fp, &body);
+    progress.save(&path).unwrap();
+    let mut saved = ScanIndex::default();
+    saved.upload_ack_retirement_handoff = Some(crate::snapshots::UploadAckRetirementHandoff {
+        destination_namespace_hash: namespace.clone(),
+        committed_generation: 1,
+        bodies: [(fp.clone(), body)].into(),
+        pending_bodies: BTreeMap::new(),
+    });
+    saved.save(&index_path).unwrap();
+    // Crash after source commit, before cleanup of the external progress ACK.
+    let mut loaded = load_bound_progress(&progress, &path, &namespace);
+    loaded
+        .recover_ack_retirement_handoff(&mut saved, &index_path, &path)
+        .unwrap();
+    assert!(loaded.accepted_fingerprints.is_empty());
+    assert!(saved.upload_ack_retirement_handoff.is_none());
+    let reloaded = load_bound_progress(&loaded, &path, &namespace);
+    assert!(reloaded.accepted_fingerprints.is_empty());
+}
+#[test]
+fn v2_newer_receipt_precedes_older_db_retirement_and_cannot_be_retired_by_it() {
+    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-newer-first");
+    let index_path = scratch.join("index");
+    let path = scratch.join("progress");
+    let namespace = "a".repeat(64);
+    let fp = "b".repeat(64);
+    let mut progress = bound_progress(&index_path, &path, &namespace);
+    progress.record_body(&fp, &"c".repeat(64));
+    progress.save(&path).unwrap();
+    let old = std::fs::read(&path).unwrap();
+    progress.record_body(&fp, &"d".repeat(64));
+    progress.generation += 1;
+    progress
+        .ack_recovery
+        .as_ref()
+        .unwrap()
+        .before_progress_save(Some(&old), &serde_json::to_vec_pretty(&progress).unwrap())
+        .unwrap();
+    let mut saved = ScanIndex::default();
+    saved.upload_ack_retirement_handoff = Some(crate::snapshots::UploadAckRetirementHandoff {
+        destination_namespace_hash: namespace.clone(),
+        committed_generation: 1,
+        bodies: [(fp.clone(), "c".repeat(64))].into(),
+        pending_bodies: BTreeMap::new(),
+    });
+    saved.save(&index_path).unwrap();
+    let mut loaded = load_bound_progress(&progress, &path, &namespace);
+    loaded
+        .recover_ack_retirement_handoff(&mut saved, &index_path, &path)
+        .unwrap();
+    assert_eq!(loaded.accepted_body_witnesses[&fp], "d".repeat(64));
+    assert!(saved.upload_ack_retirement_handoff.is_none());
+}
+#[test]
+fn v2_transport_error_and_failed_index_commit_never_authorize_an_ack() {
+    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-err");
+    let index_path = scratch.join("index");
+    let path = scratch.join("progress");
+    let namespace = "a".repeat(64);
+    let mut progress = bound_progress(&index_path, &path, &namespace);
+    let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    let mut accepted = 0;
+    let result = upload_resumable_batches_with_body_witness(
+        &[item],
+        &unique_poison_scope(),
+        &mut progress,
+        &mut accepted,
+        |item| item.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
+        |_| Err(anyhow!("synthetic transport failure")),
+        |state| state.save(&path),
+    );
+    assert!(result.is_err());
+    let loaded = load_bound_progress(&progress, &path, &namespace);
+    assert!(loaded.accepted_fingerprints.is_empty());
+    assert_eq!(accepted, 0);
+
+    progress.record_body(&"b".repeat(64), &"c".repeat(64));
+    progress.save(&path).unwrap();
+    let mut tentative = ScanIndex::default();
+    progress
+        .stage_ack_retirement_handoff_with_census(
+            &ScanIndex::default(),
+            &mut tentative,
+            &BTreeSet::new(),
+            &["b".repeat(64)].into(),
+        )
+        .unwrap();
+    std::fs::create_dir(&index_path).unwrap();
+    assert!(tentative.save(&index_path).is_err());
+    // Generation zero is not committed authority, even with a staged handoff.
+    progress
+        .recover_ack_retirement_handoff(&mut tentative, &index_path, &path)
+        .unwrap();
+    assert!(progress.accepted_fingerprints.contains(&"b".repeat(64)));
+}
+
+#[test]
+fn v2_runtime_binding_preserves_existing_progress_bytes_and_off_performs_no_receipt_io() {
+    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-off-bytes");
+    let index_path = scratch.join("absent-index");
+    let mut progress = SnapshotUploadProgress::new(
+        "a".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    );
+    progress.record_body(&"b".repeat(64), &"c".repeat(64));
+    let existing_bytes = serde_json::to_vec_pretty(&progress).unwrap();
+    progress.ack_recovery = Some(crate::snapshots::ProgressRecovery::synthetic(
+        &index_path,
+        &"a".repeat(64),
+        0,
+    ));
+    assert_eq!(
+        serde_json::to_vec_pretty(&progress).unwrap(),
+        existing_bytes
+    );
+    assert!(
+        crate::snapshots::ProgressRecovery::for_index(&ScanIndex::default(), &index_path)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+}
+
+#[test]
+fn v2_bound_invalid_progress_holds_without_legacy_quarantine_or_reset() {
+    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-no-quarantine");
+    let path = scratch.join("progress");
+    let recovery =
+        crate::snapshots::ProgressRecovery::synthetic(&scratch.join("index"), &"a".repeat(64), 0);
+    let invalid = SnapshotUploadProgress::new(
+        "b".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    );
+    let bytes = serde_json::to_vec_pretty(&invalid).unwrap();
+    ottto_core::write_owner_only_file_atomic(&path, &bytes).unwrap();
+    recovery.adopt_synthetic(Some(&bytes));
+    assert!(SnapshotUploadProgress::load_with_recovery(
+        &path,
+        &"a".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        Some(recovery),
+    )
+    .is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}

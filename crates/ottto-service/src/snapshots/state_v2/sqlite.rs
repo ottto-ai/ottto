@@ -1761,3 +1761,44 @@ fn quick_check(conn: &Connection, budget: Duration) -> Result<()> {
 mod fixtures;
 #[cfg(test)]
 pub(super) use fixtures::*;
+
+impl Sqlite {
+    /// Narrow ACK boundary read: authenticate identity and writer capability in
+    /// the same snapshot as the current generation. No RW open, route change,
+    /// checkpoint, migration, or takeover of the source's owner connection.
+    pub(super) fn ack_generation(path: &Path, identity: &super::Identity) -> Result<u64> {
+        private_file(path)?;
+        let before = fs::symlink_metadata(path)?;
+        // Identity probes use immutable mode on the frozen base pages. ACK
+        // settlement must instead see the live WAL's committed generation.
+        let uri = sqlite_uri(path)?;
+        let uri = uri
+            .strip_suffix("&immutable=1")
+            .context("state_v2_ack_live_uri")?;
+        let conn = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(BUSY)?;
+        conn.execute_batch("BEGIN")?;
+        migrations::check_current(&conn)?;
+        migrations::writer_supported(&conn)?;
+        let actual: super::Identity = read_json(&conn, &RowKey::Meta("identity".into()))?
+            .context("state_v2_identity_missing")?;
+        ensure!(actual == *identity, "state_v2_foreign_binding");
+        let generation: u64 = read_json(&conn, &RowKey::Meta("generation".into()))?
+            .context("state_v2_generation_missing")?;
+        let after = fs::symlink_metadata(path)?;
+        ensure!(
+            before.dev() == after.dev() && before.ino() == after.ino(),
+            "state_v2_object_changed"
+        );
+        ensure!(
+            generation >= identity.fence_generation,
+            "state_v2_generation_rollback"
+        );
+        Ok(generation)
+    }
+}
