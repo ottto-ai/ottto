@@ -37072,8 +37072,6 @@ exit 0
         }
     }
 
-    /// The default login on the fixture HOME, file credential included.
-
     fn slot_harness(fixture: &ClaudeBindingFixture) -> PassiveRunHarness<'_> {
         PassiveRunHarness {
             fixture,
