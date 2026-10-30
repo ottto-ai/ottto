@@ -352,26 +352,23 @@ fn claude_terminal_stale_roots(index: &ScanIndex, window: &str) -> BTreeSet<Stri
 
 // Main parity (`stale_pending_roots`): a family whose authority quarantine is
 // bound to its retained witness keeps its own retry gate, so a start never
-// re-arms it and retry admission never takes it as a root.
-fn claude_terminal_family_preserved(index: &ScanIndex, root: &str) -> bool {
-    index
-        .claude_usage_authority_quarantine
-        .get(root)
-        .zip(index.claude_usage_family_witnesses.get(root))
-        .is_some_and(|(quarantine, witness)| {
-            claude_usage_authority_preserves_pending(quarantine, witness)
-        })
-}
-
-// Only the semantic clear uses this; B-P2's unACKed heads and the B-P5 memo
-// stay over the full stale set.
+// re-arms it. Only the semantic clear uses this; B-P2's unACKed heads and the
+// B-P5 memo stay over the full stale set.
 fn claude_terminal_semantic_stale_roots(
     index: &ScanIndex,
     stale: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     stale
         .iter()
-        .filter(|root| !claude_terminal_family_preserved(index, root))
+        .filter(|root| {
+            !index
+                .claude_usage_authority_quarantine
+                .get(*root)
+                .zip(index.claude_usage_family_witnesses.get(*root))
+                .is_some_and(|(quarantine, witness)| {
+                    claude_usage_authority_preserves_pending(quarantine, witness)
+                })
+        })
         .cloned()
         .collect()
 }
@@ -819,20 +816,13 @@ fn resume_claude_retry_admission(index: &mut ScanIndex, at: &str) {
         .after_root
         .clone()
         .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-    // R7: main admits only `stale_pending_roots`. Off macOS every carry is a
-    // structural refusal, so an unfiltered witness-bound family became the
-    // oversized retry root: its unchanged members took page slots and lost
-    // their fingerprints, and the split family page re-read and held its
-    // root. Its RetryPending deadline still owns the due arm.
     let stale = index
         .claude_usage_family_pending
         .range((
             lower,
             std::ops::Bound::Included(previous.upper_root.clone()),
         ))
-        .filter(|(root, p)| {
-            p.census_window_end != window && !claude_terminal_family_preserved(index, root)
-        })
+        .filter(|(_, p)| p.census_window_end != window)
         .take(CLAUDE_RETRY_ADMISSION_ROOTS + 1)
         .map(|(root, _)| root.clone())
         .collect();
