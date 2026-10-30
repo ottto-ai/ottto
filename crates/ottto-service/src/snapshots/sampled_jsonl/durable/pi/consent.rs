@@ -28,10 +28,8 @@ impl State {
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
         Scope(format!(
-            "{}|pi-consent={incarnation}:{}:{}",
-            base.0,
-            self.generation,
-            self.gates.bits()
+            "{}|pi-consent={incarnation}:{}",
+            base.0, self.generation
         ))
     }
 }
