@@ -517,7 +517,7 @@ fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
         return;
     }
     // Ron accepted this residual for Claude Code and Codex, and on 2026-10-30
-    // extended it to Pi: Pi's writer is append-only and its one known rewrite
+    // and 2026-10-31 extended it to Pi: Pi's writer is append-only and its one known rewrite
     // (the session-version header) reads Full (`pi_version_rewrite_after_tail`).
     for source in [
         SnapshotSource::ClaudeCode,
