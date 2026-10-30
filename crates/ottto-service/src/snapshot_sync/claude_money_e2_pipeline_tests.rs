@@ -5456,7 +5456,7 @@ fn e2_pipeline_withheld_new_file_retries_external_evidence_unchanged() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: unclassified"]
+#[ignore = "terminal-off ON-readiness: C1-clock"]
 fn terminal_off_on_e2_pipeline_withheld_new_file_retries_external_evidence_unchanged() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -5469,7 +5469,7 @@ fn e2_pipeline_withheld_new_file_retries_external_evidence_after_growth() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: unclassified"]
+#[ignore = "terminal-off ON-readiness: C1-clock"]
 fn terminal_off_on_e2_pipeline_withheld_new_file_retries_external_evidence_after_growth() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -5533,7 +5533,7 @@ fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: unclassified"]
+#[ignore = "terminal-off ON-readiness: C1-clock"]
 fn terminal_off_on_e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
