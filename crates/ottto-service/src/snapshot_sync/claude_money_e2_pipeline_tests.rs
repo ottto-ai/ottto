@@ -4005,6 +4005,54 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
     }
 }
 
+/// [regress] Strict review 2026-10-31: a row frozen from the corrected
+/// (switch-on) body holds the lent request's own share beside an own-proved
+/// copy of the lent org. A later own change there keeps #909's protection;
+/// it is never read as copy-derived.
+#[test]
+fn e2_pipeline_corrected_body_freeze_is_not_copy_derived() {
+    for retained in [false, true] {
+        with_e2(|| {
+            use crate::snapshots::claude_request_identity::{take_identity_counts, AcceptedBuckets};
+            let mut c = Corpus::new("e2-pipeline-corrected-freeze");
+            let scanner = E2ScanFixture::capturing_identity();
+            c.root(ROOT, &resumed(ROOT, &[A]));
+            let old = ScanIndex::default();
+            let page = ready(&c, &scanner, old.clone(), 100, false);
+            let prior = settle(&c, &old, page, &mut e2_progress());
+            let marker = |org: &str| json!({"type":"attachment", "sessionId":COPY,
+                "attachment":{"type":"credential_org","organizationUuid":org}}).to_string() + "\n";
+            let org_x = "11111111-1111-4111-8111-111111111111";
+            // The copied marker lent X to C; an own marker proves X in C's row.
+            let mut text = marker(org_x) + &resumed(COPY, &[A, C]) + &marker(org_x)
+                + &line_by(COPY, "own-x", "2026-08-02T07:30:00Z", 10, RESUME_WRITER);
+            c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
+            let corrected = ready(&c, &scanner, prior.clone(), 100, false);
+            let stored = body(&corrected, COPY).unwrap();
+            assert!(stored.usage_buckets[0].model_usage[0].identity_parts.is_some(), "{{C, X}}");
+            let mut ledger = AcceptedBuckets::for_test();
+            ledger.set_retained_enabled(retained);
+            let value = serde_json::to_value(stored).unwrap();
+            ledger.record(&value);
+            if retained {
+                ledger.record_proved(&value, true, &[]);
+            }
+            text += &(json!({"type":"attachment", "sessionId":COPY,
+                "attachment":{"type":"session_context", "context":{}}}).to_string() + "\n");
+            text += &marker("22222222-2222-4222-8222-222222222222");
+            text += &line_by(COPY, "own-b", "2026-08-02T07:40:00Z", 10, RESUME_WRITER);
+            c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
+            let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
+            take_identity_counts();
+            page.enrich_with(&c, Some(&mut ledger));
+            let counts = serde_json::to_value(take_identity_counts()).unwrap();
+            assert_eq!(identity_count(&counts, "accepted_share_changed"), 1);
+            assert_eq!(identity_count(&counts, "copy_derived_proof_invalidated"), 0);
+            assert_eq!(body(&page, COPY).unwrap().request_identity_refusals, u64::from(!retained));
+        });
+    }
+}
+
 /// Lead B F3: a prefix hold over buckets #909 accepted defers the whole
 /// session (no shrunken revision, no ledger change) under the same
 /// three-pass bound; a never-accepted session keeps the prefix-only hold.
