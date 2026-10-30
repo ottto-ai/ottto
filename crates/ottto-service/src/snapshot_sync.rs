@@ -24297,6 +24297,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap();
             // The native legacy body has no reported USD before complete
