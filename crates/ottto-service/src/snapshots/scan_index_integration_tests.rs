@@ -317,7 +317,9 @@ fn integrated_storage_controls_admission_and_native_heap_layout_keep_entry_pin()
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    assert!(std::mem::size_of::<ScanIndexEntry>() <= 480);
+    // Follows the canonical pin (claude_request_census_tests SCAN_INDEX_ENTRY_BYTES = 560
+    // after #901); #894's storage controls add 0 bytes per entry.
+    assert!(std::mem::size_of::<ScanIndexEntry>() <= 560);
     let with = crate::heap_layout_bound::completed_bound(&loaded, 8 * 1024 * 1024).unwrap();
     let mut without = loaded.clone();
     without.persistence_root = None;

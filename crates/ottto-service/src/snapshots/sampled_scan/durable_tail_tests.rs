@@ -825,7 +825,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
             for bypass in [
                 "ordinary",
                 "sampling_none",
-                "allow_sample_false",
+                "audit_metadata_unsupported",
                 "state_false",
                 "sidecar_false",
                 "owning_header_false",
@@ -971,7 +971,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 if bypass == "sampling_none" || bypass == "compressed" {
                     scan.sampling = None;
                 }
-                if bypass == "allow_sample_false" {
+                if bypass == "audit_metadata_unsupported" {
                     scan.sampling.as_mut().unwrap().audit_metadata_supported = false;
                 }
                 if bypass == "state_false" {
@@ -2958,17 +2958,72 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
         index.save(&index_path).unwrap();
         let debt = sampled_audit::debt_for_key(&index, &key, due).unwrap();
         assert_eq!(debt.due_unix_seconds, due, "later offers cannot renew debt");
+        let overdue =
+            ReadPlan::prepare(&mut held, Some(&checkpoint), &scope, Some(debt), due).unwrap();
+        assert_eq!(overdue.mode(), ReadMode::Unchanged);
+        let overdue = overdue
+            .commit_after_native_completion(&held, &scope, due)
+            .unwrap();
+        assert_eq!(overdue.audit_debt().unwrap().due_unix_seconds, due);
         assert_eq!(
-            ReadPlan::prepare(&mut held, Some(&checkpoint), &scope, Some(debt), due)
-                .unwrap()
-                .mode(),
-            ReadMode::Full(FullReason::AuditDue)
+            overdue.last_full_verified(),
+            checkpoint.last_full_verified(),
+            "no Full credit"
         );
     }
     // Third case: absent entries miss without inventing membership. Reset
     // carriers re-arm an immediate current-index audit before any source read.
     // A completed Full whose durable replacement failed has the same state.
     let saved = ScanIndex::load(&index_path).unwrap();
+    // A missing entry must still reach same-context carrier classification.
+    // No entry-derived binding or transcript read is available in either arm.
+    // A foreign namespace supplies no scheduling authority and stays NoEntry.
+    for matching_context in [true, false] {
+        let mut absent = saved.clone();
+        absent.files.remove(&key);
+        let namespace = if matching_context {
+            scope.clone()
+        } else {
+            Scope("foreign-debt-survival".into())
+        };
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(SnapshotSource::ClaudeCode, &index_path, &namespace, true);
+        let interpretation =
+            Interpretation::of(SnapshotSource::ClaudeCode, &key, &absent, true, &namespace);
+        let mut held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let record_path = dir.join(format!(
+            "{}.rec",
+            record_key
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        let before = std::fs::read(&record_path).unwrap();
+        let outcome = cache.durable_restore(
+            SnapshotSource::ClaudeCode,
+            &key,
+            &path,
+            &scope,
+            &mut held,
+            &absent,
+            &interpretation,
+        );
+        assert!(if matching_context {
+            matches!(outcome, RestoreOutcome::Miss(MissClass::AuditCarrier))
+        } else {
+            matches!(outcome, RestoreOutcome::Miss(MissClass::NoEntry))
+        });
+        assert!(!absent.files.contains_key(&key), "no invented membership");
+        assert_eq!(std::fs::read(&record_path).unwrap(), before);
+        let (counts, _) = cache.durable_counters(SnapshotSource::ClaudeCode).unwrap();
+        assert_eq!(
+            counts.ineligible.get("audit_carrier"),
+            matching_context.then_some(&1)
+        );
+        assert_eq!(counts.durable_held, [0; 5]);
+        assert_eq!(counts.restored, 0);
+    }
+
     for reset in [false, true] {
         let mut missing = saved.clone();
         if reset {
@@ -3008,12 +3063,12 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
                 sampled_audit::debt_for_key(&missing, &key, now),
                 Some(rearmed)
             );
-            assert_eq!(
-                ReadPlan::prepare(&mut held, None, &scope, Some(rearmed), now)
-                    .unwrap()
-                    .mode(),
-                ReadMode::Full(FullReason::AuditDue)
-            );
+            // Carrier custody re-arms scheduling debt, independently of the
+            // read cause: without a checkpoint the reader is StateMissing.
+            let plan = ReadPlan::prepare(&mut held, None, &scope, Some(rearmed), now).unwrap();
+            assert_eq!(plan.mode(), ReadMode::Full(FullReason::StateMissing));
+            assert_eq!(rearmed.due_unix_seconds, now);
+            assert_eq!(plan.metrics().audit_due, Some(rearmed.due_unix_seconds));
             missing.save(&index_path).unwrap();
             let loaded = ScanIndex::load(&index_path).unwrap();
             let mut disk = DurableTailStore::new(dir.clone(), source);
