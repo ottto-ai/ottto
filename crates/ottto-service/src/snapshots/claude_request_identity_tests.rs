@@ -1362,7 +1362,6 @@ fn desktop_census_witness_follows_the_store_inventory_through_retry_backoff() {
     let swept = BTreeSet::from([PathBuf::from("/synthetic/store-a")]);
     let backed_off = |store_dirs: &BTreeSet<PathBuf>| {
         let mut index = ScanIndex {
-            claude_desktop_store_inventory: Some(identity::inventory_digest(&swept)),
             claude_desktop_identity_census_complete: true,
             claude_desktop_census_witness: Some(identity::DesktopCensusWitness::new(
                 NOW - 30,
@@ -2824,28 +2823,6 @@ fn bind_owner_a(
         index.session_account_bindings,
         serde_json::to_vec(items).unwrap() == rows,
     )
-}
-
-#[test]
-fn unbound_contract5_requests_survive_conflicting_creator_profiles() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    for mixed in [false, true] {
-        // Real request classification proves the rows independently of the
-        // creator. A cross-profile creator conflict must not revoke that proof.
-        let (dir, mut items, _) = bound_case(mixed, Some(OWNER_A));
-        items[0].session_account_evidence.as_mut().unwrap().identity_disposition = Some("conflict");
-        let mut capability = claude_request_accounts::MixedUploads::default();
-        capability.admit_request_identity(&items[0]);
-        assert!(capability.permits_request_identity(&items[0]));
-        let before = serde_json::to_value(&items).unwrap();
-        let (deferred, bindings, rows_unchanged) =
-            bind_owner_a(&mut items, &capability, false, "machine");
-        assert!(!deferred, "request proof does not establish a creator binding");
-        assert!(bindings.is_empty());
-        assert!(rows_unchanged);
-        assert_eq!(serde_json::to_value(&items).unwrap(), before);
-        let _ = fs::remove_dir_all(dir);
-    }
 }
 
 /// SESSION ruling 3: a bound session admits this scan's exact contract-5 body

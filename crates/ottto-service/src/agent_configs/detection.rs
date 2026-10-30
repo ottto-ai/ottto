@@ -138,20 +138,12 @@ fn detection_spec(source: &SourceKind, home: &Path) -> DetectionSpec {
             // data (vendored CLI downloads and desktop session dirs). Ottto's
             // onboarding never writes any of them, so unlike settings.json they
             // are safe presence evidence for desktop-app-only installs.
-            metadata_paths: std::iter::once(home.join(".claude").join("projects"))
-                .chain(
-                    crate::claude_desktop::support_roots(home)
-                        .into_iter()
-                        .flat_map(|root| {
-                            [
-                                "claude-code",
-                                "claude-code-sessions",
-                                "local-agent-mode-sessions",
-                            ]
-                            .map(|name| root.join(name))
-                        }),
-                )
-                .collect(),
+            metadata_paths: vec![
+                home.join(".claude").join("projects"),
+                claude_desktop_support_dir(home).join("claude-code"),
+                claude_desktop_support_dir(home).join("claude-code-sessions"),
+                claude_desktop_support_dir(home).join("local-agent-mode-sessions"),
+            ],
             install_docs_url: Some(CLAUDE_CODE_INSTALL_DOCS_URL),
         },
         SourceKind::Pi => DetectionSpec {
@@ -163,6 +155,12 @@ fn detection_spec(source: &SourceKind, home: &Path) -> DetectionSpec {
             install_docs_url: None,
         },
     }
+}
+
+fn claude_desktop_support_dir(home: &Path) -> PathBuf {
+    home.join("Library")
+        .join("Application Support")
+        .join("Claude")
 }
 
 fn capture_version(binary_path: &Path, args: &[&str]) -> Option<String> {
@@ -359,24 +357,6 @@ mod tests {
             detection_spec(&SourceKind::ClaudeCode, &home),
             false,
         ));
-    }
-
-    #[test]
-    fn presence_claude_alt_requires_configured_sibling_metadata() {
-        let home = crate::test_scratch::ScratchDir::new("presence-claude-alt");
-        let root = home.join("Library/Application Support/Claude-ALT");
-        fs::create_dir_all(root.join("claude-code-sessions")).unwrap();
-        assert!(!source_present_with_paths(
-            detection_spec(&SourceKind::ClaudeCode, &home),
-            false,
-        ));
-        fs::write(root.join("config.json"), "{}").unwrap();
-        let spec = detection_spec(&SourceKind::ClaudeCode, &home);
-        assert!(source_present_with_paths(spec.clone(), false));
-        assert!(
-            detect_agent_installation_with_paths(&SourceKind::ClaudeCode, spec, None, None)
-                .installed
-        );
     }
 
     #[test]

@@ -17,8 +17,6 @@ use std::time::Duration;
 pub(super) type BatchObserver =
     Arc<dyn Fn(&serde_json::Value) -> std::io::Result<()> + Send + Sync>;
 
-type RequestObserver = Arc<dyn Fn(&str, &serde_json::Value) -> std::io::Result<()> + Send + Sync>;
-
 pub(super) fn thread_cpu_us() -> u64 {
     let mut now = libc::timespec {
         tv_sec: 0,
@@ -59,9 +57,6 @@ fn entity_ack(item: &serde_json::Value) -> serde_json::Value {
     let mut payload = serde_json::Map::new();
     for key in [
         "session_account_evidence",
-        // Creator-bearing ACKs also witness the optional curve; the resumable
-        // uploader refuses a creator-only digest for that larger body.
-        "context_curve",
         "tool_usage",
         "tool_usage_truncated",
     ] {
@@ -102,23 +97,6 @@ impl Backend {
         listener: std::net::TcpListener,
         observer: Option<BatchObserver>,
     ) -> std::io::Result<Self> {
-        Self::with_observers(listener, observer, None)
-    }
-
-    #[cfg(test)]
-    pub(super) fn with_request_observer(
-        listener: std::net::TcpListener,
-        observer: Option<BatchObserver>,
-        request_observer: RequestObserver,
-    ) -> std::io::Result<Self> {
-        Self::with_observers(listener, observer, Some(request_observer))
-    }
-
-    fn with_observers(
-        listener: std::net::TcpListener,
-        observer: Option<BatchObserver>,
-        request_observer: Option<RequestObserver>,
-    ) -> std::io::Result<Self> {
         listener.set_nonblocking(true)?;
         let url = format!("http://{}", listener.local_addr()?);
         let stop = Arc::new(AtomicBool::new(false));
@@ -145,9 +123,6 @@ impl Backend {
                 } else {
                     serde_json::from_str(raw)?
                 };
-                if let Some(observer) = &request_observer {
-                    observer(&head, &value)?;
-                }
                 if head.contains("/relay-token") {
                     if let Some(selected @ ("claude_code" | "codex" | "pi")) =
                         value["source"].as_str()

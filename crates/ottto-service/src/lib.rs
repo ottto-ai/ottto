@@ -8,7 +8,6 @@ mod app_bundle_version;
 pub mod backfill;
 pub mod canonical_json;
 pub mod claude_browser_auth;
-mod claude_desktop;
 pub mod claude_local_otel;
 pub(crate) mod claude_refresher;
 mod claude_session_registrations;
