@@ -845,6 +845,97 @@ pub(crate) fn claude_reemission_family_closure_root_absent_excluded(members: u64
         },
     );
 }
+static CENSUS_RETIRE_KEPT_OVERLAP_TOTAL: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// One `claude_census_retire_kept_overlap` row (E7 stopgap): a complete
+/// terminal's kept records, their hashes and those retired because the
+/// census was above 90% occupancy, with the terminal's census-full tombstone
+/// count; or the records an insert retired so it fits (admission overflow,
+/// no terminal count); or a new key refused at the live record bound.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CensusRetireKeptOverlapCounts {
+    pub(crate) records: u64,
+    pub(crate) hashes: u64,
+    pub(crate) overflow_occupancy: u64,
+    pub(crate) overflow_admission: u64,
+    /// New keys refused at the live census record bound.
+    pub(crate) record_limit_refused: u64,
+    /// The terminal's shadow `missing_over_budget`; None on admission rows.
+    pub(crate) missing_over_budget: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct CensusRetireKeptOverlap {
+    census_retire_kept_overlap_records: u64,
+    census_retire_kept_overlap_hashes: u64,
+    census_retire_kept_overflow: u64,
+    census_retire_kept_overflow_occupancy: u64,
+    census_retire_kept_overflow_admission: u64,
+    census_record_limit_refused: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    census_missing_over_budget: Option<u64>,
+    census_retire_kept_overlap_records_total: u64,
+    census_retire_kept_overlap_hashes_total: u64,
+    census_retire_kept_overflow_total: u64,
+    census_retire_kept_overflow_occupancy_total: u64,
+    census_retire_kept_overflow_admission_total: u64,
+    census_record_limit_refused_total: u64,
+}
+
+/// Local counter (E7 stopgap): aged Claude transcript census records kept
+/// because they share a request id with another unretired record, and those
+/// retired anyway: above 90% census occupancy at a terminal, or so an insert
+/// fits. `census_retire_kept_overflow` counts both reasons, `_occupancy`
+/// and `_admission` each one. `census_record_limit_refused` counts new keys
+/// refused at the live record bound. The row's counts and saturating process totals; a positive
+/// overflow or refusal (each loses money proof) also emits
+/// `claude_census_retire_kept_overlap_alarm`. Counts only; no path, id or
+/// wire event.
+pub(crate) fn claude_census_retire_kept_overlap(counts: CensusRetireKeptOverlapCounts) {
+    let add = |slot: usize, count: u64| {
+        CENSUS_RETIRE_KEPT_OVERLAP_TOTAL[slot]
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |total| Some(total.saturating_add(count)),
+            )
+            .unwrap_or(u64::MAX)
+            .saturating_add(count)
+    };
+    let overflow = counts
+        .overflow_occupancy
+        .saturating_add(counts.overflow_admission);
+    let row = CensusRetireKeptOverlap {
+        census_retire_kept_overlap_records: counts.records,
+        census_retire_kept_overlap_hashes: counts.hashes,
+        census_retire_kept_overflow: overflow,
+        census_retire_kept_overflow_occupancy: counts.overflow_occupancy,
+        census_retire_kept_overflow_admission: counts.overflow_admission,
+        census_record_limit_refused: counts.record_limit_refused,
+        census_missing_over_budget: counts.missing_over_budget,
+        census_retire_kept_overlap_records_total: add(0, counts.records),
+        census_retire_kept_overlap_hashes_total: add(1, counts.hashes),
+        census_retire_kept_overflow_total: add(2, overflow),
+        census_retire_kept_overflow_occupancy_total: add(3, counts.overflow_occupancy),
+        census_retire_kept_overflow_admission_total: add(4, counts.overflow_admission),
+        census_record_limit_refused_total: add(5, counts.record_limit_refused),
+    };
+    traversal_point("claude_census_retire_kept_overlap", "claude_code", &row);
+    if overflow > 0 || counts.record_limit_refused > 0 {
+        traversal_point(
+            "claude_census_retire_kept_overlap_alarm",
+            "claude_code",
+            &row,
+        );
+    }
+}
 /// Local alarm: the one-time Claude history re-read latched its stop until
 /// the daemon restarts (SOURCE Amendment 10), once when it sets and at most
 /// hourly as a reminder. Counts and hashed root refs only; no wire event.
