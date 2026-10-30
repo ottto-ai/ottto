@@ -86,7 +86,7 @@ const PINNED_SOURCES: &[SourcePin] = &[
     SourcePin {
         path: "snapshots/sampled_scan/durable_tail.rs",
         text: include_str!("durable_tail.rs"),
-        sha256: "5166e50e0a290f5f512253c89557ea29f3e2ef64472dbd3fcf4cedf3b4fc2f54",
+        sha256: "2fdd2916a71021bd4ec74568d3a7651df86f07896aa21acae5ec2cd361603e84",
     },
     SourcePin {
         path: "durable_tail_store.rs",

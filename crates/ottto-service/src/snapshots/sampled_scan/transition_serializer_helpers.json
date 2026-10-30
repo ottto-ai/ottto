@@ -280,6 +280,7 @@
   "nibble": "pinned: durable_tail_codec.rs primitive/trait/macro definitions and generated field dispatch",
   "note_verify_visit": "pinned: codec macro argument token; the callback is used only in cfg(test), excluded from encoding",
   "now": "exception: native input/identity/certificate/budget selection may change admission or input state; it does not implement the pinned wire encoding of an admitted record; source: #865 (688fdb893), reviewed",
+  "offered_files": "pinned: publication/store/codec region token or local binding; selected body and local helper definitions are frozen; source: #904 (f45c36fd5), reviewed",
   "offset": "pinned: conservative callback-value/pattern token in hashed serializer regions; binding and dispatch remain pinned",
   "old": "pinned: publication/store/codec region token or local binding; selected body and local helper definitions are frozen",
   "out": "pinned: conservative callback-value/pattern token in hashed serializer regions; binding and dispatch remain pinned",
