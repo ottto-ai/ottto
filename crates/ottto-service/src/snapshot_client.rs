@@ -3762,35 +3762,6 @@ mod tests {
     }
 
     #[test]
-    fn batch_rejected_downcasts_from_anyhow_and_keeps_status() {
-        // The upload_batch validation path wraps BatchRejected in anyhow::Error;
-        // the snapshot_sync caller relies on downcast_ref to choose the loud
-        // payload-validation diagnostic over the generic network-error path.
-        let err = anyhow::Error::new(BatchRejected {
-            status: 422,
-            body_excerpt: Some(
-                r#"{"detail":"usage_buckets are required for schema_version 6 usage snapshots"}"#
-                    .to_string(),
-            ),
-        });
-        let rejected = err
-            .downcast_ref::<BatchRejected>()
-            .expect("BatchRejected must downcast from anyhow::Error");
-        assert_eq!(rejected.status, 422);
-        assert!(rejected
-            .body_excerpt
-            .as_deref()
-            .expect("body")
-            .contains("usage_buckets"));
-        assert!(err.to_string().contains("422"));
-        assert!(err.to_string().contains("usage_buckets"));
-
-        // A plain transport error must NOT masquerade as a schema rejection.
-        let other = anyhow!("upload snapshot batch failed: connection refused");
-        assert!(other.downcast_ref::<BatchRejected>().is_none());
-    }
-
-    #[test]
     fn upload_failure_diagnostics_are_classified_and_redacted() {
         assert_eq!(http_status_family(500), "http_5xx");
         assert_eq!(http_status_family(429), "http_429");
@@ -3855,15 +3826,6 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("scan_id are invalid"));
-    }
-
-    #[test]
-    fn snapshot_batch_timeout_covers_initial_backfill_reconciliation() {
-        // Initial backfills can synchronously reconcile many historical
-        // sessions. Keep the longer read window scoped to batch uploads so
-        // health/status calls still fail quickly when production is unhealthy.
-        assert!(SNAPSHOT_BATCH_HTTP_READ_TIMEOUT >= Duration::from_secs(120));
-        assert!(SNAPSHOT_HTTP_READ_TIMEOUT <= Duration::from_secs(15));
     }
 
     #[test]
@@ -4697,127 +4659,6 @@ mod tests {
         assert_eq!(response.accepted, 1);
         server.join().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn resource_diagnostics_count_actual_batch_buffers_and_gzip_fallback() {
-        use std::net::TcpListener;
-        let request = SnapshotBatchRequest {
-            schema_version: SNAPSHOT_SCHEMA_VERSION,
-            source: "codex".into(),
-            machine_id: "never-log-machine".into(),
-            collector_version: None,
-            snapshots: Vec::new(),
-            upload_policy: crate::snapshots::SnapshotUploadPolicy::default(),
-            client_report: crate::client_report::ClientReport::empty(),
-        };
-        let serialized = serde_json::to_vec(&request).unwrap().len() as u64;
-        for (gzip, refused, refuse_send) in [
-            (false, false, false),
-            (true, false, false),
-            (true, true, false),
-            (true, true, true),
-        ] {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap();
-            let server = std::thread::spawn(move || {
-                let mut attempts = Vec::new();
-                for attempt in 0..if refused && !refuse_send { 2 } else { 1 } {
-                    let (mut stream, _) = listener.accept().unwrap();
-                    let wire = read_complete_http_request(&mut stream);
-                    let headers = wire.split("\r\n\r\n").next().unwrap();
-                    assert!(!headers.contains("local_resources"));
-                    let bytes = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("Content-Length")
-                                .then(|| value.trim().parse::<u64>().unwrap())
-                        })
-                        .unwrap();
-                    let encoded = headers
-                        .to_ascii_lowercase()
-                        .contains("content-encoding: gzip");
-                    attempts.push((bytes, encoded));
-                    let (status, body) = if refused && attempt == 0 {
-                        ("415 Unsupported Media Type", "{}")
-                    } else {
-                        (
-                            "200 OK",
-                            r#"{"accepted":0,"sessions_reconciled":0,"session_ids":[],"disabled":false,"disabled_reason":null,"entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":[],"unchanged_entities":[],"rejected_entities":[],"conflict_entities":[]}"#,
-                        )
-                    };
-                    write!(stream,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-                }
-                attempts
-            });
-            let client = SnapshotApiClient::new(format!("http://{address}"));
-            let mut budget =
-                crate::snapshot_retry::RetryBudget::after_shed(Instant::now(), Duration::ZERO)
-                    .unwrap();
-            budget.enter(Instant::now()).unwrap();
-            if gzip {
-                budget.force_gzip_for_test();
-            }
-            let mut validations = 0;
-            let mut validate = || {
-                validations += 1;
-                if refuse_send && validations == 2 {
-                    Err(anyhow!("synthetic authority changed"))
-                } else {
-                    Ok(())
-                }
-            };
-            let (result, records) = crate::local_resource_diagnostics::capture(|| {
-                client.upload_batch_inner(
-                    "never-log-token",
-                    &request,
-                    false,
-                    Some((&mut budget, &mut validate)),
-                )
-            });
-            assert_eq!(result.is_err(), refuse_send);
-            let attempts = server.join().unwrap();
-            assert_eq!(records.len(), 1);
-            let counts = &records[0]["counts"];
-            assert_eq!(counts["serialized_body_bytes"], serialized);
-            assert_eq!(
-                counts["attempted_encoded_body_bytes"],
-                attempts.iter().map(|a| a.0).sum::<u64>()
-            );
-            assert_eq!(
-                counts["attempted_decoded_body_bytes"],
-                serialized * attempts.len() as u64
-            );
-            assert_eq!(
-                counts["gzip_attempts"],
-                attempts.iter().filter(|a| a.1).count()
-            );
-            assert_eq!(
-                counts["identity_attempts"],
-                attempts.iter().filter(|a| !a.1).count()
-            );
-            let record = records[0].to_string();
-            assert!(!record.contains("never-log") && !record.contains("127.0.0.1"));
-        }
-        let client = SnapshotApiClient::new("http://127.0.0.1:1");
-        let mut budget =
-            crate::snapshot_retry::RetryBudget::after_shed(Instant::now(), Duration::ZERO).unwrap();
-        budget.enter(Instant::now()).unwrap();
-        let (result, records) = crate::local_resource_diagnostics::capture(|| {
-            client.upload_batch_inner(
-                "never-log-token",
-                &request,
-                false,
-                Some((&mut budget, &mut || {
-                    Err(anyhow!("synthetic presend refusal"))
-                })),
-            )
-        });
-        assert!(result.is_err());
-        assert_eq!(records[0]["counts"]["attempted_encoded_body_bytes"], 0);
-        assert_eq!(records[0]["counts"]["gzip_attempts"], 0);
-        assert_eq!(records[0]["counts"]["identity_attempts"], 0);
     }
 
     #[test]

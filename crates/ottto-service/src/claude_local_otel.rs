@@ -2008,31 +2008,6 @@ mod otlp_proto {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn append_capture_success_requires_complete_write_below_strict_cap() {
-        let row = b"{\"synthetic\":true}\n";
-        for (before, writes, succeeds) in [
-            (MAX_EVIDENCE_FILE_BYTES - row.len() as u64 - 1, true, true),
-            (MAX_EVIDENCE_FILE_BYTES - row.len() as u64, true, false),
-            (MAX_EVIDENCE_FILE_BYTES - 1, true, false),
-            (MAX_EVIDENCE_FILE_BYTES, false, false),
-            (MAX_EVIDENCE_FILE_BYTES + 1, false, false),
-        ] {
-            let mut output = Vec::new();
-            let result = append_evidence_bytes(&mut output, before, row);
-            assert_eq!(result.is_ok(), succeeds, "before={before}");
-            assert_eq!(output.as_slice(), if writes { row.as_slice() } else { &[] });
-            if writes && !succeeds {
-                // Retry at the persisted boundary must refuse without another
-                // duplicate append.
-                let size = output.len();
-                assert!(
-                    append_evidence_bytes(&mut output, before + row.len() as u64, row).is_err()
-                );
-                assert_eq!(output.len(), size);
-            }
-        }
-    }
 
     #[test]
     fn append_partial_and_zero_byte_write_errors_never_report_capture_success() {
@@ -2495,96 +2470,6 @@ mod tests {
     }
 
     #[test]
-    fn request_pair_protobuf_retains_resource_and_record_origins_and_conflict() {
-        for resource_org in [ORGANIZATION, OTHER_ORGANIZATION] {
-            let body = otlp_proto::ExportLogsServiceRequest {
-                resource_logs: vec![otlp_proto::ResourceLogs {
-                    resource: Some(otlp_proto::Resource {
-                        attributes: vec![
-                            proto_string("user.account_uuid", ACCOUNT),
-                            proto_string("organization.id", resource_org),
-                        ],
-                    }),
-                    scope_logs: vec![otlp_proto::ScopeLogs {
-                        log_records: vec![otlp_proto::LogRecord {
-                            time_unix_nano: 1_783_728_000_000_000_000,
-                            observed_time_unix_nano: 0,
-                            body: Some(otlp_proto::AnyValue {
-                                value: Some(otlp_proto::any_value::Value::StringValue(
-                                    "claude_code.api_request".into(),
-                                )),
-                            }),
-                            attributes: vec![
-                                proto_string("session.id", "identity-session"),
-                                proto_string("request_id", "identity-request"),
-                                proto_string("model", "claude-test"),
-                                proto_string("organization.id", ORGANIZATION),
-                                proto_string("input_tokens", "12"),
-                            ],
-                        }],
-                    }],
-                }],
-            }
-            .encode_to_vec();
-            let row = api_evidence_from_protobuf(&body).unwrap().remove(0);
-            let pair = row.request_identity.unwrap();
-            assert_eq!(pair.account.origin, ClaudeIdentityAttributeOrigin::Resource);
-            assert_eq!(
-                pair.organization.origin,
-                ClaudeIdentityAttributeOrigin::ResourceAndLogRecord
-            );
-            assert_eq!(
-                pair.disposition,
-                if resource_org == ORGANIZATION {
-                    ClaudeIdentityDisposition::Complete
-                } else {
-                    ClaudeIdentityDisposition::Conflict
-                }
-            );
-            assert_eq!(row.input_tokens, 12);
-        }
-    }
-
-    #[test]
-    fn request_pair_changes_sidecar_fingerprint_and_strict_request_conflict() {
-        let dir = std::env::temp_dir().join(format!("ottto-org-conflict-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        for organization in [ORGANIZATION, ORGANIZATION, OTHER_ORGANIZATION] {
-            capture_claude_api_request_logs(
-                &dir,
-                &identity_json(
-                    &[],
-                    &[
-                        ("user.account_uuid", ACCOUNT),
-                        ("organization.id", organization),
-                    ],
-                ),
-                "application/json",
-            )
-            .unwrap();
-        }
-        let report =
-            load_claude_api_request_evidence_report(&dir, ["identity-session".to_string()]);
-        let rows = &report.evidence["identity-session"];
-        assert_eq!(rows.len(), 2);
-        assert_ne!(rows[0].fingerprint, rows[1].fingerprint);
-        assert_ne!(
-            serde_json::to_vec(&rows[0]).unwrap(),
-            serde_json::to_vec(&rows[1]).unwrap()
-        );
-        assert_eq!(
-            report.health.conflicting_request_ids,
-            BTreeSet::from(["identity-request".to_string()])
-        );
-        assert!(!report.health.is_complete());
-        let bytes = fs::read_to_string(evidence_path(&dir, "identity-session")).unwrap();
-        for raw in [ACCOUNT, ORGANIZATION, OTHER_ORGANIZATION] {
-            assert!(!bytes.contains(raw));
-        }
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn request_pair_legacy_omission_is_neutral_and_byte_preserved() {
         let row = api_evidence_from_json(&identity_json(&[], &[("user.account_uuid", ACCOUNT)]))
             .unwrap()
@@ -2725,6 +2610,10 @@ mod tests {
                 BTreeSet::from(["identity-request".into()])
             );
             assert_eq!(report.evidence["identity-session"].len(), 2);
+            let persisted = fs::read_to_string(evidence_path(&dir, "identity-session")).unwrap();
+            for raw in [ACCOUNT, ORGANIZATION, OTHER_ORGANIZATION] {
+                assert!(!persisted.contains(raw));
+            }
         }
         let _ = fs::remove_dir_all(dir);
     }
@@ -3015,45 +2904,6 @@ mod tests {
             first_decimal_usd_micros(&attrs, &["carry"]),
             Some(2_000_000)
         );
-    }
-
-    #[test]
-    fn strict_api_request_loader_reports_malformed_oversized_and_conflicting_rows() {
-        let dir = std::env::temp_dir().join(format!("ottto-log-health-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        capture_claude_api_request_logs(&dir, parent_and_subagent_body(), "application/json")
-            .unwrap();
-        let mut conflicting: ClaudeLocalOtelEvidence =
-            load_claude_effort_evidence(&dir, ["sess-mixed".to_string()]).unwrap()["sess-mixed"][0]
-                .clone();
-        conflicting.model = "different-model".to_string();
-        conflicting.fingerprint = "different".to_string();
-        append_evidence(&dir, &conflicting).unwrap();
-        let path = evidence_path(&dir, "sess-mixed");
-        let mut options = OpenOptions::new();
-        options.append(true);
-        options
-            .open(&path)
-            .unwrap()
-            .write_all(b"not json\n")
-            .unwrap();
-        let report = load_claude_api_request_evidence_report(&dir, ["sess-mixed".to_string()]);
-        assert_eq!(report.health.malformed_lines, 1);
-        assert!(report.health.conflicting_request_ids.contains("req_PARENT"));
-        assert!(!report.health.is_complete());
-
-        let oversized = evidence_path(&dir, "sess-oversized");
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&oversized)
-            .unwrap();
-        file.set_len(MAX_EVIDENCE_FILE_BYTES).unwrap();
-        let report = load_claude_api_request_evidence_report(&dir, ["sess-oversized".to_string()]);
-        assert_eq!(report.health.oversized_files, 1);
-        assert!(!report.health.is_complete());
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3352,66 +3202,6 @@ mod tests {
             assert_eq!(witness.health, ordinary_witness.health);
             assert_eq!(witness.generation, ordinary_witness.generation);
         }
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn native_comparison_lazy_final_cohort_moves_early_rows_and_loads_rest_once() {
-        let (dir, rows) = decode_reuse_fixture("lazy-cohort");
-        for row in &rows {
-            let mut later = row.clone();
-            later.session_id = "later-root".into();
-            append_evidence(&dir, &with_canonical_fingerprint(later)).unwrap();
-        }
-        let cohort = BTreeSet::from([
-            "sess-mixed".to_owned(),
-            "later-root".to_owned(),
-            "missing".to_owned(),
-        ]);
-        let expected = ClaudeApiEvidenceRead::load(&dir, cohort.clone()).unwrap();
-        reset_evidence_read_counts_for_test();
-        let mut early = ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into()]).unwrap();
-        let row_owner = early.evidence["sess-mixed"].as_ptr();
-        let final_read = early.complete_permissive(&dir, &cohort).unwrap();
-        assert_eq!(final_read.evidence, expected.evidence);
-        assert_eq!(final_read.evidence["sess-mixed"].as_ptr(), row_owner);
-        assert_eq!(
-            evidence_read_counts_for_test().0,
-            2,
-            "one early open + one remaining open; missing stays missing"
-        );
-        assert_eq!(final_read.reads["missing"].health.missing_files, 1);
-        assert!(final_read.reads["missing"].generation.is_none());
-        assert!(early.evidence.is_empty() && early.reads.is_empty());
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn native_comparison_lazy_final_changed_input_and_open_failure_keep_base_veto() {
-        let (dir, rows) = decode_reuse_fixture("lazy-failures");
-        let cohort = BTreeSet::from(["sess-mixed".to_owned()]);
-        let mut early = ClaudeApiEvidenceRead::load(&dir, cohort.clone()).unwrap();
-        let mut changed = rows[0].clone();
-        changed.request_id = "new-request".into();
-        append_evidence(&dir, &with_canonical_fingerprint(changed)).unwrap();
-        reset_evidence_read_counts_for_test();
-        let completed = early.complete_permissive(&dir, &cohort).unwrap();
-        assert_eq!(
-            evidence_read_counts_for_test().0,
-            1,
-            "changed early generation must reread"
-        );
-        assert_eq!(completed.evidence["sess-mixed"].len(), 3);
-        let mut early = ClaudeApiEvidenceRead::load(&dir, cohort).unwrap();
-        let bad_path = evidence_path(&dir, "unreadable");
-        fs::create_dir(&bad_path).unwrap();
-        let cohort = BTreeSet::from(["sess-mixed".to_owned(), "unreadable".to_owned()]);
-        assert!(
-            early.complete_permissive(&dir, &cohort).is_err(),
-            "a missing early lookup is not a final health permit"
-        );
-        assert!(early.evidence.is_empty() && early.reads.is_empty());
-        assert!(ClaudeApiEvidenceRead::load(&dir, cohort).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 

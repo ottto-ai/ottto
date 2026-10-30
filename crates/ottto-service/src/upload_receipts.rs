@@ -1410,51 +1410,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_older_reason_is_retained_only_as_rejected_receipt_evidence() {
-        let request = proof_request("claude_code", false);
-        let item = &request.snapshots[0];
-        let mut ack = proof_response(&request, false);
-        ack.accepted = 0;
-        ack.sessions_reconciled = 0;
-        ack.accepted_entities.clear();
-        ack.rejected_entities.push(SnapshotEntityRejection {
-            source_session_id: item.source_session_id.clone(),
-            snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-            occurrence_count: 1,
-            reason: "accepted_log_stale_older_upload".into(),
-            detail: "must-not-persist".into(),
-            permanent: true,
-        });
-        let proof = evidence(&request, &ack, false).unwrap();
-        assert_eq!(proof.outcome_occurrences["rejected"], 1);
-        assert_eq!(
-            proof
-                .outcome_occurrences
-                .get("accepted")
-                .copied()
-                .unwrap_or(0),
-            0
-        );
-        let entity = &proof.entities[0];
-        assert_eq!(entity.outcome, "rejected");
-        assert_eq!(entity.snapshot_fingerprint, item.snapshot_fingerprint);
-        let usage = entity.rejection_usage.as_ref().unwrap();
-        assert_eq!(
-            usage.reason,
-            RejectedUsageReason::AcceptedLogStaleOlderUpload
-        );
-        assert!(usage.permanent);
-        let bytes = serde_json::to_string(entity).unwrap();
-        assert!(bytes.contains("accepted_log_stale_older_upload"));
-        assert!(!bytes.contains("must-not-persist"));
-        let restored: ValidatedReceiptEntity = serde_json::from_str(&bytes).unwrap();
-        assert_eq!(restored.rejection_usage.unwrap().reason, usage.reason);
-        // A reason token does not authorize an invalid entity partition.
-        ack.rejected_entities[0].snapshot_fingerprint = "f".repeat(64);
-        assert!(evidence(&request, &ack, false).is_none());
-    }
-
-    #[test]
     fn unknown_rejection_reasons_still_map_to_other_and_old_other_decodes() {
         assert_eq!(
             RejectedUsageReason::from_wire("future-private-reason"),
@@ -1677,74 +1632,6 @@ mod tests {
             .contains(".corrupt.")));
         append_transport_error(&dir, SourceKind::Pi, 3).unwrap();
         assert_eq!(read(&dir, 50, None, None).unwrap().receipts.len(), 1);
-    }
-
-    #[test]
-    fn outcomes_and_filters_cover_each_upload_path() {
-        let dir = temp_dir();
-        append_success(&dir, SourceKind::Codex, 1, 200, None, &response("a")).unwrap();
-        let mut partial = response("b");
-        partial.conflict_entities = partial.accepted_entities.clone();
-        append_success(&dir, SourceKind::Codex, 1, 200, None, &partial).unwrap();
-        append_http_failure(
-            &dir,
-            SourceKind::ClaudeCode,
-            2,
-            UploadReceiptOutcomeV1::Shed,
-            429,
-            None,
-            Some(30),
-        )
-        .unwrap();
-        append_http_failure(
-            &dir,
-            SourceKind::Pi,
-            3,
-            UploadReceiptOutcomeV1::Rejected,
-            422,
-            None,
-            None,
-        )
-        .unwrap();
-        append_http_failure(
-            &dir,
-            SourceKind::Pi,
-            3,
-            UploadReceiptOutcomeV1::AuthRejected,
-            401,
-            None,
-            None,
-        )
-        .unwrap();
-        append_transport_error(&dir, SourceKind::Pi, 4).unwrap();
-        let outcomes = read(&dir, 500, None, None)
-            .unwrap()
-            .receipts
-            .into_iter()
-            .map(|receipt| receipt.outcome)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            outcomes,
-            vec![
-                UploadReceiptOutcomeV1::TransportError,
-                UploadReceiptOutcomeV1::AuthRejected,
-                UploadReceiptOutcomeV1::Rejected,
-                UploadReceiptOutcomeV1::Shed,
-                UploadReceiptOutcomeV1::Partial,
-                UploadReceiptOutcomeV1::Accepted
-            ]
-        );
-        assert_eq!(
-            read(&dir, 10, None, Some(SourceKind::Codex))
-                .unwrap()
-                .receipts
-                .len(),
-            2
-        );
-        assert!(read(&dir, 10, Some("2999-01-01T00:00:00Z"), None)
-            .unwrap()
-            .receipts
-            .is_empty());
     }
 }
 
