@@ -947,3 +947,24 @@ fn unpublished_import_does_not_reorder_v1_progress_admission() {
     f.published();
     assert!(published(&f.path).unwrap());
 }
+
+#[test]
+fn tree_erasure_does_not_admit_legacy_or_progress_paths_to_route_cache() {
+    let f = Fixture::new();
+    let root = f.support.join("snapshots");
+    for namespace in 0..70 {
+        let dir = root.join("destinations").join(format!("{namespace:064x}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("claude_code-legacy.json"), b"{}").unwrap();
+        fs::write(dir.join("claude_code-legacy-upload-progress.json"), b"{}").unwrap();
+    }
+    erase_tree(&f.support).unwrap();
+    assert!(!states()
+        .lock()
+        .unwrap()
+        .keys()
+        .any(|p| p.starts_with(&root)));
+    // This hook closes owned runtimes; enclosing Forget owns tree deletion.
+    fs::remove_dir_all(&root).unwrap();
+    assert!(!root.exists());
+}
