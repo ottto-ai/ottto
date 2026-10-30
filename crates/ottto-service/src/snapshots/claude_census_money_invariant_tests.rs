@@ -1728,3 +1728,202 @@ fn money_census_round_trips_at_the_hash_cap() {
     );
     assert_eq!(loaded, census);
 }
+
+// M4 production-policy twins: execute each original body unchanged.
+// These subjects have no completion override or thread handoff.
+
+#[test]
+fn terminal_off_on_money_birth_is_carried_only_for_the_same_object() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    money_birth_is_carried_only_for_the_same_object();
+}
+
+#[test]
+fn terminal_off_on_money_birth_is_the_open_time_read_shared_with_the_birth_rule() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    money_birth_is_the_open_time_read_shared_with_the_birth_rule();
+}
+
+#[test]
+fn terminal_off_on_money_birth_floor_makes_placeholder_births_unknown() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    money_birth_floor_makes_placeholder_births_unknown();
+}
+
+#[test]
+fn terminal_off_on_money_ledger_records_are_invisible_to_d1() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    money_ledger_records_are_invisible_to_d1();
+}
+
+#[test]
+fn terminal_off_on_money_transcript_records_retire_after_35_days() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    money_transcript_records_retire_after_35_days();
+}
+
+#[test]
+fn terminal_off_on_census_retirement_keeps_aged_records_that_share_request_ids() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_retirement_keeps_aged_records_that_share_request_ids();
+}
+
+#[test]
+fn terminal_off_on_census_retirement_without_overlap_is_unchanged() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_retirement_without_overlap_is_unchanged();
+}
+
+#[test]
+fn terminal_off_on_census_retirement_occupancy_overflow_retires_the_oldest_and_alarms() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_retirement_occupancy_overflow_retires_the_oldest_and_alarms();
+}
+
+#[test]
+fn terminal_off_on_census_retirement_overlap_decision_is_deterministic() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_retirement_overlap_decision_is_deterministic();
+}
+
+#[test]
+fn terminal_off_on_census_retirement_survivor_retires_after_its_partner_goes() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_retirement_survivor_retires_after_its_partner_goes();
+}
+
+#[test]
+fn terminal_off_on_census_admission_releases_kept_records_oldest_first() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_admission_releases_kept_records_oldest_first();
+}
+
+#[test]
+fn terminal_off_on_census_admission_release_is_deterministic() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_admission_release_is_deterministic();
+}
+
+#[test]
+fn terminal_off_on_census_admission_without_releasable_records_is_unchanged() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_admission_without_releasable_records_is_unchanged();
+}
+
+#[test]
+fn terminal_off_on_census_admission_admits_what_pre_stopgap_retirement_admitted() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_admission_admits_what_pre_stopgap_retirement_admitted();
+}
+
+#[test]
+fn terminal_off_on_census_admission_with_room_releases_nothing() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_admission_with_room_releases_nothing();
+}
+
+#[test]
+fn terminal_off_on_census_admission_hopeless_release_is_remembered_by_size() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_admission_hopeless_release_is_remembered_by_size();
+}
+
+#[test]
+fn terminal_off_on_census_retirement_serialized_occupancy_overflow_retires_the_oldest() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_retirement_serialized_occupancy_overflow_retires_the_oldest();
+}
+
+#[test]
+fn terminal_off_on_census_admission_release_driven_by_the_serialized_budget() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_admission_release_driven_by_the_serialized_budget();
+}
+
+#[test]
+fn terminal_off_on_census_admission_release_survives_reload_and_restart() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_admission_release_survives_reload_and_restart();
+}
+
+#[test]
+fn terminal_off_on_census_admission_release_memo_rescans_when_the_cutoff_advances() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_admission_release_memo_rescans_when_the_cutoff_advances();
+}
+
+#[test]
+fn terminal_off_on_census_admission_release_memo_rechecks_its_suspects() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_admission_release_memo_rechecks_its_suspects();
+}
+
+#[test]
+fn terminal_off_on_census_retirement_keeps_overlap_under_pressure_until_admission() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_retirement_keeps_overlap_under_pressure_until_admission();
+}
+
+#[test]
+fn terminal_off_on_census_live_insert_mirrors_the_decoder_record_bound() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_live_insert_mirrors_the_decoder_record_bound();
+}
+
+#[test]
+fn terminal_off_on_census_retirement_peak_is_measured_at_m4_size() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    census_retirement_peak_is_measured_at_m4_size();
+}
+
+#[test]
+fn terminal_off_on_money_census_ledger_fields_round_trip_and_are_charged_exactly() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    money_census_ledger_fields_round_trip_and_are_charged_exactly();
+}
+
+#[test]
+fn terminal_off_on_money_census_decoder_refuses_hostile_ledger_fields() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    money_census_decoder_refuses_hostile_ledger_fields();
+}
+
+#[test]
+fn terminal_off_on_money_serialized_budget_keeps_a_tombstone_reserve() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    money_serialized_budget_keeps_a_tombstone_reserve();
+}
+
+#[test]
+fn terminal_off_on_money_census_round_trips_at_the_hash_cap() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    money_census_round_trips_at_the_hash_cap();
+}
