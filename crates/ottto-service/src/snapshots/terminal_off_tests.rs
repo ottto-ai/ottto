@@ -2158,6 +2158,7 @@ fn terminal_off_unacked_head_stays_parse_and_is_reoffered_beside_an_acked_contro
 
     // The next window starts a new traversal with the clear suppressed.
     index.traversal = None;
+    let previous = index.clone();
     ensure_bounded_traversal(
         SnapshotSource::ClaudeCode,
         std::slice::from_ref(&root),
@@ -2173,6 +2174,18 @@ fn terminal_off_unacked_head_stays_parse_and_is_reoffered_beside_an_acked_contro
     assert!(
         index.files[&unacked_key].source_file_fingerprint.is_empty(),
         "unaccepted debt stays debt: Parse"
+    );
+    assert!(index.files[&unacked_key].last_upload_body_witness.is_none());
+    // AutoReview: an earlier page's partial checkpoint reverts the unsettled
+    // member to its committed entry; the re-offer debt survives it.
+    index = index.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+    index = serde_json::from_value(serde_json::to_value(&index).unwrap()).unwrap();
+    index.activate_upload_context("settled-destination".into());
+    assert!(index.files[&unacked_key].source_file_fingerprint.is_empty());
+    assert!(index.files[&unacked_key].last_upload_body_witness.is_none());
+    assert_eq!(
+        index.files[&acked_key].last_upload_body_witness,
+        previous.files[&acked_key].last_upload_body_witness
     );
     index
         .claude_full_rearm_progress

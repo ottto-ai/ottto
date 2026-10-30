@@ -229,6 +229,23 @@ fn claude_reoffer_unacked_head(entry: &mut ScanIndexEntry) {
     entry.last_upload_body_witness = None;
 }
 
+/// B-P2: a partial checkpoint that reverts an unsettled member to its
+/// committed entry keeps the cleared source witness (main) and, under
+/// containment, also the cleared body witness while its head is still
+/// unACKed, so the re-offer debt survives until that member is parsed.
+fn claude_retain_unacked_reoffer(result: &mut ScanIndex, key: &str, working: &ScanIndexEntry) {
+    if !claude_terminal_off() || working.last_upload_body_witness.is_some() {
+        return;
+    }
+    let unacked = result
+        .file_snapshot_fingerprints
+        .get(key)
+        .is_some_and(|head| claude_head_has_unacked_body(result, head));
+    if let Some(retained) = result.files.get_mut(key).filter(|_| unacked) {
+        retained.last_upload_body_witness = None;
+    }
+}
+
 // B-P5: under containment neither the identity-contract latch nor
 // source-wide context adoption discharges, so an unsuppressed semantic stale
 // clear would re-arm every stale pending family at every red-retry or floor

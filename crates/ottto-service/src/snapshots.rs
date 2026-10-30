@@ -50031,6 +50031,7 @@ impl ScanIndex {
                 if let Some(retained) = result.files.get_mut(key) {
                     retained.source_file_fingerprint.clear();
                 }
+                claude_retain_unacked_reoffer(&mut result, key, working);
             }
             if let Some(retained) = result.files.get_mut(key) {
                 retained.carry_sampled_audit(working);
