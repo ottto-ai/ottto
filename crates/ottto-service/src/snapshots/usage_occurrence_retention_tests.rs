@@ -31,14 +31,7 @@ fn claude_row(index: usize, tier: Option<&str>, long: bool) -> Value {
 }
 
 fn parsed_items(rows: &[Value]) -> Vec<SnapshotItem> {
-    let dir = std::env::temp_dir().join(format!(
-        "ottto-occurrence-retention-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = crate::test_scratch::unique_path("ottto-occurrence-retention");
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("0b6b6c2e-0000-4000-8000-0000000000aa.jsonl");
     let mut file = File::create(&path).unwrap();

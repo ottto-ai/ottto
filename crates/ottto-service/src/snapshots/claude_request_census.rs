@@ -2921,6 +2921,10 @@ pub(crate) struct ClaudeRequestCensusParse<'a> {
     pub(crate) complete: bool,
     pub(crate) lossy: bool,
     pub(crate) source_verified: bool,
+    /// Successful, loss-free, debt-free Unchanged acquisition. Its checkpoint
+    /// binds the same physical object and interpretation scope; this is not
+    /// Full credit and cannot promote an unverified census record.
+    pub(crate) unchanged_source: bool,
     pub(crate) itemless_request_hashes: Vec<u64>,
     /// Creation time and identity of the object this parse opened, when the
     /// parse opened one and the file system reports a creation time.
@@ -2960,7 +2964,8 @@ pub(super) fn claude_buffered_request_hashes(parser: &super::OwnedJsonlParser) -
 /// Every Claude family-member parse that reaches `finish` replaces the key's
 /// record with one bound to the candidate fingerprint and this window: a
 /// complete parse by its shape, an incomplete or residue parse as `Lossy`
-/// with the ids it saw. An older record never survives a newer parse.
+/// with the ids it saw. Only an identical, debt-free Unchanged completion
+/// carries forward an existing record's verification.
 pub(crate) fn record_claude_request_census(
     index: &mut ScanIndex,
     parse: ClaudeRequestCensusParse<'_>,
@@ -3011,10 +3016,6 @@ pub(crate) fn record_claude_request_census(
         .carried_birth(parse.index_key, parse.opened_birth);
     record.modified = (parse.modified_unix_seconds > 0).then_some(parse.modified_unix_seconds);
     if let Some(old) = index.claude_request_census.get(parse.index_key) {
-        // S3(d): the same verified revision under the same derivation must
-        // yield the same census. Residue, lossy and budget tombstones (whose
-        // shape and hashes the budget replaced) and retired records (whose
-        // hashes retirement dropped) are excluded.
         let comparable = |record: &ClaudeRequestCensusRecord| {
             !record.unverified
                 && record.retired.is_none()
@@ -3023,6 +3024,22 @@ pub(crate) fn record_claude_request_census(
                     ClaudeRequestCensusShape::Lossy | ClaudeRequestCensusShape::OverBudget
                 )
         };
+        if parse.unchanged_source
+            && parse.complete
+            && !parse.lossy
+            && comparable(old)
+            && old.derivation == record.derivation
+            && old.source_file_fingerprint == record.source_file_fingerprint
+            && old.shape == record.shape
+            && old.request_hashes == record.request_hashes
+            && old.twin == record.twin
+        {
+            record.unverified = false;
+        }
+        // S3(d): the same verified revision under the same derivation must
+        // yield the same census. Residue, lossy and budget tombstones (whose
+        // shape and hashes the budget replaced) and retired records (whose
+        // hashes retirement dropped) are excluded.
         if parse.complete
             && comparable(old)
             && comparable(&record)
