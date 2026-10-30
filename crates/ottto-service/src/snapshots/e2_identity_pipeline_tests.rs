@@ -552,6 +552,7 @@ fn e2_unhealthy_root_page(
     root: &str,
     index: &mut ScanIndex,
     unhealthy: bool,
+    accepted: Option<&claude_request_identity::AcceptedBuckets>,
 ) -> (
     Vec<SnapshotItem>,
     ClaudeUsageAuthorityDisposition,
@@ -608,7 +609,9 @@ fn e2_unhealthy_root_page(
         assert_eq!(index.claude_history_emission.files.len(), 2);
         let ((disposition, _, stats), counts) =
             claude_request_money::e2::pipeline_test_observer::capture_identity_counts(|| {
-                crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, &mut scan, index)
+                crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_accepted_for_test(
+                    support, &mut scan, index, accepted,
+                )
             });
         for gated in index.claude_history_emission.files.values() {
             assert!(gated.permitted, "owed permission is retained");
@@ -730,7 +733,7 @@ fn e2_unhealthy_root_case(mode: &str, split_logins: bool) {
     let child = Some(if split_logins { "c" } else { "b" }.repeat(64));
 
     let (clean, _, stats, _) =
-        e2_unhealthy_root_page(&dirs, &support, &root, &mut bound_index(), false);
+        e2_unhealthy_root_page(&dirs, &support, &root, &mut bound_index(), false, None);
     e2_unhealthy_assert_logins(&clean, &root, b.clone(), child.clone());
     assert!(stats.unhealthy_root_no_fallback_requests.is_empty());
     let line = serde_json::to_value(&stats).unwrap();
@@ -763,7 +766,7 @@ fn e2_unhealthy_root_case(mode: &str, split_logins: bool) {
     }
     e2_sibling_evidence(&support);
     let (items, disposition, stats, counts) =
-        e2_unhealthy_root_page(&dirs, &support, &root, &mut bound_index(), true);
+        e2_unhealthy_root_page(&dirs, &support, &root, &mut bound_index(), true, None);
     // Never A, never another login: every family share is Unknown. The
     // sibling's own clean evidence keeps D on the same page.
     e2_unhealthy_assert_logins(&items, &root, None, None);
@@ -802,12 +805,184 @@ fn e2_unhealthy_root_case(mode: &str, split_logins: bool) {
     );
     e2_sibling_evidence(&support);
     let (recovered, _, stats, _) =
-        e2_unhealthy_root_page(&dirs, &support, &root, &mut bound_index(), false);
+        e2_unhealthy_root_page(&dirs, &support, &root, &mut bound_index(), false, None);
     e2_unhealthy_assert_logins(&recovered, &root, b, child);
     assert_eq!(e2_unhealthy_totals(&recovered), totals, "no usage is dropped");
     assert!(stats.unhealthy_root_no_fallback_requests.is_empty());
     fs::remove_dir_all(sibling).unwrap();
     fs::remove_dir_all(dir).unwrap();
+}
+
+/// A fresh index carrying only the durable creator binding A for the family
+/// root and the sibling.
+fn e2_unhealthy_bound_index(root: &str) -> ScanIndex {
+    let mut index = ScanIndex::default();
+    for bound in [root, E2_SIBLING] {
+        index.session_account_bindings.insert(
+            e2_owner_key(bound),
+            SessionAccountBinding {
+                account_identifier_hash: e2_account(),
+                workspace_identifier_hash: None,
+            },
+        );
+    }
+    index
+}
+
+/// Rows of `item`'s buckets that carry at least one tagged share.
+fn e2_tagged_bucket_rows(item: &SnapshotItem) -> u64 {
+    item.usage_buckets
+        .iter()
+        .flat_map(|bucket| &bucket.model_usage)
+        .filter(|row| match &row.identity_parts {
+            Some(parts) => parts.iter().any(|part| part.account_identifier_hash.is_some()),
+            None => row.account_identifier_hash.is_some(),
+        })
+        .count() as u64
+}
+
+/// #909 x SOURCE (Lead B pin): a bucket ACCEPTED tagged and then made Unknown
+/// by an unhealthy (malformed) trace still carries #909's per-share refusal,
+/// one per changed accepted row, so the server can keep the retained proof.
+/// A never-accepted body made Unknown carries none. The root holds two own
+/// logins (B, C), so contract-5 grouping, not the D1 shortcut, tags the clean
+/// body and the ledger freezes its tagged shares.
+fn e2_unhealthy_root_accepted_case(accepted_ledger: bool) {
+    let (dir, root, _) = claude_account_family_fixture();
+    let support = dir.join("support");
+    let (mut api, trace) = e2_family_evidence(&root);
+    for (n, row) in api.iter_mut().enumerate() {
+        row.account_identifier_hash = Some(if n < 2 { "b" } else { "c" }.repeat(64));
+        e2_resign(row);
+    }
+    e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
+    e2_write_rows(
+        &support,
+        "local-otel/claude-code-trace-ownership",
+        &root,
+        &trace,
+    );
+    let sibling = e2_healthy_sibling(&support);
+    let dirs = [dir.clone(), sibling.clone()];
+    let path = support
+        .join("local-otel/claude-code-trace-ownership")
+        .join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
+    let mut ledger = claude_request_identity::AcceptedBuckets::for_test();
+    let in_family = |item: &&SnapshotItem| item.source_session_id != E2_SIBLING;
+
+    let (clean, _, _, _) = e2_unhealthy_root_page(
+        &dirs,
+        &support,
+        &root,
+        &mut e2_unhealthy_bound_index(&root),
+        false,
+        Some(&ledger),
+    );
+    let root_item = clean
+        .iter()
+        .find(|item| item.source_session_id == root)
+        .unwrap();
+    assert_eq!(
+        e2_login_counts(root_item),
+        BTreeMap::from([(Some("b".repeat(64)), 2), (Some("c".repeat(64)), 2)]),
+        "the clean root body is grouped per request"
+    );
+    // Expected refusals per item: its accepted rows that carried a tag.
+    let mut expected = BTreeMap::<String, u64>::new();
+    if accepted_ledger {
+        // The same ledger write `record_cache_state` makes for a stored ACK.
+        for item in &clean {
+            ledger.record(&serde_json::to_value(item).unwrap());
+        }
+        for item in clean.iter().filter(in_family) {
+            if ledger.get(&item.source_session_id).is_some() {
+                expected.insert(item.source_session_id.clone(), e2_tagged_bucket_rows(item));
+            }
+        }
+        assert!(
+            expected.get(&root).is_some_and(|rows| *rows > 0),
+            "the root bucket was accepted with tagged shares: {expected:?}"
+        );
+    }
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"malformed\n")
+        .unwrap();
+    e2_sibling_evidence(&support);
+    let (items, _, stats, _) = e2_unhealthy_root_page(
+        &dirs,
+        &support,
+        &root,
+        &mut e2_unhealthy_bound_index(&root),
+        true,
+        Some(&ledger),
+    );
+    assert_eq!(
+        serde_json::to_value(stats.unhealthy_root_no_fallback_requests).unwrap(),
+        json!({"malformed": 5})
+    );
+    for item in &items {
+        if item.source_session_id == E2_SIBLING {
+            assert_eq!(item.request_identity_refusals, 0, "the clean sibling is unchanged");
+            continue;
+        }
+        let requests = if item.source_session_id == root { 4 } else { 1 };
+        assert_eq!(
+            e2_login_counts(item),
+            BTreeMap::from([(None, requests)]),
+            "never A, never the accepted B/C"
+        );
+        let want = expected.get(&item.source_session_id).copied().unwrap_or(0);
+        assert_eq!(
+            item.request_identity_refusals, want,
+            "{}: one refusal per changed accepted row; none for a never-accepted body",
+            item.source_session_id
+        );
+    }
+    if !accepted_ledger {
+        assert!(items.iter().all(|item| item.request_identity_refusals == 0));
+    }
+
+    // Clean again: the accepted shares are re-proven, so nothing is refused.
+    e2_write_rows(
+        &support,
+        "local-otel/claude-code-trace-ownership",
+        &root,
+        &trace,
+    );
+    e2_sibling_evidence(&support);
+    let (recovered, _, _, _) = e2_unhealthy_root_page(
+        &dirs,
+        &support,
+        &root,
+        &mut e2_unhealthy_bound_index(&root),
+        false,
+        Some(&ledger),
+    );
+    let root_item = recovered
+        .iter()
+        .find(|item| item.source_session_id == root)
+        .unwrap();
+    assert_eq!(
+        e2_login_counts(root_item),
+        BTreeMap::from([(Some("b".repeat(64)), 2), (Some("c".repeat(64)), 2)])
+    );
+    assert_eq!(root_item.request_identity_refusals, 0);
+    fs::remove_dir_all(sibling).unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn e2_pipeline_accepted_bucket_unhealthy_root_keeps_909_refusal() {
+    e2_unhealthy_root_accepted_case(true);
+}
+
+#[test]
+fn e2_pipeline_never_accepted_unhealthy_root_has_no_refusal() {
+    e2_unhealthy_root_accepted_case(false);
 }
 
 #[test]

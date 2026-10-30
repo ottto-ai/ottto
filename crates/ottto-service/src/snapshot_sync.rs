@@ -9179,6 +9179,32 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
     apply_claude_local_evidence_to_scan_with_prepared(support_dir, scan_result, index, None)
 }
 
+/// The production evidence stage with this cycle's accepted-identity ledger.
+#[cfg(test)]
+pub(crate) fn apply_claude_local_evidence_to_scan_with_accepted_for_test(
+    support_dir: &Path,
+    scan_result: &mut crate::snapshots::SourceScanResult,
+    index: &mut ScanIndex,
+    accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
+) -> (
+    crate::snapshots::ClaudeUsageAuthorityDisposition,
+    bool,
+    ClaudeLocalEvidenceStats,
+) {
+    try_apply_claude_local_evidence_to_scan_with_comparison(
+        support_dir,
+        scan_result,
+        index,
+        None,
+        None,
+        None,
+        None,
+        accepted_identity_buckets,
+        None,
+    )
+    .expect("evidence fixture has no resource refusal")
+}
+
 fn apply_claude_local_evidence_to_scan_with_prepared(
     support_dir: &Path,
     scan_result: &mut crate::snapshots::SourceScanResult,
