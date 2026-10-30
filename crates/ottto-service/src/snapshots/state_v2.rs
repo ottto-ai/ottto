@@ -20,6 +20,7 @@ pub(super) use runtime::{
     idle, load_locked, save_locked,
 };
 mod interning;
+mod kinds_census;
 mod kinds_files;
 mod packed;
 mod shape;

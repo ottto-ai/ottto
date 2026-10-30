@@ -402,7 +402,86 @@ pub(crate) fn shared_hashes(hashes: Vec<u64>) -> Option<Arc<[u64]>> {
     (!hashes.is_empty()).then(|| Arc::from(hashes))
 }
 
+/// Lossless storage projection; transcript census only, never the P1 ledger.
+/// The optional hash buffer is carried independently (including Some(empty)).
+pub(crate) type ClaudeCensusStorageParts = (
+    [u8; 32],
+    u16,
+    u64,
+    u8,
+    u8,
+    Option<[u64; 3]>,
+    Option<u64>,
+    Option<(u64, u64)>,
+    Option<u64>,
+);
+
 impl ClaudeRequestCensusRecord {
+    /// Storage accessor: no retirement, normalization or hash-buffer copy.
+    pub(crate) fn storage_parts(&self) -> Option<ClaudeCensusStorageParts> {
+        self.ledger.is_none().then(|| {
+            (
+                self.source_file_fingerprint,
+                self.derivation,
+                self.window,
+                ClaudeRequestCensusShape::ALL
+                    .iter()
+                    .position(|s| *s == self.shape)
+                    .expect("closed census shape") as u8,
+                u8::from(self.twin) | (u8::from(self.unverified) << 1),
+                self.birth.map(|b| [b.unix_seconds, b.device, b.inode]),
+                self.retired,
+                self.old_path_usage,
+                self.modified,
+            )
+        })
+    }
+
+    /// Checked inverse accessor. Unknown fields/shapes never become empty evidence.
+    pub(crate) fn from_storage_parts(
+        parts: ClaudeCensusStorageParts,
+        request_hashes: Option<Arc<[u64]>>,
+    ) -> Option<Self> {
+        let (
+            source_file_fingerprint,
+            derivation,
+            window,
+            shape,
+            flags,
+            birth,
+            retired,
+            old_path_usage,
+            modified,
+        ) = parts;
+        let shape = *ClaudeRequestCensusShape::ALL.get(shape as usize)?;
+        if flags > 3
+            || (retired.is_none() && !shape.admits(request_hashes.as_deref().unwrap_or(&[])))
+            || request_hashes
+                .as_deref()
+                .is_some_and(|h| h.windows(2).any(|w| w[0] >= w[1]))
+        {
+            return None;
+        }
+        Some(Self {
+            source_file_fingerprint,
+            derivation,
+            window,
+            shape,
+            twin: flags & 1 != 0,
+            unverified: flags & 2 != 0,
+            request_hashes,
+            birth: birth.map(|[unix_seconds, device, inode]| ClaudeRequestBirth {
+                unix_seconds,
+                device,
+                inode,
+            }),
+            retired,
+            old_path_usage,
+            modified,
+            ledger: None,
+        })
+    }
+
     /// What the hash budget charges.
     fn hash_count(&self) -> usize {
         self.request_hashes().len()
@@ -923,6 +1002,37 @@ fn serialized_len<T: Serialize + ?Sized>(value: &T) -> usize {
 }
 
 impl ClaudeRequestCensus {
+    /// Storage sees invalidation stubs too; ordinary readers deliberately do not.
+    pub(crate) fn storage_records(&self) -> &BTreeMap<String, ClaudeRequestCensusRecord> {
+        &self.records
+    }
+
+    /// Restore admitted custody exactly, recomputing only runtime accounting.
+    /// Refuse overflow/duplicates instead of the v1 decoder's lossy admission.
+    pub(crate) fn storage_insert(
+        &mut self,
+        key: String,
+        record: ClaudeRequestCensusRecord,
+    ) -> bool {
+        if self.records.contains_key(&key) {
+            return false;
+        }
+        let Some(hashes) = self.hash_total.checked_add(record.hash_count()) else {
+            return false;
+        };
+        let Some(bytes) = self
+            .serialized_total
+            .checked_add(entry_serialized_bytes(&key, &record))
+        else {
+            return false;
+        };
+        self.hash_total = hashes;
+        self.serialized_total = bytes;
+        self.release_memo = None;
+        self.records.insert(key, record);
+        true
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.records.is_empty()
     }

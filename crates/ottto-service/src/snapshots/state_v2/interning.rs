@@ -134,7 +134,7 @@ impl Value for Checked<'_> {
 }
 
 fn allocate(
-    tx: &mut impl Transaction,
+    tx: &mut (impl Transaction + ?Sized),
     name: &str,
     existing: bool,
     owner: impl FnOnce(u64) -> RowKey,
@@ -165,7 +165,7 @@ fn allocate(
 }
 
 pub(super) fn intern_request_set(
-    tx: &mut impl Transaction,
+    tx: &mut (impl Transaction + ?Sized),
     evidence: &RequestEvidence<'_>,
 ) -> Result<u64> {
     let digest = commitment(evidence)?;
@@ -218,7 +218,7 @@ pub(super) fn intern_request_set(
     Ok(id)
 }
 
-pub(super) fn release_request_set(tx: &mut impl Transaction, id: u64) -> Result<()> {
+pub(super) fn release_request_set(tx: &mut (impl Transaction + ?Sized), id: u64) -> Result<()> {
     tx.adjust_refs(&RowKey::RequestSet(id), -1)?;
     Ok(())
 }
