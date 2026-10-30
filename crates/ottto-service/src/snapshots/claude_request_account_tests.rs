@@ -748,8 +748,10 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// [money] A fresh contract-5 body gets telemetry identity tags without a
-/// cohort token or org marker; repeated qualification leaves its bytes intact.
+/// Contract 5 is always on: with no cohort token anywhere, a Claude page
+/// builds contract-5 bodies, the same bytes every run. Was
+/// `claude_contract5_bodies_need_this_cycles_cohort_permit`, whose
+/// tokenless and denied cycles kept today's (`COMPLETE`) bytes.
 #[test]
 fn claude_contract5_bodies_need_no_cohort_token() {
     // D1 session-account qualification and binding; E2 keeps per-request account partitions.
@@ -759,69 +761,28 @@ fn claude_contract5_bodies_need_no_cohort_token() {
     let support = dir.join("support");
     let digest = format!("{:x}", Sha256::digest(root.source_session_id.as_bytes()));
     for (kind, rows) in [
-        (
-            "claude-code-effort",
-            api.evidence[&root.source_session_id]
-                .iter()
-                .map(|row| serde_json::to_value(row).unwrap())
-                .collect::<Vec<_>>(),
-        ),
-        (
-            "claude-code-trace-ownership",
-            trace.evidence[&root.source_session_id]
-                .iter()
-                .map(|row| serde_json::to_value(row).unwrap())
-                .collect::<Vec<_>>(),
-        ),
+        ("claude-code-effort", api.evidence[&root.source_session_id].iter().map(|row| serde_json::to_value(row).unwrap()).collect::<Vec<_>>()),
+        ("claude-code-trace-ownership", trace.evidence[&root.source_session_id].iter().map(|row| serde_json::to_value(row).unwrap()).collect::<Vec<_>>()),
     ] {
-        let path = support
-            .join("local-otel")
-            .join(kind)
-            .join(format!("{digest}.jsonl"));
+        let path = support.join("local-otel").join(kind).join(format!("{digest}.jsonl"));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            path,
-            rows.iter()
-                .map(|row| row.to_string() + "\n")
-                .collect::<String>(),
-        )
-        .unwrap();
+        fs::write(path, rows.iter().map(|row| row.to_string()+"\n").collect::<String>()).unwrap();
     }
     let run = || {
         let mut index = ScanIndex::default();
-        let mut scan = scan_source_roots_with_test_limit(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&dir),
-            &mut index,
-            "2026-08-02T07:10:00Z",
-            7,
-            100,
-            false,
-        )
-        .unwrap();
+        let mut scan = scan_source_roots_with_test_limit(SnapshotSource::ClaudeCode, std::slice::from_ref(&dir), &mut index, "2026-08-02T07:10:00Z", 7, 100, false).unwrap();
         crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);
         scan.snapshots
     };
+    let collector = |items: &[SnapshotItem]| items.iter().find(|item| item.source_session_id == root.source_session_id).unwrap().provenance.collector.clone();
     let first = run();
-    let tagged = first
-        .iter()
-        .find(|item| item.source_session_id == root.source_session_id)
-        .unwrap();
-    assert_eq!(tagged.provenance.collector, identity::COLLECTOR);
-    assert!(
-        tagged.claude_org_markers.is_none(),
-        "no marker is needed for telemetry tags"
-    );
-    assert!(
-        !tagged.request_evidence.is_empty(),
-        "fresh bodies get identity tags"
-    );
+    assert_eq!(collector(&first), identity::COLLECTOR);
+    let tagged = first.iter().find(|item| item.source_session_id == root.source_session_id).unwrap();
+    assert!(tagged.claude_org_markers.is_none(), "fresh tags need no org marker");
+    assert!(!tagged.request_evidence.is_empty(), "fresh contract-5 bodies get identity tags");
     assert_eq!(tagged.request_count, 4);
     assert_eq!(tagged.request_identity_refusals, 0);
-    assert_eq!(
-        serde_json::to_vec(&run()).unwrap(),
-        serde_json::to_vec(&first).unwrap()
-    );
+    assert_eq!(serde_json::to_vec(&run()).unwrap(), serde_json::to_vec(&first).unwrap());
     fs::remove_dir_all(dir).unwrap();
 }
 
