@@ -29453,6 +29453,8 @@ impl OwnedSourceScan {
                     group,
                     side_origin,
                 } = *active;
+                // The usage guard notes the exact read after `candidate` may move.
+                let usage_guard_read_path = candidate.path.clone();
                 let member_dues = group.map_or_else(Vec::new, |mut group| {
                     codex_legacy_join_baselines.extend(group.take_legacy_baselines());
                     std::mem::take(&mut group.recovered)
@@ -31179,7 +31181,7 @@ impl OwnedSourceScan {
                 // disclosed, so independently parsed sibling records remain usable.
                 if parse_complete {
                     if source == SnapshotSource::ClaudeCode {
-                        index.usage_guard_note_read(&candidate.path);
+                        index.usage_guard_note_read(&usage_guard_read_path);
                     }
                     snapshots.extend(parsed);
                 }
