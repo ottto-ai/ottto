@@ -15946,8 +15946,7 @@ mod tests {
             &"b".repeat(64),
             snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
         )
-        .err()
-        .expect("busy progress must fail first");
+        .expect_err("busy progress must fail first");
         assert!(error.to_string().contains("owned by another daemon"));
         assert_eq!(std::fs::read(&index_path).unwrap(), damaged);
         assert!(!progress_path.exists());
@@ -15990,8 +15989,7 @@ mod tests {
             &"b".repeat(64),
             snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
         )
-        .err()
-        .expect("unauthenticated custody must hold");
+        .expect_err("unauthenticated custody must hold");
         assert!(error.to_string().contains("state_v2_fence_lost"));
         assert_eq!(std::fs::read(&progress_path).unwrap(), b"{broken-progress");
         assert_eq!(std::fs::read(&index_path).unwrap(), b"{broken-fence");
