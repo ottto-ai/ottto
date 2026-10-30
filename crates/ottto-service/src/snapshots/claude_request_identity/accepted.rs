@@ -374,6 +374,12 @@ impl AcceptedBuckets {
         }
         self.1 = key;
     }
+    /// A copy reread from disk has no key, and may still hold hints this
+    /// cycle's bind discarded. Rebind it like the live ledger before comparing.
+    pub(crate) fn adopt_runtime_from(&mut self, live: &Self) {
+        self.bind_key(live.1.clone());
+        self.2 = live.2;
+    }
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
