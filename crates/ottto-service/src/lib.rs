@@ -5508,6 +5508,47 @@ mod tests {
             )
             .expect("save synthetic diagnostic secret");
         }
+        // A real retained ledger is present on disk. Diagnostics and status
+        // must exclude its class H grain, including the compact persisted form.
+        let retained_hash = "0123456789abcdef".repeat(4);
+        let mut ledger = snapshots::claude_request_identity::AcceptedBuckets::for_test();
+        ledger.record_proved(
+            &serde_json::json!({
+                "source_session_id":"diagnostics-retained",
+                "provenance":{"collector":snapshots::claude_request_identity::COLLECTOR},
+                "request_evidence":[{"identity_basis":"telemetry_login"}],
+                "usage_buckets":[{"bucket_start":"2026-09-01T10:00:00Z", "model_usage":[{
+                    "model":"claude-synthetic", "request_count":1, "evidence_ref":0,
+                    "account_identifier_hash":retained_hash
+                }]}]
+            }),
+            true,
+            &[],
+        );
+        assert_eq!(
+            ledger.proved_rows_for_test("diagnostics-retained"),
+            Some((1, 0))
+        );
+        let ledger_value = serde_json::to_value(&ledger).unwrap();
+        let compact = ledger_value.as_object().unwrap().values().next().unwrap()["proved"]
+            .as_str()
+            .unwrap();
+        let progress_path =
+            support.join("snapshots/destinations/synthetic/claude-upload-progress.json");
+        std::fs::create_dir_all(progress_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &progress_path,
+            serde_json::to_vec(&serde_json::json!({
+                "accepted_identity_buckets":ledger_value
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let debug = format!("{ledger:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains(&retained_hash));
+        // Derived array Debug would leak decimal bytes rather than hex.
+        assert!(!debug.contains("[1, 35, 69, 103, 137, 171, 205, 239"));
         let daemon = daemon();
         let bundle = daemon
             .diagnostics_stub(TOKEN)
@@ -5524,6 +5565,11 @@ mod tests {
         );
         assert!(!encoded.contains(synthetic_control_token));
         assert!(!encoded.contains(synthetic_relay_secret));
+        assert!(!encoded.contains(&retained_hash));
+        assert!(!encoded.contains(&compact));
+        let status = serde_json::to_string(&daemon.status(TOKEN).unwrap()).unwrap();
+        assert!(!status.contains(&retained_hash));
+        assert!(!status.contains(&compact));
         assert!(!encoded.contains(support.to_str().unwrap()));
         assert_eq!(
             diagnostic_item(&bundle, "security", "auth_header"),

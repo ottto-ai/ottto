@@ -1,5 +1,5 @@
 //! Class L hints: bucket starts and non-reversible accepted share fingerprints,
-//! plus option (ii)'s witnessed proved rows (keyed row/proof digests only).
+//! plus option (ii)'s witnessed proved rows and bounded class H marker grains.
 use super::*;
 use hmac::{Hmac, Mac};
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -78,13 +78,24 @@ pub(crate) struct AcceptedSession {
     missing: Vec<i64>,
 }
 /// Truncated keyed digests: the (bucket, row) grain and its exact proof.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ProvedRow {
     bucket: i64,
     row: [u8; 16],
     proof: [u8; 16],
     // Class H: ACK-bound grain only, bounded and erased with this session.
     account: Option<[u8; 32]>,
+}
+// Class H must remain private even through derived Debug on containing state.
+impl std::fmt::Debug for ProvedRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProvedRow")
+            .field("bucket", &self.bucket)
+            .field("row", &self.row)
+            .field("proof", &self.proof)
+            .field("account", &"[redacted]")
+            .finish()
+    }
 }
 /// Versioned base64 of fixed 73-byte records: bucket, row, proof, optional
 /// ACKed account hash. Old hex hints have no grain provenance and fail closed.
@@ -1265,11 +1276,26 @@ mod eviction_tests {
         };
         super::super::take_identity_counts();
         for session in 0..MAX_SESSIONS {
-            state.record(&body(session));
+            let body = body(session);
+            state.record(&body);
+            state.record_proved(&body, true, &[]);
         }
         state.record(&body(0)); // refresh the oldest before restart
         let mut restored = AcceptedBuckets::restore_for_test(&serde_json::to_vec(&state).unwrap());
         restored.record(&body(MAX_SESSIONS));
+        restored.record_proved(&body(MAX_SESSIONS), true, &[]);
+        assert_eq!(
+            restored.get("lru-0").unwrap().proved[0].account,
+            Some([0xaa; 32])
+        );
+        assert_eq!(
+            restored
+                .0
+                .values()
+                .map(|entry| entry.proved.len())
+                .sum::<usize>(),
+            MAX_SESSIONS
+        );
         assert!(restored.get("lru-0").is_some());
         assert!(restored.get("lru-1").is_none());
         assert!(restored.get(&format!("lru-{MAX_SESSIONS}")).is_some());
@@ -1305,7 +1331,12 @@ mod retained_tests {
         let a = body(tagged(&"a".repeat(64), 1));
         state.record_proved(&a, false, &[]);
         assert_eq!(proof(&state), None, "unwitnessed ACK never adds");
+        assert!(state.get("synthetic").unwrap().proved.is_empty());
         state.record_proved(&a, true, &[]);
+        assert_eq!(
+            state.get("synthetic").unwrap().proved[0].account,
+            Some([0xaa; 32])
+        );
         let first = proof(&state).unwrap();
         let b = body(tagged(&"b".repeat(64), 1));
         state.record_proved(&b, true, &[]);
@@ -1354,6 +1385,10 @@ mod retained_tests {
         assert!(!restored.invalidate_replaced(&a));
         restored.record_proved(&a, true, &[]);
         assert!(!settled(&restored));
+        assert_eq!(
+            restored.get("synthetic").unwrap().proved[0].account,
+            Some([0xaa; 32])
+        );
         assert_eq!(restored.proved_rows_for_test("synthetic"), Some((1, 0)));
         // retained_proof_missing removes only rows this body marked.
         state.record_proved(&b, true, &["2026-09-01T10:00:00Z".into()]);
@@ -1363,6 +1398,10 @@ mod retained_tests {
         state.record_proved(&marked, true, &["2026-09-01T10:00:00Z".into()]);
         assert_eq!(proof(&state), None);
         assert_eq!(state.proved_rows_for_test("synthetic"), Some((0, 1)));
+        assert!(
+            state.get("synthetic").unwrap().proved.is_empty(),
+            "missing grain drops class H too"
+        );
         state.record_proved(&b, true, &[]);
         assert_eq!(state.proved_rows_for_test("synthetic"), Some((1, 0)));
         // A bucket the body no longer has leaves with it; legacy bodies never touch.
