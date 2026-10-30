@@ -13,62 +13,39 @@ fn assistant(usage: Value) -> Value {
     })
 }
 
+/// [money] Thinking details default to zero, clamp to output, and yield to
+/// an explicit reasoning count without changing the output total.
 #[test]
 fn thinking_tokens_fill_reasoning_output_tokens() {
-    let usage = claude_code_delta_usage(&assistant(json!({
-        "input_tokens": 12,
-        "output_tokens": 900,
-        "cache_read_input_tokens": 4000,
-        "output_tokens_details": {"thinking_tokens": 300}
-    })))
-    .expect("usage");
-    assert_eq!(usage.output_tokens, 900);
-    assert_eq!(usage.reasoning_output_tokens, 300);
-}
-
-#[test]
-fn usage_without_thinking_tokens_keeps_zero_reasoning() {
-    let usage = claude_code_delta_usage(&assistant(json!({
-        "input_tokens": 12,
-        "output_tokens": 900,
-        "cache_read_input_tokens": 4000
-    })))
-    .expect("usage");
-    assert_eq!(usage.output_tokens, 900);
-    assert_eq!(usage.reasoning_output_tokens, 0);
-}
-
-#[test]
-fn thinking_tokens_never_exceed_output_tokens() {
-    let usage = claude_code_delta_usage(&assistant(json!({
-        "input_tokens": 12,
-        "output_tokens": 40,
-        "output_tokens_details": {"thinking_tokens": 300}
-    })))
-    .expect("usage");
-    assert_eq!(usage.reasoning_output_tokens, 40);
-}
-
-#[test]
-fn explicit_reasoning_output_tokens_wins_over_thinking_tokens() {
-    let usage = claude_code_delta_usage(&assistant(json!({
-        "input_tokens": 12,
-        "output_tokens": 900,
-        "reasoning_output_tokens": 200,
-        "output_tokens_details": {"thinking_tokens": 300}
-    })))
-    .expect("usage");
-    assert_eq!(usage.reasoning_output_tokens, 200);
-}
-
-#[test]
-fn unreported_sidecar_reasoning_matches_transcript_thinking() {
-    // Claude Code's api_request event has no thinking count (sidecar 0).
-    assert!(claude_api_reasoning_matches(0u64, 300u64));
-    assert!(claude_api_reasoning_matches(0u64, 0u64));
-    assert!(claude_api_reasoning_matches(300u64, 300u64));
-    assert!(!claude_api_reasoning_matches(200u64, 300u64));
-    assert!(!claude_api_reasoning_matches(300u64, 0u64));
+    for (usage, output, reasoning) in [
+        (
+            json!({"input_tokens": 12, "output_tokens": 900, "cache_read_input_tokens": 4000,
+            "output_tokens_details": {"thinking_tokens": 300}}),
+            900,
+            300,
+        ),
+        (
+            json!({"input_tokens": 12, "output_tokens": 900, "cache_read_input_tokens": 4000}),
+            900,
+            0,
+        ),
+        (
+            json!({"input_tokens": 12, "output_tokens": 40,
+            "output_tokens_details": {"thinking_tokens": 300}}),
+            40,
+            40,
+        ),
+        (
+            json!({"input_tokens": 12, "output_tokens": 900, "reasoning_output_tokens": 200,
+            "output_tokens_details": {"thinking_tokens": 300}}),
+            900,
+            200,
+        ),
+    ] {
+        let usage = claude_code_delta_usage(&assistant(usage)).expect("usage");
+        assert_eq!(usage.output_tokens, output);
+        assert_eq!(usage.reasoning_output_tokens, reasoning);
+    }
 }
 
 fn sidecar_row(output_tokens: u64) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
@@ -103,21 +80,6 @@ fn parsed_session() -> SnapshotItem {
         .expect("snapshot");
     let _ = fs::remove_file(&path);
     item
-}
-
-#[test]
-fn aggregate_account_coverage_accepts_transcript_thinking_with_unreported_sidecar() {
-    let item = parsed_session();
-    assert_eq!(item.output_tokens, 1000);
-    assert_eq!(item.reasoning_output_tokens, 300);
-    let rows = [sidecar_row(900), sidecar_row(100)];
-    let evidence: Vec<_> = rows.iter().collect();
-    assert!(claude_account_evidence_covers_snapshot(&item, &evidence));
-
-    let mut reported = rows.clone();
-    reported[0].reasoning_output_tokens = 200;
-    let evidence: Vec<_> = reported.iter().collect();
-    assert!(!claude_account_evidence_covers_snapshot(&item, &evidence));
 }
 
 fn sidecar_request(

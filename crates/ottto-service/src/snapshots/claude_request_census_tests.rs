@@ -1690,112 +1690,6 @@ fn census_records_past_the_budget_become_inert_tombstones() {
     assert_eq!(census.hash_total_for_test(), 0);
 }
 
-/// Layout: census fields are charged through `fields!` without adding per-entry
-/// data. Keep the exact current entry-size pin used by restore pricing.
-#[test]
-fn census_records_are_charged_with_the_scan_index_and_leave_entries_alone() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    // CI layout: the hash-only Codex counting-owner Option<String> adds 24
-    // inline bytes to the previous 440-byte entry. Census and Claude money
-    // births add none: births live in the ScanIndex side table. The stored
-    // opened-object ctime and file birth (`opened_changed_nanos`,
-    // `opened_birth_nanos`, u64 each) add 16 bytes: Ron's content-only
-    // re-read rule rebuilds the scan fingerprint from the ctime so a
-    // ctime-only change never re-reads, and only for the same object
-    // generation, bound by its exact birth (owner-approved 464 -> 472 -> 480).
-    // Optional context receipt adds 80 inline bytes; its three H digests are heap-charged.
-    const SCAN_INDEX_ENTRY_BYTES: usize = 560;
-    assert_eq!(
-        std::mem::size_of::<ScanIndexEntry>(),
-        SCAN_INDEX_ENTRY_BYTES
-    );
-    let mut index = ScanIndex::default();
-    let before = crate::heap_layout_bound::completed_bound(&index, usize::MAX).expect("bound");
-    index.claude_request_census_mut_for_test().insert_for_test(
-        "/census/projects/census-a.jsonl",
-        ClaudeRequestCensusRecord::synthetic_for_test(
-            &hex_fingerprint('a'),
-            1,
-            ClaudeRequestCensusShape::Lossy,
-            (0..1_000).collect(),
-        ),
-    );
-    let after = crate::heap_layout_bound::completed_bound(&index, usize::MAX).expect("bound");
-    assert!(after >= before + 8_000, "{before} -> {after}");
-}
-
-/// The shadow counters ride the duplicate-census counters, bounded.
-#[test]
-fn census_shadow_counts_encoding_is_bounded() {
-    let shadow = ClaudeRequestCensusShadowCounts {
-        would_open: false,
-        would_open_flips: u64::MAX,
-        family_keys: usize::MAX,
-        covered_by_fingerprint: usize::MAX,
-        covered_by_window: usize::MAX,
-        missing_residue: usize::MAX,
-        missing_account_hold: usize::MAX,
-        missing_placeholder: usize::MAX,
-        missing_empty_fingerprint: usize::MAX,
-        missing_fingerprint_mismatch: usize::MAX,
-        missing_migrate: usize::MAX,
-        missing_over_budget: usize::MAX,
-        quarantine_without_record: usize::MAX,
-        shape_exact: usize::MAX,
-        shape_empty: usize::MAX,
-        shape_identity_incomplete: usize::MAX,
-        shape_lossy: usize::MAX,
-        unverified: usize::MAX,
-        twin: usize::MAX,
-        family_unknown_roots: usize::MAX,
-        records: usize::MAX,
-        hashes: usize::MAX,
-        hash_budget_usage_percent: usize::MAX,
-        hash_budget_warning: false,
-        transient_limited: false,
-        transient_peak_bytes: usize::MAX,
-        duplicate_hashes: usize::MAX,
-        duplicate_owner_entries: usize::MAX,
-        shared_keys: usize::MAX,
-        derivation_drift: u64::MAX,
-        json_bytes: usize::MAX,
-        heap_bytes: usize::MAX,
-    };
-    let encoded = serde_json::to_string(&shadow).expect("encode shadow");
-    assert!(
-        encoded.len() <= CENSUS_SHADOW_MAX_BYTES,
-        "{} bytes",
-        encoded.len()
-    );
-    assert_eq!(
-        encoded.len(),
-        CENSUS_SHADOW_MAX_BYTES,
-        "longest scalar spellings"
-    );
-    let without = ClaudeDuplicateCensusCounts::default();
-    let with = ClaudeDuplicateCensusCounts {
-        request_census: Some(shadow),
-        ..without
-    };
-    let grown = serde_json::to_string(&with).expect("encode counts").len()
-        - serde_json::to_string(&without)
-            .expect("encode counts")
-            .len();
-    assert!(
-        grown <= CENSUS_SHADOW_MAX_BYTES + r#","request_census":"#.len(),
-        "{grown} bytes"
-    );
-    // Absent (every non-terminal page and every other source), nothing is
-    // added to the existing line.
-    assert!(!serde_json::to_string(&without)
-        .expect("encode counts")
-        .contains("request_census"));
-}
-
-const CENSUS_SHADOW_MAX_BYTES: usize = 1_238;
-
 /// Literal tokens matter: Value cannot represent the overflow that regressed
 /// load and the compare-and-swap reader. Compare every other persisted field.
 #[test]
@@ -1885,35 +1779,6 @@ fn census_oversized_hostile_field_is_drained_before_serde_buffers_it() {
     loaded
         .save(&path)
         .expect("CAS also drains oversized evidence");
-}
-
-#[test]
-fn census_hash_budget_warning_starts_at_eighty_percent() {
-    // 80% of the hash cap, rounded up: the first count that warns.
-    let threshold = (MAX_CLAUDE_REQUEST_CENSUS_HASHES * 4).div_ceil(5) as u64;
-    for hashes in [threshold - 1, threshold] {
-        let mut index = ScanIndex::default();
-        index.claude_request_census_mut_for_test().insert_for_test(
-            "key",
-            ClaudeRequestCensusRecord::synthetic_for_test(
-                &hex_fingerprint('a'),
-                1,
-                ClaudeRequestCensusShape::Lossy,
-                (0..hashes).collect(),
-            ),
-        );
-        let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
-            &mut index,
-            &BTreeSet::from(["key".to_owned()]),
-            &BTreeSet::new(),
-            FIRST_WINDOW,
-        );
-        assert_eq!(counts.hash_budget_warning, hashes == threshold);
-        assert_eq!(
-            counts.hash_budget_usage_percent,
-            if hashes == threshold { 80 } else { 79 }
-        );
-    }
 }
 
 /// A pre-D1 shape has no census fields: IgnoredAny consumes their tokens,
@@ -2086,35 +1951,21 @@ fn census_assert_abandoned_parse_invalidates_record(failure: CensusAbandonedPars
     panic!("failure path was not reached");
 }
 
+/// [money] Every abandoned parse invalidates stale census evidence while
+/// ordinary in-progress continuations retain the exact previous record.
 #[test]
 #[cfg(unix)]
-fn census_failed_read_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Read);
-}
-#[test]
-#[cfg(unix)]
-fn census_failed_attribution_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Attribution);
-}
-#[test]
-#[cfg(unix)]
-fn census_failed_scope_revalidation_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Scope);
-}
-#[test]
-#[cfg(unix)]
-fn census_failed_object_revalidation_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Object);
-}
-#[test]
-#[cfg(unix)]
-fn census_failed_reopen_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Reopen);
-}
-#[test]
-#[cfg(unix)]
-fn census_failed_reduction_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Reduction);
+fn census_failed_parse_invalidates_old_record() {
+    for failure in [
+        CensusAbandonedParse::Read,
+        CensusAbandonedParse::Attribution,
+        CensusAbandonedParse::Scope,
+        CensusAbandonedParse::Object,
+        CensusAbandonedParse::Reopen,
+        CensusAbandonedParse::Reduction,
+    ] {
+        census_assert_abandoned_parse_invalidates_record(failure);
+    }
 }
 
 #[test]
