@@ -834,6 +834,9 @@ fn terminal_off_on_e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumu
         assert_mode(first.modes, (1, 0, 0));
         assert_eq!(total(&first), 1);
         first.finish();
+        // PREMISE CHANGE vs main (bootstrap receipt), not main's assertion:
+        // main never accepts this page. The twin mints the real fixture
+        // current-context exact-ACK receipt (Page::accept) before the tail.
         first.accept();
         let prior = c.reload(&mut first.index);
         std::fs::OpenOptions::new()
@@ -862,6 +865,11 @@ fn terminal_off_on_e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumu
             canonical(&full.scan.snapshots)
         );
         tail.finish();
+        // PREMISE CHANGE vs main (receipt), not main's assertion: main leaves
+        // the tail body unaccepted, so the "Unaccepted" note below is main's.
+        // The phases below keep main's mode/oracle assertions after this
+        // receipt; the unACKed-head re-offer under ON is covered by the B-P2
+        // production-default fixture (terminal_off_tests.rs).
         tail.accept();
         let prior = c.reload(&mut tail.index);
         // Unaccepted exact body remains due; a fresh sidecar is read even if

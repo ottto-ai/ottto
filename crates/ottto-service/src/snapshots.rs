@@ -72593,11 +72593,17 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// HISTORICAL/qualified control, not production-default ON evidence.
+    /// Completion paths restore the terminal census authority, so the whole
+    /// family qualifies and main's exact revision assertion holds unchanged.
+    /// The production-default ON state is pinned separately by
+    /// `terminal_off_account_finalizer_withholds_the_unproven_member_revision`.
     #[test]
     fn terminal_off_on_claude_account_pending_finalizer_records_exact_account_bearing_upload_revision(
     ) {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, _) = claude_account_family_fixture();
         let mut index = ScanIndex::default();
         let mut result = scan_source_roots_with_limit(
@@ -72630,31 +72636,110 @@ mod tests {
                 entry.last_snapshot_fingerprint.as_deref(),
                 entry.last_upload_body_witness.as_deref(),
             );
-            assert!(
-                expected.is_some(),
-                "finalized file retains exact source/head/body identity"
+            assert!(expected.is_some());
+            assert_eq!(
+                index.claude_account_family_pending[&root].member_requests[&member]
+                    .identity_revision,
+                expected
             );
-            assert!(entry.last_upload_body_witness.is_some());
-            let pending = &index.claude_account_family_pending[&root];
-            match &pending.member_requests[&member].identity_revision {
-                Some(actual) => assert_eq!(
-                    Some(actual),
-                    expected.as_ref(),
-                    "only the exact finalized revision is captured"
-                ),
-                None => assert!(
-                    pending.invalid
-                        || result
-                            .snapshots
-                            .iter()
-                            .filter(|item| item.source_file_fingerprint.as_deref()
-                                == Some(entry.source_file_fingerprint.as_str()))
-                            .any(|item| exact_session_account_hash(item).as_ref()
-                                != Some(&pending.account_identifier_hash)),
-                    "an unqualified account body cannot acquire a pending identity revision"
-                ),
-            }
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Production-default ON containment for the finalizer above (no
+    /// completion override). The root's own request ids are covered by
+    /// checked same-account evidence, so it qualifies and records main's exact
+    /// revision. The child qualifies only through a terminal family proof,
+    /// which ON never grants: it gets no account identity and no identity
+    /// revision, while the family stays in account custody and is counted
+    /// among the pending families.
+    #[test]
+    fn terminal_off_account_finalizer_withholds_the_unproven_member_revision() {
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+        assert!(claude_terminal_off());
+        let (dir, root, _) = claude_account_family_fixture();
+        let mut index = ScanIndex::default();
+        let mut result = scan_source_roots_with_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&dir),
+            &mut index,
+            "2026-08-02T07:01:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .unwrap();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        apply_claude_effort_evidence_with_index(
+            &mut result.snapshots,
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:01:00Z",
+        );
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+        assert!(
+            !index.claude_account_family_witnesses.contains_key(&root),
+            "no family identity credit without terminal authority"
+        );
+        let pending = &index.claude_account_family_pending[&root];
+        assert!(!pending.invalid, "the evidence itself is consistent");
+        assert!(!pending.census_complete, "no census credit");
+        assert!(pending.previous_windows.is_empty());
+        assert!(
+            claude_pending_family_session_ids(&index).contains(&root),
+            "custody is retained and counted"
+        );
+        let mut members = BTreeSet::new();
+        for (key, entry) in &index.files {
+            let (_, member) = claude_index_path_family_member(Path::new(key)).unwrap();
+            let expected = claude_account_identity_revision(
+                &entry.source_file_fingerprint,
+                entry.last_snapshot_fingerprint.as_deref(),
+                entry.last_upload_body_witness.as_deref(),
+            );
+            assert!(expected.is_some());
+            let owned = result
+                .snapshots
+                .iter()
+                .filter(|item| {
+                    item.source_file_fingerprint.as_deref()
+                        == Some(entry.source_file_fingerprint.as_str())
+                })
+                .collect::<Vec<_>>();
+            assert!(!owned.is_empty());
+            let revision = &pending.member_requests[&member].identity_revision;
+            if member == root {
+                assert!(owned
+                    .iter()
+                    .all(|item| exact_session_account_hash(item).as_ref()
+                        == Some(&pending.account_identifier_hash)));
+                assert_eq!(
+                    revision, &expected,
+                    "self-proven root: main's exact revision"
+                );
+            } else {
+                assert!(
+                    owned
+                        .iter()
+                        .all(|item| exact_session_account_hash(item).is_none()),
+                    "no account identity without the family proof"
+                );
+                assert_eq!(revision, &None, "no identity revision credit");
+            }
+            members.insert(member);
+        }
+        assert_eq!(members.len(), 2);
+        assert!(members.contains(&root));
+        assert_eq!(
+            pending
+                .member_requests
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            members,
+            "both members' request sets stay in custody"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
