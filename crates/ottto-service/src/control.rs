@@ -28730,9 +28730,19 @@ for line in sys.stdin:
             );
             thread::yield_now();
         }
-        let lifecycle_lock = SETUP_RUN_BINDING_LOCK
-            .try_lock()
-            .expect("provider-idle wait must not retain lifecycle lock");
+        // Revoke saves the Revoked status under the lock and releases it just
+        // after, so poll briefly. The worker then waits up to 15 s for collector
+        // I/O, which stays active here, so a lock held across that wait still
+        // fails this 2 s deadline.
+        let lock_deadline = Instant::now() + Duration::from_secs(2);
+        let lifecycle_lock = loop {
+            match SETUP_RUN_BINDING_LOCK.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < lock_deadline => {
+                    thread::yield_now()
+                }
+                result => break result.expect("provider-idle wait must not retain lifecycle lock"),
+            }
+        };
         // Simulate a raced/out-of-contract identity write while Revoke waits.
         // The post-wait transaction must reject it before returning a DELETE
         // target, even though ordinary production writers use this same lock.
