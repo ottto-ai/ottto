@@ -82,7 +82,6 @@ struct Observed {
     selection: SelectionCounts,
     max_priority_witnesses: usize,
     max_pending_rows: usize,
-    maximal_rows_seen: bool,
     open_debt_seen: bool,
     overflow_seen: bool,
     joined_seen: bool,
@@ -140,7 +139,6 @@ fn acquire(
                 observed.max_pending_rows = observed.max_pending_rows.max(rows);
                 if rows == 64 && !real {
                     assert_eq!((min, max), (4096, 4096), "all 64 rows at the content cap");
-                    observed.maximal_rows_seen = true;
                 }
             }
             if let Some(context) = scan.sampling.as_ref() {
