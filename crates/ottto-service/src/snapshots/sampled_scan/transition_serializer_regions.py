@@ -46,6 +46,16 @@ or add a separately versioned seed), then runs this SAME script with --baseline
 <reviewed-ref> --source-root crates/ottto-service/src and empty JSON stdin.
 Review all changed per-unit hashes, outside-catalog entries and helper inventory
 classifications together; never copy current hashes merely to clear CI.
+
+Archived writers: --archive <sha> verifies archived_writers/w_<sha8>.rs instead
+of the live tree. Each declared region must equal the file's marked text after
+undoing its module root and cfg(any()) markers, and must equal the same roots at
+git show <sha>:<path>. Its crate:: paths must stay inside the archive and its
+references must match the adjacent w_<sha8>_helpers.json. Test checkouts are
+shallow, so tests pass --archive-text-only and an owner runs the git form:
+python3 <this file> --source-root crates/ottto-service/src --archive <sha>
+with empty JSON stdin. A pinned region is never edited; a later writer adds a
+new archive and leaves the earlier files and hashes alone.
 """
 import hashlib
 import json
@@ -281,7 +291,7 @@ def definitions(t, ends):
     return out
 
 
-def regions(path, t):
+def regions(path, t, roots=None):
     ends = balanced(t)
     signatures = []
     for i, part in enumerate(t[:-1]):
@@ -325,7 +335,8 @@ def regions(path, t):
     if path == "codex_scan_diagnostics.rs":
         chosen.update((a, b) for name, a, b, kind in defs
                       if kind == "const" and name == "PARENT_UNRESOLVABLE_CAUSES")
-    roots = ROOT_FUNCTIONS.get(path, set())
+    if roots is None:
+        roots = ROOT_FUNCTIONS.get(path, set())
     chosen.update((a, b) for name, a, b, kind in defs if kind == "fn" and name in roots)
     if {name for name, _, _, kind in defs if kind == "fn"} & roots != roots:
         raise ValueError("missing explicit serializer helper root: " + path)
@@ -618,12 +629,137 @@ def extract(sources):
     return {"hashes": hashes, "references": sorted(refs)}
 
 
+ARCHIVE_DIR = "snapshots/sampled_scan/archived_writers/"
+ARCHIVE_SHA = re.compile(r'const SOURCE_SHA: &str = "([0-9a-f]{40})";')
+ARCHIVE_ROOT = re.compile(r'const ARCHIVE_ROOT: &str = "([^"]+)";')
+ARCHIVE_REGION = re.compile(
+    r'Region \{\s*path: "([^"]+)",\s*roots: &\[([^\]]*)\],\s*sha256: "([0-9a-f]{64})",\s*\}'
+)
+ARCHIVE_MARK = re.compile(r'^[ \t]*// archive-region(?:: (\S+)|-end)[ \t]*$')
+
+
+def archive_blocks(text):
+    """Marked text per source path; everything else is reviewed scaffold."""
+    blocks, path, lines = {}, None, []
+    for line in text.split("\n"):
+        mark = ARCHIVE_MARK.match(line)
+        if mark is None:
+            if path is not None:
+                lines.append(line)
+            continue
+        if (mark.group(1) is None) == (path is None):
+            raise ValueError("unbalanced archive region markers")
+        if path is not None:
+            blocks.setdefault(path, []).append("\n".join(lines))
+        path, lines = mark.group(1), []
+    if path is not None:
+        raise ValueError("unterminated archive region")
+    return blocks
+
+
+def archive_tokens(path, blocks, root):
+    """Reverse the two mechanical changes, leaving the commit's tokens."""
+    prefix = tokens(root)
+    out = []
+    for block in blocks:
+        t = production_tokens(path, block)[0]
+        at = 0
+        while at < len(t):
+            if t[at:at + len(prefix)] == prefix:
+                out.append("crate")
+                at += len(prefix)
+            else:
+                out.append(t[at])
+                at += 1
+    return out
+
+
+def digest(selected):
+    return hashlib.sha256("\0".join(selected).encode()).hexdigest()
+
+
+def verify_archive(sources, wanted, text_only, source_root):
+    archives = {}
+    for path, text in sources.items():
+        name = path[len(ARCHIVE_DIR):]
+        if path.startswith(ARCHIVE_DIR) and path.endswith(".rs") and name != "mod.rs":
+            sha = ARCHIVE_SHA.search(text)
+            root = ARCHIVE_ROOT.search(text)
+            if sha is None or root is None:
+                raise ValueError("archive without SOURCE_SHA/ARCHIVE_ROOT: " + path)
+            if name != "w_" + sha.group(1)[:8] + ".rs":
+                raise ValueError("archive file name does not match SOURCE_SHA: " + path)
+            archives[sha.group(1)] = (path, text, root.group(1))
+    matches = [sha for sha in archives if len(wanted) >= 8 and sha.startswith(wanted)]
+    if len(matches) != 1:
+        raise ValueError("unknown archived writer: " + wanted)
+    sha = matches[0]
+    path, text, root = archives[sha]
+    all_tokens = tokens(text)
+    prefix = tokens(root)
+    for at, token in enumerate(all_tokens):
+        if token == "crate" and all_tokens[at + 1:at + 2] == [":"]:
+            if all_tokens[at:at + len(prefix)] != prefix:
+                raise ValueError("archive reaches outside itself: " + "".join(all_tokens[at:at + 9]))
+    blocks = archive_blocks(text)
+    declared = ARCHIVE_REGION.findall(text)
+    if {unit for unit, _, _ in declared} != set(blocks) or len(declared) != len(blocks):
+        raise ValueError("archive regions and markers differ: " + path)
+    hashes, root_names, selected = {}, {}, []
+    for unit, roots, pinned in declared:
+        names = re.findall(r'"([^"]+)"', roots)
+        archived = archive_tokens(unit, blocks[unit], root)
+        if digest(archived) != pinned:
+            raise ValueError("archive region does not match its pin: " + unit)
+        if not text_only:
+            at_commit = subprocess.check_output([
+                "git", "show", sha + ":crates/ottto-service/src/" + unit
+            ]).decode()
+            frozen = regions(unit, production_tokens(unit, at_commit)[0], set(names))
+            if digest(frozen) != pinned:
+                raise ValueError("archive region differs from its commit: " + unit)
+        hashes[unit] = pinned
+        root_names[unit] = names
+        selected.extend(archived)
+    inventory_path = path[:-len(".rs")] + "_helpers.json"
+    if inventory_path in sources:
+        inventory = json.loads(sources[inventory_path])
+    else:
+        inventory = json.loads((source_root / inventory_path).read_text(encoding="utf-8"))
+    if not all(status.startswith(("archived: ", "exception: ")) for status in inventory.values()):
+        raise ValueError("unreviewed archive helper classification")
+    references = reference_names(selected)
+    if references != set(inventory):
+        raise ValueError("archive helper inventory changed: "
+                         + ", ".join(sorted(references ^ set(inventory))))
+    return {"archive": sha, "hashes": hashes, "roots": root_names, "references": sorted(references)}
+
+
+def archive_sources(root):
+    """Only archive files: a checkout's other sources play no part here."""
+    directory = root / ARCHIVE_DIR
+    if not directory.is_dir():
+        raise ValueError("archive verification requires an existing source tree: " + str(root))
+    return {
+        ARCHIVE_DIR + path.name: path.read_text(encoding="utf-8")
+        for path in sorted(directory.glob("*.rs"))
+    }
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--baseline")
+    parser.add_argument("--archive")
+    parser.add_argument("--archive-text-only", action="store_true")
     args = parser.parse_args()
+    if args.archive:
+        sources = archive_sources(args.source_root)
+        sources.update(json.load(sys.stdin))
+        result = verify_archive(sources, args.archive, args.archive_text_only, args.source_root)
+        json.dump(result, sys.stdout, indent=2, sort_keys=True)
+        return
     sources = source_tree(args.source_root, args.baseline)
     sources.update(json.load(sys.stdin))  # In-memory discriminating controls.
     json.dump(extract(sources), sys.stdout, indent=2, sort_keys=True)
