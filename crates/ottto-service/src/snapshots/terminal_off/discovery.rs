@@ -418,7 +418,6 @@ pub(super) fn walk_path(
         if metadata.len() > MAX_CLAUDE_JSONL_FILE_BYTES {
             o.served = Some((stat, [0; 32]));
             o.served_at = Some(now);
-            o.held_retry = false; // Classification belongs to this parse's settlement.
         }
         if enqueue_suppressed {
             WalkPath::ObserveOnly
@@ -458,6 +457,7 @@ pub(super) fn served(index: &ScanIndex, candidate: &CandidateFile, now: u64) {
             o.round = round;
             o.served = Some((stat, token));
             o.served_at = Some(now);
+            o.held_retry = false; // Classification belongs to this parse's settlement.
             o.served_root = Some(digest(&local_index_key(&candidate.scan_root)));
             o.targeted = Some(service_token(token, debt, stat, cause));
         }
