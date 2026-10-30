@@ -2410,7 +2410,7 @@ fn terminal_off_on_terminal_family_never_committed_members_let_the_claude_census
         );
         assert!(!hold.index.file_snapshot_fingerprints.contains_key(&key));
     }
-    assert!(last.uploaded.is_disjoint(&last.held));
+    assert!(last.held.is_empty());
 
     // Native exhaustion retains the same window and authority evidence without proof.
     assert!(!last.scan.census_complete);
@@ -3679,7 +3679,7 @@ fn terminal_off_on_assert_real_rejected_hold(
     let last = fixture.page("2026-08-02T09:01:00Z", cycle, PipelineUpload::Accept);
     assert!(!last.scan.census_complete);
     assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
-    assert!(last.uploaded.is_disjoint(&last.held));
+    assert!(last.held.is_empty());
     assert_eq!(
         terminal_hold_settlement_count(),
         before + 1,
@@ -3755,10 +3755,12 @@ fn terminal_off_on_assert_real_rejected_hold(
     }
 
     // Independent accepted-fold oracle: A retains its accepted revision;
-    // A refusal is no authority to retire an earlier accepted body. Keep B's
-    // accepted baseline, C's newly exact-ACKed body and D's baseline. No
-    // rejected/held revision enters this update or a published manifest.
+    // refused B contributes nothing, C contributes its newly ACKed body, and
+    // D keeps its baseline body. The held key never enters this update.
     let mut expected = baseline.clone();
+    let refused_key = PipelineFixture::key(baseline, PIPELINE_REFUSED_SESSION);
+    expected.files.remove(&refused_key);
+    expected.file_snapshot_fingerprints.remove(&refused_key);
     let accepted_key = PipelineFixture::key(baseline, PIPELINE_SESSIONS[2]);
     let accepted_body = first.progress.accepted_fingerprints.iter().next().unwrap();
     assert!(!baseline
@@ -4734,6 +4736,11 @@ fn terminal_off_on_retry_pending_debt_elsewhere_settles_unrelated_pages_like_no_
         );
     }
     assert!(debt
+        .iter()
+        .any(|page| !page.progress.accepted_fingerprints.is_empty()));
+    // Non-vacuity: the no-debt arm reads and accepts the revised sibling too,
+    // so the per-page parity above compares real reads.
+    assert!(control
         .iter()
         .any(|page| !page.progress.accepted_fingerprints.is_empty()));
     let last = debt.last().expect("terminal page");
