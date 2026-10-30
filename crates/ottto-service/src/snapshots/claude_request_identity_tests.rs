@@ -2261,6 +2261,11 @@ fn legacy_excluded_reported_fork_stays_contract5_by_owned_requests() {
 #[cfg(unix)]
 #[test]
 fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() {
+    // Like the sampled production reuse fixtures, this requires a platform
+    // whose heap layout permits retaining the Full read's native reduction.
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
     use crate::snapshots::claude_reemission_exclusions::ReemissionExclusions;
     use crate::snapshots::claude_request_census::{
         record_claude_request_census, ClaudeRequestCensusParse,
@@ -2317,6 +2322,10 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
         };
         let (mut index, full, mode) = run(index);
         assert!(matches!(mode, Some(ReadMode::Full(_))));
+        let checkpoint = cache
+            .retained_checkpoint(&key)
+            .expect("the quiet member's Full read must retain its native reduction");
+        assert!(checkpoint.audit_debt().is_none());
         let verified = index.claude_request_census.get(&key).unwrap().clone();
         assert!(!verified.unverified_for_test());
         let raw = full.snapshots;
@@ -2353,6 +2362,11 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
             .clear();
         let (mut index, _, mode) = run(index);
         assert_eq!(mode, Some(ReadMode::Unchanged));
+        assert!(cache
+            .retained_checkpoint(&key)
+            .expect("the quiet member's Unchanged read must retain its native reduction")
+            .audit_debt()
+            .is_none());
         assert!(!index
             .claude_request_census
             .get(&key)
