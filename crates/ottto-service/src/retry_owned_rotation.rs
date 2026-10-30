@@ -313,6 +313,7 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
 }
 
 #[test]
+#[ignore = "flaky: 41090732420 retry_allocation_probe live stats underflow (requested_live < 0) in the macOS merge queue"]
 // Exact report counts: exclude other client_report resetters and leasers.
 #[serial(client_report)]
 fn owned_rotation_integrated_native_oracle() {

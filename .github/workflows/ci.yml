@@ -147,13 +147,14 @@ jobs:
 
       - name: Runtime tests
         if: env.OTTTO_CI_TEST_FILTER == ''
-        # Print a failing assertion when it happens, not only after the suite.
-        # Four threads on the 3-core runner: many tests wait on I/O or #[serial].
-        # Six exposed shared-state races (control.rs notes some fail above 4).
+        # Same tests as `cargo test --workspace --locked -- --nocapture`. The
+        # ottto-service #[serial] tests run one at a time in a second process
+        # beside the rest (3 threads), so threads stop idling on serial locks.
+        # Six shared-state races appeared above 4 threads in one process.
         # Branch Mac runs (dispatch) keep going past a failing test binary so
         # scripts/mac_batch.py can map every failure to a PR; merge_group and
         # schedule runs still stop at the first failing binary.
-        run: cargo test --workspace --locked ${{ github.event_name == 'workflow_dispatch' && '--no-fail-fast' || '' }} -- --nocapture --test-threads=4
+        run: python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1 ${{ github.event_name == 'workflow_dispatch' && '--no-fail-fast' || '' }}
 
       - name: Filtered Rust tests (partial pre-check)
         if: env.OTTTO_CI_TEST_FILTER != ''

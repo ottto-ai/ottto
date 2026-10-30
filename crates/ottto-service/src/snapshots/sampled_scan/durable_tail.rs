@@ -987,6 +987,8 @@ impl SharedCache {
             return Err(MissClass::BudgetRefused);
         }
         stores.counters.restored += 1;
+        #[cfg(test)]
+        super::transition_fixture::reach(super::transition_fixture::CrashPoint::Restore);
         drop(stores);
         self.take(key).ok_or(MissClass::TakeLost)
     }
@@ -1752,6 +1754,10 @@ pub(crate) enum Failure {
 #[cfg(test)]
 #[path = "durable_tail_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "transition_seed.rs"]
+pub(crate) mod transition_seed;
 
 #[cfg(test)]
 #[path = "durable_tail_store_write_tests.rs"]
