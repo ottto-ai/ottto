@@ -935,6 +935,22 @@ fn retry_would_block<T>(mut accept: impl FnMut() -> io::Result<T>) -> io::Result
 }
 
 #[test]
+fn wildcard_ipv4_owner_is_not_stolen_or_shared() {
+    let (_dir, mut supervisor) = scratch();
+    let owner = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    owner.set_nonblocking(true).unwrap();
+    let port = owner.local_addr().unwrap().port();
+    supervisor
+        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .unwrap();
+    assert!(supervisor.open.is_empty());
+    assert_eq!(supervisor.counters.bind_skipped.load(Ordering::Relaxed), 1);
+    let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let _accepted =
+        accept_within(&owner).expect("the wildcard owner still receives its loopback traffic");
+}
+
+#[test]
 fn dual_stack_ipv6_owner_vetoes_ipv4_legacy_bind() {
     let fd = match socket::bind_ipv6_wildcard(0) {
         Ok(fd) => fd,
