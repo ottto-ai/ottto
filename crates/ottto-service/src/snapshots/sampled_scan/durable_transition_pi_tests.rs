@@ -2034,12 +2034,11 @@ fn pi_fork_pre_header_copies_reduce_double_counted_money() {
             .sum::<u64>(),
         30
     );
-    let cost = cold
-        .snapshots
-        .values()
-        .map(|s| s["cost"].as_f64().unwrap_or(0.0))
-        .sum::<f64>();
-    assert!((cost - 0.002).abs() < 1e-12);
+    assert_eq!(
+        cold.snapshots[&f.entity]["cost"]["total_cost_usd"],
+        json!("0.002")
+    );
+    assert!(cold.snapshots["synthetic-fork-session"]["cost"].is_null());
     for mode in [Mode::Ram, Mode::Restart, Mode::EvictRetry] {
         let route = f.emit_bodies(mode);
         money_oracle::assert_equivalent(&cold, &route);
