@@ -182,16 +182,13 @@ fn maximum_accepted_ledger_progress_json_and_actual_load_peak_are_bounded() {
         crate::snapshots::claude_request_identity::AcceptedBuckets::maximum_for_test();
     let bytes = serde_json::to_vec(&progress).unwrap();
     // Worst accepted-ledger caps in the real progress envelope; other ACK owners empty.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let root = std::env::temp_dir().join(format!(
-        "ottto-identity-load-{}",
-        format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )
+        "ottto-identity-load-{}-{stamp}",
+        std::process::id()
     ));
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("progress.json");
