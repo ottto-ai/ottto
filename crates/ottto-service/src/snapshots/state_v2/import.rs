@@ -142,7 +142,32 @@ pub(super) trait Mapper {
     /// permission to drop unsettled custody. KEEP persisted shared refs: decode
     /// only each changed row's old refs, diff against new refs, adjust/reclaim
     /// in this transaction. Never perform whole-history GC during a save.
-    fn delta<T: Transaction>(&self, txn: &mut T, index: &ScanIndex) -> Result<()>;
+    fn delta<T: Transaction>(
+        &self,
+        txn: &mut T,
+        index: &ScanIndex,
+        plan: Option<&units_graph::RowPlan>,
+    ) -> Result<()>;
+    fn selected_save(
+        &self,
+        db: &mut sqlite::Sqlite,
+        identity: &Identity,
+        prev: &ScanIndex,
+        index: &mut ScanIndex,
+        cx: &mut KindCx,
+    ) -> Result<bool> {
+        let _ = (db, identity, prev, index, cx);
+        Ok(false)
+    }
+    fn restore_selected(
+        &self,
+        db: &mut sqlite::Sqlite,
+        index: &mut ScanIndex,
+        cx: &mut KindCx,
+    ) -> Result<()> {
+        let _ = (db, index, cx);
+        Ok(())
+    }
 }
 /// Semantic reads/extractors are integrated. Conversion and writes deliberately
 /// refuse until original-authority inventory, import generation publication,
@@ -231,8 +256,75 @@ impl Mapper for ClaudeMapper {
         kinds_misc::merge_cas(tx, index)?;
         kinds_files::merge_growth_cas(tx, index)
     }
-    fn delta<T: Transaction>(&self, _: &mut T, _: &ScanIndex) -> Result<()> {
-        bail!(Pause::PublicationPending)
+    fn delta<T: Transaction>(
+        &self,
+        tx: &mut T,
+        _: &ScanIndex,
+        plan: Option<&units_graph::RowPlan>,
+    ) -> Result<()> {
+        plan.ok_or(Pause::PublicationPending)?.apply(tx)
+    }
+    fn selected_save(
+        &self,
+        db: &mut sqlite::Sqlite,
+        identity: &Identity,
+        prev: &ScanIndex,
+        index: &mut ScanIndex,
+        cx: &mut KindCx,
+    ) -> Result<bool> {
+        self.save_admitted(
+            db,
+            identity,
+            prev,
+            index,
+            cx,
+            &mut kinds_files::NoResumeHooks,
+        )?;
+        Ok(true)
+    }
+    fn restore_selected(
+        &self,
+        db: &mut sqlite::Sqlite,
+        index: &mut ScanIndex,
+        cx: &mut KindCx,
+    ) -> Result<()> {
+        let identity = {
+            let mut tx = db.begin(TxnMode::Read)?;
+            identity(&mut tx)?
+        };
+        if let Some(mut desired) = units_graph::restore(db, &identity, index)? {
+            self.save_admitted(
+                db,
+                &identity,
+                index,
+                &mut desired,
+                cx,
+                &mut kinds_files::NoResumeHooks,
+            )?;
+            *index = desired;
+        }
+        Ok(())
+    }
+}
+impl ClaudeMapper {
+    pub(super) fn save_admitted(
+        &self,
+        db: &mut sqlite::Sqlite,
+        identity: &Identity,
+        prev: &ScanIndex,
+        next: &mut ScanIndex,
+        cx: &mut KindCx,
+        hooks: &mut dyn kinds_files::ResumeHooks,
+    ) -> Result<()> {
+        {
+            let mut tx = db.begin(TxnMode::Read)?;
+            kinds_misc::merge_cas_at(&mut tx, next, prev.generation)?;
+            kinds_files::merge_growth_cas(&mut tx, next)?;
+        }
+        next.retire_committed_claude_account_pending_windows();
+        super::super::lenient_decode::check_held_output(next)?;
+        let plan = units_graph::plan(db, identity, prev, next, cx, hooks)?;
+        kinds::save_selected(db, prev, next, cx, plan, hooks, self)
     }
 }
 

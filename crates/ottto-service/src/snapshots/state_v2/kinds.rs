@@ -3,7 +3,7 @@
 //! Runtime publication stays gated until raw inventory, CAS and R1 are composed.
 #![allow(dead_code)] // Publication integration is a separate, fail-closed step.
 use super::*;
-use anyhow::{bail, ensure};
+use anyhow::{bail, ensure, Context};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
@@ -23,6 +23,86 @@ pub(super) struct KindCx {
     pub(super) delta: bool,
     pub(super) dirty_fields: Option<BTreeSet<String>>,
     valid: bool,
+}
+
+/// Copy only dirty encoder metadata, never the history-wide account/header map.
+/// The original remains the committed context until the selected transaction wins.
+pub(super) fn planning_context(
+    prev: &ScanIndex,
+    next: &ScanIndex,
+    committed: &KindCx,
+    dirty: &BTreeSet<String>,
+) -> Result<KindCx> {
+    ensure!(
+        committed.valid && !committed.ambiguous,
+        "state_v2_context_invalid"
+    );
+    let mut cx = KindCx {
+        binding: committed.binding.clone(),
+        committed: committed.committed.clone(),
+        presence: committed.presence.clone(),
+        require_preflight: committed.require_preflight,
+        accounts_ready: true,
+        valid: true,
+        ..Default::default()
+    };
+    let mut kinds: BTreeSet<_> = dirty
+        .iter()
+        .filter_map(|f| kinds_misc::field_kind(f))
+        .collect();
+    if dirty.contains("decode_holds") {
+        kinds.insert("v1_field.repair_provenance");
+        kinds.extend(
+            kinds_misc::KINDS
+                .iter()
+                .copied()
+                .filter(|k| k.starts_with("raw_hold.")),
+        );
+    }
+    let mut bytes = 0_usize;
+    for (key, row) in &committed.misc_rows {
+        let needed = match key {
+            RowKey::Meta(_) => true,
+            RowKey::Record { kind, .. } => kinds.contains(kind.name()),
+            _ => false,
+        };
+        if needed {
+            bytes = bytes
+                .checked_add(units_graph::metadata_cost(key))
+                .context("state_v2_save_admission")?;
+            ensure!(bytes <= 8 * 1024 * 1024, "state_v2_save_admission");
+            cx.misc_rows.insert(key.clone(), row.clone());
+        }
+    }
+    let mut families = BTreeSet::new();
+    macro_rules! changed {
+        ($($field:ident),* $(,)?) => { $(
+            for family in prev.$field.keys().chain(next.$field.keys()) {
+                if prev.$field.get(family) != next.$field.get(family) { families.insert(family); }
+            }
+        )* };
+    }
+    changed!(
+        claude_account_family_pending,
+        claude_usage_family_pending,
+        claude_account_family_witnesses,
+        claude_usage_family_witnesses,
+        claude_usage_authority_quarantine,
+        claude_account_deferred_holds,
+        session_account_bindings
+    );
+    for (scope, rows) in &committed.account_rows {
+        if families.contains(&scope.1) || scope.0 == "account.window_retention" {
+            for key in rows.keys() {
+                bytes = bytes
+                    .checked_add(units_graph::metadata_cost(key))
+                    .context("state_v2_save_admission")?;
+                ensure!(bytes <= 8 * 1024 * 1024, "state_v2_save_admission");
+            }
+            cx.account_rows.insert(scope.clone(), rows.clone());
+        }
+    }
+    Ok(cx)
 }
 
 pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
@@ -86,7 +166,10 @@ pub(super) fn hydrate_txn(
             let RowKey::Record { kind, .. } = &header.key else {
                 bail!("state_v2_record_kind");
             };
-            ensure!(owns_kind(kind.name()), "state_v2_unmapped_kind");
+            ensure!(
+                units_graph::owns_header(header)? || owns_kind(kind.name()),
+                "state_v2_unmapped_kind"
+            );
         }
         after = page.last().map(|h| h.key.clone());
     }
@@ -138,11 +221,13 @@ pub(super) fn delta(
     result
 }
 
+/// Backend adversarial fixture seam; production uses the exact row-plan executor.
+#[cfg(test)]
 /// Execute one owner-selected graph under the caller's source/checkpoint lock.
 /// Selection must already include the exact planned resume rows. The backend
 /// rejects missing, stale, extra or undercharged mutations atomically. R1's real
 /// admission/staging/GC implementation belongs to the owner of ResumeHooks.
-pub(super) fn save_selected(
+pub(super) fn save_selected_graph(
     store: &mut sqlite::Sqlite,
     prev: &ScanIndex,
     next: &mut ScanIndex,
@@ -202,6 +287,87 @@ pub(super) fn save_selected(
     result
 }
 
+/// Production selected-row executor. The graph projection and context were
+/// decoded from the same exact-ref plan; neither becomes current before COMMIT
+/// and the owner callback. Deferred custody is admitted in this transaction too.
+pub(super) fn save_selected(
+    store: &mut sqlite::Sqlite,
+    prev: &ScanIndex,
+    next: &mut ScanIndex,
+    committed: &mut KindCx,
+    plan: units_graph::Planned,
+    hooks: &mut dyn kinds_files::ResumeHooks,
+    mapper: &impl import::Mapper,
+) -> Result<()> {
+    let units_graph::Planned {
+        selection,
+        rows,
+        graph,
+        mut context,
+        deferred,
+    } = plan;
+    ensure!(committed.valid, "state_v2_context_invalid");
+    let mut pending = std::mem::take(committed);
+    let mut published = false;
+    let result = (|| {
+        store.validate_selection(&selection)?;
+        pending.preflight_selected(prev, &graph, &selection, hooks)?;
+        ensure!(
+            pending.prepared_checkpoints() == Some(&context.committed),
+            "state_v2_resume_plan_changed"
+        );
+        let mut tx = store.begin_selected(selection)?;
+        mapper.delta(&mut tx, &graph, Some(&rows))?;
+        let outcome = tx.commit(prev.generation, graph.generation);
+        published = !matches!(outcome, DurableCommitOutcome::NotPublished);
+        match outcome {
+            DurableCommitOutcome::Committed(g) => {
+                next.generation = g;
+                pending.post_commit(&DurableCommitOutcome::Committed(g), hooks)?;
+                context.committed = pending.committed;
+                *committed = context;
+                units_graph::install(next, graph);
+                let mut count = 0_u64;
+                let mut windows = 0_u64;
+                let mut max = 0_u64;
+                for family in next.claude_account_family_pending.values() {
+                    let n = family.previous_windows.len() as u64 + 1;
+                    count += u64::from(n > 64);
+                    windows += n;
+                    max = max.max(n);
+                }
+                if count != 0 {
+                    telemetry::event("account_windows_alarm", &count);
+                }
+                telemetry::event(
+                    "account_windows_retained",
+                    &serde_json::json!({
+                        "windows": windows, "max_per_family": max, "families_over_64": count
+                    }),
+                );
+                if deferred {
+                    bail!(Hold::SaveAdmission);
+                }
+                Ok(())
+            }
+            other => {
+                if let DurableCommitOutcome::Published(g) = &other {
+                    next.generation = *g;
+                }
+                pending.post_commit(&other, hooks)?;
+                bail!("current_index_requires_reload")
+            }
+        }
+    })();
+    if result.is_err() && !committed.valid {
+        committed.ambiguous = true;
+        if !published {
+            next.generation = prev.generation;
+        }
+    }
+    result
+}
+
 pub(super) fn private_paths(
     header: &Header,
     value: &dyn Value,
@@ -214,6 +380,9 @@ pub(super) fn private_paths(
         }
         RowKey::RequestSet(_) => interning::private_paths(header, value, emit),
         RowKey::Record { kind, .. } => {
+            if kind.name() == "unit.deferred" {
+                return units_graph::private_paths(header, value, emit);
+            }
             let extract = if kinds_files::KINDS.contains(&kind.name()) {
                 kinds_files::private_paths
             } else if kinds_census::KINDS.contains(&kind.name()) {
@@ -241,6 +410,10 @@ pub(super) fn references(
         }
         RowKey::RequestSet(_) => Ok(()),
         RowKey::Record { kind, .. } => {
+            if kind.name() == "unit.deferred" {
+                // Deferred shared-value deltas are inert until restoration.
+                return Ok(());
+            }
             let extract = if kinds_files::KINDS.contains(&kind.name()) {
                 kinds_files::references
             } else if kinds_census::KINDS.contains(&kind.name()) {

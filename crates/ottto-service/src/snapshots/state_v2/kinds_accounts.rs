@@ -145,6 +145,13 @@ fn decode(bytes: &[u8]) -> Result<Vec<String>> {
     );
     Ok(parts)
 }
+pub(super) fn dependency_family(bytes: &[u8]) -> Result<String> {
+    decode(bytes)?
+        .into_iter()
+        .next()
+        .context("state_v2_unit_family")
+}
+
 fn key(kind: &str, family: &str, path: &[&str], position: u64) -> Result<RowKey> {
     let mut parts = vec![family];
     parts.extend_from_slice(path);

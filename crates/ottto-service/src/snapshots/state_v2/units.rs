@@ -455,6 +455,20 @@ pub(super) struct Selection {
     holds: BTreeMap<[u8; 32], UnitHold>,
 }
 impl Selection {
+    /// Custody is part of the same admitted transaction, including replacement
+    /// and deletion costs. It cannot bypass the hard ceiling.
+    pub(super) fn add_custody(&mut self, change: Change) -> Result<()> {
+        let charge = self.charge.add(change.charge()?)?;
+        ensure!(charge.fits(Charge::hard()), "state_v2_save_admission");
+        let key = change.key()?.clone();
+        ensure!(
+            !self.changes.contains_key(&key),
+            "state_v2_unit_duplicate_change"
+        );
+        self.changes.insert(key, change);
+        self.charge = charge;
+        Ok(())
+    }
     pub(super) fn staging_bytes(&self) -> u64 {
         self.stage_bytes
     }

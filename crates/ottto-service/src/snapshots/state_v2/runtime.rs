@@ -226,8 +226,10 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
                         // on the same connection; never acquire another owner.
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
                         telemetry::event("hydrate_count", &1);
-                        let (mut index, cx) = mapper.hydrate_context(&mut session.db)?;
-                        ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+                        let (mut index, mut cx) = mapper.hydrate_context(&mut session.db)?;
+                        mapper.restore_selected(&mut session.db, &mut index, &mut cx)?;
+                        session.stamp = session.db.stamp()?;
+                        ensure!(index.generation == session.stamp.0, Hold::DbUnavailable);
                         session.cx = cx;
                         index.persistence_v2 = Some(runtime.clone());
                         state.cached = Some(index.clone());
@@ -248,7 +250,9 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
             db.reference_extractor(M::references);
             let stamp = db.stamp()?;
             super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
-            let (mut index, cx) = mapper.hydrate_context(&mut db)?;
+            let (mut index, mut cx) = mapper.hydrate_context(&mut db)?;
+            mapper.restore_selected(&mut db, &mut index, &mut cx)?;
+            let stamp = db.stamp()?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
             db.prime_headers()?;
             index.persistence_v2 = Some(Arc::new(Runtime {
@@ -435,6 +439,7 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             })),
         }));
         register(state, index)?;
+        state.cached = Some(index.clone());
         Ok(())
     })
 }
@@ -509,6 +514,22 @@ fn save_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Resul
         );
         telemetry::baseline(path);
         let _gauge = telemetry::Stage::new(telemetry::Kind::Save);
+        let previous = state.cached.take().ok_or(Hold::ReloadRequired)?;
+        ensure!(
+            previous.generation == session.stamp.0 && index.generation == previous.generation,
+            Hold::ReloadRequired
+        );
+        if mapper.selected_save(
+            &mut session.db,
+            &identity,
+            &previous,
+            index,
+            &mut session.cx,
+        )? {
+            session.stamp = session.db.stamp()?;
+            state.cached = Some(index.clone());
+            return Ok(true);
+        }
         mapper.preflight(index).map_err(|_| Hold::DbUnavailable)?;
         state.cached = None;
         let mut tx = session.db.begin(TxnMode::Write)?;
@@ -519,7 +540,7 @@ fn save_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Resul
         lenient_check(index)?;
         let previous = index.generation;
         let next = previous.checked_add(1).ok_or(Hold::DbUnavailable)?;
-        mapper.delta(&mut tx, index)?;
+        mapper.delta(&mut tx, index, None)?;
         apply_outcome(index, &mut session.reload, tx.commit(previous, next))?;
         session.stamp = session.db.stamp()?;
         // Cache exactly the committed graph, including subset-save outcomes;

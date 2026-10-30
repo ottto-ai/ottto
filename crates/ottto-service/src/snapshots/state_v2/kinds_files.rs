@@ -569,8 +569,19 @@ pub(super) struct StagedCheckpoints {
 /// immutable file and its directory before returning staging proof. The mapper
 /// owns no filesystem handles and never implements a promote step.
 pub(super) trait ResumeHooks {
-    /// Called on the already-selected graph, before staging or Store::begin.
-    /// R1 admits immutable output bytes without writing them in this callback.
+    /// Pure candidate planning: exact intended refs and a byte reservation.
+    /// No files are written here; stage must return these exact refs after
+    /// selection, or the transaction refuses before publication.
+    fn plan(
+        &mut self,
+        prev: &ScanIndex,
+        next: &ScanIndex,
+        current: &BTreeMap<String, ResumeCheckpoint>,
+    ) -> Result<StagedCheckpoints> {
+        let _ = (prev, next, current);
+        Ok(StagedCheckpoints::default())
+    }
+    /// Admit the selected output before any staging side effect.
     fn preflight_selected(
         &mut self,
         prev: &ScanIndex,
@@ -611,6 +622,9 @@ pub(super) struct Prepared {
 }
 
 impl KindCx {
+    pub(super) fn prepared_checkpoints(&self) -> Option<&BTreeMap<String, ResumeCheckpoint>> {
+        self.prepared.as_ref().map(|p| &p.checkpoints)
+    }
     pub(super) fn checkpoints(&self) -> &BTreeMap<String, ResumeCheckpoint> {
         &self.committed
     }
@@ -665,13 +679,32 @@ impl KindCx {
             "state_v2_resume_reopen_required"
         );
         self.require_preflight = true;
-        let binding = self.binding.as_ref().context("state_v2_resume_binding")?;
         let staged = hooks.stage(prev, next, &self.committed)?;
         ensure!(
             staged.bytes <= reserved_staging_bytes
                 && (staged.replacements.is_empty() || staged.bytes > 0),
             "state_v2_resume_staging_admission"
         );
+        self.prepare_checkpoints(prev, next, staged)
+    }
+    pub(super) fn prepare_plan(
+        &mut self,
+        prev: &ScanIndex,
+        next: &ScanIndex,
+        hooks: &mut dyn ResumeHooks,
+    ) -> Result<u64> {
+        let staged = hooks.plan(prev, next, &self.committed)?;
+        let bytes = staged.bytes;
+        self.prepare_checkpoints(prev, next, staged)?;
+        Ok(bytes)
+    }
+    fn prepare_checkpoints(
+        &mut self,
+        prev: &ScanIndex,
+        next: &ScanIndex,
+        staged: StagedCheckpoints,
+    ) -> Result<()> {
+        let binding = self.binding.as_ref().context("state_v2_resume_binding")?;
         let mut checkpoints = self.committed.clone();
         let finished_paths: BTreeSet<_> = staged.finished.keys().cloned().collect();
         for (path, proof) in staged.finished {

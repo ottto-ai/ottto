@@ -334,7 +334,7 @@ fn selected_save_installs_context_and_calls_r1_only_after_confirmed_commit() {
     next.generation += 1;
     let selection = empty_selection(&mut db, prev.generation);
     let mut hooks = SelectedHooks::default();
-    save_selected(&mut db, &prev, &mut next, &mut cx, selection, &mut hooks).unwrap();
+    save_selected_graph(&mut db, &prev, &mut next, &mut cx, selection, &mut hooks).unwrap();
     assert_eq!(hooks.0, ["preflight", "stage", "post_commit"]);
     assert!(cx.valid && !cx.ambiguous && cx.prepared.is_none());
     let mut tx = db.begin(TxnMode::Read).unwrap();
@@ -351,7 +351,9 @@ fn unplanned_semantic_write_rolls_back_and_invalidates_context_without_r1_gc() {
     next.upload_context_fingerprint = Some("selected-but-not-admitted".into());
     let selection = empty_selection(&mut db, prev.generation);
     let mut hooks = SelectedHooks::default();
-    assert!(save_selected(&mut db, &prev, &mut next, &mut cx, selection, &mut hooks).is_err());
+    assert!(
+        save_selected_graph(&mut db, &prev, &mut next, &mut cx, selection, &mut hooks).is_err()
+    );
     assert_eq!(hooks.0, ["preflight", "stage"]);
     assert!(!cx.valid && cx.ambiguous);
     let (current, _) = hydrate(&mut db, Scratch::binding()).unwrap();
@@ -370,7 +372,9 @@ fn stale_selected_generation_refuses_before_r1_preflight_or_staging() {
     next.generation += 1;
     let selection = empty_selection(&mut db, 0);
     let mut hooks = SelectedHooks::default();
-    assert!(save_selected(&mut db, &prev, &mut next, &mut cx, selection, &mut hooks).is_err());
+    assert!(
+        save_selected_graph(&mut db, &prev, &mut next, &mut cx, selection, &mut hooks).is_err()
+    );
     assert!(hooks.0.is_empty());
     assert!(!cx.valid);
 }
@@ -483,7 +487,9 @@ fn writer_capability_refuses_selected_save_before_any_r1_side_effect() {
     let selection = empty_selection(&mut db, prev.generation);
     sqlite::future_writer_for_test(&mut db);
     let mut hooks = SelectedHooks::default();
-    assert!(save_selected(&mut db, &prev, &mut next, &mut cx, selection, &mut hooks).is_err());
+    assert!(
+        save_selected_graph(&mut db, &prev, &mut next, &mut cx, selection, &mut hooks).is_err()
+    );
     assert!(hooks.0.is_empty());
     assert_eq!(next.generation, prev.generation);
 }

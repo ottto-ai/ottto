@@ -251,6 +251,13 @@ fn family_key(root: &str, member: Option<&str>) -> Result<RowKey> {
     admit_key(&k)?;
     Ok(k)
 }
+pub(super) fn dependency_family(bytes: &[u8]) -> Result<String> {
+    components(bytes)?
+        .into_iter()
+        .next()
+        .context("state_v2_unit_family")
+}
+
 fn components(mut bytes: &[u8]) -> Result<Vec<String>> {
     let mut result = Vec::new();
     while !bytes.is_empty() {

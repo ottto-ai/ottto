@@ -94,7 +94,12 @@ impl Mapper for EmptyMapper {
     fn merge_cas<T: Transaction>(&self, _: &mut T, _: &mut ScanIndex) -> Result<()> {
         Ok(())
     }
-    fn delta<T: Transaction>(&self, _: &mut T, _: &ScanIndex) -> Result<()> {
+    fn delta<T: Transaction>(
+        &self,
+        _: &mut T,
+        _: &ScanIndex,
+        _: Option<&units_graph::RowPlan>,
+    ) -> Result<()> {
         Ok(())
     }
 }
@@ -381,4 +386,51 @@ fn route_replays_receipt_before_fresh_or_cached_graph_and_missing_receipt_holds(
         assert_eq!(fs::read(&progress).unwrap(), next);
         assert!(guard_containment_locked(&f.path).is_err());
     }
+}
+
+#[test]
+fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
+    let f = Fixture::new();
+    let mut db =
+        sqlite::Sqlite::create_import(&fence::sibling(&f.path, ".v2.sqlite.import")).unwrap();
+    db.path_extractor(kinds::private_paths);
+    db.reference_extractor(kinds::references);
+    db.control("identity", &f.identity()).unwrap();
+    let mut cx = KindCx::default();
+    cx.binding = Some(f.identity().binding);
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    kinds::populate(&ScanIndex::default(), &mut tx, &mut cx).unwrap();
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    db.finish_import().unwrap();
+    super::super::ack::ProgressRecovery::seal_import(f.identity(), 1, &f.path, None).unwrap();
+    fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+    let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    index.upload_context_fingerprint = Some("synthetic-policy".into());
+    index.active_upload_context_fingerprint = Some("active-synthetic-policy".into());
+    index.file_upload_context_enabled = true;
+    assert!(save_locked(&f.path, &mut index).unwrap());
+    assert_eq!(index.generation, 2);
+    assert_eq!(
+        index.active_upload_context_fingerprint.as_deref(),
+        Some("active-synthetic-policy")
+    );
+    assert!(index.file_upload_context_enabled && index.persistence_v2.is_some());
+    let current = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    assert_eq!(
+        current.upload_context_fingerprint,
+        index.upload_context_fingerprint
+    );
+    assert_eq!(current.generation, index.generation);
+}
+
+#[test]
+fn newly_adopted_import_can_save_without_an_intervening_load() {
+    let f = Fixture::new();
+    fs::write(&f.path, b"synthetic-v1-authority").unwrap();
+    assert!(load_with(&f.path, true, &EmptyMapper).unwrap().is_none());
+    let mut index = ScanIndex::default();
+    import_with(&f.path, &mut index, &EmptyMapper).unwrap();
+    assert!(index.persistence_v2.is_some());
+    assert!(save_with(&f.path, &mut index, &EmptyMapper).unwrap());
+    assert_eq!(index.generation, 1);
 }

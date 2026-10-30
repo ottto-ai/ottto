@@ -31,6 +31,7 @@ mod packed;
 mod shape;
 mod sqlite;
 mod units;
+mod units_graph;
 use kinds::KindCx;
 
 /// Runtime-only custody carrier. Only the verified v2 load route may install it.
@@ -78,13 +79,14 @@ const WAL_ALARM_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Readable closed record catalogue. Field-backed kinds inherit the original
 /// slot's privacy and presence contract; accepting a name is not a mapper.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) struct RecordKind(String);
 impl RecordKind {
     fn parse(name: &str) -> Result<Self> {
         let known = matches!(
             name,
-            "file.progress"
+            "unit.deferred"
+                | "file.progress"
                 | "file.receipt"
                 | "file.terminal"
                 | "file.confirmed_empty"
@@ -134,7 +136,7 @@ impl RecordKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) enum RowKey {
     Meta(String),
     Record {
@@ -157,7 +159,7 @@ impl RowKey {
 /// Scan projections only. All strings, exact boundary lexemes, reference lists,
 /// selectors and presence payloads live in the typed value. Fixed-width hashes
 /// here never substitute for the original representations in that value.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum Fixed {
     None,
     File {
@@ -204,7 +206,7 @@ pub(super) enum Fixed {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Header {
     key: RowKey,
     fixed: Fixed,
@@ -365,7 +367,11 @@ fn integrity(hash: sha2::Sha256) -> [u8; 16] {
 fn value_cap(key: &RowKey) -> u64 {
     match key {
         RowKey::Meta(_) => CONTROL_BYTES,
-        RowKey::Record { kind, .. } if kind.name().starts_with("raw_hold.") => VALUE_BYTES,
+        RowKey::Record { kind, .. }
+            if kind.name().starts_with("raw_hold.") || kind.name() == "unit.deferred" =>
+        {
+            VALUE_BYTES
+        }
         // Semantic adapters must apply any tighter source bound before storage admission.
         RowKey::RequestSet(_) => VALUE_BYTES,
         _ => MUTABLE_VALUE_BYTES,
