@@ -6,19 +6,19 @@
 //! is ignored, and dropped at the file's next store. Local state (class L):
 //! never uploaded, never a wire field.
 //!
-//! Bounded by `MAX_BYTES` of charged state: 32 bytes per file, 32 per holder
+//! Bounded by `MAX_BYTES` of charged state: 40 bytes per file, 32 per holder
 //! group and 8 per hash (about 520k hashes when dense; the encoded index text
 //! is at most 4/3 of the raw bytes, which are smaller than the charge). A
 //! decision past the cap is not stored and is counted
-//! (`copy_removal_store_overflow`); a later re-read without proof then counts
-//! the copies, flagged: never silently fresh.
+//! (`copy_removal_store_overflow`); the new removal is held until it can be
+//! recorded. Recorded decisions are never evicted to admit new ones.
 use crate::snapshots::claude_money_birth_store::LocationKey;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const MAX_BYTES: usize = 4 * 1024 * 1024;
-const FILE_BYTES: usize = 32;
+const FILE_BYTES: usize = 40;
 const GROUP_BYTES: usize = 32;
 const HASH_BYTES: usize = 8;
 
@@ -27,8 +27,8 @@ type Groups = Box<[(LocationKey, Box<[u64]>)]>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CopyRemovals {
-    /// (file, store sequence, groups), sorted by file key; never an empty
-    /// group list or an empty group. The sequence orders eviction.
+    /// (file, reserved sequence, groups), sorted by file key; never an empty
+    /// group list or an empty group. Recorded decisions are never evicted.
     files: Vec<(LocationKey, u64, Groups)>,
     /// The charged bytes of `files` (see `charge`).
     bytes: usize,
@@ -39,8 +39,8 @@ pub(crate) struct CopyRemovals {
 pub(crate) struct Stored {
     /// Hashes newly recorded for the file.
     pub(crate) added: u64,
-    /// Hashes of decisions lost to the cap: older files' entries evicted
-    /// (oldest stored first) or, when even that cannot fit it, this one.
+    /// Hashes of the new decision refused by the cap. Existing decisions
+    /// stay recorded; the caller must not publish this new removal.
     pub(crate) overflow: u64,
 }
 
@@ -62,9 +62,24 @@ impl CopyRemovals {
     }
 
     /// The charged bytes held now (at most `MAX_BYTES`).
-    #[cfg(test)]
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    pub(crate) fn file_bytes(&self, file: LocationKey) -> usize {
+        charge(self.get(file))
+    }
+
+    pub(crate) fn decision_bytes(groups: &BTreeMap<LocationKey, BTreeSet<u64>>) -> usize {
+        if groups.values().all(BTreeSet::is_empty) {
+            return 0;
+        }
+        groups
+            .values()
+            .filter(|hashes| !hashes.is_empty())
+            .fold(FILE_BYTES, |bytes, hashes| {
+                bytes + GROUP_BYTES + HASH_BYTES * hashes.len()
+            })
     }
 
     /// `file`'s stored (holder, hashes) groups.
@@ -75,9 +90,8 @@ impl CopyRemovals {
     }
 
     /// Replace `file`'s removals with `groups` (empty forgets it). Past the
-    /// cap, other files' entries are evicted oldest stored first; a decision
-    /// that cannot fit even alone keeps the old entry. Lost hashes are
-    /// returned as overflow. The same state and decisions give the same result.
+    /// cap, refuse the new decision and keep every existing entry. The caller
+    /// must hold a newly proven removal it cannot record durably.
     pub(crate) fn store(
         &mut self,
         file: LocationKey,
@@ -93,7 +107,7 @@ impl CopyRemovals {
             return Stored::default();
         }
         let new_bytes = charge(&groups);
-        if new_bytes > MAX_BYTES {
+        if self.bytes - charge(old) + new_bytes > MAX_BYTES {
             return Stored {
                 added: 0,
                 overflow: hash_count(&groups),
@@ -106,22 +120,13 @@ impl CopyRemovals {
             .filter(|hash| !held(hash))
             .count() as u64;
         self.forget(file);
-        let mut overflow = 0;
-        while self.bytes + new_bytes > MAX_BYTES {
-            let oldest = (0..self.files.len())
-                .min_by_key(|&i| (self.files[i].1, self.files[i].0))
-                .expect("over the cap with no entry");
-            overflow += hash_count(&self.files[oldest].2);
-            self.bytes -= charge(&self.files[oldest].2);
-            self.files.remove(oldest);
-        }
         if !groups.is_empty() {
-            let seq = self.files.iter().map(|f| f.1 + 1).max().unwrap_or(1);
+            let seq = 1; // Reserved in CCR1; no eviction or age-based expiry.
             let at = self.files.binary_search_by_key(&file, |f| f.0).unwrap_err();
             self.files.insert(at, (file, seq, groups));
             self.bytes += new_bytes;
         }
-        Stored { added, overflow }
+        Stored { added, overflow: 0 }
     }
 
     /// The file is no longer indexed: its removals go with it.
@@ -319,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_removals_evict_the_oldest_stored_file_first_and_count_it() {
+    fn copy_removals_refuse_new_files_without_evicting_recorded_removals() {
         let half = (0..(MAX_BYTES / HASH_BYTES / 2) as u64).collect::<Vec<_>>();
         let run = || {
             let mut removals = CopyRemovals::default();
@@ -337,9 +342,10 @@ mod tests {
             assert_eq!(
                 stored.overflow,
                 half.len() as u64,
-                "the oldest entry is evicted, counted"
+                "the new decision is refused and counted"
             );
-            assert!(removals.get(first).is_empty());
+            assert_eq!(removals.get(first)[0].1.as_ref(), half.as_slice());
+            assert!(removals.get(third).is_empty());
             assert_eq!(removals.get(second)[0].1.as_ref(), &[1, 2]);
             assert!(removals.bytes() <= MAX_BYTES);
             removals

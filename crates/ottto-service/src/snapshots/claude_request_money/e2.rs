@@ -2094,13 +2094,16 @@ fn tally_unproven_prefix(item: &mut SnapshotItem) {
 
 /// Removal decisions of one page for the index's stored copy removals.
 #[derive(Debug, Default)]
-pub(crate) struct CopyRemovalUpdates(Vec<(LocationKey, BTreeMap<LocationKey, BTreeSet<u64>>)>);
+pub(crate) struct CopyRemovalUpdates {
+    decisions: Vec<(LocationKey, BTreeMap<LocationKey, BTreeSet<u64>>)>,
+    overflow: u64,
+}
 impl CopyRemovalUpdates {
-    /// Store each file's decision, counted: hashes newly stored and hashes
-    /// the cap refused (never silently fresh: a refused decision is decided
-    /// again on a later read, and counts flagged without proof).
+    /// Store admitted decisions. A refusal holds the newly proven removal
+    /// before emission, rather than removing a copy without durable custody.
+    /// Existing removals are never evicted to make room.
     pub(crate) fn apply(self, index: &mut ScanIndex) {
-        if self.0.is_empty() {
+        if self.decisions.is_empty() && self.overflow == 0 {
             return;
         }
         // Files no longer indexed (any removal path) leave first; this
@@ -2110,8 +2113,8 @@ impl CopyRemovalUpdates {
             .collect::<BTreeSet<_>>();
         let removals = &mut index.claude_copy_removals;
         removals.retain_files(|file| live.contains(&file));
-        let (mut added, mut overflow) = (0, 0);
-        for (file, groups) in self.0 {
+        let (mut added, mut overflow) = (0, self.overflow);
+        for (file, groups) in self.decisions {
             let stored = removals.store(file, groups);
             added += stored.added;
             overflow += stored.overflow;
@@ -2495,6 +2498,9 @@ fn decide_holders(
     let pending = std::cell::OnceCell::<BTreeSet<String>>::new();
     let pending_files = std::cell::OnceCell::new();
     let mut updates = CopyRemovalUpdates::default();
+    // Reserve against the complete store before removing anything. Application
+    // may prune deleted files, which can only increase the available space.
+    let mut available = super::copy_removals::MAX_BYTES - index.claude_copy_removals.bytes();
     for wanted in wanted {
         let uncovered = wanted
             .hashes
@@ -2504,10 +2510,24 @@ fn decide_holders(
             .collect::<Vec<_>>();
         if enabled() {
             // Proven now (each hash on a current holder) or stored: keep it.
-            updates.0.push((
-                wanted.order.1,
-                stored_groups(index, &live, &wanted.covered, wanted.order.1),
-            ));
+            // A proven copy whose decision cannot fit is held, not removed
+            // without a durable record and not mislabeled as unproven.
+            let groups = stored_groups(index, &live, &wanted.covered, wanted.order.1);
+            let old = index.claude_copy_removals.file_bytes(wanted.order.1);
+            let new = super::copy_removals::CopyRemovals::decision_bytes(&groups);
+            if new > available + old {
+                updates.overflow += groups
+                    .values()
+                    .map(|hashes| hashes.len() as u64)
+                    .sum::<u64>();
+                hold_copies(&mut items[wanted.at], "held_copy_removal_capacity");
+                let mut held = Counts::default();
+                held.0[14] = 1;
+                record_counts(held);
+                continue;
+            }
+            available = available + old - new;
+            updates.decisions.push((wanted.order.1, groups));
         }
         let reused = wanted
             .stored
@@ -2526,7 +2546,11 @@ fn decide_holders(
             hold_copies(&mut items[wanted.at], "held_copy_stale_holder");
             continue;
         }
-        if !uncovered.is_empty()
+        // The pre-existing all-copy /branch lineage rule is not request-id
+        // proof for a resumed prefix. Missing/retired ids there must emit
+        // flagged, even when the transcript names an earlier parent.
+        if !wanted.resumed
+            && !uncovered.is_empty()
             && wanted
                 .parent
                 .as_deref()
@@ -3736,7 +3760,7 @@ fn absent_twins(sessions: &[(&str, &[LocationKey])], index: &ScanIndex) -> BTree
 // Existing native_collection_page carrier, nonzero only. These are shared
 // process fold deltas since its previous Claude page line.
 use std::sync::atomic::{AtomicU64, Ordering};
-const COUNT_NAMES: [&str; 14] = [
+const COUNT_NAMES: [&str; 15] = [
     "fold_us",
     "responses",
     "copy_skipped",
@@ -3755,8 +3779,9 @@ const COUNT_NAMES: [&str; 14] = [
     "copy_removal_reused",
     "copy_removal_stored",
     "copy_removal_store_overflow",
+    "held_copy_removal_capacity",
 ];
-static COUNTS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+static COUNTS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(
     Instant,
@@ -3788,18 +3813,18 @@ pub(crate) fn take_counts() -> Counts {
     Counts(COUNTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed)))
 }
 #[derive(Debug, Default)]
-pub(crate) struct Counts([u64; 14]);
+pub(crate) struct Counts([u64; 15]);
 impl Counts {
     /// The first seven (work and decision) counters.
     fn work(values: [u64; 7]) -> Self {
-        let mut all = [0; 14];
+        let mut all = [0; 15];
         all[..7].copy_from_slice(&values);
         Self(all)
     }
     /// A decided fold's copied-prefix outcome.
     fn prefix(tally: &PrefixTally) -> Self {
         let unproven = tally.unproven_requests + tally.unproven_idless;
-        let mut all = [0; 14];
+        let mut all = [0; 15];
         all[7..12].copy_from_slice(&[
             unproven,
             u64::from(unproven > 0),
@@ -3810,7 +3835,7 @@ impl Counts {
         Self(all)
     }
     fn removal_store(added: u64, overflow: u64) -> Self {
-        let mut all = [0; 14];
+        let mut all = [0; 15];
         all[12] = added;
         all[13] = overflow;
         Self(all)
