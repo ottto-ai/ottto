@@ -85,7 +85,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
       # Dispatch-only; the special-purpose dispatch jobs keep their precedence.
       # Queue/schedule runs always execute the original full commands below.
-      RUST_TEST_FILTER: ${{ github.event_name == 'workflow_dispatch' && inputs.rust_test_filter || '' }}
+      OTTTO_CI_TEST_FILTER: ${{ github.event_name == 'workflow_dispatch' && inputs.rust_test_filter || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -93,16 +93,16 @@ jobs:
           persist-credentials: false
 
       - name: Identify partial pre-check
-        if: env.RUST_TEST_FILTER != ''
+        if: env.OTTTO_CI_TEST_FILTER != ''
         run: |
           set -euo pipefail
           # A single Rust path substring, never shell code or test-runner flags.
-          if [[ ! "$RUST_TEST_FILTER" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_:]*$ ]]; then
+          if [[ ! "$OTTTO_CI_TEST_FILTER" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_:]*$ ]]; then
             echo "::error::rust_test_filter must contain only Rust path characters (letters, digits, underscores, colons)"
             exit 1
           fi
           echo "::warning::Partial Rust pre-check only; a full merge-queue run is still required"
-          printf '### Partial Rust pre-check\n\nFilter: %s\n\nOnly matching non-ignored tests run. Layout and peak-memory receipts are omitted. This is not merge evidence; the full merge-queue run is still required.\n' "$RUST_TEST_FILTER" >> "$GITHUB_STEP_SUMMARY"
+          printf '### Partial Rust pre-check\n\nFilter: %s\n\nOnly matching non-ignored tests run. Layout and peak-memory receipts are omitted. This is not merge evidence; the full merge-queue run is still required.\n' "$OTTTO_CI_TEST_FILTER" >> "$GITHUB_STEP_SUMMARY"
 
       # Keep layout-sensitive tests on the compiler validated by the runtime.
       - name: Install validated Rust toolchain
@@ -118,7 +118,7 @@ jobs:
           workspaces: |
             . -> target
             crates -> target
-          save-if: ${{ github.ref == 'refs/heads/main' && env.RUST_TEST_FILTER == '' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && env.OTTTO_CI_TEST_FILTER == '' }}
           cache-bin: "false"
 
       - name: Compiler receipt
@@ -142,26 +142,26 @@ jobs:
         run: cargo clippy --manifest-path crates/Cargo.toml --workspace --all-targets --locked -- -D warnings
 
       - name: Runtime tests
-        if: env.RUST_TEST_FILTER == ''
+        if: env.OTTTO_CI_TEST_FILTER == ''
         # Print a failing assertion when it happens, not only after the suite.
         # Four threads on the 3-core runner: many tests wait on I/O or #[serial].
         # Six exposed shared-state races (control.rs notes some fail above 4).
         run: cargo test --workspace --locked -- --nocapture --test-threads=4
 
       - name: Filtered Rust tests (partial pre-check)
-        if: env.RUST_TEST_FILTER != ''
+        if: env.OTTTO_CI_TEST_FILTER != ''
         run: |
           set -euo pipefail
           # A name filter saves execution time, not compilation: both workspaces
           # still build their test binaries. Pass one quoted positional argument.
-          cargo test --workspace --locked "$RUST_TEST_FILTER" -- --nocapture --test-threads=4 2>&1 | tee "$RUNNER_TEMP/filtered-rust-tests.log"
-          cargo test --manifest-path crates/Cargo.toml --workspace --locked "$RUST_TEST_FILTER" -- --nocapture --test-threads=4 2>&1 | tee -a "$RUNNER_TEMP/filtered-rust-tests.log"
+          cargo test --workspace --locked "$OTTTO_CI_TEST_FILTER" -- --nocapture --test-threads=4 2>&1 | tee "$RUNNER_TEMP/filtered-rust-tests.log"
+          cargo test --manifest-path crates/Cargo.toml --workspace --locked "$OTTTO_CI_TEST_FILTER" -- --nocapture --test-threads=4 2>&1 | tee -a "$RUNNER_TEMP/filtered-rust-tests.log"
           # Cargo succeeds when nothing matches. A typo or ignored-only filter
           # must fail this pre-check, including when the other workspace is empty.
           grep -E '^test result: ok\. [1-9][0-9]* passed;' "$RUNNER_TEMP/filtered-rust-tests.log"
 
       - name: Layout coverage receipt
-        if: env.RUST_TEST_FILTER == ''
+        if: env.OTTTO_CI_TEST_FILTER == ''
         run: |
           set -euo pipefail
           cargo test -p ottto-service --lib --locked heap_layout_bound::sampled_scalar_buffer_tests::layout_gate_coverage_receipt -- --exact --nocapture | tee "$RUNNER_TEMP/layout-coverage-receipt.log"
@@ -169,7 +169,7 @@ jobs:
           grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/layout-coverage-receipt.log"
 
       - name: Synthetic Codex counting peak memory
-        if: env.RUST_TEST_FILTER == ''
+        if: env.OTTTO_CI_TEST_FILTER == ''
         timeout-minutes: 15
         run: |
           set -euo pipefail
@@ -178,11 +178,11 @@ jobs:
           test "$(grep -c '^codex_v2_rss_receipt: ' "$RUNNER_TEMP/codex-rss-receipt.log")" -eq 2
 
       - name: Connector tests
-        if: env.RUST_TEST_FILTER == ''
+        if: env.OTTTO_CI_TEST_FILTER == ''
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked
 
       - name: Connector package tests
-        if: env.RUST_TEST_FILTER == ''
+        if: env.OTTTO_CI_TEST_FILTER == ''
         run: cargo test --manifest-path crates/Cargo.toml --locked -p ottto-connector-testkit --test first_party_sources
 
   public-surface:
