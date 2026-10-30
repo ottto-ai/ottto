@@ -11,7 +11,7 @@ use super::super::claude_history_upgrade::{
 use super::super::claude_money_birth_store::{location_key, LocationKey};
 use super::super::claude_request_census::claude_request_hash;
 use super::super::claude_request_identity::{
-    self, AcceptedBuckets, AccountPartition, RequestAccounts,
+    self, AcceptedBuckets, AccountPartition, AuthorityKey, RequestAccounts,
 };
 use super::super::{
     claude_api_cache_creation, claude_api_matches_transcript_occurrence,
@@ -2319,7 +2319,7 @@ fn finish_holder_identity(item: &mut SnapshotItem) {
                 if own.account(o.sequence).as_ref() == Some(&lent) {
                     return None;
                 }
-                Some((fold.occurrence_key(o)?.0, lent))
+                Some((fold.occurrence_key(o)?, lent))
             })
             .collect();
         own.copied_marker_lent = lent;
@@ -4228,6 +4228,32 @@ fn record_decided(held: bool, counts: Counts) {
 }
 
 /// Visit the exact final placement; account classification belongs to identity.
+/// Copy-prefix switch on: each identity row of `item` holding usage a copied
+/// marker had lent an account to, as `visit_identity_rows` builds it:
+/// (bucket start, row, lent account).
+pub(crate) fn copied_marker_lent_rows(
+    item: &SnapshotItem,
+) -> Vec<(&str, super::super::SnapshotModelUsage, Arc<AuthorityKey>)> {
+    let Some(fold) = item.claude_money.as_deref() else {
+        return Vec::new();
+    };
+    let Some(accounts) = fold.accounts.as_deref() else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for ((key, origin, _), grain) in &fold.entity.grains {
+        for (_, account) in accounts
+            .copied_marker_lent
+            .iter()
+            .filter(|(lent, _)| lent == key)
+        {
+            let row = super::emit::grain_row(key, *origin, grain, None);
+            rows.push((key.0.as_str(), row, account.clone()));
+        }
+    }
+    rows
+}
+
 pub(crate) fn visit_identity_rows(
     item: &SnapshotItem,
     mut visit: impl FnMut(

@@ -1442,47 +1442,39 @@ pub(crate) struct CopyInvalidation {
 }
 
 /// SOURCE 2026-10-31 (#944 xPR F5): proof a copied marker lent must not keep
-/// placing. A frozen row whose shares change and include an account a copied
-/// marker lent in that bucket (one the copy-prefix switch re-derived without
-/// it) is copy-derived: it is treated as never accepted (fresh own tags or
-/// untagged, never a refusal or marker). Other changed rows keep #909's
-/// refusal, and rows their own evidence still proves are unchanged.
+/// placing. A frozen row whose shares change and include the account a copied
+/// marker lent to that very row (one the copy-prefix switch re-derived
+/// without it) is copy-derived: it is treated as never accepted (fresh own
+/// tags or untagged, never a refusal or marker). Other changed rows keep
+/// #909's refusal, and rows their own evidence still proves are unchanged.
 fn copy_derived_rows(
     item: &SnapshotItem,
     grouping: &Grouping,
     accepted: Option<&accepted::AcceptedSession>,
 ) -> Vec<(i64, RowKey)> {
-    let Some((accepted, accounts)) = accepted.zip(
-        item.claude_money
-            .as_deref()
-            .and_then(|fold| fold.accounts.as_deref()),
-    ) else {
+    let Some(accepted) = accepted else {
         return Vec::new();
     };
-    let lent = accounts
-        .copied_marker_lent
-        .iter()
-        .filter_map(|(bucket, key)| {
-            Some((
-                accepted::bucket_key(bucket)?,
-                Some(accepted.authority_hash(key)),
-            ))
-        })
-        .collect::<BTreeSet<_>>();
-    if lent.is_empty() {
-        return Vec::new();
+    let mut lent = BTreeMap::<(i64, RowKey), BTreeSet<Option<[u8; 32]>>>::new();
+    for (bucket, row, key) in super::claude_request_money::e2::copied_marker_lent_rows(item) {
+        if let Some(start) = accepted::bucket_key(bucket) {
+            lent.entry((start, row_key_from_model_usage(&row)))
+                .or_default()
+                .insert(Some(accepted.authority_hash(&key)));
+        }
     }
     let mut rows = Vec::new();
-    for (bucket, groups) in &grouping.groups {
-        let Some(start) = accepted::bucket_key(bucket) else {
-            continue;
-        };
-        for (row, group) in groups {
-            if changed_shares(accepted, start, row, group)
-                .is_some_and(|prior| prior.iter().any(|share| lent.contains(&(start, *share))))
-            {
-                rows.push((start, row.clone()));
-            }
+    for ((start, row), lent) in lent {
+        let group = grouping
+            .groups
+            .iter()
+            .find(|(bucket, _)| accepted::bucket_key(bucket) == Some(start))
+            .and_then(|(_, rows)| rows.get(&row));
+        if group
+            .and_then(|group| changed_shares(accepted, start, &row, group))
+            .is_some_and(|prior| !prior.is_disjoint(&lent))
+        {
+            rows.push((start, row));
         }
     }
     rows
@@ -2631,10 +2623,13 @@ pub(crate) struct RequestAccounts {
     reconciled: bool,
     /// Root start known, but the native Unknown grains are not filled yet.
     root_fallback_pending: bool,
-    /// Copy-prefix switch on: (bucket start, account) a copied marker had
+    /// Copy-prefix switch on: (grain live key, account) a copied marker had
     /// lent to a counted request the copy decision re-derived without it
     /// (see `copy_derived_rows`).
-    pub(crate) copied_marker_lent: BTreeSet<(String, Arc<AuthorityKey>)>,
+    pub(crate) copied_marker_lent: BTreeSet<(
+        super::claude_request_money::body::ClaudeLiveKey,
+        Arc<AuthorityKey>,
+    )>,
 }
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
 crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, copied_marker_lent);
