@@ -1640,13 +1640,15 @@ fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
         .write_all(b"{}\n")
         .unwrap();
     let mut due = parser(&path, source);
+    // Since #870, audit debt alone never forces a Full on a checkpoint; an
+    // independently owed Full (here a scope change) must not touch the gate.
     let mode = due
         .prepare_acquisition_with_reuse_gate(
             Some(Retained {
                 checkpoint: checkpoint.clone(),
                 state: state.clone(),
             }),
-            &scope(),
+            &Scope("durable-codec-test-other-scope".into()),
             Some(crate::transcript_acquisition::AuditDebt {
                 due_unix_seconds: NOW,
             }),
@@ -1654,7 +1656,7 @@ fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
             |_, _| panic!("an owed Full never spends or checks a Tail allowance"),
         )
         .unwrap();
-    assert_eq!(mode, ReadMode::Full(FullReason::AuditDue));
+    assert_eq!(mode, ReadMode::Full(FullReason::ScopeChanged));
     let mut limited = parser(&path, source);
     let calls = std::cell::Cell::new(0);
     let mode = limited
