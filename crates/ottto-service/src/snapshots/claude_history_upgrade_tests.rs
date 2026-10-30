@@ -135,15 +135,10 @@ fn settle(
 // Mirror the driver's existing exact acceptance for per-file #901 custody.
 fn terminal_off_on_accept_context(index: &mut ScanIndex, items: &[SnapshotItem]) {
     let candidates = index.file_upload_context_ack_candidates(items);
-    let fresh_acks = items
-        .iter()
-        .map(|item| {
-            (
-                item.snapshot_fingerprint.clone(),
-                snapshot_upload_body_witness(item),
-            )
-        })
-        .collect();
+    let fresh_acks = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(
+        SnapshotSource::ClaudeCode,
+        items,
+    );
     index.accept_file_upload_context_acks(&candidates, &fresh_acks);
 }
 
