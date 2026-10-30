@@ -15,6 +15,63 @@ pub(crate) mod codex_side_lifecycle;
 mod footprint;
 pub(crate) mod rearm_cause;
 
+#[cfg(not(test))]
+static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 6] = const { [const { AtomicU64::new(0) }; 6] };
+}
+
+/// Append-only reason labels, cumulative per process (not distinct sessions).
+/// Records each attempted over-cap body before its identities are stripped.
+pub(crate) fn claude_identity_over_cap(
+    reasons: &std::collections::BTreeSet<crate::snapshots::claude_request_identity::OverCap>,
+    item_bytes: usize,
+) {
+    use crate::snapshots::claude_request_identity::OverCap;
+    const LABELS: [&str; 6] = [
+        "evidence_entries",
+        "authority_keys",
+        "parts_per_row",
+        "parts_per_item",
+        "rows",
+        "bytes",
+    ];
+    let record = |counters: &[AtomicU64; 6]| {
+        for reason in reasons {
+            let index = match reason {
+                OverCap::EvidenceEntries => 0,
+                OverCap::AuthorityKeys => 1,
+                OverCap::PartsPerRow => 2,
+                OverCap::PartsPerItem => 3,
+                OverCap::Rows => 4,
+                OverCap::Bytes => 5,
+            };
+            let _ = counters[index].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+        }
+        #[derive(Serialize)]
+        struct Counts {
+            claude_request_identity_over_cap: BTreeMap<&'static str, u64>,
+            claude_request_identity_last_over_cap_item_bytes: usize,
+        }
+        traversal_point(
+            "claude_request_identity_over_cap",
+            "claude_code",
+            &Counts {
+                claude_request_identity_over_cap: LABELS
+                    .into_iter()
+                    .zip(counters.iter().map(|n| n.load(Relaxed)))
+                    .collect(),
+                claude_request_identity_last_over_cap_item_bytes: item_bytes,
+            },
+        );
+    };
+    #[cfg(test)]
+    CLAUDE_IDENTITY_OVER_CAP.with(record);
+    #[cfg(not(test))]
+    record(&CLAUDE_IDENTITY_OVER_CAP);
+}
+
 /// Closed, content-free refusal labels; cumulative process counters on #799.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub(crate) enum CodexZstCause {
