@@ -4102,10 +4102,14 @@ fn terminal_off_r11_no_list_held_member_keeps_semantic_clear() {
         .iter()
         .all(|(key, entry)| terminal_off_stale_member_can_skip_clear(&index, key, entry)));
     index.claude_reemission_exclusions = ReemissionExclusions::with_state(ListState::NotInstalled);
-    for (key, entry) in &index.files {
-        assert!(!terminal_off_stale_member_can_skip_clear(
-            &index, key, entry
-        ));
-    }
+    // Synthetic births must be old on every platform, independent of the
+    // fixture file's real creation time on the branch Mac/Linux runner.
+    with_no_list_cutoff(u64::MAX, || {
+        for (key, entry) in &index.files {
+            assert!(!terminal_off_stale_member_can_skip_clear(
+                &index, key, entry
+            ));
+        }
+    });
     let _ = fs::remove_dir_all(home);
 }
