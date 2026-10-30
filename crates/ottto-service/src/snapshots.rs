@@ -4072,13 +4072,6 @@ pub struct ScanIndex {
     /// Appended to preserve every older positional index slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_desktop_store_inventory: Option<String>,
-    /// Capacity refusal custody: existing index keys mapped to observed whole
-    /// source-file byte lengths (u64), not encoded size, append delta, or extent.
-    /// Values contain no path/content. The map can include not-yet-delivered
-    /// keys; it has no separate cardinality/byte cap. Never checkpoint or ACK
-    /// authority. Only the effectively-ON serializer emits this optional field.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    tail_capacity_debt: BTreeMap<String, u64>,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
@@ -4285,7 +4278,6 @@ impl Default for ScanIndex {
             claude_request_identity_contract: None,
             claude_request_identity_contract_changed: false,
             claude_desktop_store_inventory: None,
-            tail_capacity_debt: BTreeMap::new(),
             claude_desktop_store_cursor: None,
             claude_desktop_store_upper_bound: None,
             claude_desktop_store_sweep_had_errors: false,
@@ -27060,7 +27052,6 @@ impl OwnedSourceScan {
         );
         let mut resource_probe = crate::local_resource_diagnostics::Probe::start();
         let index = &mut owned_index;
-        index.report_tail_capacity(source);
         index.context_read_counts = Default::default();
         index.activate_quarantine_witness(source);
         let backfill_window_days = effective_backfill_window_days(requested_backfill_window_days);
@@ -27145,7 +27136,6 @@ impl OwnedSourceScan {
                 backfill_window_days,
                 DiscoveryRecovery {
                     files: &index.files,
-                    capacity_debt: Some(&index.tail_capacity_debt),
                     cache: durable_cache,
                 },
             );
@@ -27437,7 +27427,6 @@ impl OwnedSourceScan {
                     backfill_window_days,
                     DiscoveryRecovery {
                         files: &index.files,
-                        capacity_debt: Some(&index.tail_capacity_debt),
                         cache: durable_cache,
                     },
                 )
@@ -27472,14 +27461,13 @@ impl OwnedSourceScan {
             files
                 .into_iter()
                 .filter_map(|candidate| {
-                    open_and_identify_capacity_candidate(
+                    open_and_identify_scan_candidate(
                         source,
                         candidate,
                         &mut census,
                         census_unix_seconds,
                         backfill_window_days,
                         &index.files,
-                        &index.tail_capacity_debt,
                     )
                     .map(|(candidate, _)| candidate)
                 })
@@ -27572,14 +27560,13 @@ impl OwnedSourceScan {
                 .filter(|candidate| {
                     let mut twin = (*candidate).clone();
                     prepare_candidate_context(&mut twin);
-                    match open_and_identify_capacity_candidate(
+                    match open_and_identify_scan_candidate(
                         source,
                         twin,
                         &mut ScanCensus::default(),
                         census_unix_seconds,
                         backfill_window_days,
                         &index.files,
-                        &index.tail_capacity_debt,
                     ) {
                         Some((twin, _)) => {
                             index.candidate_decision_with_reason_at(&twin, audit_now).0
@@ -27660,21 +27647,19 @@ impl OwnedSourceScan {
                     backfill_window_days,
                     DiscoveryRecovery {
                         files: &index.files,
-                        capacity_debt: Some(&index.tail_capacity_debt),
                         cache: durable_cache,
                     },
                 ) else {
                     continue;
                 };
                 prepare_candidate_context(&mut candidate);
-                if let Some(opened) = open_and_identify_capacity_candidate(
+                if let Some(opened) = open_and_identify_scan_candidate(
                     source,
                     candidate,
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
                     &index.files,
-                    &index.tail_capacity_debt,
                 ) {
                     identified_candidates.push(opened.0);
                 }
@@ -30686,28 +30671,6 @@ impl OwnedSourceScan {
                                 committed_index: index,
                             },
                         );
-                        if settled.native.is_ok() {
-                            match settled.capacity_debt {
-                                Some(true) => {
-                                    index
-                                        .tail_capacity_debt
-                                        .insert(active.key.clone(), candidate.size_bytes);
-                                    if matches!(
-                                        active.mode,
-                                        crate::transcript_acquisition::ReadMode::Full(_)
-                                    ) {
-                                        context.cache.completed_capacity_full(source, &active.key);
-                                    }
-                                }
-                                Some(false) => {
-                                    index.clear_tail_capacity_debt(source, &active.key, "replaced");
-                                }
-                                None => {}
-                            }
-                            if settled.capacity_debt.is_some() {
-                                index.report_tail_capacity(source);
-                            }
-                        }
                         NativePublication::carry(&mut native_publication, settled.publication);
                         completed_acquisition = settled.completed;
                         (
@@ -33139,8 +33102,6 @@ impl OwnedSourceScan {
             let rescue_key = local_index_key(&candidate.path);
             let verification_rescue = sampled_audit::progress_debt(index, &rescue_key, audit_now)
                 .is_some()
-                || (restart_restore::enabled()
-                    && index.tail_capacity_debt.contains_key(&rescue_key))
                 || sampling.as_ref().is_some_and(|context| {
                     context.cache.repin_growth(
                         source,
@@ -34099,8 +34060,6 @@ impl OwnedSourceScan {
                 ) {
                     match context.cache.reconcile_receipt(source, &key) {
                         sampled_scan::durable_tail::ReconcileOutcome::Receipted(receipt) => {
-                            index.clear_tail_capacity_debt(source, &key, "replaced");
-                            index.report_tail_capacity(source);
                             Some(receipt)
                         }
                         sampled_scan::durable_tail::ReconcileOutcome::Held(cause) => {
@@ -34562,14 +34521,6 @@ impl OwnedSourceScan {
                                         }
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Miss(class) => {
-                                        // Non-Codex resource recovery already starts its
-                                        // shared pace inside restore_resource_pending.
-                                        if source != SnapshotSource::Codex
-                                            && index.tail_capacity_debt.contains_key(&key)
-                                            && matches!(class, sampled_scan::durable_tail::MissClass::Resource(_))
-                                        {
-                                            paced_full_granted = true;
-                                        }
                                         if source == SnapshotSource::Codex {
                                             if let sampled_scan::durable_tail::MissClass::Resource(phase) = class {
                                                 resource_full_pending = Some(phase);
@@ -35212,28 +35163,6 @@ impl OwnedSourceScan {
                 }
             }
             #[cfg(unix)]
-            let capacity_growth = restart_restore::enabled()
-                && active.side_origin.is_none()
-                && index
-                    .tail_capacity_debt
-                    .contains_key(&local_index_key(&active.candidate.path))
-                && active.sampling.as_ref().map_or(true, |a| {
-                    matches!(a.mode, crate::transcript_acquisition::ReadMode::Full(_))
-                })
-                && active
-                    .parser
-                    .reader
-                    .reader
-                    .get_ref()
-                    .metadata()
-                    .is_ok_and(|m| {
-                        m.len()
-                            > index
-                                .files
-                                .get(&local_index_key(&active.candidate.path))
-                                .map_or(0, |entry| entry.size_bytes)
-                    });
-            #[cfg(unix)]
             if active.side_origin.is_none()
                 && active.sampling.as_ref().map_or(true, |a| {
                     matches!(a.mode, crate::transcript_acquisition::ReadMode::Full(_))
@@ -35290,13 +35219,15 @@ impl OwnedSourceScan {
             // There is one shared admission for this actual Full. Earlier
             // grants and later structural/stale-selection owners take priority.
             #[cfg(unix)]
-            let resource_full_pending = capacity_full_phase(
-                capacity_growth,
-                paced_full_granted || repin_ready,
-                active_bound_degraded,
-                stale_selection_pending,
-                resource_full_pending,
-            );
+            let resource_full_pending = if paced_full_granted
+                || repin_ready
+                || active_bound_degraded
+                || stale_selection_pending
+            {
+                None
+            } else {
+                resource_full_pending
+            };
             if let (Some(phase), Some(context)) = (resource_full_pending, sampling.as_ref()) {
                 let key = local_index_key(&active.candidate.path);
                 if !context.cache.start_resource_full(
@@ -37234,8 +37165,6 @@ struct NativeSettlement {
     publication: Option<NativePublication>,
     /// The M3 route decided this completion's record; no post-save offer.
     staged: bool,
-    /// Some(true) owes capacity; Some(false) has an exact replacement receipt.
-    capacity_debt: Option<bool>,
 }
 
 /// Explicit cleanup of a staging the native finish cannot use.
@@ -37274,13 +37203,6 @@ fn settle_native_attempt(
         preparation,
     } = attempt;
     let staged = preparation.is_some();
-    let mut capacity_debt = preparation.as_ref().and_then(|outcome| {
-        matches!(
-            outcome,
-            PrepareOutcome::NotPersisted(sampled_scan::durable_tail::NotPersisted::Capacity)
-        )
-        .then_some(true)
-    });
     let (publication, strict_rebind) = match preparation {
         // Not staged (no chain or no lease). A Claude key held by D3 still
         // never publishes over its surviving A; the query counts its growth
@@ -37323,7 +37245,6 @@ fn settle_native_attempt(
                         strict_rebind: false,
                         publication: Some(NativePublication::Hold),
                         staged: true,
-                        capacity_debt,
                     };
                 }
             }
@@ -37353,20 +37274,6 @@ fn settle_native_attempt(
                 Ok(fences) => match staged {
                     PrepareOutcome::Prepared(prepared) => {
                         let outcome = cache.commit_prepared(prepared, fences);
-                        if matches!(
-                            &outcome,
-                            sampled_scan::durable_tail::WriteOutcome::FailedHeld(
-                                sampled_scan::durable_tail::HeldCause::Capacity
-                            )
-                        ) {
-                            capacity_debt = Some(true);
-                        }
-                        if matches!(
-                            &outcome,
-                            sampled_scan::durable_tail::WriteOutcome::Receipted { .. }
-                        ) {
-                            capacity_debt = Some(false);
-                        }
                         write_disposition(
                             cache,
                             &mut acquisition,
@@ -37438,7 +37345,6 @@ fn settle_native_attempt(
         strict_rebind,
         publication,
         staged,
-        capacity_debt,
     }
 }
 
@@ -37557,7 +37463,6 @@ fn unprepared_disposition(
                     | sampled_scan::durable_tail::HeldCause::Protected(_)
                     | sampled_scan::durable_tail::HeldCause::ReceiptPending
                     | sampled_scan::durable_tail::HeldCause::CustodyBound
-                    | sampled_scan::durable_tail::HeldCause::Capacity
                     | sampled_scan::durable_tail::HeldCause::Incompatible
                     | sampled_scan::durable_tail::HeldCause::StaleSurvivor
             ));
@@ -45297,18 +45202,7 @@ fn ensure_bounded_traversal(
         codex_rollout_paths: BTreeSet::new(),
         codex_join_directory_census: (source == SnapshotSource::Codex)
             .then(codex_file_join::DirectoryCensus::new),
-        reconciliation_upper_bound: index
-            .files
-            .keys()
-            .next_back()
-            .into_iter()
-            .chain(
-                restart_restore::enabled()
-                    .then(|| index.tail_capacity_debt.keys().next_back())
-                    .flatten(),
-            )
-            .max()
-            .cloned(),
+        reconciliation_upper_bound: index.files.keys().next_back().cloned(),
         reconciliation_after: None,
         reconciliation_started: false,
         watcher_hint_seen: false,
@@ -45761,27 +45655,15 @@ fn owed_discovery(
 #[derive(Clone, Copy)]
 struct DiscoveryRecovery<'a> {
     files: &'a BTreeMap<String, ScanIndexEntry>,
-    capacity_debt: Option<&'a BTreeMap<String, u64>>,
     cache: Option<&'a sampled_scan::SharedCache>,
 }
 impl<'a> From<&'a BTreeMap<String, ScanIndexEntry>> for DiscoveryRecovery<'a> {
     fn from(files: &'a BTreeMap<String, ScanIndexEntry>) -> Self {
-        Self {
-            files,
-            capacity_debt: None,
-            cache: None,
-        }
+        Self { files, cache: None }
     }
 }
 impl DiscoveryRecovery<'_> {
     fn requires(&self, source: SnapshotSource, path: &Path, length: u64) -> bool {
-        if restart_restore::enabled()
-            && self
-                .capacity_debt
-                .is_some_and(|debt| debt.contains_key(&local_index_key(path)))
-        {
-            return true;
-        }
         #[cfg(unix)]
         if self.cache.is_some_and(|cache| {
             cache.owes_discovery(source, &local_index_key(path))
@@ -46200,40 +46082,20 @@ fn reconcile_missing_index_entries_with_side(
     };
     let after = snapshot.reconciliation_after.clone();
     let lower_bound = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-    // Debt may outlive withheld delivery entries. Merge at most two bounded
-    // pages so those keys share the existing reconciliation cursor and proof.
-    let mut page = index
+    let page = index
         .files
-        .range((
-            lower_bound.clone(),
-            std::ops::Bound::Included(upper_bound.clone()),
-        ))
+        .range((lower_bound, std::ops::Bound::Included(upper_bound.clone())))
         .take(limit)
         .map(|(key, _)| key.clone())
-        .collect::<BTreeSet<_>>();
-    if restart_restore::enabled() {
-        page.extend(
-            index
-                .tail_capacity_debt
-                .range((lower_bound, std::ops::Bound::Included(upper_bound.clone())))
-                .take(limit)
-                .map(|(key, _)| key.clone()),
-        );
-    }
-    let page = page.into_iter().take(limit).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
     if page.is_empty() {
         return true;
     }
-    let mut capacity_debt_cleared = false;
     for key in &page {
         let observed = index
             .traversal
             .as_ref()
             .is_some_and(|traversal| traversal.observed_index_keys.contains(key));
-        // This path runs only after the same healthy, frozen, complete walk
-        // that admits vanished-entry pruning. Debt is not finish/ACK authority:
-        // releasing it leaves every other custody and history guard intact.
-        capacity_debt_cleared |= index.retire_tail_capacity_debt(source, key, observed);
         if !observed && index.claude_account_deferred_holds.contains_key(key) {
             index.retire_absent_account_hold(key);
             if !index.files.contains_key(key) {
@@ -46274,10 +46136,7 @@ fn reconcile_missing_index_entries_with_side(
             crate::local_resource_diagnostics::audit_retired_absent(source.api_slug());
             continue; // SOURCE: debt retirement alone does not prune incidence.
         }
-        let capacity_held =
-            restart_restore::enabled() && index.tail_capacity_debt.contains_key(key);
         if !observed
-            && !capacity_held
             && !durable.is_some_and(|(source, cache)| owed_discovery(Some(cache), source, key))
             && !index.decode_holds_file(key)
             && !index
@@ -46294,9 +46153,6 @@ fn reconcile_missing_index_entries_with_side(
             index.claude_account_deferred_holds.remove(key);
             index.drop_codex_proof_items(key, codex_side_drop);
         }
-    }
-    if capacity_debt_cleared {
-        index.report_tail_capacity(source);
     }
     let done = page.last() == Some(&upper_bound) || page.len() < limit;
     if let Some(traversal) = index.traversal.as_mut() {
@@ -46660,29 +46516,6 @@ fn open_and_identify_scan_candidate(
         backfill_window_days,
         files,
         false,
-        None,
-    )
-}
-
-fn open_and_identify_capacity_candidate(
-    source: SnapshotSource,
-    candidate: CandidateFile,
-    census: &mut ScanCensus,
-    census_unix_seconds: Option<u64>,
-    backfill_window_days: u64,
-    files: &BTreeMap<String, ScanIndexEntry>,
-    capacity_debt: &BTreeMap<String, u64>,
-) -> Option<(CandidateFile, File)> {
-    let rescue =
-        restart_restore::enabled() && capacity_debt.contains_key(&local_index_key(&candidate.path));
-    open_and_identify_scan_candidate_with_rescue(
-        source,
-        candidate,
-        census,
-        census_unix_seconds,
-        backfill_window_days,
-        files,
-        rescue,
         None,
     )
 }
@@ -47558,79 +47391,6 @@ fn canonicalize_codex_identity_map<T: PartialEq>(values: &mut BTreeMap<String, T
 }
 
 impl ScanIndex {
-    fn clear_tail_capacity_debt(
-        &mut self,
-        source: SnapshotSource,
-        key: &str,
-        reason: &'static str,
-    ) -> bool {
-        if restart_restore::enabled()
-            && self.persistence_available()
-            && self.tail_capacity_debt.remove(key).is_some()
-        {
-            crate::local_resource_diagnostics::durable_tail_alarm(
-                source.api_slug(),
-                &serde_json::json!({"tail_capacity_debt_cleared": {reason: 1}}),
-            );
-            return true;
-        }
-        false
-    }
-
-    /// Called by complete-census reconciliation, including keys whose delivery
-    /// entry was withheld. Never opens or reads source content.
-    fn retire_tail_capacity_debt(
-        &mut self,
-        source: SnapshotSource,
-        key: &str,
-        observed: bool,
-    ) -> bool {
-        if !restart_restore::enabled()
-            || !self.persistence_available()
-            || !self.tail_capacity_debt.contains_key(key)
-        {
-            return false;
-        }
-        let Some(walk) = self.traversal.as_ref() else {
-            return false;
-        };
-        if !observed && sampled_audit::proven_absent(Path::new(key), &walk.scan_roots) {
-            return self.clear_tail_capacity_debt(source, key, "absent");
-        }
-        // Reuse transcript retirement's strict 35-day mtime cutoff. Current
-        // metadata prevents a stale delivery entry from aging recent growth;
-        // unknown timestamps, links and I/O failures retain the obligation.
-        let cutoff = rfc3339_unix_seconds(&walk.census_window_end)
-            .unwrap_or_default()
-            .saturating_sub(claude_request_census::CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
-        if observed
-            && fs::symlink_metadata(key).is_ok_and(|metadata| {
-                metadata.is_file()
-                    && metadata
-                        .modified()
-                        .ok()
-                        .and_then(unix_seconds)
-                        .is_some_and(|modified| modified > 0 && modified < cutoff)
-            })
-        {
-            return self.clear_tail_capacity_debt(source, key, "aged");
-        }
-        false
-    }
-
-    fn report_tail_capacity(&self, source: SnapshotSource) {
-        if restart_restore::enabled() {
-            crate::local_resource_diagnostics::durable_tail_alarm(
-                source.api_slug(),
-                &serde_json::json!({
-                    "held_capacity_debt": {"files": self.tail_capacity_debt.len(), "source_bytes": self.tail_capacity_debt.values().copied().fold(0u64, u64::saturating_add), "evictions": 0},
-                    "tail_active_files": self.files.len() + self.tail_capacity_debt.keys().filter(|key| !self.files.contains_key(*key)).count(),
-                    "tail_coverage_debt_files": self.tail_capacity_debt.len()
-                }),
-            );
-        }
-    }
-
     pub(crate) fn local_codex_census_aggregates(
         &self,
     ) -> codex_scan_diagnostics::CensusIndexAggregates {
@@ -52370,7 +52130,6 @@ impl ScanIndex {
             upload_context_fingerprint: previous.upload_context_fingerprint.clone(),
             o3_replay,
             files,
-            tail_capacity_debt: self.tail_capacity_debt.clone(),
             session_account_bindings: self.session_account_bindings.clone(),
             terminal_jsonl_dispositions: previous.terminal_jsonl_dispositions.clone(),
             known_configured_scan_roots: self.known_configured_scan_roots.clone(),
@@ -96077,7 +95836,7 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U subscription_product: Option<String>,
 });
 crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; persistence_legacy_recovery, persistence_root, persistence_unavailable, persistence_controls, decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, file_upload_context_enabled, context_read_counts, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, o3_replay, held_audit_progress, claude_money_birth_store, claude_desktop_store_inventory, tail_capacity_debt);
+crate::heap_layout_bound::fields!(ScanIndex; persistence_legacy_recovery, persistence_root, persistence_unavailable, persistence_controls, decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, file_upload_context_enabled, context_read_counts, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, o3_replay, held_audit_progress, claude_money_birth_store, claude_desktop_store_inventory);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
@@ -96769,26 +96528,6 @@ impl ScanIndex {
     }
 }
 
-/// Existing Full owners take priority over capacity's fallback label.
-#[cfg(unix)]
-fn capacity_full_phase(
-    capacity_growth: bool,
-    paid: bool,
-    active_bound: bool,
-    stale_selection: bool,
-    resource: Option<&'static str>,
-) -> Option<&'static str> {
-    if paid || active_bound || stale_selection {
-        None
-    } else {
-        // Resource recovery owns its admission even when a prior quota
-        // refusal also leaves capacity debt for this file.
-        resource.or(capacity_growth.then_some("capacity"))
-    }
-}
-
-#[cfg(test)]
-mod capacity_tests;
 #[cfg(all(test, unix))]
 pub(crate) fn test_replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
     sampled_jsonl::durable::test_replay_privacy_artifacts(root)

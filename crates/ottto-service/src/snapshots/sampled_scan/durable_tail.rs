@@ -2340,9 +2340,6 @@ impl SharedCache {
             if !restart_restore::enabled() {
                 slot.store.restrict_reads_to_v1();
             }
-            if restart_restore::enabled() {
-                slot.store.enable_capacity_quota();
-            }
             slot.store.begin_pass();
             // At most one resource probe per pass; the store owns its back-off.
             // Held keys retry through their own next native write.
@@ -3421,34 +3418,6 @@ impl SharedCache {
         }
     }
 
-    /// Quota can first become known after a legitimate Full has completed.
-    /// Enrol that read in the same pace, so immediate growth cannot buy a
-    /// second Full. If its start already spent the pace, this spends nothing.
-    pub(in crate::snapshots) fn completed_capacity_full(&self, source: SnapshotSource, key: &str) {
-        let now = SystemTime::now();
-        let already_spent = self.durable().is_some_and(|stores| {
-            #[cfg(test)]
-            let now = stores.retail_full_now.unwrap_or(now);
-            let digest = full_pace_key(source, key);
-            stores
-                .key_debt
-                .get(&digest)
-                .and_then(|debt| debt.full_spend)
-                .map(|spend| spend.at)
-                .or_else(|| {
-                    stores
-                        .retail_full_at
-                        .get(&digest)
-                        .filter(|stamp| stamp.flags & FULL_SPENT != 0)
-                        .map(|stamp| stamp.at)
-                })
-                .is_some_and(|at| full_pace_delayed(at, now))
-        });
-        if !already_spent {
-            let _ = self.paced_admission(source, key, now, false, false, true);
-        }
-    }
-
     pub(in crate::snapshots) fn start_resource_full(
         &self,
         source: SnapshotSource,
@@ -3464,14 +3433,6 @@ impl SharedCache {
         };
         if !granted {
             return false;
-        }
-        if phase == "capacity" {
-            crate::local_resource_diagnostics::durable_tail_alarm(
-                source.api_slug(),
-                &serde_json::json!({
-                    "capacity_full": {"files": 1, "source_bytes": file.metadata().map_or(0, |m| m.len())}
-                }),
-            );
         }
         if let Some(mut stores) = self.durable() {
             Counters::bump(&mut stores.counters.resource_full, phase);
@@ -5796,6 +5757,7 @@ impl SharedCache {
         struct StoreAlarm {
             #[serde(flatten)]
             store: store::StoreCounters,
+            store_bytes_alarm: bool,
             owed_overflow_discovery_only: bool,
             platform: &'static str,
             native_stage_skipped: StageSkipped,
@@ -5922,19 +5884,13 @@ impl SharedCache {
         // with cause-only totals omits an empty snapshot, including on repeat
         // calls after its delta has been reported.
         let cause_only = now[..5] == [0; 5] && now[5..].iter().any(|&n| n != 0);
-        // A configured quota alone is not store activity. Keep it in snapshots
-        // that otherwise emit, without adding a second cause-only alarm.
-        let activity = store::StoreCounters {
-            tail_quota_bytes: 0,
-            ..store
-        };
-        if activity != store::StoreCounters::default() || !cause_only || hold_alarm || hold_changed
-        {
+        if store != store::StoreCounters::default() || !cause_only || hold_alarm || hold_changed {
             // One existing store snapshot carries the fault reason, degraded
             // publishes, refusals, pause duration and per-key hold age together.
             crate::local_resource_diagnostics::durable_tail_alarm(
                 snapshot_source.api_slug(),
                 &StoreAlarm {
+                    store_bytes_alarm: store.disk_bytes > 512 * 1024 * 1024,
                     store,
                     owed_overflow_discovery_only,
                     platform: std::env::consts::OS,

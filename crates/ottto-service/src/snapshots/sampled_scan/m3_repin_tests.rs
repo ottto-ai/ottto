@@ -341,7 +341,6 @@ fn repin_cold_growth_survives_age_filters_and_partial_retry_uses_shared_pace() {
         let key = local_index_key(&f.paths[0]);
         let recovery = DiscoveryRecovery {
             files: &f.index.files,
-            capacity_debt: None,
             cache: Some(&f.cache),
         };
         assert!(

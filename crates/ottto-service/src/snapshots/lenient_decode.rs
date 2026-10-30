@@ -337,11 +337,6 @@ impl Serialize for ScanIndex {
             claude_money_birth_store::BirthStore::is_empty
         );
         field!(claude_desktop_store_inventory, Option::is_none);
-        // OFF follows M1 even after loading an index previously written ON.
-        // Readers tolerate the field; an OFF save never publishes it again.
-        if super::restart_restore::enabled() {
-            field!(tail_capacity_debt, BTreeMap::is_empty);
-        }
         map.end()
     }
 }
@@ -434,7 +429,6 @@ pub(super) const FIELDS: &[&str] = &[
     "held_audit_progress",
     "claude_money_birth_store",
     "claude_desktop_store_inventory",
-    "tail_capacity_debt",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1641,7 +1635,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                         } => {}
                         "schema_version" => index.schema_version = self.typed(value)?,
                         "generation" => index.generation = self.typed(value)?,
-                        "tail_capacity_debt" => index.tail_capacity_debt = self.typed(value)?,
                         "reread_guard" => {
                             index.o3_replay =
                                 if value.len > claude_request_census::MAX_RAW_BYTES as u64 {
