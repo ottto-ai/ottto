@@ -701,6 +701,78 @@ finding above. Without an approved candidate, the fallback chain applies immedia
 Startup retains its existing behavior of falling back if the approved port is
 busy.
 
+## Claude Stale Exporter Port
+
+Claude Code keeps its telemetry endpoint for the life of a session. Ottto can
+serve up to two older approved candidate ports on loopback, accepting only
+`POST /v1/logs`, `/v1/metrics` and `/v1/traces` through the same local export
+handler. Control and health routes return 404 on these listeners. A private,
+versioned port record retains the newest two previous approvals. On first
+approval it seeds once from retained Ottto-owned Claude settings backups,
+reading at most the newest ten JSON backups with the existing size and
+no-symlink checks. Ports must be in the current user's relay candidate list;
+seed discovery does not guess ports or connect to them. Busy ports are skipped
+and retried every 60 seconds. Legacy binds first probe IPv4 and dual-stack
+IPv6 wildcard addresses, then bind IPv4 loopback. Successful wildcard probes
+stay bound through the loopback bind and listen, closing that acquisition gap.
+All three binds use `SO_REUSEADDR`: live wildcard or IPv4 loopback listeners veto
+the port, while our connected sockets and TIME_WAIT allow immediate replacement.
+IPv4 remains available when the probe reports that IPv6 is unavailable.
+A port observed as the current approval is removed from legacy ingress; primary
+recovery releases that legacy socket before attempting its bind.
+
+Every legacy export rechecks Claude endpoint approval and the listener's live
+approval generation immediately before capture. Refused exports return 403 and
+store no evidence or successful-request activity. Claude telemetry disable,
+default-approval removal and setup opt-out operations invalidate that generation
+synchronously and wait up to two seconds for the supervisor to persist
+retirement and close sockets. Secondary-account removal
+and browser-login cleanup preserve legacy listeners and default approval;
+acknowledgement waits never hold the Claude settings lock. Each tick captures
+its generation before reading approval, so a concurrent revoke also fences
+sockets created later in that tick. A pending revoke also blocks exports and
+new/refreshed listener activity until retirement is persisted and sockets close.
+Periodic checks retire ports only after two consecutive definite non-approval
+reads. I/O errors, missing
+settings and truncated or unparsable JSON are unknown: that export is refused,
+but listeners/history are preserved and the consecutive-revocation streak resets.
+Idle expiry also retires a port. Retirement survives restarts and prevents
+re-seeding or reopening until that port is explicitly approved again and then
+superseded. The primary listener continues its existing behavior for all sources.
+The optional record is separate from existing daemon formats: older daemons
+ignore it, and missing fields or unknown extra fields decode without error.
+Retirement is persisted before socket closure, with a separate owner-only
+`legacy-relay-retired.json` tombstone protecting against replay of a stale main
+record after a failed write. A write failure closes legacy listeners and attempts
+to remove the stale main record. If both state and tombstone writes fail,
+compatibility supervision stops and logs the failure; retirement may be unknown
+after restart. Existing atomic-file durability guarantees apply.
+
+A legacy entry retires after 24 hours without a successful OTLP request, starting
+when it enters the persisted record even if a busy port never binds. Entry time
+and request activity persist across daemon restarts; activity writes are
+limited to once per 10 minutes, so a crash can lose up to that much recent
+activity and shorten retention. No request content or identity is in the port
+record. The primary relay's `/healthz` response includes process-local counts
+under `legacy_relay`: `otlp_legacy_listener_bound` (current gauge),
+`otlp_legacy_listener_requests`, `otlp_legacy_listener_busy` and
+`otlp_legacy_listener_closed` (cumulative counts since process start). Busy means
+bind attempts skipped. Closed counts only actually open sockets released,
+including on supervisor exit; retiring a never-bound entry adds no close.
+With no open sockets the supervisor waits until its next tick or a command.
+Live sockets drain up to 16 pending connections per turn. Resource-related
+accept failures back off; unusable sockets release for later tick rebind, keeping
+recent request activity. Release checks descriptor ownership before closing. Accept
+error logs are limited to one line per minute per socket.
+
+Canonical health reports `claude_stale_exporter_port` as a `Warning` owned by
+`source`, with runtime authority, while a legacy listener has accepted OTLP
+within the last hour in this process. Restart those Claude Code sessions to
+reload the current telemetry endpoint. The uploaded warning contains no port
+number. It follows blocking account and source findings in the blocker list.
+This restores future local evidence; it cannot recover dropped batches
+and does not change consent, account attribution or money calculations.
+
 ## Common Diagnostics Flow
 
 ```bash

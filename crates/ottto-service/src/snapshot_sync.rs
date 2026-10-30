@@ -6263,6 +6263,7 @@ fn prepare_sync_source_inner(
     )?;
     let (mut index, load_origin) =
         ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
+    index.require_persistence_available()?;
     upload_progress.recover_ack_retirement_handoff(
         &mut index,
         &index_path,
@@ -6814,6 +6815,7 @@ fn prepare_continuation_source(
     )?;
     let (mut index, _) =
         ScanIndex::load_for_snapshot_source_with_origin(&inputs.index_path, source, support_dir)?;
+    index.require_persistence_available()?;
     upload_progress.configure_ack_capacity(&index);
     let backfill_state = load_backfill_state(support_dir);
     let replay_generation = cycle_replay_generation(
@@ -6992,6 +6994,7 @@ fn capture_codex_recovery_evidence(
         match saved {
             Ok(()) => {
                 index.generation = captured.generation;
+                index.retain_persistence_baseline_from(&captured);
                 *committed_index = captured;
             }
             Err(_) => scan_result.hold_codex_groups(

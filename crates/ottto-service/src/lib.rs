@@ -283,6 +283,7 @@ struct DaemonState {
     /// `SourceHealth.reconciliation_enabled`. In-memory only (cleared on reset
     /// and restart), which the Companion tolerates as "managed by workspace".
     source_reconciliation: BTreeMap<String, bool>,
+    scan_index_health_revisions: [[u64; 3]; 2],
     /// Directory for the persisted per-source state files. `None` keeps
     /// source state purely in-memory (tests); production sets it via
     /// `with_source_state_dir(default_sources_dir())`.
@@ -493,6 +494,7 @@ impl LocalDaemon {
                 sources: Vec::new(),
                 source_first_seen: BTreeMap::new(),
                 source_reconciliation: BTreeMap::new(),
+                scan_index_health_revisions: [[0; 3]; 2],
                 source_state_dir: None,
                 local_health_events: Vec::new(),
                 command_ledger: Vec::new(),
@@ -642,12 +644,10 @@ impl LocalDaemon {
         let relay = self.state()?.relay.clone();
         let observed = otlp_relay::approved_endpoint_mismatch(&relay);
         let mut status = {
-            let state = self.state()?;
-            // Keep it only for the relay this status reports. It enters the one
-            // canonical projection, so a set or cleared blocker gets the same
-            // revision and an upload can never clear with a lower one.
-            // A relay error or a relay change between the locks also ends the
-            // streak, so a recovered listener starts a fresh one.
+            let mut state = self.state()?;
+            observe_scan_index_health_changes(&mut state);
+            // Pair the relay finding with the same captured state and canonical
+            // projection as the ScanIndex collection transition events.
             let finding = self.relay_mismatch.observe(
                 observed.filter(|_| state.relay == relay && state.relay.last_error.is_none()),
             );
@@ -2181,6 +2181,75 @@ impl Drop for RepairLease {
     }
 }
 
+fn observe_scan_index_health_changes(state: &mut DaemonState) {
+    use snapshots::{scan_index_health as health, SnapshotSource};
+    // One atomic capture: a concurrent load cannot change the state belonging
+    // to these counters. Projection below reads only the resulting events.
+    let observations = health::observations();
+    for (reason_index, observations) in observations.iter().enumerate() {
+        let reason = health::REASONS[reason_index];
+        for (i, source) in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (since, transitions) = &observations[i];
+            let prior = state.scan_index_health_revisions[reason_index][i];
+            if prior == *transitions {
+                continue;
+            }
+            for transition in prior.saturating_add(1)..=*transitions {
+                // Real set/clear transitions alternate. Preserve BOTH when a good
+                // load follows a refusal before a client asks for status.
+                let blocked = since.is_some() ^ ((*transitions - transition) % 2 != 0);
+                push_local_health_event(
+                    state,
+                    "ScanIndexCollectionChanged",
+                    "scan_index_collection_changed",
+                    LocalHealthAuthority::Runtime,
+                    serde_json::json!({
+                        "source": source.api_slug(), "reason": reason.code(),
+                        "blocked_sources": u8::from(blocked), "transitions": transition,
+                    }),
+                );
+                if transition == *transitions {
+                    if let Some(since) = since {
+                        state
+                            .local_health_events
+                            .last_mut()
+                            .expect("just pushed event")
+                            .observed_at = since.clone();
+                    }
+                }
+            }
+            state.scan_index_health_revisions[reason_index][i] = *transitions;
+        }
+    }
+}
+
+fn projected_scan_index_refusal(
+    events: &[LocalHealthEventV1],
+    source: snapshots::SnapshotSource,
+) -> Option<(snapshots::scan_index_health::Reason, &str)> {
+    snapshots::scan_index_health::REASONS
+        .into_iter()
+        .find_map(|reason| {
+            events
+                .iter()
+                .rev()
+                .find(|event| {
+                    event.event_type == "ScanIndexCollectionChanged"
+                        && event.payload["source"] == source.api_slug()
+                        && event.payload["reason"] == reason.code()
+                })
+                .filter(|event| event.payload["blocked_sources"] == 1)
+                .map(|event| (reason, event.observed_at.as_str()))
+        })
+}
+
 fn status_from_state_with_relay_finding(
     state: &DaemonState,
     relay_finding: Option<StableMessage>,
@@ -2339,8 +2408,34 @@ pub fn refresh_canonical_local_health_with_started_at(status: &mut DaemonStatus,
     let mut sources = status
         .sources
         .iter()
-        .map(|source| local_health_source_for_status(source, projection_revision))
+        .map(|source| {
+            local_health_source_for_status(source, projection_revision, &status.local_health_events)
+        })
         .collect::<Vec<_>>();
+    // A refusal may precede the first agent-status/verification observation.
+    // The actual loader already identified the source; do not hide its warning
+    // merely because the legacy source-health row has not arrived yet.
+    for (app, source) in [
+        (
+            SourceKind::ClaudeCode,
+            snapshots::SnapshotSource::ClaudeCode,
+        ),
+        (SourceKind::Codex, snapshots::SnapshotSource::Codex),
+        (SourceKind::Pi, snapshots::SnapshotSource::Pi),
+    ] {
+        if !sources.iter().any(|row| row.app == app) {
+            if let Some((reason, since)) =
+                projected_scan_index_refusal(&status.local_health_events, source)
+            {
+                sources.push(scan_index_refused_source(
+                    &app,
+                    projection_revision,
+                    since,
+                    reason,
+                ));
+            }
+        }
+    }
     apply_account_prerequisite_to_sources(&account, &mut sources);
     let blockers = local_health_blockers_for_status(status, &runtime, &account, &sources);
     let overall = local_health_overall(&blockers, &runtime, &account, &sources);
@@ -2781,15 +2876,38 @@ fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV
     }
 }
 
+fn scan_index_refused_source(
+    source: &SourceKind,
+    projection_revision: u64,
+    since: &str,
+    reason: snapshots::scan_index_health::Reason,
+) -> LocalHealthSourceV1 {
+    LocalHealthSourceV1 {
+        source_id: format!("src_{}", source_slug(source)),
+        app: source.clone(),
+        state: LocalHealthSourceState::Unknown,
+        authority: LocalHealthAuthority::Runtime,
+        authority_at: since.into(),
+        projection_revision: projection_revision.saturating_sub(1),
+        blocking_reason: Some(reason.code().into()),
+        next_action: Some(reason.action().into()),
+        clear_condition: Some(reason.detail().into()),
+    }
+}
+
 fn local_health_source_for_status(
     source: &SourceHealth,
     projection_revision: u64,
+    events: &[LocalHealthEventV1],
 ) -> LocalHealthSourceV1 {
     let snapshot_source = match source.source {
         SourceKind::ClaudeCode => snapshots::SnapshotSource::ClaudeCode,
         SourceKind::Codex => snapshots::SnapshotSource::Codex,
         SourceKind::Pi => snapshots::SnapshotSource::Pi,
     };
+    if let Some((reason, since)) = projected_scan_index_refusal(events, snapshot_source) {
+        return scan_index_refused_source(&source.source, projection_revision, since, reason);
+    }
     if snapshots::scan_index_rebuild_paused(snapshot_source) {
         return LocalHealthSourceV1 {
             source_id: format!("src_{}", source_slug(&source.source)),
@@ -3124,6 +3242,21 @@ fn local_health_blockers_for_status(
         ));
     }
     for source in sources {
+        if let Some(reason) = source
+            .blocking_reason
+            .as_deref()
+            .and_then(snapshots::scan_index_health::Reason::from_code)
+        {
+            blockers.push(LocalHealthBlockerV1 {
+                code: reason.code().into(),
+                severity: LocalHealthSeverity::Warning,
+                owner: "source".into(),
+                source: source_slug(&source.app).into(),
+                since: source.authority_at.clone(),
+                clear_condition: reason.detail().into(),
+            });
+            continue;
+        }
         if matches!(
             source.state,
             LocalHealthSourceState::RepairRequired | LocalHealthSourceState::VerifyFailed
@@ -3141,6 +3274,16 @@ fn local_health_blockers_for_status(
             ));
         }
     }
+    if otlp_relay::legacy::recent_request() {
+        blockers.push(blocker(
+            otlp_relay::legacy::STALE_EXPORTER_CODE,
+            LocalHealthSeverity::Warning,
+            "source",
+            LocalHealthAuthority::Runtime,
+            &status.generated_at,
+            "Some Claude Code sessions still send telemetry to an older Ottto port; restart those Claude Code sessions.",
+        ));
+    }
     blockers
 }
 
@@ -3156,7 +3299,18 @@ fn blocker(
         code: code.to_string(),
         severity,
         owner: owner.to_string(),
-        source,
+        source: match source {
+            LocalHealthAuthority::Runtime => "runtime",
+            LocalHealthAuthority::Heartbeat => "heartbeat",
+            LocalHealthAuthority::Backend => "backend",
+            LocalHealthAuthority::Verify => "verify",
+            LocalHealthAuthority::Command => "command",
+            LocalHealthAuthority::Backfill => "backfill",
+            LocalHealthAuthority::Diagnostics => "diagnostics",
+            LocalHealthAuthority::Setup => "setup",
+            LocalHealthAuthority::Reducer => "reducer",
+        }
+        .into(),
         since: since.to_string(),
         clear_condition: clear_condition.to_string(),
     }
@@ -6185,6 +6339,58 @@ mod tests {
     }
 
     #[test]
+    fn canonical_health_warns_for_recent_legacy_requests_without_port_text() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        for (now, recent) in [(1000, true), (4599, true), (4600, false)] {
+            otlp_relay::legacy::with_recent_request_for_test(1000, now, || {
+                let status = daemon.status(TOKEN).expect("status");
+                let health = status.canonical_health.expect("canonical health");
+                let finding = health
+                    .blockers
+                    .iter()
+                    .find(|blocker| blocker.code == otlp_relay::legacy::STALE_EXPORTER_CODE);
+                assert_eq!(finding.is_some(), recent);
+                if recent {
+                    let finding = finding.unwrap();
+                    assert_eq!(finding.severity, LocalHealthSeverity::Warning);
+                    assert_eq!(finding.owner, "source");
+                    assert_eq!(finding.source, "runtime");
+                    assert_eq!(finding.clear_condition, "Some Claude Code sessions still send telemetry to an older Ottto port; restart those Claude Code sessions.");
+                    assert!(!finding.clear_condition.chars().any(|c| c.is_ascii_digit()));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn stale_exporter_warning_follows_disconnected_account_blocker() {
+        otlp_relay::legacy::with_recent_request_for_test(1000, 1000, || {
+            let status = daemon().status(TOKEN).expect("status");
+            let health = status.canonical_health.expect("health");
+            assert_eq!(health.account.state, LocalHealthAccountState::NotConnected);
+            let reconnect = health
+                .blockers
+                .iter()
+                .position(|finding| finding.code == "reconnect_required")
+                .unwrap();
+            let stale = health
+                .blockers
+                .iter()
+                .position(|finding| finding.code == otlp_relay::legacy::STALE_EXPORTER_CODE)
+                .unwrap();
+            assert!(reconnect < stale);
+            assert_ne!(
+                health.overall.primary_blocker.as_deref(),
+                Some(otlp_relay::legacy::STALE_EXPORTER_CODE)
+            );
+            assert_eq!(
+                health.blockers[reconnect].severity,
+                LocalHealthSeverity::Blocking
+            );
+        });
+    }
+
+    #[test]
     fn canonical_health_marks_protocol_mismatch_upgrade_required() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let mut status = daemon.status(TOKEN).expect("status");
@@ -8351,6 +8557,11 @@ mod tests {
         assert_eq!(health.runtime.last_seen_at, reprojected.generated_at);
     }
 
+    mod scan_index_health_tests {
+        use super::*;
+        include!("scan_index_health_tests.rs");
+    }
+
     fn daemon() -> LocalDaemon {
         LocalDaemon::new(
             MachineIdentity {
@@ -9837,3 +10048,6 @@ mod owned_heap;
 #[cfg(test)]
 mod retry_allocation_probe;
 mod retry_retention_bound;
+
+#[cfg(all(test, unix))]
+mod scan_index_persistence_contract_tests;

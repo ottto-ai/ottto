@@ -195,13 +195,17 @@ fn same_input_finish_pair(outcome: FinishOutcome, conflict: bool, count: usize) 
     large_prior_index(count).save(&index_path).unwrap();
     // Preserve exactly the initial on-disk inputs, including sidecars. No
     // clock/body normalization is used in any conservation assertion below.
-    fn files(dir: &Path, into: &mut Vec<(PathBuf, Vec<u8>)>) {
+    fn files(dir: &Path, into: &mut Vec<(PathBuf, Vec<u8>, std::fs::Permissions)>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 files(&path, into);
             } else {
-                into.push((path.clone(), std::fs::read(path).unwrap()));
+                into.push((
+                    path.clone(),
+                    std::fs::read(&path).unwrap(),
+                    std::fs::metadata(path).unwrap().permissions(),
+                ));
             }
         }
     }
@@ -221,9 +225,10 @@ fn same_input_finish_pair(outcome: FinishOutcome, conflict: bool, count: usize) 
     let pair_retry_clock = current_unix_seconds();
     for keep in [true, false] {
         std::fs::remove_dir_all(&support).unwrap();
-        for (path, bytes) in &initial {
+        for (path, bytes, permissions) in &initial {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, permissions.clone()).unwrap();
         }
         server.offered.lock().unwrap().clear();
         server.terminal.lock().unwrap().clear();
@@ -605,13 +610,17 @@ fn e2_real_caller_parity_at_tight_allowances() {
             "usage": {"input_tokens": 30, "output_tokens": 3}}})
     ));
     std::fs::write(&transcript, lines).unwrap();
-    fn files(dir: &Path, into: &mut Vec<(PathBuf, Vec<u8>)>) {
+    fn files(dir: &Path, into: &mut Vec<(PathBuf, Vec<u8>, std::fs::Permissions)>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 files(&path, into);
             } else {
-                into.push((path.clone(), std::fs::read(path).unwrap()));
+                into.push((
+                    path.clone(),
+                    std::fs::read(&path).unwrap(),
+                    std::fs::metadata(path).unwrap().permissions(),
+                ));
             }
         }
     }
@@ -621,9 +630,10 @@ fn e2_real_caller_parity_at_tight_allowances() {
     files(&support, &mut saved);
     let mut run = |budget: usize, conflict: bool| {
         std::fs::remove_dir_all(&support).unwrap();
-        for (path, bytes) in &saved {
+        for (path, bytes, permissions) in &saved {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, permissions.clone()).unwrap();
         }
         cycle(budget, conflict, true)
     };

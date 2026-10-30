@@ -2617,3 +2617,114 @@ mod continuation_tests {
         }
     }
 }
+
+/// Fixed low-cardinality storage observations on the existing #799 envelope.
+pub(crate) fn scan_index_storage(
+    source: &'static str,
+    orphans: u64,
+    reserved: u64,
+    unavailable: [[u64; 6]; 3],
+) {
+    #[cfg(test)]
+    SCAN_INDEX_STORAGE_OBSERVATIONS.with(|v| v.borrow_mut().push((orphans, unavailable, reserved)));
+
+    static TOTAL_ORPHANS: AtomicU64 = AtomicU64::new(0);
+    static ROOT_MISSING_RESERVED_ONLY: AtomicU64 = AtomicU64::new(0);
+    static UNAVAILABLE: [[AtomicU64; 6]; 3] = [const { [const { AtomicU64::new(0) }; 6] }; 3];
+    let add = |counter: &AtomicU64, n: u64| {
+        counter
+            .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(n)))
+            .unwrap_or_else(|v| v)
+            .saturating_add(n)
+    };
+    let reserved_total = add(&ROOT_MISSING_RESERVED_ONLY, reserved);
+    if reserved != 0 {
+        traversal_point(
+            "scan_index_storage",
+            source,
+            &BTreeMap::from([("root_missing_reserved_only", reserved_total)]),
+        );
+    }
+    let total = add(&TOTAL_ORPHANS, orphans);
+    for (map, counts) in unavailable.into_iter().enumerate() {
+        for (cause, n) in counts.into_iter().enumerate() {
+            let count = add(&UNAVAILABLE[map][cause], n);
+            if n != 0 {
+                traversal_point(
+                    "scan_index_storage",
+                    source,
+                    &serde_json::json!({"index_shard_unavailable": {"map": (["account_pending", "usage_pending", "request_census"][map]), "cause": ([crate::snapshots::scan_index_persistence::UnavailableCause::Missing, crate::snapshots::scan_index_persistence::UnavailableCause::Generation, crate::snapshots::scan_index_persistence::UnavailableCause::Digest, crate::snapshots::scan_index_persistence::UnavailableCause::Decode, crate::snapshots::scan_index_persistence::UnavailableCause::Descriptor, crate::snapshots::scan_index_persistence::UnavailableCause::Unsafe][cause].label()), "count": count}}),
+                );
+            }
+        }
+    }
+    if orphans != 0 {
+        traversal_point(
+            "scan_index_storage",
+            source,
+            &BTreeMap::from([("scanindex_orphan_init_discarded", total)]),
+        );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCAN_INDEX_STORAGE_OBSERVATIONS: std::cell::RefCell<Vec<StorageReadObservation>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(test)]
+pub(crate) fn take_scan_index_storage_observations() -> Vec<StorageReadObservation> {
+    SCAN_INDEX_STORAGE_OBSERVATIONS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+#[cfg(test)]
+type StorageReadObservation = (u64, [[u64; 6]; 3], u64);
+
+/// One content-free alarm on entry to a shard-unavailable source episode.
+pub(crate) fn scan_index_shard_alarm(source: &'static str, unavailable: usize, transitions: u64) {
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "index_shard_unavailable_alarm": 1,
+            "unavailable_maps": unavailable,
+            "blocked_sources": 1,
+            "transitions": transitions,
+        }),
+    );
+}
+pub(crate) fn scan_index_manifest_refused(source: &'static str) {
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    let count = TOTAL
+        .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
+        .unwrap_or_else(|v| v)
+        .saturating_add(1);
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "scanindex_manifest_unavailable_refused": count,
+        }),
+    );
+}
+
+/// Per-refused-load counter, independent of the repair blocker's episode alarm.
+/// Only fixed causes and numeric counts; never include the originating error.
+pub(crate) fn scan_index_repair_required(
+    source: &str,
+    cause: crate::snapshots::scan_index_health::RepairCause,
+) {
+    static TOTALS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    let count = TOTALS[cause as usize]
+        .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
+        .unwrap_or_else(|v| v)
+        .saturating_add(1);
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "scan_index_repair_required": {
+                "cause": cause.label(), "delta": 1, "count": count,
+            },
+        }),
+    );
+}

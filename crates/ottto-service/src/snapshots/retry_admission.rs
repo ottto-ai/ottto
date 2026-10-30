@@ -18,6 +18,10 @@ fn claude_retry_record_due(
 }
 
 fn claude_retry_due_family_exists(index: &ScanIndex, collected_at: &str) -> bool {
+    if !index.persistence_available() {
+        return false;
+    }
+
     let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
     let served = index
         .traversal
@@ -74,6 +78,13 @@ fn claude_retry_admit_batch_observed(
         })
         .cloned()
         .unwrap_or_else(|| claude_retry_admission_start(index, stale, collected_at, previous));
+    if !index.persistence_available() {
+        state.complete = false;
+        state.roots_complete = false;
+        state.storage_deferred = true;
+        state.progressed = false;
+        return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state);
+    }
     state.progressed = false;
     let lower = state
         .after_root
@@ -303,6 +314,10 @@ fn claude_retry_path_owed(
 }
 
 fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
+    if !index.persistence_available() {
+        return;
+    }
+
     let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
     let became_storage_only = index
         .claude_stale_family_carry
