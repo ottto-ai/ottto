@@ -638,6 +638,10 @@ fn with_terminal_off_held_contexts<T>(f: impl FnOnce(&mut TerminalOffHeldContext
     TERMINAL_OFF_HELD_CONTEXTS.with(|memo| f(&mut memo.borrow_mut()))
 }
 #[cfg(test)]
+pub(crate) fn nbf_initial_retry_reads_for_test() -> u64 {
+    terminal_off_discovery::nbf_initial_retry_reads()
+}
+#[cfg(test)]
 pub(crate) fn clear_terminal_off_held_contexts_for_test() {
     with_terminal_off_held_contexts(|memo| *memo = TerminalOffHeldContexts::default());
 }
