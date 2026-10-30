@@ -1585,3 +1585,62 @@ fn unheld_production_open_refusal_blocks_unrelated_retirement_with_or_without_pe
         fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn source_wide_open_refusal_recovers_on_verified_unchanged_reopen_without_rearm() {
+    let root = temp_dir("sourcewide-open-recovery");
+    let path = root.join("recovered.jsonl");
+    let at = OffsetDateTime::now_utc();
+    let stamp = |minutes| (at + time::Duration::minutes(minutes)).format(&Rfc3339).unwrap();
+    fs::write(&path, format!("{}\n", json!({"timestamp":stamp(0),"type":"assistant",
+        "sessionId":"recovered","requestId":"req_recovered","message":{
+            "id":"msg_recovered","model":"claude-opus-4-8",
+            "usage":{"input_tokens":100,"output_tokens":2}}}))).unwrap();
+    let mut index = ScanIndex::default();
+    let mut baseline = scan_source_roots_with_limit(
+        SnapshotSource::ClaudeCode, std::slice::from_ref(&root), &mut index,
+        &stamp(0), BACKFILL_WINDOW_DAYS, 16, false,
+    ).unwrap();
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut baseline, &mut index);
+    let key = local_index_key(&path);
+    assert_eq!(baseline.snapshots.len(), 1);
+    index.record_accepted_snapshot_fingerprints(&baseline.snapshots.iter()
+        .map(|s| s.snapshot_fingerprint.clone()).collect());
+    let record = index.claude_request_census.get(&key).unwrap();
+    assert!(record.can_bind_recomposed_body() && !record.unverified_or_twin());
+    assert!(claude_request_census::fingerprint_matches(record, &index.files[&key].source_file_fingerprint));
+    let retained = index.files[&key].source_file_fingerprint.clone();
+    let mut state = OwnedSourceScan::new(
+        SnapshotSource::ClaudeCode, std::slice::from_ref(&root), index,
+        &stamp(1), BACKFILL_WINDOW_DAYS, 16, false, None, &[], false, true,
+    );
+    assert!(state.identified_candidates.iter().any(|c| c.path == path));
+    // Preserve the exact original object while making the real no-follow
+    // open fail. Replacing the symlink with that object restores its data.
+    let parked = root.join("parked");
+    fs::rename(&path, &parked).unwrap();
+    std::os::unix::fs::symlink(&parked, &path).unwrap();
+    let failed_index = loop {
+        match state.step(None) {
+            OwnedSourceScanStep::Pending(next) => state = next,
+            OwnedSourceScanStep::Complete { index, scan, .. } => {
+                assert!(scan.unreadable_path_count > 0);
+                break index;
+            }
+        }
+    };
+    assert!(usage_pending_guard::fork_lineage_incomplete(&failed_index));
+    fs::remove_file(&path).unwrap();
+    fs::rename(&parked, &path).unwrap();
+    let mut index = failed_index;
+    let (scan, rows) = crate::local_resource_diagnostics::capture(||
+        scan_source_roots_with_limit(SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root), &mut index, &stamp(10),
+            BACKFILL_WINDOW_DAYS, 16, false).unwrap());
+    assert_eq!(scan.scanned_file_count, 0, "verified unchanged reopen needs no parse");
+    assert!(rows.iter().any(|r| r["counts"]["fork_lineage_refused_reopen_recovered_files"] == 1));
+    assert_eq!(index.files[&key].source_file_fingerprint, retained);
+    assert!(!usage_pending_guard::fork_lineage_incomplete(&index));
+    fs::remove_dir_all(root).unwrap();
+}

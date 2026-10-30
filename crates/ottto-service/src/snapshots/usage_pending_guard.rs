@@ -974,6 +974,77 @@ impl ScanIndex {
 }
 
 impl ScanIndex {
+    /// Observe every production open, including authority preflight. A real
+    /// removal/window exit is not unread input; unresolved absence is.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn usage_guard_open_candidate(
+        &mut self,
+        source: SnapshotSource,
+        candidate: CandidateFile,
+        census: &mut ScanCensus,
+        window: Option<u64>,
+        days: u64,
+        rescue: bool,
+        cache: Option<&sampled_scan::SharedCache>,
+    ) -> Option<(CandidateFile, File)> {
+        let path = (source == SnapshotSource::ClaudeCode).then(|| candidate.path.clone());
+        let before = (census.unreadable_path_count, census.disappeared_file_count);
+        let opened = open_and_identify_scan_candidate_with_rescue(
+            source,
+            candidate,
+            census,
+            window,
+            days,
+            &self.files,
+            rescue,
+            cache,
+            Some(&self.usage_guard_holds),
+        );
+        if let Some(path) = path {
+            if opened.is_none()
+                && before != (census.unreadable_path_count, census.disappeared_file_count)
+            {
+                self.usage_guard_mark_refused(&path);
+            }
+        }
+        opened
+    }
+
+    /// A recovered open of the exact already verified census revision proves
+    /// that a transient open failure hid no growth. No parse or re-arm grant:
+    /// partial, unverified, retired and missing records stay Unknown. Scoped
+    /// held-read debt is independent and is not cleared by this check.
+    pub(super) fn usage_guard_note_reopen(&mut self, candidate: &CandidateFile) {
+        let runtime = &self.usage_guard_holds.runtime;
+        if runtime.refused.is_empty() {
+            return;
+        }
+        let key = local_index_key(&candidate.path);
+        if !runtime.refused.contains(&key) {
+            return;
+        }
+        let covered = self.files.get(&key).is_some_and(|entry| {
+            entry.size_bytes == candidate.size_bytes
+                && entry.source_file_fingerprint == candidate.source_file_fingerprint
+                && self.claude_request_census.get(&key).is_some_and(|record| {
+                    record.can_bind_recomposed_body()
+                        && !record.unverified_or_twin()
+                        && claude_request_census::fingerprint_matches(
+                            record,
+                            &candidate.source_file_fingerprint,
+                        )
+                })
+        });
+        if covered {
+            self.usage_guard_holds.runtime.refused.remove(&key);
+            crate::local_resource_diagnostics::traversal_point(
+                "claude_usage_fork_lineage_recovery",
+                SnapshotSource::ClaudeCode.api_slug(),
+                &json!({"fork_lineage_refused_reopen_recovered_files":1}),
+            );
+        }
+    }
+
     /// Source-wide fork-lineage mark: an attempted read of this Claude file
     /// (any family, held or not, with or without usage pending) ended without
     /// a published complete parse: open, parser, reduction, durable or pace

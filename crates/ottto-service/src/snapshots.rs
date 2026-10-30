@@ -27276,7 +27276,9 @@ impl OwnedSourceScan {
         let mut files = pending_paths
             .into_iter()
             .filter_map(|pending| {
-                candidate_from_traversal_path(
+                let path = (source == SnapshotSource::ClaudeCode).then(|| pending.path.clone());
+                let before = (census.unreadable_path_count, census.disappeared_file_count);
+                let candidate = candidate_from_traversal_path(
                     source,
                     pending,
                     &mut census,
@@ -27284,7 +27286,15 @@ impl OwnedSourceScan {
                     backfill_window_days,
                     &index.files,
                     Some(&index.usage_guard_holds),
-                )
+                );
+                if let Some(path) = path {
+                    if candidate.is_none()
+                        && before != (census.unreadable_path_count, census.disappeared_file_count)
+                    {
+                        index.usage_guard_mark_refused(&path);
+                    }
+                }
+                candidate
             })
             .collect::<Vec<_>>();
 
@@ -27316,16 +27326,17 @@ impl OwnedSourceScan {
             files
                 .into_iter()
                 .filter_map(|candidate| {
-                    open_and_identify_scan_candidate(
-                        source,
-                        candidate,
-                        &mut census,
-                        census_unix_seconds,
-                        backfill_window_days,
-                        &index.files,
-                        Some(&index.usage_guard_holds),
-                    )
-                    .map(|(candidate, _)| candidate)
+                    index
+                        .usage_guard_open_candidate(
+                            source,
+                            candidate,
+                            &mut census,
+                            census_unix_seconds,
+                            backfill_window_days,
+                            false,
+                            None,
+                        )
+                        .map(|(candidate, _)| candidate)
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -27507,14 +27518,14 @@ impl OwnedSourceScan {
                     continue;
                 };
                 prepare_candidate_context(&mut candidate);
-                if let Some(opened) = open_and_identify_scan_candidate(
+                if let Some(opened) = index.usage_guard_open_candidate(
                     source,
                     candidate,
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
-                    &index.files,
-                    Some(&index.usage_guard_holds),
+                    false,
+                    None,
                 ) {
                     identified_candidates.push(opened.0);
                 }
@@ -31224,6 +31235,8 @@ impl OwnedSourceScan {
                         index.usage_guard_note_read(&usage_guard_read_path);
                     }
                     snapshots.extend(parsed);
+                } else if source == SnapshotSource::ClaudeCode {
+                    index.usage_guard_mark_refused(&usage_guard_read_path);
                 }
                 if let Some(bytes) = target_finalization_credit {
                     native_comparison
@@ -32178,17 +32191,14 @@ impl OwnedSourceScan {
             let verification_rescue =
                 sampled_audit::progress_debt(index, &rescue_key, sampled_scan::now_seconds())
                     .is_some();
-            let unreadable_before = census.unreadable_path_count;
-            let Some((mut candidate, opened_file)) = open_and_identify_scan_candidate_with_rescue(
+            let Some((mut candidate, opened_file)) = index.usage_guard_open_candidate(
                 source,
                 candidate,
                 &mut census,
                 census_unix_seconds,
                 backfill_window_days,
-                &index.files,
                 verification_rescue,
                 sampling.as_ref().map(|context| context.cache.as_ref()),
-                Some(&index.usage_guard_holds),
             ) else {
                 if verification_rescue {
                     sampled_audit::progress_open_failed(
@@ -32196,13 +32206,6 @@ impl OwnedSourceScan {
                         &rescue_key,
                         sampled_scan::now_seconds(),
                     );
-                }
-                // An open refusal (not a vanish or a window exit) leaves the
-                // file unread: source-wide fork-lineage mark.
-                if source == SnapshotSource::ClaudeCode
-                    && census.unreadable_path_count != unreadable_before
-                {
-                    index.usage_guard_mark_refused(Path::new(&rescue_key));
                 }
                 pending!();
             };
@@ -32213,6 +32216,7 @@ impl OwnedSourceScan {
                 .as_ref()
                 .is_some_and(|fingerprint| fingerprint != &candidate.source_file_fingerprint)
             {
+                index.usage_guard_mark_refused(&candidate.path);
                 // A quarantined candidate changed after the family prepass. Do not
                 // parse a mixed family or refresh its retry record; keep this
                 // generation non-terminal and retry the new exact object together.
@@ -32235,6 +32239,9 @@ impl OwnedSourceScan {
                         &witness,
                     ]);
                 }
+            }
+            if source == SnapshotSource::ClaudeCode {
+                index.usage_guard_note_reopen(&candidate);
             }
             // Constructor preflight has only physical identities. Reconcile its
             // family retry decision once launcher context is prepared, while keeping
