@@ -1511,18 +1511,41 @@ fn terminal_off_real_hold_renews_floor_and_three_pages_do_not_requeue_it() {
             })
             .collect::<Vec<_>>()
     };
-    let seed = pages_at(at, 3);
+    // Lead B P2-1: count actual body acquisitions of the held transcript,
+    // not only hold classifications, over each three-page group.
+    let held_reads = |reads: &std::collections::BTreeMap<std::path::PathBuf, usize>| {
+        reads
+            .iter()
+            .filter(|(path, _)| {
+                path.file_stem()
+                    .is_some_and(|stem| stem == PIPELINE_HELD_SESSION)
+            })
+            .map(|(_, count)| *count)
+            .sum::<usize>()
+    };
+    let (seed, seed_reads) =
+        crate::snapshots::terminal_contract_retry::source_acquisitions(|| pages_at(at, 3));
     assert_eq!(
         seed.iter().map(|p| p.held.len()).sum::<usize>(),
         1,
         "real hold classified once then parked across three pages"
+    );
+    assert!(
+        held_reads(&seed_reads) <= 1,
+        "the seed's three-page hold reads the held transcript at most once: {seed_reads:?}"
     );
     for (now, expected) in [
         (at + 6 * 3600, 1),
         (at + 6 * 3600 + 300, 0),
         (at + 12 * 3600, 1),
     ] {
-        let pages = pages_at(now, 3);
+        let (pages, reads) =
+            crate::snapshots::terminal_contract_retry::source_acquisitions(|| pages_at(now, 3));
+        assert_eq!(
+            held_reads(&reads),
+            expected,
+            "held transcript READ acquisitions at {now}: one renewing per-key six-hour floor"
+        );
         assert_eq!(
             pages.iter().map(|p| p.held.len()).sum::<usize>(),
             expected,
