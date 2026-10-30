@@ -2893,6 +2893,36 @@ fn e2_pipeline_resumed_copy_removal_stays_removed_after_its_proof_retires() {
 }
 
 #[test]
+fn e2_pipeline_stored_copy_removal_is_dropped_when_its_holder_no_longer_holds_it() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-copy-family-disproven");
+        let mut progress = e2_progress();
+        let prior = demo_family(&mut c, &mut progress);
+        // The original is rewritten without request a (replaced, not
+        // appended) and read again: its current census lacks a.
+        c.write_at(&file(ROOT), &resumed(ROOT, &[B]), "2026-08-02T07:00:00Z");
+        let rewrite = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        assert_eq!(body(&rewrite, ROOT).map(|s| s.request_count), Some(1));
+        let mut prior = settle(&c, &prior, rewrite, &mut progress);
+        // The first resume's id list retires; the second resume grows.
+        e2::pipeline_test_observer::retire_census(&mut prior, &file(COPY));
+        append(
+            &c.root.join(file(THIRD)),
+            &line_by(THIRD, "e", "2026-08-02T07:06:20Z", 10, RESUME_WRITER),
+        );
+        e2::take_diag();
+        let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        literal(&page);
+        let third = body(&page, THIRD).expect("the grown resume publishes");
+        // a: its stored holder disproves it and no other holder answers, so
+        // it counts here once (flagged); b: the original still proves it;
+        // c: the retired first resume's stored removal stands.
+        assert_eq!((third.request_count, third.removed_request_count), (3, Some(2)));
+        assert_eq!(copy_diag(&PREFIX_KEYS), [1, 1, 0, 1, 0]);
+    });
+}
+
+#[test]
 fn e2_pipeline_resumed_copy_without_proof_or_stored_removal_counts_flagged() {
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-copy-family-unproven");

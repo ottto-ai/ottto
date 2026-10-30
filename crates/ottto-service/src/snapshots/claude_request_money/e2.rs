@@ -2099,7 +2099,17 @@ impl CopyRemovalUpdates {
     /// Store each file's decision, counted: hashes newly stored and hashes
     /// the cap refused (never silently fresh: a refused decision is decided
     /// again on a later read, and counts flagged without proof).
-    pub(crate) fn apply(self, removals: &mut super::copy_removals::CopyRemovals) {
+    pub(crate) fn apply(self, index: &mut ScanIndex) {
+        if self.0.is_empty() {
+            return;
+        }
+        // Files no longer indexed (any removal path) leave first; this
+        // page's own files are stored after, whether indexed yet or not.
+        let live = indexed_main_files(index)
+            .into_keys()
+            .collect::<BTreeSet<_>>();
+        let removals = &mut index.claude_copy_removals;
+        removals.retain_files(|file| live.contains(&file));
         let (mut added, mut overflow) = (0, 0);
         for (file, groups) in self.0 {
             let stored = removals.store(file, groups);
@@ -2114,7 +2124,7 @@ impl CopyRemovalUpdates {
 
 /// Location keys of every indexed MAIN Claude file: a stored removal's
 /// holder proves only while it is still indexed.
-fn indexed_main_locations(index: &ScanIndex) -> BTreeSet<LocationKey> {
+fn indexed_main_files(index: &ScanIndex) -> BTreeMap<LocationKey, &str> {
     index
         .files
         .keys()
@@ -2122,8 +2132,20 @@ fn indexed_main_locations(index: &ScanIndex) -> BTreeSet<LocationKey> {
             claude_index_path_member_ref(Path::new(key.as_str()))
                 .is_some_and(|member| member.subagent_stem.is_none())
         })
-        .map(|key| location_key(key))
+        .map(|key| (location_key(key), key.as_str()))
         .collect()
+}
+
+/// A stored removal of `hash` under `holder` (index key): `None` when the
+/// holder's census can no longer answer (retired, over budget or no
+/// record), so the stored decision stands; else whether its record holds
+/// the hash (a record that lacks it disproves the stored ownership).
+fn stored_holder_answer(index: &ScanIndex, holder: &str, hash: u64) -> Option<bool> {
+    index
+        .claude_request_census
+        .get(holder)
+        .filter(|record| record.proves_scan())
+        .map(|record| record.holds_hash(hash))
 }
 
 fn decide_twin(items: &mut [SnapshotItem], at: usize, witness: &str, index: &ScanIndex) {
@@ -2243,6 +2265,14 @@ fn queued(index: &ScanIndex, key: &str) -> bool {
 /// never wait on each other; with the queue drained (traversal complete)
 /// nothing is pending and what exists decides.
 fn unscanned_main_roots(index: &ScanIndex) -> BTreeSet<String> {
+    unscanned_main_files(index)
+        .into_iter()
+        .map(|(root, _)| root)
+        .collect()
+}
+
+/// `unscanned_main_roots` with each file's index key.
+fn unscanned_main_files(index: &ScanIndex) -> Vec<(String, String)> {
     index
         .traversal
         .iter()
@@ -2251,12 +2281,41 @@ fn unscanned_main_roots(index: &ScanIndex) -> BTreeSet<String> {
         .filter(|key| index.claude_request_census.get(key).is_none())
         .filter_map(|key| {
             let member = claude_index_path_member_ref(Path::new(&key))?;
-            member
+            let root = member
                 .subagent_stem
                 .is_none()
-                .then(|| member.root.to_owned())
+                .then(|| member.root.to_owned())?;
+            Some((root, key))
         })
         .collect()
+}
+
+/// Unscanned other main files: (session root, copy order when known).
+type UnscannedOrders = Vec<(String, Option<(i128, LocationKey)>)>;
+
+/// Copy-family fix: a resumed file waits only for an unscanned main file
+/// of another session that may be its earlier holder (born before it, or
+/// birth unknown); a later file cannot hold its copied prefix.
+fn unscanned_earlier_main(
+    index: &ScanIndex,
+    pending: &std::cell::OnceCell<UnscannedOrders>,
+    session: &str,
+    order: (i128, LocationKey),
+) -> bool {
+    pending
+        .get_or_init(|| {
+            unscanned_main_files(index)
+                .into_iter()
+                .map(|(root, key)| {
+                    let order = holder_order(&index.claude_money_birth_store, &root, &key);
+                    (root, order)
+                })
+                .collect()
+        })
+        .iter()
+        .any(|(root, holder)| {
+            root != session && !matches!(holder, Some(holder) if *holder >= order)
+        })
 }
 
 /// A holder's place in the total copy order: (effective birth, location).
@@ -2326,8 +2385,8 @@ fn decide_holders(
         covered: BTreeMap<u64, (i128, LocationKey)>,
         /// Hashes a stored removal keeps removed (its holder still indexed).
         stored: BTreeSet<u64>,
-        /// Own turns follow the copied prefix: never held (Lead B Addendum
-        /// 2); what cannot be proven now counts, flagged.
+        /// Own turns follow the copied prefix: waits only for a possibly
+        /// earlier unscanned holder (`unscanned_earlier_main`).
         resumed: bool,
         /// A holder that would cover it changed and is still queued.
         waiting: bool,
@@ -2336,7 +2395,7 @@ fn decide_holders(
         /// The original its `fork-context-ref` line names.
         parent: Option<String>,
     }
-    let live = std::cell::OnceCell::<BTreeSet<LocationKey>>::new();
+    let live = std::cell::OnceCell::<BTreeMap<LocationKey, &str>>::new();
     let mut wanted = folds
         .iter()
         .filter_map(|&at| {
@@ -2354,19 +2413,19 @@ fn decide_holders(
             hashes.sort_unstable();
             hashes.dedup();
             // Addendum 1: a stored removal stays removed after its holder's
-            // proof list retires, while that holder is still indexed.
+            // id list retires, while that holder is still indexed. A holder
+            // whose census still answers decides through the walk instead.
             let mut stored = BTreeSet::new();
             if enabled() {
                 for (holder, held) in index.claude_copy_removals.get(order.1) {
-                    if live
-                        .get_or_init(|| indexed_main_locations(index))
-                        .contains(holder)
-                    {
-                        stored.extend(
-                            held.iter()
-                                .filter(|hash| hashes.binary_search(*hash).is_ok()),
-                        );
-                    }
+                    let Some(key) = live.get_or_init(|| indexed_main_files(index)).get(holder)
+                    else {
+                        continue;
+                    };
+                    stored.extend(held.iter().filter(|&&hash| {
+                        hashes.binary_search(&hash).is_ok()
+                            && stored_holder_answer(index, key, hash).is_none()
+                    }));
                 }
             }
             Some(Wanted {
@@ -2434,6 +2493,7 @@ fn decide_holders(
         },
     );
     let pending = std::cell::OnceCell::<BTreeSet<String>>::new();
+    let pending_files = std::cell::OnceCell::new();
     let mut updates = CopyRemovalUpdates::default();
     for wanted in wanted {
         let uncovered = wanted
@@ -2454,21 +2514,19 @@ fn decide_holders(
             .iter()
             .filter(|hash| !wanted.covered.contains_key(hash))
             .count() as u64;
-        // An all-copy file waits when undecidable; a resumed file never
-        // holds its own turns for its prefix: it counts what is unproven.
-        let undecided = if walked.is_none() {
-            Some("held_copy_deadline")
-        } else if wanted.waiting || uncovered.iter().any(|hash| wanted.stale.contains(hash)) {
-            Some("held_copy_stale_holder")
-        } else {
-            None
-        };
-        if let (Some(reason), false) = (undecided, wanted.resumed) {
-            hold_copies(&mut items[wanted.at], reason);
+        // Undecidable now (a holder not read at its current revision, or the
+        // walk deadline): the session waits for a later page, resumed or
+        // not. A resumed file emitted now would never be decided again
+        // unless it changes, so its prefix would count twice for good.
+        if walked.is_none() {
+            hold_copies(&mut items[wanted.at], "held_copy_deadline");
             continue;
         }
-        if undecided.is_none()
-            && !uncovered.is_empty()
+        if wanted.waiting || uncovered.iter().any(|hash| wanted.stale.contains(hash)) {
+            hold_copies(&mut items[wanted.at], "held_copy_stale_holder");
+            continue;
+        }
+        if !uncovered.is_empty()
             && wanted
                 .parent
                 .as_deref()
@@ -2479,22 +2537,23 @@ fn decide_holders(
             note_reused(&mut items[wanted.at], reused);
             continue;
         }
-        if undecided.is_none()
-            && !uncovered.is_empty()
-            && pending
-                .get_or_init(|| unscanned_main_roots(index))
-                .iter()
-                .any(|root| *root != wanted.session)
-        {
-            if !wanted.resumed {
-                hold_copies(&mut items[wanted.at], "held_copy_unscanned");
-                continue;
-            }
-            diag("copy_prefix_undecided", 1);
+        // A resumed file waits only for a possible earlier holder; an
+        // all-copy file for any unscanned main file (unchanged).
+        let blocked = !uncovered.is_empty()
+            && if wanted.resumed {
+                unscanned_earlier_main(index, &pending_files, &wanted.session, wanted.order)
+            } else {
+                pending
+                    .get_or_init(|| unscanned_main_roots(index))
+                    .iter()
+                    .any(|root| *root != wanted.session)
+            };
+        if blocked {
+            hold_copies(&mut items[wanted.at], "held_copy_unscanned");
+            continue;
         }
-        if undecided.is_some() {
-            diag("copy_prefix_undecided", 1);
-        }
+        // Lead B Addendum 2: what no holder proves now (its id list retired,
+        // over budget or missing, no stored removal) counts, flagged.
         let ids = skipped_ids(&items[wanted.at])
             .filter(|id| uncovered.binary_search(&claude_request_hash(id)).is_ok())
             .cloned()
@@ -2505,24 +2564,27 @@ fn decide_holders(
     updates
 }
 
-/// The file's removals to store: its stored groups whose holder is still
-/// indexed, plus each newly proven hash under its earliest current holder.
-fn stored_groups(
-    index: &ScanIndex,
-    live: &std::cell::OnceCell<BTreeSet<LocationKey>>,
+/// The file's removals to store: its stored hashes whose holder is still
+/// indexed and not disproven by a record that lacks them, plus each newly
+/// proven hash under its earliest current holder.
+fn stored_groups<'a>(
+    index: &'a ScanIndex,
+    live: &std::cell::OnceCell<BTreeMap<LocationKey, &'a str>>,
     covered: &BTreeMap<u64, (i128, LocationKey)>,
     file: LocationKey,
 ) -> BTreeMap<LocationKey, BTreeSet<u64>> {
     let mut groups = BTreeMap::<LocationKey, BTreeSet<u64>>::new();
     let old = index.claude_copy_removals.get(file);
     for (holder, hashes) in old {
-        if live
-            .get_or_init(|| indexed_main_locations(index))
-            .contains(holder)
-        {
-            groups.entry(*holder).or_default().extend(hashes.iter());
-        }
+        let Some(key) = live.get_or_init(|| indexed_main_files(index)).get(holder) else {
+            continue;
+        };
+        let kept = hashes
+            .iter()
+            .filter(|&&hash| stored_holder_answer(index, key, hash) != Some(false));
+        groups.entry(*holder).or_default().extend(kept);
     }
+    groups.retain(|_, hashes| !hashes.is_empty());
     let held = |hash: &u64| groups.values().any(|hashes| hashes.contains(hash));
     let new = covered
         .iter()

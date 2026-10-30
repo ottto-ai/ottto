@@ -9236,7 +9236,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         &mut scan_result.snapshots,
         index,
     )
-    .apply(&mut index.claude_copy_removals);
+    .apply(index);
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
     let mut full_rearm_evidence_complete = true;
     let api_load = match prepared.as_mut() {

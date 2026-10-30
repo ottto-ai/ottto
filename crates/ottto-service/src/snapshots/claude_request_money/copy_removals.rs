@@ -27,8 +27,9 @@ type Groups = Box<[(LocationKey, Box<[u64]>)]>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CopyRemovals {
-    /// Sorted by file key; never an empty group list or an empty group.
-    files: Vec<(LocationKey, Groups)>,
+    /// (file, store sequence, groups), sorted by file key; never an empty
+    /// group list or an empty group. The sequence orders eviction.
+    files: Vec<(LocationKey, u64, Groups)>,
     /// The charged bytes of `files` (see `charge`).
     bytes: usize,
 }
@@ -38,7 +39,8 @@ pub(crate) struct CopyRemovals {
 pub(crate) struct Stored {
     /// Hashes newly recorded for the file.
     pub(crate) added: u64,
-    /// Hashes of a decision the cap refused (the old entry stays).
+    /// Hashes of decisions lost to the cap: older files' entries evicted
+    /// (oldest stored first) or, when even that cannot fit it, this one.
     pub(crate) overflow: u64,
 }
 
@@ -49,6 +51,9 @@ fn charge(groups: &[(LocationKey, Box<[u64]>)]) -> usize {
     groups.iter().fold(FILE_BYTES, |bytes, (_, hashes)| {
         bytes + GROUP_BYTES + HASH_BYTES * hashes.len()
     })
+}
+fn hash_count(groups: &[(LocationKey, Box<[u64]>)]) -> u64 {
+    groups.iter().map(|(_, hashes)| hashes.len() as u64).sum()
 }
 
 impl CopyRemovals {
@@ -66,12 +71,13 @@ impl CopyRemovals {
     pub(crate) fn get(&self, file: LocationKey) -> &[(LocationKey, Box<[u64]>)] {
         self.files
             .binary_search_by_key(&file, |f| f.0)
-            .map_or(&[], |i| &*self.files[i].1)
+            .map_or(&[], |i| &*self.files[i].2)
     }
 
     /// Replace `file`'s removals with `groups` (empty forgets it). Past the
-    /// cap the old entry stays and the refused hashes are returned as
-    /// overflow; the same index and decisions always give the same result.
+    /// cap, other files' entries are evicted oldest stored first; a decision
+    /// that cannot fit even alone keeps the old entry. Lost hashes are
+    /// returned as overflow. The same state and decisions give the same result.
     pub(crate) fn store(
         &mut self,
         file: LocationKey,
@@ -82,18 +88,15 @@ impl CopyRemovals {
             .filter(|(_, hashes)| !hashes.is_empty())
             .map(|(holder, hashes)| (holder, hashes.into_iter().collect()))
             .collect();
-        let at = self.files.binary_search_by_key(&file, |f| f.0);
-        let old: &[(LocationKey, Box<[u64]>)] = at.map_or(&[], |i| &*self.files[i].1);
+        let old = self.get(file);
         if *old == *groups {
             return Stored::default();
         }
         let new_bytes = charge(&groups);
-        let bytes = self.bytes - charge(old) + new_bytes;
-        let new_hashes = groups.iter().map(|(_, h)| h.len() as u64).sum::<u64>();
-        if bytes > MAX_BYTES {
+        if new_bytes > MAX_BYTES {
             return Stored {
                 added: 0,
-                overflow: new_hashes,
+                overflow: hash_count(&groups),
             };
         }
         let held = |hash: &u64| old.iter().any(|(_, h)| h.binary_search(hash).is_ok());
@@ -102,38 +105,58 @@ impl CopyRemovals {
             .flat_map(|(_, hashes)| hashes.iter())
             .filter(|hash| !held(hash))
             .count() as u64;
-        match (at, groups.is_empty()) {
-            (Ok(i), true) => {
-                self.files.remove(i);
-            }
-            (Ok(i), false) => self.files[i].1 = groups,
-            (Err(_), true) => {}
-            (Err(i), false) => self.files.insert(i, (file, groups)),
+        self.forget(file);
+        let mut overflow = 0;
+        while self.bytes + new_bytes > MAX_BYTES {
+            let oldest = (0..self.files.len())
+                .min_by_key(|&i| (self.files[i].1, self.files[i].0))
+                .expect("over the cap with no entry");
+            overflow += hash_count(&self.files[oldest].2);
+            self.bytes -= charge(&self.files[oldest].2);
+            self.files.remove(oldest);
         }
-        self.bytes = bytes;
-        Stored { added, overflow: 0 }
+        if !groups.is_empty() {
+            let seq = self.files.iter().map(|f| f.1 + 1).max().unwrap_or(1);
+            let at = self.files.binary_search_by_key(&file, |f| f.0).unwrap_err();
+            self.files.insert(at, (file, seq, groups));
+            self.bytes += new_bytes;
+        }
+        Stored { added, overflow }
     }
 
     /// The file is no longer indexed: its removals go with it.
     pub(crate) fn forget(&mut self, file: LocationKey) {
         if let Ok(i) = self.files.binary_search_by_key(&file, |f| f.0) {
-            self.bytes -= charge(&self.files[i].1);
+            self.bytes -= charge(&self.files[i].2);
             self.files.remove(i);
         }
+    }
+
+    /// Keep only files `live` still indexes (every removal path included).
+    pub(crate) fn retain_files(&mut self, live: impl Fn(LocationKey) -> bool) {
+        let mut bytes = self.bytes;
+        self.files.retain(|(file, _, groups)| {
+            let keep = live(*file);
+            if !keep {
+                bytes -= charge(groups);
+            }
+            keep
+        });
+        self.bytes = bytes;
     }
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for CopyRemovals {
     const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        let entry = std::mem::size_of::<(LocationKey, Groups)>();
+        let entry = std::mem::size_of::<(LocationKey, u64, Groups)>();
         let group = std::mem::size_of::<(LocationKey, Box<[u64]>)>();
         let mut bytes = self
             .files
             .capacity()
             .checked_mul(entry)?
-            .checked_add(std::mem::align_of::<(LocationKey, Groups)>())?;
-        for (_, groups) in &self.files {
+            .checked_add(std::mem::align_of::<(LocationKey, u64, Groups)>())?;
+        for (_, _, groups) in &self.files {
             bytes = bytes.checked_add(groups.len().checked_mul(group)?)?;
             for (_, hashes) in groups.iter() {
                 bytes = bytes.checked_add(std::mem::size_of_val(&**hashes))?;
@@ -144,15 +167,16 @@ impl crate::heap_layout_bound::HeapLayoutBound for CopyRemovals {
 }
 
 // One versioned binary string, like the birth table: CCR1, file count u32,
-// then per file: key 16, group count u32; per group: holder 16, count u32,
+// then per file: key 16, store sequence u64, group count u32; per group: holder 16, count u32,
 // hashes u64 each. Little endian.
 impl Serialize for CopyRemovals {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut bytes = Vec::with_capacity(8 + self.bytes);
         bytes.extend_from_slice(b"CCR1");
         bytes.extend_from_slice(&(self.files.len() as u32).to_le_bytes());
-        for (file, groups) in &self.files {
+        for (file, seq, groups) in &self.files {
             bytes.extend_from_slice(&file.to_bytes());
+            bytes.extend_from_slice(&seq.to_le_bytes());
             bytes.extend_from_slice(&(groups.len() as u32).to_le_bytes());
             for (holder, hashes) in groups.iter() {
                 bytes.extend_from_slice(&holder.to_bytes());
@@ -196,7 +220,7 @@ fn decode(encoded: &str) -> Option<CopyRemovals> {
         return None;
     }
     let files = u32::from_le_bytes(take(&mut input)?) as usize;
-    if files > input.len() / 48 {
+    if files > input.len() / 56 {
         return None;
     }
     let mut removals = CopyRemovals {
@@ -205,6 +229,7 @@ fn decode(encoded: &str) -> Option<CopyRemovals> {
     };
     for _ in 0..files {
         let file = LocationKey::from_bytes(take(&mut input)?);
+        let seq = u64::from_le_bytes(take(&mut input)?);
         let group_count = count(&mut input, 28)?;
         let mut groups = Vec::with_capacity(group_count);
         for _ in 0..group_count {
@@ -227,7 +252,7 @@ fn decode(encoded: &str) -> Option<CopyRemovals> {
         if removals.bytes > MAX_BYTES {
             return None;
         }
-        removals.files.push((file, groups.into_boxed_slice()));
+        removals.files.push((file, seq, groups.into_boxed_slice()));
     }
     input.is_empty().then_some(removals)
 }
@@ -291,6 +316,47 @@ mod tests {
         assert_eq!(refused.added, 0);
         assert_eq!(refused.overflow, huge.len() as u64);
         assert_eq!(removals.get(file)[0].1.as_ref(), &[1]);
+    }
+
+    #[test]
+    fn copy_removals_evict_the_oldest_stored_file_first_and_count_it() {
+        let half = (0..(MAX_BYTES / HASH_BYTES / 2) as u64).collect::<Vec<_>>();
+        let run = || {
+            let mut removals = CopyRemovals::default();
+            let (first, second, third) = (
+                location_key("first"),
+                location_key("second"),
+                location_key("third"),
+            );
+            assert_eq!(removals.store(first, groups(&[("h", &half)])).overflow, 0);
+            assert_eq!(
+                removals.store(second, groups(&[("h", &[1, 2])])).overflow,
+                0
+            );
+            let stored = removals.store(third, groups(&[("h", &half)]));
+            assert_eq!(
+                stored.overflow,
+                half.len() as u64,
+                "the oldest entry is evicted, counted"
+            );
+            assert!(removals.get(first).is_empty());
+            assert_eq!(removals.get(second)[0].1.as_ref(), &[1, 2]);
+            assert!(removals.bytes() <= MAX_BYTES);
+            removals
+        };
+        // Deterministic: the same decisions give the same state.
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn copy_removals_keep_only_indexed_files() {
+        let mut removals = CopyRemovals::default();
+        let (kept, gone) = (location_key("kept"), location_key("gone"));
+        removals.store(kept, groups(&[("h", &[1])]));
+        removals.store(gone, groups(&[("h", &[2, 3])]));
+        removals.retain_files(|file| file == kept);
+        assert!(removals.get(gone).is_empty());
+        assert_eq!(removals.bytes(), FILE_BYTES + GROUP_BYTES + HASH_BYTES);
     }
 
     #[test]
