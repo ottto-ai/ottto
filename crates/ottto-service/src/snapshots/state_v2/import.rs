@@ -1815,7 +1815,7 @@ mod application_cases {
         let mut tx = db.begin(TxnMode::Read).unwrap();
         let verified = verify_normalized(&mut tx, &index, &original, c.binding()).unwrap();
         assert_eq!(verified.presence, original.presence);
-        assert!(verified.accounts_ready);
+        assert_eq!(verified.binding, Some(c.binding()));
     }
     include!("import_peak_tests.rs");
 }

@@ -1365,7 +1365,7 @@ fn changing_control_replay_is_bounded_before_capability_parse() {
             value: &Changes(std::cell::Cell::new(0)),
         })
         .unwrap_err();
-    assert_eq!(error.to_string(), "state_v2_control_admission");
+    assert_eq!(error.to_string(), "state_v2_value_admission");
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::NotPublished);
     assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(0));
 }

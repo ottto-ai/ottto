@@ -104,14 +104,13 @@ fn windows(
     Ok(created)
 }
 pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
-    cx.accounts_ready = true;
     delta(&ScanIndex::default(), index, tx, cx)
 }
 pub(super) fn delta(
     prev: &ScanIndex,
     next: &ScanIndex,
     tx: &mut dyn Transaction,
-    cx: &mut KindCx,
+    _cx: &mut KindCx,
 ) -> Result<()> {
     macro_rules! save {
         ($field:ident,$kind:literal) => {
@@ -147,7 +146,6 @@ pub(super) fn delta(
         &manifest,
         &(next.claude_account_family_pending.len(), controls),
     )?;
-    cx.accounts_ready = true;
     Ok(())
 }
 pub(super) fn hydrate_txn(
@@ -160,7 +158,7 @@ pub(super) fn hydrate_txn(
 pub(super) fn hydrate_filtered(
     tx: &mut dyn Transaction,
     index: &mut ScanIndex,
-    cx: &mut KindCx,
+    _cx: &mut KindCx,
     filter: Option<(&BTreeSet<String>, bool)>,
 ) -> Result<()> {
     let roots = filter.map(|(roots, _)| roots);
@@ -262,7 +260,6 @@ pub(super) fn hydrate_filtered(
         }
         Ok(())
     })?;
-    cx.accounts_ready = true;
     Ok(())
 }
 pub(super) use mapper::{private_paths, references};

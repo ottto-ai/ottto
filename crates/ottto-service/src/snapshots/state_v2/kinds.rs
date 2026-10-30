@@ -13,14 +13,9 @@ pub(super) struct KindCx {
     pub(super) prepared: Option<resume::Prepared>,
     pub(super) ambiguous: bool,
     pub(super) require_preflight: bool,
-    pub(super) account_rows: BTreeMap<(String, String), BTreeMap<RowKey, Header>>,
-    pub(super) accounts_ready: bool,
-    pub(super) families_over_64_windows: u64,
-    pub(super) buckets_over_target: u64,
     pub(super) misc_rows: BTreeMap<RowKey, (Header, bool)>,
     /// Original field presence, obtained before any v1 normalization.
     pub(super) presence: BTreeMap<String, bool>,
-    pub(super) delta: bool,
     pub(super) dirty_fields: Option<BTreeSet<String>>,
     valid: bool,
 }
@@ -28,8 +23,8 @@ pub(super) struct KindCx {
 /// Copy only dirty encoder metadata, never the history-wide account/header map.
 /// The original remains the committed context until the selected transaction wins.
 pub(super) fn planning_context(
-    prev: &ScanIndex,
-    next: &ScanIndex,
+    _prev: &ScanIndex,
+    _next: &ScanIndex,
     committed: &KindCx,
     dirty: &BTreeSet<String>,
 ) -> Result<KindCx> {
@@ -42,7 +37,6 @@ pub(super) fn planning_context(
         committed: committed.committed.clone(),
         presence: committed.presence.clone(),
         require_preflight: committed.require_preflight,
-        accounts_ready: true,
         valid: true,
         ..Default::default()
     };
@@ -72,34 +66,6 @@ pub(super) fn planning_context(
                 .context("state_v2_save_admission")?;
             ensure!(bytes <= 8 * 1024 * 1024, "state_v2_save_admission");
             cx.misc_rows.insert(key.clone(), row.clone());
-        }
-    }
-    let mut families = BTreeSet::new();
-    macro_rules! changed {
-        ($($field:ident),* $(,)?) => { $(
-            for family in prev.$field.keys().chain(next.$field.keys()) {
-                if prev.$field.get(family) != next.$field.get(family) { families.insert(family); }
-            }
-        )* };
-    }
-    changed!(
-        claude_account_family_pending,
-        claude_usage_family_pending,
-        claude_account_family_witnesses,
-        claude_usage_family_witnesses,
-        claude_usage_authority_quarantine,
-        claude_account_deferred_holds,
-        session_account_bindings
-    );
-    for (scope, rows) in &committed.account_rows {
-        if families.contains(&scope.1) || scope.0 == "account.window_retention" {
-            for key in rows.keys() {
-                bytes = bytes
-                    .checked_add(units_graph::metadata_cost(key))
-                    .context("state_v2_save_admission")?;
-                ensure!(bytes <= 8 * 1024 * 1024, "state_v2_save_admission");
-            }
-            cx.account_rows.insert(scope.clone(), rows.clone());
         }
     }
     Ok(cx)
