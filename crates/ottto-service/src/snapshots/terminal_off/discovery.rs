@@ -42,6 +42,9 @@ struct Observation {
     served_at: Option<u64>,
     // Explicit per-key hold custody, independent of sweep/proof family roots.
     held_retry: bool,
+    // This serve re-read a key the previous settlement held. Only a held
+    // re-read starts the floor: a fresh hold keeps its one immediate retry.
+    held_reread: bool,
 }
 #[derive(Clone, Default)]
 struct Walk {
@@ -445,7 +448,14 @@ pub(super) fn served(index: &ScanIndex, candidate: &CandidateFile, now: u64) {
     });
     let debt = sampled_audit::debt_for_key(index, &key, now);
     let cause = cause(index, &key, now).unwrap_or("watcher_stat_change");
+    let id = digest(&key);
     with_walks(|memo| {
+        // Hold custody from any retained walk scope is consumed by this read.
+        let held_reread = memo.values_mut().fold(false, |held, walk| {
+            walk.observations
+                .get_mut(&id)
+                .map_or(held, |o| std::mem::take(&mut o.held_retry) || held)
+        });
         if let Some(walk) = memo.get_mut(&scope) {
             let round = walk.round;
             let now = walk.now;
@@ -458,6 +468,7 @@ pub(super) fn served(index: &ScanIndex, candidate: &CandidateFile, now: u64) {
             o.served = Some((stat, token));
             o.served_at = Some(now);
             o.held_retry = false; // Classification belongs to this parse's settlement.
+            o.held_reread = held_reread;
             o.served_root = Some(digest(&local_index_key(&candidate.scan_root)));
             o.targeted = Some(service_token(token, debt, stat, cause));
         }
@@ -607,7 +618,7 @@ pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
 }
 
 crate::heap_layout_bound::fields!(Stat; length, modified, identity, birth);
-crate::heap_layout_bound::fields!(Observation; stat, round, first_seen, targeted, served, served_root, served_at, held_retry);
+crate::heap_layout_bound::fields!(Observation; stat, round, first_seen, targeted, served, served_root, served_at, held_retry, held_reread);
 crate::heap_layout_bound::fields!(Walk; now, last_walk, coalesced_since, round, suppressing, target_cursor, held_roots, oversized, observations);
 
 pub(super) fn retry_blocked(index: &ScanIndex, key: &str) -> bool {
@@ -628,12 +639,14 @@ pub(super) fn retry_blocked(index: &ScanIndex, key: &str) -> bool {
         // Explicit non-blocking custody survives traversal starts in the same
         // bounded RAM observation map. It never borrows held_family_roots,
         // which owns distinct sweep/proof semantics. Real object/context
-        // changes and unknown identity fail toward another read.
+        // changes and unknown identity fail toward another read. Only a held
+        // re-read is floored, so a fresh hold keeps its one immediate retry.
         let held_key_blocked = stat
             .is_some_and(|s| s.identity.is_some() && s.modified.is_some() && s.birth > 0)
             && m.values().any(|prior| {
                 prior.observations.get(&digest(key)).is_some_and(|o| {
                     o.held_retry
+                        && o.held_reread
                         && o.served_at
                             .is_some_and(|at| walk.now < at.saturating_add(6 * 3600))
                         && o.served == Some((stat, token))
@@ -647,6 +660,7 @@ pub(super) fn retry_blocked(index: &ScanIndex, key: &str) -> bool {
 
 /// Register the keys actually returned by local hold settlement. Querying or
 /// re-enqueueing never renews served_at; only an actual parse can do that.
+/// A fresh hold is still retried once; its held re-read starts the floor.
 pub(super) fn held_retry_blocked(index: &ScanIndex, key: &str) -> bool {
     if !claude_terminal_off() {
         return false;
