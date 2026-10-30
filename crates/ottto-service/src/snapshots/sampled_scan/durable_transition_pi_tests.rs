@@ -14,6 +14,7 @@
 // cross-build property: it belongs to the money_equivalence base-vs-candidate
 // lane, not to this in-process matrix.
 use super::*;
+use crate::local_resource_diagnostics::cache_lifecycle;
 use crate::snapshots::sampled_scan::transition_fixture::{
     self as fixture, money_oracle, Accepted, IoBytes, Mode, RouteResult, TransitionDriver,
 };
@@ -132,6 +133,8 @@ struct PiPage {
     emitted: BTreeMap<String, Accepted>,
     /// The store as this route left it (its own native receipt).
     records: Records,
+    /// This route's process-wide lifecycle events, on this thread.
+    lifecycle: cache_lifecycle::Counts,
 }
 
 type Records = BTreeMap<PathBuf, Vec<u8>>;
@@ -269,6 +272,17 @@ impl PiDriver {
         counts.certificate_refused.get(class).copied().unwrap_or(0)
     }
 
+    /// This route's certificate refusals of every class.
+    fn certificates_refused(&self, mode: Mode) -> u64 {
+        let (counts, _) = self.pages[&mode].cache.durable_counters(SOURCE).unwrap();
+        counts.certificate_refused.values().sum()
+    }
+
+    /// This route's `pi_restored_behind_accepted` count.
+    fn restored_behind(&self, mode: Mode) -> u64 {
+        self.pages[&mode].lifecycle.pi_restored_behind_accepted
+    }
+
     /// This route's cache-admission refusals: (the Pi `cache_transit` Full
     /// count, pending delays, Pi slot paced recovery [Full, delay]).
     fn cache_transit(&self, mode: Mode) -> (u64, u64, [u64; 2]) {
@@ -312,7 +326,8 @@ impl TransitionDriver for PiDriver {
             }
         };
         let cache = scanner.cache.clone();
-        let (mut result, index, emitted) = pi_route(&self.c, scanner, self.prior.clone(), mode);
+        let ((mut result, index, emitted), lifecycle) =
+            cache_lifecycle::observe(|| pi_route(&self.c, scanner, self.prior.clone(), mode));
         result.accepted = self.accepted.clone();
         let records = store_records(&self.disk);
         self.pages.insert(
@@ -322,6 +337,7 @@ impl TransitionDriver for PiDriver {
                 index,
                 emitted,
                 records,
+                lifecycle,
             },
         );
         result
@@ -352,6 +368,22 @@ fn only_record(disk: &Disk) -> (PathBuf, Vec<u8>) {
     let records = store_records(disk);
     assert_eq!(records.len(), 1);
     records.into_iter().next().unwrap()
+}
+
+/// One route's page counts: (Full selections, Tail selections, completed
+/// native bytes), from its captured `native_collection_page` rows.
+fn page_reads(rows: &[Value]) -> (u64, u64, u64) {
+    let count = |key: &str| {
+        rows.iter()
+            .filter(|row| row["stage"] == "native_collection_page" && row["source"] == "pi")
+            .map(|row| row["counts"]["sampled_acquisition"][key].as_u64().unwrap())
+            .sum()
+    };
+    (
+        count("full_selections"),
+        count("tail_selections"),
+        count("completed_native_bytes"),
+    )
 }
 
 /// Runs its closure on drop, so a panicking row still clears a test knob.
@@ -520,10 +552,9 @@ fn pi_evict_retry_save_restart_reads_no_full() {
 // equals a cold Full of the file, today's Pi behaviour: the floor is
 // Claude-only (`Interpretation::of`). No hold and no Full; the accepted state
 // moves down with it. The extent regression is known independently from the
-// index. The only existing count of this event is the ordinary `restored`; the
-// D-T13 name `record_behind_accepted{write_ahead}` has no production counter.
-// An equal-or-larger extent POSTs normally. The RAM-resident cut is the
-// in-process control below.
+// index. `pi_restored_behind_accepted` counts exactly this offer. An
+// equal-or-larger extent POSTs normally and leaves it at 0. The RAM-resident
+// cut is the in-process control below.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -544,6 +575,7 @@ fn pi_restored_tail_behind_accepted_extent_publishes_the_cold_body() {
     let route = f.emit_bodies(Mode::Restart);
     money_oracle::assert_equivalent(&cold, &route);
     whole_body(&cold, &route);
+    assert_eq!(f.restored_behind(Mode::Restart), 0, "past accepted");
     f.save_gc(Mode::Restart);
     let grown = std::fs::read(&f.path).unwrap();
     // The predecessor survives in place of its successor (an A/B survivor),
@@ -568,6 +600,8 @@ fn pi_restored_tail_behind_accepted_extent_publishes_the_cold_body() {
     let cold = f.emit_bodies(Mode::ColdFull);
     let published = f.emit_bodies(Mode::Restart);
     assert_eq!((published.modes, published.restored), ((0, 1, 0), 1));
+    assert_eq!(f.restored_behind(Mode::Restart), 1, "the counted event");
+    assert_eq!(f.restored_behind(Mode::ColdFull), 0, "a Full never counts");
     assert_eq!(f.holds(Mode::Restart), ([0; 8], 0), "no hold of any class");
     money_oracle::assert_equivalent(&cold, &published);
     whole_body(&cold, &published);
@@ -596,6 +630,7 @@ fn pi_restored_tail_behind_accepted_extent_publishes_the_cold_body() {
     let cold = f.emit_bodies(Mode::ColdFull);
     let restored = f.emit_bodies(Mode::Restart);
     assert_eq!((restored.modes, restored.restored), ((0, 1, 0), 1));
+    assert_eq!(f.restored_behind(Mode::Restart), 0, "past accepted");
     money_oracle::assert_no_smaller_reemit(&f.entity, &cold, &restored, &cold, behind);
     whole_body(&cold, &restored);
 }
@@ -648,6 +683,7 @@ fn pi_ram_resident_same_head_cut_reads_one_real_edit_full() {
         "one in-process Shrunk Full"
     );
     assert_eq!(edited.io.consumed, extent);
+    assert_eq!(f.restored_behind(Mode::Ram), 0, "not restored, not Tailed");
     let (_, refused, t14) = f.counters(Mode::Ram);
     let (format_hold, held) = f.holds(Mode::Ram);
     assert_eq!((refused, t14, held), (0, 0, 0));
@@ -749,8 +785,11 @@ fn pi_stale_survivor_holds_then_resolves_with_a_counted_tail() {
 // upgrade. v1->v3 grows (HeadChanged) and v2->v3 shrinks (Shrunk); the cheap
 // checks classify either before restore, so a restarted owner reads exactly
 // ONE A2 Full equal to cold Full, counted by its certificate class, never T14
-// or a hold. It writes a new record: a quiet restart reads nothing, and the
-// next growth restores that record and Tails, so no second Full follows.
+// or a hold, its bytes under the page's completed native bytes. It writes a new
+// record: a quiet restart reads nothing, and the next growth restores that
+// record and Tails, so no second Full follows. Neither later stage refuses a
+// certificate: that count belongs to the rewrite alone. The shrink arm's Full
+// ends below accepted, but it is not a restored Tail.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -789,14 +828,22 @@ fn pi_version_rewrite_after_restart_reads_one_real_edit_full() {
         assert_eq!(before.ino(), after.ino(), "{arm}: same inode");
         assert_eq!(after.len() > before.len(), arm == "grow", "{arm}");
         let cold = f.emit_bodies(Mode::ColdFull);
-        let edited = f.emit_bodies(Mode::Restart);
+        let (edited, rows) =
+            crate::local_resource_diagnostics::capture(|| f.emit_bodies(Mode::Restart));
         assert_eq!(
             (edited.modes, edited.restored),
             ((1, 0, 0), 0),
             "{arm}: ONE Full, no restore"
         );
         assert_eq!(edited.io.consumed, after.len(), "{arm}");
+        assert_eq!(
+            page_reads(&rows),
+            (1, 0, after.len()),
+            "{arm}: the Full's bytes are counted"
+        );
         assert_eq!(f.certificate_refused(Mode::Restart, class), 1, "{arm}");
+        assert_eq!(f.certificates_refused(Mode::Restart), 1, "{arm}");
+        assert_eq!(f.restored_behind(Mode::Restart), 0, "{arm}: not a Tail");
         let (_, refused, t14) = f.counters(Mode::Restart);
         assert_eq!((refused, t14), (0, 0), "{arm}: never T14");
         assert_eq!(f.holds(Mode::Restart), ([0; 8], 0), "{arm}: never a hold");
@@ -809,6 +856,7 @@ fn pi_version_rewrite_after_restart_reads_one_real_edit_full() {
         let quiet = f.emit_bodies(Mode::Restart);
         assert_eq!((quiet.modes.0, quiet.modes.1), (0, 0), "{arm}: no 2nd Full");
         assert!(quiet.batches.is_empty(), "{arm}: quiet restart POSTed");
+        assert_eq!(f.certificates_refused(Mode::Restart), 0, "{arm}: quiet");
         f.restart();
         let tail = f.grow(&[pi_turn(
             "message",
@@ -823,6 +871,7 @@ fn pi_version_rewrite_after_restart_reads_one_real_edit_full() {
             ((0, 1, 0), 1),
             "{arm}: the new record Tails"
         );
+        assert_eq!(f.certificates_refused(Mode::Restart), 0, "{arm}: Tail");
         assert_eq!(restored.io.consumed, tail + restored.io.rederive_head);
         money_oracle::assert_equivalent(&cold, &restored);
         whole_body(&cold, &restored);
