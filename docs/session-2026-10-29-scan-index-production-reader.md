@@ -14,7 +14,8 @@ Only version refusals become an update-app health blocker.
 The existing local resource envelope receives fixed map/cause counts on both
 successful and failed opens. Additional retained custody is admitted against the
 shared parked budget and is included in heap/Arc/Clone accounting. ScanIndexEntry
-is unchanged; native layout remains pinned at 480 bytes. No local tests were run;
+has no storage-control fields; its native pin follows main's canonical 560-byte
+bound after the per-file context receipt change. No local tests were run;
 all-target compilation and Linux runtime/native contract jobs supply validation.
 See scan-index-persistence.md for representation, downgrade and release gates.
 
@@ -101,3 +102,13 @@ transcript acquisitions, no re-upload/replacement and unchanged witness/ledger.
 Portable observer tests cover both causes plus the typed loader refusal, repeated
 loads/one alarm, good-load clearing, new episodes and unrelated-error lookalikes.
 No local tests or Mac dispatch; only the requested Linux workflow is dispatched.
+
+
+Main reconciliation preserves the unavailable-index early return byte for byte,
+before capturing the audit clock. Heap registrations retain both the persistence
+custody fields and main's context fields. The integration fixture follows main's
+canonical 560-byte entry pin; storage controls add no per-entry fields. The main
+legacy-listener health test compares the existing source wire string to runtime.
+These are mechanical unions and test/documentation alignment; persistence,
+repair-refusal mapping, root-loss guards, reserved-name GC and UNKNOWN mapping
+are unchanged. Native layout qualification remains a separate macOS gate.

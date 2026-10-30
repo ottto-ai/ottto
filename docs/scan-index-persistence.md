@@ -281,7 +281,8 @@ controls and exact retry-claim maxima are charged through the ordinary heap
 visitor, including Arc headers and Clone custody. A separate preflight bounds
 additional retained baseline allocations by the shared 8 MiB parked budget.
 Root descriptors remain capped at 256 KiB / 769 objects. No field is added to
-ScanIndexEntry; its native 480-byte pin remains authoritative. Existing namespace
+ScanIndexEntry; its native pin follows the canonical 560-byte bound after the
+per-file context receipt change. Existing namespace
 directories may be owner-readable 0755 if owned and not writable by others;
 shard directories remain 0700 and new payloads/root/markers remain 0600.
 
