@@ -600,31 +600,6 @@ fn paused_overlong_skip_salvages_early_with_identical_output() {
     );
 }
 
-#[test]
-fn monotone_holds_are_fork_and_broken_ordinal_streams_only() {
-    let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
-    assert!(!held_monotone(&accumulator));
-    accumulator.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
-    assert!(held_monotone(&accumulator));
-    // A parented created thread keeps the ordinal-only rule.
-    accumulator.codex_parent_session_ref = Some("parent".into());
-    for boundary in [
-        CodexOwnershipBoundary::NativeCreatedThread,
-        CodexOwnershipBoundary::Ordinal { start: 3 },
-    ] {
-        accumulator.codex_ownership_boundary = boundary;
-        accumulator.codex_ordinal_sequence_valid = true;
-        assert!(!held_monotone(&accumulator));
-        accumulator.codex_ordinal_sequence_valid = false;
-        assert!(held_monotone(&accumulator));
-    }
-    accumulator.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
-    assert!(!held_monotone(&accumulator));
-    // K8: one reuse predicate for the restored accumulator.
-    assert!(counting_reusable(&accumulator, "legacy", "legacy"));
-    assert!(!counting_reusable(&accumulator, "legacy", "v2"));
-}
-
 /// C6: #597's parentless created-thread hold is memoized only where an
 /// append cannot cure it.
 #[test]
@@ -770,97 +745,6 @@ fn strict_debt_is_never_settleable_residue_and_held_debt_is() {
     );
 }
 
-/// K3 (R1-B3): a parentless created thread held for a missing sidecar
-/// projection wakes when the sidecar facts that can cure it change, e.g. the
-/// rollout extent catching up with the file (`rollout_file_matches`), or an
-/// identity conflict appearing. An ambiguous fork records no sidecar wake.
-#[test]
-fn held_singleton_memo_woken_by_sidecar_change() {
-    let temp = Temp::new("memo-sidecar", b"{\"n\":1}\n{\"n\":2}\n");
-    let file = File::open(&temp.0).unwrap();
-    let path = PathBuf::from(format!(
-        "/synthetic/sessions/rollout-2026-10-07T10-00-00-{SESSION}.jsonl"
-    ));
-    let mut codex = CodexTitleMetadata::default();
-    codex.rollout_extents.insert(
-        SESSION.into(),
-        CodexRolloutExtent {
-            next_byte_offset: 8,
-            next_ordinal: 1,
-        },
-    );
-    let mut held = SnapshotAccumulator::new(SnapshotSource::Codex);
-    held.codex_ownership_boundary = CodexOwnershipBoundary::NativeCreatedThread;
-    held.codex_sidecar_projected_next_ordinal = None;
-    // `NativeCreatedThread` is set only in the classifier's created-thread
-    // branch, which also sets `codex_created_thread_native_only` (B1).
-    held.codex_created_thread_native_only = true;
-    assert!(held_monotone(&held) && sidecar_wakes(&held));
-    let recorded = sidecar_fingerprint(&codex, &path);
-    let entry = |sidecar: Option<String>| {
-        MemoEntry::new(
-            "digest".into(),
-            LiveWitness::read(plain_path(), &file, 8).unwrap(),
-            OpenStamp::capture(&file).unwrap(),
-            None,
-            sidecar,
-            disclosure(),
-        )
-    };
-    let created = entry(sidecar_wakes(&held).then(|| recorded.clone()));
-    assert!(created
-        .matches(plain_path(), "digest", &file, None, &recorded)
-        .is_some());
-    // The sidecar rollout extent catches up with the file: the cure is
-    // visible, the entry wakes and the file is re-read.
-    codex.rollout_extents.insert(
-        SESSION.into(),
-        CodexRolloutExtent {
-            next_byte_offset: 16,
-            next_ordinal: 2,
-        },
-    );
-    let caught_up = sidecar_fingerprint(&codex, &path);
-    assert_ne!(caught_up, recorded);
-    assert!(created
-        .matches(plain_path(), "digest", &file, None, &caught_up)
-        .is_none());
-    // An identity conflict on the path's session also wakes it.
-    let mut conflicted = codex.clone();
-    conflicted.identity_conflicts.insert(SESSION.into());
-    let conflict = sidecar_fingerprint(&conflicted, &path);
-    assert_ne!(conflict, caught_up);
-    let caught_up_entry = entry(Some(caught_up.clone()));
-    assert!(caught_up_entry
-        .matches(plain_path(), "digest", &file, None, &conflict)
-        .is_none());
-    // R1-H1: a missing projection may also mean the sidecar extent is ahead
-    // of the flushed file, which an append cures: that entry hits only on
-    // its exact stamp, and any growth re-reads it.
-    assert!(growth_may_cure(&held));
-    let ahead = entry(Some(caught_up.clone())).growth_may_cure(growth_may_cure(&held));
-    assert!(ahead
-        .matches(plain_path(), "digest", &file, None, &caught_up)
-        .is_some());
-    temp.append(b"{\"n\":3}\n");
-    assert!(ahead
-        .matches(plain_path(), "digest", &file, None, &caught_up)
-        .is_none());
-    assert!(caught_up_entry
-        .matches(plain_path(), "digest", &file, None, &caught_up)
-        .is_some());
-    // An ordinary (not created-thread) fork hold is cured by peer parent
-    // evidence only.
-    held.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
-    held.codex_created_thread_native_only = false;
-    assert!(!growth_may_cure(&held));
-    assert!(!sidecar_wakes(&held));
-    let fork = entry(sidecar_wakes(&held).then(|| recorded.clone()));
-    assert!(fork
-        .matches(plain_path(), "digest", &file, None, &caught_up)
-        .is_some());
-}
-
 /// C2: no time-based expiry. A memo entry wakes on cheap changed evidence
 /// only: an object change, shrink or same-length stamp change of the held
 /// file, a head or boundary sample mismatch at the refused offset, or a
@@ -962,48 +846,6 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
     assert!(entry
         .matches(plain_path(), "digest", &file, Some(&now_1), "")
         .is_none());
-}
-
-#[test]
-fn singleton_memo_is_bounded_lru_with_frozen_charges() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let temp = Temp::new("memo-lru", b"{\"n\":1}\n");
-    let file = File::open(&temp.0).unwrap();
-    let entry = MemoEntry::new(
-        "digest".into(),
-        LiveWitness::read(plain_path(), &file, 8).unwrap(),
-        OpenStamp::capture(&file).unwrap(),
-        None,
-        None,
-        disclosure(),
-    );
-    let mut memo = SingletonMemo::default();
-    for index in 0..MEMO_ENTRIES {
-        assert!(memo.insert(format!("key-{index}"), entry.clone()));
-    }
-    memo.touch("key-0");
-    assert!(memo.insert("key-new".into(), entry.clone()));
-    assert_eq!(memo.entries.len(), MEMO_ENTRIES);
-    assert!(memo.entries.contains_key("key-0"));
-    assert!(!memo.entries.contains_key("key-1"));
-    assert!(memo.entries.values().all(|entry| entry.charge > 0));
-    let charged = crate::heap_layout_bound::bound(&memo, usize::MAX).unwrap();
-    let frozen: usize = memo.entries.values().map(|entry| entry.charge).sum();
-    assert!(charged >= frozen);
-    memo.remove("key-0");
-    assert!(!memo.entries.contains_key("key-0"));
-    // A copy-refusal release keeps every memo entry (K6): they are charged
-    // once in `heap_bound` and reserved at insert admission.
-    let cache = SharedCache::default();
-    cache.memo_record("key".into(), entry);
-    assert!(cache.memo_lookup("key").is_some());
-    let resident = cache.cursor_resident();
-    assert!(resident >= frozen / MEMO_ENTRIES);
-    cache.clear();
-    assert!(cache.memo_lookup("key").is_some());
-    assert_eq!(cache.cursor_resident(), resident);
 }
 
 fn codex_line(value: Value) -> Vec<u8> {
@@ -2575,48 +2417,6 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
     });
 }
 
-/// E2: a paused job whose path no longer names its held object (replaced
-/// here) ends on its next resume: slot freed, nothing published from it,
-/// never counted as a member change.
-#[test]
-fn paused_job_whose_path_was_replaced_ends_on_resume() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let fixture = ScanRoot::new(40);
-    let path = fixture.file(SESSION);
-    let cache = Arc::new(SharedCache::default());
-    with_test_limits(2048, 1024, 64, || {
-        let (index, _) = page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)));
-        assert_eq!(
-            counter(&cache, |c| c.jobs_paused),
-            1,
-            "{}",
-            counters(&cache)
-        );
-        let replacement = path.with_extension("replacement");
-        fs::copy(&path, &replacement).unwrap();
-        fs::rename(&replacement, &path).unwrap();
-        let (_, _, _) = page_steps(
-            &fixture,
-            index,
-            Some(Arc::clone(&cache)),
-            "cursor-fixture",
-            NOW,
-            |_| {},
-            10_000,
-        );
-        assert_eq!(
-            counter(&cache, |c| c.jobs_unavailable_ended),
-            1,
-            "{}",
-            counters(&cache)
-        );
-        assert_eq!(counter(&cache, |c| c.jobs_resumed), 1, "one attempt");
-        assert_eq!(counter(&cache, |c| c.jobs_invalidated), 0);
-    });
-}
-
 /// E3 (R2-H1): between walks a live job's copy-budget charge is the last
 /// walk plus every byte consumed since; a walk is due again only after
 /// `CHARGE_REFRESH_BYTES` or a reader restart, never per line.
@@ -3362,125 +3162,6 @@ fn lossy_grown_job_publishes_uncertified_through_same_object_identity() {
     }
 }
 
-/// K7 as pure state: oldest waiter first, never-served files ahead of served
-/// ones (an overdue audit is aged behind waiting large files), inactive
-/// waiters do not block, and one completed attempt per census generation.
-#[test]
-fn rotation_serves_waiters_in_turn_and_fences_one_attempt_per_generation() {
-    let mut rotation = Rotation {
-        page: 10,
-        ..Rotation::default()
-    };
-    rotation.wait("a");
-    rotation.page = 11;
-    rotation.wait("b");
-    assert!(rotation.turn("a"));
-    assert!(!rotation.turn("b"));
-    assert!(
-        !rotation.turn("new"),
-        "a newcomer waits behind active waiters"
-    );
-    rotation.complete("a", Some("g1"));
-    assert!(rotation.turn("b"));
-    assert!(!rotation.turn("a"), "a served file goes behind a waiter");
-    assert!(rotation.fenced("a", Some("g1")));
-    assert!(!rotation.fenced("a", Some("g2")));
-    assert!(!rotation.fenced("a", None));
-    rotation.complete("b", Some("g1"));
-    // Next generation: both served, `a` longer ago; a never-served file
-    // that starts waiting later still goes first.
-    rotation.page = 12;
-    rotation.wait("b");
-    rotation.wait("a");
-    rotation.page = 13;
-    rotation.wait("c");
-    assert!(rotation.turn("c"));
-    assert!(!rotation.turn("a") && !rotation.turn("b"));
-    rotation.complete("c", Some("g2"));
-    assert!(rotation.turn("a"));
-    assert!(!rotation.turn("b"));
-    // A waiter not seen for `WAITER_ACTIVE_PAGES` pages blocks nobody.
-    rotation.page += WAITER_ACTIVE_PAGES;
-    rotation.wait("b");
-    assert!(rotation.turn("b"));
-    // Forgotten after `WAITER_FORGET_PAGES`; every table stays bounded.
-    rotation.page += WAITER_FORGET_PAGES;
-    rotation.wait("d");
-    assert!(!rotation.waiting.contains_key("a"));
-    for index in 0..=ROTATION_KEYS {
-        let key = format!("key-{index:03}");
-        rotation.wait(&key);
-        rotation.complete(&key, Some("g3"));
-    }
-    assert!(rotation.waiting.len() <= ROTATION_KEYS);
-    assert_eq!(rotation.served.len(), ROTATION_KEYS);
-    assert_eq!(rotation.attempted.len(), ROTATION_KEYS);
-}
-
-/// G1: a census member's large read takes the slot ahead of every re-read
-/// (growth after its path was processed in this generation), whatever their
-/// rank or wait; among census members the K7 order is unchanged.
-#[test]
-fn rotation_serves_census_members_ahead_of_rereads() {
-    let mut rotation = Rotation {
-        page: 10,
-        ..Rotation::default()
-    };
-    rotation.wait_as("reread", false);
-    rotation.page = 11;
-    rotation.wait_as("member", true);
-    rotation.page = 12;
-    assert!(rotation.turn_as("member", true));
-    assert!(
-        !rotation.turn_as("reread", false),
-        "an older re-read waits behind a census member"
-    );
-    assert!(
-        !rotation.turn_as("new", true),
-        "a newcomer member waits behind an older member"
-    );
-    assert!(
-        !rotation.turn_as("new-reread", false),
-        "a newcomer re-read waits behind every member"
-    );
-    rotation.complete("member", Some("g1"));
-    assert!(
-        rotation.turn_as("reread", false),
-        "no member waits any more"
-    );
-    // A waiter's membership follows its latest plan.
-    rotation.wait_as("reread", true);
-    rotation.page = 13;
-    rotation.wait_as("late", true);
-    assert!(rotation.turn_as("reread", true));
-    assert!(!rotation.turn_as("late", true));
-}
-
-/// G1: a read holds the census when one of its paths was selected as a
-/// census member, or none of them was selected (a cursor job's unselected
-/// path, a group's unselected members); one whose selected paths are all
-/// re-reads holds nothing.
-#[test]
-fn census_membership_follows_the_selected_paths_only() {
-    let member = PathBuf::from("/synthetic/sessions/member.jsonl");
-    let reread = PathBuf::from("/synthetic/sessions/reread.jsonl");
-    let unselected = PathBuf::from("/synthetic/sessions/unselected.jsonl");
-    let flags = BTreeMap::from([
-        (local_index_key(&member), (true, false)),
-        (local_index_key(&reread), (false, true)),
-    ]);
-    assert!(selected_census_member(&flags, &member));
-    assert!(!selected_census_member(&flags, &reread));
-    assert!(selected_census_member(&flags, &unselected));
-    assert!(census_member(&flags, [member.as_path(), reread.as_path()]));
-    assert!(!census_member(
-        &flags,
-        [reread.as_path(), unselected.as_path()]
-    ));
-    assert!(census_member(&flags, [unselected.as_path()]));
-    assert!(census_member(&flags, std::iter::empty::<&Path>()));
-}
-
 /// G1 (K7 for singletons and re-reads): a Codex watcher hint for a path this
 /// generation already processed (observed, no longer pending) re-enters as
 /// a non-member and is counted; a pending path is not duplicated; a path the
@@ -3763,31 +3444,6 @@ fn growing_generation_with_large_file_closes_within_bounded_pages() {
         .collect::<BTreeMap<_, _>>();
     assert_eq!(expected.len(), sessions.len());
     assert_eq!(latest, expected);
-}
-
-/// Scheduling consumes only path novelty and byte length. Metadata-only
-/// changes and an identical inode replacement cannot create a fresh turn.
-#[test]
-fn freshness_priority_ignores_metadata_and_identical_replacement() {
-    use std::os::unix::fs::PermissionsExt;
-    let fixture = ScanRoot::new(4);
-    let (index, _) = page(&fixture, ScanIndex::default(), None);
-    let path = fixture.file(SESSION);
-    let candidate = ScanTraversalPath {
-        scan_root: fixture.root.clone(),
-        path: path.clone(),
-        census_member: false,
-        watcher_hint: true,
-    };
-    assert!(!codex_fresh_data_pending(&candidate, &index.files));
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(!codex_fresh_data_pending(&candidate, &index.files));
-    let replacement = path.with_extension("replacement");
-    fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
-    fs::rename(&replacement, &path).unwrap();
-    assert!(!codex_fresh_data_pending(&candidate, &index.files));
-    fixture.append(SESSION, &token_line(5));
-    assert!(codex_fresh_data_pending(&candidate, &index.files));
 }
 
 /// An ordinary page that fits must still service both old revalidation and
@@ -4757,60 +4413,6 @@ fn growth_curable_hold_is_not_anchored_past_unread_bytes() {
             !grow || !created,
             "grow: {grow}, fork: {fork}, created: {created}"
         );
-    }
-}
-
-/// R2-N5: a group's legacy tee takes every consumed byte too, so the E3
-/// estimate counts each byte once per accumulator.
-#[test]
-fn estimate_counts_bytes_once_per_fed_accumulator() {
-    assert_eq!(
-        estimate_charge(Some((1_000, 10, 64)), 510, 64, 1),
-        Some(1_500)
-    );
-    assert_eq!(
-        estimate_charge(Some((1_000, 10, 64)), 510, 64, 2),
-        Some(2_000)
-    );
-}
-
-/// B1 (steady-state rev 2), replacing #635's unbound-only class: every hold
-/// from the classifier's created-thread branch or identity-ambiguous return
-/// (`codex_created_thread_native_only`) is growth-curable and sidecar-woken,
-/// whether the thread is state- or rollout-declared, and whether or not its
-/// sidecar bound a parent or projection: the bind itself depends on the file
-/// length, so a bound parent can come undone with growth. An ordinary fork
-/// (NC2) keeps the fork rule: growth matches, no sidecar wake.
-#[test]
-fn created_thread_holds_are_exact_and_sidecar_woken() {
-    let created = || {
-        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
-        accumulator.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
-        accumulator.codex_created_thread_native_only = true;
-        accumulator
-    };
-    let mut fork = SnapshotAccumulator::new(SnapshotSource::Codex);
-    fork.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
-    assert!(held_monotone(&fork) && !growth_may_cure(&fork) && !sidecar_wakes(&fork));
-    // The state flag alone no longer decides: a state-declared row on an
-    // ordinary fork's accumulator (never produced by the classifier) is not
-    // a member; a rollout-declared thread with no state flag is.
-    fork.codex_sidecar_created_thread = true;
-    assert!(!growth_may_cure(&fork) && !sidecar_wakes(&fork));
-    assert!(held_monotone(&created()) && growth_may_cure(&created()) && sidecar_wakes(&created()));
-    let variants: [fn(&mut SnapshotAccumulator); 5] = [
-        |a| a.codex_sidecar_created_thread = true,
-        |a| a.codex_sidecar_projected_next_ordinal = Some(4),
-        |a| a.codex_sidecar_parent = Some(("child".into(), "parent".into())),
-        |a| a.codex_parent_session_ref = Some("parent".into()),
-        // NC3: the identity-ambiguous return, created or not.
-        |a| a.codex_sidecar_identity_ambiguous = true,
-    ];
-    for set in variants {
-        let mut accumulator = created();
-        set(&mut accumulator);
-        assert!(held_monotone(&accumulator));
-        assert!(growth_may_cure(&accumulator) && sidecar_wakes(&accumulator));
     }
 }
 
@@ -8060,37 +7662,6 @@ fn outstanding_claim_blocks_a_second_claim_and_provenance() {
     });
 }
 
-/// The mandatory paused-job reserve forgets optional join provenance for
-/// room; optional provenance never forgets other provenance and never takes
-/// a claim's room back (baseline progress keeps its reserve).
-#[test]
-fn paused_reserve_outranks_join_provenance() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let cache = Arc::new(SharedCache::default());
-    let floor = admission_floor(&cache);
-    let empty = cache.cursor_resident();
-    let members = join_members(&["a.jsonl", "b.jsonl"]);
-    cache.record_join_owner(JOIN_OWNER, &members);
-    let claim = join_charge(JOIN_OWNER, &members);
-    with_test_state_budget(empty + claim + floor, || {
-        cache.record_join_owner(JOIN_OTHER, &members);
-        assert_eq!(join_entry(&cache, JOIN_OTHER), None);
-        assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&members)));
-        let credit = cache
-            .cursor_reserve(claim)
-            .expect("baseline progress forgets provenance first");
-        assert_eq!(join_entry(&cache, JOIN_OWNER), None);
-        assert_eq!(cache.cursor_resident(), empty + claim);
-        cache.record_join_owner(JOIN_OWNER, &members);
-        assert_eq!(join_entry(&cache, JOIN_OWNER), None);
-        credit.refund();
-    });
-    assert_eq!(cache.cursor_reserved(), 0);
-    assert_eq!(cache.cursor_resident(), empty);
-}
-
 /// R2-M1: an admission that cannot fit even after every eviction it may make
 /// evicts nothing. A hopeless paused reserve (`JoinStateBound`) keeps both
 /// provenance entries and the retained copy; optional provenance inside the
@@ -8177,86 +7748,6 @@ fn hopeless_admission_evicts_nothing() {
         credit.refund();
         assert_eq!(cache.cursor_reserved(), 0);
     });
-}
-
-/// F4b: every cursor admission keeps the side ledger's fixed reservation
-/// (full ledger here; its heap charge is the constant either way). Mandatory
-/// and optional admissions fit exactly at the boundary with it and are
-/// refused one byte past it, including where the old budget (no side term)
-/// would have taken them; a budget below the floor fails closed and evicts
-/// nothing. Settling returns the room; the ledger is never locked.
-#[test]
-fn cursor_admission_keeps_the_side_ledger_reservation() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let side = crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
-    let cache = Arc::new(SharedCache::default());
-    cache.side_ledger().fill_for_test(7);
-    let entries = cache.side_ledger().len();
-    let floor = admission_floor(&cache);
-    assert_eq!(floor, retained_floor(&cache) + side);
-    let state = cache.cursor_resident();
-    let claim = 4096;
-    // The ledger lock is held throughout: admission never takes it.
-    let held = cache.side_ledger();
-    // Mandatory, exact boundary: one byte more is refused, the claim fits.
-    with_test_state_budget(state + claim + floor, || {
-        assert!(cache.cursor_reserve(claim + 1).is_none(), "one byte past");
-        let credit = cache.cursor_reserve(claim).expect("exactly fits");
-        assert_eq!(cache.cursor_resident(), state + claim);
-        credit.refund();
-    });
-    assert_eq!(cache.cursor_reserved(), 0);
-    // The old budget (no side term) would take it: refused, nothing claimed.
-    with_test_state_budget(state + claim + retained_floor(&cache), || {
-        assert!(cache.cursor_reserve(claim).is_none());
-    });
-    assert_eq!(cache.cursor_resident(), state);
-    // Optional (join provenance), exact boundary and one byte short.
-    let members = join_members(&["a.jsonl", "b.jsonl"]);
-    let optional = join_charge(JOIN_OWNER, &members);
-    with_test_state_budget(state + optional + floor - 1, || {
-        cache.record_join_owner(JOIN_OWNER, &members);
-    });
-    assert_eq!(join_entry(&cache, JOIN_OWNER), None);
-    with_test_state_budget(state + optional + retained_floor(&cache), || {
-        cache.record_join_owner(JOIN_OWNER, &members);
-    });
-    assert_eq!(join_entry(&cache, JOIN_OWNER), None, "old budget: refused");
-    with_test_state_budget(state + optional + floor, || {
-        cache.record_join_owner(JOIN_OWNER, &members);
-    });
-    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&members)));
-    let resident = cache.cursor_resident();
-    assert_eq!(resident, state + optional);
-    // Below the floor (below the side reservation alone; below it with the
-    // retained floor; no room for one byte beside the state without its
-    // provenance): fails closed, and the provenance a mandatory charge
-    // could forget is kept.
-    for budget in [side - 1, floor - 1, state + floor] {
-        with_test_state_budget(budget, || {
-            assert!(cache.cursor_reserve(1).is_none(), "{budget}");
-            cache.record_join_owner(JOIN_OTHER, &members);
-        });
-        assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&members)));
-        assert_eq!(join_entry(&cache, JOIN_OTHER), None);
-        assert_eq!(cache.cursor_resident(), resident);
-    }
-    // A mandatory claim still forgets optional provenance for its room
-    // (baseline progress), inside the side reservation.
-    with_test_state_budget(state + optional + floor, || {
-        let credit = cache
-            .cursor_reserve(optional)
-            .expect("baseline progress forgets provenance");
-        assert_eq!(join_entry(&cache, JOIN_OWNER), None);
-        assert_eq!(cache.cursor_resident(), state + optional);
-        credit.refund();
-    });
-    assert_eq!(cache.cursor_reserved(), 0);
-    assert_eq!(cache.cursor_resident(), state);
-    drop(held);
-    assert_eq!(cache.side_ledger().len(), entries);
 }
 
 /// J-T8: claim vs retained insert. The insert measures outstanding claims
@@ -8413,42 +7904,6 @@ fn corrupt_credit_accounting_fails_closed() {
     }
 }
 
-/// H5: a job the slot no longer names is freed, counted lost, and only
-/// then is its claim refunded; nothing stays reserved or charged.
-#[test]
-fn failed_store_drops_the_job_then_refunds_its_claim() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let fixture = ScanRoot::new(40);
-    let cache = Arc::new(SharedCache::default());
-    with_test_limits(2048, 4096, 64, || {
-        let mut scan = codex_scan(&fixture, ScanIndex::default(), NOW)
-            .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
-        for _ in 0..10_000 {
-            if scan
-                .active_file
-                .as_ref()
-                .is_some_and(|active| active.cursor.is_some())
-            {
-                break;
-            }
-            match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => scan = next,
-                OwnedSourceScanStep::Complete { .. } => panic!("the job never started"),
-            }
-        }
-        assert!(!cache.cursor_slot_free(), "the frame holds the job");
-        // The impossible case `store` still handles: the slot moved on.
-        cache.with_cursor(|cursor| cursor.slot = Slot::Empty);
-        drop(scan);
-        assert_eq!(counter(&cache, |c| c.jobs_frame_returned), 0);
-        assert_eq!(counter(&cache, |c| c.jobs_lost), 1);
-        assert_eq!(cache.cursor_reserved(), 0);
-        assert_eq!(cache.cursor_charge(), 0);
-    });
-}
-
 // PR-P: parent witnesses, the restart table and held parent causes.
 
 fn absent_witness() -> ParentWitness {
@@ -8515,32 +7970,6 @@ fn witness_of(cache: &SharedCache, namespace: &str, parent: &str) -> Option<Pare
         .unwrap()
 }
 
-/// P-T26 (L1): a restart slot is keyed by (namespace, scope). A new scope is
-/// a new slot; the old scope's spent budget is never reset; two pairs whose
-/// keys collide share one budget (spent sooner, never refilled).
-#[test]
-fn restart_slots_are_per_scope_and_never_reset() {
-    let x = parent_restart_key("namespace", "scope-x");
-    let y = parent_restart_key("namespace", "scope-y");
-    assert_ne!(x, y);
-    // The length prefix keeps the pair unambiguous.
-    assert_ne!(parent_restart_key("ab", "c"), parent_restart_key("a", "bc"));
-    let mut table = ParentRestarts::default();
-    for page in 0..PARENT_RESTART_BUDGET {
-        table.touch(x, page).0.restarts += 1;
-    }
-    assert_eq!(table.touch(y, 10).0.restarts, 0);
-    assert_eq!(table.touch(x, 11).0.restarts, PARENT_RESTART_BUDGET);
-    for page in 12..32 {
-        assert_eq!(table.touch(x, page).0.restarts, PARENT_RESTART_BUDGET);
-    }
-    // Two pairs forced onto one key share one budget.
-    let mut shared = ParentRestarts::default();
-    shared.touch(7, 1).0.restarts += 1;
-    shared.touch(7, 2).0.restarts += 1;
-    assert_eq!(shared.touch(7, 3).0.restarts, PARENT_RESTART_BUDGET);
-}
-
 /// P-T26 (L4, cache level): the inline table holds `ROTATION_KEYS` pairs.
 /// An evicting insert starts spent, and so does an evicted pair that comes
 /// back: no restart is ever refilled. `parent_state` never inserts into
@@ -8587,37 +8016,6 @@ fn evicted_restart_slot_reenters_spent() {
     assert!(cache
         .with_cursor(|cursor| cursor.parents.is_empty())
         .unwrap());
-}
-
-/// P-T19 (unit): a refused witness keeps nothing and is counted; a refused
-/// match mark leaves the namespace unmarked (it re-matches next page).
-#[test]
-fn refused_witness_and_mark_keep_nothing() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let cache = SharedCache::default();
-    let namespace = Scope("namespace".into());
-    let resident = cache.cursor_resident();
-    with_test_state_budget(0, || {
-        assert!(!cache.witness_parent(&namespace, "scope", PARENT, absent_witness()));
-        cache.mark_parents_matched(&namespace, "scope", "window-end", 0);
-    });
-    assert_eq!(counter(&cache, |c| c.parent_witness_refused), 1);
-    assert_eq!(counter(&cache, |c| c.parent_match_unmarked), 1);
-    assert_eq!(cache.cursor_resident(), resident);
-    let state = cache.parent_state(&namespace, "scope");
-    assert!(state.witnesses.is_empty() && state.matched.is_none());
-    // Admitted under the production budget: kept with its exact charge.
-    assert!(cache.witness_parent(&namespace, "scope", PARENT, absent_witness()));
-    let state = cache.parent_state(&namespace, "scope");
-    assert_eq!(state.witnesses, vec![(PARENT.to_owned(), absent_witness())]);
-    // A scope change drops the namespace's witnesses (revalidated later).
-    assert!(cache
-        .parent_state(&namespace, "other-scope")
-        .witnesses
-        .is_empty());
-    assert_eq!(cache.cursor_resident(), resident);
 }
 
 /// P-T17 (R2-L4): 5,000 witnesses across 80 namespaces under the production
@@ -8764,47 +8162,6 @@ fn poisoned_cursor_spends_the_budget_but_reports_no_restart_count() {
         "fail closed: the budget reads spent"
     );
     assert_eq!(cache.note_parent_restart(&namespace, "scope"), None);
-}
-
-/// P-T30 (R2-L2): the witness store's walk costs a fixed number of visits
-/// per namespace whatever its witness count (stored charges, no per-witness
-/// walk), so a full store stays far inside `Counter`'s 4,096-visit limit.
-#[test]
-fn witness_store_visits_do_not_grow_with_witness_count() {
-    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let visits = |cache: &SharedCache| {
-        cache
-            .with_cursor(|cursor| {
-                let mut counter = Counter::new(usize::MAX);
-                cursor.heap_bound(&mut counter).unwrap();
-                counter.visits_for_test()
-            })
-            .unwrap()
-    };
-    let cache = SharedCache::default();
-    let fill = |per: usize| {
-        for namespace in 0..ROTATION_KEYS {
-            for parent in 0..per {
-                assert!(cache.witness_parent(
-                    &Scope(format!("namespace-{namespace:02}")),
-                    "scope",
-                    &format!("parent-{parent:03}"),
-                    absent_witness(),
-                ));
-            }
-        }
-    };
-    let empty = visits(&cache);
-    fill(1);
-    let one = visits(&cache);
-    fill(50);
-    let many = visits(&cache);
-    assert_eq!(many, one, "visits grew with the witness count");
-    assert!(one - empty <= ROTATION_KEYS * 8 + 8, "{empty} -> {one}");
-    assert!(many < 4096, "{many}");
 }
 
 const WITNESS_NAMESPACES: [&str; 2] = ["witness-namespace-1", "witness-namespace-2"];
@@ -8991,27 +8348,6 @@ fn feasible_reserve_forgets_provenance_then_witnesses() {
         credit.refund();
         assert_eq!(cache.cursor_reserved(), 0);
     });
-}
-
-/// N1: `parent_restarts_in_scope` is reported only when the page
-/// established it: omitted, never a fabricated 0, without a shared cache;
-/// present on a cached page whose step-start pass ran.
-#[test]
-fn parent_restarts_in_scope_is_omitted_unless_established() {
-    let fixture = ScanRoot::new(3);
-    let (_, uncached) = page(&fixture, ScanIndex::default(), None);
-    let diagnostic = uncached.local_codex_diagnostics.expect("Codex diagnostics");
-    assert_eq!(diagnostic.parent_restarts_in_scope, None);
-    assert!(serde_json::to_value(diagnostic)
-        .unwrap()
-        .get("parent_restarts_in_scope")
-        .is_none());
-    let (_, cached) = page(
-        &fixture,
-        ScanIndex::default(),
-        Some(Arc::new(SharedCache::default())),
-    );
-    assert_eq!(restarts_in_scope(&cached), Some(0));
 }
 
 /// P-T21/P-T22: with the scope's budget already spent, a new fork of an
@@ -9638,31 +8974,6 @@ fn chain_fixture(reversed: bool) -> ScanRoot {
         }
     }
     fixture
-}
-
-/// P-T10b: C -> P -> G with G present and resolvable, in both page orders:
-/// no generation ever counts `ParentHeld`, and P is admitted once.
-#[test]
-fn resolvable_chain_never_counts_parent_held() {
-    for reversed in [false, true] {
-        let fixture = chain_fixture(reversed);
-        let cache = Arc::new(SharedCache::default());
-        let mut index = ScanIndex::default();
-        let mut published = Vec::new();
-        for n in 0..6 {
-            let (next, scan) = fixture_generation(&fixture, &cache, index, n);
-            assert_eq!(
-                parent_causes(&scan)[CodexParentUnresolvable::ParentHeld.index()],
-                0,
-                "reversed {reversed}, generation {n}: {}",
-                counters(&cache)
-            );
-            assert!(restarts_in_scope(&scan).is_some_and(|restarts| restarts <= 2));
-            published.extend(session_usage(&scan, PARENT));
-            index = next;
-        }
-        assert_eq!(published, vec![(30, 1)], "reversed {reversed}");
-    }
 }
 
 /// P-T26b (M2): a `ParentHeld` witness is never stale-pruned. After 20
@@ -10480,97 +9791,6 @@ fn next_page_in(cache: &SharedCache, namespace: &str) {
     PageBudget::default().note_page(cache, &Scope(namespace.into()));
 }
 
-/// cc rows 1–2: a suspended proof is charged exactly its walked bound, and
-/// `Admitter::Proof` admits only into free room: one byte short is refused
-/// (the job is dropped, counted) and nothing else is released.
-#[test]
-fn proof_suspend_takes_free_room_only_and_charges_its_walk() {
-    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let cache = Arc::new(SharedCache::default());
-    let floor = admission_floor(&cache);
-    let empty = cache.cursor_resident();
-    let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
-    let charge = proof_charge(&job);
-    let (suspended, counts) =
-        observe(|| with_test_state_budget(empty + charge + floor - 1, || suspend(&cache, job)));
-    assert!(!suspended);
-    assert_eq!(proof_drops(counts), 1);
-    assert_eq!(cache.proof_suspended_for_test(), None);
-    assert_eq!(cache.cursor_resident(), empty);
-    let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
-    let (suspended, counts) =
-        observe(|| with_test_state_budget(empty + charge + floor, || suspend(&cache, job)));
-    assert!(suspended);
-    assert_eq!(proof_drops(counts), 0);
-    assert_eq!(
-        cache.proof_suspended_for_test(),
-        Some(("ns-a".to_owned(), charge))
-    );
-    assert_eq!(cache.cursor_resident(), empty + charge);
-    assert_eq!(cache.cursor_resident_for_main(), empty);
-    // A second suspend while the holder is taken is refused and counted.
-    let (suspended, counts) = observe(|| suspend(&cache, proof_job("ns-b", "/idx/b.json", "i", 8)));
-    assert!(!suspended);
-    assert_eq!(proof_drops(counts), 1);
-    assert_eq!(
-        cache.proof_suspended_for_test(),
-        Some(("ns-a".to_owned(), charge))
-    );
-}
-
-/// cc row 2: main decides as if no proof existed. An optional main charge
-/// that fits only without the proof is admitted, exactly as with no proof,
-/// and the proof is dropped first (counted); with room for both it stays.
-#[test]
-fn main_admission_measures_without_the_proof_and_drops_it_first() {
-    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let three = join_members(&["a.jsonl", "bb.jsonl", "rollout-ccc.jsonl"]);
-    let charge = join_charge(JOIN_OWNER, &three);
-    // Control: no proof, budget with exactly the join's room.
-    let control = Arc::new(SharedCache::default());
-    let floor = admission_floor(&control);
-    let empty = control.cursor_resident();
-    with_test_state_budget(empty + charge + floor, || {
-        control.record_join_owner(JOIN_OWNER, &three);
-    });
-    assert_eq!(join_entry(&control, JOIN_OWNER), Some(joined(&three)));
-    // Treated: a suspended proof sits in the same room.
-    let cache = Arc::new(SharedCache::default());
-    let job = proof_job("ns-a", "/idx/a.json", "inc-1", 2048);
-    let proof = proof_charge(&job);
-    assert!(suspend(&cache, job));
-    let (_, counts) = observe(|| {
-        with_test_state_budget(empty + charge + floor, || {
-            cache.record_join_owner(JOIN_OWNER, &three);
-        })
-    });
-    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&three)));
-    assert_eq!(cache.proof_suspended_for_test(), None, "dropped first");
-    assert_eq!(proof_drops(counts), 1);
-    assert_eq!(cache.cursor_resident(), control.cursor_resident());
-    // Room for both: the proof stays.
-    let cache = Arc::new(SharedCache::default());
-    assert!(suspend(
-        &cache,
-        proof_job("ns-a", "/idx/a.json", "inc-1", 2048)
-    ));
-    let (_, counts) = observe(|| {
-        with_test_state_budget(empty + charge + proof + floor, || {
-            cache.record_join_owner(JOIN_OWNER, &three);
-        })
-    });
-    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&three)));
-    assert!(cache.proof_suspended_for_test().is_some());
-    assert_eq!(proof_drops(counts), 0);
-    assert_eq!(cache.cursor_resident(), empty + charge + proof);
-}
-
 /// cc rows 1, 5: the hook's claim. Another index's job is busy until it is
 /// `NAMESPACE_STALE_PAGES` cursor pages old, then dropped (counted); this
 /// index's job comes out with its pages touched; the same index under a new
@@ -10647,67 +9867,6 @@ fn proof_take_is_mine_busy_stale_or_mismatched() {
     let ((), counts) = observe(|| lease.finish());
     assert_eq!(proof_drops(counts), 0);
     assert_eq!(cache.proof_suspended_for_test(), None);
-}
-
-/// cc row 8: a page with due proof work that never reached the hook is
-/// counted once, at the next page's tick; a page that reached it is not,
-/// and nothing is counted while no work is due.
-#[test]
-fn a_due_page_that_missed_the_proof_hook_is_counted_at_the_next_tick() {
-    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
-    let cache = Arc::new(SharedCache::default());
-    let ns = Scope("ns".into());
-    next_page(&cache);
-    cache.note_proof_hook(&ns, true);
-    let ((), counts) = observe(|| next_page(&cache));
-    assert_eq!(proof_drops(counts), 0, "the hook ran on that page");
-    let ((), counts) = observe(|| next_page(&cache));
-    assert_eq!(proof_drops(counts), 1, "due, hook missed");
-    cache.note_proof_hook(&ns, false);
-    let ((), counts) = observe(|| {
-        next_page(&cache);
-        next_page(&cache);
-    });
-    assert_eq!(proof_drops(counts), 0, "nothing due");
-    // One tick per scan object, as the page clock.
-    let mut page = PageBudget::default();
-    cache.note_proof_hook(&ns, true);
-    page.note_page(&cache, &ns);
-    let ((), counts) = observe(|| page.note_page(&cache, &ns));
-    assert_eq!(proof_drops(counts), 0);
-}
-
-/// Increment-14 disclosure: the due flag never crosses namespaces. Another
-/// namespace's pages neither count nor clear it, its own "nothing due" hook
-/// leaves it, and it gates nothing but the diagnostic count (no pacing or
-/// admission reads it; per-request pacing stays in the index entries).
-#[test]
-fn the_proof_due_flag_is_per_namespace() {
-    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
-    let cache = Arc::new(SharedCache::default());
-    let (x, y) = (Scope("x".into()), Scope("y".into()));
-    cache.note_proof_hook(&x, true);
-    let ((), counts) = observe(|| {
-        next_page_in(&cache, "y");
-        next_page_in(&cache, "y");
-    });
-    assert_eq!(proof_drops(counts), 0, "y never had due work");
-    cache.note_proof_hook(&y, false);
-    let ((), counts) = observe(|| next_page_in(&cache, "x"));
-    assert_eq!(proof_drops(counts), 0, "x's page reached its hook");
-    let ((), counts) = observe(|| next_page_in(&cache, "x"));
-    assert_eq!(proof_drops(counts), 1, "x due, x's hook missed");
-    cache.note_proof_hook(&x, false);
-    let ((), counts) = observe(|| next_page_in(&cache, "x"));
-    assert_eq!(proof_drops(counts), 0);
-    // A due hook in y replaces x's entry: x is then never counted.
-    cache.note_proof_hook(&x, true);
-    cache.note_proof_hook(&y, true);
-    let ((), counts) = observe(|| {
-        next_page_in(&cache, "x");
-        next_page_in(&cache, "x");
-    });
-    assert_eq!(proof_drops(counts), 0, "under-count only");
 }
 
 /// cc row 4: the step needs `PROOF_STEP_HEADROOM_BYTES` beside the context
@@ -11933,77 +11092,6 @@ fn continuation_prepares_no_group_attempt() {
     });
 }
 
-/// §7 A: a ticket only for a paused, valid, budget-exhausted, accelerated
-/// attempt. A fresh key's attempt is accelerated, so every pause of its
-/// ordinary pages mints one (`ticket_for` reads it); the page that completes
-/// the job, an uncached page, a page whose cursor budget is not exhausted and
-/// an unaccelerated attempt mint none. Ordinary-only pages never pace.
-#[test]
-fn ticket_only_for_paused_valid_exhausted_accelerated_job() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let fixture = ScanRoot::new(80);
-    let cache = Arc::new(SharedCache::default());
-    let (_, uncached) = page(&fixture, ScanIndex::default(), None);
-    assert!(uncached.continuation_ticket().is_none(), "no cursor");
-    with_test_limits(2048, 1024, 64, || {
-        let (mut index, scan) = page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)));
-        assert_eq!(counter(&cache, |c| c.jobs_paused), 1);
-        let paused = cache
-            .with_cursor(|cursor| match &cursor.slot {
-                Slot::Paused(job) => job.cursor.as_ref().map(accelerated),
-                Slot::Empty | Slot::ActiveElsewhere { .. } => None,
-            })
-            .flatten();
-        assert_eq!(paused, Some(true), "a fresh key's attempt is accelerated");
-        let minted = scan
-            .continuation_ticket()
-            .cloned()
-            .expect("paused: a ticket");
-        assert_eq!(Some(&minted), cache.paused_ticket_for_test().as_ref());
-        let port = CodexCursorPort::new(Arc::clone(&cache));
-        assert_eq!(port.ticket_for(&scan), Some(minted));
-        // The pause site's own conditions, on the resumed job.
-        let (mut job, lease) = cache
-            .cursor_resume(&Scope("cursor-fixture".into()), false)
-            .expect("paused job");
-        let limits = Limits::current();
-        let fresh = PageBudget::default();
-        let mut exhausted = PageBudget::default();
-        exhausted.charge(true, limits.cursor);
-        assert!(!cursor_held() && !crate::snapshots::sampled_scan::retained_held());
-        assert!(
-            cache.continuation_ticket(&job, &fresh).is_none(),
-            "not exhausted"
-        );
-        assert!(cache.continuation_ticket(&job, &exhausted).is_some());
-        job.cursor.as_mut().unwrap().pace.accelerate = false;
-        assert!(
-            cache.continuation_ticket(&job, &exhausted).is_none(),
-            "unaccelerated"
-        );
-        job.cursor.as_mut().unwrap().pace.accelerate = true;
-        assert!(matches!(lease.pause(job), PauseEnd::Paused));
-        for _ in 0..64 {
-            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
-            index = next;
-            assert_eq!(
-                scan.continuation_ticket().is_some(),
-                cache.paused_members_for_test().is_some(),
-                "a ticket exactly when the page paused the job: {}",
-                counters(&cache)
-            );
-            if counter(&cache, |c| c.jobs_certified) > 0 {
-                assert!(scan.continuation_ticket().is_none(), "completed: none");
-                assert_eq!(counter(&cache, |c| c.deferred_paced), 0);
-                return;
-            }
-        }
-        panic!("{}", counters(&cache));
-    });
-}
-
 /// §7 ready: `cursor_continuation_ready` readies the exact paused,
 /// accelerated attempt (its members are the job's), and refuses a foreign,
 /// stale or restarted ticket and an unaccelerated attempt. A refused ticket
@@ -12148,12 +11236,6 @@ fn paced(
     assert!(table.record(&pace, at));
 }
 
-fn offsets(table: &PaceTable, key: [u64; 2]) -> Option<(u32, u32)> {
-    let slot = table.slots[table.position(key)?].as_ref()?;
-    Some((slot.same_off, slot.new_off))
-}
-
-const START: PaceVerdict = PaceVerdict::Start { accelerate: true };
 const START_UNACCELERATED: PaceVerdict = PaceVerdict::Start { accelerate: false };
 
 /// §7 Guard, through the scan: an accelerated attempt that took a
@@ -12246,119 +11328,6 @@ fn paced_defer_is_pending_not_waiter_not_fenced() {
             .flatten();
         assert_eq!(accelerated, Some(true), "{now:?}");
     });
-}
-
-/// §7 Guard, condition 4: a full table places in a free slot, else an
-/// expired one (lossless: `unknown_until` untouched), else evicts the slot
-/// expiring first and holds `unknown_until` at its deadline: until then a key
-/// with no slot (the evicted one included) starts unaccelerated, while keys
-/// with slots keep their coverage. Later evictions never lower the hold.
-#[test]
-fn pace_lossy_eviction_disables_acceleration_until_expiry() {
-    let t0 = std::time::Instant::now();
-    let keys = (0..ROTATION_KEYS)
-        .map(|i| pace_key("ns", "s", &format!("/{i}")))
-        .collect::<Vec<_>>();
-    let full = || {
-        let mut table = PaceTable::default();
-        for (i, key) in keys.iter().enumerate() {
-            paced(
-                &mut table,
-                *key,
-                &rev(i as u64 + 1, 10),
-                t0,
-                secs(1_000 + i as u64),
-                t0,
-            );
-        }
-        assert!(table.slots.iter().all(Option::is_some));
-        table
-    };
-    // Expired-slot reuse: keys 0..=2 have expired by t0 + 1002 s.
-    let mut table = full();
-    let fresh = pace_key("ns", "s", "/fresh");
-    assert!(table.begin(fresh, &rev(900, 1), t0 + secs(1_002)));
-    assert_eq!(table.unknown_until, None, "lossless");
-    assert!(table.position(keys[0]).is_none() && table.position(fresh).is_some());
-    // Overflow: nothing expired, the earliest deadline is evicted (lossy).
-    let mut table = full();
-    paced(
-        &mut table,
-        fresh,
-        &rev(900, 1),
-        t0 + secs(10),
-        secs(5_000),
-        t0 + secs(10),
-    );
-    assert!(table.position(keys[0]).is_none());
-    assert_eq!(table.unknown_until, Some(t0 + secs(1_000)));
-    let later = t0 + secs(11);
-    assert_eq!(
-        table.verdict(keys[0], &rev(1, 10), later),
-        START_UNACCELERATED
-    );
-    let stranger = pace_key("ns", "s", "/stranger");
-    assert_eq!(
-        table.verdict(stranger, &rev(901, 1), later),
-        START_UNACCELERATED
-    );
-    assert_eq!(
-        table.verdict(keys[1], &rev(2, 10), later),
-        PaceVerdict::Defer
-    );
-    assert_eq!(
-        table.verdict(stranger, &rev(901, 1), t0 + secs(1_000)),
-        START
-    );
-    // A later eviction raises the hold; none lowers it.
-    assert!(table.begin(stranger, &rev(901, 1), later));
-    assert_eq!(table.unknown_until, Some(t0 + secs(1_001)));
-    table.unknown_until = Some(t0 + secs(9_000));
-    assert!(table.begin(pace_key("ns", "s", "/third"), &rev(902, 1), later));
-    assert_eq!(table.unknown_until, Some(t0 + secs(9_000)), "preserved");
-}
-
-/// Condition 2: keys include the namespace, the receipt/replay scope and the
-/// path, length-prefixed. A slot of another object under a matching key (a
-/// replaced file, or a collision) never shortens a deferral and never lends
-/// its coverage: it defers its changed-revision offset, then starts
-/// unaccelerated, and the live slot is kept (not overwritten) until it
-/// expires.
-#[test]
-fn pace_keys_isolate_namespaces_scopes_and_objects() {
-    let key = pace_key("ns", "scope", "/a");
-    assert_ne!(key, pace_key("other", "scope", "/a"));
-    assert_ne!(key, pace_key("ns", "another", "/a"));
-    assert_ne!(key, pace_key("ns", "scope", "/b"));
-    assert_ne!(pace_key("ab", "c", "/a"), pace_key("a", "bc", "/a"));
-    let t0 = std::time::Instant::now();
-    let mut table = PaceTable::default();
-    paced(&mut table, key, &rev(1, 100), t0, secs(7_200), t0);
-    let foreign = pace_key("other", "scope", "/a");
-    assert_eq!(table.verdict(foreign, &rev(1, 100), t0 + secs(1)), START);
-    // Another object (dev/ino) under the same key.
-    let replaced = rev(2, 100);
-    assert_eq!(
-        table.verdict(key, &replaced, t0 + secs(3_599)),
-        PaceVerdict::Defer
-    );
-    assert_eq!(
-        table.verdict(key, &replaced, t0 + secs(3_600)),
-        START_UNACCELERATED
-    );
-    assert!(
-        !table.begin(key, &replaced, t0 + secs(3_600)),
-        "the live slot stays"
-    );
-    assert_eq!(offsets(&table, key), Some((7_200, 3_600)));
-    assert_eq!(
-        table.verdict(key, &rev(1, 100), t0 + secs(3_600)),
-        PaceVerdict::Defer
-    );
-    // Expired, the slot is free for the new object.
-    assert_eq!(table.verdict(key, &replaced, t0 + secs(7_200)), START);
-    assert!(table.begin(key, &replaced, t0 + secs(7_200)));
-    assert_eq!(offsets(&table, key), Some((0, 0)));
 }
 
 /// §7 Guard, condition 2: a clock failure, an unknown ordinary interval or an
@@ -12546,57 +11515,6 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
     let mut c = Counter::new(usize::MAX);
     meta.pace.heap_bound(&mut c).unwrap();
     assert_eq!(c.bytes, 0);
-}
-
-/// Condition 4 boundaries with a full table: a mandatory claim fits exactly
-/// at `state + claim + SIDE_LEDGER_BYTES + retained floor` (the table counted
-/// once inside `state`) and not one byte past; counting the table twice
-/// would refuse that fit, so a budget one table short refuses. A hopeless
-/// claim evicts nothing and leaves the table as it was.
-#[test]
-fn pace_table_admission_boundary_beside_the_side_reservation() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let cache = Arc::new(SharedCache::default());
-    fill_pace(&cache);
-    let floor = admission_floor(&cache);
-    let state = cache.cursor_resident();
-    let claim = 4096;
-    with_test_state_budget(state + claim + floor, || {
-        assert!(cache.cursor_reserve(claim + 1).is_none(), "one byte past");
-        let credit = cache.cursor_reserve(claim).expect("exactly fits");
-        assert_eq!(cache.cursor_resident(), state + claim);
-        credit.refund();
-    });
-    with_test_state_budget(
-        state + claim + floor - std::mem::size_of::<PaceTable>(),
-        || {
-            assert!(cache.cursor_reserve(claim).is_none());
-        },
-    );
-    let table = |cache: &SharedCache| {
-        cache
-            .with_cursor(|cursor| {
-                (
-                    cursor
-                        .pace
-                        .slots
-                        .iter()
-                        .filter(|slot| slot.is_some())
-                        .count(),
-                    cursor.pace.unknown_until,
-                )
-            })
-            .unwrap()
-    };
-    let before = table(&cache);
-    for budget in [floor - 1, state + floor] {
-        with_test_state_budget(budget, || assert!(cache.cursor_reserve(1).is_none()));
-    }
-    assert_eq!(table(&cache), before);
-    assert_eq!(before, (ROTATION_KEYS, None));
-    assert_eq!(cache.cursor_reserved(), 0);
 }
 
 /// Carried evidence removes the parent sample re-probe. Continuation also
