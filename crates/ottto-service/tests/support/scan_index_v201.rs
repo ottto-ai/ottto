@@ -122,9 +122,15 @@ fn assert_integrated_decision(source: &str, frozen: &str) {
         assert!(source.contains("if !self.persistence_map && !seen.contains(\"files\")"));
         assert!(source.contains("return Err(Error::Refused(\"missing files\"));"));
     } else if frozen.contains("if !path.exists()") {
-        assert!(source.contains(
-            "scan_index_integration::check_missing(path, scan_index_source_label(source))?;"
-        ));
+        // Missing-root checks now receive support_dir so published v2 custody
+        // is checked under the same lock even when the feature switch is OFF.
+        assert!(source.contains(concat!(
+            "scan_index_integration::check_missing(\n",
+            "                path,\n",
+            "                scan_index_source_label(source),\n",
+            "                support_dir,\n",
+            "            )?;"
+        )));
         assert!(source.contains("let persistence_root ="));
         assert!(source.contains("persistence_root,"));
         assert!(source.contains("LoadOrigin::Missing,"));

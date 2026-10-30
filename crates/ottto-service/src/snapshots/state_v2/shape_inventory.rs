@@ -4,6 +4,14 @@ use super::Rule;
 
 pub(super) fn named(name: &str) -> Option<Rule> {
     Some(match name {
+        "AppliedTierReceipt" => Rule::Struct(&[
+            ("version", "u16"),
+            ("derivation", "String"),
+            ("scope", "String"),
+            ("records", "usize"),
+            ("prefix_digest", "String"),
+            ("tiers", "BTreeMap<String,String>"),
+        ]),
         "BirthStore"
         | "PathBuf"
         | "SnapshotQuarantineDisposition"

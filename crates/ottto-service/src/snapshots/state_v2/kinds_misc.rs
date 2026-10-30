@@ -1621,7 +1621,8 @@ mod tests {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir(&path).unwrap();
-            let mut db = sqlite::Sqlite::create_import(&path.join("fixture.import")).unwrap();
+            let mut db =
+                sqlite::Sqlite::create_import(&path.join("fixture.v2.sqlite.import")).unwrap();
             let identity = Identity {
                 format: FORMAT,
                 db_id: "synthetic-misc".into(),

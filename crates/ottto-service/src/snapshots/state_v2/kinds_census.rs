@@ -874,7 +874,8 @@ mod tests {
             Self(dir)
         }
         fn store(&self) -> sqlite::Sqlite {
-            let mut db = sqlite::Sqlite::create_import(&self.0.join("index.import")).unwrap();
+            let mut db =
+                sqlite::Sqlite::create_import(&self.0.join("index.v2.sqlite.import")).unwrap();
             db.path_extractor(private_paths);
             db.reference_extractor(references);
             db.control(
