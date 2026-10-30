@@ -1306,7 +1306,6 @@ fn terminal_off_on_twins(reverse: bool) {
         assert_eq!(first.scan.snapshots.len(), 1);
         let expected = canonical(&first.scan.snapshots);
         first.finish();
-        first.accept();
         let prior = c.reload(&mut first.index);
         let repeated = ready(&c, &scanner, prior, 100, false);
         assert_eq!(
@@ -3583,6 +3582,9 @@ fn terminal_off_on_e2_pipeline_inplace_rewritten_original_cannot_remove_its_twin
 /// and H1+H2, every line pre-birth: the union counts, H1 once, H2 once, on
 /// the first page in either discovery order and through settlement.
 fn overlapping_restored(reverse: bool) {
+    if crate::snapshots::ClaudeTerminalOffForTest::active() {
+        return terminal_off_on_overlapping_restored(reverse);
+    }
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-overlap-restored-{reverse}"));
         let (a, b) = if reverse {
@@ -3618,6 +3620,53 @@ fn overlapping_restored(reverse: bool) {
         let again = ready(&c, &E2ScanFixture::default(), prior, 100, false);
         literal(&again);
         assert_eq!(total(&again), 2, "settled and re-read: unchanged");
+    });
+}
+
+fn terminal_off_on_overlapping_restored(reverse: bool) {
+    with_e2(|| {
+        let mut c = Corpus::new(&format!("e2-pipeline-overlap-restored-{reverse}"));
+        let (a, b) = if reverse {
+            ("z-original", "a-copy")
+        } else {
+            ("a-original", "z-copy")
+        };
+        c.write_at(
+            &format!("{a}/{ROOT}.jsonl"),
+            &line(ROOT, "h1", AT, 10),
+            "2026-08-02T07:02:00Z",
+        );
+        let twin = c.write_at(
+            &format!("{b}/{ROOT}.jsonl"),
+            &(line(ROOT, "h1", AT, 10) + &line(ROOT, "h2", "2026-08-02T07:00:20Z", 20)),
+            "2026-08-02T07:03:00Z",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let old = ScanIndex::default();
+        let first = ready(&c, &scanner, old.clone(), 100, false);
+        let opened = scanner.paths();
+        assert_eq!(opened.len(), 2);
+        assert!(
+            opened[0].ends_with(format!("{}/{ROOT}.jsonl", if reverse { b } else { a })),
+            "actual discovery order"
+        );
+        literal(&first);
+        assert_eq!(total(&first), 2, "the union of both histories, once");
+        assert_eq!(first.scan.snapshots[0].input_tokens, 30);
+        assert_eq!(first.scan.snapshots[0].removed_request_count, Some(1));
+        let prior = settle(&c, &old, first, &mut progress);
+        let stored = stored_bodies(&prior);
+        let mut again = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        assert!(again.scan.snapshots.is_empty());
+        assert_eq!(again.scan.scanned_file_count, 0);
+        again.finish();
+        assert_eq!(stored_bodies(&again.index), stored);
+        append(&twin, &line(ROOT, "h3", "2026-08-02T07:04:00Z", 30));
+        let prior = c.reload(&mut again.index);
+        let changed = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        literal(&changed);
+        assert_eq!(total(&changed), 3, "the union plus the new request, once");
     });
 }
 #[test]
@@ -5334,6 +5383,9 @@ fn terminal_off_on_settle_captured_holds(
 /// A census deadline withholds a NEW copy. Every walk re-decides the hold;
 /// a healthy external census releases it without any transcript change.
 fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss: u8) {
+    if crate::snapshots::ClaudeTerminalOffForTest::active() {
+        return terminal_off_on_withheld_new_file_retries_from_retained_read(grow, sampled, loss);
+    }
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-held-new-tail-{grow}-{sampled}-{loss}"));
         c.root(ROOT, &line(ROOT, "root", AT, 10));
@@ -5411,6 +5463,126 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
         // Today's settlement omits this NEW held key. Keep its other census
         // evidence, and compare the resulting published body byte for byte.
         let full = ready(&c, &E2ScanFixture::default(), full_prior, 100, false);
+        assert_eq!(
+            canonical(&request(&restored.scan.snapshots)),
+            canonical(&request(&full.scan.snapshots))
+        );
+        let copy = body(&restored, COPY).expect("external evidence releases the copy");
+        assert_eq!(copy.removed_request_count, Some(1));
+        assert_eq!(copy.request_count, u64::from(grow));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before.len());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+        // Check the two rejected placeholder authority paths using the real
+        // held settlement; modes/body checks above finish before disappearance.
+        std::fs::remove_file(&path).unwrap();
+        e2::pipeline_test_observer::assert_held_new_file_has_no_money_authority(&prior, &path);
+        let settled = settle_captured_holds(&c, &prior, restored, &mut progress);
+        assert_eq!(
+            progress.accepted_fingerprints.len(),
+            accepted_before.len() + 1
+        );
+        assert_eq!(
+            settled.current_snapshot_fingerprints().len(),
+            accepted_before.len() + 1
+        );
+    });
+}
+
+fn terminal_off_on_withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss: u8) {
+    with_e2(|| {
+        assert!(crate::snapshots::claude_terminal_off());
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let mut c = Corpus::new(&format!("e2-held-new-tail-{grow}-{sampled}-{loss}"));
+        c.root(ROOT, &line(ROOT, "root", AT, 10));
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let empty = ScanIndex::default();
+        let original = ready(&c, &scanner, empty.clone(), 100, sampled);
+        let prior = settle_captured_holds(&c, &empty, original, &mut progress);
+        // Consume the existing one-time identity-contract re-arm.
+        let warm = ready(&c, &scanner, prior.clone(), 100, sampled);
+        let prior = settle_captured_holds(&c, &prior, warm, &mut progress);
+        let accepted_before = progress.accepted_fingerprints.clone();
+        let path = c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line(COPY, "root", AT, 10),
+            "2026-08-02T07:03:00Z",
+        );
+        let mut first = c.raw(&scanner, prior.clone(), 100, sampled, &[]);
+        crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
+            first.enrich(&c);
+        });
+        assert_withheld(&first, COPY, "external census unavailable");
+        let prior = settle_captured_holds(&c, &prior, first, &mut progress);
+        assert_eq!(progress.accepted_fingerprints, accepted_before);
+        assert_eq!(prior.current_snapshot_fingerprints(), accepted_before);
+        if grow {
+            // Keep every response pre-birth, so growth cannot itself resolve
+            // the all-copied main-file hold before external evidence arrives.
+            append(&path, &line(COPY, "own", "2026-08-02T07:01:00Z", 20));
+        }
+        assert!(
+            !prior.files.contains_key(path.to_string_lossy().as_ref()),
+            "held NEW keys must never gain money authority after real save/load"
+        );
+        let restarted = E2ScanFixture::default();
+        if loss == 1 {
+            scanner.evict();
+        } else if loss == 2 {
+            // Actual capacity eviction through the existing victim mechanism.
+            scanner.evict_for_pressure();
+        }
+        let scanner = if loss == 3 { &restarted } else { &scanner };
+        let mut retry = crate::snapshots::with_terminal_off_audit_now_for_test(at + 6 * 3600, || {
+            c.raw(scanner, prior.clone(), 100, sampled, &[])
+        });
+        crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
+            retry.enrich(&c);
+        });
+        assert_withheld(&retry, COPY, "external census still unavailable");
+        if sampled {
+            // These assertions run only in the macOS-specific tests below.
+            assert_eq!(
+                retry.modes,
+                if loss != 0 {
+                    (1, 0, 0)
+                } else if grow {
+                    (0, 1, 0)
+                } else {
+                    (0, 0, 1)
+                }
+            );
+        }
+        let prior = settle_captured_holds(&c, &prior, retry, &mut progress);
+        assert_eq!(progress.accepted_fingerprints, accepted_before);
+        let before = std::fs::metadata(&path).unwrap();
+        let restored = {
+            let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
+            crate::snapshots::with_terminal_off_audit_now_for_test(at + 12 * 3600, || {
+                ready(&c, scanner, prior.clone(), 100, sampled)
+            })
+        };
+        if sampled {
+            assert_eq!(restored.modes, (0, 0, 1));
+        }
+        literal(&restored);
+        // Cold Full is only the fixture's reference oracle. Production keeps
+        // the retained read when the external census becomes available.
+        let full_prior = prior.clone();
+        assert!(!full_prior
+            .files
+            .contains_key(path.to_string_lossy().as_ref()));
+        // Today's settlement omits this NEW held key. Keep its other census
+        // evidence, and compare the resulting published body byte for byte.
+        let full = {
+            let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
+            crate::snapshots::with_terminal_off_audit_now_for_test(at + 12 * 3600, || {
+                ready(&c, &E2ScanFixture::default(), full_prior, 100, false)
+            })
+        };
         assert_eq!(
             canonical(&request(&restored.scan.snapshots)),
             canonical(&request(&full.scan.snapshots))

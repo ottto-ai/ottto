@@ -4512,7 +4512,7 @@ fn terminal_off_on_e2_refused_twins_keep_prior_tuple_and_stay_owed_while_sibling
     with_e2_history(&fixture, || {
         // Existing identity at the emitter boundary makes it refuse. Both
         // contributions came through the real file parser, not hand-fed folds.
-        for hour in [9, 10] {
+        for hour in [9, 15] {
             let outcome = fixture.cycle_with_scan(
                 &format!("2026-08-02T{hour:02}:00:00Z"),
                 E2_HISTORY_UPGRADE,
