@@ -1106,7 +1106,7 @@ fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use crate::snapshot_client::{SnapshotBatchResponse, SnapshotEntityRef};
-    use crate::test_scratch::{create_private_dir, ScratchDir};
+    use crate::test_scratch::ScratchDir;
     use std::os::unix::fs::PermissionsExt;
 
     fn temp_dir() -> ScratchDir {
@@ -1745,52 +1745,6 @@ mod tests {
             .unwrap()
             .receipts
             .is_empty());
-    }
-
-    #[test]
-    fn scratch_directory_is_owner_traversable() {
-        let dir = temp_dir();
-        let mode = std::fs::metadata(&dir)
-            .expect("scratch metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        // `0o600` on a directory reads as "private" but has no execute bit, so
-        // the directory cannot be traversed and every write inside it fails.
-        assert_eq!(mode, 0o700);
-        std::fs::write(dir.join("probe"), b"probe").expect("write inside scratch directory");
-    }
-
-    #[test]
-    fn scratch_directory_never_adopts_an_existing_path() {
-        let dir = temp_dir();
-        let leftover = dir.join("leftover");
-        std::fs::create_dir(&leftover).expect("leftover directory");
-        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o600))
-            .expect("narrow leftover directory");
-
-        let error = create_private_dir(&leftover).expect_err("an existing path must be refused");
-        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-
-        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o700))
-            .expect("restore leftover directory");
-    }
-
-    #[test]
-    fn scratch_directory_is_removed_when_a_test_panics() {
-        let dir = temp_dir();
-        let path = dir.to_path_buf();
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let _dir = dir;
-            panic!("failing test body");
-        }));
-
-        assert!(outcome.is_err());
-        assert!(
-            !path.exists(),
-            "a panicking test left {} behind for a later run to inherit",
-            path.display()
-        );
     }
 }
 

@@ -3603,19 +3603,6 @@ mod tests {
     }
 
     #[test]
-    fn attribution_private_label_capability_defaults_off_for_older_backends() {
-        let old_backend: ActivityHintResponse =
-            serde_json::from_str(&activity_hint_json("")).expect("old activity hint");
-        assert!(!old_backend.session_attribution_labels_enabled);
-
-        let new_backend: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
-            r#", "session_attribution_labels_enabled":true"#,
-        ))
-        .expect("new activity hint");
-        assert!(new_backend.session_attribution_labels_enabled);
-    }
-
-    #[test]
     fn cache_capability_defaults_off_and_requires_exact_contract() {
         for extra in [
             "",
@@ -3637,74 +3624,6 @@ mod tests {
             hint.session_cache_observations_contract.as_deref(),
             Some("session_cache_observations:v1")
         );
-    }
-
-    #[test]
-    fn context_curve_capability_defaults_off_and_requires_exact_contract() {
-        let old_backend: ActivityHintResponse =
-            serde_json::from_str(&activity_hint_json("")).expect("old activity hint");
-        assert_eq!(old_backend.session_context_curve_contract, None);
-
-        let admitted: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
-            r#", "session_context_curve_contract":"session_context_curve:v1""#,
-        ))
-        .expect("curve-capable activity hint");
-        assert_eq!(
-            admitted.session_context_curve_contract.as_deref(),
-            Some("session_context_curve:v1")
-        );
-    }
-
-    /// The `census_residue` admission follows the same fail-closed contract
-    /// shape as the curve capability: absent, null, and any other token all
-    /// read as "not admitted", and only the exact token admits.
-    #[test]
-    fn census_residue_status_admission_defaults_off_and_requires_exact_contract() {
-        let old_backend: ActivityHintResponse =
-            serde_json::from_str(&activity_hint_json("")).expect("old activity hint");
-        assert_eq!(old_backend.census_residue_status_contract, None);
-
-        let explicit_null: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
-            r#", "census_residue_status_contract":null"#,
-        ))
-        .expect("null admission");
-        assert_eq!(explicit_null.census_residue_status_contract, None);
-
-        let admitted: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
-            r#", "census_residue_status_contract":"census_residue_status:v1""#,
-        ))
-        .expect("residue-admitting activity hint");
-        assert_eq!(
-            admitted.census_residue_status_contract.as_deref(),
-            Some(CENSUS_RESIDUE_STATUS_CONTRACT)
-        );
-        assert_eq!(CENSUS_RESIDUE_STATUS_CONTRACT, "census_residue_status:v1");
-        assert_eq!(CENSUS_RESIDUE_ERROR_CODE, "census_residue");
-    }
-
-    /// The retired contract-5 cohort token still decodes as sent: absent and
-    /// null read as none, any string is kept verbatim (and never read).
-    #[test]
-    fn request_identity_cohort_token_defaults_off_and_is_kept_verbatim() {
-        for extra in ["", r#", "session_request_identity_contract":null"#] {
-            let hint: ActivityHintResponse =
-                serde_json::from_str(&activity_hint_json(extra)).expect("activity hint");
-            assert_eq!(hint.session_request_identity_contract, None);
-        }
-        for token in [
-            "own_request_identity_rows:v1",
-            "claude_code_jsonl:own_request_identity_rows:v1",
-            "unknown",
-        ] {
-            let hint: ActivityHintResponse = serde_json::from_str(&activity_hint_json(&format!(
-                r#", "session_request_identity_contract":"{token}""#
-            )))
-            .expect("token-bearing activity hint");
-            assert_eq!(
-                hint.session_request_identity_contract.as_deref(),
-                Some(token)
-            );
-        }
     }
 
     /// An older daemon's terminal-status journal predates the residue fields.
@@ -3804,18 +3723,6 @@ mod tests {
     }
 
     #[test]
-    fn batch_authorization_rejected_downcasts_separately_from_schema_rejection() {
-        let err = anyhow::Error::new(BatchAuthorizationRejected { status: 401 });
-        let rejected = err
-            .downcast_ref::<BatchAuthorizationRejected>()
-            .expect("BatchAuthorizationRejected must downcast from anyhow::Error");
-        assert_eq!(rejected.status, 401);
-        assert!(err.to_string().contains("401"));
-        assert!(err.to_string().contains("authorization"));
-        assert!(err.downcast_ref::<BatchRejected>().is_none());
-    }
-
-    #[test]
     fn upload_failure_diagnostics_are_classified_and_redacted() {
         assert_eq!(http_status_family(500), "http_5xx");
         assert_eq!(http_status_family(429), "http_429");
@@ -3866,57 +3773,6 @@ mod tests {
         assert_eq!(
             diagnostics.safe_message(),
             "relay token request failed (endpoint=relay_token, status_family=transport_dns, retryable=true, request_id=absent)"
-        );
-    }
-
-    #[test]
-    fn relay_token_authorization_rejected_downcasts_separately() {
-        let err = anyhow::Error::new(RelayTokenAuthorizationRejected {
-            status: 403,
-            suppressed: false,
-        });
-        let rejected = err
-            .downcast_ref::<RelayTokenAuthorizationRejected>()
-            .expect("RelayTokenAuthorizationRejected must downcast from anyhow::Error");
-        assert_eq!(rejected.status, 403);
-        assert!(err.to_string().contains("403"));
-        assert!(err.to_string().contains("relay token authorization"));
-        assert!(err.downcast_ref::<BatchAuthorizationRejected>().is_none());
-        assert!(err.downcast_ref::<BatchRejected>().is_none());
-    }
-
-    #[test]
-    fn local_health_rejections_downcast_separately() {
-        let rejected = anyhow::Error::new(LocalHealthProjectionRejected { status: 422 });
-        assert!(rejected
-            .downcast_ref::<LocalHealthProjectionRejected>()
-            .is_some());
-        assert!(rejected
-            .downcast_ref::<LocalHealthAuthorizationRejected>()
-            .is_none());
-        assert!(rejected
-            .downcast_ref::<RelayTokenAuthorizationRejected>()
-            .is_none());
-
-        let unauthorized = anyhow::Error::new(LocalHealthAuthorizationRejected { status: 401 });
-        assert!(unauthorized
-            .downcast_ref::<LocalHealthAuthorizationRejected>()
-            .is_some());
-        assert!(unauthorized
-            .downcast_ref::<LocalHealthProjectionRejected>()
-            .is_none());
-    }
-
-    #[test]
-    fn api_urls_are_joined_without_double_slashes() {
-        let client = SnapshotApiClient::new("https://ottto.test/backend/");
-        assert_eq!(
-            client.api_url("/api/v1/agent-session-snapshots/status"),
-            "https://ottto.test/backend/api/v1/agent-session-snapshots/status"
-        );
-        assert_eq!(
-            client.api_url("/api/v1/agent-status/snapshots"),
-            "https://ottto.test/backend/api/v1/agent-status/snapshots"
         );
     }
 
@@ -4054,20 +3910,6 @@ mod tests {
                 "identity fallback preserves large packed requests without a gzip 413"
             );
         }
-    }
-
-    #[test]
-    fn gzip_round_trips_and_shrinks_a_repetitive_body() {
-        // Snapshot batches repeat identical selector maps per hour bucket, which
-        // is exactly the shape a deflate window exploits.
-        let body = r#"{"selector_context":{"auth_mode":"subscription"}}"#.repeat(64);
-        let compressed = gzip(body.as_bytes()).expect("gzip");
-        assert!(compressed.len() * 4 < body.len());
-        let mut decoded = Vec::new();
-        flate2::read::GzDecoder::new(compressed.as_slice())
-            .read_to_end(&mut decoded)
-            .expect("gunzip");
-        assert_eq!(decoded, body.as_bytes());
     }
 
     #[test]

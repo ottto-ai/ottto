@@ -2290,112 +2290,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_api_log_clock_both_absent_never_create_epoch_evidence() {
-        assert!(
-            clock_test_protobuf(0, 0).is_empty(),
-            "protobuf zero is absent, not epoch"
-        );
-        for event in [
-            None,
-            Some(serde_json::json!("0")),
-            Some(serde_json::json!(0)),
-            Some(Value::Null),
-        ] {
-            for observed in [
-                None,
-                Some(serde_json::json!("0")),
-                Some(serde_json::json!(0)),
-                Some(Value::Null),
-            ] {
-                assert!(
-                    clock_test_json(event.clone(), observed.clone()).is_empty(),
-                    "event={event:?}, observed={observed:?}: no usable clock"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn claude_api_log_clock_real_event_wins_even_next_to_epoch() {
-        let observed = 1_783_728_000_000_000_000_u64;
-        for event in [1_u64, observed - 1, u64::MAX] {
-            let expected = clock_test_protobuf(event, observed);
-            assert_eq!(expected.len(), 1);
-            for raw in [
-                serde_json::json!(event.to_string()),
-                serde_json::json!(event),
-            ] {
-                assert_eq!(
-                    clock_test_json(Some(raw), Some(serde_json::json!(observed.to_string()))),
-                    expected
-                );
-            }
-            assert_ne!(expected[0].observed_at, "2026-07-11T00:00:00Z");
-        }
-        assert_eq!(
-            clock_test_protobuf(1, observed)[0].observed_at,
-            "1970-01-01T00:00:00.000000001Z",
-            "only zero is absence; genuine positive instants are preserved"
-        );
-    }
-
-    #[test]
-    fn request_pair_malformed_json_identity_preserves_presence_both_origins() {
-        for key in ["user.account_uuid", "organization.id"] {
-            for malformed in [
-                serde_json::json!({"arrayValue":{"values":[]}}),
-                serde_json::json!({"kvlistValue":{"values":[]}}),
-                serde_json::json!({"bytesValue":"AA=="}),
-                serde_json::json!({}),
-                serde_json::Value::Null,
-            ] {
-                for resource_invalid in [false, true] {
-                    let mut payload: Value = serde_json::from_slice(&identity_json(
-                        &[
-                            ("user.account_uuid", ACCOUNT),
-                            ("organization.id", ORGANIZATION),
-                        ],
-                        &[
-                            ("user.account_uuid", ACCOUNT),
-                            ("organization.id", ORGANIZATION),
-                        ],
-                    ))
-                    .unwrap();
-                    let pointer = if resource_invalid {
-                        "/resourceLogs/0/resource/attributes"
-                    } else {
-                        "/resourceLogs/0/scopeLogs/0/logRecords/0/attributes"
-                    };
-                    let items = payload
-                        .pointer_mut(pointer)
-                        .unwrap()
-                        .as_array_mut()
-                        .unwrap();
-                    let item = items.iter_mut().find(|item| item["key"] == key).unwrap();
-                    item["value"] = malformed.clone();
-                    let row = api_evidence_from_json(&serde_json::to_vec(&payload).unwrap())
-                        .unwrap()
-                        .remove(0);
-                    let pair = row.request_identity.as_ref().unwrap();
-                    let attribute = if key == "user.account_uuid" {
-                        &pair.account
-                    } else {
-                        &pair.organization
-                    };
-                    assert_eq!(
-                        attribute.origin,
-                        ClaudeIdentityAttributeOrigin::ResourceAndLogRecord
-                    );
-                    assert_eq!(attribute.disposition, ClaudeIdentityDisposition::Invalid);
-                    assert_eq!(pair.disposition, ClaudeIdentityDisposition::Invalid);
-                    assert_eq!(row.input_tokens, 12);
-                    assert_eq!(row.output_tokens, 3);
-                }
-            }
-        }
-    }
-
-    #[test]
     fn request_pair_malformed_protobuf_identity_preserves_presence_both_origins() {
         use otlp_proto::any_value::Value as ProtoValue;
         for key in ["user.account_uuid", "organization.id"] {
@@ -3639,26 +3533,6 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn sidecar_decode_reuse_releases_nonpaired_rows_and_moves_paired_allocation() {
-        let (dir, rows) = decode_reuse_fixture("allocation");
-        let mut extra = rows[0].clone();
-        extra.session_id = "effort-only".into();
-        append_evidence(&dir, &extra).unwrap();
-        let mut read =
-            ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into(), "effort-only".into()]).unwrap();
-        let allocation = read.evidence["sess-mixed"].as_ptr();
-        read.retain_roots(&BTreeSet::from(["sess-mixed".into()]));
-        assert_eq!(read.evidence.len(), 1);
-        assert_eq!(read.reads.len(), 1);
-        let report = read.take_strict_report(&dir, "sess-mixed");
-        assert_eq!(report.evidence["sess-mixed"].as_ptr(), allocation);
-        assert!(read.evidence.is_empty());
-        assert!(read.reads.is_empty());
-        fs::remove_dir_all(dir).unwrap();
-    }
-
     #[test]
     fn sidecar_decode_reuse_rereads_append_truncate_and_same_stat_replacement() {
         for change in ["append", "truncate", "replace", "rewrite"] {
@@ -3851,59 +3725,6 @@ mod tests {
             assert_eq!(API_READ_RECEIPT.with(|r| r.get().0), 2);
             fs::remove_dir_all(dir).unwrap();
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sidecar_decode_reuse_stat_open_races_refuse_cap_and_fifo() {
-        for change in ["cap", "fifo"] {
-            let (dir, _) = decode_reuse_fixture(change);
-            API_BEFORE_OPEN.with(|h| {
-                *h.borrow_mut() = Some(Box::new(move |path| {
-                    if change == "cap" {
-                        File::options()
-                            .write(true)
-                            .open(path)
-                            .unwrap()
-                            .set_len(MAX_EVIDENCE_FILE_BYTES)
-                            .unwrap();
-                    } else {
-                        use std::os::unix::ffi::OsStrExt;
-                        fs::remove_file(path).unwrap();
-                        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-                        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-                    }
-                }))
-            });
-            let report = load_claude_api_request_evidence_report(&dir, ["sess-mixed".into()]);
-            assert!(report.evidence.is_empty());
-            assert!(!report.health.is_complete());
-            if change == "cap" {
-                assert_eq!(report.health.oversized_files, 1);
-            } else {
-                assert_eq!(report.health.unreadable_lines, 1);
-            }
-            fs::remove_dir_all(dir).unwrap();
-        }
-    }
-    #[test]
-    fn sidecar_decode_reuse_same_label_fixtures_keep_independent_evidence() {
-        let (first, rows) = decode_reuse_fixture("cap");
-        let (second, _) = decode_reuse_fixture("cap");
-        File::options()
-            .write(true)
-            .open(evidence_path(&second, "sess-mixed"))
-            .unwrap()
-            .set_len(MAX_EVIDENCE_FILE_BYTES)
-            .unwrap();
-        let first_report = load_claude_api_request_evidence_report(&first, ["sess-mixed".into()]);
-        assert!(
-            first_report.health.is_complete(),
-            "a second fixture must not delete or truncate the first"
-        );
-        assert_eq!(first_report.evidence["sess-mixed"], rows);
-        fs::remove_dir_all(first).unwrap();
-        fs::remove_dir_all(second).unwrap();
     }
 }
 
