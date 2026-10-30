@@ -6,7 +6,7 @@ use super::loopback_backend::{synthetic_device, Backend, EnvVarGuard};
 use super::*;
 use crate::source_rotation::{Owner, Step};
 use hmac::{Hmac, Mac};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -64,6 +64,9 @@ struct Roots {
     claude: Vec<PathBuf>,
     codex: Vec<PathBuf>,
     pi: Vec<PathBuf>,
+    // Explicit session-store directories, never inferred from transcript roots.
+    #[serde(default)]
+    desktop_metadata: Vec<PathBuf>,
 }
 impl Roots {
     fn get(&self, source: SnapshotSource) -> &[PathBuf] {
@@ -77,6 +80,7 @@ impl Roots {
 thread_local! {
     // An in-memory fake slot registry, installed only after isolation validation.
     static REGISTRY: RefCell<Option<Roots>> = const { RefCell::new(None) };
+    static DESKTOP_METADATA_READ_ATTEMPTS: Cell<u64> = const { Cell::new(0) };
 }
 pub(crate) fn registered_roots(source: SnapshotSource) -> Option<Vec<PathBuf>> {
     REGISTRY.with(|registry| {
@@ -86,10 +90,25 @@ pub(crate) fn registered_roots(source: SnapshotSource) -> Option<Vec<PathBuf>> {
             .map(|roots| roots.get(source).to_vec())
     })
 }
+pub(crate) fn registered_desktop_metadata() -> Option<BTreeSet<PathBuf>> {
+    REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .as_ref()
+            .map(|roots| roots.desktop_metadata.iter().cloned().collect())
+    })
+}
+
+// Count at the actual sidecar open boundary, including failed attempts. This
+// feature-only witness lets child-process tests prove no reads without atime.
+pub(crate) fn observe_desktop_metadata_read() {
+    DESKTOP_METADATA_READ_ATTEMPTS.with(|count| count.set(count.get().saturating_add(1)));
+}
 struct RegistryGuard;
 impl Drop for RegistryGuard {
     fn drop(&mut self) {
         REGISTRY.with(|registry| registry.borrow_mut().take());
+        DESKTOP_METADATA_READ_ATTEMPTS.with(|count| count.set(0));
     }
 }
 
@@ -284,6 +303,7 @@ impl Isolation {
             .iter_mut()
             .chain(&mut roots.codex)
             .chain(&mut roots.pi)
+            .chain(&mut roots.desktop_metadata)
         {
             let original = if root.is_absolute() {
                 root.clone()
@@ -305,7 +325,7 @@ impl Isolation {
                     "root symlink refused"
                 );
             }
-            anyhow::ensure!(canonical.is_dir(), "transcript root must be a directory");
+            anyhow::ensure!(canonical.is_dir(), "input root must be a directory");
             isolated_tree(&canonical, &clone)?;
             *root = canonical;
         }
@@ -758,6 +778,7 @@ fn execute(args: &Args, isolation: Isolation) -> Result<()> {
             .collect(),
     )?;
     REGISTRY.with(|registry| *registry.borrow_mut() = Some(isolation.roots));
+    DESKTOP_METADATA_READ_ATTEMPTS.with(|count| count.set(0));
     let _registry = RegistryGuard;
     let daemon = LocalDaemon::new(
         ottto_protocol::MachineIdentity {
@@ -891,6 +912,7 @@ fn execute(args: &Args, isolation: Isolation) -> Result<()> {
         "full_reads":(!totals.unknown).then_some(totals.full), "tail_reads":(!totals.unknown).then_some(totals.tail), "restored":totals.restored, "bytes_read":(!totals.unknown).then_some(totals.bytes),
         "index_reuse_skips":totals.index_reuse_skips, "durable_store_io":durable_store_io,
         "durable_records_after_save":durable_records_after_save,
+        "desktop_metadata_read_attempts":DESKTOP_METADATA_READ_ATTEMPTS.with(Cell::get),
         "emitted_entities":backend.stats.items.load(std::sync::atomic::Ordering::Relaxed),
         "read_units":"sampled acquisition selections; completed native + guard bytes", "advisory_only":true}),
     )?;

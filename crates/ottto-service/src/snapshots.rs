@@ -16356,6 +16356,17 @@ impl ClaudeTitleMetadata {
         collected_at: &str,
         identity_capture: bool,
     ) -> Self {
+        #[cfg(feature = "replay-harness")]
+        if let Some(store_dirs) =
+            crate::snapshot_sync::replay_harness::registered_desktop_metadata()
+        {
+            return Self::load_from_store_dirs_with_index(
+                &store_dirs,
+                index,
+                collected_at,
+                identity_capture,
+            );
+        }
         let mut store_dirs = BTreeSet::new();
         for root in roots {
             // root is `<home>/.claude/projects`; discover each configured app's
@@ -17331,6 +17342,8 @@ fn load_claude_desktop_session_title(
     account_identifier_hash: Option<String>,
     mut original_identity: Option<ClaudeDesktopIdentityEvidence>,
 ) -> Result<Option<ClaudeDesktopTitleIndexEntry>> {
+    #[cfg(feature = "replay-harness")]
+    crate::snapshot_sync::replay_harness::observe_desktop_metadata_read();
     #[cfg(test)]
     CLAUDE_DESKTOP_READ_FOR_TEST.with(|hook| {
         if let Some(observe) = hook.get() {

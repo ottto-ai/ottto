@@ -44,8 +44,13 @@ slots or Keychain; proxy variables are removed. The real state-directory lock
 is held for process lifetime. Never edit the private clone during a pass.
 
 The roots manifest is `{"claude": [paths], "codex": [paths], "pi": [paths]}`,
-with absolute paths or paths relative to its containing directory. The optional
-hold-back inventory is `{"files": [clone-relative paths]}`; the driver owns
+with absolute paths or paths relative to its containing directory. An optional
+`"desktop_metadata": [paths]` lists existing Desktop session-store directories
+(the `claude-code-sessions` directories themselves) inside the clone. Omitted
+or empty means no Desktop metadata. The harness never infers Desktop stores
+from transcript ancestors or HOME. These paths and their contents follow the
+same containment, symlink and hard-link refusal rules as transcript roots.
+The optional hold-back inventory is `{"files": [clone-relative paths]}`; the driver owns
 truncation and appending. `--kill-after-pages` accepts a positive page count only
 for P3 and kills after a successfully completed real source page, with records
 already synced. A count beyond the final page does not cause a kill.
@@ -56,6 +61,11 @@ for each blinded session is the latest emitted body; quiet pages emit no fake
 zero or empty replacement. Consumers fold records in emission order, including
 completed records before a P3 kill. Counts and unavailable values in page
 diagnostics retain their existing meanings.
+
+`desktop_metadata_read_attempts` in pass totals counts actual Desktop sidecar
+open attempts, including failed opens, for that process. It is a feature-only
+test witness, independent of access times; it excludes transcript-window reads
+and directory discovery and does not change the production diagnostics schema.
 
 Pass totals are sampled acquisition selections and completed native plus guard
 bytes, excluding discovery, joins, sidecars and failed acquisitions. They are

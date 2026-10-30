@@ -1096,6 +1096,114 @@ fn refuses_root_outside_clone_and_nested_symlink() {
     symlink(&f.support, f.root.join("escape")).unwrap();
     f.refused(f.command("P0"));
 }
+
+fn write_desktop_canary(store: &std::path::Path) {
+    fs::create_dir_all(store).unwrap();
+    fs::write(
+        store.join("session.json"),
+        json!({"cliSessionId":SESSION, "title":CANARY, "titleSource":"user"}).to_string(),
+    )
+    .unwrap();
+}
+
+fn desktop_title_entries(support: &std::path::Path) -> Vec<Value> {
+    fn visit(dir: &std::path::Path, indexes: &mut Vec<Value>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, indexes);
+            } else if path.file_name().unwrap() == "claude_code-scan-index-v3.json" {
+                indexes.push(serde_json::from_slice(&fs::read(path).unwrap()).unwrap());
+            }
+        }
+    }
+    let mut indexes = Vec::new();
+    visit(&support.join("snapshots"), &mut indexes);
+    assert_eq!(indexes.len(), 1, "one actual saved Claude index");
+    indexes[0]["claude_desktop_title_files"]
+        .as_object()
+        .map(|entries| entries.values().cloned().collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn desktop_metadata_reads_only_explicit_clone_stores() {
+    let mut f = Fixture::new();
+    // The old loader derives this fake home from clone/claude's grandparent,
+    // even after execute replaces HOME. Both stores are outside the clone.
+    let fake_home = f.base.clone();
+    let support = fake_home.join("Library/Application Support");
+    for profile in ["Claude", "Claude-CANARY"] {
+        let profile = support.join(profile);
+        write_desktop_canary(&profile.join("claude-code-sessions"));
+        fs::write(profile.join("config.json"), "{}").unwrap();
+    }
+    let inside = f.clone.join("desktop/claude-code-sessions");
+    write_desktop_canary(&inside);
+
+    // Omission is explicit absence, with a counter at the real open boundary.
+    // Permission errors would be swallowed by the loader, so chmod/atime alone
+    // cannot prove this. Readable canaries would count even on a root runner.
+    let output = f.command("P0").env("HOME", &fake_home).output().unwrap();
+    assert!(output.status.success());
+    f.assert_private(&output);
+    assert_eq!(totals(&f.rows("P0"))["desktop_metadata_read_attempts"], 0);
+    assert!(desktop_title_entries(&f.support).is_empty());
+
+    // Same frozen input, new process and fresh scratch. Only the explicitly
+    // provided in-clone sidecar may be opened, decoded and retained.
+    f.support = f.base.join("scratch-with-desktop");
+    fs::create_dir(&f.support).unwrap();
+    fs::set_permissions(&f.support, fs::Permissions::from_mode(0o700)).unwrap();
+    f.manifest(json!({"claude":["claude"], "codex":[], "pi":[],
+        "desktop_metadata":["desktop/claude-code-sessions"]}));
+    let output = f.command("COLD").env("HOME", &fake_home).output().unwrap();
+    assert!(output.status.success());
+    f.assert_private(&output);
+    assert_eq!(totals(&f.rows("COLD"))["desktop_metadata_read_attempts"], 1);
+    let entries = desktop_title_entries(&f.support);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["cli_session_id"], SESSION);
+    assert_eq!(entries[0]["title"], CANARY);
+    assert_eq!(entries[0]["user_set"], true);
+}
+
+#[test]
+fn refuses_desktop_metadata_outside_clone_and_symlink_escapes() {
+    for relative in [false, true] {
+        let f = Fixture::new();
+        let outside = f.base.join("outside-desktop");
+        write_desktop_canary(&outside);
+        let path = if relative {
+            PathBuf::from("../outside-desktop")
+        } else {
+            outside
+        };
+        f.manifest(json!({"claude":["claude"], "codex":[], "pi":[],
+            "desktop_metadata":[path]}));
+        f.refused(f.command("P0"));
+    }
+    for nested in [false, true] {
+        let f = Fixture::new();
+        let outside = f.base.join("outside-desktop");
+        write_desktop_canary(&outside.join("claude-code-sessions"));
+        let path = f.clone.join("desktop");
+        if nested {
+            fs::create_dir(&path).unwrap();
+            symlink(&outside, path.join("profile")).unwrap();
+        } else {
+            symlink(&outside, &path).unwrap();
+        }
+        let store = if nested {
+            "desktop/profile/claude-code-sessions"
+        } else {
+            "desktop/claude-code-sessions"
+        };
+        f.manifest(json!({"claude":["claude"], "codex":[], "pi":[],
+            "desktop_metadata":[store]}));
+        f.refused(f.command("P0"));
+    }
+}
 #[test]
 fn refuses_external_api_and_unowned_loopback() {
     let f = Fixture::new();
