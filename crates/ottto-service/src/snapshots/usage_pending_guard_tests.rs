@@ -1705,6 +1705,104 @@ fn unheld_production_open_refusal_blocks_unrelated_retirement_with_or_without_pe
     }
 }
 
+#[test]
+fn size_limit_growth_of_complete_indexed_family_blocks_unrelated_retirement() {
+    // Review r12 MEDIUM: Match family B has complete indexed membership and
+    // grows past the source size limit. Discovery refuses it on size, with
+    // no unreadable/disappeared count and no read; that refusal must still
+    // feed the source-wide gate, so unrelated qualified family A is held.
+    let dir = temp_dir("size-limit-growth-refusal");
+    let path = dir.join(format!("{CARRY_ROOT}.jsonl"));
+    fs::write(&path, "{}\n").unwrap();
+    let mut index = carry_index();
+    retry_under_way(&mut index);
+    index.claude_usage_family_pending.remove(CARRY_UNWITNESSED);
+    carry_family(&mut index, CARRY_OTHER, &[None], true);
+    let entry = index.files.remove(&carry_key(CARRY_ROOT, None)).unwrap();
+    index.files.insert(local_index_key(&path), entry);
+    index.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
+    assert!(!index.usage_guard_holds.holds(CARRY_ROOT));
+    assert!(!usage_pending_guard::fork_lineage_incomplete(&index));
+    // Sparse growth: logical length over the cap, negligible bytes on disk.
+    File::options().write(true).open(&path).unwrap()
+        .set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1).unwrap();
+    let mut state = OwnedSourceScan::new(
+        SnapshotSource::ClaudeCode, std::slice::from_ref(&dir), index,
+        CARRY_RETRY, BACKFILL_WINDOW_DAYS, 16, true, None, &[], false, true,
+    );
+    let traversal = state.index.traversal.as_ref().unwrap();
+    assert_eq!(traversal.counts.oversized_file_count, 1);
+    assert_eq!(traversal.counts.unreadable_path_count, 0);
+    assert_eq!(traversal.counts.disappeared_file_count, 0);
+    assert!(!state.identified_candidates.iter().any(|c| c.path == path), "no read");
+    assert!(state.index.usage_guard_refused_for_test(&path));
+    assert!(!state.index.usage_guard_holds.holds(CARRY_ROOT));
+    assert!(usage_pending_guard::fork_lineage_incomplete(&state.index));
+    let counts = retirement_attempt(&mut state.index);
+    assert!(counts["retire_refused"]["fork_lineage_unknown"]["families"].as_u64().unwrap() >= 1);
+    assert_eq!(counts["retired"]["families"], 0);
+    assert!(state.index.claude_usage_family_pending.contains_key(CARRY_OTHER));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn size_limit_candidate_and_open_exits_mark_refusal_but_exclusions_do_not() {
+    let dir = temp_dir("size-limit-refusal-exits");
+    let path = dir.join("oversized-copy.jsonl");
+    File::create(&path).unwrap().set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1).unwrap();
+    let pending = |path: &Path, member, watcher_hint| ScanTraversalPath {
+        scan_root: dir.clone(), path: path.to_path_buf(), census_member: member, watcher_hint,
+    };
+    // Candidate stat: a census member (counted) and an uncounted re-read.
+    for member in [true, false] {
+        let mut index = ScanIndex::default();
+        let mut census = ScanCensus::default();
+        assert!(index.usage_guard_traversal_candidate(
+            SnapshotSource::ClaudeCode, disappearance_diagnostics::Site::CandidateWalk,
+            pending(&path, member, false), &mut census, None, BACKFILL_WINDOW_DAYS,
+        ).is_none());
+        assert_eq!(census.oversized_file_count, usize::from(member));
+        assert!(index.usage_guard_refused_for_test(&path), "member={member}");
+    }
+    // Open: the candidate was stat'ed at its oversized length.
+    let candidate = {
+        let small = dir.join("small-copy.jsonl");
+        fs::write(&small, "{}\n").unwrap();
+        let mut census = ScanCensus::default();
+        let mut candidate = ScanIndex::default().usage_guard_traversal_candidate(
+            SnapshotSource::ClaudeCode, disappearance_diagnostics::Site::CandidateWalk,
+            pending(&small, true, false), &mut census, None, BACKFILL_WINDOW_DAYS,
+        ).unwrap();
+        candidate.path = path.clone();
+        candidate.size_bytes = MAX_CLAUDE_JSONL_FILE_BYTES + 1;
+        candidate
+    };
+    let mut index = ScanIndex::default();
+    let mut census = ScanCensus::default();
+    assert!(index.usage_guard_open_candidate(
+        SnapshotSource::ClaudeCode, candidate, &mut census, None, BACKFILL_WINDOW_DAYS, false, None,
+    ).is_none());
+    assert_eq!(census.oversized_file_count, 1);
+    assert!(index.usage_guard_refused_for_test(&path));
+    // A remove hint for a vanished file and a window exit hide no data.
+    let vanished = dir.join("vanished-copy.jsonl");
+    let aged = dir.join("aged-copy.jsonl");
+    fs::write(&aged, "{}\n").unwrap();
+    File::options().write(true).open(&aged).unwrap()
+        .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1)))
+        .unwrap();
+    for (excluded, watcher_hint) in [(&vanished, true), (&aged, false)] {
+        let mut index = ScanIndex::default();
+        let mut census = ScanCensus::default();
+        assert!(index.usage_guard_traversal_candidate(
+            SnapshotSource::ClaudeCode, disappearance_diagnostics::Site::CandidateWalk,
+            pending(excluded, true, watcher_hint), &mut census, Some(2_000_000_000), 1,
+        ).is_none());
+        assert!(!index.usage_guard_refused_for_test(excluded), "{}", excluded.display());
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn source_wide_open_refusal_recovers_on_verified_unchanged_reopen_without_rearm() {

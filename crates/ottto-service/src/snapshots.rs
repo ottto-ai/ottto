@@ -26994,7 +26994,7 @@ impl OwnedSourceScan {
                 traversal,
                 backfill_window_days,
                 &index.files,
-                Some(&index.usage_guard_holds),
+                Some(&mut index.usage_guard_holds),
             );
             release_codex_inventory_hold(source, traversal);
         }
@@ -27276,25 +27276,14 @@ impl OwnedSourceScan {
         let mut files = pending_paths
             .into_iter()
             .filter_map(|pending| {
-                let path = (source == SnapshotSource::ClaudeCode).then(|| pending.path.clone());
-                let before = (census.unreadable_path_count, census.disappeared_file_count);
-                let candidate = candidate_from_traversal_path(
+                index.usage_guard_traversal_candidate(
                     source,
+                    disappearance_diagnostics::Site::CandidateWalk,
                     pending,
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
-                    &index.files,
-                    Some(&index.usage_guard_holds),
-                );
-                if let Some(path) = path {
-                    if candidate.is_none()
-                        && before != (census.unreadable_path_count, census.disappeared_file_count)
-                    {
-                        index.usage_guard_mark_refused(&path);
-                    }
-                }
-                candidate
+                )
             })
             .collect::<Vec<_>>();
 
@@ -27500,7 +27489,7 @@ impl OwnedSourceScan {
                 else {
                     continue;
                 };
-                let Some(mut candidate) = candidate_from_traversal_path_at(
+                let Some(mut candidate) = index.usage_guard_traversal_candidate(
                     source,
                     disappearance_diagnostics::Site::CandidateForcedIndex,
                     ScanTraversalPath {
@@ -27512,8 +27501,6 @@ impl OwnedSourceScan {
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
-                    &index.files,
-                    Some(&index.usage_guard_holds),
                 ) else {
                     continue;
                 };
@@ -43173,7 +43160,7 @@ fn advance_bounded_directory_traversal(
     traversal: &mut ScanTraversalCheckpoint,
     backfill_window_days: u64,
     files: &BTreeMap<String, ScanIndexEntry>,
-    usage_holds: Option<&usage_pending_guard::Holds>,
+    usage_holds: Option<&mut usage_pending_guard::Holds>,
 ) {
     advance_bounded_directory_traversal_with_budget(
         source,
@@ -43191,7 +43178,7 @@ fn advance_bounded_directory_traversal_with_budget(
     backfill_window_days: u64,
     max_entries: usize,
     files: &BTreeMap<String, ScanIndexEntry>,
-    usage_holds: Option<&usage_pending_guard::Holds>,
+    mut usage_holds: Option<&mut usage_pending_guard::Holds>,
 ) {
     let walk_issues = |counts: &ScanTraversalCounts| {
         (
@@ -43338,7 +43325,9 @@ fn advance_bounded_directory_traversal_with_budget(
                 .ok()
                 .and_then(unix_seconds)
                 .unwrap_or_default();
-            if !usage_holds.is_some_and(|holds| holds.retains_path(&path))
+            if !usage_holds
+                .as_deref()
+                .is_some_and(|holds| holds.retains_path(&path))
                 && !sampled_audit::path_requires_verification(files, &path)
                 && census_unix_seconds.is_some_and(|now| {
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
@@ -43357,6 +43346,13 @@ fn advance_bounded_directory_traversal_with_budget(
                     &path,
                     &mut traversal.oversized_discovery,
                 );
+                // Existing, in-window bytes past the size limit stay unread:
+                // a source-wide fork-lineage refusal (review r12).
+                if source == SnapshotSource::ClaudeCode {
+                    if let Some(holds) = usage_holds.as_deref_mut() {
+                        holds.mark_refused(&path);
+                    }
+                }
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
                 continue;
             }
@@ -43404,6 +43400,7 @@ fn claude_absence_is_removal(source: SnapshotSource, path: &Path) -> Parent {
     }
 }
 
+#[cfg(test)]
 fn candidate_from_traversal_path(
     source: SnapshotSource,
     pending: ScanTraversalPath,
@@ -43425,6 +43422,7 @@ fn candidate_from_traversal_path(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn candidate_from_traversal_path_at(
     source: SnapshotSource,
@@ -43436,6 +43434,39 @@ fn candidate_from_traversal_path_at(
     files: &BTreeMap<String, ScanIndexEntry>,
     usage_holds: Option<&usage_pending_guard::Holds>,
 ) -> Option<CandidateFile> {
+    traversal_path_candidate(
+        source,
+        site,
+        pending,
+        census,
+        census_unix_seconds,
+        backfill_window_days,
+        files,
+        usage_holds,
+    )
+    .ok()
+}
+
+/// Why a traversal path yielded no candidate. `Unread` is existing input
+/// this page could not read (fork-lineage refusal); `Excluded` is a removal,
+/// window exit or non-file, which hides no data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TraversalPathExit {
+    Excluded,
+    Unread,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn traversal_path_candidate(
+    source: SnapshotSource,
+    site: disappearance_diagnostics::Site,
+    pending: ScanTraversalPath,
+    census: &mut ScanCensus,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+    files: &BTreeMap<String, ScanIndexEntry>,
+    usage_holds: Option<&usage_pending_guard::Holds>,
+) -> Result<CandidateFile, TraversalPathExit> {
     let metadata = match fs::symlink_metadata(&pending.path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -43461,22 +43492,23 @@ fn candidate_from_traversal_path_at(
                         source,
                         site,
                     );
+                    return Err(TraversalPathExit::Unread);
                 }
             }
-            return None;
+            return Err(TraversalPathExit::Excluded);
         }
         Err(_) => {
             if pending.census_member {
                 census.record_unreadable(UnreadableCause::Metadata, 1);
             }
-            return None;
+            return Err(TraversalPathExit::Unread);
         }
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         if pending.census_member && metadata.file_type().is_symlink() {
             census.symlink_rejected_count += 1;
         }
-        return None;
+        return Err(TraversalPathExit::Excluded);
     }
     if metadata.len() > max_jsonl_file_bytes(source) {
         if pending.census_member {
@@ -43491,7 +43523,9 @@ fn candidate_from_traversal_path_at(
                 &mut census.oversized_discovery,
             );
         }
-        return None;
+        // Existing bytes past the size limit stay unread (review r12),
+        // whether or not this visit counts as a census member.
+        return Err(TraversalPathExit::Unread);
     }
     let modified_unix_seconds = metadata
         .modified()
@@ -43512,7 +43546,7 @@ fn candidate_from_traversal_path_at(
                 .removed_index_keys
                 .insert(local_index_key(&pending.path));
         }
-        return None;
+        return Err(TraversalPathExit::Excluded);
     }
     let modified_unix_nanos = metadata
         .modified()
@@ -43524,7 +43558,7 @@ fn candidate_from_traversal_path_at(
             .observed_index_keys
             .insert(local_index_key(&pending.path));
     }
-    Some(CandidateFile {
+    Ok(CandidateFile {
         physical_identity: None,
         scan_root: pending.scan_root,
         source_file_fingerprint: String::new(),

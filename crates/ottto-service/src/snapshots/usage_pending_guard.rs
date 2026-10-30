@@ -329,6 +329,23 @@ impl Holds {
     fn fresh(&self) -> bool {
         self.built && !self.dirty
     }
+    /// Source-wide refused read of ANY Claude file (fork-lineage gate).
+    pub(super) fn mark_refused(&mut self, path: &Path) {
+        if claude_index_path_member_ref(path).is_none() {
+            return;
+        }
+        let runtime = &mut self.runtime;
+        let key = local_index_key(path);
+        if runtime.refused_saturated || runtime.refused.contains(&key) {
+            return;
+        }
+        if runtime.refused.len() >= FORK_LINEAGE_REFUSED_KEYS {
+            runtime.refused = BTreeSet::new();
+            runtime.refused_saturated = true;
+        } else {
+            runtime.refused.insert(key);
+        }
+    }
     /// An empty projection that keeps this one's runtime custody.
     pub(super) fn carry_runtime(&self) -> Self {
         Self {
@@ -988,7 +1005,15 @@ impl ScanIndex {
         cache: Option<&sampled_scan::SharedCache>,
     ) -> Option<(CandidateFile, File)> {
         let path = (source == SnapshotSource::ClaudeCode).then(|| candidate.path.clone());
-        let before = (census.unreadable_path_count, census.disappeared_file_count);
+        // A size-limit refusal leaves the file unread too (review r12).
+        let refusals = |census: &ScanCensus| {
+            (
+                census.unreadable_path_count,
+                census.disappeared_file_count,
+                census.oversized_file_count,
+            )
+        };
+        let before = refusals(census);
         let opened = open_and_identify_scan_candidate_with_rescue(
             source,
             candidate,
@@ -1001,13 +1026,44 @@ impl ScanIndex {
             Some(&self.usage_guard_holds),
         );
         if let Some(path) = path {
-            if opened.is_none()
-                && before != (census.unreadable_path_count, census.disappeared_file_count)
-            {
+            if opened.is_none() && before != refusals(census) {
                 self.usage_guard_mark_refused(&path);
             }
         }
         opened
+    }
+
+    /// Observe every production traversal-path candidate stat. A size-limit,
+    /// metadata or unresolved-absence exit leaves existing input unread.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn usage_guard_traversal_candidate(
+        &mut self,
+        source: SnapshotSource,
+        site: disappearance_diagnostics::Site,
+        pending: ScanTraversalPath,
+        census: &mut ScanCensus,
+        window: Option<u64>,
+        days: u64,
+    ) -> Option<CandidateFile> {
+        let path = (source == SnapshotSource::ClaudeCode).then(|| pending.path.clone());
+        let candidate = traversal_path_candidate(
+            source,
+            site,
+            pending,
+            census,
+            window,
+            days,
+            &self.files,
+            Some(&self.usage_guard_holds),
+        );
+        match (candidate, path) {
+            (Ok(candidate), _) => Some(candidate),
+            (Err(TraversalPathExit::Unread), Some(path)) => {
+                self.usage_guard_mark_refused(&path);
+                None
+            }
+            (Err(_), _) => None,
+        }
     }
 
     /// A recovered open of the exact already verified census revision proves
@@ -1052,20 +1108,7 @@ impl ScanIndex {
     /// a complete parse of the key is published or the key vanishes. Bounded;
     /// past the bound it saturates (fails closed) until the process restarts.
     pub(super) fn usage_guard_mark_refused(&mut self, path: &Path) {
-        if claude_index_path_member_ref(path).is_none() {
-            return;
-        }
-        let runtime = &mut self.usage_guard_holds.runtime;
-        let key = local_index_key(path);
-        if runtime.refused_saturated || runtime.refused.contains(&key) {
-            return;
-        }
-        if runtime.refused.len() >= FORK_LINEAGE_REFUSED_KEYS {
-            runtime.refused = BTreeSet::new();
-            runtime.refused_saturated = true;
-        } else {
-            runtime.refused.insert(key);
-        }
+        self.usage_guard_holds.mark_refused(path);
     }
 
     /// Complete terminal: a refused key neither indexed nor walked this
@@ -1347,6 +1390,12 @@ impl ScanIndex {
     #[cfg(test)]
     pub(super) fn usage_guard_pace_for_test(&mut self, keys: impl IntoIterator<Item = String>) {
         self.usage_guard_holds.runtime.paced = keys.into_iter().map(|key| (key, 0)).collect();
+    }
+    /// Whether this exact key carries the source-wide fork-lineage refusal.
+    #[cfg(test)]
+    pub(super) fn usage_guard_refused_for_test(&self, path: &Path) -> bool {
+        let runtime = &self.usage_guard_holds.runtime;
+        runtime.refused_saturated || runtime.refused.contains(&local_index_key(path))
     }
     /// A completed withheld Full read the whole file: audits due by its pace
     /// stamp are satisfied for this process, so the next visit can Tail.
