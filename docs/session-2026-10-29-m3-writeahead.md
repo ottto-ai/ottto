@@ -176,3 +176,8 @@ quarantines the whole derived entity and emits no replacement. Its fixture
 requires the prior positive body's finalized fingerprint and upload witness to
 survive index save/reload, with #865 debt retained after the unusable record is
 retired. Neither case changes native publication or source-verification rules.
+
+The missing-carrier GC negative control commits its own index generation.
+Qualification explicitly checks stale-writer rejection, reloads that committed
+index, and carries only the completed read's audit obligation before saving its
+finalized body. It never stamps an invented generation onto stale state.

@@ -522,6 +522,26 @@ fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
                 0
             );
 
+            // The negative-control save advanced the real CAS generation.
+            // Reject the stale writer, then carry only this read's audit debt
+            // into the freshly loaded index; never manufacture a generation.
+            assert_eq!(
+                read.index.save(&f.index_path()).unwrap_err().to_string(),
+                "local snapshot scan index changed concurrently"
+            );
+            let mut current = ScanIndex::load(&f.index_path()).unwrap();
+            assert_eq!(current.generation, missing_carrier.generation);
+            assert_eq!(
+                current.files[&key].source_file_fingerprint,
+                read.index.files[&key].source_file_fingerprint
+            );
+            current
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .carry_sampled_audit(&read.index.files[&key]);
+            assert_eq!(current.files[&key].unverified_deadline(), Some(carrier));
+            read.index = current;
             finalize_scan_after_policy_with_body_witness(
                 SOURCE,
                 &mut read.scan,
