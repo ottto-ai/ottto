@@ -29478,6 +29478,17 @@ impl OwnedSourceScan {
                 if let Some(context) = sampling.as_mut().filter(|_| active.side_origin.is_none()) {
                     if let Some(plan) = active.parser.reader.acquisition.as_ref() {
                         context.record_input(plan.metrics());
+                        if std::mem::take(&mut active.parser.owed_full_after_lossy_shrink)
+                            && matches!(
+                                plan.mode(),
+                                crate::transcript_acquisition::ReadMode::Full(_)
+                            )
+                        {
+                            let completed = &mut resource_probe
+                                .full_causes
+                                .owed_full_after_lossy_shrink_completed;
+                            *completed = completed.saturating_add(1);
+                        }
                         resource_probe.rearm_full_completed(
                             &local_index_key(&active.candidate.path),
                             plan.mode(),
@@ -34353,6 +34364,7 @@ impl OwnedSourceScan {
                                         // A marked lossy extent is not a verified prefix.
                                         // Re-read the due body; S2 and the Full-start
                                         // store guard still fence preparation/publication.
+                                        parser.owed_full_after_lossy_shrink = true;
                                         resource_probe.full_causes.owed_full_after_lossy_shrink =
                                             resource_probe.full_causes.owed_full_after_lossy_shrink.saturating_add(1);
                                         (None, taken_admission, debt)
@@ -35949,6 +35961,8 @@ type LineSink<'a> = &'a mut dyn FnMut(&Value);
 const RETURN_ADMISSION_ATTEMPTS: u8 = 3;
 
 struct OwnedJsonlParser {
+    // Diagnostic origin only; follows this acquisition across step/page boundaries.
+    owed_full_after_lossy_shrink: bool,
     // Drop the optional original before its funding, including cancellation.
     pending_taken: Option<Box<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>>,
     pending_returns: u8,
@@ -36044,6 +36058,7 @@ impl OwnedJsonlParser {
 
         Ok(Self {
             pending_taken: None,
+            owed_full_after_lossy_shrink: false,
             pending_returns: 0,
             #[cfg(unix)]
             pending_funding: None,
@@ -95499,7 +95514,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
-crate::heap_layout_bound::fields!(OwnedJsonlParser; pending_taken, pending_returns, #[cfg(unix)] pending_funding, #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
+crate::heap_layout_bound::fields!(OwnedJsonlParser; owed_full_after_lossy_shrink, pending_taken, pending_returns, #[cfg(unix)] pending_funding, #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_publication, native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);

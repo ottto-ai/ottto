@@ -1129,6 +1129,9 @@ pub(crate) struct FullCauses {
     pub(crate) restore_outcome: RestoreCounts,
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) owed_full_after_lossy_shrink: u64,
+    /// Native Full read completed; does not imply verification or publication.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) owed_full_after_lossy_shrink_completed: u64,
 }
 impl FullCauses {
     fn is_empty(&self) -> bool {
@@ -1138,6 +1141,7 @@ impl FullCauses {
             && self.restore_outcome.miss.is_empty()
             && self.restore_outcome.stale.is_empty()
             && self.owed_full_after_lossy_shrink == 0
+            && self.owed_full_after_lossy_shrink_completed == 0
     }
 }
 #[derive(Debug, Default, Serialize)]
@@ -1679,6 +1683,14 @@ mod tests {
             serde_json::to_value(causes).unwrap()["owed_full_after_lossy_shrink"],
             1
         );
+        let completed = FullCauses {
+            owed_full_after_lossy_shrink_completed: 1,
+            ..Default::default()
+        };
+        assert!(!completed.is_empty(), "completion may fall on a later page");
+        let json = serde_json::to_value(completed).unwrap();
+        assert_eq!(json["owed_full_after_lossy_shrink_completed"], 1);
+        assert!(json.get("owed_full_after_lossy_shrink").is_none());
     }
 
     #[test]

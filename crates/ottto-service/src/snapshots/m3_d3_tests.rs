@@ -399,6 +399,15 @@ fn lossy_shrink_rig() -> (Rig, Vec<u8>) {
     (rig, record)
 }
 
+fn owed_shrink_completed_fulls(pass: &Pass) -> u64 {
+    pass.events
+        .iter()
+        .filter_map(|e| {
+            e["counts"]["full_causes"]["owed_full_after_lossy_shrink_completed"].as_u64()
+        })
+        .sum()
+}
+
 fn owed_shrink_fulls(pass: &Pass) -> u64 {
     pass.events
         .iter()
@@ -442,6 +451,7 @@ fn m3_due_matching_record_lossy_shrink_full_verifies_once_across_restart() {
             1,
             "must reach matching A's Held arm, not Stale"
         );
+        assert_eq!(owed_shrink_completed_fulls(&corrected), 1);
         assert_eq!(corrected.published(SESSION_A), 1);
         assert_eq!(corrected.snapshots[0].input_tokens, 600);
         assert_cold_body(&rig, &corrected);
@@ -458,6 +468,7 @@ fn m3_due_matching_record_lossy_shrink_full_verifies_once_across_restart() {
         assert_eq!(quiet.full(), 0, "verified publication does not repeat Full");
         assert_eq!(quiet.published(SESSION_A), 0);
         assert_eq!(owed_shrink_fulls(&quiet), 0);
+        assert_eq!(owed_shrink_completed_fulls(&quiet), 0);
     });
 }
 
@@ -469,7 +480,11 @@ fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
     }
     let _gate = claude_request_money::e2::GateForTest::set(true);
     with_test_line_cap(64 * 1024, || {
-        for control in ["verified_extent", "future_revision", "not_due"] {
+        for (control, expected_counter) in [
+            ("verified_extent", "accepted_body_floor"),
+            ("future_revision", "stale_hold"),
+            ("not_due", "behind_accepted.legacy"),
+        ] {
             let (mut rig, record) = lossy_shrink_rig();
             let key = rig.key(SESSION_A);
             let revision = rig.index.files[&key].effective_upload_body_witness_revision;
@@ -491,6 +506,7 @@ fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
             assert_eq!(held.full(), 0, "{control}");
             assert_eq!(held.published(SESSION_A), 0, "{control}");
             assert_eq!(owed_shrink_fulls(&held), 0, "{control}");
+            assert_eq!(owed_shrink_completed_fulls(&held), 0, "{control}");
             assert_eq!(rig.accepted(SESSION_A), accepted, "{control}");
             assert_eq!(
                 fs::read(rig.record(SESSION_A)).unwrap(),
@@ -501,11 +517,7 @@ fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
             assert!(
                 counters
                     .ineligible
-                    .get(if control == "not_due" {
-                        "behind_accepted.legacy"
-                    } else {
-                        "accepted_body_floor"
-                    })
+                    .get(expected_counter)
                     .is_some_and(|n| *n > 0),
                 "{control}: exercise the actual held outcome"
             );
@@ -542,6 +554,7 @@ fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
             let caught_up = rig.pass();
             assert_eq!(caught_up.full(), 1);
             assert_eq!(owed_shrink_fulls(&caught_up), 1);
+            assert_eq!(owed_shrink_completed_fulls(&caught_up), 1);
             assert_eq!(caught_up.published(SESSION_A), 1);
             assert_eq!(caught_up.snapshots[0].input_tokens, 1000);
             assert_cold_body(&rig, &caught_up);
