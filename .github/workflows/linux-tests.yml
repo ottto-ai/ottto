@@ -33,6 +33,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Exact-tree macOS reuse policy tests
+        run: python3 -m unittest discover -s scripts -p test_mac_contract_reuse.py
+
       - name: Install pinned Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt
 
