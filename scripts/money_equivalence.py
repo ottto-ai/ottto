@@ -42,15 +42,34 @@ _MONEY_DIFF_SCHEMA = {key: {} for key in (
     "request_count", "cost_usd", "input_cost_usd", "output_cost_usd",
     "cache_read_cost_usd", "cache_creation_cost_usd",
 )}
-_MODEL_DIFF_SCHEMA = dict(_MONEY_DIFF_SCHEMA, model={}, reasoning_effort={},
-                          selector_context={}, selector_sources={}, account_identifier_hash={})
+# Wire records: snapshots.rs::{SnapshotModelUsage, SnapshotIdentityPart,
+# SessionAccountEvidence, SnapshotRequestEvidence, SnapshotCost}. Empty child
+# schemas intentionally keep all entries of selector/data maps redacted.
+_IDENTITY_PART_DIFF_SCHEMA = dict(_MONEY_DIFF_SCHEMA, account_identifier_hash={}, evidence_ref={})
+_MODEL_DIFF_SCHEMA = dict(_MONEY_DIFF_SCHEMA, **{key: {} for key in (
+    "model", "reasoning_effort", "selector_context", "selector_sources",
+    "account_identifier_hash", "auth_mode", "billing_channel", "billing_provider",
+    "gateway_provider", "model_provider", "subscription_product", "evidence_ref",
+)})
+_MODEL_DIFF_SCHEMA["identity_parts"] = _IDENTITY_PART_DIFF_SCHEMA
 _SNAPSHOT_DIFF_SCHEMA = dict(_MONEY_DIFF_SCHEMA, **{key: {} for key in (
     "source_session_id", "snapshot_fingerprint", "source_file_fingerprint", "status",
     "account_id", "bucket", "request_id", "refusal", "telemetry_owned_complete",
     "resolver_conflict_count", "usage_accounting_contract", "removed_request_count",
+    "request_identity_refusals",
 )})
 _SNAPSHOT_DIFF_SCHEMA.update(
     usage=_MONEY_DIFF_SCHEMA, removed_usage=_MONEY_DIFF_SCHEMA,
+    model_usage=_MODEL_DIFF_SCHEMA,
+    cost={key: {} for key in (
+        "total_cost_usd", "input_cost_usd", "output_cost_usd", "cache_read_cost_usd",
+        "cache_creation_cost_usd", "evidence_source",
+    )},
+    session_account_evidence={key: {} for key in (
+        "provider", "account_identifier_hash", "provider_workspace_hash",
+        "identity_hash_scheme", "evidence_source", "identity_disposition", "source_created_at",
+    )},
+    request_evidence={"identity_basis": {}, "provider_workspace_hash": {}},
     usage_buckets={"bucket_start": {}, "model_usage": _MODEL_DIFF_SCHEMA,
                    "first_activity_at": {}, "last_activity_at": {}},
     semantic_envelope={key: {} for key in (
