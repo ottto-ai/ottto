@@ -20,6 +20,7 @@ pub(super) use runtime::{
     idle, load_locked, save_locked,
 };
 mod interning;
+mod kinds_misc;
 mod packed;
 mod shape;
 mod sqlite;
@@ -756,6 +757,7 @@ fn control_name(name: &str) -> bool {
     matches!(
         name,
         "identity"
+            | "schema_version"
             | "generation"
             | "phase"
             | "erasure_success"
