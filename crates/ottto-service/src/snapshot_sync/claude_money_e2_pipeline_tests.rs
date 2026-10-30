@@ -2559,7 +2559,8 @@ fn e2_pipeline_aged_original_sharing_ids_with_its_copy_keeps_the_copy_proven() {
 
 /// #920 round 3, finding 1, through the production pipeline: kept stock
 /// never costs a young holder its proof. A terminal keeps the aged pair
-/// `ROOT` and `COPY` (they share a request id; below the cap, no overflow).
+/// `ROOT` and `COPY` (they share a request id; below 90% occupancy, no
+/// overflow).
 /// The census is then full when the young holder `GROWING` grows by one
 /// request: the kept `ROOT` retires so it fits (admission overflow, with the
 /// alarm) and `GROWING` is stored whole, not as a hashless tombstone. A
