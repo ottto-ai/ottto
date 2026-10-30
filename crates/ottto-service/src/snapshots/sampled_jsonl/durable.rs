@@ -111,7 +111,11 @@ fn head_mark(mark: Option<u64>, field: &'static str) -> Result<u64, Refuse> {
 fn rederive_digests(acc: &SnapshotAccumulator, line_cap: u64) -> Result<Rederive, Refuse> {
     let marks = acc.durable_marks;
     let mut out = Rederive::default();
-    if acc.first_prompt_material.is_some() || acc.first_prompt_title.is_some() {
+    // Carried Pi wire values answer both the first prompt and the title.
+    let wire_prompt = pi::wire_obligation(acc)?;
+    if wire_prompt.is_some() {
+        out.first_prompt = wire_prompt;
+    } else if acc.first_prompt_material.is_some() || acc.first_prompt_title.is_some() {
         head_mark(
             marks.first_prompt,
             "SnapshotAccumulator.first_prompt_material",
@@ -130,7 +134,7 @@ fn rederive_digests(acc: &SnapshotAccumulator, line_cap: u64) -> Result<Rederive
         .session_start
         .durable_content_digest(HEAD_BOUND)?
         .map(|(digest, _)| digest);
-    if acc.title.is_some() {
+    if acc.title.is_some() && wire_prompt.is_none() {
         marks
             .title_line
             .filter(|(_, len)| *len <= line_cap)
@@ -314,8 +318,14 @@ pub(in crate::snapshots) fn decode_body_bounded(
     if !crate::heap_layout_bound::layout_supported() {
         return Err(DecodeFailure::Budget);
     }
+    // A Pi body also boxes its section's prompt fields.
+    let boxed = if source == SnapshotSource::Pi {
+        std::mem::size_of::<pi::PiPromptCarry>()
+    } else {
+        0
+    };
     lease
-        .charge(std::mem::size_of::<Decoded>() as u64)
+        .charge((std::mem::size_of::<Decoded>() + boxed) as u64)
         .map_err(|_| DecodeFailure::Budget)?;
     let mut reserve = |bytes| lease.charge(bytes).is_ok();
     let mut d = Dec::bounded(body, &mut reserve);
@@ -357,6 +367,7 @@ impl SnapshotAccumulator {
 }
 #[cfg(unix)]
 mod content;
+mod pi_wire_stub;
 
 /// Content obligations without a supported, pre-funded extractor.
 #[derive(Debug)]

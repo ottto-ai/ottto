@@ -16,6 +16,9 @@
 //! - `E` must be empty in the retained copy. A non-empty value refuses the
 //!   record, and the entry reads in Full;
 //! - `I` a live input re-injected every pass. Never encoded;
+//! - `R` Pi-only runtime state on a shared struct. Outside the shared body and
+//!   the shape, so `A_C`/`A_X` do not move; a non-empty value refuses any body
+//!   but Pi's, which persists it in `PiSection` under `A_P`;
 //! - `D` a nested persisted type, encoded by its own field classes.
 //! - `P` pass-through: a shared payload (an enum variant used by several
 //!   fields) whose class is the enclosing field's, so an `L` span is only
@@ -174,6 +177,11 @@ impl<'a> Enc<'a> {
     }
     pub(crate) fn field_moved(&self, path: &str) -> bool {
         self.moved_field == Some(path)
+    }
+    /// Inside the Pi body's shared walk, the one place an `R` field may hold
+    /// a value.
+    pub(crate) fn pi_body(&self) -> bool {
+        self.moved_field.is_some()
     }
     /// Tagged section, `varint tag ‖ u64 LE length ‖ bytes`. The length comes
     /// from a count pass of the same walk, so no sink is ever back-patched.
@@ -1407,6 +1415,12 @@ macro_rules! durable_field {
     (put I, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
         let _: &$ty = $f;
     }};
+    (put R, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
+        let value: &$ty = $f;
+        if !$e.pi_body() && !$crate::durable_tail_codec::DurableEmpty::durable_empty(value) {
+            return Err($crate::durable_tail_codec::Refuse::NonEmpty($path));
+        }
+    }};
     (take N, $d:ident, $ty:ty) => {
         <$ty as $crate::durable_tail_codec::Durable>::take($d)?
     };
@@ -1432,6 +1446,7 @@ macro_rules! durable_field {
     (verify X, $d:ident, $ty:ty) => {};
     (verify E, $d:ident, $ty:ty) => {};
     (verify I, $d:ident, $ty:ty) => {};
+    (verify R, $d:ident, $ty:ty) => {};
     (verify N, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
     (verify U, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
     (verify L, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
@@ -1441,9 +1456,11 @@ macro_rules! durable_field {
     (key_type X, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
     (key_type E, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
     (key_type I, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
+    (key_type R, $ty:ty, $lt:lifetime) => { compile_error!("R fields cannot appear in durable keys") };
     (key X, $d:ident, $ty:ty) => { compile_error!("X/E/I fields cannot appear in durable keys") };
     (key E, $d:ident, $ty:ty) => { compile_error!("X/E/I fields cannot appear in durable keys") };
     (key I, $d:ident, $ty:ty) => { compile_error!("X/E/I fields cannot appear in durable keys") };
+    (key R, $d:ident, $ty:ty) => { compile_error!("R fields cannot appear in durable keys") };
     (key_type H, $ty:ty, $lt:lifetime) => { <$ty as $crate::durable_tail_codec::HDigestKey>::View<$lt> };
     (key_type $c:ident, $ty:ty, $lt:lifetime) => { <$ty as $crate::durable_tail_codec::DurableKey>::View<$lt> };
     (key H, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::HDigestKey>::key_h($d)? };
@@ -1462,6 +1479,7 @@ macro_rules! durable_field {
     (shape I, $s:ident, $f:ident, $ty:ty) => {
         $s.push(concat!("I ", stringify!($f), ": ", stringify!($ty)))
     };
+    (shape R, $s:ident, $f:ident, $ty:ty) => {};
     (shape $c:ident, $s:ident, $f:ident, $ty:ty) => {{
         $s.push(concat!(stringify!($c), " ", stringify!($f)));
         <$ty as $crate::durable_tail_codec::Durable>::shape($s);

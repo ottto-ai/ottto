@@ -375,6 +375,10 @@ struct Slot {
     reported: [u64; 22],
     /// Last reported D3 Claude hold key count.
     d3_reported: u64,
+    /// Pi: this pass's upload settings and HMAC key epoch.
+    pi_upload: Option<(codec::pi::UploadGates, Option<codec::pi::HmacKeyEpoch>)>,
+    /// Pi: the upload context whose stale literals are already purged.
+    pi_literals_purged: Option<store::Digest32>,
     /// Key count of the last committed index seen; sizes the per-pass maps.
     indexed: usize,
 }
@@ -2089,6 +2093,8 @@ impl SharedCache {
                 old_binding_no_match: 0,
                 reported: [0; 22],
                 d3_reported: 0,
+                pi_upload: None,
+                pi_literals_purged: None,
                 indexed: 0,
             });
         }
@@ -3890,7 +3896,7 @@ impl SharedCache {
             .certificate
             .restore(held, scope.clone())
             .map_err(Failure::Certificate)?;
-        let decoded = codec::decode_bounded(&record.record.body, source, lease).map_err(
+        let mut decoded = codec::decode_bounded(&record.record.body, source, lease).map_err(
             |reason| match reason {
                 crate::durable_tail_codec::DecodeFailure::Budget => Failure::Resource("decode"),
                 crate::durable_tail_codec::DecodeFailure::Integrity => Failure::Corrupt,
@@ -3922,6 +3928,9 @@ impl SharedCache {
             .is_some_and(|stored| stored != codex_counting_version::cutover_unix_ms())
         {
             return Err(Failure::Ineligible(store::Ineligible::Scope));
+        }
+        if source == SnapshotSource::Pi {
+            decoded.settle_pi_wire_prompt(self.durable_pi_key_epoch());
         }
         // Metadata and bounded certificate samples precede every repeatable
         // resource refusal. Fund b4's content-only extractor before its input.
@@ -4763,6 +4772,75 @@ impl SharedCache {
             return Ok(());
         };
         slot.store.gc_classified(writer, &context, &keep)
+    }
+
+    /// Binds the Pi store to this pass's upload settings and key epoch.
+    pub(crate) fn durable_note_pi_upload(
+        &self,
+        gates: codec::pi::UploadGates,
+        key_epoch: Option<codec::pi::HmacKeyEpoch>,
+    ) {
+        if let Some(mut stores) = self.durable() {
+            if let Some(slot) = stores.slot(DurableSource::Pi).as_mut() {
+                slot.pi_upload = Some((gates, key_epoch));
+            }
+        }
+    }
+
+    /// `None` until a pass notes them: capture then stores nothing.
+    pub(in crate::snapshots) fn durable_pi_upload_gates(&self) -> Option<codec::pi::UploadGates> {
+        let mut stores = self.durable()?;
+        Some(stores.slot(DurableSource::Pi).as_ref()?.pi_upload?.0)
+    }
+
+    fn durable_pi_key_epoch(&self) -> Option<codec::pi::HmacKeyEpoch> {
+        let mut stores = self.durable()?;
+        stores.slot(DurableSource::Pi).as_ref()?.pi_upload?.1
+    }
+
+    /// SOURCE condition 3 and Addendum extra 1. A record bound to another
+    /// upload context can never restore here, but it would keep its literals
+    /// on disk (GC needs a proof a Pi record from that context cannot give).
+    /// Deletes each one that holds a literal the current settings forbid or a
+    /// value made under another HMAC key, and counts it. One sweep per context:
+    /// the store's page covers every record a store may hold.
+    pub(crate) fn durable_purge_pi_literals<W: SingleWriter>(
+        &self,
+        writer: &W,
+        index: &ScanIndex,
+    ) -> std::io::Result<()> {
+        use crate::local_resource_diagnostics::cache_lifecycle;
+        let Some(mut stores) = self.durable() else {
+            return Ok(());
+        };
+        let Some(slot) = stores.slot(DurableSource::Pi).as_mut() else {
+            return Ok(());
+        };
+        let Some((gates, key_epoch)) = slot.pi_upload else {
+            return Ok(());
+        };
+        let context = store::context_digest(
+            &slot.namespace.0,
+            index.active_upload_context_fingerprint.as_deref(),
+        );
+        if slot.pi_literals_purged == Some(context) {
+            return Ok(());
+        }
+        slot.store.purge_other_context(writer, &context, |body| {
+            match codec::pi::stored_literal_verdict(body, gates, key_epoch) {
+                Ok(codec::pi::LiteralVerdict::Purge) => {
+                    cache_lifecycle::record(cache_lifecycle::Event::PiUploadedLiteralPurged);
+                    true
+                }
+                Ok(codec::pi::LiteralVerdict::KeyChanged) => {
+                    cache_lifecycle::record(cache_lifecycle::Event::PiUploadedLiteralKeyChanged);
+                    true
+                }
+                Ok(codec::pi::LiteralVerdict::Keep) | Err(_) => false,
+            }
+        })?;
+        slot.pi_literals_purged = Some(context);
+        Ok(())
     }
 
     /// Fresh-index cleanup uses the same verified, bounded GC; U/T14 survive.
