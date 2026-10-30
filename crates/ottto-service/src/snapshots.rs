@@ -56373,7 +56373,7 @@ mod tests {
         path: &Path,
         at: &str,
     ) {
-        apply_claude_reported_usage_with_index(
+        let mut disposition = apply_claude_reported_usage_with_index(
             &mut scan.snapshots,
             &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
             &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
@@ -56381,7 +56381,22 @@ mod tests {
             scan.census_complete,
             &scan.census_window_end,
         );
+        assert_eq!(
+            disposition.posture_admission("held-growing"),
+            Some("file_birth_rule")
+        );
+        let deferred = index.bind_session_accounts_with_mixed(
+            SnapshotSource::ClaudeCode,
+            "synthetic-held-money-machine",
+            &mut scan.snapshots,
+            &[],
+            &disposition.mixed_uploads,
+        );
+        disposition.defer_sessions(deferred);
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, scan, index);
+        // The same final network-boundary filter LocalHoldSettlement uses;
+        // a body left for local posture consumers is not proof of an upload.
+        disposition.retain_uploadable(&mut scan.snapshots);
         // Finalized selection is serialized with SnapshotItem's wire serde,
         // AFTER history/decode/no-op emission gates. No pre-gate totals pass.
         assert_eq!(
