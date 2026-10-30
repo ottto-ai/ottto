@@ -2871,12 +2871,12 @@ fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
         let accepted = finish(accepted);
         assert!(accepted.report.complete());
         assert!(!accepted.snapshots.is_empty());
-        let previous_entities = accepted
+        let previous_entities: BTreeSet<String> = accepted
             .snapshots
             .iter()
             .map(|i| snapshot_fingerprint(source, i))
             .collect();
-        let previous_bodies = accepted
+        let previous_bodies: BTreeSet<String> = accepted
             .snapshots
             .iter()
             .map(snapshot_upload_body_witness)
@@ -2939,7 +2939,7 @@ fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
             diagnostic_reason: FileReason::Complete,
             parsed_snapshot_count: scan.snapshots.len(),
             effective_upload_body_witness_revision:
-                effective_upload_body_witness_revision_for_source(source),
+                crate::snapshot_sync::effective_upload_body_witness_revision(source),
         });
         let mut index = ScanIndex::default();
         let (_, rows) = crate::local_resource_diagnostics::capture(|| {
