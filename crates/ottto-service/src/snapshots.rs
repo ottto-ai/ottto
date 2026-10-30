@@ -81587,7 +81587,11 @@ mod tests {
             let previous = index.clone();
             let mut scan = claude_context_backfill_scan(&root, &mut index, 2);
             assert_eq!(scan.scanned_file_count, 2);
-            assert_eq!(scan.census_complete, page == 2);
+            assert!(!scan.census_complete);
+        assert_eq!(index.claude_usage_authority_pending_count(), 0);
+        assert_eq!((scan.unreadable_path_count, scan.disappeared_file_count,
+            scan.malformed_json_line_count, scan.invalid_utf8_line_count), (0, 0, 0, 0));
+            assert_eq!(index.scan_traversal_exhausted_for_test(), page == 2);
             parsed += scan.scanned_file_count;
             // Restart between pages: only the settled index survives.
             index = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
@@ -81604,6 +81608,7 @@ mod tests {
         let stable = claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
         assert_eq!((stable.scanned_file_count, stable.snapshots.len()), (0, 0));
         assert!(!stable.census_complete);
+        assert_eq!(index.claude_usage_authority_pending_count(), 0);
         let _ = fs::remove_dir_all(home);
     }
 
@@ -82321,7 +82326,10 @@ mod tests {
             deferred.scanned_file_count, 0,
             "an unreadable list adopts nothing"
         );
-        assert!(deferred.census_complete);
+        assert!(!deferred.census_complete);
+        assert_eq!(refused.claude_usage_authority_pending_count(), 0);
+        assert_eq!((deferred.unreadable_path_count, deferred.disappeared_file_count,
+            deferred.malformed_json_line_count, deferred.invalid_utf8_line_count), (0, 0, 0, 0));
         let changed = index
             .files
             .keys()
@@ -82356,7 +82364,10 @@ mod tests {
             scan.scanned_file_count, 2,
             "only the unlisted family adopts"
         );
-        assert!(scan.census_complete);
+        assert!(!scan.census_complete);
+        assert_eq!(index.claude_usage_authority_pending_count(), 0);
+        assert_eq!((scan.unreadable_path_count, scan.disappeared_file_count,
+            scan.malformed_json_line_count, scan.invalid_utf8_line_count), (0, 0, 0, 0));
         let mut index = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
         let mut settled = revisions(&index);
         settled.sort();
@@ -82692,7 +82703,10 @@ mod tests {
             claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE)
         });
         assert_eq!(paused.scanned_file_count, 0);
-        assert!(paused.census_complete);
+        assert!(!paused.census_complete);
+        assert_eq!(index.claude_usage_authority_pending_count(), 0);
+        assert_eq!((paused.unreadable_path_count, paused.disappeared_file_count,
+            paused.malformed_json_line_count, paused.invalid_utf8_line_count), (0, 0, 0, 0));
         assert!(index
             .files
             .values()
