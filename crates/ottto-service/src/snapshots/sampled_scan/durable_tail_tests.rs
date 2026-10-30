@@ -15103,3 +15103,6 @@ fn pi_census_and_summary_work_before_any_native_record() {
     assert!(summary.starts_with("ottto-service: durable_tail source=pi "));
     assert!(summary.contains("retail_physical_bytes[process,daily]="));
 }
+
+#[path = "durable_tail_pi_bound_tests.rs"]
+mod pi_bound;
