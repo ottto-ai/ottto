@@ -516,74 +516,60 @@ fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    // Ron accepted this residual for Claude Code and Codex, and on 2026-10-30
+    // extended it to Pi: Pi's writer is append-only and its one known rewrite
+    // (the session-version header) reads Full (`pi_version_rewrite_after_tail`).
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
         let fixture = Fixture::new(source);
         fixture.append(&json!({"type":"ignored", "padding":"a".repeat(12 * 1024)}));
-        let model = if source == SnapshotSource::Codex {
-            "gpt-5.6"
-        } else {
-            "claude-opus-4-8"
+        let model = match source {
+            SnapshotSource::Codex => "gpt-5.6",
+            SnapshotSource::Pi => "fixture-model",
+            _ => "claude-opus-4-8",
         };
         fixture.append(&usage(source, 100, 0, model));
         fixture.append(&json!({"type":"ignored", "padding":"b".repeat(12 * 1024)}));
-        let (old, _, _, _) = acquire(&fixture, source, None, 100);
+        let (old, mode, _, initial) = acquire(&fixture, source, None, 100);
         assert!(old.is_some());
+        if source == SnapshotSource::Pi {
+            assert!(matches!(mode, ReadMode::Full(_)));
+            assert_eq!(initial, oracle(&fixture, source));
+        }
         let original = fs::read_to_string(&fixture.0).unwrap();
-        let edited = original.replace("\"input_tokens\":100", "\"input_tokens\":900");
+        let (needle, replacement) = if source == SnapshotSource::Pi {
+            ("\"input\":100", "\"input\":900")
+        } else {
+            ("\"input_tokens\":100", "\"input_tokens\":900")
+        };
+        let edited = original.replace(needle, replacement);
         assert_ne!(original, edited);
         assert_eq!(original.len(), edited.len());
         fs::write(&fixture.0, edited).unwrap();
         fixture.append(&usage(source, 140, 1, model));
         let (tail, mode, _, interim) = acquire(&fixture, source, old, 101);
         assert_eq!(mode, ReadMode::Tail);
-        assert_ne!(
-            interim,
-            oracle(&fixture, source),
-            "accepted sampled limitation must be visible"
-        );
-        let (_, mode, guards, later) = acquire(&fixture, source, tail, 3700);
+        let full = oracle(&fixture, source);
+        if source == SnapshotSource::Pi {
+            assert!(tail.is_some());
+            assert_eq!(interim[0]["input_tokens"], 240);
+            assert_eq!(full[0]["input_tokens"], 1040);
+        }
+        assert_ne!(interim, full, "accepted sampled limitation must be visible");
+        let later_at = if source == SnapshotSource::Pi {
+            101 + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS
+        } else {
+            3700
+        };
+        let (_, mode, guards, later) = acquire(&fixture, source, tail, later_at);
         assert_eq!(mode, ReadMode::Unchanged);
         assert_eq!(guards, 0);
         assert_eq!(later, interim);
-        assert_ne!(later, oracle(&fixture, source));
+        assert_ne!(later, full);
     }
-}
-
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_hidden_middle_edit_remains_an_accepted_sampled_residual() {
-    let source = SnapshotSource::Pi;
-    let fixture = Fixture::new(source);
-    fixture.append(&json!({"type":"ignored", "padding":"a".repeat(12 * 1024)}));
-    fixture.append(&usage(source, 100, 0, "fixture-model"));
-    fixture.append(&json!({"type":"ignored", "padding":"b".repeat(12 * 1024)}));
-    let (old, mode, _, initial) = acquire(&fixture, source, None, 100);
-    assert!(old.is_some());
-    assert!(matches!(mode, ReadMode::Full(_)));
-    assert_eq!(initial, oracle(&fixture, source));
-    let original = fs::read_to_string(&fixture.0).unwrap();
-    let edited = original.replace("\"input\":100", "\"input\":900");
-    assert_ne!(original, edited);
-    assert_eq!(original.len(), edited.len());
-    fs::write(&fixture.0, edited).unwrap();
-    fixture.append(&usage(source, 140, 1, "fixture-model"));
-    let (tail, mode, _, interim) = acquire(&fixture, source, old, 101);
-    assert_eq!(mode, ReadMode::Tail);
-    assert!(tail.is_some());
-    let full = oracle(&fixture, source);
-    assert_eq!(interim[0]["input_tokens"], 240);
-    assert_eq!(full[0]["input_tokens"], 1040);
-    assert_ne!(interim, full, "accepted sampled limitation must be visible");
-    let (_, mode, guards, later) = acquire(
-        &fixture,
-        source,
-        tail,
-        101 + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
-    );
-    assert_eq!(mode, ReadMode::Unchanged);
-    assert_eq!(guards, 0);
-    assert_eq!(later, interim);
-    assert_ne!(later, full);
 }
 
 #[test]
