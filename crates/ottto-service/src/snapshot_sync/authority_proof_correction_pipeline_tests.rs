@@ -3122,10 +3122,43 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
     }
 }
 
+/// The R2 invariant, strictly: every member this page drained certifies the
+/// exact revision its saved file entry has, the re-arm marker included (which
+/// `check` skips). Returns the owed set before the page.
+fn apc_r2_drained_pairs(page: &ApcPage, label: &str) -> Option<BTreeSet<String>> {
+    let (_, owed_before) = page.record_before().and_then(|record| record.correction)?;
+    let after = page.record();
+    let owed_after = after
+        .as_ref()
+        .and_then(|record| record.correction.clone())
+        .map(|(_, owed)| owed)
+        .unwrap_or_default();
+    let keys = ApcFixture::family_keys(&page.index);
+    for member in owed_before.difference(&owed_after) {
+        let saved = &page.index.files[&keys[member]].source_file_fingerprint;
+        assert!(
+            page.candidates.iter().any(|candidate| {
+                candidate.member_for_test() == member && candidate.revision_for_test() == saved
+            }),
+            "{label}: {member} drained at a revision its saved entry {saved:?} does not have"
+        );
+        if let Some(record) = &after {
+            assert_eq!(
+                record.member_source_file_fingerprints.get(member),
+                Some(saved),
+                "{label}: {member}'s saved record names the saved file's revision"
+            );
+        }
+    }
+    Some(owed_before)
+}
+
 /// R2 seam pages: checks every page and returns each owed member that was
-/// captured at a moved revision with its accepted body unchanged (a no-op),
-/// was not offered, and whose committed entry the page's save kept. Each
-/// stays owed, and the saved record names the saved file's revision.
+/// captured at a revision other than its committed entry's (a granted
+/// member's committed entry is the re-arm marker; the sidecar touch also
+/// moves its pair) with its accepted body unchanged (a no-op), was not
+/// offered, and whose committed entry the page's save kept. Each stays owed
+/// with its pre-page pair.
 fn apc_r2_reverted(pages: &[ApcPage], label: &str) -> BTreeSet<String> {
     let mut reverted = BTreeSet::new();
     for (number, page) in pages.iter().enumerate() {
@@ -3134,10 +3167,13 @@ fn apc_r2_reverted(pages: &[ApcPage], label: &str) -> BTreeSet<String> {
         assert!(transition.granted.is_none(), "{label}: no fresh grant");
         assert!(!transition.failed, "{label}: no failure");
         assert!(transition.acked.is_empty(), "{label}: nothing was ACKed");
-        let Some((_, owed_before)) = page.record_before().and_then(|record| record.correction)
-        else {
+        let Some(owed_before) = apc_r2_drained_pairs(page, &label) else {
             continue;
         };
+        let pairs_before = page
+            .record_before()
+            .expect("an owed record")
+            .member_source_file_fingerprints;
         let keys = ApcFixture::family_keys(&page.before);
         for candidate in &page.candidates {
             let member = candidate.member_for_test();
@@ -3174,10 +3210,15 @@ fn apc_r2_reverted(pages: &[ApcPage], label: &str) -> BTreeSet<String> {
                 owed.contains(member),
                 "{label}: {member}'s no-op at an unselected revision stays owed"
             );
+            assert_ne!(
+                pairs_before.get(member).map(String::as_str),
+                Some(candidate.revision_for_test()),
+                "{label}: {member}'s pair moved"
+            );
             assert_eq!(
                 record.member_source_file_fingerprints.get(member),
-                Some(committed),
-                "{label}: {member}'s saved record names the saved file's revision"
+                pairs_before.get(member),
+                "{label}: {member} keeps its pre-page pair"
             );
             reverted.insert(member.to_string());
         }
@@ -3202,6 +3243,7 @@ fn apc_r2_redrain(
     for (number, page) in pages.iter().enumerate() {
         let label = format!("re-drain page {number}");
         let transition = ApcFixture::check(page, &label);
+        apc_r2_drained_pairs(page, &label);
         assert!(transition.granted.is_none(), "{label}: no fresh grant");
         assert!(!transition.failed, "{label}: no failure");
         noop.extend(transition.noop);
@@ -3253,9 +3295,8 @@ fn r2_sidecar_only_revision_move_then_a_shed_page_keeps_no_op_members_owed() {
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-r2-shed", false);
     let (_, grant) = fixture.reach_grant();
-    let entities = ApcFixture::family_entities(
-        &ScanIndex::load(&fixture.index_path).expect("load the granted index"),
-    );
+    let granted = ScanIndex::load(&fixture.index_path).expect("load the granted index");
+    let entities = ApcFixture::family_entities(&granted);
     fixture.touch_api_sidecar();
     let pages = fixture.generation(grant.hour + 1, |_| ApcUpload::Shed);
     assert!(pages.iter().any(|page| page.shed), "a page shed");
@@ -3275,8 +3316,13 @@ fn r2_sidecar_only_revision_move_then_a_shed_page_keeps_no_op_members_owed() {
     for member in &reverted {
         assert_eq!(
             record.member_source_file_fingerprints.get(member),
-            Some(&restarted.files[&keys[member]].source_file_fingerprint),
-            "{member}: the restarted record names the saved file's revision"
+            grant.record.member_source_file_fingerprints.get(member),
+            "{member}: the restarted record keeps the granted pair"
+        );
+        assert_eq!(
+            restarted.files[&keys[member]].source_file_fingerprint,
+            granted.files[&keys[member]].source_file_fingerprint,
+            "{member}: the shed save published no drained revision"
         );
     }
     assert_eq!(
