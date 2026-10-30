@@ -81,8 +81,24 @@ impl IdentityFixture {
         self.run_with(index, Arc::new(SharedCache::default()), at)
     }
     fn run_with(&self, index: ScanIndex, cache: Arc<SharedCache>, at: &str) -> (Run, Reoffers) {
+        self.run_stages(index, cache, at, false)
+    }
+    /// The production order for a page E2 publishes: evidence, policy, finalize.
+    fn run_published(&self, index: ScanIndex, at: &str) -> (Run, Reoffers) {
+        self.run_stages(index, Arc::new(SharedCache::default()), at, true)
+    }
+    fn run_stages(
+        &self,
+        index: ScanIndex,
+        cache: Arc<SharedCache>,
+        at: &str,
+        published: bool,
+    ) -> (Run, Reoffers) {
         let (run, rows) = crate::local_resource_diagnostics::capture(|| {
             let mut run = raw_scan_at(&self.native, index, Some(cache), true, at, |_| {});
+            if published {
+                run = enriched(&self.native, run);
+            }
             finalize_scan_after_policy_with_body_witness(
                 SOURCE,
                 &mut run.result,
@@ -400,12 +416,14 @@ fn desktop_identity_recovery_reads_its_settled_e2_path_twin_and_publishes() {
     fs::create_dir_all(&copy).unwrap();
     let copy = copy.join(format!("{}.jsonl", f.native.session));
     fs::write(&copy, fs::read(&f.native.path).unwrap()).unwrap();
-    let (first, _) = f.run(f.loaded_incomplete("2026-08-02T07:11:00Z"), COLLECTED);
-    assert!(first.result.snapshots.iter().all(|item| {
-        item.source_session_id == f.native.session && disposition(item) == Some("missing")
-    }));
+    let (first, _) = f.run_published(f.loaded_incomplete("2026-08-02T07:11:00Z"), COLLECTED);
+    assert_eq!(
+        disposition(f.child(&first)),
+        Some("missing"),
+        "one summed body"
+    );
     let mut index = ack(first);
-    // E2 may publish one body for both paths: recover the path that owns it.
+    // E2 publishes one body for both paths: recover the path that owns it.
     let (pending, twin) = {
         let keys = [f.key(), local_index_key(&copy)];
         let owner = keys
@@ -417,16 +435,14 @@ fn desktop_identity_recovery_reads_its_settled_e2_path_twin_and_publishes() {
     index
         .claude_desktop_identity_latches
         .insert(twin.clone(), Settled);
-    let (recovered, counts) = f.run(index, "2026-08-02T07:12:00Z");
+    let (recovered, counts) = f.run_published(index, "2026-08-02T07:12:00Z");
     assert_eq!(
         recovered.native_bytes,
         2 * f.len(),
         "the settled twin is read with the recovering path"
     );
-    assert!(!recovered.result.snapshots.is_empty(), "E2 withheld it");
-    assert!(recovered.result.snapshots.iter().all(|item| {
-        item.source_session_id == f.native.session && disposition(item) == Some("complete")
-    }));
+    assert_eq!(recovered.result.snapshots.len(), 1, "E2 withheld the body");
+    assert_eq!(disposition(f.child(&recovered)), Some("complete"));
     assert_eq!(counts.recovered, [1, 0, 0, f.len()]);
     let index = ack(recovered);
     assert_eq!(index.claude_desktop_identity_latches[&pending], Settled);
