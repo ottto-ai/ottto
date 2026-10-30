@@ -1468,14 +1468,18 @@ fn copy_derived_rows(
             *read &= slot.read;
         }
     }
+    if lent.is_empty() {
+        return Vec::new();
+    }
+    let groups = grouping
+        .groups
+        .iter()
+        .filter_map(|(bucket, rows)| Some((accepted::bucket_key(bucket)?, rows)))
+        .collect::<BTreeMap<_, _>>();
     let mut rows = Vec::new();
     let mut counts = budget::Counts::default();
     for ((start, row), (lent, read)) in lent {
-        let group = grouping
-            .groups
-            .iter()
-            .find(|(bucket, _)| accepted::bucket_key(bucket) == Some(start))
-            .and_then(|(_, rows)| rows.get(&row));
+        let group = groups.get(&start).and_then(|rows| rows.get(&row));
         let Some(prior) = group
             .and_then(|group| changed_shares(accepted, start, &row, group))
             .filter(|prior| !prior.is_disjoint(&lent))
