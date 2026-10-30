@@ -1456,30 +1456,46 @@ fn copy_derived_rows(
     let Some(accepted) = accepted else {
         return Vec::new();
     };
-    let mut lent = BTreeMap::<(i64, RowKey), BTreeSet<Option<[u8; 32]>>>::new();
-    for (bucket, row, key) in super::claude_request_money::e2::copied_marker_lent_rows(item) {
+    // Per row: the accounts copied markers lent, and whether every lent
+    // request's own evidence was positively read this pass.
+    let mut lent = BTreeMap::<(i64, RowKey), (BTreeSet<Option<[u8; 32]>>, bool)>::new();
+    for (bucket, row, slot) in super::claude_request_money::e2::copied_marker_lent_rows(item) {
         if let Some(start) = accepted::bucket_key(bucket) {
-            lent.entry((start, row_key_from_model_usage(&row)))
-                .or_default()
-                .insert(Some(accepted.authority_hash(&key)));
+            let (accounts, read) = lent
+                .entry((start, row_key_from_model_usage(&row)))
+                .or_insert_with(|| (BTreeSet::new(), true));
+            accounts.insert(Some(accepted.authority_hash(&slot.lent)));
+            *read &= slot.read;
         }
     }
     let mut rows = Vec::new();
-    for ((start, row), lent) in lent {
+    let mut counts = budget::Counts::default();
+    for ((start, row), (lent, read)) in lent {
         let group = grouping
             .groups
             .iter()
             .find(|(bucket, _)| accepted::bucket_key(bucket) == Some(start))
             .and_then(|(_, rows)| rows.get(&row));
-        if group
+        let Some(prior) = group
             .and_then(|group| changed_shares(accepted, start, &row, group))
-            // Only shares copied markers lent to this row's requests. Without
-            // per-ACK provenance, a freeze holding any other share may be a
-            // corrected body's and keeps #909's protection.
-            .is_some_and(|prior| prior.is_subset(&lent))
-        {
+            .filter(|prior| !prior.is_disjoint(&lent))
+        else {
+            continue;
+        };
+        // Lead B Addendum 4: without per-ACK provenance, a freeze holding any
+        // share copied markers did not lend may be a corrected body's, and
+        // evidence this pass could not read may still prove the latest
+        // proof. Both keep #909's protection, counted.
+        if !prior.is_subset(&lent) {
+            counts.copy_derived_mixed_not_invalidated += 1;
+        } else if !read {
+            counts.copy_derived_skipped_evidence_unavailable += 1;
+        } else {
             rows.push((start, row));
         }
+    }
+    if !counts.is_empty() {
+        budget::record(&counts);
     }
     rows
 }
@@ -2600,12 +2616,17 @@ impl OrgMarkers {
 // E2 consumes this compact, native-sequence-ordered placement before any
 // requests aggregate. Marker state is bounded independently of request count.
 pub(crate) type AccountPartition = Option<Arc<AuthorityKey>>;
-/// A request's grain slot (live key, origin) and the account lent to it.
-pub(crate) type LentSlot = (
-    super::claude_request_money::body::ClaudeLiveKey,
-    Option<super::claude_request_money::body::ClaudeRequestUsageOrigin>,
-    Arc<AuthorityKey>,
-);
+/// A counted request's grain slot (live key, origin), the account a copied
+/// marker lent it, and whether this pass positively read its own evidence.
+#[derive(Clone, Debug)]
+pub(crate) struct LentSlot {
+    pub(crate) key: super::claude_request_money::body::ClaudeLiveKey,
+    pub(crate) origin: Option<super::claude_request_money::body::ClaudeRequestUsageOrigin>,
+    pub(crate) lent: Arc<AuthorityKey>,
+    /// Classified tagged or missing, never refused (unreadable, pending).
+    pub(crate) read: bool,
+}
+crate::heap_layout_bound::fields!(LentSlot; key, origin, lent, read);
 
 #[derive(Clone, Debug)]
 struct AccountRun {
@@ -3072,6 +3093,10 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
                 .and_then(|row| *row);
             let identity = request_occurrence_facts(item, request, occurrence, false)
                 .map(|facts| classify_ref(evidence, &facts));
+            let read = matches!(
+                identity,
+                Some(IdentityRef::Tagged(_) | IdentityRef::Missing)
+            );
             let own = match identity {
                 Some(IdentityRef::Tagged(key)) if telemetry.is_some() && key.login.is_some() => {
                     let found = keys.iter().find(|known| key.matches(known));
@@ -3171,12 +3196,14 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
             };
             occurrence.e2_inherited = account.as_ref().map(|_| accounts.inherited > before);
             // Own evidence for the lent account itself ends the loan.
-            if accounts
-                .copied_marker_lent
-                .get(&sequence)
-                .is_some_and(|lent| account.as_ref() == Some(&lent.2))
+            if let std::collections::btree_map::Entry::Occupied(mut lent) =
+                accounts.copied_marker_lent.entry(sequence)
             {
-                accounts.copied_marker_lent.remove(&sequence);
+                if account.as_ref() == Some(&lent.get().lent) {
+                    lent.remove();
+                } else {
+                    lent.get_mut().read = read;
+                }
             }
             place_request_identity(
                 &mut fold,

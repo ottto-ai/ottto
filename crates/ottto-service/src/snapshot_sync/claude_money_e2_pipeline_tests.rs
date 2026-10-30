@@ -4048,7 +4048,69 @@ fn e2_pipeline_corrected_body_freeze_is_not_copy_derived() {
             let counts = serde_json::to_value(take_identity_counts()).unwrap();
             assert_eq!(identity_count(&counts, "accepted_share_changed"), 1);
             assert_eq!(identity_count(&counts, "copy_derived_proof_invalidated"), 0);
+            assert_eq!(identity_count(&counts, "copy_derived_mixed_not_invalidated"), 1);
             assert_eq!(body(&page, COPY).unwrap().request_identity_refusals, u64::from(!retained));
+        });
+    }
+}
+
+/// [money] Lead B Addendum 4: a row frozen {X} by a copied marker, whose
+/// latest proof is the own account B, is not tombstoned while this pass
+/// cannot read the session's own evidence (a partial telemetry sidecar pair).
+/// #909 / option (ii) protection stays, counted; money and account unchanged.
+#[test]
+fn e2_pipeline_copy_derived_row_is_kept_while_own_evidence_is_unreadable() {
+    for retained in [false, true] {
+        with_e2(|| {
+            use crate::snapshots::claude_request_identity::{take_identity_counts, AcceptedBuckets};
+            let mut c = Corpus::new("e2-pipeline-copy-derived-unread");
+            let scanner = E2ScanFixture::capturing_identity();
+            c.root(ROOT, &resumed(ROOT, &[A]));
+            let old = ScanIndex::default();
+            let page = ready(&c, &scanner, old.clone(), 100, false);
+            let prior = settle(&c, &old, page, &mut e2_progress());
+            let [x, b] = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"]
+                .map(|org| ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap());
+            let marker = json!({"type":"attachment", "sessionId":COPY, "attachment":{
+                "type":"credential_org", "organizationUuid":"11111111-1111-4111-8111-111111111111"}});
+            c.write_at(&file(COPY), &(marker.to_string() + "\n" + &resumed(COPY, &[A, C])),
+                "2026-08-02T07:03:00Z");
+            let off = {
+                let _off = e2::ResumedPrefixForTest::set(false);
+                ready(&c, &scanner, prior.clone(), 100, false)
+            };
+            let mut stored = serde_json::to_value(body(&off, COPY).unwrap()).unwrap();
+            let mut ledger = AcceptedBuckets::for_test();
+            ledger.set_retained_enabled(retained);
+            ledger.record(&stored);
+            if retained {
+                // The latest witnessed proof is B (own evidence, since lost).
+                let evidence = stored["request_evidence"].as_array_mut().unwrap();
+                assert_eq!(evidence.len(), 1);
+                assert_eq!(evidence[0]["provider_workspace_hash"], json!(x));
+                evidence[0]["provider_workspace_hash"] = json!(b);
+                ledger.record_proved(&stored, true, &[]);
+            }
+            // One sidecar of the pair: this root's telemetry read is incomplete.
+            let effort = c.support.join("local-otel/claude-code-effort")
+                .join(format!("{:x}.jsonl", Sha256::digest(COPY.as_bytes())));
+            std::fs::create_dir_all(effort.parent().unwrap()).unwrap();
+            std::fs::write(&effort, "").unwrap();
+            let saved = serde_json::to_vec(&ledger).unwrap();
+            let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
+            take_identity_counts();
+            page.enrich_with(&c, Some(&mut ledger));
+            let counts = serde_json::to_value(take_identity_counts()).unwrap();
+            assert_eq!(identity_count(&counts, "copy_derived_skipped_evidence_unavailable"), 1);
+            assert_eq!(identity_count(&counts, "copy_derived_proof_invalidated"), 0);
+            assert_eq!(serde_json::to_vec(&ledger).unwrap(), saved, "no tombstone");
+            // A body withheld for unread telemetry leaves the stored one in place.
+            if let Some(copy) = body(&page, COPY) {
+                let row = &copy.usage_buckets[0].model_usage[0];
+                assert!(copy.request_identity_refusals > 0 || row.identity_retained, "protection kept");
+                assert_eq!((copy.request_count, copy.removed_request_count), (1, Some(1)));
+                assert_eq!(org_shares(copy).get(&b), None);
+            }
         });
     }
 }
