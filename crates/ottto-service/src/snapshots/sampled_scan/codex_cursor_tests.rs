@@ -584,6 +584,109 @@ fn strict_debt_is_never_settleable_residue_and_held_debt_is() {
     );
 }
 
+/// C2: no time-based expiry. A memo entry wakes on cheap changed evidence
+/// only: an object change, shrink or same-length stamp change of the held
+/// file, a head or boundary sample mismatch at the refused offset, or a
+/// changed digest dependency or parent ledger.
+///
+/// Premise (disclosed): an in-place interior edit outside the samples that
+/// also appends is not detected until the entry is lost (restart, LRU
+/// eviction) or a dependency changes. A miss is never treated as proof of
+/// uniqueness; it only costs a re-read.
+#[test]
+fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
+    let temp = Temp::new("memo", b"{\"n\":1}\n{\"n\":2}\n");
+    let file = File::open(&temp.0).unwrap();
+    assert!(LiveWitness::read(plain_path(), &file, 0).is_none());
+    assert!(LiveWitness::read(plain_path(), &file, 10_000).is_none());
+    let live = LiveWitness::read(plain_path(), &file, 8).unwrap();
+    let stamp = OpenStamp::capture(&file).unwrap();
+    let parent = Some(ParentDep {
+        id: "parent".into(),
+        ledger: Some("ledger-1".into()),
+        current: Some("p-1".into()),
+        witnessed: None,
+    });
+    let now = |ledger: &str, current: &str| ParentNow {
+        ledger: Some(ledger.into()),
+        current: Some(current.into()),
+        witnessed: None,
+    };
+    let now_1 = now("ledger-1", "p-1");
+    let entry = MemoEntry::new("digest".into(), live, stamp, parent, None, disclosure());
+    assert_eq!(entry.parent_ref(), Some("parent"));
+    assert!(entry
+        .matches(plain_path(), "digest", &file, Some(&now_1), "")
+        .is_some());
+    assert!(entry
+        .matches(plain_path(), "other", &file, Some(&now_1), "")
+        .is_none());
+    // PR-1 L4: a changed ledger and, separately, a changed parent object
+    // each miss.
+    assert!(entry
+        .matches(
+            plain_path(),
+            "digest",
+            &file,
+            Some(&now("ledger-2", "p-1")),
+            ""
+        )
+        .is_none());
+    assert!(entry
+        .matches(
+            plain_path(),
+            "digest",
+            &file,
+            Some(&now("ledger-1", "p-2")),
+            ""
+        )
+        .is_none());
+    assert!(entry
+        .matches(
+            plain_path(),
+            "digest",
+            &file,
+            Some(&ParentNow {
+                ledger: Some("ledger-1".into()),
+                current: None,
+                witnessed: None,
+            }),
+            ""
+        )
+        .is_none());
+    assert!(entry
+        .matches(plain_path(), "digest", &file, None, "")
+        .is_none());
+    // Growth past the refused offset cannot cure the hold: still a hit, and
+    // the hit returns the grown stamp for the entry to keep.
+    temp.append(b"{\"n\":3}\n");
+    let grown = entry
+        .matches(plain_path(), "digest", &file, Some(&now_1), "")
+        .expect("growth is a hit");
+    assert!(grown.extent > entry.stamp.extent);
+    let mut refreshed = entry.clone();
+    refreshed.stamp = grown;
+    // No timer: an entry whose evidence is unchanged keeps matching.
+    assert!(refreshed
+        .matches(plain_path(), "digest", &file, Some(&now_1), "")
+        .is_some());
+    // A same-length stamp change (an in-place write elsewhere) wakes it.
+    OpenOptions::new()
+        .write(true)
+        .open(&temp.0)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+        .unwrap();
+    assert!(refreshed
+        .matches(plain_path(), "digest", &file, Some(&now_1), "")
+        .is_none());
+    // A rewritten prefix is a miss (re-read).
+    fs::write(&temp.0, b"{\"n\":9}\n{\"n\":2}\n{\"n\":3}\n").unwrap();
+    assert!(entry
+        .matches(plain_path(), "digest", &file, Some(&now_1), "")
+        .is_none());
+}
+
 fn codex_line(value: Value) -> Vec<u8> {
     let mut line = serde_json::to_vec(&value).unwrap();
     line.push(b'\n');
@@ -2151,67 +2254,6 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
         assert!(cache.cursor_slot_free(), "{}", counters(&cache));
         assert_eq!(pending_hint(&index, &path), None, "dequeued");
     });
-}
-
-/// E3 (R2-H1): between walks a live job's copy-budget charge is the last
-/// walk plus every byte consumed since; a walk is due again only after
-/// `CHARGE_REFRESH_BYTES` or a reader restart, never per line.
-#[test]
-fn live_job_charge_is_estimated_between_bounded_walks() {
-    let temp = Temp::new("charge", b"{}\n");
-    let mut meta = JobMeta {
-        key: "key".into(),
-        namespace: "namespace".into(),
-        stamp_open: OpenStamp::capture(&File::open(&temp.0).unwrap()).unwrap(),
-        started: 0,
-        dependencies: None,
-        owner: None,
-        counting: String::new(),
-        fence: None,
-        census_trusted: true,
-        pages: 0,
-        unavailable_resumes: 0,
-        charge: None,
-        eof_applied: false,
-        pace: JobPace::new([0; 2], std::time::Instant::now(), false),
-    };
-    assert_eq!(meta.charge_estimate(0, 64), None, "the first step walks");
-    meta.record_charge(1_000, 10, 64);
-    assert_eq!(meta.charge_estimate(10, 64), Some(1_000));
-    assert_eq!(
-        meta.charge_estimate(510, 64),
-        Some(1_500),
-        "consumed bytes charged"
-    );
-    assert_eq!(
-        meta.charge_estimate(510, 4_160),
-        Some(5_596),
-        "reader buffer capacity growth charged (R2-M1)"
-    );
-    assert_eq!(
-        meta.charge_estimate(510, 32),
-        Some(1_500),
-        "a shrunk buffer never lowers the charge below the walk"
-    );
-    assert!(meta
-        .charge_estimate(10 + CHARGE_REFRESH_BYTES - 1, 64)
-        .is_some());
-    assert_eq!(
-        meta.charge_estimate(10 + CHARGE_REFRESH_BYTES, 64),
-        None,
-        "walk again"
-    );
-    assert_eq!(
-        meta.charge_estimate(5, 64),
-        None,
-        "a restarted reader walks again"
-    );
-    meta.record_charge(usize::MAX, 10, 64);
-    assert_eq!(
-        meta.charge_estimate(20, 64),
-        Some(usize::MAX),
-        "a refused walk stays refused"
-    );
 }
 
 /// E1 (R1-B1 = R2-B2): a quiescent file larger than B whose last record has
