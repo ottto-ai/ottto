@@ -18,8 +18,9 @@ pub(crate) struct Candidate {
     key: String,
     receipt: Receipt,
     /// Retry/ACK mode isolation remains source-wide even when the file's
-    /// acquisition receipt uses the unaffected base context.
-    mode_context: String,
+    /// acquisition receipt uses the unaffected base context. `None` when the
+    /// mode is the receipt's own context (always, switch OFF): no allocation.
+    mode_context: Option<String>,
     historical_replay_generation: Option<String>,
     bodies: BTreeMap<String, String>,
     wire_bytes: BTreeMap<String, u64>,
@@ -329,11 +330,14 @@ impl ScanIndex {
                 if entry.last_upload_body_witness.as_ref() != Some(&body_witness) {
                     return None;
                 }
+                let mode_context = self.active_upload_context_fingerprint.as_ref()?;
+                let context_fingerprint = self.file_expected_context(key)?;
                 Some(Candidate {
                     key: key.clone(),
-                    mode_context: self.active_upload_context_fingerprint.clone()?,
+                    mode_context: (mode_context != context_fingerprint)
+                        .then(|| mode_context.clone()),
                     receipt: Receipt {
-                        context_fingerprint: self.file_expected_context(key)?.clone(),
+                        context_fingerprint: context_fingerprint.clone(),
                         replay_generation: self.context_curve_replay_epoch,
                         source_witness: entry.source_file_fingerprint.clone(),
                         body_witness,
@@ -363,7 +367,11 @@ impl ScanIndex {
         // Joined file aliases can earn separate receipts for one wire entity.
         let mut counted_entities = BTreeSet::new();
         for candidate in candidates {
-            if self.active_upload_context_fingerprint.as_ref() != Some(&candidate.mode_context)
+            let mode_context = candidate
+                .mode_context
+                .as_ref()
+                .unwrap_or(&candidate.receipt.context_fingerprint);
+            if self.active_upload_context_fingerprint.as_ref() != Some(mode_context)
                 || self.file_expected_context(&candidate.key)
                     != Some(&candidate.receipt.context_fingerprint)
                 || self.context_curve_replay_epoch != candidate.receipt.replay_generation
