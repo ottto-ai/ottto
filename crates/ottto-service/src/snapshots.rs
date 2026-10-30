@@ -4021,10 +4021,12 @@ pub struct ScanIndex {
     /// E2 stored copy removals (copy-family fix): what each Claude file once
     /// removed on an earlier holder's current proof stays removed after that
     /// proof retires. Bounded and local. Appended slot; older daemons ignore
-    /// it; absent/damaged metadata stays uncertain until the current proof decides.
+    /// it. Only an empty undamaged store is never written, so an absent field
+    /// is an empty store (Lead B F4); damaged metadata stays uncertain until
+    /// the current proof decides.
     #[serde(
-        default = "claude_request_money::copy_removals::CopyRemovals::missing",
-        skip_serializing_if = "claude_request_money::copy_removals::CopyRemovals::is_empty",
+        default,
+        skip_serializing_if = "claude_request_money::copy_removals::CopyRemovals::is_unwritten",
         deserialize_with = "claude_request_money::copy_removals::CopyRemovals::deserialize_lenient"
     )]
     pub(crate) claude_copy_removals: claude_request_money::copy_removals::CopyRemovals,
@@ -15803,11 +15805,7 @@ impl SelectorHashes {
 // a native selector hash ("base" or hexadecimal).
 const COPY_UNPROVEN_PARTITION: &str = "copy_unproven:";
 fn row_key_with_selector_hash(row: &SnapshotModelUsage, selector_hash: String) -> RowKey {
-    let selector_hash = if row.copy_unproven {
-        format!("{COPY_UNPROVEN_PARTITION}{selector_hash}")
-    } else {
-        selector_hash
-    };
+    let selector_hash = copy_unproven_selector_hash(row.copy_unproven, selector_hash);
     RowKey {
         model: row.model.clone(),
         selector_hash,
@@ -15818,6 +15816,18 @@ fn row_key_with_selector_hash(row: &SnapshotModelUsage, selector_hash: String) -
         gateway_provider: row.gateway_provider.clone(),
         model_provider: row.model_provider.clone(),
         subscription_product: row.subscription_product.clone(),
+    }
+}
+
+/// The RowKey selector partition of a `copy_unproven` row. Every RowKey of a
+/// usage row, local or rebuilt from its wire form (the #909 accepted ledger,
+/// #944 proved rows), must partition through here so a marked row and an
+/// unmarked twin never share a key.
+pub(crate) fn copy_unproven_selector_hash(copy_unproven: bool, selector_hash: String) -> String {
+    if copy_unproven {
+        format!("{COPY_UNPROVEN_PARTITION}{selector_hash}")
+    } else {
+        selector_hash
     }
 }
 

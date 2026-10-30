@@ -255,7 +255,12 @@ fn wire_row_key(row: &Value) -> Option<RowKey> {
     };
     Some(RowKey {
         model: text("model")?,
-        selector_hash: super::super::selector_hash(&context),
+        // The daemon's RowKey partition (`row_key_with_selector_hash`): a
+        // marked copy and its unmarked own twin are different rows.
+        selector_hash: super::super::copy_unproven_selector_hash(
+            row["copy_unproven"] == json!(true),
+            super::super::selector_hash(&context),
+        ),
         reasoning_effort: text("reasoning_effort"),
         auth_mode: text("auth_mode"),
         billing_channel: text("billing_channel"),
@@ -846,6 +851,18 @@ impl AcceptedBuckets {
                 ..Default::default()
             });
         }
+    }
+    /// Copy-prefix ENABLE guard (Lead B F2/F3): whether a stored-body ACK
+    /// may have frozen `session`'s bucket at `bucket_start`. Known hints
+    /// answer exactly; incomplete hints (whole buckets evicted) or an
+    /// unparsable start answer yes. Without hints for the session the answer
+    /// is no, the same reach as #909's own protection (`accepted_state_unknown`).
+    pub(crate) fn may_have_accepted(&self, session: &str, bucket_start: &str) -> bool {
+        self.get(session).is_some_and(|state| {
+            state.incomplete
+                || bucket_key(bucket_start)
+                    .map_or(true, |start| state.binary_search(&start).is_ok())
+        })
     }
     pub(crate) fn get(&self, session: &str) -> Option<&AcceptedSession> {
         let key = self.1.as_ref()?;
