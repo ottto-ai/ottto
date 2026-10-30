@@ -156,6 +156,8 @@ fn exact_rec_predecessor_is_protected_until_replacement_bundle_verifies() {
     let identity = read(&f.path).unwrap().set.identity().clone();
     let db_path = fence::sibling(&f.path, ".v2.sqlite");
     let mut db = sqlite::Sqlite::open(&db_path, &identity).unwrap();
+    // Checkpoint replacements require the same private-text inventory as runtime writes.
+    db.path_extractor(kinds::private_paths);
     let records = crate::durable_tail_store::store_dir_for_index(&f.path);
     fs::DirBuilder::new()
         .recursive(true)
