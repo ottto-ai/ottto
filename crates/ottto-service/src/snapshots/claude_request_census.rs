@@ -806,16 +806,22 @@ pub(crate) struct ClaudeCensusLostRecords {
     /// Serialized bytes of `keys`, each with its separator.
     wire: usize,
     saturated: bool,
+    /// While saturated: unix seconds of the first complete terminal that
+    /// found it so (the episode start, at most one scan cycle late). Persisted
+    /// as `lt` beside the flag, so a restart keeps the episode's age.
+    since: Option<u64>,
 }
-crate::heap_layout_bound::fields!(ClaudeCensusLostRecords; keys, wire, saturated);
+crate::heap_layout_bound::fields!(ClaudeCensusLostRecords; keys, wire, saturated, since);
 
 /// Lost keys kept before the set saturates (each at most
 /// `MAX_CLAUDE_REQUEST_CENSUS_KEY_BYTES`).
 pub(crate) const MAX_CLAUDE_CENSUS_LOST_KEYS: usize = 256;
 /// Census map key of the persisted lost set. Never an index key (those are
 /// absolute paths) or a ledger key. Wire value, each field omitted when
-/// empty or false: `{"lk":["<index key>",...],"ls":true}`. 0.1.201-0.1.203
-/// decode it as a record without `v`/`fp`/`s` and drop it.
+/// empty, false or unset: `{"lk":["<index key>",...],"ls":true,"lt":<unix
+/// seconds>}`. Only a saturated set, which holds no keys, carries `lt`: at
+/// most 37 bytes. 0.1.201-0.1.203 decode it as a record without
+/// `v`/`fp`/`s` and drop it.
 pub(crate) const CLAUDE_CENSUS_LOST_KEY: &str = "~lost";
 /// Wire bound of the lost set's value. It sits in the raw slack above the
 /// serialized record budget (`MAX_RAW_BYTES` minus the 48 MiB budget is
@@ -879,11 +885,16 @@ impl ClaudeCensusLostRecords {
     /// transcript key: nothing the saturation stood for can still be missing.
     fn clear_saturated(&mut self) {
         self.saturated = false;
+        self.since = None;
     }
 
     pub(crate) fn absorb(&mut self, other: Self) {
         if other.saturated {
             self.saturate();
+            self.since = match (self.since, other.since) {
+                (Some(ours), Some(theirs)) => Some(ours.min(theirs)),
+                (ours, theirs) => ours.or(theirs),
+            };
         }
         for key in &other.keys {
             self.mark(key);
@@ -934,6 +945,8 @@ impl ClaudeCensusLostRecords {
             lk: Option<LostKeys>,
             #[serde(default)]
             ls: bool,
+            #[serde(default)]
+            lt: Option<u64>,
         }
         let mut lost = Self::default();
         // A map only: a derived struct would also accept a sequence.
@@ -944,6 +957,7 @@ impl ClaudeCensusLostRecords {
             Some(wire) => {
                 if wire.ls {
                     lost.saturate();
+                    lost.since = wire.lt;
                 }
                 if let Some(LostKeys(keys)) = wire.lk {
                     lost.absorb(keys);
@@ -986,6 +1000,9 @@ impl Serialize for ClaudeCensusLostRecords {
         }
         if self.saturated {
             map.serialize_entry("ls", &true)?;
+            if let Some(since) = self.since {
+                map.serialize_entry("lt", &since)?;
+            }
         }
         map.end()
     }
@@ -3182,7 +3199,15 @@ pub(crate) fn transcript_retirements() -> (u64, u64) {
 /// generation has a census record again (a birth stub is none) or is idle
 /// past the retirement cutoff (its record would hold no prefix either). One
 /// key without either keeps it saturated: source-wide Unknown, counted and
-/// alarmed (Lead B r18 proposal; fails closed).
+/// alarmed (Lead B r18 ruling 1; fails closed). Each row carries the
+/// episode's age, also on the terminal that clears it.
+///
+/// Lead B's r19 refinement, to also pass keys the index proves were never
+/// parsed since D1, is not applied: no per-entry evidence proves it.
+/// Every parse since before D1 writes `scan_identity_version`
+/// `semantic_sync:v2` (or a sampled-audit marker); the opened-object stamps
+/// arrived after D1, and `migrate` writes them without a parse; the index
+/// generation is index-wide; the modification time alone is not proof.
 fn settle_lost_saturation(
     index: &mut ScanIndex,
     observed_index_keys: &BTreeSet<String>,
@@ -3191,6 +3216,11 @@ fn settle_lost_saturation(
     if !index.claude_request_census.lost.saturated() {
         return;
     }
+    let since = &mut index.claude_request_census.lost.since;
+    if since.is_none() && window > 0 {
+        *since = Some(window);
+    }
+    let age = since.map_or(0, |since| window.saturating_sub(since));
     let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
     let census = &index.claude_request_census;
     let files = &index.files;
@@ -3221,6 +3251,57 @@ fn settle_lost_saturation(
         &serde_json::json!({
             "census_lost_saturated_unrecorded_keys": unrecorded,
             "census_lost_saturated_cleared": u64::from(unrecorded == 0),
+            "census_lost_saturated_age_seconds": age,
+        }),
+    );
+}
+
+/// Lead B r18 ruling 2: the pre-#915 upgrade gap, disclosed and measured
+/// once. A record refused or dropped before #915 left no loss mark, so its
+/// key reads as having no prefixes (Known). On the process's first Claude
+/// index load whose census holds no loss marks (no `~lost` entry, as in every
+/// index a pre-#915 build wrote), count the pending-free transcript keys of
+/// the D1 coverage set (family members not confirmed empty) that have no
+/// census record (a birth stub is none). Counts only, never a decision input.
+/// No index evidence separates keys never parsed since D1 from keys parsed
+/// since (see `settle_lost_saturation`), so they form one `unclassified`
+/// bucket.
+pub(crate) fn note_census_upgrade_unrecorded(index: &ScanIndex) {
+    static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    note_census_upgrade_unrecorded_once(index, &FIRED);
+}
+
+pub(super) fn note_census_upgrade_unrecorded_once(
+    index: &ScanIndex,
+    fired: &std::sync::atomic::AtomicBool,
+) {
+    if !index.persistence_available()
+        || !index.claude_request_census.lost.is_empty()
+        || fired.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+    let (mut pending_free, mut unrecorded) = (0_u64, 0_u64);
+    for key in index.files.keys() {
+        let Some(member) = super::claude_index_path_member_ref(Path::new(key.as_str())) else {
+            continue;
+        };
+        if index.confirmed_empty_files.contains(key)
+            || index.claude_usage_family_pending.contains_key(member.root)
+        {
+            continue;
+        }
+        pending_free += 1;
+        if index.claude_request_census.get(key).is_none() {
+            unrecorded += 1;
+        }
+    }
+    crate::local_resource_diagnostics::traversal_point(
+        "claude_census_upgrade_unrecorded",
+        super::SnapshotSource::ClaudeCode.api_slug(),
+        &serde_json::json!({
+            "census_upgrade_pending_free_keys": pending_free,
+            "census_upgrade_unrecorded_unclassified": unrecorded,
         }),
     );
 }

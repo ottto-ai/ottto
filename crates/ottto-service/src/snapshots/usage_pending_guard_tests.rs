@@ -1730,6 +1730,8 @@ fn census_lost_set_corrupt_on_disk_is_saturated_counted_and_alarmed() {
         json!({"lk": [{"k": 1}]}),
         json!({"ls": "yes"}),
         json!({"ls": 1}),
+        json!({"ls": true, "lt": "soon"}),
+        json!({"ls": true, "lt": -1}),
         json!({"lk": over_count}),
         json!({"pad": oversized}),
     ]
@@ -2018,6 +2020,177 @@ fn census_lost_saturation_clears_only_when_every_transcript_key_has_a_record() {
     assert!(!rows
         .iter()
         .any(|row| row["stage"] == "claude_census_lost_saturated"));
+}
+
+#[test]
+fn census_lost_saturation_episode_age_persists_and_reports_on_clear() {
+    // Lead B r19: the saturated row carries the episode's age, also when it
+    // clears. The start is the first complete terminal that found the set
+    // saturated, persisted as `lt` beside the flag (a restart keeps it).
+    use claude_request_census::{ClaudeRequestCensus, CLAUDE_CENSUS_LOST_KEY};
+    let failed = rfc3339_unix_seconds(CARRY_FAILED).expect("window");
+    let key = carry_key(CARRY_OTHER, None);
+    let mut index = ScanIndex::default();
+    *index.claude_request_census_mut_for_test() = ClaudeRequestCensus::lost_whole();
+    let mut entry = manifest_index_entry(Some("snapshot"));
+    entry.modified_unix_seconds = failed - 60;
+    index.files.insert(key.clone(), entry);
+    let settle = |index: &mut ScanIndex, at: &str| {
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            claude_request_census::settle_claude_request_census_terminal(
+                index,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                at,
+            )
+        });
+        let row = rows
+            .iter()
+            .find(|row| row["stage"] == "claude_census_lost_saturated")
+            .expect("saturated settle row")
+            .clone();
+        assert_census_prefix_rows_private(
+            std::slice::from_ref(&row),
+            &[CARRY_OTHER, ".jsonl", "/carry"],
+        );
+        (
+            row["counts"]["census_lost_saturated_cleared"].clone(),
+            row["counts"]["census_lost_saturated_age_seconds"].clone(),
+        )
+    };
+    // A fresh saturation has no start until a complete terminal sees it.
+    assert_eq!(census_json(&index)[CLAUDE_CENSUS_LOST_KEY], json!({"ls": true}));
+    assert_eq!(settle(&mut index, CARRY_FAILED), (json!(0), json!(0)));
+    assert_eq!(
+        census_json(&index)[CLAUDE_CENSUS_LOST_KEY],
+        json!({"ls": true, "lt": failed})
+    );
+    // The start survives a save and reload (decode of the census value).
+    let reloaded = serde_json::from_str::<ClaudeRequestCensus>(
+        &serde_json::to_string(index.claude_request_census_for_test()).expect("census json"),
+    )
+    .expect("census");
+    assert!(reloaded.lost().saturated());
+    *index.claude_request_census_mut_for_test() = reloaded;
+    assert_eq!(settle(&mut index, CARRY_RETRY), (json!(0), json!(600)));
+    assert_eq!(
+        census_json(&index)[CLAUDE_CENSUS_LOST_KEY],
+        json!({"ls": true, "lt": failed})
+    );
+    // The clearing terminal reports the whole episode, then nothing persists.
+    let _ = index.claude_request_census_mut_for_test().insert(
+        key.clone(),
+        claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+            &"a".repeat(64),
+            1,
+            claude_request_census::ClaudeRequestCensusShape::Exact,
+            vec![1],
+        ),
+    );
+    assert_eq!(settle(&mut index, CARRY_SECOND_RETRY), (json!(1), json!(1200)));
+    assert!(index.claude_request_census_for_test().lost().is_empty());
+    assert!(census_json(&index).get(CLAUDE_CENSUS_LOST_KEY).is_none());
+    // A persisted start older than this process is carried, not restarted.
+    let decoded = serde_json::from_str::<ClaudeRequestCensus>(
+        &json!({ CLAUDE_CENSUS_LOST_KEY: {"ls": true, "lt": failed - 100} }).to_string(),
+    )
+    .expect("census");
+    // The key has no record in the decoded census: still saturated.
+    *index.claude_request_census_mut_for_test() = decoded;
+    assert_eq!(settle(&mut index, CARRY_FAILED), (json!(0), json!(100)));
+    // A start in the future (a clock step back) reads as age zero.
+    *index.claude_request_census_mut_for_test() = serde_json::from_str::<ClaudeRequestCensus>(
+        &json!({ CLAUDE_CENSUS_LOST_KEY: {"ls": true, "lt": failed + 100} }).to_string(),
+    )
+    .expect("census");
+    assert_eq!(settle(&mut index, CARRY_FAILED), (json!(0), json!(0)));
+}
+
+#[test]
+fn census_upgrade_gauge_counts_unrecorded_pending_free_keys_once() {
+    // Lead B r18 ruling 2: the pre-#915 upgrade gap is disclosed and measured
+    // once per process, on the first load whose census holds no loss marks.
+    // Pending-free transcript keys of the D1 coverage set with no census
+    // record, in one unclassified bucket (no exact evidence tells "parsed
+    // since D1" apart). Counts only.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const RECORDED: &str = "d4444444-4444-4444-8444-444444444444";
+    const EMPTY: &str = "e5555555-5555-4555-8555-555555555555";
+    const STUB: &str = "f6666666-6666-4666-8666-666666666666";
+    // CARRY_OTHER: pending-free, committed, no record. CARRY_ROOT (two
+    // members) and CARRY_UNWITNESSED have usage pending: out of scope.
+    let mut index = carry_index();
+    for root in [RECORDED, EMPTY, STUB] {
+        carry_file(&mut index, root, None);
+    }
+    index.confirmed_empty_files.insert(carry_key(EMPTY, None));
+    index
+        .files
+        .insert("/carry/projects/notes.txt".into(), manifest_index_entry(None));
+    let record = |seed: &str| {
+        claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+            &seed.repeat(64),
+            1,
+            claude_request_census::ClaudeRequestCensusShape::Exact,
+            vec![7],
+        )
+    };
+    let census = index.claude_request_census_mut_for_test();
+    let _ = census.insert(carry_key(RECORDED, None), record("a"));
+    // A birth stub is no record.
+    let _ = census.insert(carry_key(STUB, None), record("b"));
+    census.invalidate_keeping_birth_for_test(&carry_key(STUB, None));
+    let gauge = |index: &ScanIndex, fired: &AtomicBool| {
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            claude_request_census::note_census_upgrade_unrecorded_once(index, fired)
+        });
+        let rows = rows
+            .into_iter()
+            .filter(|row| row["stage"] == "claude_census_upgrade_unrecorded")
+            .collect::<Vec<_>>();
+        assert_census_prefix_rows_private(
+            &rows,
+            &[
+                CARRY_ROOT,
+                CARRY_OTHER,
+                CARRY_UNWITNESSED,
+                RECORDED,
+                EMPTY,
+                STUB,
+                ".jsonl",
+                "/carry",
+                "notes",
+            ],
+        );
+        rows
+    };
+    let fired = AtomicBool::new(false);
+    let rows = gauge(&index, &fired);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["counts"],
+        json!({
+            "census_upgrade_pending_free_keys": 3,
+            "census_upgrade_unrecorded_unclassified": 2,
+        })
+    );
+    // Once per process.
+    assert!(gauge(&index, &fired).is_empty());
+    // A census with loss marks was written under #915: no gauge, and the
+    // once-flag stays unspent until a load without marks.
+    let fresh = AtomicBool::new(false);
+    let mut marked = index.clone();
+    marked
+        .claude_request_census_mut_for_test()
+        .mark_lost(&carry_key(CARRY_OTHER, None));
+    assert!(gauge(&marked, &fresh).is_empty());
+    assert!(!fresh.load(Ordering::Relaxed));
+    let mut saturated = index.clone();
+    *saturated.claude_request_census_mut_for_test() =
+        claude_request_census::ClaudeRequestCensus::lost_whole();
+    assert!(gauge(&saturated, &fresh).is_empty());
+    assert!(!fresh.load(Ordering::Relaxed));
+    assert_eq!(gauge(&index, &fresh).len(), 1);
 }
 
 #[test]

@@ -47843,6 +47843,7 @@ impl ScanIndex {
         index.settle_claude_index_load(path, load_origin);
         if source == SnapshotSource::ClaudeCode {
             index.usage_guard_adopt_custody(path);
+            claude_request_census::note_census_upgrade_unrecorded(&index);
         }
         index.mint_or_reuse_codex_proof_incarnation(path, origin);
         if source == SnapshotSource::ClaudeCode
