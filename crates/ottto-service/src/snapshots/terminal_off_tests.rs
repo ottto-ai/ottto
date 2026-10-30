@@ -2460,70 +2460,16 @@ fn terminal_off_on_carry_refund_and_family_replay_reoffer_unacked_head() {
 }
 
 impl ScanIndex {
-    // Kept beside the scanner fixtures so the adapter can change the effective
-    // in-memory closure without changing the raw installed list or transcript.
-    pub(crate) fn assert_terminal_off_held_list_closure_for_test() {
+    // A fixture-only mutation of the effective closure, after raw-list load.
+    pub(crate) fn extend_terminal_off_list_closure_for_test(&mut self, kind: u8) {
         assert!(claude_terminal_off());
-        let scratch = crate::test_scratch::ScratchDir::new("held-list-closure");
-        let root = scratch.join("projects");
-        let support = scratch.join("support");
-        fs::create_dir_all(&root).unwrap();
-        fs::create_dir_all(support.join("snapshots")).unwrap();
-        let path = root.join(format!("{OFF_ROOT}.jsonl"));
-        fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
-        let key = local_index_key(&path);
-        let mut index = off_index();
-        index
-            .activate_file_upload_context(SnapshotSource::ClaudeCode, "settled-destination".into());
-        index.activate_effective_upload_body_witness_revision(1);
-        let baseline = off_scan(&mut index, &root, W1, 10);
-        off_accept(&mut index, &baseline);
-        let body = index.files[&key].last_upload_body_witness.clone();
-        let accepted = index.accepted_snapshot_fingerprints.clone();
-        let root_digest = format!("{:x}", Sha256::digest(OFF_ROOT.as_bytes()));
-        let member_digest = format!("{:x}", Sha256::digest(b"closure-root_agent-a"));
-        let raw = format!("{root_digest}\n{member_digest}\n");
-        let list = support.join("snapshots/claude_code-reemission-exclusions.txt");
-        fs::write(&list, &raw).unwrap();
-        index.load_claude_reemission_exclusions(&support);
-        index.activate_effective_upload_body_witness_revision(2);
-        index
-            .activate_file_upload_context(SnapshotSource::ClaudeCode, "closure-destination".into());
-        let transcript = fs::read(&path).unwrap();
-        for change in ["initial", "closure", "explicit"] {
-            match change {
-                "closure" => index
-                    .claude_reemission_exclusions
-                    .close_over_roots(std::iter::once(("closure-root", "agent-a"))),
-                "explicit" => index
-                    .claude_reemission_exclusions
-                    .list_root("another-absent-root"),
-                _ => {}
-            }
-            let receipt = serde_json::to_value(&index).unwrap()["files"][&key]
-                ["upload_context_receipt"]
-                .clone();
-            for pass in 0..3 {
-                let now = rfc3339_unix_seconds(W2).unwrap() + 301 * pass;
-                expire_terminal_off_discovery_for_test(&index);
-                let held = with_terminal_off_audit_now_for_test(now, || {
-                    off_scan(&mut index, &root, W2, 10)
-                });
-                assert_eq!(
-                    held.scanned_file_count,
-                    usize::from(pass == 0),
-                    "{change}/{pass}"
-                );
-                assert!(held.snapshots.is_empty(), "held money never reaches POST");
-                assert_eq!(index.files[&key].last_upload_body_witness, body);
-                assert_eq!(index.accepted_snapshot_fingerprints, accepted);
-                assert_eq!(
-                    serde_json::to_value(&index).unwrap()["files"][&key]["upload_context_receipt"],
-                    receipt
-                );
-            }
-            assert_eq!(fs::read(&path).unwrap(), transcript);
-            assert_eq!(fs::read_to_string(&list).unwrap(), raw);
+        if kind >= 1 {
+            self.claude_reemission_exclusions
+                .close_over_roots(std::iter::once(("closure-root", "agent-a")));
+        }
+        if kind >= 2 {
+            self.claude_reemission_exclusions
+                .list_root("another-absent-root");
         }
     }
 }

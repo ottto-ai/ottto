@@ -522,6 +522,12 @@ impl HistoryFixture {
         index.activate_effective_upload_body_witness_revision(cycle.revision);
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(&self.support);
+        M4_HELD_LIST_CLOSURE.with(|kind| {
+            if kind.get() > 0 {
+                index.extend_terminal_off_list_closure_for_test(kind.get());
+            }
+        });
+
         crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
         if cycle.request_identity {
             index.observe_claude_request_identity_contract(true);
@@ -630,6 +636,11 @@ impl HistoryFixture {
             |snapshot| snapshot.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
             |items| {
+                M4_CLOSURE_POSTS.with(|count| count.set(count.get() + 1));
+                M4_CLOSURE_BYTES.with(|count| {
+                    count.set(count.get() + serde_json::to_vec(&items).unwrap().len())
+                });
+
                 if cycle.shed_upload {
                     return Err(anyhow::Error::new(UploadShed {
                         status: 503,
@@ -6268,10 +6279,97 @@ fn terminal_off_on_e2_restamp_carries_the_retired_permit_bit() {
     });
 }
 
+thread_local! {
+    static M4_HELD_LIST_CLOSURE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static M4_CLOSURE_POSTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static M4_CLOSURE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[test]
 #[ignore = "terminal-off ON-readiness: R5"]
 fn terminal_off_on_held_list_closure_invalidates_context_hit() {
     let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
     assert!(crate::snapshots::claude_terminal_off());
-    ScanIndex::assert_terminal_off_held_list_closure_for_test();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            M4_HELD_LIST_CLOSURE.with(|kind| kind.set(0));
+        }
+    }
+    let _reset = Reset;
+    let fixture = HistoryFixture::new("held-effective-list-closure");
+    let start = OffsetDateTime::parse("2026-08-02T08:00:00Z", &Rfc3339)
+        .unwrap()
+        .unix_timestamp() as u64;
+    let baseline =
+        crate::snapshots::with_terminal_off_audit_now_for_test(start, || fixture.baseline());
+    let mut listed = HISTORY_SESSIONS.to_vec();
+    listed.push("closure-root_agent-a");
+    fixture.install_list(&listed);
+    let list = fixture
+        .support
+        .join("snapshots/claude_code-reemission-exclusions.txt");
+    let raw_list = std::fs::read(&list).unwrap();
+    let transcript_bytes = HISTORY_SESSIONS
+        .iter()
+        .map(|id| std::fs::read(fixture.root.join(format!("{id}.jsonl"))).unwrap())
+        .collect::<Vec<_>>();
+    let baseline_state = serde_json::to_value(&baseline).unwrap();
+    let context = HistoryCycle {
+        upload_context: "held-closure-context-2",
+        ..HISTORY_REVISION_2
+    };
+    for kind in 0..3 {
+        M4_HELD_LIST_CLOSURE.with(|value| value.set(kind));
+        for pass in 0..3 {
+            let seconds = 9 * 3600 + u64::from(kind) * 3600 + pass * 301;
+            let at = format!(
+                "2026-08-02T{:02}:{:02}:{:02}Z",
+                seconds / 3600,
+                seconds / 60 % 60,
+                seconds % 60
+            );
+            let now = OffsetDateTime::parse(&at, &Rfc3339)
+                .unwrap()
+                .unix_timestamp() as u64;
+            M4_CLOSURE_POSTS.with(|count| count.set(0));
+            M4_CLOSURE_BYTES.with(|count| count.set(0));
+            assert!(crate::snapshots::claude_terminal_off());
+            let held = crate::snapshots::with_terminal_off_audit_now_for_test(now, || {
+                fixture.cycle(&at, context)
+            });
+            assert_eq!(
+                held.scan.scanned_file_count,
+                if pass == 0 { HISTORY_SESSIONS.len() } else { 0 },
+                "closure={kind}/pass={pass}"
+            );
+            assert!(held.scan.snapshots.is_empty());
+            assert!(held.uploaded.is_empty());
+            assert_eq!(M4_CLOSURE_POSTS.with(std::cell::Cell::get), 0);
+            assert_eq!(M4_CLOSURE_BYTES.with(std::cell::Cell::get), 0);
+            let state = serde_json::to_value(&held.index).unwrap();
+            assert_eq!(
+                state["accepted_snapshot_fingerprints"],
+                baseline_state["accepted_snapshot_fingerprints"]
+            );
+            for (key, entry) in &held.index.files {
+                assert_eq!(
+                    entry.last_upload_body_witness,
+                    baseline.files[key].last_upload_body_witness
+                );
+                assert_eq!(entry.effective_upload_body_witness_revision, 1);
+                assert_eq!(
+                    state["files"][key]["upload_context_receipt"],
+                    baseline_state["files"][key]["upload_context_receipt"]
+                );
+            }
+            assert_eq!(std::fs::read(&list).unwrap(), raw_list);
+            for (id, before) in HISTORY_SESSIONS.iter().zip(&transcript_bytes) {
+                assert_eq!(
+                    std::fs::read(fixture.root.join(format!("{id}.jsonl"))).unwrap(),
+                    *before
+                );
+            }
+        }
+    }
 }
