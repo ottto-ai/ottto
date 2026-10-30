@@ -2032,6 +2032,12 @@ fn bounded_pi_workspace_matches_native_header_only_precedence() {
             .collect::<Vec<_>>();
         let path = scratch.write(&format!("pi-{i}"), &lines);
         let mut native = parser(&path, source);
+        assert!(matches!(
+            native
+                .prepare_acquisition(None, &scope(), None, NOW)
+                .unwrap(),
+            ReadMode::Full(FullReason::StateMissing)
+        ));
         while !native.step().unwrap() {}
         let native = native.reduction_copy();
         let make = || {
@@ -2093,6 +2099,12 @@ fn bounded_pi_workspace_enforces_cap_and_refuses_nonheader_cwd() {
             &[json!({"type":"session","id":"synthetic-pi","cwd":"x".repeat(size)}).to_string()],
         );
         let mut native = parser(&path, SnapshotSource::Pi);
+        assert!(matches!(
+            native
+                .prepare_acquisition(None, &scope(), None, NOW)
+                .unwrap(),
+            ReadMode::Full(FullReason::StateMissing)
+        ));
         while !native.step().unwrap() {}
         let mut reduction = native.reduction_copy();
         let want = workspace_digest(&reduction.accumulator).unwrap();
