@@ -1097,11 +1097,11 @@ fn refuses_root_outside_clone_and_nested_symlink() {
     f.refused(f.command("P0"));
 }
 
-fn write_desktop_canary(store: &std::path::Path) {
+fn write_desktop_canary(store: &std::path::Path, title: &str) {
     fs::create_dir_all(store).unwrap();
     fs::write(
         store.join("session.json"),
-        json!({"cliSessionId":SESSION, "title":CANARY, "titleSource":"user"}).to_string(),
+        json!({"cliSessionId":SESSION, "title":title, "titleSource":"user"}).to_string(),
     )
     .unwrap();
 }
@@ -1135,11 +1135,12 @@ fn desktop_metadata_reads_only_explicit_clone_stores() {
     let support = fake_home.join("Library/Application Support");
     for profile in ["Claude", "Claude-CANARY"] {
         let profile = support.join(profile);
-        write_desktop_canary(&profile.join("claude-code-sessions"));
+        write_desktop_canary(&profile.join("claude-code-sessions"), CANARY);
         fs::write(profile.join("config.json"), "{}").unwrap();
     }
     let inside = f.clone.join("desktop/claude-code-sessions");
-    write_desktop_canary(&inside);
+    let inside_title = format!("{CANARY}-inside-clone");
+    write_desktop_canary(&inside, &inside_title);
 
     // Omission is explicit absence, with a counter at the real open boundary.
     // Permission errors would be swallowed by the loader, so chmod/atime alone
@@ -1164,7 +1165,7 @@ fn desktop_metadata_reads_only_explicit_clone_stores() {
     let entries = desktop_title_entries(&f.support);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["cli_session_id"], SESSION);
-    assert_eq!(entries[0]["title"], CANARY);
+    assert_eq!(entries[0]["title"], inside_title);
     assert_eq!(entries[0]["user_set"], true);
 }
 
@@ -1173,7 +1174,7 @@ fn refuses_desktop_metadata_outside_clone_and_symlink_escapes() {
     for relative in [false, true] {
         let f = Fixture::new();
         let outside = f.base.join("outside-desktop");
-        write_desktop_canary(&outside);
+        write_desktop_canary(&outside, CANARY);
         let path = if relative {
             PathBuf::from("../outside-desktop")
         } else {
@@ -1186,7 +1187,7 @@ fn refuses_desktop_metadata_outside_clone_and_symlink_escapes() {
     for nested in [false, true] {
         let f = Fixture::new();
         let outside = f.base.join("outside-desktop");
-        write_desktop_canary(&outside.join("claude-code-sessions"));
+        write_desktop_canary(&outside.join("claude-code-sessions"), CANARY);
         let path = f.clone.join("desktop");
         if nested {
             fs::create_dir(&path).unwrap();
