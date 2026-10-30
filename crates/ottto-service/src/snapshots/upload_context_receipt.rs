@@ -86,6 +86,11 @@ pub(super) struct MixedContextView {
     bindings: BTreeMap<String, String>,
     pub(super) held_files: u64,
 }
+impl MixedContextView {
+    pub(super) fn is_claude(&self) -> bool {
+        self.claude
+    }
+}
 crate::heap_layout_bound::fields!(MixedContextView; claude, bindings, held_files);
 
 impl ScanIndex {

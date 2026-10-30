@@ -197,7 +197,7 @@ impl ScanIndex {
             // sidecar/retry read must not become paced context catch-up just
             // because UploadContext is the first selecting gate. OFF and
             // Codex keep the original expression above.
-            && (!self.mixed_context_view.claude
+            && (!self.mixed_context_view.is_claude()
                 || self
                     .candidate_decision_with_reason_gated(
                         candidate,
@@ -267,12 +267,6 @@ mod tests {
         assert!(page.cursor_exhausted(limits));
         budget.charge_cursor_ordinary(&mut page); // charged only once
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
     #[test]
     fn r10_off_and_codex_keep_main_context_classification() {
         for on in [false, true] {
