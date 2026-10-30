@@ -783,8 +783,37 @@ pub(crate) struct ClaudeRequestCensus {
     hash_total: usize,
     /// Exact serialized bytes of every `"key":record` pair.
     serialized_total: usize,
+    /// Runtime only (never persisted: a decoded census starts without it).
+    release_memo: Option<ReleaseMemo>,
 }
-crate::heap_layout_bound::fields!(ClaudeRequestCensus; records, hash_total, serialized_total);
+crate::heap_layout_bound::fields!(ClaudeRequestCensus; records, hash_total, serialized_total, release_memo);
+
+/// E7 #920: a derive scan (`release_aged`) at `cutoff` found nothing to
+/// release. Every record that may age at that cutoff (`may_age`) is in
+/// `suspects`: those the scan saw, and every later insert of one. Only a
+/// record that may age can be released, and whether a suspect can depends
+/// on the index entry, so re-checking the suspects against the current
+/// index decides exactly whether a scan would release anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseMemo {
+    cutoff: u64,
+    suspects: Vec<String>,
+}
+crate::heap_layout_bound::fields!(ReleaseMemo; cutoff, suspects);
+
+/// Most suspects a release memo keeps; past it no memo is kept.
+const MAX_RELEASE_MEMO_SUSPECTS: usize = 4_096;
+
+/// The record may be released at `cutoff` under some index entry: it is an
+/// unretired record holding hashes, and its own mtime is unknown or before
+/// the cutoff. A superset of `transcript_retirement_age` that does not read
+/// the index.
+fn may_age(record: &ClaudeRequestCensusRecord, cutoff: u64) -> bool {
+    !record.is_birth_stub()
+        && record.retired.is_none()
+        && record.hash_count() > 0
+        && record.modified.map_or(true, |modified| modified < cutoff)
+}
 
 /// One family's answer from [`ClaudeRequestCensus::family_transcript_holders`].
 #[derive(Debug, Default)]
@@ -843,13 +872,14 @@ fn walk_deadline_forced(walk: u8) -> bool {
     WALK_DEADLINE_FOR_TEST.with(std::cell::Cell::get) & walk != 0
 }
 
-// Test seam: derive scans (`release_aged` calls) on this thread.
+// Test seam: derive scans (full `release_aged` passes, not memo skips) on
+// this thread.
 #[cfg(test)]
 thread_local! {
     static DERIVE_SCANS_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Derive scans (`release_aged` calls) run on this thread so far.
+/// Derive scans run on this thread so far.
 #[cfg(test)]
 pub(crate) fn derive_scans_for_test() -> u64 {
     DERIVE_SCANS_FOR_TEST.with(std::cell::Cell::get)
@@ -1183,6 +1213,18 @@ impl ClaudeRequestCensus {
                 return ClaudeRequestCensusInsert::Refused;
             }
         }
+        // A stored record that may age at the memo's cutoff joins its
+        // suspects, so the memo is re-checked against it.
+        let keep_memo = match self.release_memo.as_mut() {
+            Some(memo) if may_age(&record, memo.cutoff) && !memo.suspects.contains(&key) => {
+                memo.suspects.push(key.clone());
+                memo.suspects.len() <= MAX_RELEASE_MEMO_SUSPECTS
+            }
+            _ => true,
+        };
+        if !keep_memo {
+            self.release_memo = None;
+        }
         self.charge_totals(record.hash_count(), bytes, true);
         self.records.insert(key, record);
         outcome
@@ -1209,21 +1251,38 @@ impl ClaudeRequestCensus {
         cutoff: u64,
         fits: &dyn Fn(usize, usize) -> bool,
     ) -> (u64, u64) {
+        // A scan at this cutoff found nothing; only a suspect can have become
+        // releasable since, and none has.
+        if let Some(memo) = &self.release_memo {
+            if memo.cutoff == cutoff
+                && memo.suspects.iter().all(|key| {
+                    self.records.get(key).map_or(true, |record| {
+                        transcript_retirement_age(files, cutoff, key, record).is_none()
+                    })
+                })
+            {
+                return (0, 0);
+            }
+        }
+        self.release_memo = None;
         #[cfg(test)]
         DERIVE_SCANS_FOR_TEST.with(|scans| scans.set(scans.get() + 1));
-        let count = self
-            .records
-            .iter()
-            .filter(|(key, record)| transcript_retirement_age(files, cutoff, key, record).is_some())
-            .count();
-        if count == 0 {
-            return (0, 0);
-        }
-        // (mtime, position in the census, hashes, serialized bytes retiring
-        // the record frees), in census order.
-        let mut aged = Vec::with_capacity(count);
+        // One pass: (mtime, position in the census, hashes, serialized bytes
+        // retiring the record frees) of each releasable record, in census
+        // order, and the records that may age but cannot be released now.
+        let mut aged = Vec::new();
+        let mut suspects = Some(Vec::new());
         for (position, (key, record)) in self.records.iter().enumerate() {
+            if !may_age(record, cutoff) {
+                continue;
+            }
             let Some(modified) = transcript_retirement_age(files, cutoff, key, record) else {
+                suspects = suspects
+                    .filter(|suspects: &Vec<String>| suspects.len() < MAX_RELEASE_MEMO_SUSPECTS)
+                    .map(|mut suspects| {
+                        suspects.push(key.clone());
+                        suspects
+                    });
                 continue;
             };
             // A record clone shares its hashes: nothing is copied.
@@ -1232,6 +1291,10 @@ impl ClaudeRequestCensus {
             let freed = entry_serialized_bytes(key, record)
                 .saturating_sub(entry_serialized_bytes(key, &retired));
             aged.push((modified, position, record.hash_count(), freed));
+        }
+        if aged.is_empty() {
+            self.release_memo = suspects.map(|suspects| ReleaseMemo { cutoff, suspects });
+            return (0, 0);
         }
         aged.sort_unstable();
         let (mut hash_total, mut serialized_total) = (self.hash_total, self.serialized_total);
@@ -1266,6 +1329,7 @@ impl ClaudeRequestCensus {
     /// A decoded record that would pass either budget is dropped, never
     /// stored. True when stored without replacing a duplicate key.
     fn insert_decoded(&mut self, key: String, record: ClaudeRequestCensusRecord) -> bool {
+        self.release_memo = None;
         let duplicate = self.records.remove(&key);
         if let Some(old) = &duplicate {
             self.charge(&key, old, false);
@@ -3105,6 +3169,8 @@ fn transcript_retirement_age(
 /// (telemetry owner first, else the copy). Retirement edits records in
 /// place: nothing is cloned.
 fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> TranscriptRetirement {
+    // Every terminal starts the admission release memo afresh.
+    index.claude_request_census.release_memo = None;
     let mut retirement = TranscriptRetirement::default();
     if window == 0 {
         return retirement;

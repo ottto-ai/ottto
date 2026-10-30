@@ -832,7 +832,13 @@ fn census_admission_without_releasable_records_is_unchanged() {
     });
     assert_eq!(outcome, expected);
     assert!(rows.is_empty(), "nothing released, nothing reported");
-    assert_eq!(index.claude_request_census_for_test(), &plain);
+    // Same records and totals (the runtime release memo aside).
+    let census = index.claude_request_census_for_test();
+    assert_eq!(
+        serde_json::to_value(census).unwrap(),
+        serde_json::to_value(&plain).unwrap()
+    );
+    assert_eq!(census.totals_for_test(), plain.totals_for_test());
 
     let (outcome, rows) = crate::local_resource_diagnostics::capture(|| {
         index.insert_transcript_record_for_test(&young, young_parse(vec![100]), window)
@@ -970,6 +976,98 @@ fn census_admission_release_survives_reload_and_restart() {
             "restart {restart}"
         );
     }
+}
+
+/// E1 round 6: a full census where nothing can be released. `dirty` is aged
+/// by its own mtime but its index entry has moved on (a suspect); five young
+/// records each grow past the room. Five failing inserts run one derive
+/// scan, not five, and are tombstoned exactly as before.
+fn exhausted_index() -> (ScanIndex, String) {
+    let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
+    let mut index = ScanIndex::default();
+    let dirty = indexed_census(&mut index, "dirty", 'a', 60, (1_000..1_020).collect());
+    index.files.get_mut(&dirty).unwrap().source_file_fingerprint = money_fingerprint('f');
+    for n in 0..5 {
+        indexed_census(&mut index, &format!("y{n}"), 'c', 5, vec![100 + n]);
+    }
+    fill_census_to(&mut index, MAX_CLAUDE_REQUEST_CENSUS_HASHES);
+    let scans = derive_scans_for_test();
+    for n in 0..5 {
+        let key = format!("/money/projects/y{n}.jsonl");
+        let (outcome, rows) = crate::local_resource_diagnostics::capture(|| {
+            index.insert_transcript_record_for_test(&key, young_parse((100..110).collect()), window)
+        });
+        assert_eq!(outcome, ClaudeRequestCensusInsert::Tombstone, "y{n}");
+        assert!(rows.is_empty(), "y{n}: nothing released");
+    }
+    assert_eq!(
+        derive_scans_for_test(),
+        scans + 1,
+        "one derive scan for the page"
+    );
+    (index, dirty)
+}
+
+/// The memo skips scans only while no release could succeed: once the
+/// cutoff advances (a later window), a scan runs again and releases the
+/// filler, now aged.
+#[test]
+fn census_admission_release_memo_rescans_when_the_cutoff_advances() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    let (mut index, _) = exhausted_index();
+    let later = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap() + 40 * 86_400;
+    let scans = derive_scans_for_test();
+    let (outcome, rows) = crate::local_resource_diagnostics::capture(|| {
+        index.insert_transcript_record_for_test(
+            "/money/projects/y0.jsonl",
+            young_parse((100..120).collect()),
+            later,
+        )
+    });
+    assert_eq!(outcome, ClaudeRequestCensusInsert::Stored);
+    assert_eq!(derive_scans_for_test(), scans + 1);
+    assert_eq!(
+        admission_overflow(&rows, "claude_census_retire_kept_overlap"),
+        1,
+        "the filler"
+    );
+    let census = index.claude_request_census_for_test();
+    assert!(census
+        .record_for_test("/money/projects/filler.jsonl")
+        .unwrap()
+        .retired_for_test()
+        .is_some());
+}
+
+/// Nor does an index change behind the census defeat it: when the suspect's
+/// entry is re-recorded at the record's revision (no census insert), the
+/// memo's re-check sees it, a scan runs and releases it.
+#[test]
+fn census_admission_release_memo_rechecks_its_suspects() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
+    let (mut index, dirty) = exhausted_index();
+    index.files.get_mut(&dirty).unwrap().source_file_fingerprint = money_fingerprint('a');
+    let scans = derive_scans_for_test();
+    let (outcome, rows) = crate::local_resource_diagnostics::capture(|| {
+        index.insert_transcript_record_for_test(
+            "/money/projects/y0.jsonl",
+            young_parse((100..110).collect()),
+            window,
+        )
+    });
+    assert_eq!(outcome, ClaudeRequestCensusInsert::Stored);
+    assert_eq!(derive_scans_for_test(), scans + 1);
+    assert_eq!(
+        admission_overflow(&rows, "claude_census_retire_kept_overlap"),
+        1
+    );
+    let census = index.claude_request_census_for_test();
+    assert_eq!(
+        census.record_for_test(&dirty).unwrap().retired_for_test(),
+        Some(20)
+    );
+    assert_eq!(census.totals_for_test(), census.recounted_for_test());
 }
 
 /// Lead B NO-GO item 6: kept stock is bounded by occupancy, not by a fixed
