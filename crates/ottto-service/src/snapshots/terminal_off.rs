@@ -4,9 +4,6 @@ mod terminal_off_discovery;
 #[path = "terminal_off/policy.rs"]
 mod terminal_off_policy;
 #[cfg(test)]
-#[path = "terminal_off/readiness_manifest.rs"]
-mod terminal_off_readiness_manifest;
-#[cfg(test)]
 pub(crate) use terminal_off_policy::ClaudeTerminalOffForTest;
 
 /// The machine owner alone opts in. Absent marker/default means main policy.

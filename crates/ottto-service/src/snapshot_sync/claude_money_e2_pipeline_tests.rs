@@ -635,18 +635,9 @@ fn e2_pipeline_dark_matches_fold_absent_publication_and_selection() {
     e2::with_disabled(e2_pipeline_dark_matches_fold_absent_publication_and_selection_body);
 }
 
-#[test]
-#[ignore = "terminal-off ON-readiness: r25-code-unclassified"]
-fn terminal_off_on_e2_pipeline_dark_matches_fold_absent_publication_and_selection() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    e2::with_disabled(e2_pipeline_dark_matches_fold_absent_publication_and_selection_body);
-}
 
 fn e2_pipeline_dark_matches_fold_absent_publication_and_selection_body() {
-    if crate::snapshots::ClaudeTerminalOffForTest::active() {
-        return terminal_off_on_e2_pipeline_dark_matches_fold_absent_publication_and_selection_body();
-    }
+
     let mut c = Corpus::new("e2-pipeline-dark");
     c.root(
         ROOT,
@@ -701,60 +692,6 @@ fn e2_pipeline_dark_matches_fold_absent_publication_and_selection_body() {
     );
 }
 
-fn terminal_off_on_e2_pipeline_dark_matches_fold_absent_publication_and_selection_body() {
-    let mut c = Corpus::new("e2-pipeline-dark");
-    c.root(
-        ROOT,
-        &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:01:00Z", 20)),
-    );
-    c.agent(0, &line(ROOT, "agent", AT, 3));
-    c.write_at(
-        &format!("alternate/{ROOT}.jsonl"),
-        &line(ROOT, "r1", AT, 10),
-        "2026-08-02T07:03:00Z",
-    );
-    c.write_at(
-        &format!("{COPY}.jsonl"),
-        &(line(COPY, "r1", AT, 10) + &line(COPY, "branch-own", "2026-08-02T07:04:00Z", 2)),
-        "2026-08-02T07:03:00Z",
-    );
-    c.evidence(&[api("r1", 10, 100)], &[]);
-    let scanner = E2ScanFixture::default();
-    let mut dark = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
-    let mut reference = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
-    without_money_folds(&mut reference.scan);
-    dark.enrich(&c);
-    reference.enrich(&c);
-    assert_eq!(
-        canonical(&dark.scan.snapshots),
-        canonical(&reference.scan.snapshots)
-    );
-    dark.finish();
-    reference.finish();
-    assert_eq!(dark.receipt(), reference.receipt());
-    let (mut a, mut b) = (e2_progress(), e2_progress());
-    let (ra, ba, oa) = dark.upload_context(&mut a, ack);
-    let (rb, bb, ob) = reference.upload_context(&mut b, ack);
-    assert_eq!(ra.unwrap(), rb.unwrap());
-    assert_eq!((ba, oa), (bb, ob));
-    assert_eq!(canonical(&a), canonical(&b));
-    dark.index
-        .record_accepted_snapshot_fingerprints(&a.accepted_fingerprints);
-    reference
-        .index
-        .record_accepted_snapshot_fingerprints(&b.accepted_fingerprints);
-    assert_eq!(canonical(&dark.index), canonical(&reference.index));
-    let next_a = c.raw(&scanner, dark.index, 100, false, &[]);
-    let next_b = c.raw(&scanner, reference.index, 100, false, &[]);
-    assert_eq!(
-        canonical(&next_a.scan.snapshots),
-        canonical(&next_b.scan.snapshots)
-    );
-    assert_eq!(
-        next_a.scan.scanned_file_count,
-        next_b.scan.scanned_file_count
-    );
-}
 
 #[test]
 fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
@@ -823,89 +760,9 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
     });
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-modes");
-        let path = c.root(ROOT, &line(ROOT, "copied", "2026-08-02T06:58:00Z", 10));
-        let scanner = E2ScanFixture::default();
-        let mut first = ready(&c, &scanner, ScanIndex::default(), 100, true);
-        literal(&first);
-        assert_mode(first.modes, (1, 0, 0));
-        assert_eq!(total(&first), 1);
-        first.finish();
-        // PREMISE CHANGE vs main (bootstrap receipt), not main's assertion:
-        // main never accepts this page. The twin mints the real fixture
-        // current-context exact-ACK receipt (Page::accept) before the tail.
-        first.accept();
-        let prior = c.reload(&mut first.index);
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap()
-            .write_all(line(ROOT, "r2", "2026-08-02T07:01:00Z", 20).as_bytes())
-            .unwrap();
-        let mut tail = ready(&c, &scanner, prior.clone(), 100, true);
-        assert_mode(tail.modes, (0, 1, 0));
-        literal(&tail);
-        assert_eq!(total(&tail), 1);
-        assert_eq!(tail.scan.snapshots[0].removed_request_count, Some(1));
-        assert_eq!(
-            tail.scan.snapshots[0]
-                .removed_usage
-                .as_ref()
-                .unwrap()
-                .input_tokens,
-            10
-        );
-        let full = ready(&c, &E2ScanFixture::default(), prior, 100, true);
-        assert_mode(full.modes, (1, 0, 0));
-        assert_eq!(
-            canonical(&tail.scan.snapshots),
-            canonical(&full.scan.snapshots)
-        );
-        tail.finish();
-        // PREMISE CHANGE vs main (receipt), not main's assertion: main leaves
-        // the tail body unaccepted, so the "Unaccepted" note below is main's.
-        // The phases below keep main's mode/oracle assertions after this
-        // receipt; the unACKed-head re-offer under ON is covered by the B-P2
-        // production-default fixture (terminal_off_tests.rs).
-        tail.accept();
-        let prior = c.reload(&mut tail.index);
-        // Unaccepted exact body remains due; a fresh sidecar is read even if
-        // the transcript prefix and length are unchanged.
-        c.evidence(&[api("copied", 10, 100), api("r2", 20, 200)], &[]);
-        let unchanged = ready(&c, &scanner, prior.clone(), 100, true);
-        assert_mode(unchanged.modes, (0, 0, 1));
-        let oracle = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, true);
-        assert_eq!(
-            canonical(&unchanged.scan.snapshots),
-            canonical(&oracle.scan.snapshots)
-        );
-        assert_eq!(total(&unchanged), 1);
-        assert_eq!(unchanged.scan.snapshots[0].removed_request_count, Some(1));
-        scanner.evict();
-        let evicted = ready(&c, &scanner, prior.clone(), 100, true);
-        assert_mode(evicted.modes, (1, 0, 0));
-        assert_eq!(
-            canonical(&evicted.scan.snapshots),
-            canonical(&oracle.scan.snapshots)
-        );
-        let restarted = ready(&c, &E2ScanFixture::default(), prior, 100, true);
-        assert_mode(restarted.modes, (1, 0, 0));
-        assert_eq!(
-            canonical(&restarted.scan.snapshots),
-            canonical(&oracle.scan.snapshots)
-        );
-    });
-}
 
 fn mutation_case(kind: &str) {
-    if crate::snapshots::ClaudeTerminalOffForTest::active() {
-        return terminal_off_on_mutation_case(kind);
-    }
+
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-{kind}"));
         let contents = line(ROOT, "copied", "2026-08-02T06:58:00Z", 11)
@@ -965,99 +822,24 @@ fn mutation_case(kind: &str) {
     });
 }
 
-fn terminal_off_on_mutation_case(kind: &str) {
-    with_e2(|| {
-        let mut c = Corpus::new(&format!("e2-pipeline-{kind}"));
-        let contents = line(ROOT, "copied", "2026-08-02T06:58:00Z", 11)
-            + &line(ROOT, "r1", AT, 10)
-            + &line(ROOT, "r2", "2026-08-02T07:01:00Z", 20);
-        let path = c.root(ROOT, &contents);
-        let scanner = E2ScanFixture::default();
-        let mut first = ready(&c, &scanner, ScanIndex::default(), 100, true);
-        first.finish();
-        first.accept();
-        let prior = c.reload(&mut first.index);
-        let changed = match kind {
-            "truncate" => {
-                line(ROOT, "copied", "2026-08-02T06:58:00Z", 11) + &line(ROOT, "r1", AT, 10)
-            }
-            "same-size" => contents.replace("\"input_tokens\":20", "\"input_tokens\":30"),
-            "inode" => contents.clone(),
-            _ => unreachable!(),
-        };
-        if kind == "inode" {
-            let tmp = path.with_extension("replacement");
-            std::fs::write(&tmp, &changed).unwrap();
-            std::fs::rename(tmp, &path).unwrap();
-        } else {
-            std::fs::write(&path, &changed).unwrap();
-        }
-        if kind == "same-size" {
-            assert_eq!(contents.len(), changed.len());
-        }
-        let actual = ready(&c, &scanner, prior.clone(), 100, true);
-        assert_mode(actual.modes, (1, 0, 0));
-        literal(&actual);
-        assert_eq!(actual.scan.snapshots[0].removed_request_count, Some(1));
-        assert_eq!(
-            actual.scan.snapshots[0]
-                .removed_usage
-                .as_ref()
-                .unwrap()
-                .input_tokens,
-            11
-        );
-        let oracle = ready(&c, &E2ScanFixture::default(), prior, 100, true);
-        assert_eq!(
-            canonical(&actual.scan.snapshots),
-            canonical(&oracle.scan.snapshots)
-        );
-        assert_eq!(total(&actual), if kind == "truncate" { 1 } else { 2 });
-        assert_eq!(
-            actual.scan.snapshots[0].input_tokens,
-            if kind == "truncate" {
-                10
-            } else if kind == "same-size" {
-                40
-            } else {
-                30
-            }
-        );
-    });
-}
+
 #[test]
 fn e2_pipeline_truncate_matches_full() {
     mutation_case("truncate");
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_truncate_matches_full() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    mutation_case("truncate");
-}
 #[test]
 fn e2_pipeline_same_size_edit_matches_full() {
     mutation_case("same-size");
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_same_size_edit_matches_full() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    mutation_case("same-size");
-}
 #[test]
 fn e2_pipeline_inode_replacement_matches_full() {
     mutation_case("inode");
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_inode_replacement_matches_full() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    mutation_case("inode");
-}
 
 #[test]
 fn e2_pipeline_page_boundary_matches_single_page_bodies() {
@@ -1096,44 +878,6 @@ fn e2_pipeline_page_boundary_matches_single_page_bodies() {
     });
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_page_boundary_matches_single_page_bodies() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-pages");
-        c.root(ROOT, &line(ROOT, "root", AT, 10));
-        c.agent(0, &line(ROOT, "agent-0", AT, 11));
-        c.agent(1, &line(ROOT, "agent-1", AT, 12));
-        let scanner = E2ScanFixture::default();
-        let full = ready(&c, &scanner, ScanIndex::default(), 100, true);
-        literal(&full);
-        assert_eq!(full.scan.snapshots.len(), 3);
-        let mut index = ScanIndex::default();
-        let mut observed = BTreeMap::new();
-        for _ in 0..6 {
-            let mut page = ready(&c, &scanner, index, 1, true);
-            for item in &page.scan.snapshots {
-                observed.insert(item.source_session_id.clone(), canonical(item));
-            }
-            page.finish();
-            index = c.reload(&mut page.index);
-            if page.scan.census_complete {
-                break;
-            }
-        }
-        let expected = full
-            .scan
-            .snapshots
-            .iter()
-            .map(|s| (s.source_session_id.clone(), canonical(s)))
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(
-            observed, expected,
-            "page boundaries cannot truncate cumulative money"
-        );
-    });
-}
 
 #[test]
 fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
@@ -1174,52 +918,9 @@ fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
     });
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-move-copy");
-        let original = c.root(ROOT, &line(ROOT, "r1", AT, 10));
-        let scanner = E2ScanFixture::default();
-        let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
-        assert_eq!(total(&first), 1);
-        first.finish();
-        let before = birth_store_bytes(&first.index);
-        let prior = c.reload(&mut first.index);
-        assert_eq!(before, birth_store_bytes(&prior));
-        let moved = c.write_at(
-            &format!("moved/{ROOT}.jsonl"),
-            &line(ROOT, "r1", AT, 10),
-            "2026-08-02T07:01:00Z",
-        );
-        std::fs::remove_file(&original).unwrap();
-        let mut moved_page = ready(&c, &scanner, prior, 100, false);
-        assert_eq!(total(&moved_page), 1, "a move inherits the original cutoff");
-        moved_page.finish();
-        moved_page.accept();
-        let prior = c.reload(&mut moved_page.index);
-        c.write_at(
-            &format!("copy/{ROOT}.jsonl"),
-            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
-            "2026-08-02T07:03:00Z",
-        );
-        assert!(moved.is_file());
-        let copy = ready(&c, &scanner, prior, 100, false);
-        literal(&copy);
-        assert_eq!(
-            total(&copy),
-            2,
-            "restart/move must not make copied r1 count twice"
-        );
-        assert_eq!(copy.scan.snapshots[0].removed_request_count, Some(1));
-    });
-}
 
 fn twins(reverse: bool) {
-    if crate::snapshots::ClaudeTerminalOffForTest::active() {
-        return terminal_off_on_twins(reverse);
-    }
+
     with_e2(|| {
         let mut c = Corpus::new(if reverse {
             "e2-pipeline-twins-reverse"
@@ -1271,82 +972,18 @@ fn twins(reverse: bool) {
     });
 }
 
-fn terminal_off_on_twins(reverse: bool) {
-    with_e2(|| {
-        let mut c = Corpus::new(if reverse {
-            "e2-pipeline-twins-reverse"
-        } else {
-            "e2-pipeline-twins-forward"
-        });
-        let (old_dir, new_dir) = if reverse {
-            ("z-original", "a-copy")
-        } else {
-            ("a-original", "z-copy")
-        };
-        c.write_at(
-            &format!("{old_dir}/{ROOT}.jsonl"),
-            &line(ROOT, "r1", AT, 10),
-            "2026-08-02T07:00:00Z",
-        );
-        c.write_at(
-            &format!("{new_dir}/{ROOT}.jsonl"),
-            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
-            "2026-08-02T07:03:00Z",
-        );
-        let scanner = E2ScanFixture::default();
-        let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
-        let paths = scanner.paths();
-        assert_eq!(paths.len(), 2, "both real twin files were opened");
-        assert!(
-            paths[0].ends_with(format!(
-                "{}/{ROOT}.jsonl",
-                if reverse { new_dir } else { old_dir }
-            )),
-            "fixture must exercise the requested discovery order"
-        );
-        literal(&first);
-        assert_eq!(
-            total(&first),
-            2,
-            "opposite discovery orders count each request once on the first page"
-        );
-        assert_eq!(first.scan.snapshots.len(), 1);
-        let expected = canonical(&first.scan.snapshots);
-        first.finish();
-        first.accept();
-        let prior = c.reload(&mut first.index);
-        let repeated = ready(&c, &scanner, prior, 100, false);
-        assert_eq!(
-            canonical(&repeated.scan.snapshots),
-            expected,
-            "repeated page cannot add money"
-        );
-    });
-}
+
 #[test]
 fn e2_pipeline_twins_original_discovered_first() {
     twins(false);
 }
 
-#[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
-fn terminal_off_on_e2_pipeline_twins_original_discovered_first() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    twins(false);
-}
 #[test]
 fn e2_pipeline_twins_copy_discovered_first() {
     twins(true);
 }
 
-#[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
-fn terminal_off_on_e2_pipeline_twins_copy_discovered_first() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    twins(true);
-}
 
 /// R1: each walk meets both path twins, but a settled twin does not pull its
 /// family into the page. Only a twin the page reads does; otherwise the
@@ -1398,57 +1035,6 @@ fn e2_pipeline_settled_twins_are_not_read_again() {
     });
 }
 
-/// R1: each walk meets both path twins, but a settled twin does not pull its
-/// family into the page. Only a twin the page reads does; otherwise the
-/// family is read again and one batch is sent on every walk.
-#[test]
-fn terminal_off_on_e2_pipeline_settled_twins_are_not_read_again() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-twins-settled");
-        c.write_at(
-            &format!("a-original/{ROOT}.jsonl"),
-            &line(ROOT, "r1", AT, 10),
-            "2026-08-02T07:00:00Z",
-        );
-        c.write_at(
-            &format!("z-copy/{ROOT}.jsonl"),
-            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
-            "2026-08-02T07:03:00Z",
-        );
-        let scanner = E2ScanFixture::default();
-        let mut index = ScanIndex::default();
-        let mut pages = Vec::new();
-        for _ in 0..4 {
-            let mut page = c.raw(&scanner, index, 100, false, &[]);
-            page.enrich(&c);
-            page.finish();
-            if !page.scan.snapshots.is_empty() {
-                let mut progress = e2_progress();
-                let (result, _, _) = page.upload_context(&mut progress, ack);
-                assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-                page.index
-                    .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
-            }
-            pages.push((
-                page.scan.scanned_file_count,
-                page.scan.snapshots.len(),
-                page.scan.census_complete,
-            ));
-            index = c.reload(&mut page.index);
-        }
-        assert_eq!(pages[0].0, 2, "the first walk reads both twins: {pages:?}");
-        assert_eq!(
-            pages[2..]
-                .iter()
-                .map(|page| (page.0, page.1))
-                .collect::<Vec<_>>(),
-            [(0, 0), (0, 0)],
-            "settled twins are not read again: {pages:?}"
-        );
-    });
-}
 
 #[test]
 fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
@@ -1502,59 +1088,6 @@ fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
     });
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_off_page_twin_hold_preserves_complete_history() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-twin-hold");
-        let original = c.write_at(
-            &format!("a/{ROOT}.jsonl"),
-            &line(ROOT, "r1", AT, 10),
-            "2026-08-02T07:00:00Z",
-        );
-        let twin = c.write_at(
-            &format!("z/{ROOT}.jsonl"),
-            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
-            "2026-08-02T07:03:00Z",
-        );
-        let scanner = E2ScanFixture::default();
-        let mut complete = ready(&c, &scanner, ScanIndex::default(), 100, false);
-        literal(&complete);
-        assert_eq!(total(&complete), 2);
-        complete.finish();
-        let mut progress = e2_progress();
-        let (result, _, _) = complete.upload_context(&mut progress, ack);
-        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-        complete
-            .index
-            .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
-        let prior = c.reload(&mut complete.index);
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&twin)
-            .unwrap()
-            .write_all(line(ROOT, "r3", "2026-08-02T07:04:00Z", 30).as_bytes())
-            .unwrap();
-        let mut page = c.raw(&scanner, prior, 1, false, std::slice::from_ref(&twin));
-        page.enrich(&c);
-        assert!(
-            !page.scan.snapshots.is_empty(),
-            "both twins must co-schedule at the file-count boundary"
-        );
-        assert_eq!(
-            scanner.paths().len(),
-            2,
-            "both twin paths must actually be opened"
-        );
-        assert_eq!(
-            total(&page),
-            3,
-            "a partial twin must never overwrite complete history"
-        );
-        assert!(original.is_file());
-    });
-}
 
 #[test]
 fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
@@ -1602,54 +1135,6 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
     });
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_deleted_original_leaves_one_count_after_restart() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-twin-delete");
-        let original = c.write_at(
-            &format!("a/{ROOT}.jsonl"),
-            &line(ROOT, "r1", AT, 10),
-            "2026-08-02T07:00:00Z",
-        );
-        let survivor = c.write_at(
-            &format!("z/{ROOT}.jsonl"),
-            &line(ROOT, "r1", AT, 10),
-            "2026-08-02T07:03:00Z",
-        );
-        let scanner = E2ScanFixture::default();
-        let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
-        assert_eq!(total(&first), 1);
-        first.finish();
-        first.accept();
-        let prior = c.reload(&mut first.index);
-        std::fs::remove_file(original).unwrap();
-        let stored = stored_bodies(&prior);
-        let mut left = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        // R1 (owner-authorized): the unchanged survivor is not read again
-        // (latest wins); it re-emits on its next real change.
-        assert!(
-            left.scan.snapshots.is_empty(),
-            "an unchanged survivor emits nothing new"
-        );
-        left.finish();
-        assert_eq!(
-            stored_bodies(&left.index),
-            stored,
-            "the stored body stays byte-identical"
-        );
-        append(&survivor, &line(ROOT, "r2", "2026-08-02T07:04:00Z", 20));
-        let prior = c.reload(&mut left.index);
-        let changed = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        literal(&changed);
-        assert_eq!(
-            total(&changed),
-            2,
-            "the sole surviving path keeps known original money"
-        );
-    });
-}
 
 #[test]
 fn e2_pipeline_one_branch_removes_copied_prefix_only() {
@@ -1724,80 +1209,6 @@ fn e2_pipeline_one_branch_removes_copied_prefix_only() {
     });
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_one_branch_removes_copied_prefix_only() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-branch");
-        c.root(ROOT, &line(ROOT, "r1", AT, 10));
-        c.write_at(
-            &format!("{COPY}.jsonl"),
-            &(line(COPY, "r1", AT, 10) + &line(COPY, "branch-own", "2026-08-02T07:03:10Z", 0)),
-            "2026-08-02T07:03:00Z",
-        );
-        let p = ready(
-            &c,
-            &E2ScanFixture::default(),
-            ScanIndex::default(),
-            100,
-            false,
-        );
-        literal(&p);
-        assert_eq!(
-            p.scan.snapshots.iter().map(|s| s.input_tokens).sum::<u64>(),
-            10,
-            "original tokens only (own branch response has zero input/output)"
-        );
-        let removed = p
-            .scan
-            .snapshots
-            .iter()
-            .map(|s| s.removed_request_count.unwrap_or(0))
-            .sum::<u64>();
-        assert!(
-            removed > 0,
-            "copy_skipped must be positive for deliberate branch"
-        );
-        let copied = p
-            .scan
-            .snapshots
-            .iter()
-            .find(|s| s.source_session_id == COPY)
-            .unwrap();
-        let tuple = |s: &SnapshotItem| {
-            (
-                s.request_count,
-                s.input_tokens,
-                s.output_tokens,
-                s.cache_read_tokens,
-                s.cache_creation_5m_tokens,
-                s.cache_creation_1h_tokens,
-            )
-        };
-        let root = p
-            .scan
-            .snapshots
-            .iter()
-            .find(|s| s.source_session_id == ROOT)
-            .unwrap();
-        assert_eq!(tuple(root), (1, 10, 10, 3, 5, 2));
-        assert_eq!(tuple(copied), (1, 0, 0, 3, 5, 2));
-        assert_eq!(copied.removed_request_count, Some(1));
-        assert_eq!(root.removed_request_count, Some(0));
-        let removed = copied.removed_usage.as_ref().unwrap();
-        assert_eq!(
-            (
-                removed.input_tokens,
-                removed.output_tokens,
-                removed.cache_read_tokens,
-                removed.cache_creation_5m_tokens,
-                removed.cache_creation_1h_tokens
-            ),
-            (10, 10, 3, 5, 2)
-        );
-    });
-}
 
 #[test]
 fn e2_pipeline_side_call_uses_trace_named_agent_and_counts_root_fallback() {
@@ -1845,53 +1256,6 @@ fn e2_pipeline_side_call_uses_trace_named_agent_and_counts_root_fallback() {
     });
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_side_call_uses_trace_named_agent_and_counts_root_fallback() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-side-calls");
-        c.root(ROOT, &line(ROOT, "root", AT, 10));
-        c.agent(0, &line(ROOT, "agent", AT, 20));
-        c.evidence(
-            &[
-                api("root", 10, 100),
-                api("agent", 20, 200),
-                api("side", 5, 50),
-                api("fallback", 7, 70),
-            ],
-            &[trace("side", "000")],
-        );
-        let p = ready(
-            &c,
-            &E2ScanFixture::default(),
-            ScanIndex::default(),
-            100,
-            false,
-        );
-        literal(&p);
-        let root = p
-            .scan
-            .snapshots
-            .iter()
-            .find(|s| s.source_session_id == ROOT)
-            .unwrap();
-        let agent = p
-            .scan
-            .snapshots
-            .iter()
-            .find(|s| s.source_session_id == format!("{ROOT}_agent-000"))
-            .unwrap();
-        assert_eq!((root.request_count, root.input_tokens), (2, 17));
-        assert_eq!((agent.request_count, agent.input_tokens), (2, 25));
-        assert_eq!(
-            e2::pipeline_test_observer::root_fallbacks(&p.scan.snapshots)
-                + p.released.root_fallbacks,
-            1,
-            "exactly one side call used the counted root fallback"
-        );
-    });
-}
 
 #[test]
 fn e2_pipeline_quiet_otel_only_change_replaces_estimate_without_count_growth() {
@@ -1947,61 +1311,6 @@ fn e2_pipeline_quiet_otel_only_change_replaces_estimate_without_count_growth() {
     });
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_quiet_otel_only_change_replaces_estimate_without_count_growth() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-quiet-otel");
-        let path = c.root(ROOT, &line(ROOT, "root", AT, 10));
-        let scanner = E2ScanFixture::default();
-        let mut first = ready(&c, &scanner, ScanIndex::default(), 100, true);
-        assert_eq!(total(&first), 1);
-        assert_eq!(
-            first.scan.snapshots[0].telemetry_owned_complete,
-            Some(false)
-        );
-        first.finish();
-        let mut progress = e2_progress();
-        first.upload_context(&mut progress, ack).0.unwrap();
-        first
-            .index
-            .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
-        let prior = c.reload(&mut first.index);
-        let metadata = std::fs::metadata(&path).unwrap();
-        c.evidence(&[api("root", 10, 100)], &[]);
-        let after = ready(&c, &scanner, prior, 100, true);
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().modified().unwrap(),
-            metadata.modified().unwrap()
-        );
-        assert_mode(after.modes, (0, 0, 1));
-        literal(&after);
-        assert_eq!(total(&after), 1);
-        assert_eq!(after.scan.snapshots[0].telemetry_owned_complete, Some(true));
-        assert!(after.scan.snapshots[0]
-            .model_usage
-            .iter()
-            .filter(|r| r.request_count > 0)
-            .all(|r| r
-                .selector_context
-                .get("request_usage_origin")
-                .is_some_and(|v| v == "telemetry_matched")));
-        assert_eq!(
-            after.scan.snapshots[0]
-                .model_usage
-                .iter()
-                .map(|r| r.request_count)
-                .sum::<u64>(),
-            1
-        );
-        assert_eq!(after.scan.snapshots[0].input_tokens, 10);
-        assert_ne!(
-            after.scan.snapshots[0].snapshot_fingerprint,
-            first.scan.snapshots[0].snapshot_fingerprint
-        );
-    });
-}
 
 #[test]
 fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
@@ -2096,112 +1405,9 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
     });
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-side-other-page");
-        let root = c.root(ROOT, &line(ROOT, "root", AT, 10));
-        c.agent(0, &line(ROOT, "agent", AT, 20));
-        c.evidence(
-            &[api("root", 10, 100), api("agent", 20, 200)],
-            &[trace("root", ""), trace("agent", "000")],
-        );
-        let scanner = E2ScanFixture::default();
-        let mut baseline = ready(&c, &scanner, ScanIndex::default(), 100, false);
-        baseline.finish();
-        let mut baseline_progress = e2_progress();
-        baseline
-            .upload_context(&mut baseline_progress, ack)
-            .0
-            .unwrap();
-        assert_eq!(
-            baseline_progress.accepted_fingerprints.len(),
-            2,
-            "baseline root and agent really received ACKs"
-        );
-        baseline
-            .index
-            .record_accepted_snapshot_fingerprints(&baseline_progress.accepted_fingerprints);
-        let prior = c.reload(&mut baseline.index);
-        c.evidence(
-            &[
-                api("root", 10, 100),
-                api("agent", 20, 200),
-                api("side", 5, 50),
-            ],
-            &[
-                trace("root", ""),
-                trace("agent", "000"),
-                trace("side", "000"),
-            ],
-        );
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&root)
-            .unwrap()
-            .write_all(line(ROOT, "root2", "2026-08-02T07:01:00Z", 1).as_bytes())
-            .unwrap();
-        let mut p = c.raw(&scanner, prior, 1, false, std::slice::from_ref(&root));
-        p.enrich(&c);
-        if let Some(root_body) = p
-            .scan
-            .snapshots
-            .iter()
-            .find(|s| s.source_session_id == ROOT)
-        {
-            assert_eq!(
-                root_body.input_tokens, 11,
-                "trace-named side call must never fall back to root"
-            );
-        } else if scanner.paths().contains(&root) {
-            assert!(crate::snapshots::e2_pipeline_scan_fixture::explicitly_held(&p.disposition, ROOT),
-                "absent root must have an explicit hold; a partial family cannot silently cancel it");
-        } else {
-            // The one-file page read another member first: the root was not
-            // read, so nothing about it was decided. It must still be due.
-            assert_ne!(
-                crate::snapshots::e2_pipeline_scan_fixture::indexed_size(&p.index, &root),
-                Some(std::fs::metadata(&root).unwrap().len()),
-                "an unread root keeps its old extent, so its append stays due"
-            );
-        }
-        // An absent agent must stay due or be co-scheduled. Observe the next
-        // real bounded pages; a named side call must eventually reach it.
-        let mut walk_receipts = vec![json!({"body_count":p.scan.snapshots.len(),
-            "scanned":p.scan.scanned_file_count, "root_held":crate::snapshots::e2_pipeline_scan_fixture::explicitly_held(&p.disposition, ROOT),
-            "e2":e2::take_counts()})];
-        let mut items = p.scan.snapshots.clone();
-        p.finish();
-        let mut index = c.reload(&mut p.index);
-        for _ in 0..6 {
-            let mut next = ready(&c, &scanner, index, 1, false);
-            walk_receipts.push(json!({"body_count":next.scan.snapshots.len(),
-                "scanned":next.scan.scanned_file_count, "root_held":crate::snapshots::e2_pipeline_scan_fixture::explicitly_held(&next.disposition, ROOT),
-                "e2":e2::take_counts()}));
-            items.extend(next.scan.snapshots.clone());
-            next.finish();
-            index = c.reload(&mut next.index);
-        }
-        assert!(items
-            .iter()
-            .filter(|s| s.source_session_id == ROOT)
-            .all(|s| s.input_tokens == 11));
-        assert!(
-            items
-                .iter()
-                .any(|s| s.source_session_id == ROOT && s.input_tokens == 11),
-            "the appended root must eventually publish, without the named side call; receipts={walk_receipts:?}"
-        );
-        assert!(items.iter().any(|s| s.source_session_id==format!("{ROOT}_agent-000") && s.input_tokens==25),"off-page named agent must eventually publish its side call");
-    });
-}
 
 fn retry_case(conflict: bool) {
-    if crate::snapshots::ClaudeTerminalOffForTest::active() {
-        return terminal_off_on_retry_case(conflict);
-    }
+
     with_e2(|| {
         let mut c = Corpus::new(if conflict {
             "e2-pipeline-retry-conflict"
@@ -2358,185 +1564,18 @@ fn retry_case(conflict: bool) {
     });
 }
 
-fn terminal_off_on_retry_case(conflict: bool) {
-    with_e2(|| {
-        let mut c = Corpus::new(if conflict {
-            "e2-pipeline-retry-conflict"
-        } else {
-            "e2-pipeline-retry-clean"
-        });
-        let prefix = line(ROOT, "copied", "2026-08-02T06:58:00Z", 11);
-        let a = line(ROOT, "conflict", AT, 2);
-        let b = a.replace("claude-haiku-4-5", "claude-sonnet-4-5");
-        let conflict_lines = if conflict { a + &b } else { String::new() };
-        c.root(
-            ROOT,
-            &(prefix + &conflict_lines + &line(ROOT, "own", AT, 20)),
-        );
-        c.agent(0, &line(ROOT, "agent", AT, 5));
-        let scanner = E2ScanFixture::default();
-        let committed = ScanIndex::default();
-        let mut p = ready(&c, &scanner, committed.clone(), 100, false);
-        literal(&p);
-        let root = p
-            .scan
-            .snapshots
-            .iter()
-            .find(|s| s.source_session_id == ROOT)
-            .expect("resolver-conflict root must reach literal emission with its disclosure");
-        assert_eq!(root.removed_request_count, Some(1));
-        assert_eq!(
-            root.resolver_conflict_count,
-            if conflict { Some(1) } else { None }
-        );
-        assert_eq!(root.telemetry_owned_complete, Some(false));
-        let r = root.removed_usage.as_ref().unwrap();
-        assert_eq!(
-            (
-                r.input_tokens,
-                r.output_tokens,
-                r.cache_read_tokens,
-                r.cache_creation_5m_tokens,
-                r.cache_creation_1h_tokens
-            ),
-            (11, 11, 3, 5, 2)
-        );
-        p.finish();
-        let original = canonical(&p.scan.snapshots);
-        let fingerprints = p.receipt();
-        let mut progress = e2_progress();
-        let (failed, first, order) = p.upload_context(&mut progress, |_| {
-            Err(anyhow!("synthetic connection reset before ACK"))
-        });
-        assert!(failed.is_err());
-        assert!(progress.accepted_fingerprints.is_empty());
-        assert_eq!(order.len(), 1);
-        assert_eq!(order[0].len(), 2);
-        assert_eq!(order[0][0], ROOT);
-        let holds = LocalHoldSettlement::classify(
-            SnapshotSource::ClaudeCode,
-            &mut p.index,
-            &mut p.scan,
-            &p.disposition,
-        );
-        // Production transport-error seam: progress is durable first, then
-        // only wholly settled files advance in the partial checkpoint.
-        let progress_path = c.base.join("progress.json");
-        progress.save(&progress_path).unwrap();
-        let index_path = c.base.join("scan-index.json");
-        checkpoint_partial_snapshot_index_with_comparison(
-            &p.index,
-            &committed,
-            &progress,
-            &p.scan.snapshots,
-            Some(&p.scan),
-            &holds.held_fingerprints,
-            &index_path,
-            &progress_path,
-            || Ok(()),
-            None,
-            None,
-            Some(crate::snapshots::UnsettledUploadCause::UploadError),
-        )
-        .unwrap();
-        let prior = ScanIndex::load(&index_path).unwrap();
-        let mut progress = SnapshotUploadProgress::load(
-            &progress_path,
-            &format!("{:064x}", 99),
-            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-        )
-        .unwrap();
-        let mut restart = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        restart.finish();
-        assert_eq!(
-            canonical(&restart.scan.snapshots),
-            original,
-            "re-scan after restart retains canonical bytes"
-        );
-        assert_eq!(restart.receipt(), fingerprints);
-        let copies = restart
-            .scan
-            .snapshots
-            .iter()
-            .map(|s| retry_ordinary_owned(s).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            canonical(&copies),
-            original,
-            "owned retry copy retains every literal field"
-        );
-        // Late telemetry must not mutate an already captured retry body.
-        c.evidence(&[api("own", 20, 200), api("agent", 5, 50)], &[]);
-        let mut late = ready(
-            &c,
-            &E2ScanFixture::default(),
-            restart.index.clone(),
-            100,
-            false,
-        );
-        late.finish();
-        assert_ne!(
-            late.receipt(),
-            fingerprints,
-            "fresh OTEL really changes the current body while the frozen retry stays exact"
-        );
-        let (result, resent, _) = upload(&copies, &mut progress, |batch| {
-            let mut response = ack(batch)?;
-            let refused = response.accepted_entities.pop().unwrap();
-            response.accepted -= 1;
-            let mut refused = refused;
-            refused.head_etag = None;
-            response.conflict_entities.push(refused);
-            Ok(response)
-        });
-        assert_eq!(
-            result.unwrap(),
-            ResumableUploadResult::Deferred { count: 1 }
-        );
-        assert_eq!(
-            first, resent,
-            "transport retry is byte-exact, including removals/conflict/completeness"
-        );
-        assert_eq!(
-            progress.accepted_fingerprints.len(),
-            1,
-            "partial entity ACK never settles its sibling"
-        );
-        assert_eq!(progress.quarantined_fingerprints.len(), 1);
-        // Accepted root and pending agent are the agreed entity-ACK split;
-        // before that ACK the entire small family travelled in one batch.
-        assert!(progress.accepted_fingerprints.contains(
-            &copies
-                .iter()
-                .find(|s| s.source_session_id == ROOT)
-                .unwrap()
-                .snapshot_fingerprint
-        ));
-    });
-}
 
 #[test]
 fn e2_pipeline_transport_restart_and_partial_ack_keep_exact_literal_fields() {
     retry_case(true);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_transport_restart_and_partial_ack_keep_exact_literal_fields() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    retry_case(true);
-}
 #[test]
 fn e2_pipeline_transport_restart_and_partial_ack_without_resolver_conflict() {
     retry_case(false);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_transport_restart_and_partial_ack_without_resolver_conflict() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    retry_case(false);
-}
 
 fn family_corpus(c: &mut Corpus, count: usize, model_padding: usize) {
     let model = format!("claude-haiku-4-5{}", "x".repeat(model_padding));
@@ -2552,9 +1591,7 @@ fn family_corpus(c: &mut Corpus, count: usize, model_padding: usize) {
     }
 }
 fn family_count_case(count: usize) {
-    if crate::snapshots::ClaudeTerminalOffForTest::active() {
-        return terminal_off_on_family_count_case(count);
-    }
+
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-family-{count}"));
         family_corpus(&mut c, count, 0);
@@ -2588,72 +1625,24 @@ fn family_count_case(count: usize) {
     });
 }
 
-fn terminal_off_on_family_count_case(count: usize) {
-    with_e2(|| {
-        let mut c = Corpus::new(&format!("e2-pipeline-family-{count}"));
-        family_corpus(&mut c, count, 0);
-        let mut p = ready(
-            &c,
-            &E2ScanFixture::default(),
-            ScanIndex::default(),
-            1000,
-            false,
-        );
-        literal(&p);
-        assert_eq!(p.scan.snapshots.len(), count);
-        p.finish();
-        let mut progress = e2_progress();
-        let (result, _, order) = p.upload_context(&mut progress, ack);
-        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-        assert_eq!(
-            order.iter().map(Vec::len).collect::<Vec<_>>(),
-            if count <= 50 {
-                vec![count]
-            } else {
-                vec![50, count - 50]
-            }
-        );
-        assert_eq!(order[0][0], ROOT);
-        let flat = order.concat();
-        let mut sorted = flat[1..].to_vec();
-        sorted.sort();
-        assert_eq!(&flat[1..], sorted.as_slice());
-        assert_eq!(progress.accepted_fingerprints.len(), count);
-    });
-}
+
 #[test]
 fn e2_pipeline_real_family_49() {
     family_count_case(49);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_real_family_49() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    family_count_case(49);
-}
 #[test]
 fn e2_pipeline_real_family_50() {
     family_count_case(50);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_real_family_50() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    family_count_case(50);
-}
 #[test]
 fn e2_pipeline_real_family_51() {
     family_count_case(51);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_real_family_51() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    family_count_case(51);
-}
 
 #[test]
 fn e2_pipeline_real_family_crosses_two_mib_root_first() {
@@ -2712,64 +1701,6 @@ fn e2_pipeline_real_family_crosses_two_mib_root_first() {
     });
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_real_family_crosses_two_mib_root_first() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-family-bytes");
-        // Search input model length, never mutate an emitted body to pad it.
-        // Each arm opens and parses actual root+three-agent JSONL, joins, emits and
-        // serializes with the same accounting the production packer uses.
-        let measure = |c: &mut Corpus, padding| {
-            family_corpus(c, 4, padding);
-            let mut p = c.raw(
-                &E2ScanFixture::default(),
-                ScanIndex::default(),
-                100,
-                false,
-                &[],
-            );
-            p.enrich(c);
-            literal(&p);
-            assert_eq!(p.scan.snapshots.len(), 4);
-            p.finish();
-            let bytes = 2 + p
-                .scan
-                .snapshots
-                .iter()
-                .map(|s| serde_json::to_vec(s).unwrap().len() + 1)
-                .sum::<usize>();
-            (p, bytes)
-        };
-        let mut low = 0;
-        let mut high = 300_000;
-        assert!(measure(&mut c, high).1 > SNAPSHOT_BATCH_MAX_BYTES);
-        while low + 1 < high {
-            let mid = (low + high) / 2;
-            if measure(&mut c, mid).1 <= SNAPSHOT_BATCH_MAX_BYTES {
-                low = mid
-            } else {
-                high = mid
-            }
-        }
-        let (mut below, bytes_below) = measure(&mut c, low);
-        let (mut above, bytes_above) = measure(&mut c, high);
-        assert!(bytes_below <= SNAPSHOT_BATCH_MAX_BYTES && bytes_above > SNAPSHOT_BATCH_MAX_BYTES);
-        assert!(
-            bytes_above - bytes_below < 32,
-            "adjacent model lengths bracket the actual 2 MiB boundary"
-        );
-        let (r, _, b) = below.upload_context(&mut e2_progress(), ack);
-        assert_eq!(r.unwrap(), ResumableUploadResult::Completed);
-        assert_eq!(b.len(), 1);
-        let (r, _, b) = above.upload_context(&mut e2_progress(), ack);
-        assert_eq!(r.unwrap(), ResumableUploadResult::Completed);
-        assert_eq!(b.iter().map(Vec::len).collect::<Vec<_>>(), vec![3, 1]);
-        assert_eq!(b[0][0], ROOT);
-        println!("E2_PIPELINE_BYTE_BOUNDARY below={bytes_below} above={bytes_above} limit={SNAPSHOT_BATCH_MAX_BYTES}");
-    });
-}
 
 #[test]
 fn e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
@@ -2842,79 +1773,6 @@ fn e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
     });
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-branch-no-new-reply");
-        c.root(ROOT, &line(ROOT, "original", AT, 10));
-        let scanner = E2ScanFixture::default();
-        let sum = |items: &[SnapshotItem]| {
-            items.iter().fold([0_u64; 8], |mut sum, s| {
-                for (target, n) in sum.iter_mut().zip([
-                    s.request_count,
-                    s.input_tokens,
-                    s.output_tokens,
-                    s.cache_read_tokens,
-                    s.cache_creation_5m_tokens,
-                    s.cache_creation_1h_tokens,
-                    s.reasoning_output_tokens,
-                    s.unattributed_total_tokens,
-                ]) {
-                    *target += n;
-                }
-                sum
-            })
-        };
-        let mut original = ready(&c, &scanner, ScanIndex::default(), 100, false);
-        assert_eq!(total(&original), 1);
-        let original_totals = sum(&original.scan.snapshots);
-        original.finish();
-        original.accept();
-        let prior = c.reload(&mut original.index);
-        c.write_at(
-            &format!("{COPY}.jsonl"),
-            &line(COPY, "original", AT, 10),
-            "2026-08-02T07:03:00Z",
-        );
-        let branch = ready(&c, &scanner, prior, 100, false);
-        literal(&branch);
-        // The unchanged original is not re-emitted on the branch page (it
-        // holds only the copy), so the money published is the original page
-        // plus the branch page: the original's exactly once, the branch none.
-        let branch_totals = sum(&branch.scan.snapshots);
-        let totals: [u64; 8] = std::array::from_fn(|at| original_totals[at] + branch_totals[at]);
-        let shape = branch
-            .scan
-            .snapshots
-            .iter()
-            .map(|s| {
-                (
-                    s.source_session_id == ROOT,
-                    s.request_count,
-                    s.removed_request_count,
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            totals,
-            [1, 10, 10, 3, 5, 2, 0, 0],
-            "a /branch containing only copied history cannot duplicate original money; \
-             page (is_root, requests, removed) = {shape:?}"
-        );
-        assert!(
-            branch
-                .scan
-                .snapshots
-                .iter()
-                .map(|s| s.removed_request_count.unwrap_or(0))
-                .sum::<u64>()
-                > 0,
-            "deliberate /branch must expose copy_skipped > 0; page (is_root, requests, removed) = {shape:?}"
-        );
-    });
-}
 
 #[test]
 fn e2_pipeline_orphan_branch_copy_counts_once_and_discloses() {
@@ -2955,51 +1813,9 @@ fn e2_pipeline_orphan_branch_copy_counts_once_and_discloses() {
     });
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_orphan_branch_copy_counts_once_and_discloses() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-branch-orphan");
-        // The original was deleted before it was ever read: no indexed
-        // earlier holder exists, so the all-copied branch is counted once
-        // in its own session and disclosed, never dropped.
-        let original = c.root(ROOT, &line(ROOT, "original", AT, 10));
-        std::fs::remove_file(&original).unwrap();
-        c.births.remove(&original);
-        c.write_at(
-            &format!("{COPY}.jsonl"),
-            &line(COPY, "original", AT, 10),
-            "2026-08-02T07:03:00Z",
-        );
-        let p = ready(
-            &c,
-            &E2ScanFixture::default(),
-            ScanIndex::default(),
-            100,
-            false,
-        );
-        literal(&p);
-        assert_eq!(p.scan.snapshots.len(), 1);
-        let copy = &p.scan.snapshots[0];
-        assert_eq!(copy.source_session_id, COPY);
-        assert_eq!(
-            (copy.request_count, copy.input_tokens, copy.output_tokens),
-            (1, 10, 10),
-            "an orphan copy is counted once"
-        );
-        assert_eq!(copy.removed_request_count, Some(0));
-        assert!(
-            e2::pipeline_test_observer::disclosed(&p.scan.snapshots) + p.released.disclosed > 0,
-            "an orphan copy is disclosed"
-        );
-    });
-}
 
 fn restored_twins(reverse: bool, equal: bool) {
-    if crate::snapshots::ClaudeTerminalOffForTest::active() {
-        return terminal_off_on_restored_twins(reverse, equal);
-    }
+
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-restored-{reverse}-{equal}"));
         let (a, b) = if reverse {
@@ -3063,114 +1879,30 @@ fn restored_twins(reverse: bool, equal: bool) {
     });
 }
 
-fn terminal_off_on_restored_twins(reverse: bool, equal: bool) {
-    with_e2(|| {
-        let mut c = Corpus::new(&format!("e2-pipeline-restored-{reverse}-{equal}"));
-        let (a, b) = if reverse {
-            ("z-original", "a-copy")
-        } else {
-            ("a-original", "z-copy")
-        };
-        c.write_at(
-            &format!("{a}/{ROOT}.jsonl"),
-            &line(ROOT, "r1", AT, 10),
-            "2026-08-02T07:02:00Z",
-        );
-        let twin = c.write_at(
-            &format!("{b}/{ROOT}.jsonl"),
-            &line(ROOT, "r1", AT, 10),
-            if equal {
-                "2026-08-02T07:02:00Z"
-            } else {
-                "2026-08-02T07:03:00Z"
-            },
-        );
-        let scanner = E2ScanFixture::default();
-        let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
-        let opened = scanner.paths();
-        assert_eq!(opened.len(), 2);
-        assert!(
-            opened[0].ends_with(format!("{}/{ROOT}.jsonl", if reverse { b } else { a })),
-            "actual discovery order"
-        );
-        literal(&first);
-        assert_eq!(
-            total(&first),
-            1,
-            "all-prebirth restored twins must count once on their first page"
-        );
-        first.finish();
-        first.accept();
-        let stored = stored_bodies(&first.index);
-        let prior = c.reload(&mut first.index);
-        let mut again = ready(&c, &scanner, prior, 100, false);
-        // R1 (owner-authorized): an unchanged repeated page reads and sends
-        // nothing (latest wins); a real change re-emits the twin group.
-        assert!(
-            again.scan.snapshots.is_empty(),
-            "an unchanged repeated page emits nothing new"
-        );
-        again.finish();
-        assert_eq!(
-            stored_bodies(&again.index),
-            stored,
-            "the stored body stays byte-identical"
-        );
-        append(&twin, &line(ROOT, "r2", "2026-08-02T07:04:00Z", 20));
-        let prior = c.reload(&mut again.index);
-        let changed = ready(&c, &scanner, prior, 100, false);
-        literal(&changed);
-        assert_eq!(
-            total(&changed),
-            2,
-            "restart and repeated page cannot change the total; the new response counts once"
-        );
-    });
-}
+
 #[test]
 fn e2_pipeline_restored_twins_earlier_first() {
     restored_twins(false, false);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_restored_twins_earlier_first() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    restored_twins(false, false);
-}
 #[test]
 fn e2_pipeline_restored_twins_later_first() {
     restored_twins(true, false);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_restored_twins_later_first() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    restored_twins(true, false);
-}
 #[test]
 fn e2_pipeline_restored_twins_equal_birth_forward() {
     restored_twins(false, true);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_restored_twins_equal_birth_forward() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    restored_twins(false, true);
-}
 #[test]
 fn e2_pipeline_restored_twins_equal_birth_reverse() {
     restored_twins(true, true);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_restored_twins_equal_birth_reverse() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    restored_twins(true, true);
-}
 
 #[test]
 fn e2_pipeline_deletion_reload_then_later_move_keeps_birth() {
@@ -3201,38 +1933,6 @@ fn e2_pipeline_deletion_reload_then_later_move_keeps_birth() {
     });
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_deletion_reload_then_later_move_keeps_birth() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-delayed-move");
-        let old = c.root(ROOT, &line(ROOT, "r1", AT, 10));
-        let scanner = E2ScanFixture::default();
-        let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
-        first.finish();
-        first.accept();
-        let prior = c.reload(&mut first.index);
-        std::fs::remove_file(old).unwrap();
-        let mut absent = ready(&c, &scanner, prior, 100, false);
-        absent.finish();
-        absent.accept();
-        let prior = c.reload(&mut absent.index);
-        c.write_at(
-            &format!("new-location/{ROOT}.jsonl"),
-            &line(ROOT, "r1", AT, 10),
-            "2026-08-02T07:03:00Z",
-        );
-        let moved = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        literal(&moved);
-        assert_eq!(
-            total(&moved),
-            1,
-            "lineage survives a real deletion scan and durable reload"
-        );
-        assert_eq!(moved.scan.snapshots[0].removed_request_count, Some(0));
-    });
-}
 
 #[test]
 fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
@@ -3323,103 +2023,6 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
     });
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-twin-byte-hold");
-        c.write_at(
-            &format!("a/{ROOT}.jsonl"),
-            &line(ROOT, "r1", AT, 10),
-            "2026-08-02T07:00:00Z",
-        );
-        c.write_at(
-            &format!("z/{ROOT}.jsonl"),
-            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
-            "2026-08-02T07:03:00Z",
-        );
-        let scanner = E2ScanFixture::default();
-        let mut progress = e2_progress();
-        // Production Completed settlement of one ordinary page, then reload.
-        let settle = |c: &Corpus,
-                      committed: &ScanIndex,
-                      mut page: Page,
-                      progress: &mut SnapshotUploadProgress| {
-            page.finish();
-            page.upload_context(progress, ack).0.unwrap();
-            let holds = LocalHoldSettlement::classify(
-                SnapshotSource::ClaudeCode,
-                &mut page.index,
-                &mut page.scan,
-                &page.disposition,
-            );
-            let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
-            settle_index_after_upload(&mut settled.index, committed, progress);
-            c.reload(&mut settled.index)
-        };
-        let old = ScanIndex::default();
-        let first = ready(&c, &scanner, old.clone(), 100, false);
-        literal(&first);
-        assert_eq!(total(&first), 2);
-        let prior = settle(&c, &old, first, &mut progress);
-        assert_eq!(progress.accepted_fingerprints.len(), 1);
-        // A fresh index's first page records the identity contract, which
-        // re-arms every family file for one re-read. Consume that one-time
-        // re-read on an ordinary page, so the byte-limited page below has no
-        // reason to read the twins except the owed adoption.
-        let warm = ready(&c, &scanner, prior.clone(), 100, false);
-        let mut prior = settle(&c, &prior, warm, &mut progress);
-        let before = prior.current_snapshot_fingerprints();
-        assert_eq!(
-            before.len(),
-            1,
-            "hold starts from one complete accepted family body"
-        );
-        // Main's completing prelude adopted this context. In containment that
-        // prelude is unavailable; restore the explicit historical input so this
-        // remains the ADOPTION-ONLY byte-budget control, independent of #901.
-        let mut value = serde_json::to_value(&prior).unwrap();
-        value["upload_context_fingerprint"] = json!("e2-synthetic-destination");
-        prior = serde_json::from_value(value).unwrap();
-        prior.activate_upload_context("e2-synthetic-destination".into());
-        prior.activate_effective_upload_body_witness_revision(3);
-        for key in prior.files.keys().cloned().collect::<Vec<_>>() {
-            assert!(
-                prior.re_owe_effective_upload_body_witness_revision(&key, 2),
-                "existing production re-owe keeps this family due"
-            );
-        }
-        let committed = prior.clone();
-        let mut held =
-            crate::snapshots::e2_pipeline_scan_fixture::with_history_byte_limit(1, || {
-                ready(&c, &scanner, prior, 1, false)
-            });
-        assert!(
-            held.scan.snapshots.is_empty(),
-            "byte-limited twin family emits no partial replacement"
-        );
-        held.finish();
-        let holds = LocalHoldSettlement::classify(
-            SnapshotSource::ClaudeCode,
-            &mut held.index,
-            &mut held.scan,
-            &held.disposition,
-        );
-        let mut settlement = settle_completed_upload(held.index, &committed, &progress, &holds);
-        settle_index_after_upload(&mut settlement.index, &committed, &progress);
-        let restored = c.reload(&mut settlement.index);
-        assert_eq!(
-            restored.current_snapshot_fingerprints(),
-            before,
-            "previous complete accepted history survives hold and disk reload"
-        );
-        assert!(
-            scanner.paths().is_empty(),
-            "strict byte budget refuses the complete twin group before either file is read; opened={}", scanner.paths().len()
-        );
-    });
-}
 
 // ---- I4b: gate-ON copy proofs, delays, side-call holds, conflict carrier ----
 
@@ -3568,23 +2171,12 @@ fn e2_pipeline_inplace_rewritten_original_cannot_remove_its_twin_copy() {
     rewritten_original(false);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_inplace_rewritten_original_cannot_remove_its_twin_copy() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    rewritten_original(false);
-}
 #[test]
 fn e2_pipeline_inplace_rewritten_original_cannot_remove_its_twin_copy_reverse() {
     rewritten_original(true);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_inplace_rewritten_original_cannot_remove_its_twin_copy_reverse() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    rewritten_original(true);
-}
 
 /// Owner ruling 1 (Codex P1-1 case 2): restored same-session histories H1
 /// and H1+H2, every line pre-birth: the union counts, H1 once, H2 once, on
@@ -3632,32 +2224,17 @@ fn e2_pipeline_overlapping_restored_histories_count_their_union_once() {
     overlapping_restored(false);
 }
 
-#[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
-fn terminal_off_on_e2_pipeline_overlapping_restored_histories_count_their_union_once() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    overlapping_restored(false);
-}
 #[test]
 fn e2_pipeline_overlapping_restored_histories_count_their_union_once_reverse() {
     overlapping_restored(true);
 }
 
-#[test]
-#[ignore = "terminal-off ON-readiness: prior-code-unclassified"]
-fn terminal_off_on_e2_pipeline_overlapping_restored_histories_count_their_union_once_reverse() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    overlapping_restored(true);
-}
 
 /// Owner ruling 2: an all-copied /branch is skipped on the request ids its
 /// earlier other-session holder has, whatever version wrote the lines.
 fn branch_by(version: &str) {
-    if crate::snapshots::ClaudeTerminalOffForTest::active() {
-        return terminal_off_on_branch_by(version);
-    }
+
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-branch-by-{version}"));
         c.root(ROOT, &line_by(ROOT, "original", AT, 10, version));
@@ -3683,56 +2260,19 @@ fn branch_by(version: &str) {
     });
 }
 
-fn terminal_off_on_branch_by(version: &str) {
-    with_e2(|| {
-        let mut c = Corpus::new(&format!("e2-pipeline-branch-by-{version}"));
-        c.root(ROOT, &line_by(ROOT, "original", AT, 10, version));
-        let scanner = E2ScanFixture::default();
-        let mut original = ready(&c, &scanner, ScanIndex::default(), 100, false);
-        assert_eq!(total(&original), 1);
-        original.finish();
-        original.accept();
-        let prior = c.reload(&mut original.index);
-        c.write_at(
-            &format!("{COPY}.jsonl"),
-            &line_by(COPY, "original", AT, 10, version),
-            "2026-08-02T07:03:00Z",
-        );
-        let branch = ready(&c, &scanner, prior, 100, false);
-        literal(&branch);
-        let copy = body(&branch, COPY).expect("the branch publishes its (empty) body");
-        assert_eq!(
-            (copy.request_count, copy.removed_request_count),
-            (0, Some(1)),
-            "{version}: the copy never counts the original's request again"
-        );
-        assert!(body(&branch, ROOT).is_none(), "the original is unchanged");
-    });
-}
+
 #[test]
 fn e2_pipeline_branch_written_outside_the_writer_allowlist_is_skipped_by_request_ids() {
     branch_by("2.0.99");
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_branch_written_outside_the_writer_allowlist_is_skipped_by_request_ids() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    branch_by("2.0.99");
-}
 #[test]
 fn e2_pipeline_branch_written_by_the_current_m4_claude_code_is_skipped() {
     // `claude --version` on the M4 on 2026-10-26: 2.1.310 (Claude Code).
     branch_by("2.1.310");
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_branch_written_by_the_current_m4_claude_code_is_skipped() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    // `claude --version` on the M4 on 2026-10-26: 2.1.310 (Claude Code).
-    branch_by("2.1.310");
-}
 
 /// Owner ruling 3: a /branch read before its original on a fresh index
 /// cannot decide: it is held (never counted), and a later page that reads
@@ -3797,23 +2337,12 @@ fn e2_pipeline_branch_read_before_its_original_waits_instead_of_counting() {
     branch_before_original(true);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_branch_read_before_its_original_waits_instead_of_counting() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    branch_before_original(true);
-}
 #[test]
 fn e2_pipeline_branch_read_after_its_original_on_a_fresh_index_is_skipped() {
     branch_before_original(false);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_branch_read_after_its_original_on_a_fresh_index_is_skipped() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    branch_before_original(false);
-}
 
 /// An indexed original rewritten in place to drop H, then a new all-pre-birth
 /// branch holding H, read before the original's next page: the original's
@@ -3878,70 +2407,6 @@ fn e2_pipeline_branch_waits_for_an_original_modified_since_its_read() {
     });
 }
 
-/// An indexed original rewritten in place to drop H, then a new all-pre-birth
-/// branch holding H, read before the original's next page: the original's
-/// census record no longer describes its file, so the branch waits for that
-/// read instead of skipping H. H then counts once, from the branch.
-#[test]
-fn terminal_off_on_e2_pipeline_branch_waits_for_an_original_modified_since_its_read() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-branch-stale-holder");
-        let original = c.root(LATE, &line(LATE, "h", AT, 10));
-        let mut progress = e2_progress();
-        let old = ScanIndex::default();
-        let first = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
-        assert_eq!(total(&first), 1);
-        let mut prior = settle(&c, &old, first, &mut progress);
-        // Same length: h becomes u in place; the clock moves on.
-        std::fs::write(&original, line(LATE, "u", AT, 10)).unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&original)
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
-            .unwrap();
-        c.write_at(
-            &format!("{COPY}.jsonl"),
-            &line(COPY, "h", AT, 10),
-            "2026-08-02T07:03:00Z",
-        );
-        let scanner = E2ScanFixture::default();
-        let mut page = c.raw(&scanner, prior.clone(), 1, false, &[]);
-        page.enrich(&c);
-        let opened = scanner.paths();
-        assert_eq!(opened.len(), 1, "one file per page");
-        assert!(
-            opened[0].ends_with(format!("{COPY}.jsonl")),
-            "fixture reads the branch before the modified original"
-        );
-        assert_withheld(&page, COPY, "the original changed since its read");
-        prior = settle(&c, &prior, page, &mut progress);
-        let mut original_body = None;
-        let mut copy_body = None;
-        for _ in 0..3 {
-            let page = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
-            for (session, slot) in [(LATE, &mut original_body), (COPY, &mut copy_body)] {
-                if let Some(found) = body(&page, session) {
-                    if crate::snapshots::claude_request_money::is_request_owned_literal(found) {
-                        *slot = Some((found.request_count, found.removed_request_count));
-                    }
-                }
-            }
-            prior = settle(&c, &prior, page, &mut progress);
-            if copy_body.is_some() {
-                break;
-            }
-        }
-        assert_eq!(original_body.map(|(count, _)| count), Some(1), "u only");
-        assert_eq!(
-            copy_body,
-            Some((1, Some(0))),
-            "h counts once, from the branch: nothing dropped"
-        );
-    });
-}
 
 /// Owner rule (P2): holding a session withholds its upload only; its scan
 /// state stays evidence. All-copied main files of four sessions share
@@ -4053,117 +2518,6 @@ fn e2_pipeline_held_copies_never_wait_on_each_other() {
     });
 }
 
-/// Owner rule (P2): holding a session withholds its upload only; its scan
-/// state stays evidence. All-copied main files of four sessions share
-/// request ids (the Linux probe shape: every root a cross-session copy
-/// candidate), read one per page. A file waits only for files no page has
-/// read yet, never for one that is merely held, so every session publishes
-/// within two traversal passes, each request counts exactly once, and
-/// nothing is re-read after.
-#[test]
-fn terminal_off_on_e2_pipeline_held_copies_never_wait_on_each_other() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        const A: &str = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-        const B: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-        const C: &str = "5338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-        const D: &str = "6338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-        let mut c = Corpus::new("e2-pipeline-held-cycle");
-        // Every line predates its file's birth; the (birth, location) order
-        // decides who holds a shared id first: x in A, y in C.
-        for (session, requests, birth) in [
-            (A, &["x", "a"][..], "2026-08-02T07:03:00Z"),
-            (B, &["x", "b"][..], "2026-08-02T07:04:00Z"),
-            (C, &["x", "y", "c"][..], "2026-08-02T07:05:00Z"),
-            (D, &["y", "d"][..], "2026-08-02T07:06:00Z"),
-        ] {
-            let contents = requests
-                .iter()
-                .map(|request| line(session, request, AT, 10))
-                .collect::<String>();
-            c.write_at(&format!("{session}.jsonl"), &contents, birth);
-        }
-        let mut progress = e2_progress();
-        let mut prior = ScanIndex::default();
-        let mut published = BTreeMap::<&str, (u64, Option<u64>)>::new();
-        let mut reads = BTreeMap::<PathBuf, usize>::new();
-        let mut held = 0;
-        let mut pages = 0;
-        while published.len() < 4 {
-            assert!(
-                pages < 12,
-                "every session publishes: {published:?} after {pages} pages \
-                 ({held} holds, reads {reads:?})"
-            );
-            let scanner = E2ScanFixture::default();
-            let mut page = c.raw(&scanner, prior.clone(), 1, false, &[]);
-            page.enrich(&c);
-            pages += 1;
-            for path in scanner.paths() {
-                *reads.entry(path).or_default() += 1;
-            }
-            let quarantined = page
-                .disposition
-                .quarantined_fingerprints(&page.scan.snapshots);
-            for session in [A, B, C, D] {
-                let Some(found) = body(&page, session) else {
-                    continue;
-                };
-                if quarantined.contains(&found.snapshot_fingerprint) {
-                    held += 1;
-                    continue;
-                }
-                assert!(
-                    crate::snapshots::claude_request_money::is_request_owned_literal(found),
-                    "{session}: a decided session publishes its literal body"
-                );
-                assert!(
-                    published
-                        .insert(session, (found.request_count, found.removed_request_count))
-                        .is_none(),
-                    "{session}: published once"
-                );
-            }
-            prior = settle(&c, &prior, page, &mut progress);
-        }
-        assert!(held > 0, "the shape makes sessions wait: {published:?}");
-        assert!(
-            reads.values().all(|&count| count <= 2),
-            "settled within two traversal passes: no file read more than twice, {reads:?}"
-        );
-        assert_eq!(
-            published,
-            BTreeMap::from([
-                (A, (2, Some(0))),
-                (B, (1, Some(1))),
-                (C, (2, Some(1))),
-                (D, (1, Some(1))),
-            ]),
-            "x counts in A and y in C, once; every other id in its own file"
-        );
-        // A clean follow-up may read a file once more; it never changes a
-        // published body, and the sync after it reads nothing.
-        for follow_up in 0.. {
-            assert!(follow_up < 2, "a settled corpus is not re-read every sync");
-            let mut page = c.raw(&E2ScanFixture::default(), prior.clone(), 100, false, &[]);
-            page.enrich(&c);
-            if page.scan.scanned_file_count == 0 {
-                break;
-            }
-            for session in [A, B, C, D] {
-                if let Some(found) = body(&page, session) {
-                    assert_eq!(
-                        Some(&(found.request_count, found.removed_request_count)),
-                        published.get(session),
-                        "{session}: a follow-up read decides the same"
-                    );
-                }
-            }
-            prior = settle(&c, &prior, page, &mut progress);
-        }
-    });
-}
 
 /// Owner ruling 3: the census walk deadline decides nothing: the /branch is
 /// held, then the next page's walk skips it.
@@ -4198,40 +2552,6 @@ fn e2_pipeline_branch_census_deadline_holds_then_a_later_walk_skips() {
     });
 }
 
-/// Owner ruling 3: the census walk deadline decides nothing: the /branch is
-/// held, then the next page's walk skips it.
-#[test]
-fn terminal_off_on_e2_pipeline_branch_census_deadline_holds_then_a_later_walk_skips() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-branch-deadline");
-        c.root(ROOT, &line(ROOT, "original", AT, 10));
-        let scanner = E2ScanFixture::default();
-        let mut progress = e2_progress();
-        let old = ScanIndex::default();
-        let original = ready(&c, &scanner, old.clone(), 100, false);
-        let prior = settle(&c, &old, original, &mut progress);
-        c.write_at(
-            &format!("{COPY}.jsonl"),
-            &line(COPY, "original", AT, 10),
-            "2026-08-02T07:03:00Z",
-        );
-        let mut held = c.raw(&E2ScanFixture::default(), prior.clone(), 100, false, &[]);
-        crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
-            held.enrich(&c);
-        });
-        assert_withheld(&held, COPY, "walk deadline");
-        let prior = settle(&c, &prior, held, &mut progress);
-        let decided = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        let copy = body(&decided, COPY).expect("the held copy is read again");
-        assert!(crate::snapshots::claude_request_money::is_request_owned_literal(copy));
-        assert_eq!(
-            (copy.request_count, copy.removed_request_count),
-            (0, Some(1))
-        );
-    });
-}
 
 /// Design item 9 (PR C): the legacy fork-prefix exclusion and the E2 copy
 /// skip never both remove a copied request. A legacy fork child whose
@@ -4291,65 +2611,6 @@ fn e2_pipeline_legacy_fork_prefix_is_removed_exactly_once() {
     });
 }
 
-/// Design item 9 (PR C): the legacy fork-prefix exclusion and the E2 copy
-/// skip never both remove a copied request. A legacy fork child whose
-/// leading request telemetry assigns to its parent, with a divergent parent
-/// prefix (the exclusion's exact shape, derived on this page), publishes
-/// that request removed exactly once and counts every other request once.
-#[test]
-fn terminal_off_on_e2_pipeline_legacy_fork_prefix_is_removed_exactly_once() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-legacy-fork-prefix");
-        c.root(
-            ROOT,
-            &(line(ROOT, "shared", AT, 10) + &line(ROOT, "parent", "2026-08-02T07:01:00Z", 20)),
-        );
-        c.write_at(
-            &format!("{COPY}.jsonl"),
-            &(line(COPY, "shared", AT, 10) + &line(COPY, "child", "2026-08-02T07:04:00Z", 30)),
-            "2026-08-02T07:03:00Z",
-        );
-        c.evidence_for(
-            ROOT,
-            &[
-                api_for(ROOT, "shared", 10, 100),
-                api_for(ROOT, "parent", 20, 200),
-            ],
-            &[trace_for(ROOT, "shared", ""), trace_for(ROOT, "parent", "")],
-        );
-        c.evidence_for(
-            COPY,
-            &[api_for(COPY, "child", 30, 300)],
-            &[trace_for(COPY, "child", "")],
-        );
-        let p = ready(
-            &c,
-            &E2ScanFixture::default(),
-            ScanIndex::default(),
-            100,
-            false,
-        );
-        literal(&p);
-        assert_eq!(
-            e2::pipeline_test_observer::legacy_excluded(&p.index, COPY),
-            0,
-            "terminal-off withholds the legacy completion proof; E2 still removes the copy"
-        );
-        let copy = body(&p, COPY).expect("the child publishes");
-        assert_eq!(
-            (copy.request_count, copy.removed_request_count),
-            (1, Some(1)),
-            "the shared request is removed once, by the E2 copy rule only"
-        );
-        assert_eq!(
-            body(&p, ROOT).expect("the parent publishes").request_count,
-            2
-        );
-        assert_eq!(total(&p), 3, "every request counts exactly once");
-    });
-}
 
 /// The `fork-context-ref` line `/branch` (Claude Code 2.1.309+) writes into
 /// the new session, naming the session it copied.
@@ -4403,16 +2664,7 @@ fn e2_pipeline_branch_of_a_retired_original_named_by_its_fork_line_is_skipped() 
     );
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_branch_of_a_retired_original_named_by_its_fork_line_is_skipped() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    assert_eq!(
-        branch_of_retired("e2-pipeline-retired-named", Some(ROOT)),
-        ((0, Some(1)), 0),
-        "the still-indexed original the fork line names proves the copy: never counted twice"
-    );
-}
 #[test]
 fn e2_pipeline_branch_of_a_retired_original_without_a_fork_line_counts_and_discloses() {
     // No durable per-request store: without the name, the retired original
@@ -4423,17 +2675,7 @@ fn e2_pipeline_branch_of_a_retired_original_without_a_fork_line_counts_and_discl
     );
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_branch_of_a_retired_original_without_a_fork_line_counts_and_discloses() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    // No durable per-request store: without the name, the retired original
-    // proves nothing, so the copy counts once more and is disclosed.
-    assert_eq!(
-        branch_of_retired("e2-pipeline-retired-unnamed", None),
-        ((1, Some(0)), 1)
-    );
-}
 #[test]
 fn e2_pipeline_branch_naming_an_unindexed_session_counts_and_discloses() {
     // The fork line names a session that is not indexed: no proof.
@@ -4443,16 +2685,6 @@ fn e2_pipeline_branch_naming_an_unindexed_session_counts_and_discloses() {
     );
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_branch_naming_an_unindexed_session_counts_and_discloses() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    // The fork line names a session that is not indexed: no proof.
-    assert_eq!(
-        branch_of_retired("e2-pipeline-retired-unindexed", Some(LATE)),
-        ((1, Some(0)), 1)
-    );
-}
 
 /// E7 stopgap, demo chain: the copy-only resume `COPY` repeats requests its
 /// original `ROOT` still holds. When both records are past 35 days, a
@@ -4558,111 +2790,6 @@ fn e2_pipeline_aged_original_sharing_ids_with_its_copy_keeps_the_copy_proven() {
     });
 }
 
-/// E7 stopgap, demo chain: the copy-only resume `COPY` repeats requests its
-/// original `ROOT` still holds. When both records are past 35 days, a
-/// complete terminal keeps both (they share ids), so a later re-read of the
-/// copy still proves its copies against the original instead of counting
-/// them again (as a retired original would:
-/// `e2_pipeline_branch_of_a_retired_original_without_a_fork_line_counts_and_discloses`).
-#[test]
-fn terminal_off_on_e2_pipeline_aged_original_sharing_ids_with_its_copy_keeps_the_copy_proven() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-aged-original-kept");
-        let second = "2026-08-02T07:00:20Z";
-        c.root(
-            ROOT,
-            &(line(ROOT, "first", AT, 10) + &line(ROOT, "second", second, 10)),
-        );
-        let scanner = E2ScanFixture::default();
-        let mut progress = e2_progress();
-        let old = ScanIndex::default();
-        let original = ready(&c, &scanner, old.clone(), 100, false);
-        assert_eq!(total(&original), 2, "the original counts its requests");
-        let prior = settle(&c, &old, original, &mut progress);
-        let copy = c.write_at(
-            &format!("{COPY}.jsonl"),
-            &line(COPY, "first", AT, 10),
-            "2026-08-02T07:03:00Z",
-        );
-        let branch = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
-        literal(&branch);
-        let found = body(&branch, COPY).expect("the copy publishes its body");
-        assert_eq!(
-            (found.request_count, found.removed_request_count),
-            (0, Some(1))
-        );
-        let mut prior = settle(&c, &prior, branch, &mut progress);
-
-        // A complete terminal 36 days after both files were last written.
-        let window = (OffsetDateTime::now_utc() + TimeDuration::days(36))
-            .format(&Rfc3339)
-            .unwrap();
-        let keys = prior.files.keys().cloned().collect::<BTreeSet<_>>();
-        // The retirement decision reads 0 transcript bytes: transcript I/O
-        // is denied and no transcript is opened.
-        let opens = crate::snapshots::all_transcript_opens_for_test();
-        let (_, rows) = crate::snapshots::with_transcript_io_denied(|| {
-            crate::local_resource_diagnostics::capture(|| {
-                crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
-                    &mut prior,
-                    &keys,
-                    &BTreeSet::new(),
-                    &window,
-                )
-            })
-        });
-        assert_eq!(crate::snapshots::all_transcript_opens_for_test(), opens);
-        let kept = rows
-            .iter()
-            .find(|row| row["stage"] == "claude_census_retire_kept_overlap")
-            .expect("the terminal reports the kept records");
-        assert_eq!(kept["counts"]["census_retire_kept_overlap_records"], 2);
-        assert_eq!(kept["counts"]["census_retire_kept_overlap_hashes"], 3);
-        assert_eq!(kept["counts"]["census_retire_kept_overflow"], 0);
-        let census = prior.claude_request_census_for_test();
-        let record = |session: &str| {
-            let name = format!("{session}.jsonl");
-            let key = keys
-                .iter()
-                .find(|key| key.ends_with(&name))
-                .expect("an indexed file");
-            census.record_for_test(key).expect("a census record")
-        };
-        assert_eq!(
-            record(ROOT).retired_for_test(),
-            None,
-            "the original keeps its ids"
-        );
-        assert_eq!(record(ROOT).request_hashes_for_test().len(), 2);
-        assert!(record(ROOT).proves_scan());
-        assert_eq!(
-            record(COPY).retired_for_test(),
-            None,
-            "the copy keeps its id"
-        );
-
-        // The copy is re-read with a second copied request: both stay proven.
-        std::fs::write(
-            &copy,
-            line(COPY, "first", AT, 10) + &line(COPY, "second", second, 10),
-        )
-        .unwrap();
-        let reread = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        literal(&reread);
-        let found = body(&reread, COPY).expect("the re-read copy publishes its body");
-        assert_eq!(
-            (found.request_count, found.removed_request_count),
-            (0, Some(2)),
-            "the kept original still proves every copied request"
-        );
-        assert_eq!(
-            e2::pipeline_test_observer::disclosed(&reread.scan.snapshots),
-            0
-        );
-    });
-}
 
 /// #920 round 3, finding 1, through the production pipeline: kept stock
 /// never costs a young holder its proof. A terminal keeps the aged pair
@@ -4845,188 +2972,6 @@ fn e2_pipeline_kept_stock_yields_to_a_growing_holder() {
     });
 }
 
-/// #920 round 3, finding 1, through the production pipeline: kept stock
-/// never costs a young holder its proof. A terminal keeps the aged pair
-/// `ROOT` and `COPY` (they share a request id; below 90% occupancy, no
-/// overflow).
-/// The census is then full when the young holder `GROWING` grows by one
-/// request: the kept `ROOT` retires so it fits (admission overflow, with the
-/// alarm) and `GROWING` is stored whole, not as a hashless tombstone. A
-/// later re-read of its copy `GROWING_COPY`, on its own page, still proves
-/// every copied request: none is counted again.
-#[test]
-fn terminal_off_on_e2_pipeline_kept_stock_yields_to_a_growing_holder() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    const GROWING: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-    const GROWING_COPY: &str = "5338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-    const FILLER: &str = "6338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-    // The scan fixture's census window.
-    const WINDOW: &str = "2026-08-02T08:00:00Z";
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-kept-stock-admission");
-        // Last written more than 35 days before the window: aged.
-        let aged = |path: &Path, at: &str| {
-            std::fs::File::options()
-                .write(true)
-                .open(path)
-                .unwrap()
-                .set_modified(
-                    std::time::UNIX_EPOCH + std::time::Duration::from_nanos(nanos(at) as u64),
-                )
-                .unwrap();
-        };
-        let second = "2026-08-02T07:00:20Z";
-        // The aged pair is read on one page, so no terminal sees either alone.
-        let root = c.root(
-            ROOT,
-            &(line(ROOT, "first", AT, 10) + &line(ROOT, "second", second, 10)),
-        );
-        let copy = c.write_at(
-            &format!("{COPY}.jsonl"),
-            &line(COPY, "first", AT, 10),
-            "2026-08-02T07:03:00Z",
-        );
-        aged(&root, "2026-06-01T00:00:00Z");
-        aged(&copy, "2026-06-02T00:00:00Z");
-        let scanner = E2ScanFixture::default();
-        let mut progress = e2_progress();
-        let old = ScanIndex::default();
-        let pair = ready(&c, &scanner, old.clone(), 100, false);
-        let prior = settle(&c, &old, pair, &mut progress);
-        let growing = c.write_at(
-            &format!("{GROWING}.jsonl"),
-            &line(GROWING, "g1", AT, 10),
-            "2026-08-02T07:05:00Z",
-        );
-        c.write_at(
-            &format!("{FILLER}.jsonl"),
-            &line(FILLER, "f1", AT, 10),
-            "2026-08-02T07:05:00Z",
-        );
-        let young = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
-        let prior = settle(&c, &prior, young, &mut progress);
-        let growing_copy = c.write_at(
-            &format!("{GROWING_COPY}.jsonl"),
-            &line(GROWING_COPY, "g1", AT, 10),
-            "2026-08-02T07:08:00Z",
-        );
-        let branch = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
-        literal(&branch);
-        let found = body(&branch, GROWING_COPY).expect("the copy publishes its body");
-        assert_eq!(
-            (found.request_count, found.removed_request_count),
-            (0, Some(1))
-        );
-        let mut prior = settle(&c, &prior, branch, &mut progress);
-        let key = |session: &str| {
-            let name = format!("{session}.jsonl");
-            prior
-                .files
-                .keys()
-                .find(|key| key.ends_with(&name))
-                .expect("an indexed file")
-                .clone()
-        };
-        let (root_key, copy_key, growing_key, filler_key) =
-            (key(ROOT), key(COPY), key(GROWING), key(FILLER));
-
-        // 1. A complete terminal at the window keeps the aged pair.
-        let keys = prior.files.keys().cloned().collect::<BTreeSet<_>>();
-        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-            crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
-                &mut prior,
-                &keys,
-                &BTreeSet::new(),
-                WINDOW,
-            )
-        });
-        let kept = rows
-            .iter()
-            .find(|row| row["stage"] == "claude_census_retire_kept_overlap")
-            .expect("the terminal reports the kept records");
-        assert_eq!(kept["counts"]["census_retire_kept_overlap_records"], 2);
-        assert_eq!(kept["counts"]["census_retire_kept_overlap_hashes"], 3);
-        assert_eq!(kept["counts"]["census_retire_kept_overflow"], 0);
-        assert_eq!(kept["counts"]["census_missing_over_budget"], 0);
-
-        // The young filler takes the rest of the hash budget.
-        let census = prior.claude_request_census_mut_for_test();
-        let filler = census.record_for_test(&filler_key).unwrap().clone();
-        let room = (census.hash_headroom() + filler.request_hashes_for_test().len()) as u64;
-        let stored = census.insert_for_test(
-            &filler_key,
-            filler.with_request_hashes_for_test((1..=room).collect()),
-        );
-        assert_eq!(
-            stored,
-            crate::snapshots::claude_request_census::ClaudeRequestCensusInsert::Stored
-        );
-        assert_eq!(
-            census.hash_total_for_test(),
-            crate::snapshots::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_HASHES
-        );
-        // The next page loads the saved index from disk, as production does:
-        // nothing the terminal derived survives in memory.
-        let prior = c.reload(&mut prior);
-
-        // 2. and 3. The young holder grows by one request: the oldest kept
-        // record retires so its record fits whole.
-        append(&growing, &line(GROWING, "g2", second, 10));
-        let (grown, rows) = crate::local_resource_diagnostics::capture(|| {
-            ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false)
-        });
-        for stage in [
-            "claude_census_retire_kept_overlap",
-            "claude_census_retire_kept_overlap_alarm",
-        ] {
-            let admission = rows
-                .iter()
-                .filter(|row| {
-                    row["stage"] == stage
-                        && row["counts"]["census_retire_kept_overflow_admission"] != 0
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(admission.len(), 1, "{stage}");
-            assert_eq!(
-                admission[0]["counts"]["census_retire_kept_overflow_admission"],
-                1
-            );
-        }
-        let census = grown.index.claude_request_census_for_test();
-        let record = |key: &str| census.record_for_test(key).expect("a census record");
-        assert_ne!(
-            record(&growing_key).shape_for_test(),
-            crate::snapshots::claude_request_census::ClaudeRequestCensusShape::OverBudget,
-            "the growing holder is not tombstoned"
-        );
-        assert_eq!(record(&growing_key).request_hashes_for_test().len(), 2);
-        assert!(record(&growing_key).proves_scan());
-        assert_eq!(
-            record(&root_key).retired_for_test(),
-            Some(2),
-            "the oldest kept record"
-        );
-        assert!(census.record_for_test(&copy_key).is_some());
-        let prior = settle(&c, &prior, grown, &mut progress);
-
-        // 4. The copy is re-read on its own page with a second copied
-        // request: the holder proves both, nothing is restored.
-        append(&growing_copy, &line(GROWING_COPY, "g2", second, 10));
-        let reread = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        literal(&reread);
-        let found = body(&reread, GROWING_COPY).expect("the re-read copy publishes its body");
-        assert_eq!(
-            (found.request_count, found.removed_request_count),
-            (0, Some(2)),
-            "the stored holder still proves every copied request"
-        );
-        assert_eq!(
-            e2::pipeline_test_observer::disclosed(&reread.scan.snapshots),
-            0
-        );
-    });
-}
 
 /// PR C (c) and (d): the copy is read while its holder `LATE`, changed
 /// since its last read, is still queued by the traversal. `stale_record`:
@@ -5102,31 +3047,18 @@ fn e2_pipeline_copy_waits_for_a_queued_stale_holder() {
     copy_waits_for_queued_holder(true);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_copy_waits_for_a_queued_stale_holder() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    copy_waits_for_queued_holder(true);
-}
 #[test]
 fn e2_pipeline_copy_waits_for_a_queued_indexed_holder_without_a_census_record() {
     copy_waits_for_queued_holder(false);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_copy_waits_for_a_queued_indexed_holder_without_a_census_record() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    copy_waits_for_queued_holder(false);
-}
 
 /// Owner ruling 5 (Codex P1-2): a file whose every response conflicts keeps
 /// a zero-usage carrier that publishes its conflict disclosure through the
 /// literal, ACK and restart path, over an accepted prior body.
 fn conflict_only(subagent: bool) {
-    if crate::snapshots::ClaudeTerminalOffForTest::active() {
-        return terminal_off_on_conflict_only(subagent);
-    }
+
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-conflict-only-{subagent}"));
         let session = if subagent {
@@ -5181,82 +3113,18 @@ fn conflict_only(subagent: bool) {
     });
 }
 
-fn terminal_off_on_conflict_only(subagent: bool) {
-    with_e2(|| {
-        let mut c = Corpus::new(&format!("e2-pipeline-conflict-only-{subagent}"));
-        let session = if subagent {
-            format!("{ROOT}_agent-000")
-        } else {
-            ROOT.to_owned()
-        };
-        let a = line(ROOT, "conflict", AT, 2);
-        let b = a.replace("claude-haiku-4-5", "claude-sonnet-4-5");
-        let path = if subagent {
-            c.root(ROOT, &line(ROOT, "root-own", AT, 5));
-            c.agent(0, &a)
-        } else {
-            c.root(ROOT, &a)
-        };
-        let scanner = E2ScanFixture::default();
-        let mut progress = e2_progress();
-        let old = ScanIndex::default();
-        let accepted = ready(&c, &scanner, old.clone(), 100, false);
-        let prior_body = body(&accepted, &session).expect("accepted prior body");
-        assert_eq!(prior_body.request_count, 1);
-        let prior = settle(&c, &old, accepted, &mut progress);
-        // A later revision makes its only response a resolver conflict.
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap()
-            .write_all(b.as_bytes())
-            .unwrap();
-        let mut conflicted = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
-        let carrier = body(&conflicted, &session).expect("conflict-only file keeps a carrier");
-        assert!(crate::snapshots::claude_request_money::is_request_owned_literal(carrier));
-        assert_eq!(carrier.request_count, 0, "no invented tokens");
-        assert_eq!(
-            (carrier.input_tokens, carrier.output_tokens),
-            (0, 0),
-            "no invented tokens"
-        );
-        assert_eq!(carrier.resolver_conflict_count, Some(1));
-        conflicted.finish();
-        let bytes = canonical(&conflicted.scan.snapshots);
-        // A crash before the ACK: the restart reads the same committed state.
-        let mut restart = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        restart.finish();
-        assert_eq!(
-            canonical(&restart.scan.snapshots),
-            bytes,
-            "restart re-derives the same carrier bytes"
-        );
-        let (result, _, _) = restart.upload_context(&mut progress, ack);
-        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-    });
-}
+
 #[test]
 fn e2_pipeline_root_conflict_only_file_publishes_its_disclosure() {
     conflict_only(false);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_root_conflict_only_file_publishes_its_disclosure() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    conflict_only(false);
-}
 #[test]
 fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
     conflict_only(true);
 }
 
-#[test]
-fn terminal_off_on_e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    conflict_only(true);
-}
 
 // Shared helpers above remain the real scan/evidence/finish/upload callers.
 mod money_equivalence_tests {
@@ -5288,28 +3156,6 @@ fn e2_page_never_creates_p1_ledger_or_diagnostics() {
     });
 }
 
-#[test]
-fn terminal_off_on_e2_page_never_creates_p1_ledger_or_diagnostics() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    with_e2(|| {
-        let mut corpus = Corpus::new("e2-without-p1");
-        corpus.root(ROOT, &line(ROOT, "req-real", AT, 10));
-        corpus.evidence(&[api("req-real", 10, 100)], &[]);
-        let scanner = E2ScanFixture::default();
-        let mut page = corpus.raw(&scanner, ScanIndex::default(), 16, true, &[]);
-        page.enrich(&corpus);
-        page.finish();
-        literal(&page);
-        assert_eq!(total(&page), 1);
-        assert!(!corpus.support.join("claude-request-ledger").exists());
-        assert!(!corpus
-            .support
-            .join(".claude-request-money-run.json")
-            .exists());
-        assert!(!corpus.support.join("diagnostics").exists());
-    });
-}
 
 // The held-read regression needs the classification from BEFORE finish
 // removes withheld items, matching production settlement. Existing fixtures
@@ -5320,9 +3166,7 @@ fn settle_captured_holds(
     mut page: Page,
     progress: &mut SnapshotUploadProgress,
 ) -> ScanIndex {
-    if crate::snapshots::ClaudeTerminalOffForTest::active() {
-        return terminal_off_on_settle_captured_holds(c, committed, page, progress);
-    }
+
     let holds = page.finish();
     upload(&page.scan.snapshots, progress, ack).0.unwrap();
     let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
@@ -5330,18 +3174,7 @@ fn settle_captured_holds(
     c.reload(&mut settled.index)
 }
 
-fn terminal_off_on_settle_captured_holds(
-    c: &Corpus,
-    committed: &ScanIndex,
-    mut page: Page,
-    progress: &mut SnapshotUploadProgress,
-) -> ScanIndex {
-    let holds = page.finish();
-    page.upload_context(progress, ack).0.unwrap();
-    let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
-    settle_index_after_upload(&mut settled.index, committed, progress);
-    c.reload(&mut settled.index)
-}
+
 /// A census deadline withholds a NEW copy. Every walk re-decides the hold;
 /// a healthy external census releases it without any transcript change.
 fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss: u8) {
@@ -5455,26 +3288,12 @@ fn e2_pipeline_withheld_new_file_retries_external_evidence_unchanged() {
     withheld_new_file_retries_from_retained_read(false, false, 0);
 }
 
-#[test]
-#[ignore = "terminal-off ON-readiness: C1-clock"]
-fn terminal_off_on_e2_pipeline_withheld_new_file_retries_external_evidence_unchanged() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    withheld_new_file_retries_from_retained_read(false, false, 0);
-}
 
 #[test]
 fn e2_pipeline_withheld_new_file_retries_external_evidence_after_growth() {
     withheld_new_file_retries_from_retained_read(true, false, 0);
 }
 
-#[test]
-#[ignore = "terminal-off ON-readiness: C1-clock"]
-fn terminal_off_on_e2_pipeline_withheld_new_file_retries_external_evidence_after_growth() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    withheld_new_file_retries_from_retained_read(true, false, 0);
-}
 
 #[cfg(target_os = "macos")]
 #[test]
@@ -5482,14 +3301,6 @@ fn e2_pipeline_withheld_new_file_unchanged_acquisition_is_unchanged() {
     withheld_new_file_retries_from_retained_read(false, true, 0);
 }
 
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "terminal-off ON-readiness: C1-clock"]
-fn terminal_off_on_e2_pipeline_withheld_new_file_unchanged_acquisition_is_unchanged() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    withheld_new_file_retries_from_retained_read(false, true, 0);
-}
 
 #[cfg(target_os = "macos")]
 #[test]
@@ -5497,14 +3308,6 @@ fn e2_pipeline_withheld_new_file_growth_acquisition_is_tail() {
     withheld_new_file_retries_from_retained_read(true, true, 0);
 }
 
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "terminal-off ON-readiness: C1-clock"]
-fn terminal_off_on_e2_pipeline_withheld_new_file_growth_acquisition_is_tail() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    withheld_new_file_retries_from_retained_read(true, true, 0);
-}
 
 #[cfg(target_os = "macos")]
 #[test]
@@ -5514,16 +3317,6 @@ fn e2_pipeline_held_new_file_cache_clear_eviction_restart_read_full() {
     }
 }
 
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "terminal-off ON-readiness: C1-clock"]
-fn terminal_off_on_e2_pipeline_held_new_file_cache_clear_eviction_restart_read_full() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    for loss in 1..=3 {
-        withheld_new_file_retries_from_retained_read(false, true, loss);
-    }
-}
 
 #[test]
 fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
@@ -5532,15 +3325,6 @@ fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
     }
 }
 
-#[test]
-#[ignore = "terminal-off ON-readiness: C1-clock"]
-fn terminal_off_on_e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    for loss in 1..=3 {
-        withheld_new_file_retries_from_retained_read(false, false, loss);
-    }
-}
 
 #[test]
 fn terminal_off_unproven_cohort_uploads_full_tokens_and_cost_with_unknown_account() {

@@ -124,9 +124,7 @@ impl Family {
         census_complete: bool,
         window: &str,
     ) -> ClaudeUsageAuthorityDisposition {
-        if crate::snapshots::ClaudeTerminalOffForTest::active() {
-            return self.terminal_off_on_native_unit_page(items, census_complete, window);
-        }
+
         let api = ClaudeLocalOtelLoadReport {
             evidence: BTreeMap::from([(self.root_session_id.clone(), self.api_rows.clone())]),
             health: Default::default(),
@@ -324,209 +322,6 @@ impl Family {
         disposition
     }
 
-    fn terminal_off_on_native_unit_page(
-        &mut self,
-        items: &mut [SnapshotItem],
-        census_complete: bool,
-        window: &str,
-    ) -> ClaudeUsageAuthorityDisposition {
-        let api = ClaudeLocalOtelLoadReport {
-            evidence: BTreeMap::from([(self.root_session_id.clone(), self.api_rows.clone())]),
-            health: Default::default(),
-        };
-        let trace = ClaudeTraceOwnershipLoadReport {
-            evidence: BTreeMap::from([(self.root_session_id.clone(), self.trace_rows.clone())]),
-            ..Default::default()
-        };
-        // An empty real scan supplies only the typed result envelope. It does
-        // NOT supply native-read evidence, a traversal, eligibility or a grant.
-        let empty = self.state_dir.join("empty-container");
-        fs::create_dir_all(&empty).unwrap();
-        let mut scratch_index = ScanIndex::default();
-        let mut scan = scan_source_roots_with_test_limit(
-            SnapshotSource::ClaudeCode,
-            &[empty],
-            &mut scratch_index,
-            window,
-            365,
-            2,
-            false,
-        )
-        .unwrap();
-        scan.census_complete = census_complete;
-        scan.census_window_end = window.to_owned();
-        scan.snapshots = items.to_vec();
-        let previous = self.index.clone();
-        scan.pending_finalization = items
-            .iter()
-            .map(|item| {
-                let key = [&self.parent_key, &self.child_key]
-                    .into_iter()
-                    .find(|key| {
-                        claude_index_path_family_member(Path::new(key))
-                            .is_some_and(|(_, member)| member == item.source_session_id)
-                    })
-                    .expect("exact parsed member key");
-                let old = &previous.files[key];
-                PendingIndexFinalization {
-                    sampled_audit_verified: false,
-                    codex_pending_recovery: false,
-                    index_key: key.clone(),
-                    source_file_fingerprint: item
-                        .source_file_fingerprint
-                        .clone()
-                        .expect("controlled parsed revision"),
-                    previous_snapshot_fingerprint: old.last_snapshot_fingerprint.clone(),
-                    previous_upload_body_witness: old.last_upload_body_witness.clone(),
-                    parse_complete: true,
-                    diagnostic_reason: FileReason::Complete,
-                    parsed_snapshot_count: 1,
-                    effective_upload_body_witness_revision: 0,
-                }
-            })
-            .collect();
-        let mut lease = self.native_lifecycle.begin();
-        lease.bind("primitive-native-unit".to_owned());
-        let healthy = BTreeSet::from([self.root_session_id.clone()]);
-        let mut completion = claude_native_comparison::NativePhase::primitive_completion_for_test(
-            &scan,
-            &self.index,
-            claude_native_comparison::PairedRows {
-                api: &api.evidence,
-                trace: &trace.evidence,
-                healthy_roots: &healthy,
-            },
-            &mut lease,
-        );
-        // Original primitive current-files premise is unchanged. This is the
-        // actual single fold, with no synthetic Skip or forced permission.
-        let disposition = apply_claude_reported_usage_with_negative_dependencies(
-            &mut scan.snapshots,
-            &api,
-            &trace,
-            &mut self.index,
-            census_complete,
-            window,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-            None,
-            &BTreeSet::new(),
-            None,
-            Some(completion.fold_view(Some(&lease))),
-            &BTreeMap::new(),
-            true,
-        );
-        items.clone_from_slice(&scan.snapshots);
-        completion.capture_native_corrections(
-            &mut scan,
-            &previous,
-            &disposition,
-            snapshot_upload_body_witness,
-        );
-        // A held member's prior entry/body is untouched. Never classify it as
-        // empty or ACKed simply because its current body cannot be offered.
-        let held = &disposition.quarantined_source_session_ids;
-        let held_keys = scan
-            .snapshots
-            .iter()
-            .filter(|item| held.contains(&item.source_session_id))
-            .filter_map(|item| {
-                scan.pending_finalization
-                    .iter()
-                    .find(|pending| {
-                        claude_index_path_family_member(Path::new(&pending.index_key))
-                            .is_some_and(|(_, member)| member == item.source_session_id)
-                    })
-                    .map(|pending| pending.index_key.clone())
-            })
-            .collect::<BTreeSet<_>>();
-        disposition.retain_uploadable(&mut scan.snapshots);
-        scan.pending_finalization
-            .retain(|pending| !held_keys.contains(&pending.index_key));
-        for pending in &scan.pending_finalization {
-            let entry = self.index.files.get_mut(&pending.index_key).unwrap();
-            // Preserve a terminal proof's newly created rearm debt. Ordinary
-            // parse completion commits R only when the fold did not rearm it.
-            if !entry.source_file_fingerprint.is_empty() || !census_complete {
-                entry.source_file_fingerprint = pending.source_file_fingerprint.clone();
-            }
-            entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_owned());
-        }
-        finalize_scan_after_policy_with_body_witness(
-            SnapshotSource::ClaudeCode,
-            &mut scan,
-            &mut self.index,
-            snapshot_upload_body_witness,
-        );
-        let request = SnapshotBatchRequest {
-            schema_version: SNAPSHOT_SCHEMA_VERSION,
-            source: "claude_code".to_owned(),
-            machine_id: "otm_primitive_native_unit".to_owned(),
-            collector_version: None,
-            snapshots: scan.snapshots.clone(),
-            upload_policy: SnapshotUploadPolicy::default(),
-            client_report: crate::client_report::ClientReport::empty(),
-        };
-        let head_cas = request
-            .snapshots
-            .iter()
-            .any(|item| item.cache_observations.is_some());
-        let refs = request.snapshots.iter().map(|item| {
-            let version = crate::snapshot_client::snapshot_ack_body_witness_version(item).expect("production public ACK mapping");
-            serde_json::json!({"source_session_id":item.source_session_id,
-                "snapshot_fingerprint":item.snapshot_fingerprint,"occurrence_count":1,
-                "head_etag":head_cas.then(||snapshot_upload_body_witness(item)),
-                "body_witness_version":version,"body_witness_digest":version.map(|_|snapshot_upload_body_witness(item))})
-        }).collect::<Vec<_>>();
-        let response: crate::snapshot_client::SnapshotBatchResponse =
-            serde_json::from_value(serde_json::json!({
-                "accepted":request.snapshots.len(),"sessions_reconciled":request.snapshots.len(),
-                "session_ids":[],"disabled":false,"disabled_reason":null,
-                "entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":refs,
-                "unchanged_entities":[],"rejected_entities":[],"conflict_entities":[],
-            }))
-            .unwrap();
-        response
-            .validate_entity_ack(&request)
-            .expect("strict actual corrected-body ACK validator");
-        let acknowledgments = request
-            .snapshots
-            .iter()
-            .map(|item| {
-                (
-                    item.snapshot_fingerprint.clone(),
-                    snapshot_upload_body_witness(item),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        self.index
-            .record_accepted_snapshot_fingerprints(&acknowledgments.keys().cloned().collect());
-        self.index
-            .save(&self.state_dir.join("scan-index.json"))
-            .unwrap();
-        let fully_settled = disposition.quarantined_entity_count() == 0;
-        if fully_settled && lease.allowed() {
-            completion.note_native_corrections_after_save(&self.index, &previous, |fp, witness| {
-                Some(
-                    acknowledgments
-                        .get(fp)
-                        .is_some_and(|actual| actual == witness),
-                )
-            });
-        }
-        lease.note_selected_save(
-            fully_settled && claude_native_comparison::actual_native_conjunction(&disposition),
-        );
-        lease.stage_window_after_save(completion.window, &self.index, census_complete);
-        // Logical-page cleanliness is solely this primitive's real native fold
-        // and exact ACK/save. No physical traversal cleanliness is fabricated.
-        lease.finish(
-            fully_settled
-                && !disposition.duplicate_census.census_invalid
-                && !disposition.duplicate_census.fence_after,
-        );
-        disposition
-    }
 
     /// Persist and reload the index in the SAME process. A separate lifecycle
     /// restart control proves that disk state cannot restore a native receipt.
@@ -658,48 +453,6 @@ fn p12_family_fixtures_have_independent_checkpoint_custody() {
     second.reload();
 }
 
-/// Keep two fixtures alive together, including while one owns its checkpoint.
-/// The same-path controls reproduce the historical lock/CAS failures without
-/// depending on two threads observing the same wall-clock timestamp.
-#[test]
-fn terminal_off_on_p12_family_fixtures_have_independent_checkpoint_custody() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let mut first = Family::new();
-    let mut second = Family::new();
-    assert_ne!(first.dir, second.dir, "each family owns its transcripts");
-    assert_ne!(
-        first.state_dir, second.state_dir,
-        "each family owns its checkpoint directory"
-    );
-    first.reload();
-    second.reload();
-    let first_path = first.state_dir.join("scan-index.json");
-    let mut stale_index = first.index.clone();
-    {
-        let _owner = CheckpointLock::acquire(&first_path).expect("first fixture owns its lock");
-        let conflict = CheckpointLock::acquire(&first_path)
-            .err()
-            .expect("a shared checkpoint must refuse a second owner");
-        assert!(conflict
-            .to_string()
-            .contains("checkpoint is owned by another daemon"));
-        // This includes save, independent decode, and the production locked
-        // load. None may borrow the first fixture's custody or generation.
-        second.reload();
-    }
-    first.reload();
-    let conflict = stale_index
-        .save(&first_path)
-        .expect_err("a shared checkpoint must reject the stale generation");
-    assert!(conflict.to_string().contains("index changed concurrently"));
-    assert!(!second.index.files.contains_key(&first.parent_key));
-    assert!(!first.index.files.contains_key(&second.parent_key));
-    // One fixture's cleanup cannot remove another fixture's index/lock/files.
-    drop(first);
-    second.reload();
-}
 
 #[test]
 #[ignore = "P12: needs full qualified two-phase driver; original expectations preserved"]
@@ -787,93 +540,6 @@ fn member_change_after_unchanged_proof_fails_closed_until_family_reparse() {
         .contains_key(&root_session_id));
 }
 
-#[test]
-#[ignore = "P12: needs full qualified two-phase driver; original expectations preserved"]
-fn terminal_off_on_member_change_after_unchanged_proof_fails_closed_until_family_reparse() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let mut family = Family::new();
-    let first_witness = family.proven_and_corrected();
-    let parent_key = family.parent_key.clone();
-    let child_key = family.child_key.clone();
-    let mut child = family.child("2026-08-02T07:20:00Z", 2);
-    family.page(&mut child, true, "2026-08-02T07:20:00Z");
-    assert!(family.armed(&parent_key));
-
-    // Only the child grows. Its new request is reported, so the retained
-    // witness no longer reconstructs and the child is held, never downgraded.
-    let root_session_id = family.root_session_id.clone();
-    let appended = format!(
-        "{{\"timestamp\":\"2026-08-02T07:00:05Z\",\"type\":\"assistant\",\"sessionId\":\"{root_session_id}\",\"agentId\":\"{CHILD_AGENT}\",\"isSidechain\":true,\"requestId\":\"req_6\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":1}}}}}}\n"
-    );
-    let mut transcript = fs::read_to_string(&family.child_path).expect("read child transcript");
-    transcript.push_str(&appended);
-    fs::write(&family.child_path, transcript).expect("append child transcript");
-    family
-        .api_rows
-        .push(complete_api_row(&root_session_id, "req_6", 6, 10, 1, 0));
-    family
-        .trace_rows
-        .push(complete_trace_row(&root_session_id, "req_6", CHILD_AGENT));
-    let mut grown = family.child("2026-08-02T07:30:00Z", 3);
-    let disposition = family.page(&mut grown, false, "2026-08-02T07:30:00Z");
-    assert_eq!(grown[0].usage_accounting_contract, None);
-    assert_eq!(disposition.quarantined_entity_count(), 1);
-    let mut uploadable = grown;
-    disposition.retain_uploadable(&mut uploadable);
-    assert!(uploadable.is_empty(), "the demoting child body is held");
-
-    // The unchanged root was not parsed in this window, so the census cannot
-    // prove the family. Nothing is re-armed here; the bounded quarantine bound
-    // to the retained witness owns the family retry.
-    family.page(&mut [], true, "2026-08-02T07:30:00Z");
-    assert_eq!(family.witness(), first_witness);
-    assert!(family.armed(&parent_key));
-    let quarantine = family
-        .index
-        .claude_usage_authority_quarantine
-        .get(&root_session_id)
-        .expect("family is quarantined")
-        .clone();
-    assert_eq!(
-        quarantine.disposition,
-        ClaudeUsageAuthorityQuarantineDisposition::RetryPending
-    );
-    assert_eq!(
-        quarantine.proven_witness_fingerprint,
-        claude_usage_family_witness_fingerprint(&first_witness)
-    );
-    family.reload();
-
-    // The quarantine's family reparse observes every member in one window.
-    // Its census proves the changed witness and re-arms both members once.
-    let mut parent = family.parent("2026-08-02T07:40:00Z");
-    let mut grown = family.child("2026-08-02T07:40:00Z", 3);
-    parent.append(&mut grown);
-    let disposition = family.page(&mut parent, false, "2026-08-02T07:40:00Z");
-    assert_eq!(disposition.quarantined_entity_count(), 2);
-    family.page(&mut [], true, "2026-08-02T07:40:00Z");
-    assert_ne!(family.witness(), first_witness);
-    assert!(!family.armed(&parent_key));
-    assert!(!family.armed(&child_key));
-
-    // The re-armed members rebuild from the new witness with the grown usage,
-    // which resolves the quarantine.
-    let mut parent = family.parent("2026-08-02T07:50:00Z");
-    let mut grown = family.child("2026-08-02T07:50:00Z", 3);
-    parent.append(&mut grown);
-    let disposition = family.page(&mut parent, false, "2026-08-02T07:50:00Z");
-    assert_eq!(disposition.quarantined_entity_count(), 0);
-    assert!(parent
-        .iter()
-        .all(|item| item.usage_accounting_contract.as_deref() == REPORTED));
-    assert_eq!(parent[1].request_count, 2);
-    assert_eq!(parent[1].output_tokens, 2);
-    assert!(!family
-        .index
-        .claude_usage_authority_quarantine
-        .contains_key(&root_session_id));
-}
 
 fn observe_base_prelude(experimental_base_exit: bool) {
     let _scope = experimental_base_exit.then(envelope_selection_experiment::Scope::restart);
@@ -901,15 +567,7 @@ fn p12_member_change_base_control_reveals_unmet_original_prelude() {
     observe_base_prelude(false);
 }
 
-#[test]
-fn terminal_off_on_p12_member_change_base_control_reveals_unmet_original_prelude() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
-    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    observe_base_prelude(false);
-}
 #[test]
 fn p12_member_change_experiment_base_exit_reveals_unmet_original_prelude() {
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
@@ -917,15 +575,6 @@ fn p12_member_change_experiment_base_exit_reveals_unmet_original_prelude() {
     observe_base_prelude(true);
 }
 
-#[test]
-fn terminal_off_on_p12_member_change_experiment_base_exit_reveals_unmet_original_prelude() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    observe_base_prelude(true);
-}
 
 #[test]
 fn native_comparison_original_member_change_unit_oracle() {
@@ -937,20 +586,5 @@ fn native_comparison_original_member_change_unit_oracle() {
     }
     let _native = claude_native_comparison::enable_for_test();
     member_change_after_unchanged_proof_fails_closed_until_family_reparse();
-    writeln!(std::io::stderr().lock(), "native_comparison_original_member_change_unit: original_body_ran=true original_passed=true controlled_revision_unit=true physical_source_or_performance_proof=false strict_body_ACK_validator=true selected_save=true").unwrap();
-}
-
-#[test]
-fn terminal_off_on_native_comparison_original_member_change_unit_oracle() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    if !crate::heap_layout_bound::layout_supported() {
-        writeln!(std::io::stderr().lock(), "native_comparison_original_member_change_unit: supported_positive=UNEXECUTED original_body_ran=false original_passed=false").unwrap();
-        return;
-    }
-    let _native = claude_native_comparison::enable_for_test();
-    terminal_off_on_member_change_after_unchanged_proof_fails_closed_until_family_reparse();
     writeln!(std::io::stderr().lock(), "native_comparison_original_member_change_unit: original_body_ran=true original_passed=true controlled_revision_unit=true physical_source_or_performance_proof=false strict_body_ACK_validator=true selected_save=true").unwrap();
 }

@@ -40,8 +40,8 @@ impl ClaudeTerminalOffForTest {
         Self::set(true)
     }
     /// The thread's test policy, ignoring any completion-path override.
-    /// Shared fixtures use it to keep main's helper at the default OFF and
-    /// give `terminal_off_on_*` twins the containment version.
+    /// Retained feature fixtures use it to select their containment setup;
+    /// main tests keep the original helper at the default OFF.
     pub(crate) fn active() -> bool {
         ENABLED.with(std::cell::Cell::get)
     }
