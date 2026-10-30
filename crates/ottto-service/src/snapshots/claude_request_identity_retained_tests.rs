@@ -908,7 +908,7 @@ fn retained_gate_off_listing_keeps_state_bytes_and_drops_stale_proof() {
     off.record(&body);
     let before = serde_json::to_vec(&off).unwrap();
     let hour_zero = first.usage_buckets[0].bucket_start.clone();
-    off.record_proved(&body, false, &[hour_zero.clone()]);
+    off.record_proved(&body, false, std::slice::from_ref(&hour_zero));
     assert_eq!(serde_json::to_vec(&off).unwrap(), before);
     off.clear_retained();
     assert_eq!(serde_json::to_vec(&off).unwrap(), before);
