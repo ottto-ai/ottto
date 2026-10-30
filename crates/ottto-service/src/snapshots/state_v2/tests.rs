@@ -1586,3 +1586,35 @@ fn failed_idle_purge_recovers_before_collection_even_inside_the_deadline() {
         0
     );
 }
+
+#[test]
+fn serial_scan_propagates_maintenance_refusal_without_consuming_custody() {
+    let mut index = ScanIndex {
+        generation: 17,
+        ..Default::default()
+    };
+    index
+        .confirmed_empty_files
+        .insert("synthetic-private-path".into());
+    let route = std::sync::Arc::new(Runtime {
+        active: true,
+        session: std::sync::Mutex::new(None),
+    });
+    index.persistence_v2 = Some(route.clone());
+    let before = serde_json::to_vec(&index).unwrap();
+    let result = super::super::scan_source_roots_with_test_limit(
+        super::super::SnapshotSource::ClaudeCode,
+        &[],
+        &mut index,
+        "2026-10-30T12:00:00Z",
+        30,
+        10,
+        false,
+    );
+    assert!(result.is_err());
+    assert_eq!(before, serde_json::to_vec(&index).unwrap());
+    assert!(std::sync::Arc::ptr_eq(
+        index.persistence_v2.as_ref().unwrap(),
+        &route
+    ));
+}

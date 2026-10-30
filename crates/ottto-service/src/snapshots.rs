@@ -26058,6 +26058,7 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
     context_curve_enabled: bool,
 ) -> Result<SourceScanResult> {
     index.require_persistence_available()?;
+    state_v2::before_collection(index)?;
 
     let mut state = OwnedSourceScan::new(
         source,
@@ -26073,6 +26074,12 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         context_curve_enabled,
     );
     loop {
+        // A refusal is terminal for this attempt, not cooperative progress.
+        // Restore the resident graph before returning through the Result API.
+        if let Err(error) = state_v2::before_collection(&state.index) {
+            *index = state.index;
+            return Err(error);
+        }
         match state.step(attribution_context) {
             OwnedSourceScanStep::Pending(next) => state = next,
             OwnedSourceScanStep::Complete {
@@ -27549,9 +27556,6 @@ impl OwnedSourceScan {
         self,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
     ) -> OwnedSourceScanStep {
-        if state_v2::before_collection(&self.index).is_err() {
-            return OwnedSourceScanStep::Pending(self);
-        }
         self.step_with_capture_credit(attribution_context, None)
             .expect("ordinary serial collection has no paid target retention")
     }
