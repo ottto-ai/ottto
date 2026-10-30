@@ -359,7 +359,7 @@ fn seed_predecessor(fixture: &Fixture, cache: &Arc<SharedCache>) -> ScanIndex {
     ));
     let bound = cache.inner.lock().unwrap().resident_bound();
     if crate::heap_layout_bound::layout_supported() {
-        assert!(bound.unwrap() <= STATE_BYTES);
+        assert!(bound.unwrap() <= state_bytes());
     } else {
         assert!(
             bound.is_none(),
@@ -944,8 +944,11 @@ mod durable_restart {
         state.begin(&first);
         let prior = seed_predecessor(f, &first);
         first.durable_write_after_save(state.lock, SOURCE, &prior);
-        let expected = usize::from(crate::heap_layout_bound::layout_supported());
-        assert_eq!(state.store_records(), expected);
+        assert_eq!(
+            state.store_records(),
+            usize::from(crate::heap_layout_bound::layout_supported()),
+            "native persistence requires this binary's supported restore layout"
+        );
         prior
     }
 
@@ -1025,6 +1028,7 @@ mod durable_restart {
     /// key's older record is invalidated, and a restart reads Full.
     #[test]
     fn a_held_reverted_selection_is_never_written_and_invalidates_the_old_record() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1058,6 +1062,7 @@ mod durable_restart {
     /// reads Full.
     #[test]
     fn a_cleared_fingerprint_never_restores_or_writes() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1098,10 +1103,13 @@ mod durable_restart {
             .into_test_option()
             .is_none());
         let (counters, store) = fresh.durable_counters(SOURCE).unwrap();
-        assert_eq!(counters.ineligible.get("selection_cleared"), Some(&1));
+        // #865 selection-clear permits acquisition proof; it is no longer an
+        // early refusal. Unsupported layouts wrote no predecessor at all.
+        assert!(!counters.ineligible.contains_key("selection_cleared"));
+        let present = u64::from(crate::heap_layout_bound::layout_supported());
         assert_eq!(
             (counters.missing, store.records_read, counters.restored),
-            (0, 0, 0)
+            (1 - present, present, 0)
         );
         second.durable_write_after_save(state.lock, SOURCE, &settled);
         assert_selection_refused(&second, &state);
@@ -1114,6 +1122,7 @@ mod durable_restart {
     /// invalidated and a restart reads Full.
     #[test]
     fn a_reduction_ahead_of_the_saved_selection_is_never_written() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1129,6 +1138,9 @@ mod durable_restart {
         f.append_transcript(2);
         f.evidence(3);
         state.begin(&second);
+        // Round4 approved absent-upgrade growth pacing. This row requires a
+        // second acquisition (ahead of the saved selection), not a paced hold.
+        crate::snapshots::sampled_scan::durable_tail::tests::expire_full_pace(&second, &key);
         let ahead = raw_scan(&f, first_pass.index.clone(), Some(second.clone()), |_| {});
         assert_ne!(
             ahead.index.files[&key].source_file_fingerprint,
@@ -1145,6 +1157,7 @@ mod durable_restart {
     /// mismatch, and the tailed body keeps the prefix's marker.
     #[test]
     fn a_constant_capture_restart_reads_no_full() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         capture_marked(&f);
         let state = State::new(&f);
@@ -1166,6 +1179,7 @@ mod durable_restart {
 
     #[test]
     fn restart_restores_then_tails_and_matches_cold_full() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1224,6 +1238,7 @@ mod durable_restart {
 
     #[test]
     fn e2_restart_tail_and_quiet_late_sidecar_match_cold_full_emitted_body() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let _gate = claude_request_money::e2::GateForTest::set(true);
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
             for append_native in [true, false] {
@@ -1315,6 +1330,7 @@ mod durable_restart {
 
     #[test]
     fn restart_after_a_metadata_only_touch_restores_unchanged() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(2);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1338,6 +1354,7 @@ mod durable_restart {
 
     #[test]
     fn an_index_from_another_context_never_restores() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
