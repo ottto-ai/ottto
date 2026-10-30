@@ -2208,9 +2208,8 @@ fn skipped_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> + '_ {
 /// modes; dark only counts. Returns the removals to store (gate on only):
 /// the caller applies them to the index (`CopyRemovalUpdates::apply`).
 /// `accepted`, this cycle's #909 accepted-share hints, keeps accepted usage
-/// where the server holds it (gate on, Lead B F2/F3): a marker re-derivation
-/// never re-tags an accepted row, and a prefix hold over accepted buckets
-/// defers the whole session instead of a shrunken revision.
+/// where the server holds it (gate on, Lead B F3): a prefix hold over
+/// accepted buckets defers the whole session instead of a shrunken revision.
 pub(crate) fn decide_page_copies(
     items: &mut [SnapshotItem],
     index: &ScanIndex,
@@ -2276,7 +2275,7 @@ pub(crate) fn decide_page_copies(
     }
     if enabled() {
         for at in holders {
-            finish_holder_identity(&mut items[at], accepted);
+            finish_holder_identity(&mut items[at]);
         }
         for item in items.iter_mut() {
             tally_unproven_prefix(item, index.claude_copy_removals.metadata_lost());
@@ -2287,12 +2286,11 @@ pub(crate) fn decide_page_copies(
 
 /// Apply the money decision to the existing native account policy before
 /// telemetry attachment. Only the decided skipped marker positions disappear.
-fn finish_holder_identity(item: &mut SnapshotItem, accepted: Option<&AcceptedBuckets>) {
+fn finish_holder_identity(item: &mut SnapshotItem) {
     let SnapshotItem {
         claude_money: Some(fold),
         claude_org_markers,
         claude_usage_occurrences,
-        source_session_id,
         ..
     } = item
     else {
@@ -2309,35 +2307,14 @@ fn finish_holder_identity(item: &mut SnapshotItem, accepted: Option<&AcceptedBuc
         .min();
     let mut rebuilt =
         accounts.after_copy_decision(claude_org_markers.as_deref(), &fold.skipped, first_retained);
-    // Lead B F2: a re-derived account on a row a stored-body ACK froze would
-    // untag it with a refusal, and the server then falls back to the parent's
-    // starting binding (B31). Such a session keeps the released marker policy
-    // (the identity the server already holds); its accepted rows stay tagged.
-    // A session the ledger does not know (never ACKed, or evicted past
-    // #909's window) is re-derived: its changed rows are counted as an upper
-    // bound of rows a stored body may hold under the released identity.
-    if let Some(own) = rebuilt.as_ref() {
-        let session = source_session_id.as_str();
-        let changed = claude_usage_occurrences
+    // SOURCE 2026-10-31 (#944 xPR F5): identity a copied marker lent to a
+    // counted request is invalidated where a stored body froze it, so the
+    // identity pass learns which sessions this re-derivation changed.
+    if let Some(own) = rebuilt.as_mut() {
+        own.copied_marker_authority = claude_usage_occurrences
             .values()
             .filter(|o| !fold.is_skipped(o.sequence) && !o.usage.is_zero())
-            .filter(|o| accounts.account(o.sequence) != own.account(o.sequence))
-            .filter_map(|o| fold.occurrence_key(o))
-            .collect::<BTreeSet<_>>();
-        let known = accepted.filter(|accepted| accepted.get(session).is_some());
-        let kept = changed
-            .iter()
-            .filter(|key| known.is_some_and(|accepted| accepted.may_have_accepted(session, &key.0)))
-            .count() as u64;
-        if kept > 0 {
-            diag("copy_prefix_accepted_authority_kept", kept);
-            record_counts(Counts::one(24, kept));
-            rebuilt = None;
-        } else if known.is_none() && !changed.is_empty() {
-            let changed = changed.len() as u64;
-            diag("copy_prefix_authority_changed_untracked", changed);
-            record_counts(Counts::one(27, changed));
-        }
+            .any(|o| accounts.account(o.sequence) != own.account(o.sequence));
     }
     if let Some(own) = rebuilt.as_ref() {
         // Restored identified prefix grains were placed with the original
@@ -2841,7 +2818,7 @@ fn decide_holders(
             .count() as u64;
         if absent_kept > 0 {
             diag("copy_removal_holder_absent_kept", absent_kept);
-            record_counts(Counts::one(26, absent_kept));
+            record_counts(Counts::one(25, absent_kept));
         }
         if let Some(state) = updates.state.as_mut() {
             let groups = stored_groups(index, &live, wanted.covered, wanted.order.1);
@@ -3049,7 +3026,7 @@ fn defer_prefix(
         fold.entity.held = true;
         if accepted_prefix {
             diag("copy_prefix_accepted_session_holds", 1);
-            record_counts(Counts::one(25, 1));
+            record_counts(Counts::one(24, 1));
         }
         // Whole-body undecided counters are otherwise suppressed at finish;
         // the held prefix must still be visible in production diagnostics.
@@ -4330,18 +4307,13 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     "copy_prefix_removed_cost_micros",
     "copy_prefix_own_requests",
     "copy_prefix_families_corrected",
-    // Copy-prefix ENABLE readiness (Lead B F2/F3/F5): #909-accepted rows
-    // kept on their released marker identity, sessions whose held prefix
-    // has accepted buckets deferred whole, and stored removals kept while
-    // their holder is no longer indexed.
-    "copy_prefix_accepted_authority_kept",
+    // Copy-prefix ENABLE readiness (Lead B F3/F5): sessions whose held
+    // prefix has accepted buckets deferred whole, and stored removals kept
+    // while their holder is no longer indexed.
     "copy_prefix_accepted_session_holds",
     "copy_removal_holder_absent_kept",
-    // Rows whose account that re-derivation changes in a session the #909
-    // ledger does not know: an upper bound of unprotected re-tags (F2 reach).
-    "copy_prefix_authority_changed_untracked",
 ];
-const COUNT_LEN: usize = 28;
+const COUNT_LEN: usize = 26;
 static COUNTS: [AtomicU64; COUNT_LEN] = [const { AtomicU64::new(0) }; COUNT_LEN];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(

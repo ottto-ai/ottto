@@ -193,13 +193,14 @@ impl Page {
     fn enrich(&mut self, corpus: &Corpus) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
         self.enrich_with(corpus, None)
     }
-    /// `enrich` with this cycle's #909 accepted-share hints, as production passes them.
+    /// `enrich` with this cycle's #909 accepted-share hints, which it then
+    /// updates as the sync loop does before any upload.
     fn enrich_with(
         &mut self,
         corpus: &Corpus,
-        accepted: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
+        mut accepted: Option<&mut crate::snapshots::claude_request_identity::AcceptedBuckets>,
     ) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
-        let ((mut disposition, _, _), released) =
+        let ((mut disposition, _, stats), released) =
             e2::pipeline_test_observer::capture_released(|| {
                 try_apply_claude_local_evidence_to_scan_with_comparison(
                     &corpus.support,
@@ -209,11 +210,14 @@ impl Page {
                     None,
                     None,
                     Some((&self.cache, &self.committed)),
-                    accepted,
+                    accepted.as_deref(),
                     None,
                 )
                 .unwrap()
             });
+        if let Some(accepted) = accepted.as_deref_mut() {
+            accepted.invalidate_copy_derived(&stats.copy_invalidated);
+        }
         self.released = released;
         self.index
             .veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut self.scan.snapshots);
@@ -3213,7 +3217,7 @@ fn e2_pipeline_resumed_switch_off_matches_pre_change_builder_demo_family() {
                 let mut ledger = crate::snapshots::claude_request_identity::AcceptedBuckets::for_test();
                 ledger.record(&serde_json::to_value(body(&actual, session).unwrap()).unwrap());
                 let mut with_ledger = c.raw(&E2ScanFixture::capturing_identity(), current.clone(), 100, sampled, &[]);
-                with_ledger.enrich_with(&c, Some(&ledger));
+                with_ledger.enrich_with(&c, Some(&mut ledger));
                 assert_eq!(canonical(&with_ledger.scan.snapshots), canonical(&actual.scan.snapshots));
                 actual.finish();
                 expected.finish();
@@ -3890,52 +3894,97 @@ fn org_shares(item: &SnapshotItem) -> BTreeMap<String, u64> {
     shares
 }
 
-/// Lead B F2: switch OFF stored a resumed file whose own turn inherited an
-/// org from its copied prefix marker, and #909 froze that share. Switch ON
-/// proves the prefix a copy: the accepted own turn keeps the org (never an
-/// untag + refusal the server would move to the starting binding), counted.
-/// A session no stored-body ACK froze gets the ON identity.
+/// [money] SOURCE 2026-10-31 (#944 xPR F5) fixtures 1-3 and 5, in #909 and
+/// option (ii) modes. Switch OFF froze an own turn's org a copied prefix
+/// marker lent (X). Switch ON tombstones that row once, counted, and sends it
+/// untagged with no refusal or marker (today's attribution), while a later
+/// row its own marker proves (B) keeps its accepted identity. A later own
+/// marker in the invalidated row tags it fresh. Money never changes.
 #[test]
-fn e2_pipeline_switch_on_keeps_an_accepted_own_turn_on_its_copied_marker_org() {
-    with_e2(|| {
-        use crate::snapshots::claude_request_identity::{take_identity_counts, AcceptedBuckets};
-        let mut c = Corpus::new("e2-pipeline-copy-accepted-authority");
-        let scanner = E2ScanFixture::capturing_identity();
-        c.root(ROOT, &resumed(ROOT, &[A]));
-        let old = ScanIndex::default();
-        let page = ready(&c, &scanner, old.clone(), 100, false);
-        let prior = settle(&c, &old, page, &mut e2_progress());
-        let org = "11111111-1111-4111-8111-111111111111";
-        let marker = json!({"type":"attachment", "sessionId":COPY,
-            "attachment":{"type":"credential_org","organizationUuid":org}}).to_string() + "\n";
-        c.write_at(&file(COPY), &(marker + &resumed(COPY, &[A, C])), "2026-08-02T07:03:00Z");
-        let org = ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap();
-        let off = {
-            let _off = e2::ResumedPrefixForTest::set(false);
-            ready(&c, &scanner, prior.clone(), 100, false)
-        };
-        let stored = body(&off, COPY).unwrap();
-        assert_eq!((stored.request_count, org_shares(stored).get(&org).copied()), (2, Some(2)));
-        let mut accepted = AcceptedBuckets::for_test();
-        accepted.record(&serde_json::to_value(stored).unwrap());
-        assert!(accepted.may_have_accepted(COPY, &stored.usage_buckets[0].bucket_start));
-        for (ledger, kept) in [(AcceptedBuckets::for_test(), false), (accepted, true)] {
-            let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
-            e2::take_diag();
-            take_identity_counts();
-            page.enrich_with(&c, Some(&ledger));
-            let copy = body(&page, COPY).expect("the own turn publishes");
-            assert_eq!((copy.request_count, copy.removed_request_count), (1, Some(1)));
-            assert_eq!(org_shares(copy).get(&org).copied().unwrap_or(0), u64::from(kept));
-            let counts = serde_json::to_value(take_identity_counts()).unwrap();
-            assert_eq!(counts["identity_cap"]["accepted_share_changed"], json!(0));
-            assert_eq!(
-                copy_diag(&["copy_prefix_accepted_authority_kept",
-                    "copy_prefix_authority_changed_untracked"]),
-                [u64::from(kept), u64::from(!kept)]
-            );
-        }
-    });
+fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
+    for retained in [false, true] {
+        with_e2(|| {
+            use crate::snapshots::claude_request_identity::{take_identity_counts, AcceptedBuckets};
+            let mut c = Corpus::new("e2-pipeline-copy-derived-identity");
+            let scanner = E2ScanFixture::capturing_identity();
+            c.root(ROOT, &resumed(ROOT, &[A]));
+            let old = ScanIndex::default();
+            let page = ready(&c, &scanner, old.clone(), 100, false);
+            let prior = settle(&c, &old, page, &mut e2_progress());
+            let [x, b] = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"];
+            let marker = |org: &str| json!({"type":"attachment", "sessionId":COPY,
+                "attachment":{"type":"credential_org","organizationUuid":org}}).to_string() + "\n";
+            let switched = |org: &str| json!({"type":"attachment", "sessionId":COPY,
+                "attachment":{"type":"session_context", "context":{}}}).to_string() + "\n" + &marker(org);
+            let mut text = marker(x) + &resumed(COPY, &[A, C]) + &switched(b)
+                + &line_by(COPY, "own", "2026-08-02T08:10:00Z", 10, RESUME_WRITER);
+            c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
+            let [x, b] = [x, b].map(|org| ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap());
+            let off = {
+                let _off = e2::ResumedPrefixForTest::set(false);
+                ready(&c, &scanner, prior.clone(), 100, false)
+            };
+            let stored = body(&off, COPY).unwrap();
+            assert_eq!([&x, &b].map(|org| org_shares(stored).get(org).copied()), [Some(2), Some(1)]);
+            let mut ledger = AcceptedBuckets::for_test();
+            ledger.set_retained_enabled(retained);
+            let ack = |ledger: &mut AcceptedBuckets, item: &SnapshotItem| {
+                let value = serde_json::to_value(item).unwrap();
+                ledger.record(&value);
+                if retained {
+                    ledger.record_proved(&value, true, &[]);
+                }
+            };
+            ack(&mut ledger, stored);
+            // The 07:00 row X lent, the 08:00 row B proves, and money per row.
+            let rows = |item: &SnapshotItem| item.usage_buckets.iter()
+                .map(|bucket| {
+                    let row = &bucket.model_usage[0];
+                    let tagged = row.evidence_ref.is_some() || row.identity_parts.is_some();
+                    (bucket.bucket_start.clone(), row.request_count, row.input_tokens,
+                        row.cost_usd.clone(), tagged, row.identity_retained)
+                })
+                .collect::<Vec<_>>();
+            let today = {
+                let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
+                page.enrich_with(&c, Some(&mut AcceptedBuckets::for_test()));
+                rows(body(&page, COPY).unwrap())
+            };
+            assert_eq!(today.iter().map(|row| row.4).collect::<Vec<_>>(), [false, true]);
+            let pass = |c: &Corpus, ledger: &mut AcceptedBuckets| {
+                let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
+                take_identity_counts();
+                page.enrich_with(c, Some(ledger));
+                let copy = body(&page, COPY).expect("the own turns publish").clone();
+                let counts = serde_json::to_value(take_identity_counts()).unwrap();
+                assert_eq!(copy.request_identity_refusals, 0, "never a refusal");
+                assert_eq!(counts["identity_cap"]["accepted_share_changed"], json!(0));
+                let invalidated = counts["identity_cap"]["copy_derived_proof_invalidated"].as_u64();
+                (copy, invalidated.unwrap_or(0))
+            };
+            for once in [1, 0] {
+                let (copy, invalidated) = pass(&c, &mut ledger);
+                assert_eq!(invalidated, once, "one tombstone per copy-derived row");
+                let got = rows(&copy);
+                assert_eq!(got[0], today[0], "the X row moves to today's attribution");
+                assert_eq!((&got[1].0, got[1].1, got[1].2, &got[1].3),
+                    (&today[1].0, today[1].1, today[1].2, &today[1].3));
+                assert!(got[1].4 || got[1].5, "the row B proves keeps its accepted identity");
+                assert_eq!(org_shares(&copy).get(&x), None);
+            }
+            // The invalidated row reads as never accepted: own evidence tags it fresh.
+            let (copy, _) = pass(&c, &mut ledger);
+            ack(&mut ledger, &copy);
+            text += &switched(b);
+            text += &line_by(COPY, "own-early", "2026-08-02T07:05:00Z", 10, RESUME_WRITER);
+            c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
+            let (copy, invalidated) = pass(&c, &mut ledger);
+            assert_eq!(invalidated, 0);
+            let row = &copy.usage_buckets[0].model_usage[0];
+            assert!(!row.identity_retained && row.identity_parts.is_some(), "fresh own tags");
+            assert_eq!(org_shares(&copy).get(&x), None);
+        });
+    }
 }
 
 /// Lead B F3: a prefix hold over buckets #909 accepted defers the whole
@@ -3969,7 +4018,7 @@ fn e2_pipeline_prefix_hold_over_accepted_buckets_defers_the_whole_session() {
                 let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
                 e2::take_diag();
                 crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
-                    page.enrich_with(&c, Some(&ledger));
+                    page.enrich_with(&c, Some(&mut ledger));
                 });
                 if pass == 3 {
                     let copy = body(&page, COPY).expect("the bound expires flagged");

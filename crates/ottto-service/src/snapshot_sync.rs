@@ -7370,7 +7370,7 @@ fn finish_sync_source(
             Some(&upload_progress.accepted_identity_buckets),
             Some(&reserve_cache_bytes),
         );
-        let (disposition, census_withheld, stats) = match applied {
+        let (disposition, census_withheld, mut stats) = match applied {
             Ok(applied) => applied,
             Err(reason) => {
                 if let Some(lease) = native_comparison_lease.as_mut() {
@@ -7382,6 +7382,11 @@ fn finish_sync_source(
                 return Err(reason.into());
             }
         };
+        // SOURCE 2026-10-31 (#944 xPR F5): the bodies just built treat these
+        // rows as never accepted; the ledger records that before any upload.
+        upload_progress
+            .accepted_identity_buckets
+            .invalidate_copy_derived(&std::mem::take(&mut stats.copy_invalidated));
         #[cfg(test)]
         tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::record_evidence_stats(&stats);
         if let Ok(counts) = serde_json::to_string(&stats) {
@@ -8908,6 +8913,9 @@ fn claude_evidence_root_session_ids(snapshots: &[SnapshotItem]) -> Vec<String> {
 /// from the sync loop's ownership, completeness, and quarantine semantics.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ClaudeLocalEvidenceStats {
+    /// Copy-derived accepted rows for the ledger to tombstone (local only).
+    #[serde(skip)]
+    pub(crate) copy_invalidated: Vec<crate::snapshots::claude_request_identity::CopyInvalidation>,
     pub requested_session_count: usize,
     pub candidate_root_count: usize,
     pub paired_sidecar_root_count: usize,
@@ -9721,6 +9729,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 std::mem::take(&mut disposition.request_groupings),
                 &ownership,
             );
+        stats.copy_invalidated = evidence.take_copy_invalidated();
         if let Some(activity) = request_owned_activity {
             crate::snapshots::claude_request_identity::publish_request_owned_activity(
                 &scan_result.snapshots,

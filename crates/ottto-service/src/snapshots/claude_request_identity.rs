@@ -1406,6 +1406,72 @@ fn defer_retained_rows(
     deferred
 }
 
+/// The frozen share set of a row whose current tagged shares differ from it.
+fn changed_shares(
+    accepted: &accepted::AcceptedSession,
+    start: i64,
+    row: &RowKey,
+    group: &RowGroup,
+) -> Option<BTreeSet<Option<[u8; 32]>>> {
+    let prior = accepted.row_shares(start, row);
+    // Only a row frozen with tagged proof can constrain later proof.
+    // New rows and rows previously ACKed untagged remain admissible.
+    if prior.is_empty() {
+        return None;
+    }
+    let current = group
+        .by_key
+        .iter()
+        .filter(|(_, amount)| amount.counts != [0; 8])
+        .map(|(key, _)| key.as_ref().map(|key| accepted.authority_hash(key)))
+        .collect::<BTreeSet<_>>();
+    // Resolving an untagged share to the same surviving tagged set is
+    // new proof, not a retag. Missing prior tagged keys still count changed.
+    let resolved_missing = prior.contains(&None)
+        && current == prior.iter().filter(|key| key.is_some()).copied().collect();
+    (current != prior && !resolved_missing).then_some(prior)
+}
+
+/// One copy-derived accepted row the identity pass treated as never
+/// accepted; the caller tombstones it in the durable ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CopyInvalidation {
+    session: String,
+    bucket: i64,
+    row: RowKey,
+}
+
+/// SOURCE 2026-10-31 (#944 xPR F5): proof a copied marker lent must not keep
+/// placing. In a session whose accounts the copy-prefix switch re-derived
+/// without a copied marker, a frozen row whose shares now change is
+/// copy-derived: it is treated as never accepted (fresh own tags or untagged,
+/// never a refusal or marker). A row its own evidence still proves matches
+/// its frozen shares and keeps #909/option (ii) protection.
+fn copy_derived_rows(
+    item: &SnapshotItem,
+    grouping: &Grouping,
+    accepted: Option<&accepted::AcceptedSession>,
+) -> Vec<(i64, RowKey)> {
+    let copied = item
+        .claude_money
+        .as_deref()
+        .and_then(|fold| fold.accounts.as_deref())
+        .is_some_and(|accounts| accounts.copied_marker_authority);
+    let Some(accepted) = accepted.filter(|_| copied) else {
+        return Vec::new();
+    };
+    grouping
+        .groups
+        .iter()
+        .filter_map(|(bucket, rows)| Some((accepted::bucket_key(bucket)?, rows)))
+        .flat_map(|(start, rows)| {
+            rows.iter()
+                .filter(move |(row, group)| changed_shares(accepted, start, row, group).is_some())
+                .map(move |(row, _)| (start, row.clone()))
+        })
+        .collect()
+}
+
 fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::AcceptedSession>) {
     let Some(accepted) = accepted else {
         return;
@@ -1421,26 +1487,9 @@ fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::
         // the gate (no money or tagging change).
         grouping.accepted_rows_vanished += accepted.vanished_rows(start, rows.keys());
         for (row, group) in rows {
-            let prior = accepted.row_shares(start, row);
-            let current = group
-                .by_key
-                .iter()
-                .filter(|(_, amount)| amount.counts != [0; 8])
-                .map(|(key, _)| key.as_ref().map(|key| accepted.authority_hash(key)))
-                .collect::<BTreeSet<_>>();
-            // Only a row frozen with tagged proof can constrain later proof.
-            // New rows and rows previously ACKed untagged remain admissible.
-            if prior.is_empty() {
+            let Some(prior) = changed_shares(accepted, start, row, group) else {
                 continue;
-            }
-            // Resolving an untagged share to the same surviving tagged set is
-            // new proof, not a retag. Missing prior tagged keys still count changed.
-            let resolved_missing = prior.contains(&None)
-                && current == prior.iter().filter(|key| key.is_some()).copied().collect();
-            let changed = current != prior && !resolved_missing;
-            if !changed {
-                continue;
-            }
+            };
             grouping.accepted_share_changed.insert(bucket.clone());
             let mut kept = BTreeMap::<Option<AuthorityKey>, Amounts>::new();
             for (key, amount) in std::mem::take(&mut group.by_key) {
@@ -2566,9 +2615,12 @@ pub(crate) struct RequestAccounts {
     reconciled: bool,
     /// Root start known, but the native Unknown grains are not filled yet.
     root_fallback_pending: bool,
+    /// Copy-prefix switch on: the copy decision removed a copied marker that
+    /// had lent an account to a counted request (see `copy_derived_rows`).
+    pub(crate) copied_marker_authority: bool,
 }
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
-crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending);
+crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, copied_marker_authority);
 
 /// One account policy for E2. Never use a later marker for an earlier request.
 /// A conflict fills missing shares; trusted own/earlier org runs stay intact.
@@ -3566,6 +3618,8 @@ pub(crate) struct ScanEvidence<'a> {
     native_originals: Option<&'a BTreeMap<String, super::SessionAccountEvidence>>,
     accepted_buckets: Option<&'a AcceptedBuckets>,
     wire_size_reservation: Option<&'a dyn Fn(&SnapshotItem) -> usize>,
+    /// Copy-derived rows this pass's bodies treat as never accepted.
+    copy_invalidated: std::cell::RefCell<Vec<CopyInvalidation>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -3632,6 +3686,11 @@ impl<'a> ScanEvidence<'a> {
     pub(crate) fn with_accepted_buckets(mut self, accepted: Option<&'a AcceptedBuckets>) -> Self {
         self.accepted_buckets = accepted;
         self
+    }
+
+    /// The rows the ledger must tombstone (`AcceptedBuckets::invalidate_copy_derived`).
+    pub(crate) fn take_copy_invalidated(&self) -> Vec<CopyInvalidation> {
+        self.copy_invalidated.take()
     }
 
     pub(crate) fn with_wire_size_reservation(
@@ -4891,13 +4950,35 @@ fn tag_item(
             .wire_size_reservation
             .map_or(0, |reserve| reserve(item));
         grouping.accepted_miss = miss;
-        let tagged = apply_grouped_with_accepted(item, grouping, accepted, retained);
+        let copy_derived = copy_derived_rows(item, &grouping, accepted);
+        let invalidated = accepted
+            .filter(|_| !copy_derived.is_empty())
+            .map(|accepted| accepted.invalidated(&copy_derived));
+        let tagged = apply_grouped_with_accepted(
+            item,
+            grouping,
+            invalidated.as_ref().or(accepted),
+            retained,
+        );
         if tagged.is_err() {
             (
                 item.source_started_at,
                 item.source_ended_at,
                 item.source_last_activity_at,
             ) = lifecycle;
+        } else {
+            evidence
+                .copy_invalidated
+                .borrow_mut()
+                .extend(
+                    copy_derived
+                        .into_iter()
+                        .map(|(bucket, row)| CopyInvalidation {
+                            session: item.source_session_id.clone(),
+                            bucket,
+                            row,
+                        }),
+                );
         }
         // A cap failure cannot authorize a uniform starting-account rewrite.
         // The budget's proved subset or full strip is the final identity body.
