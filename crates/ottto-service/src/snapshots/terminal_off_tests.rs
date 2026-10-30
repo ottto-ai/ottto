@@ -2041,6 +2041,149 @@ fn terminal_off_hint_preserves_quarantined_presence_without_forced_family_reads(
     }
 }
 
+const PRESERVED_ADMISSION_SIBLINGS: [&str; 2] = [
+    "b2222222-2222-4222-8222-222222222222",
+    "c3333333-3333-4333-8333-333333333333",
+];
+
+/// Three accepted roots; `OFF_ROOT` gains a terminal quarantine bound to its
+/// retained witness and every family keeps pending from W1. The traversal is
+/// dropped, so the next page starts one with all three families stale.
+fn preserved_admission_fixture(name: &str) -> (crate::test_scratch::ScratchDir, ScanIndex) {
+    let scratch = crate::test_scratch::ScratchDir::new(name);
+    for root in std::iter::once(OFF_ROOT).chain(PRESERVED_ADMISSION_SIBLINGS) {
+        fs::write(
+            scratch.join(format!("{root}.jsonl")),
+            freshness_line(root, "X"),
+        )
+        .unwrap();
+    }
+    let mut index = off_index();
+    let baseline = off_scan(&mut index, &scratch, W1, 10);
+    off_accept(&mut index, &baseline);
+    let key = local_index_key(&scratch.join(format!("{OFF_ROOT}.jsonl")));
+    let revision = index.files[&key].source_file_fingerprint.clone();
+    index.insert_unproven_terminal_claude_authority_for_test(OFF_ROOT, &revision);
+    index.insert_claude_usage_family_pending_for_test(OFF_ROOT, W1);
+    for root in PRESERVED_ADMISSION_SIBLINGS {
+        index.claude_usage_family_pending.insert(
+            root.to_string(),
+            ClaudeUsageFamilyPending {
+                census_window_end: W1.to_string(),
+                member_request_id_hashes: BTreeMap::from([(root.to_string(), BTreeSet::new())]),
+                member_occurrences: BTreeMap::new(),
+                invalid: false,
+                idless_revision: None,
+            },
+        );
+    }
+    index.traversal = None;
+    (scratch, index)
+}
+
+/// One bounded one-file page at `at`, with the source reads it acquired.
+fn preserved_admission_page(
+    index: &mut ScanIndex,
+    scratch: &Path,
+    at: &str,
+) -> BTreeMap<PathBuf, usize> {
+    terminal_contract_retry::source_acquisitions(|| {
+        sampled_scan::with_test_now(rfc3339_unix_seconds(at).unwrap(), || {
+            scan_source_roots_with_test_limit_and_hints(
+                SnapshotSource::ClaudeCode,
+                &[scratch.to_path_buf()],
+                index,
+                at,
+                183,
+                1,
+                true,
+                &[],
+            )
+            .unwrap()
+        })
+    })
+    .1
+}
+
+const PRESERVED_ADMISSION_PAGES: [&str; 3] =
+    [W2, "2026-08-20T10:13:00Z", "2026-08-20T10:14:00Z"];
+
+/// R7: as main's `stale_pending_roots`, resumed retry admission never takes a
+/// witness-bound family as a root, so its unchanged root is never offered,
+/// re-armed or read.
+#[test]
+fn terminal_off_retry_admission_never_takes_a_witness_bound_family_as_a_root() {
+    let _on = ClaudeTerminalOffForTest::enabled();
+    let (scratch, mut index) = preserved_admission_fixture("terminal-off-preserved-admission");
+    let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
+    let key = local_index_key(&path);
+    let revision = index.files[&key].source_file_fingerprint.clone();
+    for (page, at) in PRESERVED_ADMISSION_PAGES.into_iter().enumerate() {
+        let reads = preserved_admission_page(&mut index, &scratch, at);
+        assert_eq!(
+            reads.get(&path).copied().unwrap_or(0),
+            0,
+            "the witness-bound root is never read"
+        );
+        assert_eq!(
+            index.files[&key].source_file_fingerprint, revision,
+            "the witness-bound root is never offered or re-armed"
+        );
+        if page > 0 {
+            let admission = index
+                .claude_stale_family_carry
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.admission.as_ref())
+                .expect("the resumed traversal keeps its retry admission");
+            assert_ne!(admission.oversized_root.as_deref(), Some(OFF_ROOT));
+            assert!(!index.claude_stale_family_carry.contains(OFF_ROOT));
+        }
+    }
+    assert_eq!(
+        index.bound_terminal_claude_authority_revision_for_test(OFF_ROOT),
+        Some(revision)
+    );
+    assert!(index.claude_usage_family_pending.contains_key(OFF_ROOT));
+}
+
+/// R7 platform parity (Lead B): without a supported native layout main's
+/// start never runs the streaming carry batch. ON's resumed admission then
+/// neither carries a stale family nor promotes one to the oversized retry
+/// root, even re-armed siblings that are not storage-only.
+#[test]
+fn terminal_off_resume_without_native_layout_neither_carries_nor_promotes() {
+    let _on = ClaudeTerminalOffForTest::enabled();
+    if crate::heap_layout_bound::layout_supported() {
+        eprintln!("native layout supported: the streaming carry batch runs as on main");
+        return;
+    }
+    let (scratch, mut index) = preserved_admission_fixture("terminal-off-no-layout-admission");
+    // Re-armed siblings are never storage-only: a refused batch would have
+    // made each, in turn, the oversized retry root.
+    for root in PRESERVED_ADMISSION_SIBLINGS {
+        let key = local_index_key(&scratch.join(format!("{root}.jsonl")));
+        index.files.get_mut(&key).unwrap().source_file_fingerprint.clear();
+    }
+    for (page, at) in PRESERVED_ADMISSION_PAGES.into_iter().enumerate() {
+        preserved_admission_page(&mut index, &scratch, at);
+        let carry = &index.claude_stale_family_carry;
+        assert!(carry.roots.is_empty(), "page {page}: no family is carried");
+        assert!(carry.capped_roots.is_empty());
+        assert!(carry.replay.is_empty());
+        let admission = carry
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.admission.as_ref())
+            .expect("the start keeps its retry admission for the due arm");
+        assert_eq!(
+            admission.oversized_root, None,
+            "page {page}: no stale family is promoted ahead of the page queue"
+        );
+        assert_eq!(admission.after_root, None, "no root batch ever ran");
+    }
+}
+
 #[test]
 fn terminal_off_to_default_off_discards_retained_checkpoint_before_reconciliation() {
     assert!(!claude_terminal_off());

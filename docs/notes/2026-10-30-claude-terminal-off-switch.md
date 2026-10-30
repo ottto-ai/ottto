@@ -87,6 +87,14 @@ Linux and the merge-queue Mac. Two ON blockers are fixed here, both gated on
   after a cancelled page or a failed checkpoint save is cleared again. A
   cleared member stays cleared until it is read; eviction or a restart costs
   at most one more re-read, never proof, ACK or settlement.
+- **R7 (witness-bound family re-read):** like main's `stale_pending_roots`,
+  neither the ON start's semantic clear nor its per-page retry admission takes
+  a family whose authority quarantine is bound to its retained witness; its
+  RetryPending deadline keeps the due arm. On a platform without a supported
+  native layout (`heap_layout_bound::layout_supported()` is false, so anything
+  but pinned macOS), the stale-family carry is skipped, the same as main
+  today: ON's resumed admission runs no carry batch and promotes no stale
+  family to the oversized retry root. Pinned macOS is unchanged.
 
 ## OFF proof and the ON-readiness manifest
 
