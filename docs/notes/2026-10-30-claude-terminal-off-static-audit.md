@@ -1,6 +1,6 @@
 # #899 OFF-path production hunk audit
 
-Audited feature source `7b87b9cdf` against main `c440307e6`. Each table row is one
+Audited feature source `13f169cb8` against main `c440307e6`. Each table row is one
 production-counted `git diff --unified=0` hunk, not a summary by filename.
 `cfg(test)` declarations, fixture files and inline test modules are excluded by
 the standing production-line scanner; empty-only hunks are retained as neutral whitespace rows.
