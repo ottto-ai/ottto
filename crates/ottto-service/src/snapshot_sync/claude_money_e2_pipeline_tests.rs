@@ -3286,7 +3286,7 @@ fn e2_pipeline_proven_prefix_markers_never_lend_identity_to_retained_requests() 
     ] {
         with_e2(|| {
             let mut c = Corpus::new("e2-pipeline-copy-marker-exclusion");
-            let scanner = E2ScanFixture::default();
+            let scanner = E2ScanFixture::capturing_identity();
             c.root(ROOT, &resumed(ROOT, &[A]));
             let old = ScanIndex::default();
             let page = ready(&c, &scanner, old.clone(), 100, false);
@@ -3369,7 +3369,7 @@ fn e2_pipeline_zero_usage_prefix_responses_neither_lend_markers_nor_hold_own_tur
     for zero_before_proven in [false, true] {
         with_e2(|| {
             let mut c = Corpus::new("e2-pipeline-copy-marker-zero-usage");
-            let scanner = E2ScanFixture::default();
+            let scanner = E2ScanFixture::capturing_identity();
             c.root(ROOT, &resumed(ROOT, &[A]));
             let old = ScanIndex::default();
             let page = ready(&c, &scanner, old.clone(), 100, false);
