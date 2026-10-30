@@ -127,7 +127,7 @@ fn terminal_off_on_readiness_ignores_equal_the_checked_in_manifest() {
     assert_eq!(expected, sorted, "keep the manifest sorted");
     assert_eq!(ignored_for_readiness(), expected);
     // The count is the ON gate: it must reach 0 before ON anywhere.
-    assert_eq!(READINESS_MANIFEST.len(), 76);
+    assert_eq!(READINESS_MANIFEST.len(), 73);
 }
 
 #[test]
