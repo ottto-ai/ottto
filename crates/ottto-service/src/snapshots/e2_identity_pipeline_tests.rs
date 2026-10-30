@@ -711,20 +711,26 @@ fn e2_unhealthy_root_case(mode: &str, split_logins: bool) {
     let path = support
         .join("local-otel/claude-code-trace-ownership")
         .join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
-    let mut index = ScanIndex::default();
-    for bound in [root.as_str(), E2_SIBLING] {
-        index.session_account_bindings.insert(
-            e2_owner_key(bound),
-            SessionAccountBinding {
-                account_identifier_hash: e2_account(),
-                workspace_identifier_hash: None,
-            },
-        );
-    }
+    // Each page starts from the durable bindings alone, so every page selects
+    // the whole family regardless of the scanner's change detection.
+    let bound_index = || {
+        let mut index = ScanIndex::default();
+        for bound in [root.as_str(), E2_SIBLING] {
+            index.session_account_bindings.insert(
+                e2_owner_key(bound),
+                SessionAccountBinding {
+                    account_identifier_hash: e2_account(),
+                    workspace_identifier_hash: None,
+                },
+            );
+        }
+        index
+    };
     let b = Some("b".repeat(64));
     let child = Some(if split_logins { "c" } else { "b" }.repeat(64));
 
-    let (clean, _, stats, _) = e2_unhealthy_root_page(&dirs, &support, &root, &mut index, false);
+    let (clean, _, stats, _) =
+        e2_unhealthy_root_page(&dirs, &support, &root, &mut bound_index(), false);
     e2_unhealthy_assert_logins(&clean, &root, b.clone(), child.clone());
     assert!(stats.unhealthy_root_no_fallback_requests.is_empty());
     let line = serde_json::to_value(&stats).unwrap();
@@ -757,7 +763,7 @@ fn e2_unhealthy_root_case(mode: &str, split_logins: bool) {
     }
     e2_sibling_evidence(&support);
     let (items, disposition, stats, counts) =
-        e2_unhealthy_root_page(&dirs, &support, &root, &mut index, true);
+        e2_unhealthy_root_page(&dirs, &support, &root, &mut bound_index(), true);
     // Never A, never another login: every family share is Unknown. The
     // sibling's own clean evidence keeps D on the same page.
     e2_unhealthy_assert_logins(&items, &root, None, None);
@@ -796,7 +802,7 @@ fn e2_unhealthy_root_case(mode: &str, split_logins: bool) {
     );
     e2_sibling_evidence(&support);
     let (recovered, _, stats, _) =
-        e2_unhealthy_root_page(&dirs, &support, &root, &mut index, false);
+        e2_unhealthy_root_page(&dirs, &support, &root, &mut bound_index(), false);
     e2_unhealthy_assert_logins(&recovered, &root, b, child);
     assert_eq!(e2_unhealthy_totals(&recovered), totals, "no usage is dropped");
     assert!(stats.unhealthy_root_no_fallback_requests.is_empty());
