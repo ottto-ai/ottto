@@ -2057,7 +2057,7 @@ pub(super) fn renew_growth_claims(index: &mut ScanIndex, path: &Path) {
 }
 pub(super) fn own_growth_claim_generation(index: &ScanIndex, path: &Path) -> Option<u64> {
     let context = index.v2().growth_claim_context.as_ref()?;
-    let (generation, stamp) = context.receipt.lock().ok()?.clone()?;
+    let (generation, stamp) = (*context.receipt.lock().ok()?)?;
     let matches = growth_owner_matches(index, context)
         && state_v2::confirmed_growth_stamp(index, path).ok() == Some(stamp)
         && stamp.0 == generation;
