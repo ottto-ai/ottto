@@ -2782,3 +2782,184 @@ fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
         withheld_new_file_retries_from_retained_read(false, false, loss);
     }
 }
+
+// Copy-family fix (Lead B 2026-10-30, brief e2-copyfamily-r1): resumed
+// files written by Claude Code versions outside the writer allowlist, with
+// turns of their own after the copied prefix (the demo 2026-08-12 shape).
+const THIRD: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+const OLD_WRITER: &str = "2.1.222";
+const RESUME_WRITER: &str = "2.1.229";
+fn file(session: &str) -> String {
+    format!("{session}.jsonl")
+}
+/// Lines `(request, clock, writer)` of one resumed file, all under `session`.
+fn resumed(session: &str, lines: &[(&str, &str, &str)]) -> String {
+    lines
+        .iter()
+        .map(|(request, at, writer)| line_by(session, request, at, 10, writer))
+        .collect()
+}
+const A: (&str, &str, &str) = ("a", "2026-08-02T07:00:10Z", OLD_WRITER);
+const B: (&str, &str, &str) = ("b", "2026-08-02T07:00:20Z", OLD_WRITER);
+const C: (&str, &str, &str) = ("c", "2026-08-02T07:03:10Z", RESUME_WRITER);
+const D: (&str, &str, &str) = ("d", "2026-08-02T07:06:10Z", RESUME_WRITER);
+/// The page's E2 diagnostics for these keys (test-only tally).
+fn copy_diag(keys: &[&str]) -> Vec<u64> {
+    let diag = e2::take_diag();
+    keys.iter()
+        .map(|key| diag.get(key).copied().unwrap_or(0))
+        .collect()
+}
+const PREFIX_KEYS: [&str; 5] = [
+    "copy_prefix_unproven",
+    "copy_prefix_unproven_files",
+    "copy_prefix_unproven_cost_micros",
+    "copy_removal_reused",
+    "copy_removal_stored",
+];
+
+/// The original (2 requests), its resume (copies a, b; own c) and the
+/// resume of that (copies a, b, c; own d), each read after the previous
+/// file settled. Returns the settled index.
+fn demo_family(c: &mut Corpus, progress: &mut SnapshotUploadProgress) -> ScanIndex {
+    c.root(ROOT, &resumed(ROOT, &[A, B]));
+    let old = ScanIndex::default();
+    let original = ready(c, &E2ScanFixture::default(), old.clone(), 100, false);
+    assert_eq!(total(&original), 2, "the original counts its own requests");
+    let prior = settle(c, &old, original, progress);
+    e2::take_diag();
+    c.write_at(&file(COPY), &resumed(COPY, &[A, B, C]), "2026-08-02T07:03:00Z");
+    let first = ready(c, &E2ScanFixture::default(), prior.clone(), 100, false);
+    literal(&first);
+    let copy = body(&first, COPY).expect("the resume publishes its body");
+    assert_eq!(
+        (copy.request_count, copy.removed_request_count),
+        (1, Some(2)),
+        "the resume counts only its own turn; its copied prefix is removed by request ids"
+    );
+    assert_eq!(copy_diag(&PREFIX_KEYS), [0, 0, 0, 0, 2], "proven, so stored and never flagged");
+    let prior = settle(c, &prior, first, progress);
+    c.write_at(
+        &file(THIRD),
+        &resumed(THIRD, &[A, B, C, D]),
+        "2026-08-02T07:06:00Z",
+    );
+    let second = ready(c, &E2ScanFixture::default(), prior.clone(), 100, false);
+    literal(&second);
+    let third = body(&second, THIRD).expect("the second resume publishes its body");
+    assert_eq!((third.request_count, third.removed_request_count), (1, Some(3)));
+    assert_eq!(copy_diag(&PREFIX_KEYS), [0, 0, 0, 0, 3]);
+    settle(c, &prior, second, progress)
+}
+
+#[test]
+fn e2_pipeline_resumed_old_writer_family_counts_each_request_once() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-copy-family-demo");
+        let mut progress = e2_progress();
+        let settled = demo_family(&mut c, &mut progress);
+        // a, b by the original; c, d by the resume that wrote each: 4 requests
+        // across 2 + 1 + 1 counted, never a copy twice.
+        assert!(!settled.claude_copy_removals.is_empty(), "the decisions survive save and reload");
+    });
+}
+
+#[test]
+fn e2_pipeline_resumed_copy_removal_stays_removed_after_its_proof_retires() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-copy-family-retired");
+        let mut progress = e2_progress();
+        let mut prior = demo_family(&mut c, &mut progress);
+        // Both holders' census records retire (35 idle days): their id lists
+        // are gone. The latest resume then gets a new own turn and is re-read.
+        e2::pipeline_test_observer::retire_census(&mut prior, &file(ROOT));
+        e2::pipeline_test_observer::retire_census(&mut prior, &file(COPY));
+        append(
+            &c.root.join(file(THIRD)),
+            &line_by(THIRD, "e", "2026-08-02T07:06:20Z", 10, RESUME_WRITER),
+        );
+        e2::take_diag();
+        let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        literal(&page);
+        let third = body(&page, THIRD).expect("the grown resume publishes");
+        assert_eq!(
+            (third.request_count, third.removed_request_count),
+            (2, Some(3)),
+            "its own turns count; the stored removal keeps the copies removed"
+        );
+        assert_eq!(e2::pipeline_test_observer::disclosed(&page.scan.snapshots), 0);
+        assert_eq!(copy_diag(&PREFIX_KEYS), [0, 0, 0, 3, 0], "reused, never flagged or re-added");
+    });
+}
+
+#[test]
+fn e2_pipeline_resumed_copy_without_proof_or_stored_removal_counts_flagged() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-copy-family-unproven");
+        let mut progress = e2_progress();
+        c.root(ROOT, &resumed(ROOT, &[A, B]));
+        let old = ScanIndex::default();
+        let original = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
+        let mut prior = settle(&c, &old, original, &mut progress);
+        // The holder's id list aged out before the resume was ever decided.
+        e2::pipeline_test_observer::retire_census(&mut prior, &file(ROOT));
+        c.write_at(&file(COPY), &resumed(COPY, &[A, B, C]), "2026-08-02T07:03:00Z");
+        c.evidence_for(COPY, &[api_for(COPY, "a", 10, 250)], &[]);
+        e2::take_diag();
+        let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        literal(&page);
+        let copy = body(&page, COPY).expect("never held: the resume publishes");
+        assert_eq!(
+            (copy.request_count, copy.removed_request_count),
+            (3, Some(0)),
+            "unproven copies are emitted (counted), never dropped and never held"
+        );
+        assert_eq!(e2::pipeline_test_observer::disclosed(&page.scan.snapshots), 2);
+        // Exactly the copied prefix is flagged (a, b), with the reported cost
+        // of the one matched to priced telemetry; the own turn c never.
+        assert_eq!(copy_diag(&PREFIX_KEYS), [2, 1, 250, 0, 0]);
+        assert!(page.index.claude_copy_removals.is_empty(), "nothing proven, nothing stored");
+    });
+}
+
+#[test]
+fn e2_pipeline_certified_resume_keeps_its_timestamp_skip() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-copy-family-certified");
+        let mut progress = e2_progress();
+        let certified = |(request, at, _): (&'static str, &'static str, &'static str)| {
+            (request, at, "2.1.309")
+        };
+        c.root(ROOT, &resumed(ROOT, &[certified(A), certified(B)]));
+        let old = ScanIndex::default();
+        let original = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
+        let prior = settle(&c, &old, original, &mut progress);
+        c.write_at(
+            &file(COPY),
+            &resumed(COPY, &[certified(A), certified(B), certified(C)]),
+            "2026-08-02T07:03:00Z",
+        );
+        e2::take_diag();
+        let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        literal(&page);
+        let copy = body(&page, COPY).expect("the resume publishes");
+        assert_eq!((copy.request_count, copy.removed_request_count), (1, Some(2)));
+        assert_eq!(copy_diag(&PREFIX_KEYS), [0; 5], "no request-id walk, no store, no flag");
+        assert!(page.index.claude_copy_removals.is_empty());
+    });
+}
+
+#[test]
+fn e2_pipeline_file_without_copied_prefix_stores_and_flags_nothing() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-copy-family-none");
+        c.root(ROOT, &resumed(ROOT, &[A, B]));
+        e2::take_diag();
+        let page = ready(&c, &E2ScanFixture::default(), ScanIndex::default(), 100, false);
+        literal(&page);
+        let original = body(&page, ROOT).unwrap();
+        assert_eq!(original.request_count, 2);
+        assert_eq!(copy_diag(&PREFIX_KEYS), [0; 5]);
+        assert!(page.index.claude_copy_removals.is_empty());
+    });
+}
