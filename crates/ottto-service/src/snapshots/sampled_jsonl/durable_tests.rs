@@ -2126,7 +2126,6 @@ fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
                 .unwrap();
             let decoded = decode_body(&body, source).unwrap();
             let (restored, receipt) = {
-                let decoded = decoded;
                 decoded
                     .rederive_plan()
                     .map_err(Refuse::NotRederivable)
