@@ -1331,3 +1331,92 @@ fn sticky_current_bucket_tries_a_smaller_alternative_money_witness() {
     assert_eq!(padded.request_identity_refusals, 9);
     sticky_assert_reconciled(&padded);
 }
+
+#[test]
+fn sticky_current_bucket_completes_one_shared_row_before_their_union() {
+    const CURRENT: &str = "2026-09-01T12:00:00Z";
+    let mut requests = vec![
+        display_request(Some("max"), HOUR_10, 1, login_key(OWNER_A), Some(HOUR_10)),
+        display_request(Some("pro"), HOUR_11, 1, login_key(D64), Some(HOUR_11)),
+        display_request(Some("max"), CURRENT, 1, login_key(OWNER_A), Some(CURRENT)),
+        display_request(
+            Some("shared"),
+            CURRENT,
+            1,
+            login_key(OWNER_A),
+            Some(CURRENT),
+        ),
+    ];
+    let (mut first, timed) = display_item(&requests);
+    let proof = timed.into_iter().map(|(c, _)| c).collect::<Vec<_>>();
+    let mut accepted = identity::AcceptedBuckets::default();
+    identity::apply_with_accepted_for_test(&mut first, &proof, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(&first).unwrap());
+    for at in [
+        "2026-09-01T00:00:00Z",
+        "2026-09-01T01:00:00Z",
+        "2026-09-01T02:00:00Z",
+        "2026-09-01T03:00:00Z",
+        "2026-09-01T04:00:00Z",
+        "2026-09-01T05:00:00Z",
+        "2026-09-01T06:00:00Z",
+        "2026-09-01T07:00:00Z",
+    ] {
+        requests.push(display_request(
+            Some("shared"),
+            at,
+            1,
+            login_key(OWNER_A),
+            Some(at),
+        ));
+    }
+    let (mut item, timed) = display_item(&requests);
+    item.collected_at = "2026-09-01T12:05:00Z".into();
+    item.session_display_name = Some("x".into());
+    item.workspace_display_label = Some("x".into());
+    item.repository_label = Some("x".into());
+    let mut proof = timed.into_iter().map(|(c, _)| c).collect::<Vec<_>>();
+    let clean = stripped(&item);
+    // X completion is current + hour 10. The union also pulls eight new Y
+    // buckets, whose extra tags exceed the room freed by completing X.
+    let extra = |mode: u8| {
+        let mut candidate = clean.clone();
+        let mut shares = proof.clone();
+        let mut refused = 0;
+        for share in &mut shares {
+            let keep = share.bucket_start == CURRENT
+                || (mode != 0 && share.bucket_start == HOUR_10)
+                || (mode == 2 && share.bucket_start != HOUR_11);
+            if !keep {
+                share.identity = RequestIdentity::Missing;
+                refused += 1;
+            }
+        }
+        identity::apply_with_accepted_for_test(
+            &mut candidate,
+            &shares,
+            &identity::AcceptedBuckets::default(),
+        )
+        .unwrap();
+        candidate.request_identity_refusals = refused;
+        sticky_assert_reconciled(&candidate);
+        identity::item_bytes(&candidate) - identity::item_bytes(&clean)
+    };
+    let headroom = extra(1);
+    assert!(extra(0) > headroom, "current alone cannot fit");
+    assert!(extra(2) > headroom, "union unnecessarily adds Y buckets");
+    let (mut padded, filler) = sticky_pad_to_bytes(&clean, identity::MAX_ITEM_BYTES - headroom);
+    proof.extend(filler);
+    identity::apply_with_accepted_for_test(&mut padded, &proof, &accepted).unwrap();
+    assert!(padded.usage_buckets[..8]
+        .iter()
+        .all(|bucket| !sticky_tagged(&bucket.model_usage[0])));
+    assert!(sticky_tagged(&padded.usage_buckets[8].model_usage[0]));
+    assert!(!sticky_tagged(&padded.usage_buckets[9].model_usage[0]));
+    assert!(padded.usage_buckets[10]
+        .model_usage
+        .iter()
+        .all(sticky_tagged));
+    assert_eq!(padded.request_identity_refusals, 9);
+    sticky_assert_reconciled(&padded);
+}

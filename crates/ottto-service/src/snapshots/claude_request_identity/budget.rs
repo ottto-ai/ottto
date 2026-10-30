@@ -813,8 +813,24 @@ pub(super) fn select(
                 witness_trials_left -= 1;
                 plan.closure([index], &kept, Some(supplier))
             });
+        // Completing just one row can shrink its top-level Parts to Single.
+        // The union may pull unrelated new buckets through another row and
+        // exceed the cap, even when this smaller completion protects the open
+        // accepted bucket. Cache each failed row until selection changes.
+        let individual_completions = own_rows
+            .iter()
+            .filter(|&&row| !failed_completions.contains(&vec![row]))
+            .filter_map(|&row| {
+                plan.closure(row_buckets[row].iter().copied(), &kept, None)
+                    .filter(|members| members.len() > 1)
+            });
         let mut admitted = None;
-        for mut members in choices.into_iter().chain(alternatives).chain(completion) {
+        for mut members in choices
+            .into_iter()
+            .chain(alternatives)
+            .chain(individual_completions)
+            .chain(completion)
+        {
             members.sort_by_key(|&member| rank[member]);
             let mut trial = selection.clone();
             let mut added = Vec::new();
@@ -843,6 +859,7 @@ pub(super) fn select(
             }
             failed_completions.clear();
         } else {
+            failed_completions.extend(own_rows.iter().map(|&row| vec![row]));
             failed_completions.insert(own_rows);
         }
     }

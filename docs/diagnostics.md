@@ -1184,6 +1184,8 @@ cache patch is left intact. Required money companions try deterministic
 alternative witnesses before refusing the preferred bucket, with at most
 5,000 alternative trials shared by the item and no full-item serialization
 per trial.
+Individual shared-row completions are tried before their union, so unrelated
+new buckets sharing another row cannot prevent a fitting accepted completion.
 
 The destination-scoped upload progress stores class L priority hints only:
 hashed session keys and sorted bucket-start timestamps, with no identities.
