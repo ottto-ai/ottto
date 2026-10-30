@@ -283,7 +283,7 @@ fn assert_rederive_pending(
         .unwrap()
         .0
         .ineligible
-        .get("rederive_unfunded")
+        .get("rederive_quiet")
         .is_some_and(|n| *n > 0));
 }
 
@@ -316,6 +316,11 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
             "decode" => {
                 store::RESTORE_INPUT_BYTES
                     + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64
+            }
+            "rederive" => {
+                store::RESTORE_INPUT_BYTES
+                    + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64
+                    + 8 * 1024 * 1024
             }
             _ => store::ACTIVE_BYTES,
         };
@@ -497,7 +502,7 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
 // head or named-line read before the typed resource refusal.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
-fn rederive_refusal_precedes_certificate_io_and_keeps_integrity_separate() {
+fn certificate_io_precedes_decode_and_rederive_refusals() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
@@ -559,7 +564,7 @@ fn rederive_refusal_precedes_certificate_io_and_keeps_integrity_separate() {
         cache.durable_restore_record(
             source, &record, &expected, &path, &scope, &mut held, &mut lease
         ),
-        Err(Failure::Resource("rederive_unfunded"))
+        Err(Failure::Certificate(CertificateRefusal::ReadError))
     ));
     assert_eq!(held.stream_position().unwrap(), 0);
     record.record.body.clear();
@@ -567,7 +572,7 @@ fn rederive_refusal_precedes_certificate_io_and_keeps_integrity_separate() {
         cache.durable_restore_record(
             source, &record, &expected, &path, &scope, &mut held, &mut lease
         ),
-        Err(Failure::Corrupt)
+        Err(Failure::Certificate(CertificateRefusal::ReadError))
     ));
     lease.release();
     // Empty obligations are a positive decode, but never bypass certificate IO.
@@ -3176,7 +3181,7 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         let (counts, disk) = restart.durable_counters(source).unwrap();
         println!("dt_budget {arm} restart: {}", counts.summary(source, &disk));
         assert_eq!(counts.restored, 0, "{arm}: resource holds grant no restore");
-        assert_eq!(counts.ineligible.get("rederive_unfunded"), Some(&3));
+        assert_eq!(counts.ineligible.get("rederive_quiet"), Some(&3));
         assert_eq!(disk.t14_rebuild_full_started, 0);
         let _ = std::fs::remove_dir_all(root);
     }
