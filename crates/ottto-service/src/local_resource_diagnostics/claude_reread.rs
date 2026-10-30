@@ -617,6 +617,8 @@ mod tests {
             serde_json::json!({})
         );
         let scope = Scope::begin(true);
+        desktop_inventory_restart();
+        desktop_scoped_acquisition();
         {
             let _failed = Reinsertion::new(true);
             let success = Reinsertion::new(true);

@@ -1977,4 +1977,25 @@ mod tests {
         // harmless and leaves the daemon ready for when the network returns.
         assert!(state.streak.should_rebuild(long_after));
     }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn probe_targets_parse_from_api_base_urls() {
+        assert_eq!(
+            parse_probe_target("https://api.ottto.net"),
+            Some(("api.ottto.net".to_string(), 443))
+        );
+        assert_eq!(
+            parse_probe_target("https://api.ottto.net/"),
+            Some(("api.ottto.net".to_string(), 443))
+        );
+        assert_eq!(
+            parse_probe_target("http://127.0.0.1:8000/api"),
+            Some(("127.0.0.1".to_string(), 8000))
+        );
+        assert_eq!(
+            parse_probe_target("http://localhost"),
+            Some(("localhost".to_string(), 80))
+        );
+        assert_eq!(parse_probe_target("not a url"), None);
+    }
 }
