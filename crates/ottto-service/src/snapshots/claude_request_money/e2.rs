@@ -36,38 +36,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// Inline fields are paid by their containing slot and own no allocation.
-// Visit only owned heaps: scalar-by-scalar walks otherwise exhaust the
-// native frame's 4096-visit guard even when the frame uses under 1 MiB.
-// Destructuring is exhaustive; a field moved into the inline group must
-// prove INLINE_ONLY before the walk can succeed. Byte/visit caps stay native.
-macro_rules! money_heap_fields {
-    ($t:ty; inline: [$($inline:ident),*]; heap: [$($heap:ident),*]) => {
-        impl crate::heap_layout_bound::HeapLayoutBound for $t {
-            fn stable_heap(&self) -> bool {
-                let Self { $($inline,)* $($heap,)* } = self;
-                true $(&& crate::heap_layout_bound::HeapLayoutBound::stable_heap($inline))*
-                    $(&& crate::heap_layout_bound::HeapLayoutBound::stable_heap($heap))*
-            }
-            fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-                let Self { $($inline,)* $($heap,)* } = self;
-                $(require_inline($inline)?;)*
-                $(crate::heap_layout_bound::HeapLayoutBound::heap_bound($heap, c)?;)*
-                Some(())
-            }
-            fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-                let Self { $($inline,)* $($heap,)* } = self;
-                $(require_inline($inline)?;)*
-                $(crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound($heap, c)?;)*
-                Some(())
-            }
-        }
-    };
-}
-#[inline(always)]
-fn require_inline<T: crate::heap_layout_bound::HeapLayoutBound>(_: &T) -> Option<()> {
-    T::INLINE_ONLY.then_some(())
-}
+use crate::heap_layout_bound::split_fields as money_heap_fields;
 
 pub(crate) const GATE: bool = true;
 /// A record this much older than its file's effective birth was copied in.
