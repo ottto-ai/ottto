@@ -99,7 +99,6 @@ fn oversized_unchanged_has_no_clock_restarts_and_keeps_incomplete_disclosure() {
     }
 }
 
-
 #[test]
 #[serial(source_manifests)]
 fn oversized_growth_retries_only_its_discovery_then_shrink_admits_it() {
@@ -149,7 +148,6 @@ fn oversized_growth_retries_only_its_discovery_then_shrink_admits_it() {
     );
 }
 
-
 #[test]
 #[serial(source_manifests)]
 fn oversized_same_size_sample_edit_wakes_discovery() {
@@ -173,7 +171,6 @@ fn oversized_same_size_sample_edit_wakes_discovery() {
         oversized_deadline(&before) + 120
     );
 }
-
 
 #[test]
 #[serial(source_manifests)]
@@ -213,7 +210,6 @@ fn oversized_metadata_only_touches_give_zero_wakes() {
     }
     std::fs::set_permissions(&path, original_permissions).unwrap();
 }
-
 
 #[test]
 #[serial(source_manifests)]
@@ -267,7 +263,6 @@ fn oversized_minutely_growth_is_bounded_by_existing_exponential_cadence() {
     assert_eq!(wakes, 8, "six exponential retries and two hourly retries");
 }
 
-
 #[test]
 #[serial(source_manifests)]
 fn oversized_does_not_suppress_another_retryable_problem() {
@@ -304,7 +299,6 @@ fn oversized_does_not_suppress_another_retryable_problem() {
         1
     );
 }
-
 
 #[test]
 #[serial(source_manifests)]
@@ -372,7 +366,6 @@ fn oversized_keeps_complete_families_empty_and_refuses_absence_retirement_sweep_
         before["claude_retired_family_tombstones"]
     );
 }
-
 
 fn oversized_floor(saved: &serde_json::Value) -> u64 {
     time::OffsetDateTime::parse(
@@ -465,7 +458,6 @@ fn oversized_shed_upload_is_reoffered_at_the_original_retry_deadline() {
     );
     assert!(!retry.last().unwrap().scan.census_complete);
 }
-
 
 #[test]
 #[serial(source_manifests)]
@@ -584,7 +576,6 @@ fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
     }
 }
 
-
 #[test]
 #[serial(source_manifests)]
 fn oversized_restart_discovers_and_uploads_a_new_file_without_hints_within_floor() {
@@ -629,7 +620,6 @@ fn oversized_restart_discovers_and_uploads_a_new_file_without_hints_within_floor
     assert_eq!(retry.last().unwrap().scan.oversized_file_count, 1);
     assert!(fixture.hinted_paths.is_empty());
 }
-
 
 #[test]
 #[serial(source_manifests)]
@@ -703,7 +693,6 @@ fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
     assert_eq!(page.scan.scanned_file_count, 1);
     assert!(!page.scan.census_complete);
 }
-
 
 /// E2 holds stay progress-blocking beside an oversized file and are offered
 /// again at the same recovery floor, never cancelled or uploaded while held.
@@ -788,6 +777,7 @@ fn oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor() {
 }
 
 
+/// [regress] Containment regression: real hold renews floor and three pages do not requeue it.
 /// Real demotion classification and selected-save custody, without oversized
 /// debt restarting the frozen window: each served hold must renew its floor.
 #[test]

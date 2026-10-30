@@ -10,7 +10,6 @@ fn p12_experimental_base_exit_claude_duplicate_across_pages_stays_refused_withou
     writeln!(std::io::stderr().lock(), "p12_oracle: name=claude_duplicate_across_pages_stays_refused_without_reparse_loop mode=experimental_base_exit_no_reuse status=PASS original_assertions_unchanged=true eligible_reuse_proved=false").unwrap();
 }
 
-
 #[test]
 fn p12_experimental_base_exit_claude_explicit_fork_duplicate_owned_request_fails_posture_closed() {
     let scope = crate::snapshots::envelope_selection_experiment::Scope::restart();
@@ -18,7 +17,6 @@ fn p12_experimental_base_exit_claude_explicit_fork_duplicate_owned_request_fails
     assert_eq!(scope.counts().rearm_suppressed, 0);
     writeln!(std::io::stderr().lock(), "p12_oracle: name=claude_explicit_fork_duplicate_owned_request_fails_posture_closed mode=experimental_base_exit_no_reuse status=PASS original_assertions_unchanged=true eligible_reuse_proved=false").unwrap();
 }
-
 
 #[test]
 fn p12_experimental_base_exit_claude_future_quarantine_preserves_cross_page_duplicate_refusal() {
@@ -28,7 +26,6 @@ fn p12_experimental_base_exit_claude_future_quarantine_preserves_cross_page_dupl
     writeln!(std::io::stderr().lock(), "p12_oracle: name=claude_future_quarantine_preserves_cross_page_duplicate_refusal mode=experimental_base_exit_no_reuse status=PASS original_assertions_unchanged=true eligible_reuse_proved=false").unwrap();
 }
 
-
 #[test]
 fn p12_experimental_base_exit_claude_pending_census_recovers_without_releasing_future_quarantine() {
     let scope = crate::snapshots::envelope_selection_experiment::Scope::restart();
@@ -36,7 +33,6 @@ fn p12_experimental_base_exit_claude_pending_census_recovers_without_releasing_f
     assert_eq!(scope.counts().rearm_suppressed, 0);
     writeln!(std::io::stderr().lock(), "p12_oracle: name=claude_pending_census_recovers_without_releasing_future_quarantine mode=experimental_base_exit_no_reuse status=PASS original_assertions_unchanged=true eligible_reuse_proved=false").unwrap();
 }
-
 
 #[test]
 fn p12_experimental_base_exit_claude_stable_owned_start_recovers_after_partial_conflict() {

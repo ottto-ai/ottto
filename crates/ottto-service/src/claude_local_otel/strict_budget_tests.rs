@@ -1,4 +1,5 @@
 use super::*;
+/// [regress] Containment regression: strict growing trace obeys actual reader allowance.
 #[test]
 fn terminal_off_strict_growing_trace_obeys_actual_reader_allowance() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();

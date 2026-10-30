@@ -216,7 +216,6 @@ fn claude_family_pending_reobservation_stays_exact_within_a_window() {
     let _ = fs::remove_dir_all(root);
 }
 
-
 // Coverage counts every indexed family member this window did not observe.
 #[test]
 fn claude_duplicate_fence_coverage_counts_unobserved_indexed_members() {
@@ -285,7 +284,6 @@ fn claude_duplicate_fence_coverage_counts_unobserved_indexed_members() {
     );
 }
 
-
 // The full re-arm backs off while the fence stays closed, and missing
 // scheduling state only costs a replay.
 #[test]
@@ -339,7 +337,6 @@ fn claude_duplicate_fence_full_rearm_backs_off_and_fails_closed() {
         );
     }
 }
-
 
 // A closed fence stays closed while any indexed member is unobserved,
 // even when every observed family is valid; its full replay is deferred by
@@ -461,7 +458,6 @@ fn claude_duplicate_fence_reopens_only_after_full_coverage() {
 
     let _ = fs::remove_dir_all(root);
 }
-
 
 // Only a bound authority demotion of this exact revision (terminal, or, since
 // the path-(a) bridge, RetryPending without a correction grant), or a durably
@@ -599,7 +595,6 @@ fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
     let _ = fs::remove_dir_all(root);
 }
 
-
 // SI P3 (path-(a) bridge): authority debt no longer marks the sweep, so the
 // unchanged-proof skip may run while a family is held. A root that still
 // carries a RetryPending record bound to its witness is never an
@@ -671,7 +666,6 @@ fn retry_pending_root_is_never_an_unchanged_proof_root() {
         "the held root is excluded"
     );
 }
-
 
 // A held key keeps its committed revision, its activity and accepted
 // ledger, and reparse debt; every other key commits as scanned. A held key
@@ -874,7 +868,6 @@ fn locally_held_keys_revert_to_committed_revision_and_keep_manifest() {
     ));
 }
 
-
 // A never-committed subagent of a committed family, held by that family's
 // bound terminal quarantine at exactly its scanned revision, settles with a
 // delivery-free membership entry: no entity, activity, acceptance, or
@@ -1018,7 +1011,6 @@ fn bound_terminal_member_of_committed_family_keeps_delivery_free_membership() {
     ));
 }
 
-
 // A bound terminal hold keeps its revision and is skipped even under a
 // changed upload context; a due retry or changed revision reparses.
 #[test]
@@ -1076,7 +1068,6 @@ fn bound_terminal_hold_skips_until_family_changes() {
         )
     );
 }
-
 
 // Account holds are durable, bounded, and pruned only by a resolving
 // parse or proved absence.
@@ -1198,7 +1189,6 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
     );
 }
 
-
 // Each parse is attributed to the first selecting gate, by stable name.
 #[test]
 fn candidate_parse_reasons_name_the_selecting_gate() {
@@ -1284,7 +1274,6 @@ fn candidate_parse_reasons_name_the_selecting_gate() {
         parse(CandidateParseReason::SourceChanged)
     );
 }
-
 
 // Contract 5 withdraws transcript markers even when the census is complete.
 // A quarantine can excuse fence coverage without comparing an original, but
@@ -1420,7 +1409,6 @@ fn transcript_ownership_needs_quarantined_originals_observed() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-
 mod owned_held_index_allocation {
     include!("owned_held_index_allocation_tests.rs");
 }
@@ -1444,7 +1432,6 @@ fn p12_experimental_base_exit_duplicate_fence_full_coverage_oracle() {
     assert_eq!(scope.counts().rearm_suppressed, 0);
     writeln!(std::io::stderr().lock(), "p12_oracle: name=claude_duplicate_fence_reopens_only_after_full_coverage mode=experimental_base_exit_no_reuse status=PASS original_assertions_unchanged=true eligible_reuse_proved=false").unwrap();
 }
-
 
 // Re-review r3 (path-(a) bridge): with the absent-family scratch refused for
 // the whole test, more RetryPending roots than one fallback window all get
@@ -1502,7 +1489,6 @@ fn bounded_absence_fallback_checks_every_retry_pending_root_through_its_cursor()
         .claude_authority_record_for_test("terminal-root")
         .is_some_and(|record| record.terminal));
 }
-
 
 /// `count` RetryPending roots named `{prefix}-NN`, each with pending, and the
 /// observed paths of those whose number `present` accepts.
@@ -1573,7 +1559,6 @@ fn bounded_absence_fallback_cursor_is_scoped_per_index() {
     }
 }
 
-
 // Re-review r4: the per-index cursor map is capped. A new index at the cap
 // evicts only the least recently used cursor; every other cursor survives.
 #[test]
@@ -1595,7 +1580,6 @@ fn bounded_absence_fallback_cursors_evict_only_the_least_recently_used() {
         assert_eq!(cursors.cursor(&format!("index-{scope:02}")), scope + 1);
     }
 }
-
 
 /// A synthetic traversal problem, applied to a clean terminal traversal.
 type TraversalProblem = fn(&mut ScanTraversalCheckpoint);
@@ -1707,7 +1691,6 @@ fn absence_retirement_keeps_every_family_after_any_traversal_problem() {
     );
 }
 
-
 // SOURCE Round 11 guards (a) and (b) at the unit seam: the latch and an
 // unverified-history index each refuse with their own reason.
 #[test]
@@ -1733,7 +1716,6 @@ fn absence_retirement_names_the_latch_and_unverified_history_refusals() {
         Ok(1)
     );
 }
-
 
 /// Saves `index` at a new `path` through ordinary compare-and-swap saves
 /// until the saved index carries `generation`; it never loads the path.
@@ -1786,7 +1768,6 @@ fn fresh_index_loads_leave_their_path_unverified_until_a_restart() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
-
 
 // #705/#712 composition: both daemon and general loads share freshness,
 // retain guard (b) after the index fills, and repair a lost tombstone set.
@@ -1872,7 +1853,6 @@ fn source_aware_loads_share_history_freshness_and_repair_tombstones() {
         .is_some());
     let _ = fs::remove_dir_all(&dir);
 }
-
 
 // SOURCE Round 11 tombstone decode: malformed entries drop one by one, a
 // wrong container type decodes as empty, each counted; the index and all its
@@ -1982,7 +1962,6 @@ fn malformed_tombstones_never_fail_the_index_decode() {
         .claude_family_tombstoned_for_test("kept-root"));
     let _ = fs::remove_dir_all(&dir);
 }
-
 
 // SOURCE Round 13 F2: a full tombstone set refuses the next retirement and
 // never evicts. The refused family keeps its RetryPending record, pending
@@ -2103,7 +2082,6 @@ fn full_tombstone_set_refuses_retirement_and_keeps_the_family() {
         let _ = fs::remove_dir_all(&dir);
     }
 }
-
 
 /// Edits a saved index's top-level JSON object.
 type IndexJsonEdit<'a> = dyn Fn(&mut serde_json::Map<String, serde_json::Value>) + 'a;
@@ -2263,7 +2241,6 @@ fn a_lost_tombstone_set_never_restores_new_file_eligibility() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-
 // SOURCE Round 13 F1/F2: when the lost roots cannot all be tombstoned within
 // the cap (here an over-cap persisted set, trimmed at decode, dropped the
 // retired family's tombstone), the uncertainty fence stays up durably: every
@@ -2372,7 +2349,6 @@ fn an_unplaceable_tombstone_loss_keeps_a_durable_fence() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-
 // SOURCE Round 14 H729-1 control: a member that returns and parses empty is
 // indexed (confirmed empty) while its family's proof is unsettled, so its
 // tombstone stays. If the set is then lost, that indexed member must not
@@ -2449,7 +2425,6 @@ fn an_indexed_member_never_waives_a_lost_tombstone() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
-
 
 // SOURCE Round 14 H729-2: the fence drain is bounded whatever the witness
 // count. It counts untombstoned witnessed roots only until one more than it
@@ -2700,7 +2675,6 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-
 // SOURCE Round 14 (d): an older writer drops the marker, the set and the
 // fence. A load that then finds a witnessed root with no record, pending
 // proof, indexed member or tombstone fails closed: the fence goes up, and
@@ -2860,7 +2834,6 @@ fn a_downgrade_that_drops_the_marker_and_set_fails_closed() {
     assert!(!loaded.claude_retired_family_tombstones_uncertain_for_test());
     let _ = fs::remove_dir_all(&dir);
 }
-
 
 // SOURCE Round 15 bounded drain: the fence comes down at a complete healthy
 // terminal once every witnessed root the walk did not see present is
@@ -3038,7 +3011,6 @@ fn the_fence_drain_skips_present_roots_and_only_absent_roots_block_it() {
     assert_eq!(aged_out(), before + 2);
 }
 
-
 // SOURCE Round 15, checkpoint selection: the drain exempts a present root by
 // the working index. When a partial checkpoint then drops that root's new
 // entry (its body is not held by the server yet), the root would be
@@ -3089,7 +3061,6 @@ fn a_partial_checkpoint_that_drops_an_exempted_entry_keeps_the_fence() {
     assert!(kept.files.contains_key(&key));
     assert!(!kept.claude_retired_family_tombstones_uncertain_for_test());
 }
-
 
 // SOURCE Round 15: the accepted upgrade false positive. A pre-bridge index
 // whose removed family's witness outlived its entry looks like a downgrade,
@@ -3165,7 +3136,6 @@ fn an_upgrade_false_positive_is_counted_and_bounded_by_the_drain() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-
 fn hex64_number(number: usize) -> String {
     format!("{number:064x}")
 }
@@ -3199,7 +3169,6 @@ fn kept_tombstone_fence_alarm_names_unsupported_layout() {
         assert_eq!(alarms[0]["counts"]["witness_visits"], 3);
     }
 }
-
 
 /// Returning RetryPending roots must be visible separately from ordinary
 /// RetryPending causes, terminal records, and recordless retirement markers.

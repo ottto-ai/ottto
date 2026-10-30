@@ -124,7 +124,6 @@ impl Family {
         census_complete: bool,
         window: &str,
     ) -> ClaudeUsageAuthorityDisposition {
-
         let api = ClaudeLocalOtelLoadReport {
             evidence: BTreeMap::from([(self.root_session_id.clone(), self.api_rows.clone())]),
             health: Default::default(),
@@ -322,7 +321,6 @@ impl Family {
         disposition
     }
 
-
     /// Persist and reload the index in the SAME process. A separate lifecycle
     /// restart control proves that disk state cannot restore a native receipt.
     fn reload(&mut self) {
@@ -453,7 +451,6 @@ fn p12_family_fixtures_have_independent_checkpoint_custody() {
     second.reload();
 }
 
-
 #[test]
 #[ignore = "P12: needs full qualified two-phase driver; original expectations preserved"]
 fn member_change_after_unchanged_proof_fails_closed_until_family_reparse() {
@@ -540,7 +537,6 @@ fn member_change_after_unchanged_proof_fails_closed_until_family_reparse() {
         .contains_key(&root_session_id));
 }
 
-
 fn observe_base_prelude(experimental_base_exit: bool) {
     let _scope = experimental_base_exit.then(envelope_selection_experiment::Scope::restart);
     let mut family = Family::new();
@@ -566,15 +562,12 @@ fn p12_member_change_base_control_reveals_unmet_original_prelude() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     observe_base_prelude(false);
 }
-
-
 #[test]
 fn p12_member_change_experiment_base_exit_reveals_unmet_original_prelude() {
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     observe_base_prelude(true);
 }
-
 
 #[test]
 fn native_comparison_original_member_change_unit_oracle() {

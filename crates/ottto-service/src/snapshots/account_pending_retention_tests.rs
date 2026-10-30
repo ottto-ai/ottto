@@ -92,7 +92,6 @@ fn account_window_collapse_replays_real_retirement_and_holds() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 #[test]
 fn account_window_runs_preserve_a_b_a_and_revision_only_changes() {
     let (dir, root, base) = retention_fixture();
@@ -175,7 +174,6 @@ fn account_window_runs_preserve_a_b_a_and_revision_only_changes() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 #[test]
 fn account_window_unsafe_boundaries_are_untouched() {
     let (dir, root, base) = retention_fixture();
@@ -200,7 +198,6 @@ fn account_window_unsafe_boundaries_are_untouched() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
-
 
 #[test]
 fn account_window_push_keeps_endpoints_and_change_points() {
@@ -233,7 +230,6 @@ fn account_window_push_keeps_endpoints_and_change_points() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
-
 
 #[test]
 fn account_window_load_crash_retry_normal_save_and_old_decoder() {
@@ -287,7 +283,6 @@ fn account_window_load_crash_retry_normal_save_and_old_decoder() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 #[test]
 fn account_window_consumer_fields_are_projection_fields() {
     // Read the actual consumer's code, not a second hand-maintained field list.
@@ -327,7 +322,6 @@ fn account_window_consumer_fields_are_projection_fields() {
     }
 }
 
-
 #[test]
 fn account_window_collapse_preserves_every_other_index_field_and_scan_identity() {
     let (dir, root, mut index) = retention_fixture();
@@ -350,7 +344,6 @@ fn account_window_collapse_preserves_every_other_index_field_and_scan_identity()
     // witnesses, obligations, current evidence, generation and parser contracts.
     assert_eq!(before, after);
 }
-
 
 #[test]
 fn account_window_strict_comparison_covers_every_window_field() {
@@ -384,7 +377,6 @@ fn account_window_strict_comparison_covers_every_window_field() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 #[test]
 fn account_window_retention_counts_use_existing_diagnostics_carrier() {
     let (dir, _, mut index) = retention_fixture();
@@ -402,7 +394,6 @@ fn account_window_retention_counts_use_existing_diagnostics_carrier() {
     assert!(carrier["window_bytes_saved"].as_u64().unwrap() > 0);
     fs::remove_dir_all(dir).unwrap();
 }
-
 
 #[test]
 fn account_window_opaque_holds_preserve_history_and_its_save_budget() {

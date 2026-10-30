@@ -266,7 +266,6 @@ fn upload_context_pending_refusal_preserves_cooldown_through_prepare_and_reproje
     assert!(progress.contains_body(&entity, &body));
     assert!(progress.fresh_context_body_acks.is_empty());
 }
-
 #[test]
 fn upload_context_due_refusal_still_uses_existing_retry_lease() {
     let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
@@ -293,7 +292,6 @@ fn upload_context_due_refusal_still_uses_existing_retry_lease() {
     assert!(progress.active_quarantine_retries.contains(&entity));
     assert!(!progress.contains_body(&entity, &body));
 }
-
 #[test]
 fn upload_context_changed_body_can_correct_pending_refusal() {
     let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
@@ -355,7 +353,6 @@ impl Uploader {
             policy: SnapshotUploadPolicy::default(),
         }
     }
-
     pub(crate) fn activate(
         &mut self,
         source: SnapshotSource,
@@ -389,7 +386,6 @@ impl Uploader {
             }),
         );
     }
-
     pub(crate) fn send(
         &mut self,
         source: SnapshotSource,
@@ -524,7 +520,6 @@ impl Uploader {
         );
         Ok((counts.files, counts.bytes))
     }
-
     pub(crate) fn finish_adopted_index(
         &mut self,
         index: &mut ScanIndex,

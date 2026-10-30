@@ -98,7 +98,6 @@ fn accepted_retry_no_otel_change_ack_then_carry_again() {
     assert_eq!(entry(&c1a_saved(&fixture)), entry(&accepted));
 }
 
-
 const C1B_MAX_PAGES: usize = 8;
 
 /// Count-only fields of the traversal start that opened a window.
@@ -164,7 +163,6 @@ fn c1b_start(row: &serde_json::Value) -> C1bStart {
 /// Whether a page ended its traversal: complete (no traversal is retained) or
 /// red (the retained traversal has nothing left to walk).
 fn c1b_traversal_ended(index: &ScanIndex) -> (bool, bool) {
-
     let saved = serde_json::to_value(index).expect("encode the saved index");
     match saved.get("traversal").filter(|value| !value.is_null()) {
         None => (true, false),
@@ -176,7 +174,6 @@ fn c1b_traversal_ended(index: &ScanIndex) -> (bool, bool) {
         }
     }
 }
-
 
 /// One bounded traversal on minute clocks, from its start to its complete or
 /// red terminal.
@@ -436,7 +433,6 @@ fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
     assert!(!base.family_pending_after);
 }
 
-
 /// Q4 strict: the witnessed family's pending from the red window is invalid
 /// (the shape a cap or member-change invalidation leaves). The retry re-arms
 /// it whole, exactly as BASE.
@@ -466,7 +462,6 @@ fn c1b_invalid_pending_keeps_base_rearm() {
     assert_eq!(retry.start, base.windows[2].start, "the start is BASE's");
     assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
 }
-
 
 /// SI I3 and Condition X(a): after the red window the root's API rows gain
 /// account evidence, so the sidecar-inclusive selection fingerprint of every
@@ -498,7 +493,6 @@ fn c1b_sidecar_changed_family_is_reread_like_base() {
     assert_eq!(fix.witness_after, base.witness_after);
 }
 
-
 /// SOURCE B9: after the red window one subagent's transcript gains a request
 /// without telemetry. The walk re-parses that member at the 08:20 retry
 /// (`SourceChanged` instead of BASE's `Rearmed`), which cancels the family's
@@ -524,7 +518,6 @@ fn c1b_changed_member_after_carry_is_reparsed() {
     assert!(base.windows[2].parsed.contains(&changed));
     assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
 }
-
 
 /// Contract-only debt now defers the exactly ACKed family. Admission refusal
 /// still takes BASE's whole re-arm; retain every original read/liveness
@@ -570,7 +563,6 @@ fn c1b_identity_contract_change_keeps_base_rearm() {
         assert_eq!(fix.witness_after, base.witness_after);
     }
 }
-
 
 /// A request the provider ledger records for the first subagent from the
 /// start, before its transcript holds it.
@@ -667,7 +659,6 @@ fn c1b_recoverable_member_change_cancels_the_carry_like_base() {
     assert_eq!(fix.witness_after, base.witness_after);
 }
 
-
 /// SOURCE B9 held path: the same change with every window on one page, so
 /// the changed member is parsed on the page that ends the walk after the
 /// unchanged root was already passed. BASE reads the whole family on that
@@ -699,7 +690,6 @@ fn c1b_member_change_on_the_walk_ending_page_keeps_the_held_path() {
     assert_eq!(retry.family_reads, 1, "only the changed member is read");
     assert!(retry.retry_pending, "the ordinary path holds the family");
 }
-
 
 /// SOURCE B9 held path, the remaining case: a member that disappears after
 /// the red window yields no parse in the retry window, so nothing cancels the
@@ -750,7 +740,6 @@ fn c1b_member_removed_after_carry_keeps_the_carry_in_the_window() {
     assert_eq!(retry.red, base_retry.red);
 }
 
-
 /// R1, carry-time refusal through the fold: the walk-ending-page change, with
 /// the family's worst-case cancellation unfunded. The retry start does not
 /// carry the family, so nothing is held or cancelled, and every window's
@@ -786,7 +775,6 @@ fn c1b_unfunded_carry_takes_the_base_path_through_the_fold() {
     assert_eq!(fix.witness_after, base.witness_after);
     assert_eq!(fix.family_pending_after, base.family_pending_after);
 }
-
 
 // Path-(a) bridge, corrected option (ii): a RetryPending authority family
 // keeps its hold and quarantine and withholds the census, but authority debt
@@ -924,7 +912,6 @@ fn c1b_retry_pending_family_beside_witnessed_family_carries_only_the_witnessed_o
     assert_eq!(fix.retry.liveness(), base.retry.liveness());
 }
 
-
 /// COST: the held family itself (its root and every member) is never carried.
 /// Its RetryPending record, bound to its retained witness, is written after
 /// the red window; the retry start carries nothing and equals BASE's.
@@ -958,7 +945,6 @@ fn c1b_retry_pending_family_is_never_carried() {
     assert_eq!(retry.parsed, base_retry.parsed);
     assert!(retry.retry_pending && base_retry.retry_pending);
 }
-
 
 /// COST: authority debt beside another cause on an ordinary red retry,
 /// outside Fix 2's full-rearm-window exception. An unsettled mark already
@@ -1026,7 +1012,6 @@ fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
         .record_after_retry
         .is_some_and(|record| !record.terminal));
 }
-
 
 /// Fix 2's exception remains active beside #705 authority debt and another
 /// producer's unsettled mark: carry only the unchanged witnessed family,
@@ -1136,7 +1121,6 @@ fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry(
     assert_eq!(fix.retry.liveness(), base.retry.liveness());
 }
 
-
 /// SI P1: after a contract change, a full re-arm terminal with one
 /// RetryPending family keeps the contract-5 latch (and with it C1a's and
 /// C1b's skips off) although that debt no longer marks the sweep. Once the
@@ -1196,7 +1180,6 @@ fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
         "the next clean terminal clears it"
     );
 }
-
 
 /// Fix 2's clean follow-up: the red 08:10 window, the full-rearm window the
 /// 08:00 full re-arm opened, instead finished needing a clean follow-up (a
@@ -1284,7 +1267,6 @@ fn fix2_clean_followup_after_full_rearm_carries_unchanged_family() {
     assert_eq!(fix.witness_after, base.witness_after);
 }
 
-
 /// Control, SI I3: a late API row gives the root's requests account evidence
 /// before the clean follow-up, so the sidecar-inclusive selection of every
 /// member changes (M1) and the family is re-read exactly as BASE's re-arm
@@ -1317,7 +1299,6 @@ fn fix2_late_api_row_rereads_the_family_like_base() {
     assert_eq!(fix.heads_after, base.heads_after);
     assert_eq!(fix.witness_after, base.witness_after);
 }
-
 
 /// Exercise Condition X through the widened carry, using actual sidecars,
 /// bounded scanner, proof fold, uploads, ACKs and save/reload between pages.
@@ -1435,7 +1416,6 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
     );
 }
 
-
 /// The approved complement of the existing missing-evidence refusal: a
 /// global unsettled mark no longer makes a separately accepted family read
 /// again; the unrelated RetryPending family keeps its binding and old head.
@@ -1470,7 +1450,6 @@ fn scoped_unhealthy_retry_beside_a_mark_and_authority_debt_carries_accepted_fami
     assert_eq!(run.head_after, run.head_before);
     assert!(run.retry.red && !run.retry.census_complete && run.retry.fence_after);
 }
-
 
 include!("retry_admission_pipeline_tests.rs");
 
@@ -1642,7 +1621,6 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
     }
 }
 
-
 fn source_latch_clear_count(rows: &[serde_json::Value]) -> u64 {
     rows.iter()
         .filter_map(|row| row["counts"]["identity_contract_latch"]["cleared"].as_u64())
@@ -1705,7 +1683,6 @@ fn source_t1_started_a_then_b_keeps_placeholder_through_terminal() {
         (Some(C1A_MID_TRAVERSAL.to_owned()), true)
     );
 }
-
 
 // SOURCE T2: finish the invariant/current-contract G first while F remains
 // owed. The next debt retry carries G, but must read and ACK F's new body.

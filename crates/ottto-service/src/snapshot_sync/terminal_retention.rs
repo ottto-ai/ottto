@@ -96,6 +96,7 @@ pub(super) fn note(index: &ScanIndex, progress: &SnapshotUploadProgress) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// [behaviour] Containment contract: new exact ack has real process age legacy stays unknown.
     #[test]
     fn terminal_off_new_exact_ack_has_real_process_age_legacy_stays_unknown() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();

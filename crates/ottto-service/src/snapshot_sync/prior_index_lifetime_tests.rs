@@ -164,7 +164,6 @@ struct Finished {
 }
 
 fn same_input_finish_pair(outcome: FinishOutcome, conflict: bool, count: usize) -> [Finished; 2] {
-
     let fixture = IdentityPipelineHome::new();
     let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
     let cadence = IdentityPipelineCadence::new();
@@ -356,7 +355,6 @@ fn same_input_finish_pair(outcome: FinishOutcome, conflict: bool, count: usize) 
     output.try_into().ok().unwrap()
 }
 
-
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
@@ -382,7 +380,6 @@ fn prior_index_lifetime_real_finish_releases_before_cas_with_exact_conservation(
         base.allocation.requested_peak, candidate.allocation.requested_peak, live(candidate.observation)).unwrap();
 }
 
-
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
@@ -400,7 +397,6 @@ fn prior_index_lifetime_real_finish_preserves_refusals_retry_and_failed_cas() {
         assert_eq!(base.offered, candidate.offered);
     }
 }
-
 
 #[test]
 #[serial]
@@ -420,7 +416,6 @@ fn prior_index_lifetime_retains_real_earned_receipt_path() {
         "actual predecessor grant keeps P through durable save"
     );
 }
-
 
 /// What one real cycle of the money parity control left: the live outputs
 /// and the native allowance its collection saw.

@@ -221,7 +221,6 @@ fn w0_r5_fixture_digest_reproduces() {
     );
 }
 
-
 #[test]
 fn w0_r5_bounds_match_daemon_caps() {
     let bounds = &w0_index()["bounds"];
@@ -241,7 +240,6 @@ fn w0_r5_bounds_match_daemon_caps() {
     assert_eq!(bounds["money_max_usd"], "1000000000");
     assert_eq!(bounds["cost_fraction_digits"], 6);
 }
-
 
 /// The daemon's own component hashing reproduces W0 for every body: today's
 /// bytes for old collectors, the identity leaf and coverage for the new one.
@@ -269,7 +267,6 @@ fn w0_r5_usage_accounting_and_attribution_hash_parity() {
         }
     }
 }
-
 
 /// Typed rows serialize to the exact W0 wire members (names, omission rules).
 #[test]
@@ -324,7 +321,6 @@ fn w0_r5_wire_round_trip() {
         }
     }
 }
-
 
 fn parse_usd_picos(text: &str) -> u128 {
     let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
@@ -573,7 +569,6 @@ fn w0_r5_builder_reproduces_tagged_bodies() {
     assert!(checked >= 40, "{checked}");
 }
 
-
 /// The cap rule emits W0's fallback shape: today's rows under the new
 /// collector with refusals = bucket rows that lost identity (>= 1).
 #[test]
@@ -638,7 +633,6 @@ fn w0_r5_cap_fallbacks_match_bodies() {
         assert_eq!(identity::semantic_leaf(&built)["refused"], true);
     }
 }
-
 
 fn one_row_item(rows: &[(u64, Option<&str>)]) -> SnapshotItem {
     let mut item = valid_v6_batch_request().snapshots.remove(0);
@@ -726,7 +720,6 @@ fn builder_tags_lowercase_hex_logins_at_the_length_bounds_verbatim() {
     }
 }
 
-
 /// Any other spelling refuses its own usage, which stays on the row untagged:
 /// never rewritten into another login, never poisoning a valid key beside it.
 #[test]
@@ -770,7 +763,6 @@ fn builder_refuses_logins_that_are_not_lowercase_hex() {
     }
 }
 
-
 #[test]
 fn builder_refuses_rows_it_cannot_reproduce_and_leaves_them_untouched() {
     let item = one_row_item(&[(10, None), (20, None)]);
@@ -786,7 +778,6 @@ fn builder_refuses_rows_it_cannot_reproduce_and_leaves_them_untouched() {
     );
 }
 
-
 #[test]
 fn builder_never_emits_money_beyond_micro_dollars() {
     let item = one_row_item(&[(10, Some("0.0000001")), (20, Some("1"))]);
@@ -801,7 +792,6 @@ fn builder_never_emits_money_beyond_micro_dollars() {
     );
     assert_eq!(changed.provenance.collector, "claude_code_jsonl");
 }
-
 
 #[test]
 fn builder_keeps_unsplittable_reported_money_untagged_and_refused() {
@@ -829,7 +819,6 @@ fn builder_keeps_unsplittable_reported_money_untagged_and_refused() {
         Err(identity::Ineligible::RowsNotReproduced)
     );
 }
-
 
 #[test]
 fn builder_hash_is_order_free_and_moves_with_the_login() {
@@ -861,7 +850,6 @@ fn builder_hash_is_order_free_and_moves_with_the_login() {
         "evidence is org+basis only"
     );
 }
-
 
 #[test]
 fn builder_enforces_the_declared_parts_per_item_cap() {
@@ -923,7 +911,6 @@ fn builder_enforces_the_declared_parts_per_item_cap() {
     assert_eq!(refusals, 200);
     assert!(identity::item_bytes(&item) <= identity::MAX_ITEM_BYTES);
 }
-
 
 #[test]
 fn over_cap_diagnostics_increment_each_reason_and_record_last_size() {
@@ -1208,7 +1195,6 @@ fn classify_follows_the_session_rulings() {
     );
 }
 
-
 #[test]
 fn classify_sole_login_needs_desktop_and_a_census_after_the_request() {
     let org = "d".repeat(64);
@@ -1285,7 +1271,6 @@ fn classify_sole_login_needs_desktop_and_a_census_after_the_request() {
     assert_eq!(desktop(&none, true), org_only);
 }
 
-
 /// SESSION ruling: a trace owner outranks the transcript. A request whose
 /// owner is foreign, duplicated or unpaired is refused and never borrows this
 /// transcript's org or sole login, even where both would otherwise qualify.
@@ -1356,7 +1341,6 @@ fn trace_owned_requests_refuse_before_any_transcript_basis() {
     );
 }
 
-
 /// Contract 5 is always on for Claude Code and never for Codex or Pi; no
 /// activity-hint token, present, absent or unknown, changes that. Replaces
 /// `contract5_permit_needs_emission_claude_code_and_the_exact_hint_token` and
@@ -1372,7 +1356,6 @@ fn contract5_capture_is_always_on_for_claude_code_only() {
     assert_eq!(identity::cycle_contract(true), identity::COLLECTOR);
     assert_eq!(identity::cycle_contract(false), "");
 }
-
 
 #[test]
 fn desktop_census_witness_is_bound_to_completion_process_and_inventory() {
@@ -1460,7 +1443,6 @@ fn desktop_census_witness_is_bound_to_completion_process_and_inventory() {
     assert_eq!(old.claude_desktop_census_witness, None);
 }
 
-
 #[test]
 fn desktop_census_witness_follows_the_store_inventory_through_retry_backoff() {
     const NOW: u64 = 1_800_000_000; // 2027-01-15T08:00:00Z
@@ -1504,7 +1486,6 @@ fn desktop_census_witness_follows_the_store_inventory_through_retry_backoff() {
         assert_eq!(identity::desktop_census_at(&index, NOW), None, "{changed:?}");
     }
 }
-
 
 // --- Markers ----------------------------------------------------------------
 
@@ -1577,7 +1558,6 @@ fn markers_govern_later_responses_and_distrust_unexplained_flips() {
     }
 }
 
-
 #[test]
 fn parser_captures_owned_markers_and_never_inherited_ones() {
     let dir = temp_dir("claude-request-identity-markers");
@@ -1608,7 +1588,6 @@ fn parser_captures_owned_markers_and_never_inherited_ones() {
         .contains("credential_org"));
     let _ = fs::remove_dir_all(dir);
 }
-
 
 // --- End to end on both usage paths -------------------------------------------
 
@@ -1661,7 +1640,6 @@ fn transcript_path_tags_parsed_requests_from_their_own_telemetry() {
     assert_eq!(item.request_identity_refusals, 0);
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// D1 leaves new-collector items alone, so contract 5 must apply the same
 /// lifecycle spelling D1 applies; the lifecycle component may not drift.
@@ -1719,7 +1697,6 @@ fn contract5_lifecycle_matches_the_legacy_qualification_path() {
     assert_eq!(serde_json::to_vec(&untagged).unwrap(), before);
     let _ = fs::remove_dir_all(dir);
 }
-
 
 #[test]
 fn reported_path_tags_from_rebuild_groupings() {
@@ -1800,7 +1777,6 @@ fn reported_path_tags_from_rebuild_groupings() {
     assert_eq!(outcome.ineligible, 1, "{outcome:?}");
     let _ = fs::remove_dir_all(dir);
 }
-
 
 const CHILD_AGENT: &str = "a4d1585d310070d0f";
 
@@ -2049,7 +2025,6 @@ fn reported_rebuild_groups_requests_without_changing_its_output() {
     }
 }
 
-
 /// F1 repair path. A complete census that proves a family re-arms each member
 /// that pass did not parse (the existing earlier-page re-arm), so the next
 /// pass re-parses it and rebuilds its reported body from the family witness.
@@ -2166,7 +2141,6 @@ fn proven_reported_members_are_rearmed_and_reoffered_as_contract5() {
     assert_eq!(reparsed[1].provenance.collector, identity::COLLECTOR);
     let _ = fs::remove_dir_all(dir);
 }
-
 
 const LEGACY_PARENT: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 const LEGACY_CHILD: &str = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
@@ -2366,7 +2340,6 @@ fn legacy_excluded_reported_fork_stays_contract5_by_owned_requests() {
         let _ = fs::remove_dir_all(dir);
     }
 }
-
 
 /// A quiet off-page family member must not lose Full authority on a
 /// debt-free Unchanged retry. Both protected-list states use legacy money,
@@ -2700,7 +2673,6 @@ fn legacy_exclusion_skew_never_tags_or_borrows_the_parent() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 #[test]
 fn unreadable_sidecars_refuse_and_unqualified_items_keep_todays_bytes() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
@@ -2744,7 +2716,6 @@ fn unreadable_sidecars_refuse_and_unqualified_items_keep_todays_bytes() {
     assert_eq!(serde_json::to_vec(&unqualified).unwrap(), before);
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// Equal-input end-to-end resource comparison (synthetic, bounded): one
 /// 2,000-response transcript over 10 hours with 2 logins and 64 marker lines,
@@ -2912,7 +2883,6 @@ fn equal_input_resource_comparison() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 /// Aggregation is bounded by rows and authority keys, not by requests: ten
 /// times the requests over the same rows and keys retain exactly the same
 /// heap, keys past the cap fold into untagged as they arrive, and a request
@@ -2985,7 +2955,6 @@ fn grouping_retains_nothing_per_request() {
     assert_eq!(serde_json::to_vec(&item).unwrap(), before);
 }
 
-
 // --- Review regressions ---------------------------------------------------------
 
 #[test]
@@ -3012,7 +2981,6 @@ fn transcript_bases_need_the_original_clock() {
     plain.event_clock_complete = false;
     assert_eq!(identity::classify(&evidence, &plain), RequestIdentity::Missing);
 }
-
 
 #[test]
 fn only_intact_rows_establish_login_org_membership() {
@@ -3047,7 +3015,6 @@ fn only_intact_rows_establish_login_org_membership() {
     );
 }
 
-
 #[test]
 fn sidecar_absence_is_distinguished_from_failure() {
     let support = temp_dir("claude-request-identity-sidecars");
@@ -3061,7 +3028,6 @@ fn sidecar_absence_is_distinguished_from_failure() {
     assert!(!crate::claude_local_otel::claude_sidecars_absent(&support, ROOT));
     let _ = fs::remove_dir_all(support);
 }
-
 
 /// A contract-5 body tagged from four requests (`mixed`: two logins; else all
 /// login A), with the given creator evidence, and its scan-local admission.
@@ -3215,7 +3181,6 @@ fn bound_sessions_admit_contract5_only_with_absent_or_matching_creator() {
     assert!(bind_owner_a(&mut items, &capability, true, "machine").0, "parts changed");
     let _ = fs::remove_dir_all(dir);
 }
-
 
 // --- transcript_email over the status-coverage feed --------------------------
 
@@ -3442,7 +3407,6 @@ fn transcript_email_never_binds_and_refuses_unqualified_coverage() {
     );
 }
 
-
 #[test]
 fn status_pairings_establish_marker_org_membership_for_the_telemetry_login() {
     let org_e = "e".repeat(64);
@@ -3473,7 +3437,6 @@ fn status_pairings_establish_marker_org_membership_for_the_telemetry_login() {
         .with_status_coverage(Some(coverage(home, LOGIN_A, &org_e, 1, 1)));
     assert_eq!(identity::classify(&foreign, &request), tagged(None));
 }
-
 
 /// One synthetic session in a slot folder: an arbitrary recorded email (before
 /// or after `req_1`, optionally switched), a credential org marker and `req_1`.
@@ -3605,7 +3568,6 @@ fn unmatched_email_in_a_registered_folder_is_refused_end_to_end_with_usage_conse
     }
     let _ = fs::remove_dir_all(dir);
 }
-
 
 #[test]
 fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
@@ -3747,7 +3709,6 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 // --- Cross-root ownership and settled transcript markers ----------------------
 
 const OTHER_ROOT: &str = "2448b91b-a47d-4dcd-b6cc-61ad77541cb6";
@@ -3821,7 +3782,6 @@ fn rows_under_another_root_own_the_request() {
         })
     );
 }
-
 
 /// A witnessed duplicate still refuses. Every pass withdraws marker-derived
 /// tags to missing or login-only, including a fully compared/open census.
@@ -3940,7 +3900,6 @@ fn transcript_markers_are_withdrawn_even_when_a_settled_census_shows_unduplicate
     }
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// The open/settled result that D2 will supply cannot authorize copied
 /// markers. Both production grouping routes must withdraw them, even before
@@ -4146,7 +4105,6 @@ fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 /// Non-marker capture-ON bodies retain main's pre-withdrawal wire bytes.
 /// The oracle reproduces tag_item at main 02cad8ab: build the RequestSink
 /// grouping and apply it directly, which a settled pass did on that head.
@@ -4202,7 +4160,6 @@ fn capture_on_non_marker_body_matches_main_before_withdrawal() {
     );
     let _ = fs::remove_dir_all(dir);
 }
-
 
 // --- Zero-usage responses -----------------------------------------------------
 
@@ -4361,7 +4318,6 @@ fn zero_usage_api_error_with_request_id_keeps_contract5_and_claims_nothing() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 /// Zero-usage records the parser never counts as a request id keep today's
 /// contract 5 unchanged: an error without a request id, and a response whose
 /// early progressive record is all zero before its final usage.
@@ -4397,7 +4353,6 @@ fn zero_usage_without_an_id_or_before_final_usage_keeps_todays_contract5() {
     }
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// A zero-usage record admits nothing else: with one present, nonzero usage
 /// without its own request id, a nonzero request id held by two responses, a
@@ -4456,7 +4411,6 @@ fn zero_usage_record_never_admits_unowned_or_uncounted_usage() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 /// A copied response whose telemetry sits under another root stays refused
 /// and never lends that root's login, with or without a zero-usage record.
 #[test]
@@ -4512,7 +4466,6 @@ fn zero_usage_record_keeps_a_foreign_owned_request_refused() {
     assert_eq!(bodies[0], bodies[1]);
     let _ = fs::remove_dir_all(dir);
 }
-
 
 // Recent activity is independent of session-first origin and billing identity.
 #[test]
@@ -4582,7 +4535,6 @@ fn desktop_recent_follows_each_request_entrypoint_and_governing_org() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 #[test]
 fn desktop_recent_cli_to_desktop_and_missing_entrypoint_fail_closed() {
     let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
@@ -4623,7 +4575,6 @@ fn desktop_recent_cli_to_desktop_and_missing_entrypoint_fail_closed() {
     assert_eq!(sink.finish().desktop_recent().at(LOGIN_A, &org_hash(ORG_2)),
         OffsetDateTime::parse("2026-08-02T07:00:01Z", &Rfc3339).ok());
 }
-
 
 /// Same order as the daemon: save native originals, apply request enrichment
 /// (including its billing veto), rebuild/place requests, then publish the fold.
@@ -4702,7 +4653,6 @@ fn desktop_recent_survives_same_account_org_switch_through_enrichment_and_both_f
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 #[test]
 fn desktop_recent_refuses_foreign_conflicting_and_other_account_requests_without_duplicate_index() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
@@ -4744,7 +4694,6 @@ fn desktop_recent_refuses_foreign_conflicting_and_other_account_requests_without
     }
     fs::remove_dir_all(dir).unwrap();
 }
-
 
 // --- Local account display: current account and account history -------------
 
@@ -4949,7 +4898,6 @@ fn current_account_follows_the_newest_request_not_its_hour_bucket() {
     assert_eq!(display.current.account_identifier_hash, owned(&hex('b')));
 }
 
-
 /// A newer unidentified request makes the current account unknown; it never
 /// falls back to the previous or the most-used account. Totals stay whole.
 #[test]
@@ -4980,7 +4928,6 @@ fn a_newer_unidentified_request_clears_the_current_account() {
     assert_eq!(display.history.iter().map(|u| u.input_tokens).sum::<u64>(), row_input);
 }
 
-
 /// Requests at the same newest instant that disagree on any of account,
 /// workspace or plan leave the current account unknown; agreeing ones do not.
 #[test]
@@ -5009,7 +4956,6 @@ fn equal_newest_times_with_different_triples_are_unknown() {
     assert_eq!(display.current.account_identifier_hash, owned(&hex('a')));
 }
 
-
 /// A newer request replaces the entire conflicting tie set, even when its
 /// storage reuses one of those ties. No old account/workspace/plan may survive.
 #[test]
@@ -5030,7 +4976,6 @@ fn newer_request_replaces_conflicting_latest_ties() {
         assert_eq!(actual.history.iter().map(|entry| entry.request_count).sum::<u64>(), 3);
     }
 }
-
 
 /// One login across two workspaces and two plans: every exact triple stays
 /// its own use, and the current one names the newest request's own workspace
@@ -5057,7 +5002,6 @@ fn one_login_keeps_each_workspace_and_plan_apart() {
         ]
     );
 }
-
 
 /// A transcript request without its own clock proves no order; an auxiliary
 /// telemetry-only request, newest or not, never decides the current account
@@ -5096,7 +5040,6 @@ fn missing_clocks_and_auxiliary_requests_never_decide_the_current_account() {
     assert_eq!(display.current.latest_request_at, None);
 }
 
-
 /// Transcript-marker tags withdraw from the display exactly as from the wire:
 /// an org-only newest request is unidentified, and login-only telemetry loses
 /// a marker org.
@@ -5117,7 +5060,6 @@ fn withdrawn_transcript_tags_withdraw_from_the_display() {
     assert!(item.request_evidence.iter().all(|entry| entry.provider_workspace_hash.is_none()));
 }
 
-
 /// A row whose money cannot be split is untagged on the wire, so its newest
 /// request names no account on the card either.
 #[test]
@@ -5134,7 +5076,6 @@ fn an_unsplittable_row_untags_its_newest_request() {
     assert_eq!(display.history[0].account_identifier_hash, None);
     assert_eq!(display.history[0].request_count, 2);
 }
-
 
 /// Over the identity caps the item falls back untagged: every use is unnamed
 /// and the current account is withheld. An ineligible item gets no display.
@@ -5189,7 +5130,6 @@ fn fallback_withholds_and_ineligible_items_carry_no_display() {
     let wire = serde_json::to_string(&timed).unwrap();
     assert!(!wire.contains("latest_request_at") && !wire.contains("last_used_at"));
 }
-
 
 /// End to end on parsed requests: the newest own request's account is
 /// current, and a response without a complete event clock proves no order.
@@ -5279,6 +5219,5 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
     }
     let _ = fs::remove_dir_all(dir);
 }
-
 
 include!("claude_request_identity_window_tests.rs");

@@ -75,7 +75,6 @@ fn terminal_contract_v1_to_v2_one_paced_attempt_then_terminal_on_failure() {
     });
 }
 
-
 #[test]
 fn terminal_contract_current_and_future_versions_and_superseded_never_rearm() {
     let mut progress = test_upload_progress();
@@ -113,7 +112,6 @@ fn terminal_contract_current_and_future_versions_and_superseded_never_rearm() {
     });
 }
 
-
 #[test]
 fn terminal_contract_newer_index_assessment_dominates_stale_progress() {
     let mut progress = test_upload_progress();
@@ -135,7 +133,6 @@ fn terminal_contract_newer_index_assessment_dominates_stale_progress() {
         assert!(progress.active_quarantine_retries.is_empty());
     });
 }
-
 
 #[test]
 fn terminal_contract_permanent_refusal_keeps_its_existing_gate() {
@@ -171,7 +168,6 @@ fn terminal_contract_permanent_refusal_keeps_its_existing_gate() {
         assert_eq!(loaded.permanent_rejections, progress.permanent_rejections);
     });
 }
-
 
 // Round 2 uses both real checkpoint writers/readers. The retained identity
 // fields live in ScanIndex; exact ACK/cache/refusal evidence lives in progress.
@@ -431,7 +427,6 @@ fn terminal_contract_malformed_values_keep_both_checkpoints_and_one_paced_debt()
     }
 }
 
-
 fn successful_contract_retry(restart_after_selection: bool) {
     let fixture = RetainedRetryFixture::new();
     with_contract(2, || {
@@ -602,12 +597,10 @@ fn terminal_contract_bump_successful_ack_settles_once_with_stale_index() {
     successful_contract_retry(false);
 }
 
-
 #[test]
 fn terminal_contract_restart_after_saved_lease_keeps_owed_attempt_and_identity() {
     successful_contract_retry(true);
 }
-
 
 // Every pass uses the real source scanner on two unchanged synthetic files.
 // The parser acquisition observer counts actual opened source inputs, including
@@ -687,7 +680,6 @@ impl ReadBudgetFixture {
     }
 
     fn scan_root(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
-
         crate::snapshots::scan_source_roots(
             SnapshotSource::ClaudeCode,
             &[root.to_owned()],
@@ -697,7 +689,6 @@ impl ReadBudgetFixture {
         )
         .unwrap()
     }
-
 
     fn scan(&self, index: &ScanIndex) -> BTreeMap<PathBuf, usize> {
         let (scan, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
@@ -889,19 +880,14 @@ fn contract_read_cap(outcome: InterruptedOutcome, unbound_body: bool) {
 fn terminal_contract_restart_before_outcome_allows_one_more_paced_source_read() {
     contract_read_cap(InterruptedOutcome::Restart, false);
 }
-
-
 #[test]
 fn terminal_contract_repeated_conflicts_cap_actual_source_reads_at_two() {
     contract_read_cap(InterruptedOutcome::Conflict, false);
 }
-
-
 #[test]
 fn terminal_contract_failed_outcome_save_caps_actual_source_reads_at_two() {
     contract_read_cap(InterruptedOutcome::SaveFailure, false);
 }
-
 
 #[test]
 fn terminal_contract_stale_index_and_same_generation_cas_keep_maximum_claim() {
@@ -949,7 +935,6 @@ fn terminal_contract_stale_index_and_same_generation_cas_keep_maximum_claim() {
         fixture.retained.assert_retained(&index, &progress);
     });
 }
-
 
 #[test]
 fn terminal_contract_malformed_claims_exhaust_without_reset_or_opaque_hold() {
@@ -1006,7 +991,6 @@ fn terminal_contract_malformed_claims_exhaust_without_reset_or_opaque_hold() {
     }
 }
 
-
 #[test]
 fn terminal_contract_next_version_starts_a_distinct_paced_budget() {
     let mut progress = test_upload_progress();
@@ -1047,12 +1031,10 @@ fn terminal_contract_next_version_starts_a_distinct_paced_budget() {
     });
 }
 
-
 #[test]
 fn terminal_contract_legacy_unknown_body_conflicts_keep_the_two_source_read_cap() {
     contract_read_cap(InterruptedOutcome::Conflict, true);
 }
-
 
 // SOURCE's post-ACK/pre-index crash seam: the scanner's actual next delta
 // omits the accepted retry. Both checkpoints must retain the evidence until
@@ -1230,8 +1212,6 @@ fn contract_ack_saved_before_index_restart(unrelated: bool) {
 fn terminal_contract_ack_saved_before_index_restart_survives_empty_delta() {
     contract_ack_saved_before_index_restart(false);
 }
-
-
 #[test]
 fn terminal_contract_ack_saved_before_index_restart_survives_unrelated_only_delta() {
     contract_ack_saved_before_index_restart(true);

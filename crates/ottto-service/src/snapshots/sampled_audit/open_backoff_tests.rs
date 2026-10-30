@@ -319,6 +319,7 @@ fn held_open_backoff_overflow_evicts_oldest_and_keeps_its_due_owed() {
     assert_eq!(held_audit_open_backoff_evicted(), 1);
 }
 
+/// [behaviour] Containment contract: parked open is blocked at common boundary for all candidate routes and stat wakes.
 #[test]
 fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_wakes() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -420,6 +421,7 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
     );
 }
 
+/// [behaviour] Containment contract: blocked due debt does not resample neighbours and stat change wakes recovery.
 #[test]
 fn blocked_due_debt_does_not_resample_neighbours_and_stat_change_wakes_recovery() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -550,6 +552,7 @@ fn blocked_due_debt_does_not_resample_neighbours_and_stat_change_wakes_recovery(
     }
 }
 
+/// [behaviour] Containment contract: restoring held marker preserves same stat park and original due.
 #[test]
 fn restoring_held_marker_preserves_same_stat_park_and_original_due() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();

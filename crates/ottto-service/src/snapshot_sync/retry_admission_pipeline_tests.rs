@@ -261,7 +261,6 @@ fn persistent_structural_refusal_serves_due_authority_and_finishes_bounded_admis
     );
 }
 
-
 /// Real durability at the baseline and all three measured checkpoints. This
 /// retains save/CAS, manifest publication and the ordinary lenient loader.
 fn scale_checkpoint(fixture: &RearmFixture, mut index: ScanIndex) -> ScanIndex {

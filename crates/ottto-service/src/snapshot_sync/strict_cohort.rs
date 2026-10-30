@@ -99,6 +99,7 @@ fn select(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// [behaviour] Containment contract: strict cohort bounds many offpage roots and continues.
     #[test]
     fn terminal_off_strict_cohort_bounds_many_offpage_roots_and_continues() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();

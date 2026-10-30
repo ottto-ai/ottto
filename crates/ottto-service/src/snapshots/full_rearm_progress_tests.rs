@@ -321,7 +321,6 @@ fn unchanged_structural_set_skips_repeated_full_rearms() {
     }
 }
 
-
 /// An incremental terminal that reads nothing is closed only by coverage, by
 /// the same unchanged structural family; it skips too. BASE re-arms.
 #[test]
@@ -340,7 +339,6 @@ fn coverage_only_terminal_skips_while_the_set_is_unchanged() {
     assert_eq!(quiet.suppression.full_rearm_skipped_invalid_unchanged, 2);
     assert_eq!(quiet.rearmed_files, 0);
 }
-
 
 /// COST: any change to a recorded member's revision re-arms exactly once;
 /// that window records the new set and the skip resumes, counted afresh.
@@ -379,7 +377,6 @@ fn changed_member_revision_rearms_once_then_skips_again() {
     assert!(uncommitted.counts.full_rearm, "{uncommitted:?}");
 }
 
-
 /// A changed set: a second structurally invalid family re-arms once, then
 /// the two-family set skips.
 #[test]
@@ -397,7 +394,6 @@ fn new_structural_family_rearms_once() {
     assert!(skipped.suppression.full_rearm_suppressed, "{skipped:?}");
     assert_eq!(skipped.suppression.structural_invalid_family_count, 2);
 }
-
 
 /// Non-structural invalidation: a member changed within the window, or the
 /// pending-occurrence cap, re-arms even while the structural set is
@@ -454,7 +450,6 @@ fn non_structural_invalidation_rearms() {
     );
 }
 
-
 /// F1a: an unrecorded contract never skips. A set contract-5 latch still
 /// re-reads every family file once through its identity contract re-arm,
 /// which clears the latch; since the contract-5 cutover (Lead B) the latch
@@ -485,7 +480,6 @@ fn identity_contract_latch_or_unrecorded_contract_rearms() {
     assert!(skipped.suppression.full_rearm_suppressed, "{skipped:?}");
     assert_eq!(scope.finish().contract.identity_contract_latch.cleared, 1);
 }
-
 
 /// A record written under another basis (a D1 derivation, scan identity or
 /// record version bump) re-arms once, then the current basis is recorded.
@@ -519,7 +513,6 @@ fn record_basis_change_rearms_once() {
     );
 }
 
-
 /// A first-proof hold on a dormant owner (C1a) waits on the full re-arm, so
 /// it vetoes the skip until one runs.
 #[test]
@@ -544,7 +537,6 @@ fn first_proof_hold_vetoes_the_skip_until_a_full_rearm() {
             .full_rearm_suppressed
     );
 }
-
 
 /// A malformed persisted progress value decodes as no progress: the index
 /// still loads (nothing is quarantined) and the next due terminal re-arms.
@@ -599,7 +591,6 @@ fn malformed_persisted_progress_loads_and_rearms() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 /// COST ruling #3: a rebuilt index (the #700 seen marker beside a fresh
 /// index) starts no backoff ramp. Its first close still re-arms once, but the
 /// next due re-arm waits the capped delay; without the marker a fresh index
@@ -649,7 +640,6 @@ fn rebuilt_index_first_close_waits_the_capped_delay() {
     let _ = fs::remove_dir_all(support);
 }
 
-
 #[test]
 fn structural_classification_accepts_only_own_byte_count_failures() {
     let rearm = Rearm::new();
@@ -669,7 +659,6 @@ fn structural_classification_accepts_only_own_byte_count_failures() {
     assert!(!claude_member_invalidity_is_structural(&unknown));
 }
 
-
 #[test]
 fn unknown_identity_failure_in_a_structural_family_keeps_the_rearm() {
     let rearm = Rearm::new();
@@ -682,7 +671,6 @@ fn unknown_identity_failure_in_a_structural_family_keeps_the_rearm() {
     assert!(!unknown.suppression.full_rearm_suppressed);
     assert_eq!(unknown.rearmed_files, 2);
 }
-
 
 #[test]
 fn contract_rearm_remains_independent_of_the_full_rearm_deadline() {
@@ -707,7 +695,6 @@ fn contract_rearm_remains_independent_of_the_full_rearm_deadline() {
         "the unsettled latch survives"
     );
 }
-
 
 /// The production scanner retires a clean traversal before the fold. Its
 /// origin must survive so the re-arm can bind the next window, even then.
@@ -760,7 +747,6 @@ fn full_rearm_window_keeps_the_origin_after_scanner_checkpoint_retirement() {
         BTreeSet::from(["2026-08-02T07:20:00Z".to_string()])
     );
 }
-
 
 /// An observation before the deadline cannot pay for the required full re-arm.
 #[test]
@@ -852,7 +838,6 @@ fn non_due_changes_remain_owed_until_one_real_full_rearm() {
     }
 }
 
-
 /// These explanations never contribute request ids to the duplicate census.
 /// Exercise each alone, including both withheld-account reasons.
 #[test]
@@ -889,7 +874,6 @@ fn attribution_explanations_do_not_rearm_an_unchanged_structural_baseline() {
     }
 }
 
-
 /// A transient read failure stays retryable, then a healthy read of the same
 /// evidence can suppress again without replacing the structural baseline.
 #[test]
@@ -919,7 +903,6 @@ fn evidence_read_failure_rearms_but_a_healthy_retry_suppresses() {
     assert!(!recovered.counts.full_rearm);
     assert_eq!(recovered.rearmed_files, 0);
 }
-
 
 /// Every disallowed cause is exercised through the real terminal fold with
 /// an otherwise unchanged, established structural baseline.
@@ -997,7 +980,6 @@ fn non_own_byte_causes_veto_structural_suppression_at_the_terminal() {
     }
 }
 
-
 #[test]
 fn unhealthy_earlier_page_keeps_a_healthy_terminal_rearm_enabled() {
     let rearm = Rearm::new();
@@ -1022,7 +1004,6 @@ fn unhealthy_earlier_page_keeps_a_healthy_terminal_rearm_enabled() {
     assert_eq!(run.rearmed_files, 2);
 }
 
-
 #[test]
 fn occurrence_key_mismatch_in_an_already_invalid_family_still_vetoes() {
     let rearm = Rearm::new();
@@ -1045,7 +1026,6 @@ fn occurrence_key_mismatch_in_an_already_invalid_family_still_vetoes() {
     assert!(!run.suppression.full_rearm_suppressed);
     assert_eq!(run.rearmed_files, 2);
 }
-
 
 /// Failed reads retain their retry veto; deterministic sidecar-content
 /// refusals cannot justify a whole-index transcript re-read.
@@ -1248,7 +1228,6 @@ fn pipeline_sidecar_health_vetoes_but_fixed_evidence_refusals_do_not() {
         let _ = fs::remove_dir_all(support);
     }
 }
-
 
 /// One always-on terminal: the real sync evidence stage over the fixture
 /// family with `support`'s sidecars, then the next walk's re-read. Returns
@@ -1487,7 +1466,6 @@ fn always_on_terminals_keep_the_structural_suppression() {
     }
 }
 
-
 /// SOURCE condition (2026-10-28 review of #840): the permitted shape with
 /// real tagged bodies. The index records E2 and the structural baseline is
 /// built with evidence. Every request of the family has a paired row with
@@ -1567,7 +1545,6 @@ fn a_tagged_permitted_body_keeps_census_identity_and_the_suppression() {
     });
 }
 
-
 /// Control for the structural suppression (Lead B condition D): contract 5
 /// tags only from D1's account-checked login, and a family whose one
 /// checked row covers one of the parent's four requests also withholds the
@@ -1636,7 +1613,6 @@ fn a_withheld_account_rearms_the_same_before_and_after_the_cutover() {
         },
     );
 }
-
 
 /// Lead B condition D with Lead A ruling (a). A never-permitted install
 /// recorded `""` and its structural baseline under it (no evidence); the
@@ -1759,7 +1735,6 @@ fn a_contract_change_rearms_at_most_once_then_skips() {
     }
 }
 
-
 /// Lead A ruling (a), gate off (collector contract, revision below 3), where
 /// the latch's own re-arm clears every family file. A never-permitted index
 /// (recorded `""`, structural baseline built without evidence) observes the
@@ -1880,7 +1855,6 @@ fn a_never_permitted_cutover_rearms_once_and_is_counted() {
     );
 }
 
-
 /// A pre-cutover writer drops the spent field and records `""` again.
 /// Re-upgrading owes exactly one additional counted cutover, then keeps SPENT
 /// through another terminal and restart. An unknown contract is not this case.
@@ -1982,7 +1956,6 @@ fn a_dropped_cutover_field_with_recorded_empty_spends_one_more_run() {
         },
     );
 }
-
 
 /// A telemetry-only row never has a transcript clock to regenerate. Its
 /// canonical BadClock refusal stays visible without forcing whole-index Full.
@@ -2153,7 +2126,6 @@ fn pipeline_auxiliary_bad_clock_preserves_refusal_without_whole_index_rearm() {
     let _ = fs::remove_dir_all(support);
 }
 
-
 /// A previously loaded rebuild checkpoint can prove a new complete read; a
 /// fresh load itself cannot. This is the same non-fresh rule used by #712.
 fn rebuild_candidate(rearm: &Rearm, origin: ScanIndexLoadOrigin) -> ScanIndex {
@@ -2225,7 +2197,6 @@ fn complete_rebuild_read_skips_only_the_first_close_and_discloses_it() {
     let due = rearm.terminal(&mut index, &rearm.items);
     assert!(due.counts.full_rearm, "proof is single-use: {due:?}");
 }
-
 
 #[test]
 fn incomplete_rebuild_read_keeps_rearm_for_every_refusal() {
@@ -2317,7 +2288,6 @@ fn incomplete_rebuild_read_keeps_rearm_for_every_refusal() {
     }
 }
 
-
 #[test]
 fn fresh_load_origins_never_prove_a_complete_rebuild_even_after_replay_fills_files() {
     let rearm = Rearm::new();
@@ -2340,7 +2310,6 @@ fn fresh_load_origins_never_prove_a_complete_rebuild_even_after_replay_fills_fil
     empty.settle_claude_index_load(&rearm.root.join("empty.json"), ScanIndexLoadOrigin::Loaded);
     assert!(!empty.claude_rebuild_read_load_eligible);
 }
-
 
 /// Real discovery/parser wiring, plus fail-closed reuse of unchanged files.
 #[test]
@@ -2409,7 +2378,6 @@ fn scanner_seals_only_actual_complete_rebuild_reads() {
     );
 }
 
-
 #[test]
 fn structural_family_masks_duplicate_ownership_but_native_copy_still_rearms() {
     const THIRD_ROOT: &str = "d6666666-6666-4666-8666-666666666666";
@@ -2477,7 +2445,6 @@ fn structural_family_masks_duplicate_ownership_but_native_copy_still_rearms() {
     );
 }
 
-
 #[test]
 fn scanner_does_not_seal_capped_or_failed_rebuild_reads() {
     for failed in [false, true] {
@@ -2510,7 +2477,6 @@ fn scanner_does_not_seal_capped_or_failed_rebuild_reads() {
         assert!(!take_claude_complete_rebuild_read(&mut index, WINDOW));
     }
 }
-
 
 /// Appending the missing telemetry selects both members through their root's
 /// sidecar fingerprint. An unrelated, structurally invalid family stays quiet.
@@ -2723,7 +2689,6 @@ fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
     });
 }
 
-
 /// A fixed gap cannot be cured by the first-proof re-arm either. Once the
 /// gap is fixed, the existing dormant-owner hold must veto suppression again.
 #[test]
@@ -2844,7 +2809,6 @@ fn dormant_owner_hold_returns_when_unrelated_sidecar_gap_is_fixed() {
         assert_eq!(run.rearmed_files, if gap { 0 } else { 3 });
     }
 }
-
 
 fn diagnostics(counts: crate::local_resource_diagnostics::claude_reread::Counts) -> Value {
     serde_json::to_value(counts).unwrap()
@@ -3046,7 +3010,6 @@ fn each_canonical_telemetry_refusal_is_counted_without_whole_index_rearm() {
     }
 }
 
-
 #[test]
 fn semantic_refusal_keys_follow_real_proof_reconstruction_inputs_and_rebuild_branches() {
     let _gate = claude_request_money::e2::GateForTest::off();
@@ -3142,7 +3105,6 @@ fn semantic_refusal_keys_follow_real_proof_reconstruction_inputs_and_rebuild_bra
         assert_ignored(&diagnostics(scope.finish()), cause, 3);
     }
 }
-
 
 #[test]
 fn attribution_keys_and_request_sink_refusal_are_diagnostic_only() {
@@ -3244,7 +3206,6 @@ fn attribution_keys_and_request_sink_refusal_are_diagnostic_only() {
     }
 }
 
-
 #[test]
 fn ignored_reasons_follow_window_scope_and_exclude_independent_or_empty_clears() {
     let mut rearm = Rearm::new();
@@ -3290,7 +3251,6 @@ fn ignored_reasons_follow_window_scope_and_exclude_independent_or_empty_clears()
     progress.observe_ignored("new", IgnoredVeto::EvidenceGap.bit());
     assert_eq!(progress.ignored_vetoes, IgnoredVeto::EvidenceGap.bit());
 }
-
 
 #[test]
 fn bound_retry_pending_authority_survives_unrelated_suppression_and_offers_its_own_due_retry() {
@@ -3364,7 +3324,6 @@ fn bound_retry_pending_authority_survives_unrelated_suppression_and_offers_its_o
     );
 }
 
-
 #[test]
 fn ignored_savings_exclude_independent_proof_clears_and_non_due_passes() {
     let _gate = claude_request_money::e2::GateForTest::off();
@@ -3399,7 +3358,6 @@ fn ignored_savings_exclude_independent_proof_clears_and_non_due_passes() {
     );
     assert_ignored(&diagnostics(scope.finish()), "withheld_account", 2);
 }
-
 
 fn reidentify_native(item: &mut SnapshotItem, session: &str, prefix: Option<&str>) {
     let old_root = claude_snapshot_family_root(item);
@@ -3476,7 +3434,6 @@ fn native_cross_family_copy_keeps_vetoing_every_due_terminal_and_is_counted() {
         .get("rearm_structural_native_duplicate")
         .is_none());
 }
-
 
 #[test]
 fn unique_native_growth_and_retirement_do_not_rearm_through_removed_vetoes() {

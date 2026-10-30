@@ -1430,7 +1430,6 @@ impl ApcFixture {
     /// re-arms its earlier-page members; the next one rebuilds them from that
     /// proof and delivers the reported bodies.
     fn establish(&self) -> ApcEstablished {
-
         let family = apc_family_sessions();
         let first = self.generation(8, |_| ApcUpload::Accept);
         let last = first.last().expect("terminal page");
@@ -1485,73 +1484,6 @@ impl ApcFixture {
     }
 
 
-    fn restore_historical_retirement(&self) -> ScanIndex {
-        let mut index = ScanIndex::load(&self.index_path).unwrap();
-        assert!(
-            index.claude_authority_record_for_test(APC_ROOT).is_some(),
-            "current containment retained the absent family's debt first"
-        );
-        assert!(!index.claude_family_tombstoned_for_test(APC_ROOT));
-        index.tombstone_claude_family_for_test(APC_ROOT);
-        let keys = Self::family_keys(&index);
-        let entities = keys
-            .values()
-            .flat_map(|key| {
-                index
-                    .file_snapshot_fingerprints
-                    .get(key)
-                    .into_iter()
-                    .flatten()
-                    .cloned()
-            })
-            .collect::<BTreeSet<_>>();
-        let mut value = serde_json::to_value(&index).unwrap();
-        for field in [
-            "files",
-            "file_snapshot_fingerprints",
-            "accepted_rebuild_incidence",
-        ] {
-            if let Some(map) = value
-                .get_mut(field)
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                for key in keys.values() {
-                    map.remove(key);
-                }
-            }
-        }
-        for field in [
-            "claude_usage_authority_quarantine",
-            "claude_usage_family_pending",
-            "claude_account_family_pending",
-        ] {
-            if let Some(map) = value
-                .get_mut(field)
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                map.remove(APC_ROOT);
-            }
-        }
-        if let Some(accepted) = value["accepted_snapshot_fingerprints"].as_array_mut() {
-            accepted.retain(|v| !v.as_str().is_some_and(|fp| entities.contains(fp)));
-        }
-        std::fs::write(&self.index_path, serde_json::to_vec(&value).unwrap()).unwrap();
-        // Old completing retirement also released these exact transport ACKs.
-        if let Ok(bytes) = std::fs::read(&self.progress_path) {
-            let mut progress: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            if let Some(accepted) = progress["accepted_fingerprints"].as_array_mut() {
-                accepted.retain(|v| !v.as_str().is_some_and(|fp| entities.contains(fp)));
-            }
-            if let Some(bodies) = progress["accepted_body_witnesses"].as_object_mut() {
-                bodies.retain(|fp, _| !entities.contains(fp));
-            }
-            std::fs::write(&self.progress_path, serde_json::to_vec(&progress).unwrap()).unwrap();
-        }
-        let restored = ScanIndex::load(&self.index_path).unwrap();
-        assert!(restored.claude_family_tombstoned_for_test(APC_ROOT));
-        assert!(Self::family_keys(&restored).is_empty());
-        restored
-    }
 
     fn restore_historical_proof(&self, correction: bool) -> String {
         let mut index = ScanIndex::load(&self.index_path).expect("load historical fixture input");
@@ -1605,7 +1537,6 @@ impl ApcFixture {
     /// and its save must reload intact with the record rebound to that proof
     /// and owing a correction.
     fn reach_grant(&self) -> (ApcEstablished, ApcGrant) {
-
         let established = self.establish();
         let family = apc_family_sessions();
         let max = crate::snapshots::MAX_CLAUDE_USAGE_AUTHORITY_FAILURES_FOR_TEST;
@@ -1748,7 +1679,6 @@ impl ApcFixture {
         }
         panic!("a complete census follows the terminal authority hold");
     }
-
 
     /// Classify one page's correction change and check it against SOURCE:
     /// drains only on an exact ACK or a proven no-op of a current body, never
@@ -2011,7 +1941,6 @@ fn changed_proof_after_terminal_authority_owes_one_exact_correction() {
     );
 }
 
-
 /// R2: an owed member deferred by its account hold stays owed while owed
 /// siblings drain on their own exact settlement; the record is kept until
 /// that member's own ACK or no-op, then clears.
@@ -2072,7 +2001,6 @@ fn account_held_member_stays_owed_while_owed_siblings_drain_across_passes() {
     let (finally, _, _) = fixture.drain_until_clear(&grant, grant.hour + 2);
     assert_eq!(finally, BTreeSet::from([held_member]));
 }
-
 
 /// SHED, R6 and acceptance additions 1 and 4: a crash after the parse and
 /// before any settlement leaves the durable index byte-identical; a shed page
@@ -2203,7 +2131,6 @@ fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
     );
 }
 
-
 /// R4: a member's revision changes while it is owed under the same proof. A
 /// late ACK of the superseded revision's corrected body, presented at the
 /// real settlement seam, drains nothing; the current revision's ACK drains it
@@ -2299,7 +2226,6 @@ fn superseded_revision_ack_never_drains_the_current_revision() {
     );
 }
 
-
 /// R3 and the unhealthy-proof control: corrupt API evidence after the grant
 /// demotes the owed family. The record is replaced as terminal with no
 /// correction, still bound to the granted proof, with the counter saturated
@@ -2353,7 +2279,6 @@ fn unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant() {
         "the owed family's parse under unhealthy evidence failed"
     );
 }
-
 
 /// R3 then R5 under natural proof churn: a new request after the grant makes
 /// the owed family fail under P1 (terminal, no correction, deadline kept),
@@ -2441,7 +2366,6 @@ fn new_request_after_the_grant_fails_then_one_new_proof_regrants_all_members() {
         .write_all(format!("{line}\n").as_bytes())
         .expect("write churn receipt");
 }
-
 
 /// R1 and R2 natural incidence across separate bounded pages. After the
 /// natural grant (no seeded state), the unrelated sibling session keeps
@@ -2556,7 +2480,6 @@ fn natural_owed_members_drain_on_separate_bounded_pages() {
         .expect("write multipage receipt");
 }
 
-
 /// R2, CONTROLLED: the owed set is seeded (through the persisted index) to all
 /// three family members after the natural grant, to make this control independent of the natural grant distribution. With the sibling working,
 /// the root and one agent settle on their own separate pages by exact ACK or
@@ -2627,7 +2550,6 @@ fn controlled_three_owed_members_settle_on_their_own_pages_while_one_is_account_
     let (finally, _, _) = fixture.drain_until_clear(&regrant, natural.hour + 2);
     assert_eq!(finally, BTreeSet::from([held_member]));
 }
-
 
 // Synthetic M2 family shape (one or more roots, two members each) built
 // through the persisted index form, because the record type is private to
@@ -2914,13 +2836,11 @@ fn controlled_last_owed_empty_member_with_a_prior_entity_rolls_back_on_a_partial
     apc_checkpoint_last_owed_empty_agent(true, true);
 }
 
-
 #[test]
 fn controlled_last_owed_empty_member_without_a_prior_entity_carries_its_pair_and_drains() {
     apc_checkpoint_last_owed_empty_agent(false, false);
     apc_checkpoint_last_owed_empty_agent(false, true);
 }
-
 
 #[test]
 fn last_empty_correction_completes_replay_in_its_drain_cycle() {
@@ -2994,7 +2914,6 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
     }
 }
 
-
 #[test]
 #[serial(source_manifests)]
 // A rejected entity records Poisoned in the shared client_report counters.
@@ -3052,7 +2971,6 @@ fn exact_permanent_refusal_drains_correction_and_keeps_refusal_witness() {
     }
 }
 
-
 #[test]
 #[serial(source_manifests)]
 fn retryable_refusal_keeps_its_member_owed_across_restart() {
@@ -3073,7 +2991,6 @@ fn retryable_refusal_keeps_its_member_owed_across_restart() {
         .unwrap()
         .claude_authority_proof_correction_pending());
 }
-
 
 #[test]
 #[serial(source_manifests)]
@@ -3096,7 +3013,6 @@ fn complete_cutoff_drains_without_upload_or_repeated_grant_parse() {
         .iter()
         .all(|page| page.parsed.is_disjoint(&apc_family_sessions())));
 }
-
 
 /// R8/A2: requested bytes of the actual locked partial checkpoint on the small
 /// synthetic family shape (32 and 64 roots), for old-contract records, granted
@@ -3188,7 +3104,6 @@ fn locked_partial_checkpoint_requested_bytes_receipt() {
     }
 }
 
-
 /// Real bounded pages, BASE native terminal, selected save and production load.
 #[test]
 #[serial(source_manifests)]
@@ -3268,7 +3183,6 @@ fn retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_qua
     }
     panic!("PRECONDITION_NOT_REACHED: withheld raw-complete native terminal with RetryPending");
 }
-
 
 /// CONTROLLED: after a natural authority record forms, its persisted binding
 /// is broken by hand. Load drops only that record, re-arms only its family's
@@ -3377,7 +3291,6 @@ fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
     }
     panic!("the re-armed family is re-read within two bounded generations");
 }
-
 
 /// SOURCE/COST/SI Round 12 tombstone, proving case. A proven family is held
 /// RetryPending (unhealthy evidence), every member is removed, and a
@@ -3538,7 +3451,6 @@ fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() 
     assert_eq!(ApcFixture::family_keys(&last.index).len(), family.len());
 }
 
-
 /// E2 flip (T8 round 2): a correction owed before the flip settles on its
 /// owed members' first request-owned bodies, through the same exact-ACK
 /// settlement, with one read each; once clear nothing is re-offered.
@@ -3601,7 +3513,6 @@ fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
         );
     }
 }
-
 
 /// E2 flip (T8 round 2), returning tombstoned family (the tombstone formed
 /// before the flip). Gate on, each returning member's request-owned body
@@ -3720,6 +3631,7 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
 }
 
 
+/// [money] Containment retains token, cost, account and exact ACK custody.
 #[test]
 #[serial(source_manifests)]
 fn terminal_off_new_cohort_correction_evidence_waits_durably_for_reconstruction() {

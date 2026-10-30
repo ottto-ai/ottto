@@ -157,7 +157,6 @@ fn oversized_claude_shrink_then_grow_keeps_unread_content_unproven() {
     assert_native(&fixture.scan(SnapshotSource::ClaudeCode, &mut index, 15), 1);
 }
 
-
 #[test]
 fn each_source_admits_its_exact_file_cap_and_refuses_one_more_byte() {
     for (source, limit) in [
@@ -195,7 +194,6 @@ fn each_source_admits_its_exact_file_cap_and_refuses_one_more_byte() {
     }
     assert_eq!(MAX_JSONL_LINE_BYTES, 16 * 1024 * 1024);
 }
-
 
 #[test]
 fn three_hundred_mib_admission_is_claude_only() {
@@ -238,7 +236,6 @@ fn three_hundred_mib_admission_is_claude_only() {
     assert!(!scan.census_complete);
     assert!(index.files.is_empty());
 }
-
 
 #[cfg(target_os = "macos")]
 fn peak_rss() -> u64 {

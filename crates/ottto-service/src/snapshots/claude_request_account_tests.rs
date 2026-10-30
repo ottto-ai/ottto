@@ -197,7 +197,6 @@ fn claude_p92_clock_qualification_and_all_bucket_coverage() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 pub(crate) fn claude_request_account_mixed_fixture(
     count: usize,
     reported: bool,
@@ -207,7 +206,6 @@ pub(crate) fn claude_request_account_mixed_fixture(
     crate::claude_local_otel::ClaudeLocalOtelLoadReport,
     crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
 ) {
-
     let (dir, root, _) = claude_account_family_fixture();
     fs::remove_dir_all(dir.join(&root)).unwrap();
     let path = dir.join(format!("{root}.jsonl"));
@@ -300,7 +298,6 @@ pub(crate) fn claude_request_account_mixed_fixture(
     root_item.source_file_fingerprint = Some("e".repeat(64));
     (dir, root_item, api, trace)
 }
-
 
 #[test]
 fn claude_p92_mixed_body_capability_and_restart_refusals() {
@@ -572,7 +569,6 @@ fn claude_p92_mixed_body_capability_and_restart_refusals() {
     fs::remove_dir_all(prior_dir).unwrap();
 }
 
-
 fn h296_root_evidence() -> (
     PathBuf,
     SnapshotItem,
@@ -633,7 +629,6 @@ fn claude_h296_root_and_child_have_independent_exact_request_logins() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 #[test]
 fn claude_h296_root_refuses_partial_no_otel_owners_and_collisions() {
     let (dir, original, api, trace) = h296_root_evidence();
@@ -681,7 +676,6 @@ fn claude_h296_root_refuses_partial_no_otel_owners_and_collisions() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 #[test]
 fn claude_h296_root_clocks_and_creator_conflicts_stay_separate() {
     // D1 session-account qualification and binding; E2 keeps per-request account partitions.
@@ -713,7 +707,6 @@ fn claude_h296_root_clocks_and_creator_conflicts_stay_separate() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
-
 
 #[test]
 fn claude_h296_root_production_enrichment_keeps_child_separate() {
@@ -755,7 +748,6 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 /// Contract 5 is always on: with no cohort token anywhere, a Claude page
 /// builds contract-5 bodies, the same bytes every run. Was
 /// `claude_contract5_bodies_need_this_cycles_cohort_permit`, whose
@@ -788,7 +780,6 @@ fn claude_contract5_bodies_need_no_cohort_token() {
     assert_eq!(serde_json::to_vec(&run()).unwrap(), serde_json::to_vec(&first).unwrap());
     fs::remove_dir_all(dir).unwrap();
 }
-
 
 #[test]
 fn claude_h296_root_requires_original_clocks_in_every_hour_before_fold() {

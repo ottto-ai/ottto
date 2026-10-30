@@ -63,7 +63,6 @@ impl AckFixture {
     }
 
     fn scan(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
-
         crate::snapshots::scan_source_roots(
             SnapshotSource::ClaudeCode,
             &[root.to_owned()],
@@ -73,7 +72,6 @@ impl AckFixture {
         )
         .unwrap()
     }
-
 
     fn load(&self) -> (ScanIndex, SnapshotUploadProgress) {
         let index = ScanIndex::load(&self.index_path).unwrap();
@@ -312,7 +310,6 @@ fn committed_ack_survives_unrelated_empty_and_failed_pages_after_reload() {
     }
 }
 
-
 #[test]
 fn committed_ack_survives_bootstrap_only_input() {
     let f = AckFixture::new(true);
@@ -335,7 +332,6 @@ fn committed_ack_survives_bootstrap_only_input() {
     .unwrap();
     f.assert_ack(&f.load().1);
 }
-
 
 #[test]
 fn ack_saved_before_index_crash_survives_real_empty_and_unrelated_deltas() {
@@ -413,7 +409,6 @@ fn ack_saved_before_index_crash_survives_real_empty_and_unrelated_deltas() {
     }
 }
 
-
 #[test]
 fn changed_body_replaces_only_its_own_ack() {
     let f = AckFixture::new(true);
@@ -454,7 +449,6 @@ fn changed_body_replaces_only_its_own_ack() {
     );
     assert_eq!(loaded.accepted_body_witnesses[&sibling], "e".repeat(64));
 }
-
 
 #[test]
 fn retirement_requires_committed_scope_and_preserves_unindexed_carried_unknown_and_shared_acks() {
@@ -531,7 +525,6 @@ fn retirement_requires_committed_scope_and_preserves_unindexed_carried_unknown_a
     }
 }
 
-
 #[test]
 fn ack_capacity_stops_admission_without_evicting_evidence_and_settlement_releases_it() {
     let f = AckFixture::new(true);
@@ -585,7 +578,6 @@ fn ack_capacity_stops_admission_without_evicting_evidence_and_settlement_release
     assert!(f.scratch.as_ref().exists());
 }
 
-
 #[test]
 fn default_unsettled_ack_budget_has_bounded_persisted_and_heap_size() {
     let scratch = crate::test_scratch::ScratchDir::new("ack-debt-bound");
@@ -618,7 +610,6 @@ fn default_unsettled_ack_budget_has_bounded_persisted_and_heap_size() {
         );
     }
 }
-
 
 #[test]
 fn semantic_index_acceptance_cannot_dispose_a_newer_exact_body_ack() {
@@ -655,7 +646,6 @@ fn semantic_index_acceptance_cannot_dispose_a_newer_exact_body_ack() {
     progress.finish_cycle(&f.progress_path).unwrap();
     assert!(f.load().1.accepted_fingerprints.is_empty());
 }
-
 
 fn one_body_set_witness(body: &str) -> String {
     let mut digest = Sha256::new();
@@ -873,7 +863,6 @@ fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
     );
 }
 
-
 #[test]
 fn partial_index_replacement_retires_only_proven_state_only_ack() {
     let f = AckFixture::new(true);
@@ -930,7 +919,6 @@ fn partial_index_replacement_retires_only_proven_state_only_ack() {
     );
     assert_eq!(loaded.accepted_body_witnesses[&unknown], unknown);
 }
-
 
 #[test]
 fn vanished_files_retire_acks_at_the_next_committed_complete_census_without_growth() {
@@ -996,7 +984,6 @@ fn vanished_files_retire_acks_at_the_next_committed_complete_census_without_grow
         assert!(saved.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
     }
 }
-
 
 #[test]
 fn retirement_handoff_recovers_5000_acks_after_index_commit_and_cleanup_save_failures() {
@@ -1152,7 +1139,6 @@ fn retirement_handoff_recovers_5000_acks_after_index_commit_and_cleanup_save_fai
     }
 }
 
-
 #[test]
 fn retirement_handoff_is_bound_to_destination_generation_body_and_saved_protections() {
     for mode in [
@@ -1232,7 +1218,6 @@ fn retirement_handoff_is_bound_to_destination_generation_body_and_saved_protecti
     }
 }
 
-
 #[test]
 fn unindexed_debt_cannot_borrow_unused_live_incidence_slots() {
     let f = AckFixture::new(false);
@@ -1253,7 +1238,6 @@ fn unindexed_debt_cannot_borrow_unused_live_incidence_slots() {
     assert!(progress.admit_ack_batch(1).is_ok());
     assert!(progress.admit_ack_batch(2).is_err());
 }
-
 
 #[test]
 #[serial_test::serial(client_report)]
@@ -1338,7 +1322,6 @@ fn capacity_outcome_reports_deferred_entities_without_counting_network_loss() {
     reset_for_test();
 }
 
-
 #[test]
 fn full_unindexed_debt_still_allows_a_live_entity_without_lending_slots_to_unrelated_input() {
     let f = AckFixture::new(false);
@@ -1376,7 +1359,6 @@ fn full_unindexed_debt_still_allows_a_live_entity_without_lending_slots_to_unrel
     assert_eq!(progress.ack_capacity, 4097);
     assert_eq!(index.upload_progress_ack_incidence().count(), 1);
 }
-
 
 #[test]
 fn retirement_obligations_survive_opaque_decode_and_local_hold_cycles() {
@@ -1463,7 +1445,6 @@ fn retirement_obligations_survive_opaque_decode_and_local_hold_cycles() {
     }
 }
 
-
 #[test]
 fn complete_census_retires_never_committed_vanished_acks_after_partial_error() {
     let f = AckFixture::new(false);
@@ -1538,7 +1519,6 @@ fn complete_census_retires_never_committed_vanished_acks_after_partial_error() {
     assert!(f.load().1.accepted_fingerprints.is_empty());
 }
 
-
 #[test]
 fn complete_census_recovers_a_stale_full_cap_and_allows_new_unrelated_upload() {
     let f = AckFixture::new(false);
@@ -1597,7 +1577,6 @@ fn complete_census_recovers_a_stale_full_cap_and_allows_new_unrelated_upload() {
     f.assert_ack(&f.load().1);
 }
 
-
 #[test]
 fn first_install_current_live_incidence_admits_more_than_4096_without_a_stop() {
     let f = AckFixture::new(false);
@@ -1642,7 +1621,6 @@ fn first_install_current_live_incidence_admits_more_than_4096_without_a_stop() {
     );
     assert_eq!(f.load().1.accepted_fingerprints.len(), 4100);
 }
-
 
 #[test]
 fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
@@ -1744,7 +1722,6 @@ fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
         "a".repeat(64)
     );
 }
-
 
 // #778 R2-2: an obligation left by a held save reappears in a new file whose
 // sibling has not settled. The partial subset omits that file; the full scan
@@ -1907,7 +1884,6 @@ fn partial_save_keeps_a_pending_obligation_live_in_an_unsettled_new_file() {
     f.assert_identity(&saved);
 }
 
-
 // #778 R2-2, committed-incidence variant: E leaves its settled file for a new
 // file with an unsettled sibling. Committed incidence minus the committable
 // subset names E, but the full scan still references it.
@@ -2036,7 +2012,6 @@ fn partial_save_never_retires_a_committed_entity_moved_into_an_unsettled_new_fil
     assert_ne!(still_pending, Some(true), "the obligation is discharged");
     f.assert_identity(&saved);
 }
-
 
 fn body_set_witness(bodies: &[String]) -> String {
     let mut bodies = bodies.iter().map(String::as_str).collect::<Vec<_>>();
@@ -2200,7 +2175,6 @@ fn one_file_larger_than_the_unsettled_limit_converges_after_a_mid_file_page_fail
     f.assert_identity(&saved);
 }
 
-
 // #778 R2-3: over-cap debt retires only through a complete census. The local
 // count names how long capacity stops have waited for one.
 #[test]
@@ -2240,7 +2214,6 @@ fn incomplete_census_capacity_stops_count_consecutively_and_reset() {
     );
     ack_retention::note_capacity_stop_census(SnapshotSource::Codex, false, true);
 }
-
 
 // #794 F1: a local hold on sibling H makes the Completed-with-holds and the
 // Deferred/Rejected-with-holds selections omit a new file that still holds
@@ -2368,7 +2341,6 @@ fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_
         );
     }
 }
-
 
 // #794 round 4 guard: production can reach the final ACK apply only with an
 // `AckRetirementPlan`, and no production code can make one from a plain set.

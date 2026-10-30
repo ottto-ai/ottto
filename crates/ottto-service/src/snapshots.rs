@@ -92774,7 +92774,6 @@ pub(crate) mod cache_adapter_tests {
             "production claude cache fixture must remain exact"
         );
     }
-
     #[test]
     fn cache_generated_wire_fixture_and_witness() {
         let item = cache_fixture_item();

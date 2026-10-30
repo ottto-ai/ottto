@@ -161,7 +161,6 @@ fn unrelated_witnessed_families_do_not_change_page_family_rebuild() {
     let _ = fs::remove_dir_all(&crowded.dir);
 }
 
-
 #[test]
 fn rebuild_retains_no_copy_of_unrelated_family_rows() {
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
@@ -193,7 +192,6 @@ fn rebuild_retains_no_copy_of_unrelated_family_rows() {
     let _ = fs::remove_dir_all(&small.dir);
     let _ = fs::remove_dir_all(&large.dir);
 }
-
 
 /// Both arms start from the SAME N-family native evidence and complete index.
 /// The BASE arm changes only the test-only row-retention control; it never

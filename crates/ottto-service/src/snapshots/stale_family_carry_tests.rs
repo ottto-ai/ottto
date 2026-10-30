@@ -266,7 +266,6 @@ fn c1b_unchanged_witnessed_family_is_carried_and_compacted_at_red_retry() {
     }
 }
 
-
 /// T2, red chain: the compacted entry is carried again at the next red retry
 /// (the tripwire is vacuous on it) with no re-arm of its family.
 #[test]
@@ -308,7 +307,6 @@ fn c1b_compacted_family_is_carried_again_across_a_red_chain() {
     assert_eq!(index.claude_usage_family_pending[CARRY_ROOT], compacted);
 }
 
-
 /// T3, cap budget: compacted carried entries hold no occurrences, so the
 /// shared pending budget counts only the re-armed family's.
 #[test]
@@ -330,7 +328,6 @@ fn c1b_compaction_releases_the_pending_occurrence_budget() {
     // FLIPS: BASE keeps the witnessed family's two occurrences.
     assert_eq!(budget(&mut fix), 1);
 }
-
 
 /// Q3 residual: every indexed member is stale, so today's re-arm reaches all
 /// of them; a full retry could reopen the fence only if every stale family is
@@ -359,7 +356,6 @@ fn c1b_invalid_stale_family_cannot_reopen_so_the_witnessed_family_is_carried() {
         assert!(!fix.files[&key].source_file_fingerprint.is_empty());
     }
 }
-
 
 /// A negative control: the mutated failed window re-arms exactly as BASE,
 /// byte for byte, row included.
@@ -676,7 +672,6 @@ fn c1b_negative_controls_rearm_exactly_like_base() {
     }
 }
 
-
 /// F1, refused admission: the carry check prices its scratch before it
 /// allocates any. A refused price, here forced, keeps the BASE start byte for
 /// byte, row and transition counters included, and is counted once.
@@ -705,7 +700,6 @@ fn c1b_refused_carry_scratch_admission_keeps_the_base_start() {
         "the index is BASE's"
     );
 }
-
 
 /// F1, priced refusal: the request-owner map alone prices at (N + 1) * 704
 /// bytes on the supported layout, so a stale window holding 12,000 pending
@@ -755,7 +749,6 @@ fn c1b_carry_scratch_price_refuses_a_large_stale_window() {
     );
 }
 
-
 /// F1, admitted: the fixture's carry scratch prices far under the parked
 /// budget, so nothing is refused and the witnessed family is carried.
 #[test]
@@ -785,7 +778,6 @@ fn c1b_admitted_carry_scratch_carries_the_witnessed_family() {
     }
 }
 
-
 /// F1, layout: the carry check is admitted exactly on the supported layout.
 /// Elsewhere it refuses, so every red retry start is BASE's.
 #[test]
@@ -809,7 +801,6 @@ fn c1b_carry_scratch_admission_follows_the_supported_layout() {
         );
     }
 }
-
 
 const CARRY_SCAN_ROOT: &str = "/carry/projects";
 
@@ -886,7 +877,6 @@ fn c1b_member_only_reemission_line_excludes_the_carried_family_root() {
     let _ = (root_key, fs::remove_dir_all(support));
 }
 
-
 /// R1, admitted: a parse of a carried family's member on a non-terminal page
 /// clears the other member's revision and queues it, once, into the replay
 /// buffer the carry funded, never into the candidate queue. The parsed member
@@ -944,7 +934,6 @@ fn c1b_admitted_carry_cancellation_rearms_and_queues_the_passed_member() {
     );
     assert_eq!(index.claude_stale_family_carry.replay.len(), 1);
 }
-
 
 /// The replay entry a cancel queues for a passed member.
 fn carry_replayed(key: &str) -> ScanTraversalPath {
@@ -1005,7 +994,6 @@ fn c1b_carry_cancellation_price_admits_up_to_the_parked_budget() {
         usize::MAX
     ));
 }
-
 
 const CARRY_RESUME: &str = "2026-08-02T07:25:00Z";
 
@@ -1091,7 +1079,6 @@ fn c1b_carry_cancellation_behind_a_large_backlog_uses_only_the_funded_buffer() {
     carry_assert_cancel_uses_only_the_funded_buffer(&mut index);
 }
 
-
 /// R1, after a reload: a saved and loaded buffer keeps no spare capacity, so
 /// the page that resumes the traversal reserves it again before it selects
 /// anything, and the same cancel behind the same backlog still uses only
@@ -1115,7 +1102,6 @@ fn c1b_carry_cancellation_after_a_reload_uses_only_the_refunded_buffer() {
     );
     carry_assert_cancel_uses_only_the_funded_buffer(&mut index);
 }
-
 
 const CARRY_SECOND_WITNESSED: &str = "d4444444-4444-4444-8444-444444444444";
 
@@ -1169,7 +1155,6 @@ fn c1b_carry_funds_each_family_cancellation_up_to_the_budget() {
     assert_eq!((dropped, first_carried, second_carried), (1, false, true));
 }
 
-
 /// R1, carry-time refusal: when no carried family's worst-case cancellation
 /// is funded, none is carried and the start is BASE's byte for byte, row and
 /// transition counters included, with each dropped family counted once.
@@ -1198,7 +1183,6 @@ fn c1b_unfunded_carry_keeps_the_base_start() {
         "the index is BASE's"
     );
 }
-
 
 /// The retry start in a fix or a BASE arm, resumed by a later page after a
 /// save and load. The walk has queued an unrelated candidate and, unless
@@ -1246,7 +1230,6 @@ fn unfunded_replay_clears_fingerprints_on_every_platform() {
     let fix_value = serde_json::to_value(&fix).unwrap();
     assert_eq!(fix_value, serde_json::to_value(&base).unwrap());
 }
-
 
 /// R1, re-funding refused at a reload before the walk passed any member: the
 /// family is uncarried in place, every member's revision cleared, and the
@@ -1300,7 +1283,6 @@ fn c1b_unfunded_replay_at_a_reload_uncarries_to_the_base_start() {
     assert_eq!(fix_value, base_value, "the index is BASE's");
 }
 
-
 /// R1, re-funding refused at a reload after the walk passed a carried member:
 /// uncarrying in place would leave that member unread in this window, so the
 /// traversal starts again with the family re-armed and nothing carried, and
@@ -1328,7 +1310,6 @@ fn c1b_unfunded_replay_after_a_passed_member_restarts_the_traversal() {
         assert!(index.files[&key].source_file_fingerprint.is_empty());
     }
 }
-
 
 /// R2, defensive reset: factored out of the cancel, whose debug assertion
 /// rules it out. It re-arms every member, the parsed one included, queues the
@@ -1385,7 +1366,6 @@ fn c1b_defensive_carry_reset_rearms_every_member_and_replays_the_passed_one() {
     );
     assert_eq!(index.claude_stale_family_carry.replay.len(), 1);
 }
-
 
 // Fix 2: after a full re-arm terminal, the traversal that re-read every
 // family (started at CARRY_FAILED) finished needing a clean follow-up. Its
@@ -1585,7 +1565,6 @@ fn fix2_clean_followup_carries_window_families_and_caps_stale_rearms() {
     assert!(row.get("stale_rearm_capped_families").is_none());
 }
 
-
 /// Another upload context, a daemon restart (another process), or no window
 /// at all takes BASE's whole re-arm at the clean follow-up.
 #[test]
@@ -1629,7 +1608,6 @@ fn fix2_window_from_another_context_or_process_is_base() {
     }
 }
 
-
 /// Reuse C1b's boundary controls at the clean-follow-up entry. Only the two
 /// entry conditions intentionally changed by Fix 2 are omitted.
 #[test]
@@ -1663,7 +1641,6 @@ fn fix2_clean_followup_preserves_c1b_family_refusals() {
     }
 }
 
-
 #[test]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
@@ -1683,7 +1660,6 @@ fn fix2_restart_before_the_first_window_start_is_base() {
     assert_eq!(row["carried_pending_families"], 0);
     assert!(index.claude_full_rearm_progress.full_rearm_window.is_none());
 }
-
 
 #[test]
 fn fix2_capped_family_member_change_cancels_and_requeues_passed_member() {
@@ -1766,7 +1742,6 @@ fn fix2_capped_family_member_change_cancels_and_requeues_passed_member() {
     }
 }
 
-
 #[test]
 fn fix2_restart_during_a_carried_window_restores_base_before_resuming() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1788,7 +1763,6 @@ fn fix2_restart_during_a_carried_window_restores_base_before_resuming() {
         assert!(index.files[&key].source_file_fingerprint.is_empty());
     }
 }
-
 
 #[test]
 fn fix2_unhealthy_retry_also_honors_the_same_deadline_cap() {
@@ -1816,7 +1790,6 @@ fn fix2_unhealthy_retry_also_honors_the_same_deadline_cap() {
     assert_compacted_and_invalid(&index, CARRY_UNWITNESSED);
     assert_eq!(index.claude_full_rearm_progress.stale_rearms_at_deadline, 1);
 }
-
 
 /// Persist a real active Fix 2 carry, both with and without its capped
 /// fallback. Losing scheduling state or retained provenance must restore
@@ -1965,7 +1938,6 @@ fn fix2_persisted_carry_with_lost_progress_or_origin_restarts_as_base() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 #[test]
 fn fix2_cap_keeps_the_full_retry_that_can_reopen_the_fence() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2005,7 +1977,6 @@ fn fix2_cap_keeps_the_full_retry_that_can_reopen_the_fence() {
         );
     }
 }
-
 
 #[test]
 fn fix2_budget_refusal_precedes_digest_and_cap_allocations() {
@@ -2054,7 +2025,6 @@ fn fix2_budget_refusal_precedes_digest_and_cap_allocations() {
         }
     }
 }
-
 
 #[test]
 #[cfg_attr(
@@ -2108,7 +2078,6 @@ fn new_carry_writer_exposes_only_c1b_roots_to_old_shape_reader() {
     let old: OldCarry = serde_json::from_slice(&serde_json::to_vec(&decoded).unwrap()).unwrap();
     assert_eq!(old.roots, BTreeSet::from([CARRY_ROOT.to_string()]));
 }
-
 
 /// Source-only reproduction of the hold/unsettled retry shape. The optional
 /// acquisition cache is deliberately empty: StateMissing denotes that fact,
@@ -2281,7 +2250,6 @@ fn unhealthy_retry_with_held_families_rearms_healthy_history_reproduction() {
         eprintln!("UNHEALTHY_RETRY_REPRO held={HELD} healthy={HEALTHY} unsettled={unsettled} unrelated={unrelated} healthy_full={healthy_full} held_reads_before_deadline={held_reads_before_deadline} held_reads_when_due={held_reads_when_due}");
     }
 }
-
 
 fn scoped_retry_record(
     key: &str,
@@ -2502,7 +2470,6 @@ fn scoped_unhealthy_retry_reads_zero_of_32_healthy_files_and_keeps_evidence() {
     }
 }
 
-
 /// SOURCE (c)/(d): overdue RetryPending work runs on this next cycle, while
 /// healthy siblings remain unread. Terminal holds retain disclosure/bindings
 /// and retry a changed revision, without an early terminal conversion.
@@ -2632,7 +2599,6 @@ fn scoped_unhealthy_retry_runs_overdue_holds_next_cycle_and_preserves_terminal_h
         )
     );
 }
-
 
 /// A restart after a red terminal discards the process-local carry decision,
 /// then recomputes from durable acceptance, fingerprints and witnesses. A
@@ -2779,7 +2745,6 @@ fn scoped_unhealthy_retry_restart_recomputes_terminal_carry_from_durable_state()
         }
     }
 }
-
 
 /// Each refusal affects only its own family. None is hidden by the acceptance
 /// of a sibling, even with a global unsettled sweep and plausible full retry.
@@ -2975,7 +2940,6 @@ fn scoped_unhealthy_retry_refuses_missing_mismatched_or_incomplete_family_eviden
     }
 }
 
-
 #[test]
 fn accepted_retry_carries_without_otel_census_or_fence_deadline() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -3010,7 +2974,6 @@ fn accepted_retry_carries_without_otel_census_or_fence_deadline() {
         }
     }
 }
-
 
 #[test]
 fn accepted_idless_retry_preserves_invalid_evidence_and_refuses_second_causes() {
@@ -3158,7 +3121,6 @@ fn accepted_idless_retry_preserves_invalid_evidence_and_refuses_second_causes() 
     }
 }
 
-
 /// A new scan fingerprint (sidecar evidence included), truncation and object
 /// replacement independently select a carried member at unchanged mtime.
 #[test]
@@ -3228,7 +3190,6 @@ fn scoped_unhealthy_retry_changed_members_and_due_replays_keep_base() {
     }
 }
 
-
 #[test]
 fn scoped_unhealthy_retry_changed_member_cancels_only_its_funded_family() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -3286,7 +3247,6 @@ fn scoped_unhealthy_retry_changed_member_cancels_only_its_funded_family() {
     }
 }
 
-
 #[test]
 fn scoped_unhealthy_retry_preserves_member_protection_and_scratch_refusal() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -3315,7 +3275,6 @@ fn scoped_unhealthy_retry_preserves_member_protection_and_scratch_refusal() {
         }
     }
 }
-
 
 #[test]
 fn scoped_retry_preserves_actual_rearms_and_selection() {
@@ -3416,7 +3375,6 @@ fn scoped_retry_preserves_actual_rearms_and_selection() {
         );
     }
 }
-
 
 #[test]
 fn scaled_accepted_history_carries_6356_families_through_retry_deadline_expiry() {
@@ -3561,7 +3519,6 @@ fn scaled_accepted_history_carries_6356_families_through_retry_deadline_expiry()
             .is_empty()));
 }
 
-
 #[test]
 fn streaming_accepted_carry_matches_the_existing_family_refusals() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -3651,7 +3608,6 @@ fn streaming_accepted_carry_matches_the_existing_family_refusals() {
     }
 }
 
-
 #[test]
 fn accepted_carry_streams_when_request_graph_refuses_even_a_small_family_set() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -3696,7 +3652,6 @@ fn accepted_carry_streams_when_request_graph_refuses_even_a_small_family_set() {
     );
 }
 
-
 #[test]
 fn admitted_legacy_carry_keeps_its_existing_path_at_512_families() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -3727,7 +3682,6 @@ fn admitted_legacy_carry_keeps_its_existing_path_at_512_families() {
         0
     );
 }
-
 
 #[test]
 fn scaled_retry_defers_without_clearing_when_cancellation_cannot_be_funded() {
@@ -3769,7 +3723,6 @@ fn scaled_retry_defers_without_clearing_when_cancellation_cannot_be_funded() {
     );
 }
 
-
 #[test]
 fn deferred_retry_resumes_after_transient_funding_refusal() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -3798,7 +3751,6 @@ fn deferred_retry_resumes_after_transient_funding_refusal() {
         0
     );
 }
-
 
 include!("retry_admission_tests.rs");
 
@@ -3840,7 +3792,6 @@ fn stale_carry_rejection_histogram_reports_first_start_gate() {
     }
 }
 
-
 #[test]
 fn stale_carry_rejection_histogram_separates_window_and_ordinary_scratch() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -3862,7 +3813,6 @@ fn stale_carry_rejection_histogram_separates_window_and_ordinary_scratch() {
         assert_eq!(row["rearmed_index_files"], 3);
     }
 }
-
 
 #[test]
 fn stale_carry_rejection_histogram_separates_qualification_funding_and_reserve() {
@@ -3893,7 +3843,6 @@ fn stale_carry_rejection_histogram_separates_qualification_funding_and_reserve()
         assert_eq!(row["carried_pending_families"], counts.final_carried);
     }
 }
-
 
 // E3 PR1: exact accepted bodies may wait on global contract correction only.
 fn contract_debt_fixture(healthy: usize) -> ScopedRetryFixture {
@@ -3967,7 +3916,6 @@ fn contract_debt_defers_exact_acks_on_ordinary_streaming_and_batch_routes() {
         assert!(fixture.index.claude_request_identity_contract_changed);
     }
 }
-
 
 #[test]
 fn contract_debt_refuses_every_other_obligation_on_all_carry_routes() {
@@ -4080,7 +4028,6 @@ fn contract_debt_refuses_every_other_obligation_on_all_carry_routes() {
     }
 }
 
-
 #[test]
 fn contract_debt_keeps_context_and_ledger_vetoes_and_changed_member_selection() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -4171,7 +4118,6 @@ fn contract_debt_keeps_context_and_ledger_vetoes_and_changed_member_selection() 
         assert!(fixture.index.claude_duplicate_request_witness_overflowed);
     }
 }
-
 
 #[test]
 fn contract_start_status_preserves_resume_placeholder_and_reowes_only_once() {
@@ -4289,7 +4235,6 @@ fn contract_start_status_preserves_resume_placeholder_and_reowes_only_once() {
     );
 }
 
-
 #[test]
 fn contract_debt_scoped_hold_carries_only_settled_siblings() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -4308,7 +4253,6 @@ fn contract_debt_scoped_hold_carries_only_settled_siblings() {
         .all(|root| fixture.index.claude_stale_family_carry.contains(root)));
     assert!(fixture.index.claude_request_identity_contract_changed);
 }
-
 
 #[test]
 fn contract_debt_scratch_deferred_start_keeps_placeholder_and_old_window() {
@@ -4353,7 +4297,6 @@ fn contract_debt_scratch_deferred_start_keeps_placeholder_and_old_window() {
     assert!(fixture.index.claude_request_identity_contract_changed);
 }
 
-
 #[test]
 fn contract_observation_counts_empty_transitions_without_prepare_scan_duplicates() {
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
@@ -4371,7 +4314,6 @@ fn contract_observation_counts_empty_transitions_without_prepare_scan_duplicates
     assert_eq!(counts.identity_contract_latch.set, 1);
     assert_eq!(counts.identity_contract_latch.cleared, 0);
 }
-
 
 #[test]
 fn contract_debt_storage_recheck_cannot_forget_prior_scoped_hold() {
@@ -4446,7 +4388,6 @@ fn contract_debt_storage_recheck_cannot_forget_prior_scoped_hold() {
         );
     }
 }
-
 
 #[test]
 fn scanner_records_actual_contract_only_when_its_traversal_starts() {

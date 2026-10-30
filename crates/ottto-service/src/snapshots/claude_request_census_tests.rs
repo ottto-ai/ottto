@@ -545,7 +545,6 @@ fn census_records_bind_each_parse_to_its_revision_and_shape() {
         .twin_for_test());
 }
 
-
 /// TD1d: the derivation canary. The fixed corpus must yield exactly the
 /// pinned table under `CLAUDE_REQUEST_CENSUS_DERIVATION`.
 #[test]
@@ -562,7 +561,6 @@ fn census_derivation_canary_pins_ids_and_shapes() {
         Ok(())
     );
 }
-
 
 /// SOURCE early condition: the canary provably goes red when extraction
 /// changes without a bump. Each mutation is what the parser would yield after
@@ -623,7 +621,6 @@ fn census_derivation_canary_fails_on_a_missed_bump() {
     // A bump without a re-pinned digest is red too.
     assert!(canary_verdict(CLAUDE_REQUEST_CENSUS_DERIVATION + 1, &observed).is_err());
 }
-
 
 /// TD1f (review F1, SOURCE S2(c)): a re-parse of a previously complete key
 /// that ends as residue, with copied ids, replaces the old record. The key is
@@ -717,7 +714,6 @@ fn census_residue_reparse_never_keeps_the_old_record() {
     );
 }
 
-
 /// TD1e: the shadow reports that the record census would converge on a
 /// corpus whose BASE census cannot (identity-invalid pending, and separately
 /// a cap-exceeding occurrence total), while the real fence stays BASE.
@@ -807,7 +803,6 @@ fn census_shadow_would_open_where_the_base_fence_closes() {
     }
 }
 
-
 /// TD1b: census state follows the working index on a partial commit, never
 /// `previous`: an unsettled key reverts its entry but keeps the record this
 /// window parsed, and a never-committed key keeps its record until pruned.
@@ -882,7 +877,6 @@ fn census_records_follow_the_working_index_through_committable_subset() {
     );
 }
 
-
 /// Prune at the complete terminal: before any join, keep only keys that are
 /// indexed or were walked this generation (review F9).
 #[test]
@@ -937,7 +931,6 @@ fn census_terminal_prune_keeps_indexed_and_walked_keys_only() {
         Some(true)
     );
 }
-
 
 /// The shadow predicate and per-member status on a synthetic index: coverage
 /// by fingerprint or by this window, shared hashes, census-unknown families,
@@ -1077,7 +1070,6 @@ fn census_member_status_names_disjoint_shared_unknown_and_unobserved() {
     assert!(counts.json_bytes > 0);
 }
 
-
 /// S2(d), S8 and the review's cause list: every uncovered key is counted
 /// once, under the first matching cause, and quarantine keys without a
 /// record are counted on their own.
@@ -1147,7 +1139,6 @@ fn census_shadow_counts_each_missing_record_by_cause() {
     assert_eq!(counts.quarantine_without_record, 1);
     assert_eq!(counts.covered_by_fingerprint + counts.covered_by_window, 0);
 }
-
 
 /// S3(d) tripwire: a verified complete re-parse at an unchanged fingerprint
 /// and derivation that yields different ids is counted; the same ids are not.
@@ -1260,7 +1251,6 @@ fn census_derivation_drift_tripwire_counts_changed_ids_at_one_revision() {
     );
 }
 
-
 /// StateMissing M1: an unchanged re-parse of a record retired at 35 days
 /// (a backfill re-reading every file, a resume miss) is no derivation drift
 /// and leaves the record retired: neither the hashes nor the index bytes
@@ -1324,7 +1314,6 @@ fn census_retired_record_survives_an_unchanged_reparse() {
     );
 }
 
-
 /// A transcript of zero-usage responses only (API errors) yields no item, yet
 /// its request ids still reach the census and meet a peer's copy.
 #[test]
@@ -1373,7 +1362,6 @@ fn census_records_keep_ids_of_zero_usage_only_transcripts() {
     );
 }
 
-
 /// A lossy member that has no counted entry (a residue subagent never
 /// indexed) still leaves its family census-unknown.
 #[test]
@@ -1416,7 +1404,6 @@ fn census_unindexed_lossy_member_leaves_its_family_unknown() {
     assert_eq!(counts.family_unknown_roots, 1);
     assert_eq!(counts.records, 2);
 }
-
 
 fn census_index_json(records: serde_json::Value) -> serde_json::Value {
     let mut index = ScanIndex::default();
@@ -1640,7 +1627,6 @@ fn census_decoder_drops_bad_entries_and_never_quarantines_the_index() {
     );
 }
 
-
 /// TD1c (bounds): the decoder keeps the running hash total within the budget,
 /// refusing an over-budget entry before decoding its hex.
 #[test]
@@ -1667,7 +1653,6 @@ fn census_decoder_keeps_the_hash_budget() {
         MAX_CLAUDE_REQUEST_CENSUS_HASHES
     );
 }
-
 
 /// Production keeps the same budget by storing an `OverBudget` tombstone.
 #[test]
@@ -1705,7 +1690,6 @@ fn census_records_past_the_budget_become_inert_tombstones() {
     assert_eq!(census.hash_total_for_test(), 0);
 }
 
-
 /// Layout: census fields are charged through `fields!` without adding per-entry
 /// data. Keep the exact current entry-size pin used by restore pricing.
 #[test]
@@ -1741,7 +1725,6 @@ fn census_records_are_charged_with_the_scan_index_and_leave_entries_alone() {
     let after = crate::heap_layout_bound::completed_bound(&index, usize::MAX).expect("bound");
     assert!(after >= before + 8_000, "{before} -> {after}");
 }
-
 
 /// The shadow counters ride the duplicate-census counters, bounded.
 #[test]
@@ -1811,7 +1794,6 @@ fn census_shadow_counts_encoding_is_bounded() {
         .contains("request_census"));
 }
 
-
 const CENSUS_SHADOW_MAX_BYTES: usize = 1_238;
 
 /// Literal tokens matter: Value cannot represent the overflow that regressed
@@ -1879,7 +1861,6 @@ fn census_numeric_overflow_is_isolated_from_load_and_cas() {
     }
 }
 
-
 #[test]
 fn census_oversized_hostile_field_is_drained_before_serde_buffers_it() {
     use std::io::Write;
@@ -1905,7 +1886,6 @@ fn census_oversized_hostile_field_is_drained_before_serde_buffers_it() {
         .save(&path)
         .expect("CAS also drains oversized evidence");
 }
-
 
 #[test]
 fn census_hash_budget_warning_starts_at_eighty_percent() {
@@ -1936,7 +1916,6 @@ fn census_hash_budget_warning_starts_at_eighty_percent() {
     }
 }
 
-
 /// A pre-D1 shape has no census fields: IgnoredAny consumes their tokens,
 /// including non-finite numbers, without trying to interpret them.
 #[test]
@@ -1960,7 +1939,6 @@ fn census_old_shape_decoder_ignores_new_evidence() {
     assert_eq!(old.files.len(), 1);
 }
 
-
 #[cfg(unix)]
 #[derive(Clone, Copy)]
 enum CensusAbandonedParse {
@@ -1976,7 +1954,6 @@ enum CensusAbandonedParse {
 /// failures. Every case starts with an older valid record and changed bytes.
 #[cfg(unix)]
 fn census_assert_abandoned_parse_invalidates_record(failure: CensusAbandonedParse) {
-
     use crate::transcript_acquisition::{ReadPlan, Scope};
     let scratch = crate::test_scratch::ScratchDir::new("census-abandoned");
     let root = scratch.join("projects");
@@ -2109,48 +2086,36 @@ fn census_assert_abandoned_parse_invalidates_record(failure: CensusAbandonedPars
     panic!("failure path was not reached");
 }
 
-
 #[test]
 #[cfg(unix)]
 fn census_failed_read_invalidates_old_record() {
     census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Read);
 }
-
-
 #[test]
 #[cfg(unix)]
 fn census_failed_attribution_invalidates_old_record() {
     census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Attribution);
 }
-
-
 #[test]
 #[cfg(unix)]
 fn census_failed_scope_revalidation_invalidates_old_record() {
     census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Scope);
 }
-
-
 #[test]
 #[cfg(unix)]
 fn census_failed_object_revalidation_invalidates_old_record() {
     census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Object);
 }
-
-
 #[test]
 #[cfg(unix)]
 fn census_failed_reopen_invalidates_old_record() {
     census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Reopen);
 }
-
-
 #[test]
 #[cfg(unix)]
 fn census_failed_reduction_invalidates_old_record() {
     census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Reduction);
 }
-
 
 #[test]
 fn census_shadow_bounds_workspace_without_changing_the_index() {
@@ -2173,7 +2138,6 @@ fn census_shadow_bounds_workspace_without_changing_the_index() {
         .remove("claude_request_census_shadow");
     assert_eq!(after, before);
 }
-
 
 #[test]
 fn census_decoder_stops_after_attempted_entries_even_when_all_are_rejected() {
@@ -2203,7 +2167,6 @@ fn census_decoder_stops_after_attempted_entries_even_when_all_are_rejected() {
     );
 }
 
-
 #[test]
 fn census_decoder_stops_after_an_oversized_record() {
     use std::io::Write;
@@ -2232,7 +2195,6 @@ fn census_decoder_stops_after_an_oversized_record() {
     assert_eq!(loaded.files.len(), 1);
     assert!(loaded.claude_request_census_for_test().is_empty());
 }
-
 
 #[test]
 fn census_sequence_index_preserves_serde_compatibility_and_isolates_evidence() {
@@ -2295,7 +2257,6 @@ fn census_sequence_index_preserves_serde_compatibility_and_isolates_evidence() {
         .expect("positional CAS remains supported");
 }
 
-
 #[test]
 fn census_escaped_shadow_field_name_cannot_bypass_the_reader_bound() {
     use std::io::Write;
@@ -2327,7 +2288,6 @@ fn census_escaped_shadow_field_name_cannot_bypass_the_reader_bound() {
         .save(&path)
         .expect("CAS also bounds escaped field names");
 }
-
 
 /// The valid shadow state must survive load, CAS and reload byte-for-value,
 /// independently of whether its previous predicate was open or closed.
@@ -2371,7 +2331,6 @@ fn census_valid_shadow_state_round_trips_exactly() {
         }
     }
 }
-
 
 #[test]
 fn census_duplicate_optional_fields_invalidate_only_the_ambiguous_evidence() {
@@ -2436,7 +2395,6 @@ fn census_duplicate_optional_fields_invalidate_only_the_ambiguous_evidence() {
         "refusal never quarantines"
     );
 }
-
 
 /// C3: a Held original keeps its census (and the copy's proof) while its
 /// committed entry is unchanged, even when the file itself grew; a changed
@@ -2568,7 +2526,6 @@ fn held_original_keeps_dependent_copy_proof_only_while_committed_entry_unchanged
         );
     }
 }
-
 
 /// Review F3 / L26 on the production path: a Held durable record for an
 /// unchanged original takes the common-hold exit; the dependent copy (which

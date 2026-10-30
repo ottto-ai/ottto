@@ -181,7 +181,6 @@ fn e2_pipeline_tags_the_final_root_and_agent_rows() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 #[test]
 fn e2_pipeline_tags_a_copied_transcript_once() {
     let (dir, root, _) = claude_account_family_fixture();
@@ -259,7 +258,6 @@ fn e2_pipeline_tags_a_copied_transcript_once() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 #[test]
 fn e2_pipeline_telemetry_read_failure_is_never_complete_and_withholds_nothing() {
     let (dir, root, _) = claude_account_family_fixture();
@@ -303,7 +301,6 @@ fn e2_pipeline_telemetry_read_failure_is_never_complete_and_withholds_nothing() 
     );
     fs::remove_dir_all(dir).unwrap();
 }
-
 
 fn e2_resign(row: &mut crate::claude_local_otel::ClaudeLocalOtelEvidence) {
     row.fingerprint.clear();
@@ -372,7 +369,6 @@ fn e2_pipeline_root_and_child_keep_independent_own_telemetry_logins() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 #[test]
 fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
     for (bound, partial) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -440,7 +436,6 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
     }
 }
 
-
 #[test]
 fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     let dir = temp_dir("e2-identity-telemetry-cap");
@@ -498,7 +493,6 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     assert_eq!(disposition.quarantined_entity_count(), 0);
     fs::remove_dir_all(dir).unwrap();
 }
-
 
 /// The real evidence stage with the gate on, returning its evidence counters.
 fn e2_page_with_stats(

@@ -1030,7 +1030,6 @@ mod tests {
             assert_complete_max_row(rows[0].clone());
         }
     }
-
     // SOURCE Round 13 F3: the Claude retiring row names every absence total
     // and the fence state with their values (Round 15: and the upgrade fence
     // count; Round 16, SOURCE h733: the aged-out tombstone and refused-drain

@@ -117,7 +117,6 @@ fn native_comparison_target_body_retention_pays_exact_peak_before_buffer_growth(
     }
 }
 
-
 #[test]
 fn native_comparison_borrowed_membership_matches_complete_physical_universe() {
     let mut index = ScanIndex::default();
@@ -188,7 +187,6 @@ fn native_comparison_borrowed_membership_matches_complete_physical_universe() {
     eprintln!("native membership borrowed view: roots=2043 selected_paths={selected} requested_peak={} full_canonical_parity=true duplicate_missing_extra_paths_checked=true not_RSS=true", allocations.requested_peak_with_overlap);
 }
 
-
 #[test]
 fn native_comparison_borrowed_index_identity_matches_owned_path_oracle_without_allocating() {
     fn reference(path: &Path) -> Option<(String, String)> {
@@ -249,7 +247,6 @@ fn native_comparison_borrowed_index_identity_matches_owned_path_oracle_without_a
         "planning must not allocate a component vector or identity"
     );
 }
-
 
 #[test]
 fn native_comparison_paid_import_reserves_before_membership_and_moves_only_once() {
@@ -312,7 +309,6 @@ fn native_comparison_paid_import_reserves_before_membership_and_moves_only_once(
         eprintln!("native paid import: one_byte_short={one_byte_short} imported={imported} planned_extra={extra} measured_incremental_peak={} index_unchanged=true recovery_preserved=true", allocations.requested_peak_with_overlap);
     }
 }
-
 
 #[test]
 fn native_comparison_paid_capture_population_reports_guard_viability_without_bypass() {
@@ -422,7 +418,6 @@ fn native_comparison_paid_capture_population_reports_guard_viability_without_byp
     assert!(phase.disabled_for_test());
 }
 
-
 #[test]
 fn native_comparison_selected_membership_sees_all_paths_without_unrelated_owned_graph() {
     let mut index = ScanIndex::default();
@@ -472,7 +467,6 @@ fn native_comparison_selected_membership_sees_all_paths_without_unrelated_owned_
     assert!(base_source_bytes >= crate::source_rotation::PARKED_BUDGET);
     eprintln!("native comparison membership scratch: unrelated_files=2048 borrowed_base_source_bytes={base_source_bytes} baseline_global_peak={} selected_peak={} selected_duplicate_outside_targets_rejected=true missing_root_rejected=true extra_member_visible=true final_global_fold_unchanged=true admission_unproved=true not_RSS=true", baseline.requested_peak_with_overlap, allocated.requested_peak_with_overlap);
 }
-
 
 #[test]
 fn native_comparison_selected_restore_membership_matches_canonical_without_global_set() {
@@ -548,7 +542,6 @@ fn native_comparison_selected_restore_membership_matches_canonical_without_globa
     assert!(borrowed.requested_peak_with_overlap < old.requested_peak_with_overlap);
     eprintln!("native comparison selected restore: unrelated_files=2048 affected_queries={} universe_visits={visits} old_global_requested_peak={} selected_set_requested_peak={} one_universe_pass=true exact_empty_overrides_legacy=true codex_state_preserved=true not_RSS=true", queries.len(), old.requested_peak_with_overlap, borrowed.requested_peak_with_overlap);
 }
-
 
 fn reports(root: &str, extra: bool) -> (Api, Trace) {
     let mut api = (1..=5)
@@ -732,7 +725,6 @@ fn envelope_experiment_frozen_old_proof_does_not_mask_new_native_request() {
     writeln!(std::io::stderr().lock(), "envelope_experiment_old_p: frozen_rejected=true fresh_would_mask=true required_native_hit=1").unwrap();
     fs::remove_dir_all(dir).unwrap();
 }
-
 
 #[derive(Default)]
 struct ProcessPermit {
@@ -943,7 +935,6 @@ fn envelope_experiment_native_save_bootstrap_restart_matches_base_owners() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 #[test]
 fn envelope_experiment_selected_restore_rearm_survives_reload_without_age_proof() {
     let scratch = crate::test_scratch::ScratchDir::new("envelope-deferral");
@@ -1082,7 +1073,6 @@ fn envelope_experiment_selected_restore_rearm_survives_reload_without_age_proof(
     writeln!(std::io::stderr().lock(), "envelope_experiment_deferral: selected_old_b=true new_c_uncommitted=true durable_target_rearm=true explicit_durable_queue_priority=true deferral_age=unknown wall_completion=unknown").unwrap();
 }
 
-
 // Phase 2 uses actual constructor priority and the real locked partial-save
 // seam. Controls remain scoped/cfg(test); no shipping eligibility is added.
 struct SelectionFixture {
@@ -1210,7 +1200,6 @@ fn envelope_experiment_target_priority_precedes_actual_audit_selection() {
     writeln!(std::io::stderr().lock(), "envelope_experiment_audit: base_selects_audit=true candidate_selects_target=true page_limit=1 audit_debt_preserved=true").unwrap();
 }
 
-
 #[test]
 fn envelope_experiment_oversized_family_exits_immediately_without_cap_increase() {
     let fixture = SelectionFixture::new();
@@ -1245,7 +1234,6 @@ fn envelope_experiment_oversized_family_exits_immediately_without_cap_increase()
     assert_eq!(scope.counts().successful_deferrals, 0);
     writeln!(std::io::stderr().lock(), "envelope_experiment_oversized: family_members=2 page_limit=1 base_exits=1 native_pages=2 no_renewal=true").unwrap();
 }
-
 
 #[test]
 fn envelope_experiment_two_successful_deferrals_use_locked_shed_restore_then_disable() {
@@ -1325,7 +1313,6 @@ fn envelope_experiment_two_successful_deferrals_use_locked_shed_restore_then_dis
     assert_eq!(restarted.counts().unknown_age, 1);
     writeln!(std::io::stderr().lock(), "envelope_experiment_attempts: successful_deferrals=2 base_exits=1 no_renewal=true locked_shed_restore=true restart_native_priority=true age_unknown_count=1").unwrap();
 }
-
 
 /// Restores a file's original mode at teardown, also when an assertion panics.
 #[cfg(unix)]
@@ -1416,7 +1403,6 @@ fn envelope_experiment_failed_open_is_unavailable_not_success_and_keeps_durable_
     assert_eq!(restarted.counts().unknown_age, 1);
     writeln!(std::io::stderr().lock(), "envelope_experiment_unavailable: reason=comparison_deferred_unavailable failed_open=1 successful_deferrals=0 durable_rearm=true restart_retry=true age_unknown_count=1").unwrap();
 }
-
 
 fn comparison_owner_epoch(
     index: &mut ScanIndex,
@@ -1557,7 +1543,6 @@ fn envelope_experiment_disabled_family_bypasses_actual_rearm_suppression_gate() 
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 // Carried from #587; the tests below exercise the new moving preparation seam,
 // not the synthetic permit/rearm controls above. No reuse is activated.
 struct NativePreparationFixture {
@@ -1678,7 +1663,6 @@ fn native_comparison_actual_skip_freezes_retained_proof_before_body_fold() {
     writeln!(std::io::stderr().lock(), "native_comparison_checkpoint: actual_skip_certificates=2 retained_proof_unchanged=true body_mutations=0 reuse_activated=false").unwrap();
 }
 
-
 #[test]
 fn native_comparison_seeded_index_is_not_an_actual_skip_certificate() {
     let fixture = NativePreparationFixture::new();
@@ -1697,7 +1681,6 @@ fn native_comparison_seeded_index_is_not_an_actual_skip_certificate() {
     );
     assert_eq!(qualification.certified_member_count(), 0);
 }
-
 
 #[test]
 fn native_comparison_current_nonreported_member_withdraws_whole_family() {
@@ -1739,7 +1722,6 @@ fn native_comparison_current_nonreported_member_withdraws_whole_family() {
         .contains(&fixture.parent));
     writeln!(std::io::stderr().lock(), "native_comparison_checkpoint: nonreported_native_member=true qualified_family_members=0 authoritative_demotion_agrees=true preflight_body_mutations=0").unwrap();
 }
-
 
 fn write_native_preparation_pair(support: &Path, root: &str, api: &Api, trace: &Trace) {
     let name = format!("{:x}.jsonl", Sha256::digest(root.as_bytes()));
@@ -1811,12 +1793,10 @@ fn native_comparison_paired_rows_move_once_without_reloading_unchanged_files() {
     native_preparation_pair_roundtrip(false);
 }
 
-
 #[test]
 fn native_comparison_paired_rows_replaced_after_preflight_use_fresh_strict_load() {
     native_preparation_pair_roundtrip(true);
 }
-
 
 #[test]
 fn native_comparison_negative_rows_recheck_each_opened_pair_without_decoding() {
@@ -1859,7 +1839,6 @@ fn native_comparison_negative_rows_recheck_each_opened_pair_without_decoding() {
     writeln!(std::io::stderr().lock(), "native_comparison_generation: unchanged_pair_reusable=true same_bytes_api_or_trace_replacement_withdraws=true validation_decodes=0 controller_unproved=true").unwrap();
 }
 
-
 #[test]
 fn native_comparison_negative_rows_cannot_qualify_an_unloaded_predecessor() {
     let fixture = NativePreparationFixture::new();
@@ -1877,7 +1856,6 @@ fn native_comparison_negative_rows_cannot_qualify_an_unloaded_predecessor() {
         "one healthy root cannot certify missing predecessor rows"
     );
 }
-
 
 fn native_recovery_priority_scan(
     fixture: &SelectionFixture,
@@ -1942,7 +1920,6 @@ fn native_comparison_recovery_selection_precedes_real_audit_without_expanding_pa
     writeln!(std::io::stderr().lock(), "native_comparison_recovery_priority: real_constructor=true actual_index_save_reload=true base_selects_audit=true recovery_selected_first=true native_reads=1 page_limit=1 audit_debt_and_queue_preserved=true selected_save_and_lifecycle_unproved=true").unwrap();
 }
 
-
 #[test]
 fn native_comparison_recovery_priority_requires_scope_queued_debt_and_remaining_budget() {
     let fixture = SelectionFixture::new();
@@ -1971,7 +1948,6 @@ fn native_comparison_recovery_priority_requires_scope_queued_debt_and_remaining_
     let zero = native_recovery_priority_scan(&fixture, rearmed, 0, &fixture.paths[..1]);
     assert!(zero.identified_candidates.is_empty());
 }
-
 
 fn complete_native_with_terminal_owner(
     mut state: OwnedSourceScan,
@@ -2052,7 +2028,6 @@ fn native_comparison_terminal_checkpoint_moves_outside_cloneable_scan_result() {
     writeln!(std::io::stderr().lock(), "native_comparison_terminal_owner: original_context_allocation_moved=true result_clone_separate=true base_index_body_parity=true actual_census_complete=true selected_restore_unproved=true").unwrap();
 }
 
-
 #[test]
 fn native_comparison_terminal_owner_requires_complete_current_claude_census() {
     let fixture = SelectionFixture::new();
@@ -2086,7 +2061,6 @@ fn native_comparison_terminal_owner_requires_complete_current_claude_census() {
         );
     }
 }
-
 
 #[test]
 fn native_comparison_lifecycle_requires_native_save_and_revokes_after_drop_context_or_restart() {
@@ -2126,7 +2100,6 @@ fn native_comparison_lifecycle_requires_native_save_and_revokes_after_drop_conte
     writeln!(std::io::stderr().lock(), "native_comparison_lifecycle: actual_native_conjunction=true actual_index_save=true next_cycle_allowed=true retained_index_restart_base=true context_change_and_drop_revoke=true").unwrap();
 }
 
-
 #[test]
 fn native_comparison_lifecycle_failed_cas_never_mints_a_grant() {
     let mut fixture = NativePreparationFixture::new();
@@ -2151,7 +2124,6 @@ fn native_comparison_lifecycle_failed_cas_never_mints_a_grant() {
     )
     .unwrap();
 }
-
 
 fn native_comparison_quiet_bounded_page(
     fixture: &NativePreparationFixture,
@@ -2235,7 +2207,6 @@ fn native_comparison_lifecycle_saved_bounded_page_retains_only_existing_grant() 
     writeln!(std::io::stderr().lock(), "native_comparison_page_lease: actual_native_bootstrap_save=true actual_quiet_bounded_page_save=true prior_grant_retained=true partial_page_cannot_mint=true certificate_carry_unwired=true").unwrap();
 }
 
-
 #[test]
 fn native_comparison_lifecycle_page_loss_or_missing_selected_save_revokes() {
     let mut fixture = NativePreparationFixture::new();
@@ -2305,7 +2276,6 @@ fn native_comparison_lifecycle_page_loss_or_missing_selected_save_revokes() {
     ));
     writeln!(std::io::stderr().lock(), "native_comparison_page_lease: no_selected_save_revokes=true unreadable_sidecar_unknown_unsettled_invalid_closed_rejected=true certificate_carry_unwired=true").unwrap();
 }
-
 
 fn pause_native_comparison(mut state: OwnedSourceScan) -> OwnedSourceScan {
     for _ in 0..1024 {
@@ -2391,7 +2361,6 @@ fn native_comparison_q5_keeps_old_proof_and_checks_revision_and_occurrences() {
     );
     writeln!(std::io::stderr().lock(), "native_comparison_q5: frozen_old_p=true live_proof_replacement_ignored=true changed_revision_or_occurrence_or_request_set_uses_all=true").unwrap();
 }
-
 
 fn native_comparison_positive_hit_fixture() -> (
     NativePreparationFixture,
@@ -2480,7 +2449,6 @@ fn native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold()
     writeln!(std::io::stderr().lock(), "native_comparison_target: initial_native=1 matched_roots=1 queued=2 actual_target_reads=2 same_scanner_context=true existing_file_budget=true before_body_fold=true repeated_targets=0 requested_layout_bytes={requested_layout_bytes:?} rss_measured=false").unwrap();
 }
 
-
 #[test]
 fn native_comparison_insufficient_remaining_budget_withdraws_and_reports_unresolved() {
     if !native_positive_layout_for_test(
@@ -2501,7 +2469,6 @@ fn native_comparison_insufficient_remaining_budget_withdraws_and_reports_unresol
     assert_eq!(qualification.certified_member_count(), 0);
     assert_eq!(state.scanned_file_count, before);
 }
-
 
 #[test]
 fn native_comparison_replaced_target_keeps_safe_open_failure_visible() {
@@ -2571,7 +2538,6 @@ fn native_comparison_replaced_target_keeps_safe_open_failure_visible() {
     let (_, scan) = SelectionFixture::run(state);
     assert!(!scan.census_complete);
 }
-
 
 fn native_observation_duplicate_fixture() -> (
     crate::test_scratch::ScratchDir,
@@ -2688,7 +2654,6 @@ fn native_comparison_withheld_body_keeps_actual_duplicate_against_unaffected_bod
     writeln!(std::io::stderr().lock(), "native_comparison_observations: actual_native_files=2 actual_native_occurrences=4 withheld_bodies=1 emitted_bodies=1 b_d_duplicate_retained=true filter_first_control_misses_duplicate=true actual_fold_once=true selected_settlement_unproved=true").unwrap();
 }
 
-
 #[test]
 fn native_comparison_consumed_observations_preserve_unfiltered_base_fold() {
     let (_dir, mut index, mut scan, _, _) = native_observation_duplicate_fixture();
@@ -2726,7 +2691,6 @@ fn native_comparison_consumed_observations_preserve_unfiltered_base_fold() {
         base.transcript_ownership_complete
     );
 }
-
 
 #[test]
 fn native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior() {
@@ -2873,7 +2837,6 @@ fn native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior() {
     writeln!(std::io::stderr().lock(), "native_comparison_legacy: actual_prefix_exclusion=2 e_nonempty_q5_prior=false copied_native_requests_hit_predecessor=true certified_exclusion_is_target=true body_offer_unproved=true").unwrap();
 }
 
-
 #[test]
 fn native_comparison_acquisition_requires_actual_completed_target_reads() {
     if !native_positive_layout_for_test(
@@ -2912,7 +2875,6 @@ fn native_comparison_acquisition_requires_actual_completed_target_reads() {
     SelectionFixture::run(state);
     writeln!(std::io::stderr().lock(), "native_comparison_acquisition: queued=2 actual_full_reads=2 ready_for_exact_fold=1 body_authority_granted=false receipt_consumed_once=true").unwrap();
 }
-
 
 #[test]
 fn native_comparison_controller_moves_frozen_plan_across_native_target_yields() {
@@ -2959,7 +2921,6 @@ fn native_comparison_controller_moves_frozen_plan_across_native_target_yields() 
     writeln!(std::io::stderr().lock(), "native_comparison_controller: initial_native=1 completed_targets=2 frontier=3 same_owner_context=true repeated_targets=0 pre_fold_bodies=3 selected_deferral_and_rearm_suppression=false").unwrap();
 }
 
-
 #[test]
 fn native_comparison_controller_generation_loss_or_insufficient_budget_uses_base() {
     if !native_positive_layout_for_test(
@@ -2997,7 +2958,6 @@ fn native_comparison_controller_generation_loss_or_insufficient_budget_uses_base
     }
     writeln!(std::io::stderr().lock(), "native_comparison_controller: changed_generation_base=true insufficient_remaining_budget_base=true no_extra_target_reads=true no_body_suppression=true actual_process_bootstrap_unproved=true").unwrap();
 }
-
 
 #[test]
 fn native_comparison_controller_replaced_target_cannot_complete_comparison() {
@@ -3072,7 +3032,6 @@ fn native_comparison_controller_replaced_target_cannot_complete_comparison() {
     writeln!(std::io::stderr().lock(), "native_comparison_controller: actual_target_replacement_base=true current_native_census_incomplete=true no_acquired_owner_posture=true").unwrap();
 }
 
-
 #[test]
 fn native_comparison_failed_target_keeps_dependent_source_unresolved() {
     if !native_positive_layout_for_test(
@@ -3118,7 +3077,6 @@ fn native_comparison_failed_target_keeps_dependent_source_unresolved() {
     writeln!(std::io::stderr().lock(), "native_comparison_acquisition: queued=2 actual_full_reads=1 unresolved_sources=1 fallback_roots=1 queue_is_not_success=true body_authority_granted=false").unwrap();
 }
 
-
 #[test]
 fn native_comparison_ambiguous_index_member_withdraws_frozen_family() {
     let fixture = NativePreparationFixture::new();
@@ -3145,7 +3103,6 @@ fn native_comparison_ambiguous_index_member_withdraws_frozen_family() {
     assert_eq!(qualified.certified_member_count(), 0);
     assert!(state.snapshots.is_empty());
 }
-
 
 #[test]
 fn native_comparison_family_parse_withdraws_skips_before_and_after_attempt() {
@@ -3201,7 +3158,6 @@ fn native_comparison_family_parse_withdraws_skips_before_and_after_attempt() {
     }
 }
 
-
 #[test]
 fn native_comparison_empty_parse_withdraws_sibling_without_native_body() {
     let fixture = NativePreparationFixture::new();
@@ -3233,7 +3189,6 @@ fn native_comparison_empty_parse_withdraws_sibling_without_native_body() {
     );
     writeln!(std::io::stderr().lock(), "native_comparison_parse_revocation: actual_empty_parse=1 native_bodies=0 sibling_negative_members=0 retained_proof_unchanged=true crosspage_carry_unwired=true").unwrap();
 }
-
 
 struct NativeWindowPage {
     index: ScanIndex,
@@ -3360,7 +3315,6 @@ fn native_comparison_window_saved_graph_obeys_real_layout_gate() {
     writeln!(std::io::stderr().lock(), "native_comparison_window: actual_partial_skip=1 actual_selected_save=true requested_layout={bound:?} supported_move_exercised={} full_driver_proved=false", crate::heap_layout_bound::layout_supported()).unwrap();
 }
 
-
 #[test]
 fn native_comparison_window_component_reconstructs_same_census_current_rows() {
     if !native_positive_layout_for_test(
@@ -3389,7 +3343,6 @@ fn native_comparison_window_component_reconstructs_same_census_current_rows() {
     // establish that the original optimized pipeline or a layout gate passes.
     writeln!(std::io::stderr().lock(), "native_comparison_window: actual_skip_pages=2 current_rows_reconstructed=true component_members=2 lifecycle_budget_admission_proved=false original_oracle_passed=false").unwrap();
 }
-
 
 #[test]
 fn native_comparison_window_later_parse_withdraws_carried_sibling() {
@@ -3437,7 +3390,6 @@ fn native_comparison_window_later_parse_withdraws_carried_sibling() {
     writeln!(std::io::stderr().lock(), "native_comparison_window: actual_later_member_parse=1 carried_sibling_members=0 sticky_tombstone=true full_driver_proved=false").unwrap();
 }
 
-
 #[test]
 fn native_comparison_window_proof_membership_empty_or_context_change_withdraws() {
     if !native_positive_layout_for_test(
@@ -3476,7 +3428,6 @@ fn native_comparison_window_proof_membership_empty_or_context_change_withdraws()
         assert!(page.window.root_revoked_for_test(&fixture.parent));
     }
 }
-
 
 #[test]
 fn native_comparison_window_wrong_window_scope_restart_or_missing_save_is_base() {
@@ -3517,7 +3468,6 @@ fn native_comparison_window_wrong_window_scope_restart_or_missing_save_is_base()
     assert!(fresh.take_window().is_none());
 }
 
-
 #[test]
 fn native_comparison_window_scope_change_revokes_a_valid_saved_grant() {
     let mut fixture = NativePreparationFixture::new();
@@ -3547,7 +3497,6 @@ fn native_comparison_window_scope_change_revokes_a_valid_saved_grant() {
     );
     writeln!(std::io::stderr().lock(), "native_comparison_window_revocation: independently_valid_scope_control=true changed_scope_base=true rolled_back_scope_base=true").unwrap();
 }
-
 
 #[test]
 fn native_comparison_window_unknown_lock_and_stale_generation_revoke() {
@@ -3589,7 +3538,6 @@ fn native_comparison_window_unknown_lock_and_stale_generation_revoke() {
     assert!(next.take_window().is_none());
     writeln!(std::io::stderr().lock(), "native_comparison_window_revocation: held_lock_bound=None whole_window_discard=true stale_generation_cannot_republish=true").unwrap();
 }
-
 
 #[test]
 fn native_comparison_window_missing_current_rows_withdraws_until_window_end() {
@@ -3652,7 +3600,6 @@ fn native_comparison_window_missing_current_rows_withdraws_until_window_end() {
     writeln!(std::io::stderr().lock(), "native_comparison_window_revocation: current_api_missing_base=true current_trace_missing_base=true unhealthy_pair_base=true later_rows_cannot_revive=true").unwrap();
 }
 
-
 #[test]
 fn native_comparison_window_any_authority_quarantine_withdraws() {
     if !native_positive_layout_for_test(
@@ -3713,7 +3660,6 @@ fn native_comparison_window_any_authority_quarantine_withdraws() {
     }
     writeln!(std::io::stderr().lock(), "native_comparison_window_revocation: terminal_quarantine_base=true proof_correction_quarantine_base=true accepted_body_or_debt_unchanged=true").unwrap();
 }
-
 
 // The same actual scanner/controller and selected-save seams used by finish.
 // A/D share an exact native ID; the healthy C body has independent requests.
@@ -3868,7 +3814,6 @@ fn native_comparison_selected_fallback_preserves_prior_body_and_queues_native_be
     writeln!(std::io::stderr().lock(), "native_comparison_selected_fallback: actual_native_copy_peer_observed=true healthy_body_retained=true old_body_accepted_ledger_unchanged=true terminal_graph_moved=true native_targets_before_BC=true normal_save_reload=true parked_schema=false").unwrap();
 }
 
-
 /// Diagnostics only: the comparison fallback's fold and its selected restore
 /// each mark the sweep without naming a path, so both name `unattributed`,
 /// also beside a named page cause and across a reload.
@@ -3901,7 +3846,6 @@ fn native_comparison_fallback_marks_name_unattributed() {
         ["shed", "unattributed"]
     );
 }
-
 
 /// Slice D1 (TD1b, SOURCE #588): a selected restore reverts the withheld key
 /// to `previous` and REMOVES its request-census record. No record of the
@@ -3937,7 +3881,6 @@ fn native_comparison_selected_restore_removes_the_withheld_census_record() {
     );
     assert!(index.claude_request_census_for_test().get(&key).is_none());
 }
-
 
 #[test]
 fn native_comparison_selected_fallback_partial_locked_save_and_restart_keep_exact_debt() {
@@ -3984,7 +3927,6 @@ fn native_comparison_selected_fallback_partial_locked_save_and_restart_keep_exac
     writeln!(std::io::stderr().lock(), "native_comparison_partial_fallback: actual_progress_lock_selected_restore_CAS_save=true old_accepted_body_preserved=true new_copy_uncommitted=true no_empty_or_fake_hold=true native_priority_survives_reload=true restart_base=true").unwrap();
 }
 
-
 #[test]
 fn native_comparison_selected_fallback_cas_loss_and_wrong_window_never_commit() {
     if !native_positive_layout_for_test(
@@ -4005,7 +3947,6 @@ fn native_comparison_selected_fallback_cas_loss_and_wrong_window_never_commit() 
     assert_eq!(fs::read(&path).unwrap(), durable);
     writeln!(std::io::stderr().lock(), "native_comparison_fallback_failure: actual_index_CAS_loser_preserves_winner=true wrong_window_refused=true no_checkpoint_or_offer_success=true").unwrap();
 }
-
 
 /// Complete only the remaining physical cursor before a SECOND component
 /// parse. The first corrective page selected the parent with limit1; the child
@@ -4268,7 +4209,6 @@ fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_se
     }
 }
 
-
 #[test]
 fn native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base() {
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
@@ -4336,7 +4276,6 @@ fn native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base(
     writeln!(std::io::stderr().lock(),"native_comparison_native_receipt_revocation: changed_P_base=true changed_R_base=true same_R_reparse_drops=true restart_no_disk_receipt=true no_Skip_or_coverage_claim=true").unwrap();
 }
 
-
 #[test]
 fn native_comparison_default_constructor_honors_durable_queue_debt_prefix_before_audits() {
     let fixture = SelectionFixture::new();
@@ -4368,7 +4307,6 @@ fn native_comparison_default_constructor_honors_durable_queue_debt_prefix_before
         .any(|p| p.path == fixture.paths[1]));
     writeln!(std::io::stderr().lock(),"native_comparison_default_recovery_priority: actual_save_reload=true ordinary_constructor=true no_process_recovery_list=true known_empty_fp_queue_prefix_before_audits=true same_page_cap=true audit_debt_preserved=true no_new_native_eligibility=true").unwrap();
 }
-
 
 #[test]
 fn native_comparison_deferred_policy_unknown_native_is_base_without_new_debt() {
@@ -4430,7 +4368,6 @@ fn native_comparison_deferred_policy_unknown_native_is_base_without_new_debt() {
     assert_eq!(serde_json::to_value(&fixture.index).unwrap(), before_index);
     eprintln!("native_comparison_deferred_unknown: decision_only=true unknown_ids_not_positive=true BASE_required=true new_debt=0 body_index_unchanged=true bootstrap_grant=false physical_liveness_claim=false");
 }
-
 
 #[test]
 fn native_comparison_matching_prepays_hit_and_no_hit_before_scratch_allocation() {
@@ -4540,7 +4477,6 @@ fn native_comparison_matching_prepays_hit_and_no_hit_before_scratch_allocation()
     }
 }
 
-
 #[test]
 fn account_audit_release_waits_for_cache_heads_and_native_selected_restore() {
     if !native_positive_layout_for_test(
@@ -4632,7 +4568,6 @@ fn account_audit_release_waits_for_cache_heads_and_native_selected_restore() {
         }
     }
 }
-
 
 #[test]
 fn ownership_diagnostics_preserve_real_claude_terminal_completed_heap_and_paid_completion() {

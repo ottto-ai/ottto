@@ -322,7 +322,6 @@ fn rewind_copy_counts_only_own_records() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 /// RFC 3339 at `offset_millis` from the file's own birth, so which side of
 /// the 60 s copy line a record falls on does not depend on test timing.
 fn from_birth(birth: i128, offset_millis: i64) -> String {
@@ -434,7 +433,6 @@ fn compaction_pairs_across_the_copy_line_count_once() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 #[test]
 fn fresh_growing_file_has_numbers_on_its_first_upload() {
     let dir = temp_dir("claude-file-birth-growing");
@@ -475,7 +473,6 @@ fn fresh_growing_file_has_numbers_on_its_first_upload() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 #[test]
 fn late_born_subagent_file_is_not_tagged() {
     let dir = temp_dir("claude-file-birth-subagent");
@@ -508,7 +505,6 @@ fn late_born_subagent_file_is_not_tagged() {
     assert_eq!(disposition.context_file_birth.total.tagged_record_count, 0);
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// SOURCE condition 2: a subagent file is exempt from the birth rule only.
 /// The telemetry tripwire still applies wherever sidecars exist.
@@ -559,7 +555,6 @@ fn subagent_file_is_not_exempt_from_the_tripwire() {
     }
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// F1 / SESSION Context: the files of one session id are not merged, so
 /// neither file ships its own first/peak/last or compaction count as the
@@ -630,7 +625,6 @@ fn same_session_id_in_two_folders_withholds_the_tuple() {
     );
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// SOURCE Amendment 5 (review F7): a restored, synced or slot-moved file that
 /// keeps growing is admitted with post-birth numbers only and counted as
@@ -731,7 +725,6 @@ fn restored_file_that_grows_counts_post_birth_only_unless_the_original_is_presen
     let _ = fs::remove_dir_all(dir);
 }
 
-
 /// F5: a reported birth at or before 2020-01-01T00:00:00Z (0, the epoch, a
 /// reset clock) is not evidence, so the file withholds as unknown birth.
 #[test]
@@ -783,7 +776,6 @@ fn birth_at_or_before_2020_counts_as_unknown() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 /// F4: a root response or boundary whose timestamp is missing or unusable
 /// cannot be classified, so the file withholds (never "owned" by default).
 #[test]
@@ -823,7 +815,6 @@ fn untimed_or_invalid_record_timestamp_withholds() {
     }
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// F4: the evidence bound is per root. A root over it is withheld; another
 /// root on the same page is still admitted.
@@ -882,7 +873,6 @@ fn evidence_bound_withholds_only_that_root() {
     );
     let _ = fs::remove_dir_all(dir);
 }
-
 
 const FOURTH: &str = "d0000000-0000-4000-8000-00000000000d";
 const FIFTH: &str = "e0000000-0000-4000-8000-00000000000e";
@@ -1001,7 +991,6 @@ fn roots_under_their_own_bound_are_all_admitted_on_a_page_over_it() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 /// N1: a session admitted on a small page keeps the same body when a later
 /// big page (a backfill or a closed-fence re-arm) carries it with many other
 /// roots whose total is far over the bound.
@@ -1049,7 +1038,6 @@ fn admitted_session_is_not_blanked_by_a_big_page() {
     );
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// review-678c R3: one root whose requests span slices, with the
 /// contradiction in a later slice than a confirmed request. The earlier
@@ -1130,7 +1118,6 @@ fn contradiction_in_a_later_slice_vetoes_the_root() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 /// SOURCE Amendment 7: with the per-root bound lowered by the test seam, a
 /// root the production bound admitted is counted as evidence-bound on every
 /// later pass, the accessor reports the resource withhold, and the local
@@ -1193,7 +1180,6 @@ fn evidence_bound_past_the_lowered_seam_is_counted_and_alarms_once() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 #[test]
 fn unknown_birth_withholds_and_is_counted() {
     let dir = temp_dir("claude-file-birth-unknown");
@@ -1233,7 +1219,6 @@ fn unknown_birth_withholds_and_is_counted() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 #[test]
 fn all_copied_file_withholds() {
     let dir = temp_dir("claude-file-birth-all-copied");
@@ -1261,7 +1246,6 @@ fn all_copied_file_withholds() {
     assert_eq!(counts.tagged_record_count, 2);
     let _ = fs::remove_dir_all(dir);
 }
-
 
 #[test]
 fn telemetry_contradiction_withholds_and_is_counted() {
@@ -1313,7 +1297,6 @@ fn telemetry_contradiction_withholds_and_is_counted() {
     );
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// F2: which telemetry rows a fold loads depends on the page. A veto is
 /// remembered for the vetoed file version for the process lifetime, so a
@@ -1377,7 +1360,6 @@ fn telemetry_veto_stays_until_the_file_changes() {
     }
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// F2: the veto memory is bounded. Past its capacity it fails closed: every
 /// later file withholds until the process restarts.
@@ -1456,7 +1438,6 @@ fn remembered_tripwire_fails_closed_when_full() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 #[test]
 fn same_session_id_never_merges_across_accounts() {
     let dir = temp_dir("claude-file-birth-two-accounts");
@@ -1500,7 +1481,6 @@ fn same_session_id_never_merges_across_accounts() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 #[test]
 fn root_records_copied_under_a_subagent_path_are_not_exempt() {
     let dir = temp_dir("claude-file-birth-subagent-alias");
@@ -1531,7 +1511,6 @@ fn root_records_copied_under_a_subagent_path_are_not_exempt() {
     assert_cleared(&items[0]);
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// The production loader keeps API rows of a root without a trace sidecar for
 /// the veto only: a copied request that this root's own API sidecar reports
@@ -1622,7 +1601,6 @@ fn api_sidecar_without_trace_sidecar_still_vetoes() {
     let _ = fs::remove_dir_all(support);
 }
 
-
 #[test]
 fn api_row_without_trace_row_counts_as_owned() {
     let dir = temp_dir("claude-file-birth-api-only");
@@ -1655,7 +1633,6 @@ fn api_row_without_trace_row_counts_as_owned() {
     );
     let _ = fs::remove_dir_all(dir);
 }
-
 
 #[test]
 fn telemetry_proven_session_keeps_todays_numbers() {
@@ -1717,7 +1694,6 @@ fn telemetry_proven_session_keeps_todays_numbers() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 #[test]
 fn id_less_responses_share_the_one_scalar_source() {
     let dir = temp_dir("claude-file-birth-id-less");
@@ -1744,7 +1720,6 @@ fn id_less_responses_share_the_one_scalar_source() {
     }
     let _ = fs::remove_dir_all(dir);
 }
-
 
 #[test]
 fn last_turn_alone_does_not_change_the_upload_fingerprint() {
@@ -1774,7 +1749,6 @@ fn last_turn_alone_does_not_change_the_upload_fingerprint() {
     );
     let _ = fs::remove_dir_all(dir);
 }
-
 
 #[test]
 fn context_basis_counts_by_version_stay_bounded() {
@@ -1816,7 +1790,6 @@ fn context_basis_counts_by_version_stay_bounded() {
     assert!(serialized.len() < 12_288, "{} bytes", serialized.len());
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// SI byte-identity check with request identity capture ON: through the real
 /// scan and local evidence pipeline, the rule changes context scalars,
@@ -1939,7 +1912,6 @@ fn capture_on_bodies_match_the_clear_outside_context_scalars() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
-
 
 // ---- Session start (addendum 4) -------------------------------------------
 // One classification feeds the scalars and the split: the split is kept only
@@ -2084,7 +2056,6 @@ fn session_start_split_follows_the_scalar_classification() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 /// The per-file start verdict reads the folded item, so it matches the start
 /// the snapshot uploads: a fresh root and a subagent file keep a measured
 /// start, a copied opening keeps the version only.
@@ -2154,7 +2125,6 @@ fn start_verdict_matches_the_folded_session_start() {
     }
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// One native read: reuse `old` when the reader accepts it, retain, finish.
 fn native_read(
@@ -2284,7 +2254,6 @@ fn tail_and_full_read_select_the_same_first_request() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 /// #677 stop latch (SOURCE Amendments 7 and 10): the first Claude fold that
 /// withholds for a resource limit stops the one-time re-read until the daemon
 /// restarts; a later clean fold does not resume it. The evidence-bound trigger
@@ -2409,7 +2378,6 @@ fn claude_backfill_stop_latches_until_restart() {
     let _ = (fs::remove_dir_all(dir), fs::remove_dir_all(home));
 }
 
-
 /// While latched, the alarm repeats at most once an hour, whatever the folds.
 #[test]
 fn claude_backfill_stop_reminder_is_at_most_hourly() {
@@ -2452,7 +2420,6 @@ fn claude_backfill_stop_reminder_is_at_most_hourly() {
     assert!(!claude_reemission_stop_latched());
     assert_eq!(claude_reemission_stop_withheld_folds(), 0);
 }
-
 
 /// Exercise the daemon's real load boundary, including quarantine, rather
 /// than directly setting the stop. NewFile reads still run while adoption of
@@ -2552,7 +2519,6 @@ fn claude_backfill_index_rebuild_load_latches_until_restart() {
     }
 }
 
-
 #[test]
 fn claude_backfill_index_load_without_seen_marker_does_not_latch() {
     let home = temp_dir("claude-index-rebuild-not-active");
@@ -2567,7 +2533,6 @@ fn claude_backfill_index_load_without_seen_marker_does_not_latch() {
     }
     let _ = fs::remove_dir_all(home);
 }
-
 
 #[test]
 fn claude_backfill_index_load_preserves_other_sources_and_existing_indexes() {
@@ -2599,7 +2564,6 @@ fn claude_backfill_index_load_preserves_other_sources_and_existing_indexes() {
     assert!(!claude_reemission_stop_latched());
     let _ = fs::remove_dir_all(home);
 }
-
 
 // ---- Compaction sizes and local points (daemon 5b) --------------------------
 
@@ -2640,7 +2604,6 @@ fn withheld_item_clears_sizes_and_points_with_the_tuple() {
     assert_cleared(&items[0]);
     let _ = fs::remove_dir_all(dir);
 }
-
 
 #[test]
 fn incomplete_identity_ships_sizes_from_the_own_set() {
@@ -2689,7 +2652,6 @@ fn incomplete_identity_ships_sizes_from_the_own_set() {
     }
     let _ = fs::remove_dir_all(dir);
 }
-
 
 #[test]
 fn id_less_neighbours_of_a_compaction_are_counted_locally() {
@@ -2741,7 +2703,6 @@ fn id_less_neighbours_of_a_compaction_are_counted_locally() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 #[test]
 fn id_less_neighbours_mark_every_matching_cut_only() {
     let dir = temp_dir("claude-file-birth-id-less-repeated-cuts");
@@ -2786,7 +2747,6 @@ fn id_less_neighbours_mark_every_matching_cut_only() {
     );
     let _ = fs::remove_dir_all(dir);
 }
-
 
 #[test]
 fn folded_sizes_and_points_leave_every_identity_unchanged() {
@@ -2843,7 +2803,6 @@ fn folded_sizes_and_points_leave_every_identity_unchanged() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 // ---- first_own_request_at (SOURCE ruling, Ron's go) -------------------------
 
 /// Every body that carries `first_own_request_at` also carries this scan
@@ -2867,7 +2826,6 @@ fn claude_scan_identity_stays_at_or_above_the_server_posture_minimum() {
         "{WHY}"
     );
 }
-
 
 /// A measured root file: the first own request's end time, even when copied
 /// records with older timestamps (which set `source_started_at`) follow it.
@@ -2905,7 +2863,6 @@ fn measured_file_carries_its_first_own_request_time() {
     assert!(wire.get("first_own_request_at").is_none());
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// Absent unless the birth was measured: a file whose first own request
 /// follows copied records (partially pre-birth), withheld or unknown birth,
@@ -3010,7 +2967,6 @@ fn first_own_request_time_is_absent_unless_the_birth_is_measured() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 /// The strict rule never carries design E's first own request time, even
 /// for the same file the birth rule measures.
 #[test]
@@ -3045,7 +3001,6 @@ fn strict_path_has_no_first_own_request_time() {
     assert_eq!(birth.first_own_request_at, Some(stamp(now, -30)));
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// Display-only: the field never moves semantic identity, the content hash,
 /// the revision or revision v2 input, the envelope or the body witness.
@@ -3098,7 +3053,6 @@ fn first_own_request_time_leaves_every_identity_unchanged() {
     );
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// The tail path and a full read give the same first own request time at
 /// every append boundary.
@@ -3161,7 +3115,6 @@ fn tail_and_full_read_give_the_same_first_own_request_time() {
     }
     let _ = fs::remove_dir_all(dir);
 }
-
 
 #[test]
 fn points_work_refusal_preserves_every_other_snapshot_field() {
@@ -3254,7 +3207,6 @@ fn points_work_refusal_preserves_every_other_snapshot_field() {
     assert_cleared(&item);
     let _ = fs::remove_dir_all(dir);
 }
-
 
 /// Advertised curves must distinguish E's admitted scalars from copied or
 /// unresolved posture, while the curve itself remains strictly unavailable.
@@ -3381,7 +3333,6 @@ fn file_birth_only_curve_coverage_keeps_admitted_scalars_on_batch_wire() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 #[test]
 fn copied_and_unknown_birth_curves_keep_ownership_unresolved() {
     let dir = temp_dir("claude-file-birth-curve-unresolved");
@@ -3432,7 +3383,6 @@ fn copied_and_unknown_birth_curves_keep_ownership_unresolved() {
     }
     let _ = fs::remove_dir_all(dir);
 }
-
 
 #[test]
 fn scalars_file_birth_only_curve_rejects_nonzero_evidence() {

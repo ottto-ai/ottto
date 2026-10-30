@@ -453,7 +453,6 @@ impl RearmFixture {
         target: Option<&str>,
         input: Option<ScanIndex>,
     ) -> RearmPage {
-
         let checkpoint = input.is_none();
         let mut index =
             input.unwrap_or_else(|| ScanIndex::load(&self.index_path).expect("load scan index"));
@@ -950,11 +949,9 @@ impl RearmFixture {
         }
     }
 
-
     /// The remaining pages of one bounded traversal generation, starting at
     /// page `first`, until the traversal ends.
     fn finish_generation(&self, hour: u32, first: usize, pages: &mut Vec<RearmPage>) {
-
         for number in first..REARM_MAX_PAGES {
             let page = self.page(
                 &format!("2026-08-02T{hour:02}:{number:02}:00Z"),
@@ -968,7 +965,6 @@ impl RearmFixture {
         }
         panic!("the generation ends within {REARM_MAX_PAGES} bounded pages");
     }
-
 
     fn generation(&self, hour: u32) -> Vec<RearmPage> {
         let mut pages = Vec::new();
@@ -1321,9 +1317,7 @@ fn novel_import_recovers_after_owner_coverage_then_stops_reading() {
     assert_late_import_checks_settled_request_owners(false);
 }
 
-
 fn observe_base_prelude(experimental_base_exit: bool) {
-
     let _scope = experimental_base_exit
         .then(crate::snapshots::envelope_selection_experiment::Scope::restart);
     let _source_manifests = SourceManifestTestGuard::new();
@@ -1346,8 +1340,6 @@ fn observe_base_prelude(experimental_base_exit: bool) {
     };
     writeln!(std::io::stderr().lock(), "p12_oracle: name=novel_import_recovers_after_owner_coverage_then_stops_reading mode={mode} status=BLOCKED_OPTIMIZED_PRELUDE original_expected_reads=0 observed_reads={} original_oracle_passed=false downstream_assertions_executed=false", rearm_reads(&quiet)).unwrap();
 }
-
-
 #[test]
 #[serial(source_manifests)]
 fn p12_novel_import_base_control_reveals_unmet_original_prelude() {
@@ -1355,8 +1347,6 @@ fn p12_novel_import_base_control_reveals_unmet_original_prelude() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     observe_base_prelude(false);
 }
-
-
 #[test]
 #[serial(source_manifests)]
 fn p12_novel_import_experiment_base_exit_reveals_unmet_original_prelude() {
@@ -1364,7 +1354,6 @@ fn p12_novel_import_experiment_base_exit_reveals_unmet_original_prelude() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     observe_base_prelude(true);
 }
-
 
 #[test]
 #[ignore = "UNMET historical strict-fence aspiration; superseded by explicit native_comparison_novel_import_base_parity"]
@@ -1379,7 +1368,6 @@ fn native_comparison_original_novel_import_oracle() {
     novel_import_recovers_after_owner_coverage_then_stops_reading();
     writeln!(std::io::stderr().lock(), "native_comparison_original_novel_import: original_body_ran=true original_passed=true page_files=2 actual_SourcePreparation=true actual_existing_frame_budget=true exact_body_ACK_validator=true").unwrap();
 }
-
 
 fn native_comparison_interrupted_correction_is_terminal_base(upload: RearmUpload) {
     let mode = match upload {
@@ -1476,7 +1464,6 @@ fn native_comparison_pending_ack_corrective_parse_partial_save_and_terminal_use_
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     native_comparison_interrupted_correction_is_terminal_base(RearmUpload::AckLost);
 }
-
 
 // Separate naturally bootstrapped selected histories, sharing the SAME immutable
 // physical source/sidecar revisions. No index/permit/certificate is copied.
@@ -1708,7 +1695,6 @@ fn native_comparison_novel_import_base_parity() {
     writeln!(std::io::stderr().lock(),"native_comparison_novel_parity: parity_body_ran=true exact_same_physical_revisions=true independent_natural_bootstrap=true exact_offered_ACKed_bytes_head_collector_evidence_tags=true empty_tag_fixture=true old_A_selected_bodies_bindings_names_unchanged=true settled_coverage_false=true no_S_pending_owner_or_tag_evidence=true quiet_base3_candidate0=true import_reads_base4_candidate1=true later_quiet0=true historical_strict_fence_oracle=UNMET_SUPERSEDED installed_savings_proved=false").unwrap();
 }
 
-
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
@@ -1779,7 +1765,6 @@ fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
     );
     eprintln!("native_comparison_deferred_no_target: actual_SourcePreparation=true enough_target_capacity=true native_files=1 target_finish_calls=0 no_offer_or_checkpoint=true new_local_debt_visible=true abandoned_before_save_BASE=true");
 }
-
 
 #[test]
 #[serial(source_manifests)]
@@ -1938,7 +1923,6 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     assert!(quiet.iter().all(|page| page.offered.is_empty()));
     writeln!(std::io::stderr().lock(),"native_comparison_real_copy_hit: hit_body_ran=true quiet0_before_hit=true deliberate_policy_defer=true eligible_family3_page_cap4=true copy_withheld_until_samewindow_native=true selected_restore_debt3=true copy_not_fake_empty=true exact_pair_saved=true no_positive_copied_posture_or_tags=true bounded_copy_liveness=true").unwrap();
 }
-
 
 fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool) {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2124,8 +2108,6 @@ fn native_comparison_copy_offer_shed_partial_save_recovers() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     native_comparison_copy_offer_interruption(RearmUpload::Shed, false);
 }
-
-
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_copy_offer_ack_loss_partial_save_recovers() {
@@ -2133,8 +2115,6 @@ fn native_comparison_copy_offer_ack_loss_partial_save_recovers() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     native_comparison_copy_offer_interruption(RearmUpload::AckLost, false);
 }
-
-
 #[test]
 #[serial(source_manifests)]
 // A shed page records RatelimitBackoff in the shared client_report counters.
@@ -2144,8 +2124,6 @@ fn native_comparison_copy_offer_shed_restart_recovers() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     native_comparison_copy_offer_interruption(RearmUpload::Shed, true);
 }
-
-
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_copy_offer_ack_loss_restart_recovers() {
@@ -2153,7 +2131,6 @@ fn native_comparison_copy_offer_ack_loss_restart_recovers() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     native_comparison_copy_offer_interruption(RearmUpload::AckLost, true);
 }
-
 
 #[test]
 #[serial(source_manifests)]
@@ -2255,7 +2232,6 @@ fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
     );
     writeln!(std::io::stderr().lock(), "native_comparison_own_C5: body_ran=true actual_hint_capture_and_emission=true own_telemetry_tags_positive=true base_exact_bytes_equal=true no_borrowed_identity=true transcript_settled_false=true exact_wire_ACK_save=true").unwrap();
 }
-
 
 /// One representative matched-source usefulness run. Padding is ignored
 /// progress metadata: accounting/evidence bytes and the original oracles are

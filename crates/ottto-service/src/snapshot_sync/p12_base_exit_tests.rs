@@ -10,7 +10,6 @@ fn p12_experimental_base_exit_account_deferred_hold_lets_a_bounded_claude_traver
     writeln!(std::io::stderr().lock(), "p12_oracle: name=account_deferred_hold_lets_a_bounded_claude_traversal_converge mode=experimental_base_exit_no_reuse status=PASS original_assertions_unchanged=true eligible_reuse_proved=false").unwrap();
 }
 
-
 #[test]
 fn p12_experimental_base_exit_terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
@@ -20,7 +19,6 @@ fn p12_experimental_base_exit_terminal_family_member_controls_keep_blocking_prun
     assert_eq!(scope.counts().rearm_suppressed, 0);
     writeln!(std::io::stderr().lock(), "p12_oracle: name=terminal_family_member_controls_keep_blocking_pruning_and_rebinding mode=experimental_base_exit_no_reuse status=PASS original_assertions_unchanged=true eligible_reuse_proved=false").unwrap();
 }
-
 
 #[test]
 fn p12_experimental_base_exit_terminal_family_never_committed_members_let_the_claude_census_complete() {

@@ -183,7 +183,6 @@ impl Drop for FinishServer {
 }
 
 fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
-
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "permanent_finish_pipeline: outcome={outcome:?} supported_positive=UNEXECUTED layout_supported=false").unwrap();
         return;
@@ -403,7 +402,6 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
     }
 }
 
-
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
@@ -411,7 +409,6 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
 fn permanent_finish_real_pipeline_preserves_earned_native_lease() {
     permanent_finish_pipeline(FinishOutcome::Permanent, true);
 }
-
 
 #[test]
 #[serial]
@@ -427,7 +424,6 @@ fn permanent_finish_real_pipeline_keeps_ineligible_exits_revoked() {
     }
 }
 
-
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
@@ -435,7 +431,6 @@ fn permanent_finish_real_pipeline_keeps_ineligible_exits_revoked() {
 fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sidecars() {
     permanent_finish_pipeline(FinishOutcome::PermanentWithoutSidecars, true);
 }
-
 
 /// T1/T6: the page's only permanent refusals are dominated, no holds. The
 /// first refusal and both quiet retained cycles report settled residue, never
@@ -459,7 +454,6 @@ fn permanent_finish_dominated_refusals_report_settled_residue_every_cycle() {
     }
 }
 
-
 /// T4: a backend that does not admit `census_residue_status:v1` never
 /// receives the `census_residue` code.
 #[test]
@@ -475,7 +469,6 @@ fn permanent_finish_dominated_refusals_never_send_unadmitted_census_residue() {
         true,
     );
 }
-
 
 /// F1: body A is refused as dominated, then a newer body B of the same entity
 /// gets a retryable conflict. A conflict finish leaves exactly one durable
@@ -625,7 +618,6 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
         .unwrap();
     }
 }
-
 
 /// StateMissing M1 (SOURCE d680b524) through the real `prepare_sync_source`
 /// and `finish_sync_source`, the synthetic backend recording every offered
@@ -826,7 +818,6 @@ fn rootless_family_member_list_offers_no_sibling_through_the_real_pipeline() {
     }
 }
 
-
 /// SOURCE d680b524 (b), real prepare/finish: the list names the root `R`,
 /// `R.jsonl` is gone and only subagent files remain. None is offered, and
 /// each counts as held through the absent root.
@@ -842,7 +833,6 @@ fn rootless_family_root_list_offers_no_subagent_through_the_real_pipeline() {
     };
     assert_eq!(root_absent_family_closure_count(&lines), 2);
 }
-
 
 // Same real finish fixture; the new tests own only a test-thread observer.
 pub(crate) mod prior_index_lifetime_tests {
@@ -887,7 +877,6 @@ impl Drop for AckPostSaveFailure {
 }
 
 fn ack_finish_pipeline_case(stage: &'static str) {
-
     crate::client_report::reset_for_test();
     let fixture = IdentityPipelineHome::new();
     let _cadence = IdentityPipelineCadence::new();
@@ -1101,7 +1090,6 @@ fn ack_finish_pipeline_case(stage: &'static str) {
     );
 }
 
-
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
@@ -1116,14 +1104,12 @@ fn ack_retirement_survives_each_real_finish_post_index_error_exit() {
     }
 }
 
-
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn ack_capacity_real_finish_has_no_upload_loss_or_failure_backoff() {
     ack_finish_pipeline_case("capacity");
 }
-
 
 #[test]
 #[serial]
@@ -1132,14 +1118,12 @@ fn ack_bootstrap_capacity_real_finish_commits_census_retirement() {
     ack_finish_pipeline_case("bootstrap_capacity");
 }
 
-
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn ack_first_install_real_finish_uploads_4100_live_entities_without_a_capacity_stop() {
     ack_finish_pipeline_case("first_install");
 }
-
 
 /// #794: one scripted response per snapshot POST; an empty script accepts.
 #[derive(Clone, Copy, Debug)]
@@ -1526,7 +1510,6 @@ fn ack_census_wait_count_resets_on_a_disabled_finish_between_capacity_stops() {
     ack_retention::note_capacity_stop_census(source, false, true);
 }
 
-
 /// #794 F2: real prepare/scan and real finish finalization (incidence and the
 /// file body-set witness come from production code) for one file group of
 /// 5,000 entities next to 4,096 unrelated ACKs of debt. Current Claude and
@@ -1682,6 +1665,7 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
 }
 
 
+/// [behaviour] Containment contract: real finish uploads acks and settles with no manifest.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]

@@ -62,6 +62,7 @@ impl Drop for ClaudeTerminalOffForTest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// [off=main] Default OFF preserves the main policy and checkpoint contract.
     #[test]
     fn machine_switch_defaults_off_and_only_local_regular_marker_enables() {
         let scratch = crate::test_scratch::ScratchDir::new("terminal-off-policy");

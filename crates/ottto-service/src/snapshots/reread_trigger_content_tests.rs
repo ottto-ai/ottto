@@ -218,7 +218,6 @@ fn metadata_only_changes_never_trigger_a_reread() {
     }
 }
 
-
 /// Same bytes under a new inode: the samples re-validate, but the object's
 /// device, inode and birth time are parse inputs (Claude request births and
 /// money birth cutoffs, Codex created-thread matching; see
@@ -273,7 +272,6 @@ fn same_bytes_under_a_new_inode_read_once_for_its_object_inputs() {
     }
 }
 
-
 #[test]
 fn real_content_changes_are_reread() {
     for (source, name, body) in sources() {
@@ -325,7 +323,6 @@ fn real_content_changes_are_reread() {
     }
 }
 
-
 /// Rule 3: a ctime mismatch is a cross-check that runs only the bounded
 /// content-sample re-validation. A rewrite outside the head/tail samples
 /// with size and mtime restored is invisible to it, by design: the parse
@@ -366,7 +363,6 @@ fn ctime_mismatch_revalidates_samples_without_a_full_read() {
         assert_eq!(fixture.fingerprint(), stored, "{name}: middle rewrite");
     }
 }
-
 
 /// A truncate/regrow on the same inode to the same length, leaving the
 /// first and last 4 KiB byte-identical but changing a usage row in between,
@@ -425,7 +421,6 @@ fn truncate_regrow_with_unchanged_samples_is_reread_by_mtime() {
         assert_eq!(fixture.rescan(), 0, "{name}: then settled");
     }
 }
-
 
 const FORK_CHILD: &str = "019fc428-0000-7000-8000-0000000000c1";
 const FORK_PARENT: &str = "019fc428-0000-7000-8000-0000000000c2";
@@ -608,7 +603,6 @@ fn codex_parent_ctime_only_change_keeps_its_ledger_for_a_changed_child() {
     let _ = fs::remove_dir_all(home);
 }
 
-
 /// The live file birth (unix nanos). APFS and ext4 (the CI file systems)
 /// report it; `money_birth_is_the_open_time_read_shared_with_the_birth_rule`
 /// relies on the same.
@@ -681,7 +675,6 @@ fn reused_inode_with_an_unequal_birth_is_read() {
         }
     }
 }
-
 
 /// An unavailable birth, stored (older entries, file systems without birth)
 /// or live, never adopts a stored ctime: the normal path reads.
@@ -768,7 +761,6 @@ fn unavailable_birth_never_adopts_a_stored_ctime() {
         assert_eq!(fixture.rescan(), 0, "{name}: the real scan still binds");
     }
 }
-
 
 /// Reviewer r3 P1, parent ledgers: a ledger and parent entry witnessed on an
 /// earlier object generation (same device, inode, bytes and mtime, another

@@ -265,7 +265,6 @@ fn sampled_native_both_providers_match_full_snapshot_across_append_batches() {
         }
     }
 }
-
 #[test]
 fn sampled_native_progressive_claude_response_and_codex_cumulative_reset() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -298,7 +297,6 @@ fn sampled_native_progressive_claude_response_and_codex_cumulative_reset() {
         );
     }
 }
-
 #[test]
 fn sampled_native_claude_compaction_pairs_across_tail_passes() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -330,7 +328,6 @@ fn sampled_native_claude_compaction_pairs_across_tail_passes() {
     assert_eq!(body[0]["compaction_count"], json!(1));
     assert_eq!(body, oracle(&fixture, source));
 }
-
 /// D1: the Codex context windows ride the retained accumulator, so every
 /// real incremental Tail pass (one record per pass, so each window rule meets
 /// a record boundary: change, equal-peak tie, missing window, fill) renders
@@ -395,7 +392,6 @@ fn sampled_native_codex_context_windows_match_full_read_across_tail_passes() {
         retained = next;
     }
 }
-
 /// The fold builds Claude sizes from the retained boundaries and owned
 /// requests, so a Tail pass that sees the next request gives the full read's
 /// sizes. Rebuilt here with every request owned, as for an exclusive root.
@@ -463,7 +459,6 @@ fn sampled_native_claude_compaction_sizes_across_tail_passes() {
     assert_eq!(tail.compaction_events, full.compaction_events);
     assert_eq!(tail.local_context_points, full.local_context_points);
 }
-
 #[test]
 fn sampled_native_cache_eviction_and_active_state_accounting() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -546,7 +541,6 @@ fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
         assert_ne!(later, oracle(&fixture, source));
     }
 }
-
 #[test]
 fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
@@ -704,7 +698,6 @@ fn sampled_native_partial_eof_or_copy_refusal_keeps_audit_certificate() {
         }
     }
 }
-
 #[test]
 fn sampled_native_wrong_provider_cache_refuses_reuse() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -876,7 +869,6 @@ fn sampled_native_in_file_codex_forks_continue_tail_with_full_parse_parity() {
         );
     }
 }
-
 #[test]
 fn sampled_native_retained_ordinal_fork_with_an_ordinal_break_is_held_not_retained() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -917,7 +909,6 @@ fn sampled_native_retained_ordinal_fork_with_an_ordinal_break_is_held_not_retain
         assert!(next.is_none(), "{case}");
     }
 }
-
 #[test]
 fn sampled_native_legacy_subagent_with_sidecar_parent_retains_until_family_changes() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1362,7 +1353,6 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
         eprintln!("SAMPLED_LIVE_INPUTS inputs={inputs} full_native_bytes={full_bytes} tail_native_bytes={} guard_bytes={}", bytes.0, bytes.1);
     }
 }
-
 /// SOURCE B2: a Codex restart through the real scanner. A first process
 /// reads the rollout Full under an active counting cutover (the V2 view)
 /// with live turn traces and parent ledgers, saves, and writes its record
@@ -1699,7 +1689,6 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
         );
     }
 }
-
 /// Gate-only R2: use the existing production scanner/write/restore fixture,
 /// with real on-disk records and no surviving RAM cache. Native positive
 /// controls require the supported heap layout; Linux runs the ReadPlan cases.
@@ -2557,7 +2546,6 @@ fn durable_inventory_overflow_keeps_tail_reuse_and_defers_new_keys() {
     assert_eq!(production_body(source, scan), production_body(source, full));
     assert!(opaque());
 }
-
 fn production_body(source: SnapshotSource, mut scan: SourceScanResult) -> Value {
     apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
     serde_json::to_value(scan.snapshots).unwrap()
@@ -2779,7 +2767,6 @@ fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_r
         );
     }
 }
-
 #[test]
 fn sampled_production_account_scope_change_and_new_priority_force_real_full_replay() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2829,7 +2816,6 @@ fn sampled_production_account_scope_change_and_new_priority_force_real_full_repl
     let (_, full, _) = production_scan(&fixture, source, ScanIndex::default(), None, "account-a");
     assert_eq!(production_body(source, scan), production_body(source, full));
 }
-
 #[test]
 fn sampled_production_old_idle_source_remains_eligible_for_due_audit() {
     use std::time::{Duration, UNIX_EPOCH};
@@ -2859,7 +2845,6 @@ fn sampled_production_old_idle_source_remains_eligible_for_due_audit() {
     );
     assert!(!audited.files[&key].has_unverified_source());
 }
-
 #[test]
 fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -3078,7 +3063,6 @@ fn cached_scan(
     setup(&mut scan);
     scan
 }
-
 /// Steps `scan` until `stop` holds between two steps.
 fn step_until(
     mut scan: OwnedSourceScan,
@@ -4295,7 +4279,6 @@ fn codex_compaction_events_take_last_before_and_first_counted_after() {
     assert!(late[0].local_context_points.is_empty());
     assert_eq!(late[0].compaction_events, item.compaction_events);
 }
-
 #[test]
 fn codex_compaction_events_and_points_match_full_read_at_every_tail_split() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -5474,6 +5457,7 @@ fn rearm_full_cause_counts_native_bytes_without_changing_selection_or_uploads() 
     }
 }
 
+/// [regress] Containment regression: overlapping root retry preserves native scope and reads no full.
 #[test]
 fn terminal_off_overlapping_root_retry_preserves_native_scope_and_reads_no_full() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -5578,6 +5562,7 @@ fn terminal_off_overlapping_root_retry_preserves_native_scope_and_reads_no_full(
     assert!(index.accepted_snapshot_fingerprints.is_empty());
 }
 
+/// [regress] Containment regression: constructor progress replacement survives held and failed reload without scope full.
 #[test]
 fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload_without_scope_full(
 ) {

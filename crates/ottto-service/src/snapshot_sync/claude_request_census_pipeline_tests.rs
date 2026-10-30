@@ -83,7 +83,6 @@ fn census_records_keep_the_held_revision_and_cover_it_in_window() {
         .all(|page| page.scan.claude_request_census_shadow.is_none()));
 }
 
-
 const CENSUS_PARITY_ID_LESS: &str = "d4444444-4444-4444-8444-444444444444";
 const CENSUS_PARITY_COPY: &str = "e5555555-5555-4555-8555-555555555555";
 
@@ -226,7 +225,6 @@ fn census_records_change_no_pipeline_decision() {
     }
 }
 
-
 struct CensusPreHoldBodies {
     offered: Vec<(String, String)>,
     held: BTreeSet<String>,
@@ -260,7 +258,6 @@ fn census_pre_hold_bodies(
     collected_at: &str,
     cycle: &PipelineCycle<'_>,
 ) -> CensusPreHoldBodies {
-
     let mut index = ScanIndex::load(&fixture.index_path).expect("preview index");
     index.activate_upload_context(cycle.upload_context.to_owned());
     let mut reset_owed_members = 0;
@@ -370,7 +367,6 @@ fn census_pre_hold_bodies(
         reset_owed_members,
     }
 }
-
 
 fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Value>, usize, usize) {
     let _source_manifests = SourceManifestTestGuard::new();

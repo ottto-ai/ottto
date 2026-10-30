@@ -263,7 +263,6 @@ fn codex_incomplete_census_exact_ack_stops_upload_context_for_three_passes() {
     assert_eq!(f.adopt().files, 1);
     f.assert_quiet();
 }
-
 #[test]
 fn claude_fresh_index_and_context_change_are_quiet_after_adoption() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
@@ -280,7 +279,6 @@ fn claude_fresh_index_and_context_change_are_quiet_after_adoption() {
     assert_eq!(f.adopt().files, 1);
     f.assert_quiet();
 }
-
 #[test]
 fn claude_source_context_matched_without_receipts_is_quiet_for_three_relists() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
@@ -303,7 +301,6 @@ fn claude_source_context_matched_without_receipts_is_quiet_for_three_relists() {
         assert!(f.entry().upload_context_receipt.is_none());
     }
 }
-
 #[test]
 fn claude_source_context_matched_mixed_file_is_quiet_for_three_relists() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
@@ -344,21 +341,18 @@ fn claude_source_context_matched_mixed_file_is_quiet_for_three_relists() {
         assert!(f.entry().upload_context_receipt.is_none());
     }
 }
-
 #[test]
 fn upload_context_receipt_parse_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.walk(false);
     assert!(f.entry().upload_context_receipt.is_none());
 }
-
 #[test]
 fn upload_context_receipt_finalize_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.walk(true);
     assert!(f.entry().upload_context_receipt.is_none());
 }
-
 #[test]
 fn upload_context_receipt_quarantine_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -376,7 +370,6 @@ fn upload_context_receipt_quarantine_refused() {
     );
     assert!(f.entry().upload_context_receipt.is_none());
 }
-
 #[test]
 fn upload_context_receipt_c_ack_after_switch_to_d_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -394,7 +387,6 @@ fn upload_context_receipt_c_ack_after_switch_to_d_refused() {
     );
     assert!(f.entry().upload_context_receipt.is_none());
 }
-
 #[test]
 fn upload_context_receipt_stale_source_witness_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -409,7 +401,6 @@ fn upload_context_receipt_stale_source_witness_refused() {
         0
     );
 }
-
 #[test]
 fn upload_context_receipt_stale_body_witness_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -428,7 +419,6 @@ fn upload_context_receipt_stale_body_witness_refused() {
         0
     );
 }
-
 #[test]
 fn upload_context_receipt_stale_generation_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -442,7 +432,6 @@ fn upload_context_receipt_stale_generation_refused() {
         0
     );
 }
-
 #[test]
 fn upload_context_receipt_partial_entity_ack_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -454,7 +443,6 @@ fn upload_context_receipt_partial_entity_ack_refused() {
         0
     );
 }
-
 #[test]
 fn codex_refused_body_backoff_reads_zero_bytes_over_three_relists() {
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -468,7 +456,6 @@ fn codex_refused_body_backoff_reads_zero_bytes_over_three_relists() {
     f.assert_quiet();
     assert!(f.entry().upload_context_receipt.is_none());
 }
-
 #[test]
 fn claude_held_family_backoff_reads_zero_bytes_over_three_relists() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
@@ -479,7 +466,6 @@ fn claude_held_family_backoff_reads_zero_bytes_over_three_relists() {
     f.assert_quiet();
     assert!(f.entry().upload_context_receipt.is_none());
 }
-
 #[test]
 fn upload_context_receipt_restart_and_generation_rearm_once() {
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -523,7 +509,6 @@ fn upload_context_receipt_restart_and_generation_rearm_once() {
     assert!(counts.local_bytes <= size);
     f.assert_quiet();
 }
-
 #[test]
 fn upload_context_receipt_historical_replay_rearms_retained_entry() {
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -570,12 +555,10 @@ fn legacy_round_trip(version: &str) {
 fn upload_context_receipt_decoder_0_1_201_ignores_field() {
     legacy_round_trip("0.1.201");
 }
-
 #[test]
 fn upload_context_receipt_decoder_0_1_202_round_trip_rearms_once() {
     legacy_round_trip("0.1.202");
 }
-
 #[test]
 fn upload_context_receipt_current_round_trip_and_size() {
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -609,7 +592,6 @@ fn upload_context_receipt_wrong_ack_body_refused() {
     );
     assert!(f.entry().upload_context_receipt.is_none());
 }
-
 #[test]
 fn upload_context_receipt_withheld_after_capture_refused() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
@@ -627,7 +609,6 @@ fn upload_context_receipt_withheld_after_capture_refused() {
         0
     );
 }
-
 #[test]
 fn upload_context_receipt_destination_policy_precedes_admission() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
@@ -666,7 +647,6 @@ fn upload_context_receipt_partial_checkpoint_accepts_runtime_fields_and_persists
     assert!(f.entry().upload_context_receipt.is_some());
     f.assert_quiet();
 }
-
 #[test]
 fn upload_context_receipt_partial_checkpoint_old_ack_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -677,7 +657,6 @@ fn upload_context_receipt_partial_checkpoint_old_ack_refused() {
     );
     assert!(f.entry().upload_context_receipt.is_none());
 }
-
 #[test]
 fn upload_context_legacy_activation_preserves_identical_body_noop() {
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -690,7 +669,6 @@ fn upload_context_legacy_activation_preserves_identical_body_noop() {
     assert!(scan.snapshots.is_empty());
     assert!(scan.semantic_noop_count > 0);
 }
-
 #[test]
 fn upload_context_policy_change_reprojects_old_refusal_then_keeps_backoff() {
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -852,7 +830,6 @@ fn real_uploader_restart_mid_context_catchup_never_resends_reacked_entities() {
     assert_eq!(f.uploader.posts.len(), before + 1);
     assert_eq!(f.uploader.counts(), (0, 0, 0, 0));
 }
-
 #[test]
 fn real_uploader_same_context_transport_retry_has_zero_context_resends() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
@@ -880,7 +857,6 @@ fn real_uploader_same_context_transport_retry_has_zero_context_resends() {
     assert_eq!(f.uploader.posts.len(), 2);
     assert_eq!(f.uploader.counts(), (0, 0, 0, 0));
 }
-
 #[test]
 fn real_uploader_old_unstamped_progress_with_equal_source_context_resends_nothing() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
@@ -910,7 +886,6 @@ fn real_uploader_old_unstamped_progress_with_equal_source_context_resends_nothin
         assert_eq!((scan.scanned_file_count, bytes), (0, 0));
     }
 }
-
 #[test]
 fn real_uploader_new_usage_precedes_pending_context_catchup() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
@@ -935,7 +910,6 @@ fn real_uploader_new_usage_precedes_pending_context_catchup() {
         .iter()
         .all(|post| serde_json::to_vec(post).unwrap().len() <= 2 * 1024 * 1024));
 }
-
 #[test]
 fn real_uploader_not_stored_backs_off_but_growth_earns_receipt() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
@@ -984,7 +958,6 @@ fn real_uploader_not_stored_backs_off_but_growth_earns_receipt() {
         "e".repeat(64)
     );
 }
-
 #[test]
 fn real_uploader_duplicate_refusal_mints_nothing_and_does_not_loop() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
@@ -1014,7 +987,6 @@ fn real_uploader_duplicate_refusal_mints_nothing_and_does_not_loop() {
         assert_eq!(f.uploader.posts.len(), posts);
     }
 }
-
 #[test]
 fn real_uploader_privacy_reducing_context_uses_destination_policy() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
@@ -1710,7 +1682,6 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
 fn real_scan_new_unhinted_singleton_precedes_context_group_at_file_limit_two() {
     ordinary_singleton_precedes_context_group(false);
 }
-
 #[test]
 fn real_scan_same_size_rewrite_precedes_context_group_at_file_limit_two() {
     ordinary_singleton_precedes_context_group(true);
@@ -2022,6 +1993,7 @@ fn c1_retained_mixed_file() -> (Fixture, SnapshotItem) {
     (f, refused)
 }
 
+/// [behaviour] Containment contract: c1 mixed current context holds three relists with zero body reads.
 #[test]
 fn c1_mixed_current_context_holds_three_relists_with_zero_body_reads() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2046,6 +2018,7 @@ fn c1_mixed_current_context_holds_three_relists_with_zero_body_reads() {
     ));
 }
 
+/// [behaviour] Containment contract: c1 privacy reduction never holds old context siblings.
 #[test]
 fn c1_privacy_reduction_never_holds_old_context_siblings() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2086,6 +2059,7 @@ fn c1_privacy_reduction_never_holds_old_context_siblings() {
     f.assert_quiet();
 }
 
+/// [behaviour] Containment contract: c1 terminal ends hold and destination siblings rearm once then quiet.
 #[test]
 fn c1_terminal_ends_hold_and_destination_siblings_rearm_once_then_quiet() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2122,6 +2096,7 @@ fn c1_terminal_ends_hold_and_destination_siblings_rearm_once_then_quiet() {
     );
 }
 
+/// [behaviour] Containment contract: c1 missing current stamp or cleared source never holds a context move.
 #[test]
 fn c1_missing_current_stamp_or_cleared_source_never_holds_a_context_move() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2147,6 +2122,7 @@ fn c1_missing_current_stamp_or_cleared_source_never_holds_a_context_move() {
     );
 }
 
+/// [behaviour] Containment contract: c1 hold count uses prepared cooldown and lease views.
 #[test]
 fn c1_hold_count_uses_prepared_cooldown_and_lease_views() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2191,6 +2167,7 @@ fn c1_hold_count_uses_prepared_cooldown_and_lease_views() {
     );
 }
 
+/// [behaviour] Containment contract: receipt context move uses paced catchup then three quiet walks.
 #[test]
 fn terminal_off_receipt_context_move_uses_paced_catchup_then_three_quiet_walks() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2257,6 +2234,7 @@ fn terminal_off_receipt_context_move_uses_paced_catchup_then_three_quiet_walks()
     );
 }
 
+/// [behaviour] Containment contract: context mismatch cannot wake parked key until stat change.
 #[test]
 fn terminal_off_context_mismatch_cannot_wake_parked_key_until_stat_change() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2380,6 +2358,7 @@ fn b1_quiet_preparations(f: &mut Fixture, now: u64) {
     }
 }
 
+/// [behaviour] Containment contract: empty and three normal files stay quiet then context rereads empty once.
 #[test]
 fn terminal_off_empty_and_three_normal_files_stay_quiet_then_context_rereads_empty_once() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2513,6 +2492,7 @@ fn terminal_off_empty_and_three_normal_files_stay_quiet_then_context_rereads_emp
     );
 }
 
+/// [behaviour] Containment contract: held history without body witness does not force rediscovery.
 #[test]
 fn terminal_off_held_history_without_body_witness_does_not_force_rediscovery() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -2557,6 +2537,7 @@ fn terminal_off_held_history_without_body_witness_does_not_force_rediscovery() {
     );
 }
 
+/// [behaviour] Containment contract: empty memo requires finalization and cannot mask cleared debt.
 #[test]
 fn terminal_off_empty_memo_requires_finalization_and_cannot_mask_cleared_debt() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();

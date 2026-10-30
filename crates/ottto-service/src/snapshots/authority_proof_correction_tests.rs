@@ -231,7 +231,6 @@ fn changed_proof_rebinds_the_terminal_record_and_owes_every_member() {
     assert_eq!(apc_owed(&loaded), apc_owed(&index));
 }
 
-
 /// No grant without a genuinely changed proof over an exactly bound terminal
 /// record: the same proof, a RetryPending record, a misbound or malformed
 /// record, a missing record or a missing retained witness change nothing.
@@ -304,7 +303,6 @@ fn rebind_grants_nothing_without_a_changed_proof_over_an_exactly_bound_record() 
     );
 }
 
-
 /// R5 as implemented: a further changed proof over a pending correction owes
 /// every recorded member again, including one already drained, and resets no
 /// counter or deadline. Repeating that proof grants nothing.
@@ -360,7 +358,6 @@ fn a_new_proof_over_a_pending_correction_owes_every_member_again() {
     assert_eq!(serde_json::to_vec(&index).unwrap(), repeated);
 }
 
-
 /// A changed member revision still parses through the existing path, and a
 /// record whose correction failed (v1, terminal, no correction, rebound to
 /// the proof) skips unchanged members again until the next changed proof.
@@ -387,7 +384,6 @@ fn only_owed_or_changed_members_bypass_the_terminal_gate() {
     }
     assert_eq!(apc_decision(&index, &changed), PARSE_FOR_AUTHORITY);
 }
-
 
 /// Write one mutated saved index and load it. Returns the loaded index and
 /// whether the loader quarantined the file for a rebuild.
@@ -521,7 +517,6 @@ fn invalid_correction_states_drop_only_the_affected_authority_record() {
     }
 }
 
-
 /// A new reader treats an old-contract record exactly as before: no field is
 /// written, the encoded record is byte-for-byte the pre-change shape, and it
 /// reloads identically. The source-pinned pre-change decoder reads the same
@@ -556,7 +551,6 @@ fn new_reader_keeps_old_contract_records_byte_identical() {
         (CandidateDecision::Skip, None)
     );
 }
-
 
 /// R7 against the actual pre-change decoder source. The pinned base has no
 /// `deny_unknown_fields` on the record, so a v2 record still decodes and the
@@ -632,7 +626,6 @@ fn pre_change_decoder_rejects_the_declared_v2_contract_and_rebuilds() {
     }));
 }
 
-
 /// Partial checkpoint (shed): the committable subset keeps the correction
 /// with every member whose corrected body is not durably settled, binds it to
 /// the retained proof, and reloads intact while the unACKed file reverts.
@@ -698,7 +691,6 @@ fn partial_checkpoint_subset_keeps_every_unsettled_owed_member() {
     );
 }
 
-
 /// A complete healthy census retires only grants it disproves: members absent
 /// from the complete family leave the owed set and the recorded members, a
 /// census sharing no recorded member keeps the record, and a family absent
@@ -746,7 +738,6 @@ fn complete_census_retires_only_absent_correction_members() {
         .contains_key(APC_ROOT));
     assert!(!index.claude_usage_family_pending.contains_key(APC_ROOT));
 }
-
 
 // ---------------------------------------------------------------------------
 // SOURCE Addenda 3 and 4 (M1, M2, A1-A3) and the R1 no-op as CONTROLLED
@@ -986,7 +977,6 @@ fn m1_only_a_complete_healthy_absence_retires_the_absent_members_grant() {
     );
 }
 
-
 /// M1 edges (Addendum 3 acceptance 5 and 6). An absent member that reappears
 /// is an ordinary new file and revives no grant. A family the complete census
 /// no longer contains clears its record by the existing vanish rule, exactly
@@ -1050,7 +1040,6 @@ fn m1_reappearance_is_a_new_file_and_a_vanished_family_clears_its_record() {
     }
 }
 
-
 /// M2 (Addendum 3 acceptance 3). A member whose current recorded revision
 /// parses complete, valid and empty drains as a no-body completion only when
 /// the census is complete, offering nothing to upload; only the correction
@@ -1089,7 +1078,6 @@ fn m2_current_revision_empty_member_drains_without_a_body_only_at_a_complete_cen
         }
     }
 }
-
 
 /// M2 and A3 refusals (Addendum 3 acceptance 4; Addendum 4 unsafe
 /// combinations). Confirmation at an older revision, a legacy entry with no
@@ -1193,7 +1181,6 @@ fn m2_older_legacy_failed_partial_and_unpaired_empty_facts_stay_owed() {
     }
 }
 
-
 /// A saved empty pair is not this page's current result when the same file
 /// has an unsettled read. Exercise the production scan-aware authority seam,
 /// including a failed newer revision that produced no snapshot at all.
@@ -1235,7 +1222,6 @@ fn current_page_reads_defer_a_previously_durable_empty_pair_until_settlement() {
         assert_eq!(apc_quarantine_bytes(&loaded), before, "{case}: restart");
     }
 }
-
 
 /// A1 then A3 (Addendum 4 acceptance 1 and 5). A new empty revision parsed on
 /// an earlier partial page advances only the member's map revision, with the
@@ -1293,7 +1279,6 @@ fn a1_earlier_partial_empty_page_advances_only_the_map_then_a_complete_census_dr
     assert_eq!(apc_debts(&loaded), debts);
     apc_save_reload(&mut loaded, &scratch.join("advanced.json"));
 }
-
 
 /// A3 control (Addendum 4 acceptance 2 and 5). The committed state holds an
 /// older empty entry while the record holds a newer revision; this page
@@ -1367,7 +1352,6 @@ fn a3_held_restoration_of_an_older_empty_entry_never_advances_or_drains() {
         "a stale empty entry never completes a newer revision"
     );
 }
-
 
 /// A2 (Addendum 4 acceptance 3 and 5) and the settlement-order regression: the
 /// LAST owed member has an accepted non-empty prior entity, and its new empty
@@ -1448,7 +1432,6 @@ fn a2_shed_after_an_empty_advance_rolls_the_map_back_and_keeps_the_last_owed_mem
     );
 }
 
-
 /// A2 carriage (Addendum 4 acceptance 1, 3 and 5): the LAST owed member has
 /// no prior entity (a delivery-free entry). Its empty advance on a shed page
 /// is carried by the checkpoint selection together with the file entry and
@@ -1501,7 +1484,6 @@ fn a2_partial_save_without_a_prior_entity_carries_the_pair_and_drains_at_a_compl
     apc_save_reload(&mut loaded, &scratch.join("shed.json"));
 }
 
-
 /// A3 (Addendum 4 acceptance 4 and 5): a complete non-empty parse at a new
 /// revision never advances the map at any census; the changed revision takes
 /// the existing R4 path, and the member stays owed through restart.
@@ -1535,7 +1517,6 @@ fn a3_a_non_empty_parse_never_advances_the_map() {
     apc_apply(&mut loaded, true, true);
     assert_eq!(apc_owed(&loaded), Some(BTreeSet::from([root, agent])));
 }
-
 
 /// R1 no-op, distinct from an ACK, at the real settlement seam: a member whose
 /// captured current-proof body is already accepted with the same file body set
@@ -1618,7 +1599,6 @@ fn an_accepted_unchanged_body_drains_as_a_no_op_without_an_upload() {
         "a changed body set is not a no-op"
     );
 }
-
 
 #[test]
 fn terminal_refusal_requires_current_proof_revision_body_and_nonpartial_outcome() {
@@ -1736,7 +1716,6 @@ fn terminal_refusal_requires_current_proof_revision_body_and_nonpartial_outcome(
     }
 }
 
-
 fn apc_cutoff_item(revision: &str, activity: &str) -> SnapshotItem {
     let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
     item.source_session_id = APC_ROOT.to_string();
@@ -1821,7 +1800,6 @@ fn cutoff_only_completion_carries_its_selected_empty_facts_or_stays_owed() {
     assert_eq!(serde_json::to_vec(&cutoff).unwrap(), cutoff_bytes);
 }
 
-
 #[test]
 fn partial_cutoff_keeps_the_remaining_body_on_the_exact_ack_path() {
     let revision = apc_revisions()[0].clone();
@@ -1905,7 +1883,6 @@ fn partial_cutoff_keeps_the_remaining_body_on_the_exact_ack_path() {
     }
 }
 
-
 /// OBS: correction state persists only the proof and the owed member ids; owed
 /// counts and reasons go only to the existing local diagnostic line.
 #[test]
@@ -1936,7 +1913,6 @@ fn a_correction_persists_no_diagnostic_metadata() {
         BTreeSet::from(["proof_witness_fingerprint", "owed_member_ids"])
     );
 }
-
 
 // ---------------------------------------------------------------------------
 // R8 measurement on the small M2 synthetic family shape (32 and 64 roots, two
@@ -2289,7 +2265,6 @@ fn proof_correction_encoded_and_owned_bytes_receipt() {
     }
 }
 
-
 /// Source-pinned pre-change decoder. The record type and its predicate are
 /// copied (with rustfmt line wrapping) from `crates/ottto-service/src/snapshots.rs` at release source
 /// 896b98f6b7347251b35c2d13cd462b132cd99d84 (release 0.1.173; blob 00ffefd4574e), lines
@@ -2509,7 +2484,6 @@ fn demotion_after_same_call_reproof_binds_current_witness() {
     apc_save_reload(&mut index, &scratch.join("index.json"));
 }
 
-
 #[test]
 fn witness_removed_while_member_demotes_does_not_quarantine_index() {
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
@@ -2554,7 +2528,6 @@ fn witness_removed_while_member_demotes_does_not_quarantine_index() {
     let loaded = apc_save_reload(&mut index, &scratch.join("index.json"));
     assert_eq!(loaded.files.len(), count);
 }
-
 
 /// An index whose authority record is unbound: unbound on load or on save.
 fn apc_unbound_fixture() -> ScanIndex {
@@ -2642,7 +2615,6 @@ fn load_drops_unbound_authority_record_and_keeps_index() {
     assert_eq!(serde_json::to_value(loaded).unwrap(), expected);
 }
 
-
 #[test]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
@@ -2667,7 +2639,6 @@ fn contained_unbound_authority_record_does_not_latch_claude_reemission_stop() {
     assert!(!claude_reemission_stop_latched());
     assert_eq!(claude_reemission_stop_reason(), "none");
 }
-
 
 /// SOURCE F1: an existing orphan fails closed for its one record at save, in
 /// debug and release alike; the save succeeds and the result loads as is.
@@ -2709,7 +2680,6 @@ fn save_drops_existing_orphan_authority_record_and_succeeds() {
     );
     assert_eq!(serde_json::to_value(loaded).unwrap(), expected);
 }
-
 
 #[test]
 fn empty_map_restore_never_removes_owed_member() {

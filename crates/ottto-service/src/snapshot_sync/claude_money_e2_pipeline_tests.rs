@@ -189,11 +189,7 @@ impl Corpus {
             SnapshotSource::ClaudeCode,
             "e2-synthetic-destination".into(),
         );
-        index.activate_effective_upload_body_witness_revision(if e2::enabled() {
-            3
-        } else {
-            effective_upload_body_witness_revision(SnapshotSource::ClaudeCode)
-        });
+        index.activate_effective_upload_body_witness_revision(3);
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(&self.support);
         let committed = index.clone();
@@ -334,15 +330,7 @@ impl Page {
         );
         result
     }
-    fn accept(&mut self) {
-        let mut progress = e2_progress();
-        assert_eq!(
-            self.upload_context(&mut progress, ack).0.unwrap(),
-            ResumableUploadResult::Completed
-        );
-        self.index
-            .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
-    }
+
     fn receipt(&self) -> Vec<(String, String, String)> {
         self.scan
             .snapshots
@@ -494,13 +482,6 @@ fn ack(batch: &[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchRe
     response.sessions_reconciled = response.accepted;
     Ok(response)
 }
-
-// The history pipeline's containment twin validates this exact ACK shape.
-pub(super) fn terminal_off_on_ack(
-    batch: &[SnapshotItem],
-) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
-    ack(batch)
-}
 fn total(page: &Page) -> u64 {
     page.scan.snapshots.iter().map(|s| s.request_count).sum()
 }
@@ -635,9 +616,7 @@ fn e2_pipeline_dark_matches_fold_absent_publication_and_selection() {
     e2::with_disabled(e2_pipeline_dark_matches_fold_absent_publication_and_selection_body);
 }
 
-
 fn e2_pipeline_dark_matches_fold_absent_publication_and_selection_body() {
-
     let mut c = Corpus::new("e2-pipeline-dark");
     c.root(
         ROOT,
@@ -691,7 +670,6 @@ fn e2_pipeline_dark_matches_fold_absent_publication_and_selection_body() {
         next_b.scan.scanned_file_count
     );
 }
-
 
 #[test]
 fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
@@ -760,9 +738,7 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
     });
 }
 
-
 fn mutation_case(kind: &str) {
-
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-{kind}"));
         let contents = line(ROOT, "copied", "2026-08-02T06:58:00Z", 11)
@@ -821,25 +797,18 @@ fn mutation_case(kind: &str) {
         );
     });
 }
-
-
 #[test]
 fn e2_pipeline_truncate_matches_full() {
     mutation_case("truncate");
 }
-
-
 #[test]
 fn e2_pipeline_same_size_edit_matches_full() {
     mutation_case("same-size");
 }
-
-
 #[test]
 fn e2_pipeline_inode_replacement_matches_full() {
     mutation_case("inode");
 }
-
 
 #[test]
 fn e2_pipeline_page_boundary_matches_single_page_bodies() {
@@ -877,7 +846,6 @@ fn e2_pipeline_page_boundary_matches_single_page_bodies() {
         );
     });
 }
-
 
 #[test]
 fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
@@ -918,9 +886,7 @@ fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
     });
 }
 
-
 fn twins(reverse: bool) {
-
     with_e2(|| {
         let mut c = Corpus::new(if reverse {
             "e2-pipeline-twins-reverse"
@@ -971,19 +937,14 @@ fn twins(reverse: bool) {
         );
     });
 }
-
-
 #[test]
 fn e2_pipeline_twins_original_discovered_first() {
     twins(false);
 }
-
-
 #[test]
 fn e2_pipeline_twins_copy_discovered_first() {
     twins(true);
 }
-
 
 /// R1: each walk meets both path twins, but a settled twin does not pull its
 /// family into the page. Only a twin the page reads does; otherwise the
@@ -1034,7 +995,6 @@ fn e2_pipeline_settled_twins_are_not_read_again() {
         );
     });
 }
-
 
 #[test]
 fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
@@ -1088,7 +1048,6 @@ fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
     });
 }
 
-
 #[test]
 fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
     with_e2(|| {
@@ -1134,7 +1093,6 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
         );
     });
 }
-
 
 #[test]
 fn e2_pipeline_one_branch_removes_copied_prefix_only() {
@@ -1209,7 +1167,6 @@ fn e2_pipeline_one_branch_removes_copied_prefix_only() {
     });
 }
 
-
 #[test]
 fn e2_pipeline_side_call_uses_trace_named_agent_and_counts_root_fallback() {
     with_e2(|| {
@@ -1255,7 +1212,6 @@ fn e2_pipeline_side_call_uses_trace_named_agent_and_counts_root_fallback() {
         );
     });
 }
-
 
 #[test]
 fn e2_pipeline_quiet_otel_only_change_replaces_estimate_without_count_growth() {
@@ -1310,7 +1266,6 @@ fn e2_pipeline_quiet_otel_only_change_replaces_estimate_without_count_growth() {
         );
     });
 }
-
 
 #[test]
 fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
@@ -1405,9 +1360,7 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
     });
 }
 
-
 fn retry_case(conflict: bool) {
-
     with_e2(|| {
         let mut c = Corpus::new(if conflict {
             "e2-pipeline-retry-conflict"
@@ -1564,18 +1517,14 @@ fn retry_case(conflict: bool) {
     });
 }
 
-
 #[test]
 fn e2_pipeline_transport_restart_and_partial_ack_keep_exact_literal_fields() {
     retry_case(true);
 }
-
-
 #[test]
 fn e2_pipeline_transport_restart_and_partial_ack_without_resolver_conflict() {
     retry_case(false);
 }
-
 
 fn family_corpus(c: &mut Corpus, count: usize, model_padding: usize) {
     let model = format!("claude-haiku-4-5{}", "x".repeat(model_padding));
@@ -1591,7 +1540,6 @@ fn family_corpus(c: &mut Corpus, count: usize, model_padding: usize) {
     }
 }
 fn family_count_case(count: usize) {
-
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-family-{count}"));
         family_corpus(&mut c, count, 0);
@@ -1624,25 +1572,18 @@ fn family_count_case(count: usize) {
         assert_eq!(progress.accepted_fingerprints.len(), count);
     });
 }
-
-
 #[test]
 fn e2_pipeline_real_family_49() {
     family_count_case(49);
 }
-
-
 #[test]
 fn e2_pipeline_real_family_50() {
     family_count_case(50);
 }
-
-
 #[test]
 fn e2_pipeline_real_family_51() {
     family_count_case(51);
 }
-
 
 #[test]
 fn e2_pipeline_real_family_crosses_two_mib_root_first() {
@@ -1700,7 +1641,6 @@ fn e2_pipeline_real_family_crosses_two_mib_root_first() {
         println!("E2_PIPELINE_BYTE_BOUNDARY below={bytes_below} above={bytes_above} limit={SNAPSHOT_BATCH_MAX_BYTES}");
     });
 }
-
 
 #[test]
 fn e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
@@ -1773,7 +1713,6 @@ fn e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
     });
 }
 
-
 #[test]
 fn e2_pipeline_orphan_branch_copy_counts_once_and_discloses() {
     with_e2(|| {
@@ -1813,9 +1752,7 @@ fn e2_pipeline_orphan_branch_copy_counts_once_and_discloses() {
     });
 }
 
-
 fn restored_twins(reverse: bool, equal: bool) {
-
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-restored-{reverse}-{equal}"));
         let (a, b) = if reverse {
@@ -1878,31 +1815,22 @@ fn restored_twins(reverse: bool, equal: bool) {
         );
     });
 }
-
-
 #[test]
 fn e2_pipeline_restored_twins_earlier_first() {
     restored_twins(false, false);
 }
-
-
 #[test]
 fn e2_pipeline_restored_twins_later_first() {
     restored_twins(true, false);
 }
-
-
 #[test]
 fn e2_pipeline_restored_twins_equal_birth_forward() {
     restored_twins(false, true);
 }
-
-
 #[test]
 fn e2_pipeline_restored_twins_equal_birth_reverse() {
     restored_twins(true, true);
 }
-
 
 #[test]
 fn e2_pipeline_deletion_reload_then_later_move_keeps_birth() {
@@ -1932,7 +1860,6 @@ fn e2_pipeline_deletion_reload_then_later_move_keeps_birth() {
         assert_eq!(moved.scan.snapshots[0].removed_request_count, Some(0));
     });
 }
-
 
 #[test]
 fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
@@ -2022,7 +1949,6 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
         );
     });
 }
-
 
 // ---- I4b: gate-ON copy proofs, delays, side-call holds, conflict carrier ----
 
@@ -2170,13 +2096,10 @@ fn rewritten_original(reverse: bool) {
 fn e2_pipeline_inplace_rewritten_original_cannot_remove_its_twin_copy() {
     rewritten_original(false);
 }
-
-
 #[test]
 fn e2_pipeline_inplace_rewritten_original_cannot_remove_its_twin_copy_reverse() {
     rewritten_original(true);
 }
-
 
 /// Owner ruling 1 (Codex P1-1 case 2): restored same-session histories H1
 /// and H1+H2, every line pre-birth: the union counts, H1 once, H2 once, on
@@ -2223,18 +2146,14 @@ fn overlapping_restored(reverse: bool) {
 fn e2_pipeline_overlapping_restored_histories_count_their_union_once() {
     overlapping_restored(false);
 }
-
-
 #[test]
 fn e2_pipeline_overlapping_restored_histories_count_their_union_once_reverse() {
     overlapping_restored(true);
 }
 
-
 /// Owner ruling 2: an all-copied /branch is skipped on the request ids its
 /// earlier other-session holder has, whatever version wrote the lines.
 fn branch_by(version: &str) {
-
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-branch-by-{version}"));
         c.root(ROOT, &line_by(ROOT, "original", AT, 10, version));
@@ -2259,20 +2178,15 @@ fn branch_by(version: &str) {
         assert!(body(&branch, ROOT).is_none(), "the original is unchanged");
     });
 }
-
-
 #[test]
 fn e2_pipeline_branch_written_outside_the_writer_allowlist_is_skipped_by_request_ids() {
     branch_by("2.0.99");
 }
-
-
 #[test]
 fn e2_pipeline_branch_written_by_the_current_m4_claude_code_is_skipped() {
     // `claude --version` on the M4 on 2026-10-26: 2.1.310 (Claude Code).
     branch_by("2.1.310");
 }
-
 
 /// Owner ruling 3: a /branch read before its original on a fresh index
 /// cannot decide: it is held (never counted), and a later page that reads
@@ -2336,13 +2250,10 @@ fn branch_before_original(copy_first: bool) {
 fn e2_pipeline_branch_read_before_its_original_waits_instead_of_counting() {
     branch_before_original(true);
 }
-
-
 #[test]
 fn e2_pipeline_branch_read_after_its_original_on_a_fresh_index_is_skipped() {
     branch_before_original(false);
 }
-
 
 /// An indexed original rewritten in place to drop H, then a new all-pre-birth
 /// branch holding H, read before the original's next page: the original's
@@ -2406,7 +2317,6 @@ fn e2_pipeline_branch_waits_for_an_original_modified_since_its_read() {
         );
     });
 }
-
 
 /// Owner rule (P2): holding a session withholds its upload only; its scan
 /// state stays evidence. All-copied main files of four sessions share
@@ -2518,7 +2428,6 @@ fn e2_pipeline_held_copies_never_wait_on_each_other() {
     });
 }
 
-
 /// Owner ruling 3: the census walk deadline decides nothing: the /branch is
 /// held, then the next page's walk skips it.
 #[test]
@@ -2551,7 +2460,6 @@ fn e2_pipeline_branch_census_deadline_holds_then_a_later_walk_skips() {
         );
     });
 }
-
 
 /// Design item 9 (PR C): the legacy fork-prefix exclusion and the E2 copy
 /// skip never both remove a copied request. A legacy fork child whose
@@ -2611,7 +2519,6 @@ fn e2_pipeline_legacy_fork_prefix_is_removed_exactly_once() {
     });
 }
 
-
 /// The `fork-context-ref` line `/branch` (Claude Code 2.1.309+) writes into
 /// the new session, naming the session it copied.
 fn fork_ref(session: &str, parent: &str) -> String {
@@ -2663,8 +2570,6 @@ fn e2_pipeline_branch_of_a_retired_original_named_by_its_fork_line_is_skipped() 
         "the still-indexed original the fork line names proves the copy: never counted twice"
     );
 }
-
-
 #[test]
 fn e2_pipeline_branch_of_a_retired_original_without_a_fork_line_counts_and_discloses() {
     // No durable per-request store: without the name, the retired original
@@ -2674,8 +2579,6 @@ fn e2_pipeline_branch_of_a_retired_original_without_a_fork_line_counts_and_discl
         ((1, Some(0)), 1)
     );
 }
-
-
 #[test]
 fn e2_pipeline_branch_naming_an_unindexed_session_counts_and_discloses() {
     // The fork line names a session that is not indexed: no proof.
@@ -2684,7 +2587,6 @@ fn e2_pipeline_branch_naming_an_unindexed_session_counts_and_discloses() {
         ((1, Some(0)), 1)
     );
 }
-
 
 /// E7 stopgap, demo chain: the copy-only resume `COPY` repeats requests its
 /// original `ROOT` still holds. When both records are past 35 days, a
@@ -2789,7 +2691,6 @@ fn e2_pipeline_aged_original_sharing_ids_with_its_copy_keeps_the_copy_proven() {
         );
     });
 }
-
 
 /// #920 round 3, finding 1, through the production pipeline: kept stock
 /// never costs a young holder its proof. A terminal keeps the aged pair
@@ -2972,7 +2873,6 @@ fn e2_pipeline_kept_stock_yields_to_a_growing_holder() {
     });
 }
 
-
 /// PR C (c) and (d): the copy is read while its holder `LATE`, changed
 /// since its last read, is still queued by the traversal. `stale_record`:
 /// the holder keeps a census record of its old content (rewritten in place
@@ -3046,19 +2946,15 @@ fn copy_waits_for_queued_holder(stale_record: bool) {
 fn e2_pipeline_copy_waits_for_a_queued_stale_holder() {
     copy_waits_for_queued_holder(true);
 }
-
-
 #[test]
 fn e2_pipeline_copy_waits_for_a_queued_indexed_holder_without_a_census_record() {
     copy_waits_for_queued_holder(false);
 }
 
-
 /// Owner ruling 5 (Codex P1-2): a file whose every response conflicts keeps
 /// a zero-usage carrier that publishes its conflict disclosure through the
 /// literal, ACK and restart path, over an accepted prior body.
 fn conflict_only(subagent: bool) {
-
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-conflict-only-{subagent}"));
         let session = if subagent {
@@ -3112,19 +3008,14 @@ fn conflict_only(subagent: bool) {
         assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     });
 }
-
-
 #[test]
 fn e2_pipeline_root_conflict_only_file_publishes_its_disclosure() {
     conflict_only(false);
 }
-
-
 #[test]
 fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
     conflict_only(true);
 }
-
 
 // Shared helpers above remain the real scan/evidence/finish/upload callers.
 mod money_equivalence_tests {
@@ -3156,7 +3047,6 @@ fn e2_page_never_creates_p1_ledger_or_diagnostics() {
     });
 }
 
-
 // The held-read regression needs the classification from BEFORE finish
 // removes withheld items, matching production settlement. Existing fixtures
 // keep their original helper and their original assertions.
@@ -3166,15 +3056,12 @@ fn settle_captured_holds(
     mut page: Page,
     progress: &mut SnapshotUploadProgress,
 ) -> ScanIndex {
-
     let holds = page.finish();
     upload(&page.scan.snapshots, progress, ack).0.unwrap();
     let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
     settle_index_after_upload(&mut settled.index, committed, progress);
     c.reload(&mut settled.index)
 }
-
-
 /// A census deadline withholds a NEW copy. Every walk re-decides the hold;
 /// a healthy external census releases it without any transcript change.
 fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss: u8) {
@@ -3288,12 +3175,10 @@ fn e2_pipeline_withheld_new_file_retries_external_evidence_unchanged() {
     withheld_new_file_retries_from_retained_read(false, false, 0);
 }
 
-
 #[test]
 fn e2_pipeline_withheld_new_file_retries_external_evidence_after_growth() {
     withheld_new_file_retries_from_retained_read(true, false, 0);
 }
-
 
 #[cfg(target_os = "macos")]
 #[test]
@@ -3301,13 +3186,11 @@ fn e2_pipeline_withheld_new_file_unchanged_acquisition_is_unchanged() {
     withheld_new_file_retries_from_retained_read(false, true, 0);
 }
 
-
 #[cfg(target_os = "macos")]
 #[test]
 fn e2_pipeline_withheld_new_file_growth_acquisition_is_tail() {
     withheld_new_file_retries_from_retained_read(true, true, 0);
 }
-
 
 #[cfg(target_os = "macos")]
 #[test]
@@ -3317,7 +3200,6 @@ fn e2_pipeline_held_new_file_cache_clear_eviction_restart_read_full() {
     }
 }
 
-
 #[test]
 fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
     for loss in 1..=3 {
@@ -3326,6 +3208,7 @@ fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
 }
 
 
+/// [money] Containment retains token, cost, account and exact ACK custody.
 #[test]
 fn terminal_off_unproven_cohort_uploads_full_tokens_and_cost_with_unknown_account() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
@@ -3404,6 +3287,7 @@ fn terminal_off_unproven_cohort_uploads_full_tokens_and_cost_with_unknown_accoun
     });
 }
 
+/// [money] Containment retains token, cost, account and exact ACK custody.
 #[test]
 fn terminal_off_two_member_new_copy_cohort_emits_shared_request_once() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();

@@ -209,7 +209,6 @@ fn raw_scan_at(
         }
     }
 }
-
 fn enriched(fixture: &Fixture, mut run: Run) -> Run {
     crate::snapshot_sync::apply_claude_local_evidence_to_scan(
         &fixture.support,

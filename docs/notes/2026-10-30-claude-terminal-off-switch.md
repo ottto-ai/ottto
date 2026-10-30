@@ -52,20 +52,11 @@ before enqueue suppression, including stat-confirmed hints. Read the
 [discovery design](2026-10-30-terminal-off-discovery.md) and
 [OFF-path hunk audit](2026-10-30-claude-terminal-off-static-audit.md).
 
-## Shared safety exception in OFF
+## Inherited trace-read safety
 
-Trace sidecar reads retain a per-file take() bound and opened/path generation
-validation in both modes. This fixes an inherited main race: the real capture
-writer can append its cap-crossing final row after the reader's initial stat.
-The old reader could certify that oversized/growing file as complete. The shared
-fix withholds evidence instead; it adds no proof, ACK or receipt. Stable trace
-rows, dedupe and health counters are compared with the exact main reader body in
-a test-only reference. A real cap-crossing producer fixture asserts consumed
-bytes equal the initial opened length plus one, with no complete evidence.
-Per-pass strict-cohort pacing remains ON-only. This is the explicit shared
-correctness exception in the hunk audit, not an OFF terminal-policy change.
-The shared trace bound moves to its own main PR (`t1/trace-reader-bound`);
-#899 will merge main after it lands and keeps its copy of the change until then.
+The merged trace-reader change supplies the per-file opened-length-plus-one
+bound, generation validation and its regression fixtures. Containment adds only
+ON pass pacing to that reader. OFF uses the merged reader without a pass budget.
 
 ## Readiness and known ON residuals
 
@@ -91,26 +82,17 @@ Linux and the merge-queue Mac. Two ON blockers are fixed here, both gated on
   cleared member stays cleared until it is read; eviction or a restart costs
   at most one more re-read, never proof, ACK or settlement.
 
-## OFF proof and the ON-readiness manifest
+## OFF proof and the separate ON gate
 
-OFF is proven by main's own tests. Every test that exists on main runs with
-main's exact text at the default OFF; shared fixture helpers keep main's body
-and reach the containment version only while a test opts in to ON. The
-containment version of each changed main test runs separately as
-`terminal_off_on_<name>` under the explicit ON guard, with every money, ACK,
-body-equality and zero-read assertion of its original.
+OFF is proven by main's own tests: every original retains its exact text,
+attributes and platform gates and runs at the default OFF. The retained feature
+fixtures cover the switch, OFF checkpoints, custody and containment regressions.
 
-ON twins (and new ON tests) that are known red are ignored with the reason
-`terminal-off ON-readiness: <cluster>`. The unit test
-`terminal_off_on_readiness_ignores_equal_the_checked_in_manifest` compares every
-such ignore in the crate's sources with the checked-in list in
-`snapshots/terminal_off/readiness_manifest.rs`, so the count is visible in CI
-and cannot drift.
-
-- Turning ON anywhere, Ron's M4 included, and flipping the default to ON both
-  require that manifest to be **empty** plus Lead B's sign-off.
-- An entry is un-ignored only together with its cluster's fix, never by editing
-  an assertion.
+The ON readiness gate lives in the ON PR. Enabling containment anywhere,
+including the M4, requires its complete readiness gate to pass, the four parked
+native cases to pass, and Lead B's sign-off. The OFF release does not authorize ON.
+The train Mac must pass the unchanged main tests by name, including the native
+heap-layout, authority-correction and never-quarantine money suites.
 
 ON is **not ready anywhere**, including the M4. Lead B's pending labels remain:
 

@@ -52,6 +52,7 @@ fn main_context_fingerprint_reference(
     format!("{:x}", digest.finalize())
 }
 
+/// [off=main] Default OFF preserves the main policy and checkpoint contract.
 #[test]
 fn default_off_untagged_shipped_main_checkpoint_resumes_without_rearm() {
     assert!(!claude_terminal_off());

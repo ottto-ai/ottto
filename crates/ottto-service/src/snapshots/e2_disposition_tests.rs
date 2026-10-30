@@ -163,7 +163,6 @@ fn e2_body_of_previously_proven_family_is_not_a_demotion() {
     }
 }
 
-
 #[test]
 fn money_cache_creation_normalizer_has_one_reading_for_every_caller() {
     use crate::snapshots::claude_request_money::{claude_cache_creation, CacheCreation::*};

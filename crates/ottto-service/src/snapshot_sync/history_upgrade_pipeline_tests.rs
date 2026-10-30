@@ -79,7 +79,6 @@ struct HistoryOutcome {
 }
 
 struct HistoryFixture {
-    pending_hints: std::cell::RefCell<Vec<PathBuf>>,
     base: PathBuf,
     root: PathBuf,
     support: PathBuf,
@@ -88,7 +87,6 @@ struct HistoryFixture {
 
 impl HistoryFixture {
     fn new(name: &str) -> Self {
-
         let base = test_dir(name);
         let root = base.join("projects");
         let support = base.join("support");
@@ -106,13 +104,10 @@ impl HistoryFixture {
             base,
             root,
             support,
-            pending_hints: Default::default(),
         }
     }
 
-
     fn append(&self, session: &str, request: &str) {
-
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(self.root.join(format!("{session}.jsonl")))
@@ -120,7 +115,6 @@ impl HistoryFixture {
         file.write_all(history_line(session, request, 30).as_bytes())
             .expect("append synthetic Claude response");
     }
-
 
     fn install_list(&self, listed: &[&str]) {
         let lines = listed
@@ -210,7 +204,6 @@ impl HistoryFixture {
         cycle: HistoryCycle<'_>,
         before_evidence: impl FnOnce(&mut crate::snapshots::SourceScanResult),
     ) -> HistoryOutcome {
-
         let destination = cycle.destination.unwrap_or(HISTORY_DESTINATION);
         let index_path = self.index_path_for(cycle.destination);
         let (mut index, origin) = ScanIndex::load_for_snapshot_source_with_origin(
@@ -422,10 +415,8 @@ impl HistoryFixture {
         }
     }
 
-
     /// Every file sent and stamped at revision 1 under a fresh install.
     fn baseline(&self) -> ScanIndex {
-
         let outcome = self.cycle("2026-08-02T08:00:00Z", HISTORY_BASELINE);
         assert_eq!(outcome.uploaded.len(), HISTORY_SESSIONS.len());
         assert!(outcome.scan.census_complete);
@@ -436,7 +427,6 @@ impl HistoryFixture {
             .all(|entry| entry.effective_upload_body_witness_revision == 1));
         outcome.index
     }
-
 
     fn census_keys(index: &ScanIndex) -> usize {
         HISTORY_SESSIONS
@@ -535,7 +525,6 @@ fn quarantined_index_after_bootstrap_holds_all_history_without_a_list() {
     });
 }
 
-
 /// Addendum 3: a historical replay drops the Claude entries without resetting
 /// the generation, so every file is new again. On a verified Mac with no
 /// list the dropped history is owed (born before the cutoff the drop
@@ -571,7 +560,6 @@ fn historical_replay_after_bootstrap_paces_history_without_a_list() {
     assert_eq!(sent, vec![1, 1, 1, 0], "paced, one history file per page");
 }
 
-
 /// StateMissing N1: the incident shape on a verified Mac where no list is
 /// intended (durable intent Absent, no list, no seen-marker; this destination's own bootstrap): the
 /// rebuilt history is paced through the budget, not held for good.
@@ -604,7 +592,6 @@ fn quarantined_index_without_an_intended_list_paces_history() {
         .values()
         .all(|entry| entry.effective_upload_body_witness_revision == 2));
 }
-
 
 /// Addendum 1 item 1 (secondary): existing revision-1 entries, an
 /// independent second reason on every file (a changed upload context), no
@@ -651,7 +638,6 @@ fn upload_context_change_does_not_carry_history_past_the_gate() {
     });
 }
 
-
 /// Addendum 1 items 1 and 5: a re-armed entry (fingerprint cleared, size and
 /// mtime equal) is unchanged history: held, never emitted, and settled.
 #[test]
@@ -677,7 +663,6 @@ fn rearmed_unchanged_history_is_held_and_settles() {
         assert_eq!(again.scan.scanned_file_count, 0);
     });
 }
-
 
 /// Addendum 2 item 13: with the list installed and budget available, history
 /// after a quarantine is paced and a listed family is never emitted.
@@ -705,7 +690,6 @@ fn installed_list_paces_rebuilt_history_and_denies_listed_families() {
     }
 }
 
-
 /// Addendum 2 item 13 and addendum 3 item 19: a genuinely fresh install (a
 /// positively empty support state: no backfill state, no quarantined index,
 /// no upload ledger, no seen-marker) ingests new files normally, even with
@@ -730,7 +714,6 @@ fn fresh_install_without_a_prior_bootstrap_ingests_new_files() {
             .all(|entry| entry.effective_upload_body_witness_revision == 2));
     });
 }
-
 
 /// Addendum 2 item 13: after a held rebuild, only files that grew emit, by
 /// ordinary sync, and they settle at the active revision.
@@ -757,7 +740,6 @@ fn only_files_that_grew_after_a_rebuild_emit() {
         );
     });
 }
-
 
 /// User Repair override (#718): one interactive Repair of a rebuild-loop
 /// pause runs the same #712-gated rebuild as the first incident. On an
@@ -817,7 +799,6 @@ fn user_repair_override_rebuild_keeps_history_held() {
         assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
     });
 }
-
 
 /// SI-718-O1: the override rebuild keeps the retained owner through a
 /// replacement cycle whose upload is only server-deferred (a partial
@@ -898,7 +879,6 @@ fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
         );
     });
 }
-
 
 /// MONEY P1: seed genuine accepted incidence immediately before the override,
 /// not before a syntax rebuild that would already have erased the ACK ledger.
@@ -1018,7 +998,6 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
     });
 }
 
-
 /// SOURCE N1 third half: vanished history releases only on a healthy complete terminal.
 #[test]
 fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
@@ -1125,7 +1104,6 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
     });
 }
 
-
 /// SOURCE Amendment 14 (owner B ruling 1): under revision 3 a LISTED root's
 /// genuine transcript change emits its ORDINARY body; no request-owned
 /// literal item and no revision-3 stamp reaches that file, and
@@ -1190,7 +1168,6 @@ fn revision_three_listed_change_emits_its_ordinary_body_without_the_literal() {
     });
 }
 
-
 /// Addendum 1 item 5: revision 2 lets a listed family's genuine change sync,
 /// and a stored 3 is never downgraded by revision 2.
 #[test]
@@ -1224,7 +1201,6 @@ fn revision_two_syncs_listed_changes_and_never_downgrades_three() {
         .values()
         .all(|entry| entry.effective_upload_body_witness_revision == 3));
 }
-
 
 /// Owner B ruling 3 through the pipeline: MONEY's census re-owes a stored 3
 /// (as #699's selection-loss path will); the file is owed again, a listed
@@ -1270,7 +1246,6 @@ fn a_re_owed_file_goes_back_through_the_gate() {
         }
     });
 }
-
 
 /// Addendum 2 item 14 (#700): with the seen-marker present, an empty load
 /// latches; held history stays held even with an installed list, while a
@@ -1343,7 +1318,6 @@ fn seen_marker_rebuild_latch_and_cutoff_feed_one_decision() {
     assert_eq!(fresh.uploaded, BTreeSet::from([newcomer.to_string()]));
 }
 
-
 /// Addendum 1 item 6 group 6: a held file beside an accepted, changed sibling
 /// on a deferred page never enters accepted-body progress or its new
 /// revision; the next completed page holds it again.
@@ -1387,7 +1361,6 @@ fn held_history_never_settles_as_accepted_on_a_deferred_page() {
     });
 }
 
-
 /// SOURCE F4a: the incident shape on an unverified Mac with no override of
 /// the no-list cutoff. The fixture's history is born after 2026-10-21, but
 /// before the history cutoff this load records, so it is still held: the
@@ -1406,7 +1379,6 @@ fn quarantined_index_holds_history_born_after_the_no_list_cutoff() {
     assert_eq!(again.scan.scanned_file_count, 0, "no re-read storm");
     assert!(again.uploaded.is_empty());
 }
-
 
 /// SOURCE F1a: a quarantined sibling of this index is prior history by
 /// itself, with no backfill state at all: the rebuilt files are owed history,
@@ -1427,7 +1399,6 @@ fn quarantined_index_sibling_alone_is_prior_history() {
     });
     assert_eq!(rebuilt.uploaded.len(), 1, "{:?}", rebuilt.uploaded);
 }
-
 
 /// SOURCE F1a, StateMissing H1: an unreadable backfill state is prior
 /// history, not a fresh install. With a quarantined index, or with the index
@@ -1472,7 +1443,6 @@ fn unreadable_backfill_state_emits_no_history_from_a_rebuilt_index() {
     }
 }
 
-
 /// StateMissing H1: an unreadable backfill state over a populated index arms
 /// no replay (the entries stay, nothing is re-read) and uploads no old
 /// history. The entries' births are old (the no-list cutoff seam).
@@ -1505,7 +1475,6 @@ fn unreadable_backfill_state_arms_no_replay_over_a_populated_index() {
     }
 }
 
-
 /// SOURCE F1b and its cross-org move ruling: a re-pair to a new destination
 /// finds history born before the claim owed and gated, never re-sent
 /// ungated: the other destination's completed bootstrap is prior history.
@@ -1536,7 +1505,6 @@ fn new_destination_holds_history_born_before_the_claim() {
         assert!(moved.uploaded.is_empty(), "{:?}", moved.uploaded);
     }
 }
-
 
 /// SOURCE ruling (cross-org `full` move, no list), the named policy row: the
 /// other destination's history is paced through the budget, counted, only
@@ -1582,7 +1550,6 @@ fn explicit_full_move_paces_history_born_before_the_claim() {
     );
 }
 
-
 /// SOURCE F1b: on the destination of the claim that recorded a
 /// different-user cutoff, the previous user's history stays excluded by the
 /// cutoff, as before, not by the history gate: a session with activity after
@@ -1627,7 +1594,6 @@ fn different_user_cutoff_excludes_history_without_the_gate() {
     );
 }
 
-
 /// SOURCE h695 N1: a same-user re-claim keeps the cutoff (the server answers
 /// `full`) but mints a new destination. The cutoff belongs to the destination
 /// of the claim that set it, so on the new one the history already sent to
@@ -1638,12 +1604,10 @@ fn same_user_reclaim_keeps_the_cutoff_but_gates_the_new_destination() {
     same_user_reclaim_is_gated(true);
 }
 
-
 #[test]
 fn same_user_reclaim_before_bootstrap_is_still_gated() {
     same_user_reclaim_is_gated(false);
 }
-
 
 fn same_user_reclaim_is_gated(complete_bootstrap: bool) {
     let fixture = HistoryFixture::new(if complete_bootstrap {
@@ -1765,7 +1729,6 @@ fn an_unbound_legacy_cutoff_does_not_exempt_a_new_destination() {
     );
 }
 
-
 /// SOURCE h695 N2: a quarantined ledger of this index, a quarantined legacy
 /// Claude index and an unreadable seen-marker path are prior history (fail
 /// closed); a clean support state is not.
@@ -1819,7 +1782,6 @@ fn quarantined_ledger_and_unreadable_marker_are_prior_history() {
     );
 }
 
-
 /// SOURCE F1a, StateMissing N1: a server-attested record in this
 /// destination's ledger is prior history. A generation or replay claim alone
 /// is not: the ledger saves it before the scan, so a fresh install killed
@@ -1853,7 +1815,6 @@ fn only_server_attested_ledger_records_are_prior_history() {
     progress.accepted_fingerprints.insert("f".repeat(64));
     assert_eq!(prior(&progress), crate::snapshots::PriorHistory::Here);
 }
-
 
 /// SOURCE F1b, StateMissing M3 and N1 (a): a re-pair resuming a partial
 /// index that a pre-gate daemon saved for the new destination loads as
@@ -1930,7 +1891,6 @@ fn resumed_pre_gate_index_on_a_new_destination_records_the_cutoff() {
     );
 }
 
-
 /// SOURCE F1b (AutoReview): a bootstrap interrupted before a re-pair leaves
 /// only its own destination's Claude index or ledger. That is prior history
 /// for the new destination; the new destination's own files are not.
@@ -1991,7 +1951,6 @@ fn another_destinations_claude_state_is_prior_history() {
     assert_eq!(prior(), crate::snapshots::PriorHistory::Moved);
 }
 
-
 /// StateMissing N1 (a), the upgrade after downtime: a pre-gate `Loaded`
 /// index of this destination (its own bootstrap) and a session created
 /// after its last receipt, no list. The new session is uploaded at once,
@@ -2033,7 +1992,6 @@ fn session_created_after_a_pre_gate_index_last_receipt_is_uploaded() {
     );
 }
 
-
 /// SOURCE addendum 8, the incident M4 shape with the list intended: prior
 /// uploads, the list installed (one family listed) and its seen-marker
 /// written, then the index quarantined. The rebuild latches (#700): nothing
@@ -2071,7 +2029,6 @@ fn intended_list_holds_listed_families_and_paces_the_rest_after_a_quarantine() {
     );
 }
 
-
 /// SOURCE addendum 8: the list's seen-marker present but the list file gone
 /// (`MissingAfterInstall`) pauses: no history is emitted, whatever the
 /// budget, after a quarantine as on an intact index.
@@ -2098,7 +2055,6 @@ fn seen_marker_without_the_list_pauses_all_history() {
         crate::snapshots::restart_claude_reemission_stop_for_test();
     }
 }
-
 
 /// The lenient decoder's remaining budget rebuild must compose with the full
 /// prior-history gate. NewFile-shaped history is never emitted on the held
@@ -2187,8 +2143,6 @@ fn over_budget_rebuild_preserves_history_holds_list_latch_and_pacing() {
         crate::snapshots::restart_claude_reemission_stop_for_test();
     }
 }
-
-
 fn history_subagent_line(session: &str, agent: &str) -> String {
     format!(
         "{{\"timestamp\":\"2026-08-02T07:00:10Z\",\"type\":\"assistant\",\"sessionId\":\"{session}\",\"agentId\":\"{agent}\",\"isSidechain\":true,\"requestId\":\"req_{session}_{agent}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"
@@ -2288,7 +2242,6 @@ fn listed_member_holds_its_siblings_through_the_pipeline_without_the_root_file()
     }
 }
 
-
 /// SOURCE d680b524 (b), the reverse: the list names the root `R`, `R.jsonl`
 /// is gone and only subagent files remain. None is offered, and each counts
 /// as held through the absent root.
@@ -2302,7 +2255,6 @@ fn listed_root_holds_every_subagent_through_the_pipeline_without_the_root_file()
     assert_rootless_family_held(&outcome);
     assert_eq!(family_closure_root_absent_excluded(&lines), 2);
 }
-
 
 // F2: native scan -> evidence -> finalization -> upload -> settlement -> reload.
 // No accumulator or settlement disposition is supplied by these fixtures.
@@ -2481,7 +2433,6 @@ fn e2_refused_twins_keep_prior_tuple_and_stay_owed_while_siblings_settle() {
     });
 }
 
-
 #[test]
 fn e2_ok_unhealthy_root_holds_history_then_healthy_read_settles_reported_once() {
     for failure in [
@@ -2571,7 +2522,6 @@ fn e2_ok_unhealthy_root_holds_history_then_healthy_read_settles_reported_once() 
     }
 }
 
-
 #[test]
 fn e2_no_sidecar_old_history_settles_with_incomplete_token_estimates() {
     let fixture = HistoryFixture::new("e2-history-no-sidecar");
@@ -2595,7 +2545,6 @@ fn e2_no_sidecar_old_history_settles_with_incomplete_token_estimates() {
         assert_eq!(again.scan.scanned_file_count, 0);
     });
 }
-
 
 /// Pages of `cycle` until one reads nothing; per page (uploaded sessions,
 /// files read). Panics if the re-read does not finish within `hours`.
@@ -2699,7 +2648,6 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
     });
 }
 
-
 /// The listed session's item on a page: read without an E2 fold, so it
 /// publishes exactly as gate off (native hours, no request-owned literal).
 impl HistoryFixture {
@@ -2777,7 +2725,6 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
     });
 }
 
-
 /// Owner B: a list seen once and now missing keeps today's pause and alarm
 /// with the gate on. No owed file is re-read or stamped 3, and a genuine
 /// change uploads its ordinary body (every family is kept on ordinary money
@@ -2820,7 +2767,6 @@ fn e2_missing_list_pauses_history_and_keeps_changes_on_ordinary_money() {
     });
 }
 
-
 #[test]
 fn e2_live_trace_read_failure_keeps_body_but_never_claims_complete() {
     let fixture = HistoryFixture::new("e2-live-bad-trace");
@@ -2852,7 +2798,6 @@ fn e2_live_trace_read_failure_keeps_body_but_never_claims_complete() {
         );
     });
 }
-
 
 #[test]
 fn e2_unhealthy_root_holds_owed_agent_history_too() {
@@ -2929,7 +2874,6 @@ fn e2_unhealthy_root_holds_owed_agent_history_too() {
     });
 }
 
-
 #[test]
 fn e2_repaired_between_attachment_and_strict_read_stays_owed_until_next_page() {
     let fixture = HistoryFixture::new("e2-history-repair-during-read");
@@ -2975,7 +2919,6 @@ fn e2_repaired_between_attachment_and_strict_read_stays_owed_until_next_page() {
         assert_eq!(body.telemetry_owned_complete, Some(true));
     });
 }
-
 
 #[test]
 fn e2_side_call_census_deadline_holds_root_history_then_counts_side_call_once() {
@@ -3046,7 +2989,6 @@ fn e2_side_call_census_deadline_holds_root_history_then_counts_side_call_once() 
     });
 }
 
-
 #[test]
 fn e2_production_contract_and_revision_share_one_paced_reread_behind_closed_fence() {
     use crate::snapshots::claude_request_identity::{with_cycle_contract_for_test, E2_GROUPING};
@@ -3107,7 +3049,6 @@ fn e2_production_contract_and_revision_share_one_paced_reread_behind_closed_fenc
     });
 }
 
-
 #[test]
 fn e2_unlisting_replays_the_legacy_money_mark_once() {
     use crate::snapshots::claude_money_birth_store::location_key;
@@ -3147,7 +3088,6 @@ fn e2_unlisting_replays_the_legacy_money_mark_once() {
         assert!(quiet.uploaded.is_empty());
     });
 }
-
 
 #[test]
 fn e2_stem_listed_before_root_indexing_counts_each_session_request_once() {
@@ -3216,7 +3156,6 @@ fn e2_stem_listed_before_root_indexing_counts_each_session_request_once() {
         assert!(!changed.uploaded_literal.contains(root));
     });
 }
-
 
 /// Contract-5 cutover, first run after upgrade (SOURCE §B; card G (b)):
 /// revision-3 history stamped by a permit-era build without the permit
@@ -3306,7 +3245,6 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
         assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed);
     });
 }
-
 
 /// Contract 5: a real content change restamps a file's money marks from its
 /// new body. #825's retired bit is carried as stored through that restamp
