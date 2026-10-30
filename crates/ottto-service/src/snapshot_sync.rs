@@ -7656,6 +7656,7 @@ fn finish_sync_source(
                         live,
                         _home,
                         source,
+                        scan_result.native_publication,
                         machine_id,
                         upload_policy,
                         account_witness,

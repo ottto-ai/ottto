@@ -206,3 +206,22 @@ The header-restore sizing fixture prepares both admission budgets while its
 sizing graph owns the process-wide active lease, then drops that graph and
 releases the lease before trying either restore. A sizing-only graph cannot
 hold the single transfer owner while another restore waits for it.
+
+Native publication now travels as one eight-class, RAM-only enum from actual
+settlement to the source result and retained retry capture. Its five publishing
+and three held rows use one exhaustive policy match. Receipt/fence rejection
+and early held exits carry Hold before body effects. A bounded page preserves
+its first held decision through later publishing siblings and continuations.
+Codex strict rebind keeps its existing degraded publishing row; Claude and Pi
+map strict rebind to Hold, preserving the existing owed conversion. Pi remains
+outside the native route here. No persisted field or new disposition is added.
+The strict-rebind boolean controls only the existing PRE-index action; it is
+not a second publication predicate. Legacy attempts without an e4 result carry
+None, preserving existing Pi capture until native activation is composed.
+
+The diagnostic budget controls include the 225,720-byte fixed-digest reserve
+in both the canonical pin and the complete cache-budget conservation equation.
+Portable restart-counter fixtures exercise Codex's strict EntryChanged binding;
+Claude's original-v1 adapter/accepted-floor handling is not that premise and is
+unchanged. A fault-free Linux v1 decode may classify layout backpressure without
+starting a Full; the control checks the typed outcome and zero fault counters.

@@ -205,6 +205,7 @@ impl LiveRetryOwner {
         live: LiveAuthority,
         home: &Path,
         source: SnapshotSource,
+        native_publication: Option<crate::snapshots::NativePublication>,
         machine: &str,
         policy: SnapshotUploadPolicy,
         account: [u8; 32],
@@ -219,6 +220,7 @@ impl LiveRetryOwner {
     ) -> bool {
         if !self.enabled
             || source != SnapshotSource::Pi
+            || native_publication.is_some_and(|completion| !completion.publishes())
             || working.legacy_settlement_ledger_needs_migration()
             || committed.legacy_settlement_ledger_needs_migration()
             || live.destination() != progress.destination_namespace_hash
