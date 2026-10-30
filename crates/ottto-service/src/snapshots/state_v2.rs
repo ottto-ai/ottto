@@ -356,31 +356,35 @@ fn value_cap(key: &RowKey) -> u64 {
     match key {
         RowKey::Meta(_) => CONTROL_BYTES,
         RowKey::Record { kind, .. } if kind.name().starts_with("raw_hold.") => VALUE_BYTES,
-        // Shared request evidence has the existing source limit in its codec.
+        // Semantic adapters must apply any tighter source bound before storage admission.
         RowKey::RequestSet(_) => VALUE_BYTES,
         _ => MUTABLE_VALUE_BYTES,
     }
 }
-fn admit_header(key: &RowKey, fixed: &Fixed) -> Result<()> {
-    use anyhow::ensure;
+fn admit_key(key: &RowKey) -> Result<()> {
     match key {
-        RowKey::Meta(name) => ensure!(
-            control_name(name) && name.len() <= KEY_BYTES && *fixed == Fixed::None,
+        RowKey::Meta(name) => anyhow::ensure!(
+            control_name(name) && name.len() <= KEY_BYTES,
             "state_v2_control_admission"
         ),
         RowKey::Record {
             key_bytes,
             position,
             ..
-        } => ensure!(
+        } => anyhow::ensure!(
             key_bytes.len() <= KEY_BYTES && *position <= i64::MAX as u64,
             "state_v2_key_admission"
         ),
-        RowKey::RequestSet(id) => ensure!(
+        RowKey::RequestSet(id) => anyhow::ensure!(
             *id > 0 && *id <= i64::MAX as u64,
             "state_v2_number_admission"
         ),
     }
+    Ok(())
+}
+fn admit_header(key: &RowKey, fixed: &Fixed) -> Result<()> {
+    use anyhow::ensure;
+    admit_key(key)?;
     let kind = match key {
         RowKey::Record { kind, .. } => kind.name(),
         _ => "",

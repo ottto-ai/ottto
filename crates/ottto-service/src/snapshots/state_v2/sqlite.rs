@@ -49,6 +49,7 @@ impl RowKey {
         }
     }
     fn values(&self) -> Result<Vec<SqlValue>> {
+        admit_key(self)?;
         let number = |n| -> Result<SqlValue> {
             Ok(SqlValue::Integer(
                 i64::try_from(n).context("state_v2_number_admission")?,
@@ -1230,6 +1231,7 @@ fn pl(key: &RowKey) -> bool {
 }
 impl Transaction for Txn<'_> {
     fn get(&mut self, key: &RowKey) -> Result<Option<Header>> {
+        admit_key(key)?;
         if let Some(header) = self.changed.get(key) {
             return Ok(header.clone());
         }
@@ -1248,7 +1250,7 @@ impl Transaction for Txn<'_> {
             let h = preflight(&row)?;
             if *row.key == RowKey::Meta("minimum_writer_capability".into()) {
                 let mut bytes = Vec::new();
-                row.value.write(&mut bytes)?;
+                row.value.write(&mut ControlBuffer(&mut bytes))?;
                 let next: u64 = serde_json::from_slice(&bytes)?;
                 let old = self
                     .store

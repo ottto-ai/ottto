@@ -1436,3 +1436,53 @@ fn positions_and_current_pointer_survive_retirement_without_renumbering() {
 fn test_record(key: String) -> RowKey {
     RowKey::record("v1_field.files", key.into_bytes(), 0).unwrap()
 }
+
+#[test]
+fn changing_control_replay_is_bounded_before_capability_parse() {
+    struct Changes(std::cell::Cell<u8>);
+    impl Value for Changes {
+        fn write(&self, out: &mut dyn Write) -> Result<()> {
+            let pass = self.0.get();
+            self.0.set(pass + 1);
+            if pass < 2 {
+                out.write_all(b"1")?;
+                Ok(())
+            } else {
+                Repeat(CONTROL_BYTES + 1).write(out)
+            }
+        }
+    }
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let error = tx
+        .put(RowInput {
+            value_version: 1,
+            key: &RowKey::Meta("minimum_writer_capability".into()),
+            fixed: &Fixed::None,
+            value: &Changes(std::cell::Cell::new(0)),
+        })
+        .unwrap_err();
+    assert_eq!(error.to_string(), "state_v2_control_admission");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::NotPublished);
+    assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(0));
+}
+#[test]
+fn key_admission_matches_for_cached_and_cold_reads() {
+    let tmp = Scratch::new();
+    let mut db = tmp.store();
+    for cached in [false, true] {
+        if cached {
+            db.prime_headers().unwrap();
+        }
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let oversized = RowKey::record("file.entities", vec![b'x'; KEY_BYTES + 1], 0).unwrap();
+        assert_eq!(
+            tx.get(&oversized).unwrap_err().to_string(),
+            "state_v2_key_admission"
+        );
+        let exhausted = RowKey::record("file.entities", vec![], u64::MAX).unwrap();
+        assert!(tx.get(&exhausted).is_err());
+        assert!(tx.get(&RowKey::Meta("unregistered".into())).is_err());
+    }
+}
