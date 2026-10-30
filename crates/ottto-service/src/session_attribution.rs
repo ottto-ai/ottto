@@ -158,11 +158,28 @@ pub struct SessionAttributionGroupingInput<'a> {
     pub observed_at: &'a str,
     pub source_version: &'a str,
     pub first_prompt: Option<&'a str>,
+    /// The first prompt's facts as a durable record carried them, for a copy
+    /// restored without `first_prompt`. Never both.
+    pub carried_first_prompt: Option<&'a FirstPromptWire>,
     pub provider_skills: &'a BTreeSet<String>,
     pub activity_skills: &'a BTreeSet<String>,
     pub repository_hash: Option<&'a str>,
     pub source_started_at: Option<&'a str>,
     pub transcript_path: &'a Path,
+}
+
+/// One first-prompt fact's uploaded value and display label.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct WireFact {
+    pub(crate) value: String,
+    pub(crate) label: Option<String>,
+}
+
+/// The facts a first prompt uploads. Nothing else about it leaves this module.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct FirstPromptWire {
+    pub(crate) template: Option<WireFact>,
+    pub(crate) slash_skill: Option<WireFact>,
 }
 
 impl SessionAttributionContext {
@@ -327,6 +344,50 @@ impl SessionAttributionContext {
         facts
     }
 
+    /// The facts `grouping_facts` emits for `first_prompt`, by the same pushes.
+    /// `None` when a scheduler definition's prompt signature matches: that
+    /// correlation needs the prompt itself, which no restored copy holds.
+    pub(crate) fn first_prompt_wire(
+        &self,
+        source: SnapshotSource,
+        first_prompt: &str,
+    ) -> Option<FirstPromptWire> {
+        let evidence = EvidenceContext {
+            source_session_id: "",
+            observed_at: "",
+            source_version: "",
+        };
+        let take = |facts: &mut Vec<SessionAttributionFact>| {
+            facts.pop().map(|fact| WireFact {
+                value: fact.value,
+                label: fact.display_label,
+            })
+        };
+        let mut facts = Vec::new();
+        let mut wire = FirstPromptWire::default();
+        if let Some(template) = normalize_template_material(first_prompt) {
+            if self
+                .external_schedulers
+                .prompt_signature_matches(source, &template)
+            {
+                return None;
+            }
+            if let Some(value) = opaque_hmac_id(&self.key, "template_group", &template) {
+                let label = prompt_prefix_display_label(first_prompt);
+                push_template_fact(&mut facts, &value, label.as_deref(), &evidence);
+                wire.template = take(&mut facts);
+            }
+        }
+        if let Some(skill) = slash_skill_name(first_prompt) {
+            if let Some(value) = opaque_hmac_id(&self.key, "skill", &skill) {
+                let label = skill_name_display_label(&skill);
+                push_slash_skill_fact(&mut facts, &value, label.as_deref(), &evidence);
+                wire.slash_skill = take(&mut facts);
+            }
+        }
+        Some(wire)
+    }
+
     /// Tenant-keyed opaque id for one kind of local material, the same scheme
     /// as skill and template ids. Exists only while attribution is collected.
     pub(crate) fn opaque_id(&self, domain: &str, material: &str) -> Option<String> {
@@ -347,14 +408,10 @@ impl SessionAttributionContext {
         if let Some(template) = normalized_template.as_deref() {
             if let Some(value) = opaque_hmac_id(&self.key, "template_group", template) {
                 let display_label = input.first_prompt.and_then(prompt_prefix_display_label);
-                push_labeled_fact(
+                push_template_fact(
                     &mut facts,
-                    "template_group_id",
                     &value,
                     display_label.as_deref(),
-                    Some("prompt_prefix"),
-                    "local_template",
-                    "direct",
                     &evidence_context,
                 );
             }
@@ -376,6 +433,16 @@ impl SessionAttributionContext {
                     );
                 }
             }
+        } else if let Some(fact) = input
+            .carried_first_prompt
+            .and_then(|carried| carried.template.as_ref())
+        {
+            push_template_fact(
+                &mut facts,
+                &fact.value,
+                fact.label.as_deref(),
+                &evidence_context,
+            );
         }
 
         // Keyed case-insensitively: provider names arrive lowercased, while
@@ -426,18 +493,25 @@ impl SessionAttributionContext {
             {
                 if let Some(value) = opaque_hmac_id(&self.key, "skill", &skill) {
                     let display_label = skill_name_display_label(&skill);
-                    push_labeled_fact(
+                    push_slash_skill_fact(
                         &mut facts,
-                        "skill_id",
                         &value,
                         display_label.as_deref(),
-                        Some("skill_name"),
-                        "local_template",
-                        "direct",
                         &evidence_context,
                     );
                 }
             }
+        } else if let Some(fact) = input
+            .carried_first_prompt
+            .and_then(|carried| carried.slash_skill.as_ref())
+            .filter(|_| emitted_skills.len() < MAX_SKILL_FACTS)
+        {
+            push_slash_skill_fact(
+                &mut facts,
+                &fact.value,
+                fact.label.as_deref(),
+                &evidence_context,
+            );
         }
 
         let provider_origin_known = input.origin.map(provider_origin_is_known).unwrap_or(false);
@@ -697,6 +771,23 @@ pub(crate) fn opaque_hmac_id(key: &[u8], domain: &str, material: &str) -> Option
         "{SESSION_ATTRIBUTION_HMAC_KEY_VERSION}:{}",
         URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     ))
+}
+
+/// The raw MAC of an `opaque_hmac_id` value, when it round-trips exactly.
+pub(crate) fn opaque_hmac_bytes(value: &str) -> Option<[u8; 32]> {
+    let encoded = value.strip_prefix(SESSION_ATTRIBUTION_HMAC_KEY_VERSION)?;
+    let encoded = encoded.strip_prefix(':')?;
+    let bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+    let bytes = <[u8; 32]>::try_from(bytes.as_slice()).ok()?;
+    (opaque_hmac_text(&bytes) == value).then_some(bytes)
+}
+
+/// The `opaque_hmac_id` wire form of a raw MAC.
+pub(crate) fn opaque_hmac_text(bytes: &[u8; 32]) -> String {
+    format!(
+        "{SESSION_ATTRIBUTION_HMAC_KEY_VERSION}:{}",
+        URL_SAFE_NO_PAD.encode(bytes)
+    )
 }
 
 pub(crate) fn normalize_template_material(raw: &str) -> Option<String> {
@@ -1492,6 +1583,42 @@ fn push_fact(
     push_labeled_fact(facts, field, value, None, None, kind, strength, context);
 }
 
+fn push_template_fact(
+    facts: &mut Vec<SessionAttributionFact>,
+    value: &str,
+    display_label: Option<&str>,
+    context: &EvidenceContext<'_>,
+) {
+    push_labeled_fact(
+        facts,
+        "template_group_id",
+        value,
+        display_label,
+        Some("prompt_prefix"),
+        "local_template",
+        "direct",
+        context,
+    );
+}
+
+fn push_slash_skill_fact(
+    facts: &mut Vec<SessionAttributionFact>,
+    value: &str,
+    display_label: Option<&str>,
+    context: &EvidenceContext<'_>,
+) {
+    push_labeled_fact(
+        facts,
+        "skill_id",
+        value,
+        display_label,
+        Some("skill_name"),
+        "local_template",
+        "direct",
+        context,
+    );
+}
+
 // X_out (#665): `snapshots.rs`'s `fact_limit_scratch_bound` charges each of
 // a fact's `field`, `kind` and `strength` at `FACT_LITERAL_BYTES` (64). Pass
 // only `'static` literals of at most 64 bytes for them (the longest today is
@@ -2172,6 +2299,7 @@ mod tests {
             observed_at: "2026-07-19T00:00:00Z",
             source_version: "codex_jsonl:v21",
             first_prompt: Some(&first_prompt),
+            carried_first_prompt: None,
             provider_skills: &skills,
             activity_skills: &BTreeSet::new(),
             repository_hash: None,
@@ -2208,6 +2336,59 @@ mod tests {
         assert!(wire.len() <= MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES);
     }
 
+    /// A copy restored without its prompt emits the same facts in the same
+    /// order from the carried wire values.
+    #[test]
+    fn grouping_facts_from_carried_values_equal_the_cold_facts() {
+        let home = std::env::temp_dir().join(format!(
+            "ottto-carried-facts-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&home).unwrap();
+        let context = SessionAttributionContext::from_activity_hint(
+            SnapshotSource::Pi,
+            &home,
+            true,
+            Some(&URL_SAFE_NO_PAD.encode([3_u8; 32])),
+            Some(SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+        )
+        .unwrap();
+        let prompt = "/synthetic-skill Review the synthetic release notes";
+        let no_skills = BTreeSet::new();
+        let path = home.join("session.jsonl");
+        let facts = |first_prompt, carried_first_prompt| {
+            context.grouping_facts(SessionAttributionGroupingInput {
+                source: SnapshotSource::Pi,
+                origin: None,
+                source_session_id: "synthetic-session",
+                observed_at: "2026-10-30T00:00:00Z",
+                source_version: "pi:test",
+                first_prompt,
+                carried_first_prompt,
+                provider_skills: &no_skills,
+                activity_skills: &no_skills,
+                repository_hash: None,
+                source_started_at: None,
+                transcript_path: &path,
+            })
+        };
+        let wire = context
+            .first_prompt_wire(SnapshotSource::Pi, prompt)
+            .unwrap();
+        let cold = facts(Some(prompt), None);
+        assert_eq!(cold.len(), 2);
+        assert_eq!(facts(None, Some(&wire)), cold);
+        let template = wire.template.as_ref().unwrap();
+        let bytes = opaque_hmac_bytes(&template.value).unwrap();
+        assert_eq!(opaque_hmac_text(&bytes), template.value);
+        assert_eq!(opaque_hmac_bytes("hmac-sha256:v1:short"), None);
+        fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn grouping_facts_promote_activity_skills_without_duplicates() {
         let context = SessionAttributionContext {
@@ -2231,6 +2412,7 @@ mod tests {
             observed_at: "2026-09-04T00:00:00Z",
             source_version: "codex_jsonl:v37",
             first_prompt: Some("/repo-task-lifecycle continue"),
+            carried_first_prompt: None,
             provider_skills: &provider_skills,
             activity_skills: &activity_skills,
             repository_hash: None,
