@@ -899,6 +899,8 @@ pub(in crate::snapshots) enum GroupStep {
 
 /// Scan facts one group step needs.
 pub(in crate::snapshots) struct StepInputs<'a> {
+    #[cfg(unix)]
+    pub(in crate::snapshots) repin_cache: Option<&'a sampled_scan::SharedCache>,
     pub(in crate::snapshots) metadata: &'a CodexTitleMetadata,
     pub(in crate::snapshots) attribution:
         Option<&'a crate::session_attribution::SessionAttributionContext>,
@@ -944,7 +946,6 @@ pub(in crate::snapshots) fn step_group(
     {
         join.set_record_start(offset);
     }
-    #[cfg(test)]
     let before_body_read = active.parser.reader.consumed_bytes();
     let stepped = {
         let OwnedActiveFile { parser, group, .. } = &mut *active;
@@ -953,6 +954,19 @@ pub(in crate::snapshots) fn step_group(
             None => parser.step(),
         }
     };
+    #[cfg(unix)]
+    if let Some(cache) = inputs.repin_cache {
+        cache.repin_input(
+            SnapshotSource::Codex,
+            &local_index_key(&active.candidate.path),
+            active
+                .parser
+                .reader
+                .consumed_bytes()
+                .saturating_sub(before_body_read),
+            matches!(&stepped, Ok(true)),
+        );
+    }
     #[cfg(test)]
     terminal_contract_retry::record_group_body_bytes(
         active

@@ -48,6 +48,8 @@ use std::sync::{
 
 pub(crate) mod active;
 mod capacity;
+mod repin;
+pub(crate) use repin::retired_pin;
 mod stream;
 pub(crate) use active::{ActiveLease, ActiveOverBudget, LeaseWait, ACTIVE_BYTES};
 pub(crate) use stream::{
@@ -237,6 +239,9 @@ pub(crate) fn scope_digest_v3(
 fn header_len(format: u16, source: DurableSource, allowlist: &Digest32) -> Result<usize, Refusal> {
     if format > FORMAT_V3 {
         return Err(Refusal::NewerFormat);
+    }
+    if retired_pin(source, format, allowlist) {
+        return Ok(HEADER_BYTES);
     }
     source
         .properties()
@@ -480,6 +485,8 @@ pub(crate) enum Refusal {
     // Slot 5 belongs to the retired UpgradeMissing alarm coordinate.
     ReceiptPending = 6,
     BehindAccepted = 7,
+    /// Exact retired v1 pin: native rebuild only, never current-body decode.
+    Repin = 8,
 }
 
 /// The outcome of reading one key.
@@ -602,7 +609,7 @@ pub(crate) struct StoreCounters {
     /// Bounded verification memo turnover; never removes pending/spent authority.
     pub(crate) memo_evicted: u64,
     pub(crate) missing: u64,
-    pub(crate) format_hold: [u64; 8],
+    pub(crate) format_hold: [u64; 9],
     /// Writes skipped: predecessor unknown, or a new key while record files
     /// exceed `INVENTORY_BOUND` (offered again after the next save).
     pub(crate) store_write_skipped: [u64; 2],
@@ -984,6 +991,16 @@ impl DurableTailStore {
             rest.map_err(|e| self.read_failure(e, Refusal::Corrupt))?;
             n = header.len();
             let mut binding = decode_header(&header, key, self.source)?;
+            if retired_pin(self.source, binding.format, &binding.record.allowlist)
+                && (!matches!(work, "repin" | "overwrite")
+                    || work == "overwrite"
+                        && !self.durable.get(key).is_some_and(|(_, stamp, allowed)| {
+                            *allowed
+                                && stamp_at(&self.record_path(key)).ok().flatten() == Some(*stamp)
+                        }))
+            {
+                return Err(Refusal::Repin);
+            }
             // After any repair: its ctime moved.
             let Some(metadata) = self.inspect_file(&file) else {
                 return Ok(None);
@@ -1642,7 +1659,11 @@ impl DurableTailStore {
             let key = record.binding.key;
             pending.retain(|other| other.binding.key != key);
             if record.binding.source != self.source
-                || header_len(record.format(), self.source, &record.allowlist).is_err()
+                || self
+                    .source
+                    .properties()
+                    .representation(record.format(), &record.allowlist)
+                    .is_none()
                 || record.acquisition.is_some() && record.binding.entry != [0; 32]
             {
                 self.counters.store_write_skipped[0] += 1;
@@ -2772,6 +2793,11 @@ fn verify(bytes: &[u8], source: DurableSource) -> Result<(), Refusal> {
     if end.checked_sub(start) != Some(h.body_len) {
         return Err(bad);
     }
+    if retired_pin(source, h.format, &h.record.allowlist) {
+        // The retired body is opaque. Its checksum proves exact replacement
+        // custody only; no current decoder or restore receives these bytes.
+        return Ok(());
+    }
     crate::snapshots::verify_durable_body(&bytes[start..end], source)
         .then_some(())
         .ok_or(bad)
@@ -2882,6 +2908,21 @@ impl OwnedTemp {
         };
         if actual != prior {
             return Err(io::Error::other("predecessor changed"));
+        }
+        // A re-pin successor must be durable under its stage name before
+        // rename-over can retire the exact old inode. Ordinary writes retain
+        // their existing ordering. The final receipt still needs canonical
+        // directory sync and survivor verification.
+        if prior.is_some() && repin::retired_at(path)? {
+            self.sync()?;
+            let dir = path
+                .parent()
+                .ok_or_else(|| io::Error::other("record parent"))?;
+            sync_dir(dir)?;
+            sync_dir(
+                dir.parent()
+                    .ok_or_else(|| io::Error::other("store parent"))?,
+            )?;
         }
         fs::rename(&self.path, path)?;
         // Disarm immediately after rename, including failure of the following fstat.
@@ -3219,6 +3260,11 @@ impl<'a> Cursor<'a> {
 /// The version is checked before the trailer: a newer layout is not ours to
 /// judge. Everything else must pass the trailer and decode exactly.
 fn decode(bytes: &[u8]) -> Result<DurableRecord, Refusal> {
+    let (format, pin, source, _) = dispatch(bytes)?;
+    if retired_pin(source, format, &pin) {
+        return Err(Refusal::Repin);
+    }
+
     let source = bytes
         .get(42)
         .and_then(|tag| DurableSource::from_tag(*tag))

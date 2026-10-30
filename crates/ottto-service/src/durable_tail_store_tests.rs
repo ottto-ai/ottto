@@ -3,6 +3,8 @@
 //! the single-writer seam and the content-free certificate. The record body
 //! is a placeholder; no accumulator field is encoded here.
 use super::*;
+#[path = "durable_tail_store/repin_tests.rs"]
+mod repin_tests;
 use crate::snapshots::ScanIndex;
 use crate::transcript_acquisition::{DurableAdmission, FullReason, ReadPlan, Scope};
 use std::collections::BTreeMap;
@@ -1844,7 +1846,7 @@ fn store_mode_faults_are_repaired_without_rebuilds() {
     let counters = cold.counters();
     assert_eq!(counters.mode_repaired, 3);
     assert_eq!(counters.t14_rebuild, 0);
-    assert_eq!(counters.format_hold, [0; 8]);
+    assert_eq!(counters.format_hold, [0; 9]);
     assert_eq!(cold.disabled(), None);
 }
 
@@ -2726,7 +2728,8 @@ fn pinned_v1_scope_replay_and_header_goldens() {
         assert_eq!(&encode(&DurableRecord {
         wire: None,
         envelope_audit_debt: None,record: pending.clone(), index_generation: 9, format: 1})[..HEADER_BYTES], golden);
-        assert!(matches!(decode_header(&golden, &[1; 32], source), Err(Refusal::Unknown)), "the single PL switch-over refuses the historical allowlist");
+        assert!(retired_pin(source, FORMAT_V1, &allowlist));
+        assert!(matches!(decode(&pinned_v1_bytes(&pending, 9)), Err(Refusal::Repin)), "retired bytes never enter the current decoder");
     }
 }
 
@@ -2812,7 +2815,7 @@ fn access_failures_disable_instead_of_holding_and_not_found_stays_absent() {
         assert_eq!(cold.hold(&b.key), None, "{arm}");
         let missing = arm.ends_with("missing");
         assert_eq!(cold.disabled().is_some(), !missing, "{arm}");
-        assert_eq!(cold.counters().format_hold, [0; 8], "{arm}");
+        assert_eq!(cold.counters().format_hold, [0; 9], "{arm}");
         assert_eq!(cold.counters().t14_rebuild, 0, "{arm}");
         if arm == "retry" {
             assert_eq!(opens.get(), 2, "exactly one retry");
@@ -3133,7 +3136,7 @@ fn restore_read_access_failure_disables_but_disappearance_is_absence() {
         let mut cold = scratch.store();
         assert_eq!(cold.read(&b.key), ReadOutcome::Missing);
         assert_eq!(cold.disabled().is_some(), arm != "missing");
-        assert_eq!(cold.counters().format_hold, [0; 8]);
+        assert_eq!(cold.counters().format_hold, [0; 9]);
         assert_eq!(cold.counters().t14_rebuild, 0);
         assert_eq!(fs::read(&path).unwrap(), before);
     }
@@ -3179,7 +3182,7 @@ fn non_format_io_errors_disable_at_every_read_boundary_without_spending_t14() {
             }
             assert!(cold.disabled().is_some(), "{stage}/{errno}");
             assert_eq!(cold.hold(&b.key), None);
-            assert_eq!(cold.counters().format_hold, [0; 8]);
+            assert_eq!(cold.counters().format_hold, [0; 9]);
             assert_eq!(cold.counters().t14_rebuild, 0);
             assert!(cold.rebuilt.is_empty());
             assert_eq!(fs::read(&record).unwrap(), before);
@@ -3523,8 +3526,8 @@ fn full_v1_writer_goldens_preserve_zero_and_nonzero_debt() {
         let file = record_file(&store, &[1; 32]);
         ensure_private_dir(store.dir()).unwrap();
         put_record(&file, &golden);
-        assert!(matches!(store.read(&[1;32]), ReadOutcome::Refused(Refusal::Unknown)));
-        assert_eq!(store.counters().format_hold[Refusal::Unknown as usize],1);
+        assert!(matches!(store.read(&[1;32]), ReadOutcome::Refused(Refusal::Repin)));
+        assert_eq!(store.counters().format_hold[Refusal::Repin as usize],1);
         assert_eq!(fs::read(&file).unwrap(),golden,"refusal never misreads or rewrites historical bytes");
     }
 }

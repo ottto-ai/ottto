@@ -1803,6 +1803,8 @@ pub(super) mod tests {
         })?;
         let no_scope = |_: &CandidateFile| None;
         let inputs = StepInputs {
+            #[cfg(unix)]
+            repin_cache: None,
             metadata: &metadata,
             attribution: None,
             artifacts: false,
@@ -3942,6 +3944,8 @@ pub(super) mod tests {
             .unwrap();
         let no_scope = |_: &CandidateFile| None;
         let inputs = StepInputs {
+            #[cfg(unix)]
+            repin_cache: None,
             metadata: &metadata,
             attribution: Some(&context),
             artifacts: false,

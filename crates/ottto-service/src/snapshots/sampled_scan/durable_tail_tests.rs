@@ -9,6 +9,8 @@ const INDEX_KEYS: usize = 20_000;
 
 #[path = "m3_integrated_rederive_tests.rs"]
 mod integrated_rederive;
+#[path = "m3_repin_tests.rs"]
+mod repin_tests;
 
 thread_local! {
     static BEFORE_WARM_TRANSFER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -3806,7 +3808,7 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
             );
             let (counts, stats) = cache.durable_counters(source).unwrap();
             assert_eq!(counts.durable_held, [0; 8]);
-            assert_eq!(stats.format_hold, [0; 8]);
+            assert_eq!(stats.format_hold, [0; 9]);
             assert_eq!(stats.records_written, 0);
             assert_eq!(stats.gc_records_deleted + stats.gc_temps_deleted, 0);
             assert_eq!(std::fs::read(&record).unwrap(), before);

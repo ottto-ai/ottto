@@ -470,6 +470,22 @@ impl SharedCache {
     ) -> Result<(), HeldCause> {
         let ds = durable_source(source).ok_or(HeldCause::Incompatible)?;
         let digest = binding.key;
+        if self.repin_pending(source, key) {
+            let mut guard = self.durable().ok_or(HeldCause::Fence)?;
+            let stores = &mut *guard;
+            let proof = stores
+                .retail_spent
+                .get(&digest)
+                .and_then(|c| c.original.as_ref())
+                .ok_or(HeldCause::Fence)?;
+            return stores.slots[ds.slot()]
+                .as_mut()
+                .ok_or(HeldCause::Fence)?
+                .store
+                .authorize_repin(proof)
+                .then_some(())
+                .ok_or(HeldCause::Fence);
+        }
         if self.durable().is_some_and(|mut stores| {
             stores
                 .slot(ds)
@@ -1248,6 +1264,13 @@ fn receipted_locked(stores: &mut Stores, source: DurableSource, key: &str, recei
     let digest = store::key_digest(source, key);
     stores.release_hold(digest, HoldRelease::Write);
     stores.release_restore_pending(&digest, receipt.identity().certificate().length);
+    if stores
+        .key_debt
+        .get(&digest)
+        .is_some_and(|d| d.repin.is_some())
+    {
+        return;
+    }
     if source != DurableSource::ClaudeCode {
         return;
     }

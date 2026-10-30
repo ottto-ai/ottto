@@ -1552,6 +1552,8 @@ fn group_with_legacy_tee_is_byte_charged() {
     assert!(job.group.as_ref().unwrap().tee.is_some());
     let no_scope = |_: &CandidateFile| None;
     let inputs = StepInputs {
+        #[cfg(unix)]
+        repin_cache: None,
         metadata: &metadata,
         attribution: None,
         artifacts: false,
@@ -1703,6 +1705,8 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
         .unwrap();
     let no_scope = |_: &CandidateFile| None;
     let inputs = StepInputs {
+        #[cfg(unix)]
+        repin_cache: None,
         metadata: &metadata,
         attribution: None,
         artifacts: false,
@@ -3161,6 +3165,8 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
         .unwrap();
     let no_scope = |_: &CandidateFile| None;
     let inputs = StepInputs {
+        #[cfg(unix)]
+        repin_cache: None,
         metadata: &metadata,
         attribution: None,
         artifacts: false,
