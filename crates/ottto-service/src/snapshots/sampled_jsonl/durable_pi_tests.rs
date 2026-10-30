@@ -236,7 +236,7 @@ fn ledger_cap_decodes_at_the_bound_and_refuses_past_it() {
         PiUsageDedupState::default(),
     );
     let over = reduction(keys);
-    assert_eq!(body(&over), Err(Refuse::NonEmpty(PI_LEDGER_CAP)));
+    assert_eq!(body(&over), Err(Refuse::TooLarge));
     // A record that carries one key too many anyway is corrupt (T14), refused
     // before the ledger asks the allowance for anything.
     let forged = back_patched(&over);

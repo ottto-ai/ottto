@@ -5902,25 +5902,6 @@ fn pi_insertion_counts_claude_and_codex_cache_victims_only() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// The Pi ledger cap counter is defined and printed for Pi only; P4b's live
-/// receipt is its first writer.
-#[test]
-fn pi_ledger_cap_counter_prints_in_the_pi_summary_only() {
-    let counts = Counters {
-        retained_refused_pi_ledger_cap: 2,
-        ..Counters::default()
-    };
-    let disk = store::StoreCounters::default();
-    assert!(counts
-        .summary(SnapshotSource::Pi, &disk)
-        .contains(" peak_body_bytes=0 retained_refused_pi_ledger_cap=2 store_write_failed[setup,inventory,statvfs]=[0, 0, 0] disk_records=0 "));
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        assert!(!counts
-            .summary(source, &disk)
-            .contains("retained_refused_pi_ledger_cap"));
-    }
-}
-
 /// A Tail or Unchanged read below a known accepted extent is behind it.
 #[test]
 fn tail_behind_accepted_needs_a_continued_read_strictly_below_the_entry() {
@@ -15184,7 +15165,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
 
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_live_prepare_ledger_cap_counts_codec_refusal_once() {
+fn pi_live_prepare_ledger_cap_counts_entry_cap_refusal_once() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::ScratchDir::new("pi-live-ledger-cap");
     let _lock = test_locks::hold(&root);
@@ -15236,13 +15217,16 @@ fn pi_live_prepare_ledger_cap_counts_codec_refusal_once() {
         .unwrap();
         match cache.prepare_live(&mut lease, view) {
             PrepareOutcome::Prepared(prepared) if !over_cap => cache.discard_prepared(prepared),
-            PrepareOutcome::NotPersisted(NotPersisted::Codec) if over_cap => {}
-            _ => panic!("expected prepared at cap, Codec above cap"),
+            PrepareOutcome::NotPersisted(NotPersisted::EntryCap) if over_cap => {}
+            _ => panic!("expected prepared at cap, EntryCap above cap"),
         }
         let counts = &cache.durable().unwrap().counters;
-        assert_eq!(counts.retained_refused_pi_ledger_cap, u64::from(over_cap));
         assert_eq!(
-            counts.not_persisted.get("wa.codec").copied().unwrap_or(0),
+            counts
+                .not_persisted
+                .get("wa.entry_cap")
+                .copied()
+                .unwrap_or(0),
             u64::from(over_cap)
         );
     }
@@ -15672,7 +15656,9 @@ fn restored_below_accepted_counts_only_complete_codex_pi_tail_publications() {
                             && extent == 99
                             && published;
                         let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-                            record_restored_publication(source, behind.is_some(), published)
+                            if behind.is_some() {
+                                record_restored_publication(source, published);
+                            }
                         });
                         assert_eq!(rows.len(), usize::from(expected));
                         if expected {

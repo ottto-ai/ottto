@@ -342,9 +342,6 @@ const LIFECYCLE_COUNTERS: &[(&str, CounterClass)] = &[
         "retention_bound_refused_pi_bytes_unavailable",
         CounterClass::Observation,
     ),
-    // snapshots.rs native acquisition: transitional Pi Full on change without
-    // a RAM record (no durable Pi yet); a counted read, not a failure.
-    ("pi", CounterClass::Observation),
     // snapshots/sampled_jsonl.rs::retain_reduction/retain_after_release: no plan.
     ("retention_no_plan", CounterClass::NonLayoutFailure),
     // snapshots/sampled_jsonl.rs::retain_reduction/retain_after_release:

@@ -9,9 +9,6 @@ use super::*;
 /// Response-id keys, not occurrences. Oversized ledgers refuse, never truncate.
 pub(crate) const PI_LEDGER_MAX_KEYS: usize = 65_536;
 
-/// The codec refusal class of a ledger over `PI_LEDGER_MAX_KEYS`.
-pub(crate) const PI_LEDGER_CAP: &str = "pi_ledger_cap";
-
 const SECTION_TAG: u64 = 1;
 
 struct PiSection {
@@ -42,8 +39,7 @@ pub(in crate::snapshots) fn put_body(
     }
     let keys = &acc.seen_pi_usage_keys;
     if keys.len() > PI_LEDGER_MAX_KEYS {
-        // Not an E field: only this static class leaves the codec.
-        return Err(Refuse::NonEmpty(PI_LEDGER_CAP));
+        return Err(Refuse::TooLarge);
     }
     e.with_moved_field("SnapshotAccumulator.seen_pi_usage_keys", |e| {
         acc.put(e)?;

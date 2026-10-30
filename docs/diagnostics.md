@@ -1256,18 +1256,12 @@ and its header rewrite reads Full.
 Age and clock changes do not invalidate checkpoints. Admission of a new sampled
 obligation follows the shared audit cap: with no slot left, an unmarked change
 reads a counted cap Full (or waits); already-marked files keep Tailing.
-Until Pi durable records are enabled, an already-indexed file that changes
-without a RAM reduction still reads Full: the transitional `pi` leaf in
-`retained_cache_page_events` counts that attempt once at read start, alongside
-`state_missing`. A newly discovered file's first Full read does not increment
-that leaf. A no-RAM-copy cap Full on a changed indexed file can increment both
-`pi` and `audit_cap_full` for one read. Audit, upload-context and other non-content
-reparse reasons do not increment `pi`; a change that an earlier gate (such as a
-due audit) selects first is counted under that reason, not `pi`. After a restart or eviction, an idle Pi
-file whose 1 h verification marker falls due is read once (audit); Pi-b2's durable
-record removes this. The verified Full retires the marker without re-staging it.
-This is a staged exception; it does not turn a cache miss into a first-read
-authorization.
+Pi uses the shared durable restore path. An indexed file that changes without
+an available RAM or durable reduction reads Full under the shared `state_missing`
+planner reason in `sampled_acquisition.page_events.full_reasons`. Cache admission
+fallbacks use `resource_full{cache_transit}` and the existing source-tagged alarm.
+A Pi usage ledger above 65,536 keys refuses persistence through the shared
+`not_persisted{wa.entry_cap}` class; the ledger is never truncated.
 
 The same #799 page line (source `pi`) reports cache-only
 `retention_bound_refused_pi` events and `retention_bound_refused_pi_bytes`:

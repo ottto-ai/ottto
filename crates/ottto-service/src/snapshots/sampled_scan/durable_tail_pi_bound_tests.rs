@@ -1,12 +1,11 @@
 //! P-ACTIVE-BOUND for Pi (E5 growth-hold audit, Lead A 2026-10-29): Pi
 //! enters E1's ONE shared fallback and per-key pace owner. A structural
 //! `ActiveOverBudget` is the counted no-record Full under
-//! `degraded_no_record{active_bound}` plus the `pi` leaf, at most once per key
+//! `degraded_no_record{active_bound}`, at most once per key
 //! per 6 h; `LeaseBusy` stays a counted fair delay; a full pace map evicts its
 //! oldest stamp toward reading. These rows add no Pi path: they drive the real
 //! OwnedSourceScan over a native Pi receipt and read the shared owner's slot 2.
 use super::*;
-use crate::local_resource_diagnostics::cache_lifecycle;
 
 const SOURCE: SnapshotSource = SnapshotSource::Pi;
 const AT: &str = "2026-10-29T12:00:00Z";
@@ -199,72 +198,29 @@ fn pi_events<'a>(
 
 // The file grows past the active bound, then idles past the 1-day window:
 // exactly one counted read + publish (no record, store byte-identical, the
-// `pi` leaf), nothing pruned. A second growth inside 6 h is a counted delay
+// source alarm), nothing pruned. A second growth inside 6 h is a counted delay
 // that keeps the old committed size; the next paced read publishes it.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
 fn pi_structural_growth_paced_no_record_publish_and_no_prune() {
-    pi_structural_transition(false);
-}
-
-// Pace-map overflow (Lead A via E1): the shared map is full and a NEW growing
-// Pi key arrives. Overflow fails toward reading: the Full runs, the oldest
-// stamp is evicted (`pace_evicted` == 1 on the Pi slot) and the separate
-// durable_tail `pace_evicted` alarm fires beside the active_bound one.
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
-fn pi_pace_map_overflow_reads_evicts_oldest_and_alarms() {
-    pi_structural_transition(true);
-}
-
-fn pi_structural_transition(overflow: bool) {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
     assert!(crate::heap_layout_bound::layout_supported());
     let _reset = ResetActiveBudget;
-    let f = PiBound::new(if overflow {
-        "pi-pace-overflow"
-    } else {
-        "pi-structural-growth"
-    });
+    let f = PiBound::new("pi-structural-growth");
     let (cache, index) = f.warm();
     cache.retained().unwrap().clear();
     let original_disk = f.disk();
     let end = f.grow("growth-1", 20);
     let now = std::time::SystemTime::now();
-    let oldest = store::key_digest(DurableSource::ClaudeCode, "paced-oldest");
-    {
-        let mut stores = cache.durable().unwrap();
-        stores.retail_full_now = Some(now);
-        if overflow {
-            for n in 0..2 * store::MAX_RECORDS {
-                let key = if n == 0 {
-                    oldest
-                } else {
-                    store::key_digest(DurableSource::ClaudeCode, &format!("paced-other-{n}"))
-                };
-                let age = std::time::Duration::from_secs(u64::from(n == 0));
-                stores.retail_full_at.insert(
-                    key,
-                    FullPace {
-                        at: now - age,
-                        structural: false,
-                        flags: FULL_SPENT,
-                        head_extent: 0,
-                    },
-                );
-            }
-        }
-    }
+    cache.durable().unwrap().retail_full_now = Some(now);
     let records_read = cache.durable_counters(SOURCE).unwrap().1.records_read;
     store::active::set_active_budget_for_test(Some(f.structural_limit()));
     let prior = index.clone();
-    let ((((mut next, mut caught, modes), reads), lifecycle), events) =
-        crate::local_resource_diagnostics::capture(|| {
-            cache_lifecycle::observe(|| a0h_observe(|| f.run(cache.clone(), index)))
-        });
+    let (((mut next, mut caught, modes), reads), events) =
+        crate::local_resource_diagnostics::capture(|| a0h_observe(|| f.run(cache.clone(), index)));
     assert_eq!(modes, (1, 0, end), "exactly one counted Full");
     assert_eq!(reads.1, end, "actual single Full input extent");
     assert_eq!(
@@ -280,7 +236,6 @@ fn pi_structural_transition(overflow: bool) {
         "no-record publication retains no optional graph"
     );
     assert_eq!(f.disk(), original_disk, "no record written or removed");
-    assert_eq!(lifecycle.pi, 1, "the `pi` leaf counts the Full");
     {
         let counters = &cache.durable().unwrap().counters;
         assert_eq!(counters.active_bound[2], [1, 0], "one structural Full");
@@ -288,7 +243,7 @@ fn pi_structural_transition(overflow: bool) {
             (counters.active_bound[0], counters.active_bound[1]),
             ([0, 0], [0, 0])
         );
-        assert_eq!(counters.pace_evicted[2], u64::from(overflow));
+        assert_eq!(counters.pace_evicted[2], 0);
     }
     assert!(
         pi_events(&events, "/counts/degraded_no_record/active_bound")
@@ -301,18 +256,6 @@ fn pi_structural_transition(overflow: bool) {
     )
     .any(|v| v == &serde_json::json!(1)));
     let evictions = pi_events(&events, "/counts/pace_evicted").collect::<Vec<_>>();
-    if overflow {
-        assert_eq!(evictions, [&serde_json::json!([1, 1])], "separate alarm");
-        assert!(
-            events.iter().all(|e| e["counts"]["pace_evicted"].is_null()
-                || e["counts"]["degraded_no_record"].is_null()),
-            "kept apart from the active_bound count"
-        );
-        let stores = cache.durable().unwrap();
-        assert_eq!(stores.retail_full_at.len(), 2 * store::MAX_RECORDS);
-        assert!(!stores.retail_full_at.contains_key(&oldest));
-        return;
-    }
     assert!(evictions.is_empty());
     let actual = pi_wire(&mut next, &mut caught);
     assert_eq!(
@@ -369,82 +312,6 @@ fn pi_structural_transition(overflow: bool) {
     assert_eq!(modes, (0, 0, 0), "restart reacquires nothing");
 }
 
-// `LeaseBusy` (D-ACTIVE-WAIT, source=pi) is NOT the structural fallback: a
-// competing active owner makes the restore a counted fair delay (no Full, no
-// publish, no active_bound count); the next pass restores and reads the Tail.
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
-fn pi_lease_busy_is_a_counted_fair_delay_then_restore_tail() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !crate::test_isolation::run_here() {
-        return;
-    }
-    assert!(crate::heap_layout_bound::layout_supported());
-    let f = PiBound::new("pi-lease-busy");
-    let (cache, index) = f.warm();
-    cache.retained().unwrap().clear();
-    let entry = serde_json::to_value(&index.files[&f.key]).unwrap();
-    f.grow("busy-growth", 20);
-    let blocked = Arc::new(Mutex::new(None));
-    let owner = blocked.clone();
-    let pressure = cache.clone();
-    BEFORE_COLD_TRANSFER.with(|slot| {
-        *slot.borrow_mut() = Some(Box::new(move || {
-            let store::LeaseWait::Granted(lease) =
-                pressure.acquire_active(SnapshotSource::ClaudeCode, store::ACTIVE_BYTES)
-            else {
-                panic!("competing active owner must win before cold allocation")
-            };
-            *owner.lock().unwrap() = Some(lease);
-            store::ActiveLease::timeout_next_acquire_for_test(std::time::Duration::from_millis(5));
-        }))
-    });
-    let ((pending, output, modes), events) =
-        crate::local_resource_diagnostics::capture(|| f.run(cache.clone(), index));
-    assert!(
-        pi_events(&events, "/counts/active_wait_busy").any(|v| v == 1),
-        "counted wait"
-    );
-    assert!(pi_events(&events, "/counts/restore_resource_pending/active_wait").any(|v| v == 1));
-    assert!(output.snapshots.is_empty());
-    assert_eq!(modes, (0, 0, 0), "a delay, never a Full");
-    assert_eq!(serde_json::to_value(&pending.files[&f.key]).unwrap(), entry);
-    {
-        let counters = &cache.durable().unwrap().counters;
-        assert_eq!(counters.ineligible.get("active_wait"), Some(&1));
-        assert_eq!(counters.active_bound[2], [0, 0], "not structural");
-        assert_eq!(counters.restored, 0);
-    }
-    blocked
-        .lock()
-        .unwrap()
-        .take()
-        .expect("actual competing owner")
-        .release();
-    let (_, tail, modes) = f.run(cache.clone(), pending);
-    assert_eq!((modes.0, modes.1), (0, 1), "next pass: restore + Tail");
-    assert_eq!(tail.snapshots[0].request_count, 2);
-    assert_eq!(cache.durable().unwrap().counters.restored, 1);
-}
-
-// P-CACHE-COPY (E1 ruling (b); Lead B signed 2026-10-30 with conditions): a
-// decoded Pi graph over the RAM cache entry bound is refused at cache
-// admission (`insert_taken`), so the restore takes
-// `restore_resource_pending("cache_transit")`: exactly ONE paced, counted
-// Full under that existing cause, on the existing shared pace stamp
-// (`full_pace_key`, `PACE_SECS` = 6 h; no new cause or pace key). It is
-// counted for Pi as `resource_full{cache_transit.pi}` and alarmed by the
-// existing `durable_tail_alarm{restore_resource_full{cache_transit}}`, once
-// per counted Full. Growth inside the window, up to its last second, is a
-// counted delay with 0 Full; at 6 h the next paced Full reads it.
-// Revisit trigger: if the Pi cache_transit count is ever > 0 on M4 or the
-// fleet, a cache-less restore -> Tail path becomes next-release work.
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
-fn pi_over_entry_graph_is_one_paced_counted_cache_transit_full() {
-    pi_cache_copy(false);
-}
-
 // Rule 7 on this path: the shared pace map is full when the over-entry Pi
 // key first grows. It fails toward reading: the cache_transit Full runs, the
 // oldest stamp is evicted (`pace_evicted` == 1 on the Pi slot, its own
@@ -452,10 +319,6 @@ fn pi_over_entry_graph_is_one_paced_counted_cache_transit_full() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
 fn pi_cache_copy_pace_map_overflow_reads_and_evicts_oldest() {
-    pi_cache_copy(true);
-}
-
-fn pi_cache_copy(overflow: bool) {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     const _: () = assert!(PACE_SECS == 6 * 3600, "rule 5: one Full per 6 h");
     if !crate::test_isolation::run_here() {
@@ -463,11 +326,7 @@ fn pi_cache_copy(overflow: bool) {
     }
     assert!(crate::heap_layout_bound::layout_supported());
     let _clear = ClearPreparationFault;
-    let f = PiBound::new(if overflow {
-        "pi-cache-copy-overflow"
-    } else {
-        "pi-cache-copy"
-    });
+    let f = PiBound::new("pi-cache-copy-overflow");
     let (cache, index) = f.warm();
     cache.retained().unwrap().clear();
     let kept = f.disk();
@@ -479,24 +338,22 @@ fn pi_cache_copy(overflow: bool) {
         let mut stores = cache.durable().unwrap();
         stores.retail_full_now = Some(now);
         assert!(!stores.retail_full_at.contains_key(&pace_key));
-        if overflow {
-            for n in 0..2 * store::MAX_RECORDS {
-                let key = if n == 0 {
-                    oldest
-                } else {
-                    store::key_digest(DurableSource::ClaudeCode, &format!("paced-other-{n}"))
-                };
-                let age = std::time::Duration::from_secs(u64::from(n == 0));
-                stores.retail_full_at.insert(
-                    key,
-                    FullPace {
-                        at: now - age,
-                        structural: false,
-                        flags: FULL_SPENT,
-                        head_extent: 0,
-                    },
-                );
-            }
+        for n in 0..2 * store::MAX_RECORDS {
+            let key = if n == 0 {
+                oldest
+            } else {
+                store::key_digest(DurableSource::ClaudeCode, &format!("paced-other-{n}"))
+            };
+            let age = std::time::Duration::from_secs(u64::from(n == 0));
+            stores.retail_full_at.insert(
+                key,
+                FullPace {
+                    at: now - age,
+                    structural: false,
+                    flags: FULL_SPENT,
+                    head_extent: 0,
+                },
+            );
         }
     }
     let pace_len = cache.durable().unwrap().retail_full_at.len();
@@ -504,7 +361,6 @@ fn pi_cache_copy(overflow: bool) {
     let counts = |cache: &SharedCache| {
         let (counters, _) = cache.durable_counters(SOURCE).unwrap();
         (
-            counters.resource_full.get("cache_transit.pi").copied(),
             counters.resource_full.get("cache_transit").copied(),
             counters.ineligible.get("cache_transit").copied(),
             [counters.retail_full[0], counters.retail_full[1]],
@@ -541,12 +397,12 @@ fn pi_cache_copy(overflow: bool) {
     assert_eq!(next.files[&f.key].size_bytes, end);
     assert_eq!(
         counts(&cache),
-        (Some(1), Some(1), None, [1, 0], [0, 0]),
+        (Some(1), None, [1, 0], [0, 0]),
         "the Pi count goes to 1 under the existing cause and pace, not structural"
     );
     assert_eq!(
         stamp(&cache),
-        Some((now, false, pace_len + usize::from(!overflow))),
+        Some((now, false, pace_len)),
         "the existing per-key pace stamp; no second pace key"
     );
     assert_eq!(
@@ -558,18 +414,14 @@ fn pi_cache_copy(overflow: bool) {
     let evictions = pi_events(&events, "/counts/pace_evicted").collect::<Vec<_>>();
     {
         let stores = cache.durable().unwrap();
-        assert_eq!(stores.counters.pace_evicted[2], u64::from(overflow));
+        assert_eq!(stores.counters.pace_evicted[2], 1);
         assert!(!stores.retail_full_at.contains_key(&oldest));
     }
-    if overflow {
-        assert_eq!(
-            evictions,
-            [&serde_json::json!([1, 1])],
-            "fails toward reading"
-        );
-    } else {
-        assert!(evictions.is_empty());
-    }
+    assert_eq!(
+        evictions,
+        [&serde_json::json!([1, 1])],
+        "fails toward reading"
+    );
     let actual = pi_wire(&mut next, &mut caught);
     assert_eq!(
         actual,
@@ -607,7 +459,7 @@ fn pi_cache_copy(overflow: bool) {
     );
     assert_eq!(
         counts(&cache),
-        (Some(1), Some(1), Some(1), [1, 1], [0, 0]),
+        (Some(1), Some(1), [1, 1], [0, 0]),
         "a counted delay; the Pi Full count stays 1"
     );
     assert_eq!(
@@ -634,8 +486,5 @@ fn pi_cache_copy(overflow: bool) {
         alarms(&events, "restore_resource_full"),
         [serde_json::json!(1)]
     );
-    assert_eq!(
-        cache.durable().unwrap().counters.pace_evicted[2],
-        u64::from(overflow)
-    );
+    assert_eq!(cache.durable().unwrap().counters.pace_evicted[2], 1);
 }

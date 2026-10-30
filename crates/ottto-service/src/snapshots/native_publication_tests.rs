@@ -180,18 +180,15 @@ pub(crate) enum E4Outcome {
     Unprepared(UnpreparedDisposition),
 }
 thread_local! {
-    static OBSERVED: std::cell::RefCell<Option<Vec<(String, NativePublication)>>> = const { std::cell::RefCell::new(None) };
     static SETTLEMENT: std::cell::RefCell<Option<(String, E4Outcome)>> = const { std::cell::RefCell::new(None) };
 }
 pub(crate) struct SettlementGuard;
 impl Drop for SettlementGuard {
     fn drop(&mut self) {
         SETTLEMENT.with(|slot| *slot.borrow_mut() = None);
-        OBSERVED.with(|slot| *slot.borrow_mut() = None);
     }
 }
 pub(crate) fn inject_settlement(key: String, outcome: E4Outcome) -> SettlementGuard {
-    OBSERVED.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
     SETTLEMENT.with(|slot| {
         assert!(slot.borrow().is_none());
         *slot.borrow_mut() = Some((key, outcome));
@@ -231,15 +228,4 @@ pub(crate) fn assert_settlement_consumed() {
             "actual native settlement must be reached"
         )
     });
-}
-
-pub(super) fn observe_settlement(key: &str, publication: Option<NativePublication>) {
-    OBSERVED.with(|slot| {
-        if let Some(trace) = slot.borrow_mut().as_mut() {
-            trace.push((key.to_owned(), publication.expect("native e4 decision")));
-        }
-    });
-}
-pub(crate) fn observed_settlements() -> Vec<(String, NativePublication)> {
-    OBSERVED.with(|slot| slot.borrow().as_ref().expect("scoped e4 trace").clone())
 }

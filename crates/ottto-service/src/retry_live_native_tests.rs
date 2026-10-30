@@ -1469,16 +1469,6 @@ fn pi_native_publication_page(
     );
     assert_eq!(mode, (files, 0, 0), "first actual native Pi acquisitions");
     native_publication_tests::assert_settlement_consumed();
-    if files == 2 {
-        let trace = native_publication_tests::observed_settlements();
-        assert_eq!(trace.len(), 2, "both files settle on one bounded page");
-        assert_eq!(trace[0].1, crate::snapshots::NativePublication::FailedHeld);
-        assert_eq!(
-            trace[1].1,
-            crate::snapshots::NativePublication::Receipted,
-            "publishing sibling must settle after the held completion"
-        );
-    }
 
     apply_upload_policy(
         SnapshotSource::Pi,

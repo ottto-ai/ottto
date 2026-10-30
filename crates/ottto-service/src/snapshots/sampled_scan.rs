@@ -42,8 +42,6 @@ fn state_bytes() -> usize {
 pub(super) mod codex_cursor;
 #[cfg(unix)]
 pub(super) mod durable_tail;
-#[cfg(all(test, unix))]
-pub(crate) use durable_tail::observe_restored_publications;
 #[cfg(unix)]
 pub(crate) use durable_tail::MissClass;
 #[cfg(unix)]

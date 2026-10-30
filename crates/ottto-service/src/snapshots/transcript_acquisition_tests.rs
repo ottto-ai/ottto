@@ -5558,7 +5558,7 @@ fn pi_ram_tail_ignores_age_and_clock_and_audit_cap_reads_full() {
         let before = fs::metadata(&fixture.file.0).unwrap().len();
         fixture.file.append(&usage(source, 200, 1, "fixture-model"));
         let suffix = fs::metadata(&fixture.file.0).unwrap().len() - before;
-        let ((_, tail, modes, bytes), counts) = observe(|| {
+        let ((_, tail, modes, bytes), _counts) = observe(|| {
             production_scan_at_with_setup(
                 &fixture,
                 source,
@@ -5587,7 +5587,6 @@ fn pi_ram_tail_ignores_age_and_clock_and_audit_cap_reads_full() {
             assert_eq!(modes, (1, 0, 0), "{label}: cap Full, not Tail");
             assert!(bytes.0 > suffix, "{label}: the whole file is read");
         }
-        assert_eq!(counts.pi, 0, "{label}: a RAM copy existed; not the pi leaf");
         let (_, full, _) = production_scan(&fixture, source, quiet, None, label);
         assert_eq!(production_body(source, tail), production_body(source, full));
     }
@@ -5604,7 +5603,7 @@ fn pi_new_file_reads_once_without_transitional_full_count() {
     let index = ScanIndex::default();
     let key = local_index_key(&fixture.file.0);
     assert!(!index.files.contains_key(&key));
-    let (((index, scan, modes), counts), reads) =
+    let (((index, scan, modes), _counts), reads) =
         terminal_contract_retry::source_acquisitions(|| {
             observe(|| production_scan(&fixture, source, index, Some(cache.clone()), "pi-new-file"))
         });
@@ -5613,11 +5612,7 @@ fn pi_new_file_reads_once_without_transitional_full_count() {
     assert_eq!(reads.len(), 1);
     assert_eq!(reads.get(&fixture.file.0), Some(&1));
     assert!(index.files.contains_key(&key));
-    assert_eq!(
-        counts.pi, 0,
-        "a new object's first read is not transitional"
-    );
-    let (((_, _, modes), counts), reads) = terminal_contract_retry::source_acquisitions(|| {
+    let (((_, _, modes), _counts), reads) = terminal_contract_retry::source_acquisitions(|| {
         observe(|| production_scan(&fixture, source, index, Some(cache), "pi-new-file"))
     });
     assert_eq!(modes, (0, 0, 0));
@@ -5625,7 +5620,6 @@ fn pi_new_file_reads_once_without_transitional_full_count() {
         reads.is_empty(),
         "the new Pi file is settled after one read"
     );
-    assert_eq!(counts.pi, 0);
 }
 
 #[test]
@@ -5669,7 +5663,7 @@ fn pi_recordless_restart_and_eviction_full_only_on_change() {
         assert!(reads.is_empty(), "restart and eviction cannot read idle Pi");
         assert_eq!((modes, bytes), ((0, 0, 0), (0, 0)));
         fixture.file.append(&usage(source, 200, 1, "fixture-model"));
-        let (((index, _, modes, _), diagnostics), counts) = observe(|| {
+        let (((index, _, modes, _), diagnostics), _counts) = observe(|| {
             crate::local_resource_diagnostics::capture(|| {
                 production_scan_at(
                     &fixture,
@@ -5682,7 +5676,6 @@ fn pi_recordless_restart_and_eviction_full_only_on_change() {
             })
         });
         assert_eq!(modes, (1, 0, 0));
-        assert_eq!(counts.pi, 1, "one counted transitional pi Full");
         let pages = diagnostics
             .iter()
             .filter(|record| record["stage"] == "native_collection_page")
@@ -5694,7 +5687,7 @@ fn pi_recordless_restart_and_eviction_full_only_on_change() {
             json!({"state_missing": 1}),
             "a recordless Pi read keeps the shared planner reason"
         );
-        let ((_, _, modes, _), counts) = observe(|| {
+        let ((_, _, modes, _), _counts) = observe(|| {
             production_scan_at(
                 &fixture,
                 source,
@@ -5705,7 +5698,6 @@ fn pi_recordless_restart_and_eviction_full_only_on_change() {
             )
         });
         assert_eq!(modes, (0, 0, 0));
-        assert_eq!(counts.pi, 0);
     }
 }
 

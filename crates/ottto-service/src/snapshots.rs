@@ -8456,7 +8456,6 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .is_some_and(|entry| entry.size_bytes < accepted_extent);
         sampled_scan::durable_tail::record_restored_publication(
             source,
-            true,
             pending.parse_complete && (offered || regressed),
         );
     }
@@ -30571,11 +30570,6 @@ impl OwnedSourceScan {
                                 committed_index: index,
                             },
                         );
-                        #[cfg(test)]
-                        native_publication_tests::observe_settlement(
-                            &active.key,
-                            settled.publication,
-                        );
                         NativePublication::carry(&mut native_publication, settled.publication);
                         completed_acquisition = settled.completed;
                         (
@@ -33857,7 +33851,6 @@ impl OwnedSourceScan {
             // Counted once the page actually reads the file (R2-M3): a fence
             // or deferral below does not inflate the read diagnostics.
             let mut planned_mode = None;
-            let mut indexed_pi_entry = false;
             let mut returned_refusal = None;
             #[cfg(unix)]
             let mut paced_full_granted = false;
@@ -33963,18 +33956,6 @@ impl OwnedSourceScan {
                 }
                 #[cfg(not(unix))]
                 let taken = context.cache.take(&key);
-                // Only content-change selection without a RAM reduction
-                // counts `pi`; audit and other reparse reasons do not.
-                indexed_pi_entry = source == SnapshotSource::Pi
-                    && taken.is_none()
-                    && index.files.contains_key(&key)
-                    && matches!(
-                        parse_reason,
-                        Some(
-                            CandidateParseReason::TranscriptChanged
-                                | CandidateParseReason::SourceChanged
-                        )
-                    );
                 #[cfg(unix)]
                 let taken = if native_edit_proven {
                     // A real edit invalidates the old graph; no Tail spend or
@@ -35164,17 +35145,6 @@ impl OwnedSourceScan {
                 }
                 if let Some((mode, audit_due)) = planned_mode {
                     context.record_mode(mode, audit_due);
-                    if indexed_pi_entry
-                        && mode
-                            == crate::transcript_acquisition::ReadMode::Full(
-                                crate::transcript_acquisition::FullReason::StateMissing,
-                            )
-                    {
-                        crate::local_resource_diagnostics::cache_lifecycle::record(
-                            crate::local_resource_diagnostics::cache_lifecycle::Event::Pi,
-                        );
-                    }
-
                     resource_probe
                         .rearm_full_selected(&local_index_key(&active.candidate.path), mode);
                     if active_bound_degraded {

@@ -132,8 +132,7 @@ struct PiPage {
     emitted: BTreeMap<String, Accepted>,
     /// The store as this route left it (its own native receipt).
     records: Records,
-    /// This route's shared restored-behind-accepted publication count.
-    restored_behind: u64,
+    diagnostics: Vec<Value>,
 }
 
 type Records = BTreeMap<PathBuf, Vec<u8>>;
@@ -279,7 +278,12 @@ impl PiDriver {
 
     /// This route's `restored_behind_accepted.published` count.
     fn restored_behind(&self, mode: Mode) -> u64 {
-        self.pages[&mode].restored_behind
+        self.pages[&mode]
+            .diagnostics
+            .iter()
+            .filter(|row| row["source"] == SOURCE.api_slug())
+            .filter_map(|row| row["counts"]["restored_behind_accepted"]["published"].as_u64())
+            .sum()
     }
 
     /// This route's cache-admission refusals: (the Pi `cache_transit` Full
@@ -287,13 +291,8 @@ impl PiDriver {
     fn cache_transit(&self, mode: Mode) -> (u64, u64, [u64; 2]) {
         let (counts, _) = self.pages[&mode].cache.durable_counters(SOURCE).unwrap();
         let count = |map: &BTreeMap<&'static str, u64>, class: &str| map.get(class).copied();
-        assert_eq!(
-            count(&counts.resource_full, "cache_transit"),
-            count(&counts.resource_full, "cache_transit.pi"),
-            "a Pi-only owner: the existing cause and its Pi label agree"
-        );
         (
-            count(&counts.resource_full, "cache_transit.pi").unwrap_or(0),
+            count(&counts.resource_full, "cache_transit").unwrap_or(0),
             count(&counts.ineligible, "cache_transit").unwrap_or(0),
             [counts.retail_full[0], counts.retail_full[1]],
         )
@@ -325,8 +324,8 @@ impl TransitionDriver for PiDriver {
             }
         };
         let cache = scanner.cache.clone();
-        let ((mut result, index, emitted), restored_behind) =
-            crate::snapshots::sampled_scan::observe_restored_publications(|| {
+        let ((mut result, index, emitted), diagnostics) =
+            crate::local_resource_diagnostics::capture(|| {
                 pi_route(&self.c, scanner, self.prior.clone(), mode)
             });
         result.accepted = self.accepted.clone();
@@ -338,7 +337,7 @@ impl TransitionDriver for PiDriver {
                 index,
                 emitted,
                 records,
-                restored_behind,
+                diagnostics,
             },
         );
         result
@@ -887,8 +886,8 @@ fn pi_version_rewrite_after_restart_reads_one_real_edit_full() {
         assert_eq!(before.ino(), after.ino(), "{arm}: same inode");
         assert_eq!(after.len() > before.len(), arm == "grow", "{arm}");
         let cold = f.emit_bodies(Mode::ColdFull);
-        let (edited, rows) =
-            crate::local_resource_diagnostics::capture(|| f.emit_bodies(Mode::Restart));
+        let edited = f.emit_bodies(Mode::Restart);
+        let rows = &f.pages[&Mode::Restart].diagnostics;
         assert_eq!(
             (edited.modes, edited.restored),
             ((1, 0, 0), 0),
@@ -1162,7 +1161,7 @@ fn pi_active_bound_is_one_paced_no_record_full_and_keeps_the_record() {
 // the decoded Pi graph is over the RAM cache's entry bound, so its restore
 // is refused at cache admission and takes the existing `cache_transit`
 // resource path: ONE paced, counted Full (the Pi count,
-// `resource_full{cache_transit.pi}`, goes to 1) that publishes exactly what
+// `resource_full{cache_transit}`, goes to 1) that publishes exactly what
 // restore -> Tail and cold Full publish (body, witness, usage), in one POST,
 // keeping the durable record and the accepted state. Growth inside the pace
 // window is then a counted delay with 0 Full that holds the accepted body.
@@ -1624,8 +1623,8 @@ fn pi_canaries_never_reach_persisted_records_and_the_selector_is_validated() {
         ),
     ]);
     let cold = f.emit_bodies(Mode::ColdFull);
-    let (restored, events) =
-        crate::local_resource_diagnostics::capture(|| f.emit_bodies(Mode::Restart));
+    let restored = f.emit_bodies(Mode::Restart);
+    let events = &f.pages[&Mode::Restart].diagnostics;
     assert_eq!((restored.modes, restored.restored), ((0, 1, 0), 1));
     assert_eq!(restored.io.consumed, tail);
     money_oracle::assert_equivalent(&cold, &restored);
@@ -1787,8 +1786,8 @@ fn pi_same_length_prompt_rewrite_hits_the_rederive_fence() {
         "2026-10-27T06:02:00Z",
     )]);
     let cold = f.emit_bodies(Mode::ColdFull);
-    let (edited, rows) =
-        crate::local_resource_diagnostics::capture(|| f.emit_bodies(Mode::Restart));
+    let edited = f.emit_bodies(Mode::Restart);
+    let rows = &f.pages[&Mode::Restart].diagnostics;
     assert_eq!((edited.modes, edited.restored), ((1, 0, 0), 0));
     assert_eq!(
         rows.iter()

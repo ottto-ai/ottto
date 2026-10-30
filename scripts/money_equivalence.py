@@ -18,6 +18,8 @@ def output(args):
     return subprocess.check_output(args, text=True).strip()
 
 
+# Cap refusals use the shared entry-cap diagnostic; capability and emitted-body
+# receipts below remain the durable evidence, independent of cache counters.
 PI_DURABLE_EXPECTED = True
 # Flip to True once the comparison base contains Pi-a (the release after Pi-a, or Pi-b2).
 PI_RAM_IN_BASE = False

@@ -184,39 +184,8 @@ pub(in crate::snapshots) fn restored_tail_below_accepted(
     .flatten()
 }
 
-#[cfg(test)]
-thread_local! {
-    static PUBLICATION_OBSERVATIONS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) fn observe_restored_publications<T>(f: impl FnOnce() -> T) -> (T, u64) {
-    struct Reset(Option<u64>);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            PUBLICATION_OBSERVATIONS.with(|slot| slot.set(self.0));
-        }
-    }
-    let _reset = Reset(PUBLICATION_OBSERVATIONS.with(|slot| slot.replace(Some(0))));
-    let result = f();
-    (
-        result,
-        PUBLICATION_OBSERVATIONS.with(|slot| slot.get().unwrap()),
-    )
-}
-
-pub(in crate::snapshots) fn record_restored_publication(
-    source: SnapshotSource,
-    behind: bool,
-    published: bool,
-) {
-    if behind && published {
-        #[cfg(test)]
-        PUBLICATION_OBSERVATIONS.with(|slot| {
-            if let Some(count) = slot.get() {
-                slot.set(Some(count + 1));
-            }
-        });
+pub(in crate::snapshots) fn record_restored_publication(source: SnapshotSource, published: bool) {
+    if published {
         crate::local_resource_diagnostics::durable_tail_alarm(
             source.api_slug(),
             &serde_json::json!({"restored_behind_accepted":{"published":1}}),
@@ -384,9 +353,6 @@ pub(crate) struct Counters {
     /// state-directory lock (not the daemon).
     pub(crate) write_unlocked: u64,
     pub(crate) peak_body_bytes: u64,
-    /// Pi ledgers over `PI_LEDGER_MAX_KEYS`, refused at prepare; printed in
-    /// the Pi summary only.
-    pub(crate) retained_refused_pi_ledger_cap: u64,
     /// GC's largest keep map: index keys with a record on disk, at most the
     /// store's `INVENTORY_BOUND`, whatever the index size.
     pub(crate) gc_keep_peak: u64,
@@ -418,14 +384,6 @@ impl Counters {
                 .collect::<Vec<_>>()
                 .join(",")
         };
-        let pi = if source == SnapshotSource::Pi {
-            format!(
-                " retained_refused_pi_ledger_cap={}",
-                self.retained_refused_pi_ledger_cap
-            )
-        } else {
-            String::new()
-        };
         let diagnostic_slot = diagnostic_source_slot(source);
         let rederive_refused = REDERIVE_REFUSED[diagnostic_slot]
             .each_ref()
@@ -449,7 +407,7 @@ impl Counters {
             "ottto-service: durable_tail source={} restart_restore={switch} restart_restore_on_refused{{reason=discovery_dependency}}={on_refused} original_v1_mapped={} durable_restore_after_selection_clear={} objects[same,unknown,changed]={:?} s2_skipped_object_changed={} \
              retail_attempts={} retail_keys={} near_cap={} pace_anomaly={} upgrade_missing_full={} migration[held,await_save,claimed,replaced]={:?} retail_exhausted[full,paced,pace_evicted]={:?} tail_read_bytes={} retail_physical_bytes[process,daily]={:?} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} upgrade_state_missing={} \
              active_bound[claude,codex,pi]={:?} resource_full={{{}}} rederive_head_bytes={} rederive_named_lines={} rederive_line_bytes={} rederive_budget[refused,refused_bytes]={:?} not_persisted={{{}}} ineligible={{{}}} \
-             write_deferred={} write_unlocked={} peak_body_bytes={}{pi} store_write_failed[setup,inventory,statvfs]={:?} disk_records={} disk_bytes={} \
+             write_deferred={} write_unlocked={} peak_body_bytes={} store_write_failed[setup,inventory,statvfs]={:?} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
              bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt,retired_upgrade_missing,receipt_pending,behind_accepted]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
@@ -3410,11 +3368,6 @@ impl SharedCache {
         if let Some(mut stores) = self.durable() {
             if full && source != SnapshotSource::Codex {
                 Counters::bump(&mut stores.counters.resource_full, phase);
-                // The map is shared by every source: Pi's cache-admission
-                // Full (P-CACHE-COPY) also carries its own source label.
-                if source == SnapshotSource::Pi && phase == "cache_transit" {
-                    Counters::bump(&mut stores.counters.resource_full, "cache_transit.pi");
-                }
             } else if !full {
                 stores.counters.budget_refused += 1;
                 Counters::bump(&mut stores.counters.ineligible, phase);
