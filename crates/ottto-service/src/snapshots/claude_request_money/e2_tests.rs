@@ -1265,6 +1265,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
             complete: true,
             lossy: false,
             source_verified: true,
+            unchanged_source: false,
             itemless_request_hashes: Vec::new(),
             opened_birth: None,
             modified_unix_seconds: 1,
