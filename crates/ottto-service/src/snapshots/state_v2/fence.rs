@@ -224,12 +224,10 @@ pub(super) fn reconcile(
         // Probe independently authenticated identity BEFORE rename or RW open.
         sqlite::Sqlite::probe(&import, &identity).map_err(Hold::storage)?;
         fs::rename(&import, &final_db).map_err(|_| Hold::DbUnavailable)?;
-        boundary(Boundary::DbRenamed)?;
     }
     // Retry the durability barrier even when a previous attempt's rename
     // succeeded but its directory sync returned an error.
     super::super::sync_checkpoint_parent(path).map_err(|_| Hold::DbUnavailable)?;
-    boundary(Boundary::FinalSynced)?;
     Ok(Some((identity, final_db)))
 }
 
@@ -273,9 +271,7 @@ pub(super) fn preserve_file(from: &Path, to: &Path) -> Result<u64> {
     );
     output.set_permissions(fs::Permissions::from_mode(0o400))?;
     output.sync_all()?;
-    boundary(Boundary::BaselineFileSynced)?;
     super::super::sync_checkpoint_parent(to)?;
-    boundary(Boundary::BaselineParentSynced)?;
     Ok(bytes)
 }
 
@@ -288,11 +284,8 @@ pub(super) fn publish(path: &Path, identity: &Identity, latch: &mut bool) -> Res
     file.flush()?;
     file.sync_all()?;
     *latch = true;
-    boundary(Boundary::FenceAttempt)?;
     fs::rename(&temp, path).map_err(|_| Hold::DbUnavailable)?;
-    boundary(Boundary::FenceRenamed)?;
     super::super::sync_checkpoint_parent(path).map_err(|_| Hold::DbUnavailable)?;
-    boundary(Boundary::FenceSynced)?;
     let pair = reconcile(path, &identity.binding, true)?;
     if pair.is_none() {
         bail!(Hold::DbUnavailable);
@@ -320,38 +313,4 @@ pub(super) fn cleanup_unpublished(path: &Path, latched: bool) -> Result<u64> {
 
 pub(super) fn evidence(path: &Path) -> Result<bool> {
     Ok(exists(&sibling(path, ".v2.sqlite"))? || read(path)?.is_some())
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Boundary {
-    BaselineFileSynced,
-    BaselineParentSynced,
-    BaselineDirectorySynced,
-    ImportFinished,
-    FenceAttempt,
-    FenceRenamed,
-    FenceSynced,
-    DbRenamed,
-    FinalSynced,
-}
-#[cfg(test)]
-thread_local! { static FAILURE: std::cell::Cell<Option<Boundary>> = const { std::cell::Cell::new(None) }; }
-#[cfg(test)]
-pub(super) fn fail_at(boundary: Boundary) {
-    FAILURE.with(|f| f.set(Some(boundary)));
-}
-pub(super) fn boundary(point: Boundary) -> Result<()> {
-    #[cfg(test)]
-    if FAILURE.with(|f| {
-        if f.get() == Some(point) {
-            f.set(None);
-            true
-        } else {
-            false
-        }
-    }) {
-        bail!(Hold::DbUnavailable);
-    }
-    let _ = point;
-    Ok(())
 }

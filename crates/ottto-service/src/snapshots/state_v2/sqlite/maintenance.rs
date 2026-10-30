@@ -7,12 +7,14 @@ use std::os::fd::AsRawFd;
 pub(in super::super) struct PurgePolicy {
     pub(in super::super) deadline: Duration,
     pub(in super::super) work: Duration,
+    pub(super) space: fn(&Path) -> Option<u64>,
 }
 impl Default for PurgePolicy {
     fn default() -> Self {
         Self {
             deadline: Duration::from_secs(24 * 60 * 60),
             work: Duration::from_secs(2),
+            space: free_space,
         }
     }
 }
@@ -170,10 +172,6 @@ fn limited<T>(conn: &Connection, work: Duration, f: impl FnOnce() -> Result<T>) 
 }
 
 fn free_space(path: &Path) -> Option<u64> {
-    #[cfg(test)]
-    if let Some(space) = TEST_SPACE.with(|s| *s.borrow()) {
-        return space;
-    }
     let file = File::open(path.parent()?).ok()?;
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // fstatvfs initializes the struct only on success; no paths enter gauges.
@@ -194,7 +192,11 @@ impl Sqlite {
             !deadline.is_zero() && deadline <= Duration::from_secs(72 * 3600) && !work.is_zero(),
             "state_v2_purge_policy"
         );
-        self.purge_policy = PurgePolicy { deadline, work };
+        self.purge_policy = PurgePolicy {
+            deadline,
+            work,
+            ..self.purge_policy
+        };
         Ok(())
     }
 
@@ -248,7 +250,7 @@ impl Sqlite {
             .zip(fs::metadata(&self.path).ok().map(|m| m.len()))
             .and_then(|(logical, file)| logical.max(file).checked_mul(2))
             .and_then(|n| n.checked_add(1024 * 1024 * 1024));
-        let available = free_space(&self.path);
+        let available = (self.purge_policy.space)(&self.path);
         self.stats.free_space_required_bytes = required;
         self.stats.free_space_available_bytes = available;
         let admitted = required.zip(available).map(|(r, a)| a >= r);
@@ -364,7 +366,7 @@ impl Sqlite {
             && self
                 .stats
                 .free_space_required_bytes
-                .zip(free_space(&self.path))
+                .zip((self.purge_policy.space)(&self.path))
                 .is_some_and(|(required, available)| available >= required);
         if overdue && (woke || recovered_space) {
             // Bound consecutive recovery pauses even if the engine repeatedly
@@ -619,19 +621,4 @@ impl Sqlite {
         );
         Ok(())
     }
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_SPACE: std::cell::RefCell<Option<Option<u64>>> = const { std::cell::RefCell::new(None) };
-}
-#[cfg(test)]
-pub(in super::super) fn space_for_test(space: Option<u64>) -> impl Drop {
-    struct Reset(Option<Option<u64>>);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            TEST_SPACE.with(|s| *s.borrow_mut() = self.0);
-        }
-    }
-    Reset(TEST_SPACE.with(|s| s.replace(Some(space))))
 }

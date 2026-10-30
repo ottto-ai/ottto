@@ -244,7 +244,11 @@ impl ResumeHooks for NoResumeHooks {
 }
 /// Carries only selection keys to the existing route owner, never to diagnostics.
 #[derive(Debug)]
-pub(super) struct StageExcluded(pub BTreeSet<String>);
+pub(super) struct StageExcluded(
+    pub BTreeSet<String>,
+    pub BTreeMap<String, u64>,
+    pub BTreeSet<String>,
+);
 impl std::fmt::Display for StageExcluded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("state_v2_resume_stage_excluded")
@@ -328,7 +332,22 @@ impl KindCx {
     ) -> Result<()> {
         if !staged.excluded.is_empty() {
             telemetry::event("v2_resume_stage_excluded", &(staged.excluded.len() as u64));
-            return Err(StageExcluded(staged.excluded).into());
+            let extents = staged
+                .excluded
+                .iter()
+                .filter_map(|key| {
+                    next.files
+                        .get(key)
+                        .map(|entry| (key.clone(), entry.size_bytes))
+                })
+                .collect();
+            let prior_refs = staged
+                .excluded
+                .iter()
+                .filter(|key| self.committed.contains_key(*key))
+                .cloned()
+                .collect();
+            return Err(StageExcluded(staged.excluded, extents, prior_refs).into());
         }
         let binding = self.binding.as_ref().context("state_v2_resume_binding")?;
         let mut checkpoints = self.committed.clone();

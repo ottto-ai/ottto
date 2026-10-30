@@ -1801,6 +1801,27 @@ fn retain_growth(index: &mut ScanIndex, key: &str, len: Option<u64>) {
     }
 }
 
+pub(super) fn retain_resume_excluded(index: &mut ScanIndex, key: &str, roots: &[PathBuf]) {
+    // Reuse the no-follow metadata check and growth counters before pinning an
+    // unchanged key. R1's retry debt also survives age filters and reconciliation.
+    revalidate_growth(index, key, roots);
+    let size = index.files.get(key).map_or(0, |entry| entry.size_bytes);
+    index
+        .v2_mut()
+        .growth_retention
+        .entry(key.to_owned())
+        .or_default()
+        .predecessor_size
+        .get_or_insert(size);
+    if let Some(root) = roots
+        .iter()
+        .filter(|root| Path::new(key).starts_with(root))
+        .max_by_key(|root| root.components().count())
+    {
+        queue_growth_path(index, key, root.clone(), true);
+    }
+}
+
 pub(super) fn retain_candidate_growth(
     source: SnapshotSource,
     index: &mut ScanIndex,

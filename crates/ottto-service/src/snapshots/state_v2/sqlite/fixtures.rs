@@ -25,10 +25,7 @@ pub(in super::super) fn oversize_header_for_test(db: &mut Sqlite) {
 pub(in super::super) fn corrupt_header_for_test(db: &mut Sqlite) {
     db.conn()
         .unwrap()
-        .execute(
-            "UPDATE records SET header=zeroblob(length(header)) WHERE header IS NOT NULL",
-            [],
-        )
+        .execute("UPDATE records SET header=X'00'", [])
         .unwrap();
 }
 pub(in super::super) struct ReaderForTest {
@@ -138,4 +135,9 @@ pub(in super::super) fn remove_value_chunk(tx: &Txn<'_>, header: &Header) {
         params![owner.table, owner.kind, owner.key, owner.position, header.parts / 2],
     ).unwrap();
     assert_eq!(removed, 1);
+}
+
+// The existing per-store maintenance policy owns synthetic resource admission.
+pub(in super::super) fn set_space_reader(db: &mut Sqlite, read: Option<fn(&Path) -> Option<u64>>) {
+    db.purge_policy.space = read.unwrap_or(PurgePolicy::default().space);
 }

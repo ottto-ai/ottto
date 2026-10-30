@@ -112,3 +112,71 @@ pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIn
     fence::publish(path, &identity, &mut false).unwrap();
     ScanIndex::load(path).unwrap()
 }
+
+/// Release synthetic native custody before deleting a fixture directory.
+pub(in super::super) fn erase_published(path: &Path) {
+    let _owner = super::super::CheckpointLock::acquire(path).unwrap();
+    runtime::erase_locked(path, None).unwrap();
+}
+
+/// Synthetic R1 certificate using the real storage and durable-tail digests.
+pub(super) fn checkpoint(
+    key: &str,
+    entry: &super::super::ScanIndexEntry,
+    generation: u64,
+    binding: super::super::scan_index_persistence::Binding,
+) -> resume::ResumeCheckpoint {
+    use crate::durable_tail_store::{entry_digest, key_digest, DurableSource};
+    let key_digest = key_digest(DurableSource::ClaudeCode, key);
+    let name = key_digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let row = mapper::key("file.progress", key, 1).unwrap();
+    let publication = preflight(&RowInput {
+        key: &row,
+        fixed: &Fixed::None,
+        value_version: 1,
+        value: &ControlJson(entry),
+    })
+    .unwrap()
+    .digest;
+    resume::ResumeCheckpoint {
+        record_generation: generation,
+        record_name: format!("{name}.{generation}.synthetic.rec"),
+        trailer_digest: [1; 32],
+        file_generation: generation,
+        committed_bytes: entry.size_bytes,
+        reduction_version: 1,
+        reduction_allowlist: [2; 32],
+        reduction_pin: vec![1],
+        binding,
+        key_digest,
+        context: [3; 32],
+        scope: [4; 32],
+        entry: entry_digest(
+            &entry.source_file_fingerprint,
+            entry.last_upload_body_witness.as_deref(),
+        ),
+        publication,
+        certificate: resume::Certificate {
+            device: 1,
+            inode: 1,
+            length: entry.size_bytes,
+            modified: (
+                entry.modified_unix_seconds as i64,
+                entry
+                    .modified_unix_nanos
+                    .unwrap_or(0)
+                    .rem_euclid(1_000_000_000) as i64,
+            ),
+            birth_nanos: entry.opened_birth_nanos,
+            sealed_offset: entry.size_bytes,
+            sample_len: entry.size_bytes.min(4096) as u32,
+            head_sha256: [5; 32],
+            boundary_sha256: [6; 32],
+            verified_unix_seconds: 1,
+            audit_debt_unix_seconds: None,
+        },
+    }
+}

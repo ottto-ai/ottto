@@ -45,7 +45,10 @@ impl Fixture {
             .unwrap(),
         );
         index.v2_mut().growth_retention = claims;
-        index.v2_mut().growth_retention.insert(key.clone(), debt(None));
+        index
+            .v2_mut()
+            .growth_retention
+            .insert(key.clone(), debt(None));
         let identity = Identity {
             format: FORMAT,
             db_id: "synthetic-growth-lineage".into(),
@@ -150,7 +153,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        invalidate_locked(&self.path).unwrap();
+        super::super::money_test_support::erase_published(&self.path);
         let _ = fs::remove_dir_all(&self.support);
     }
 }
@@ -402,7 +405,10 @@ fn saves_reclaim_expired_orphan_claims_after_merging_maxima() {
             .any(|row| row["counts"]["growth_claim_reclaimed"] == 1));
         invalidate_locked(&f.path).unwrap();
         let reopened = f.load();
-        assert!(!reopened.v2().growth_retention.contains_key(expired), "{route}");
+        assert!(
+            !reopened.v2().growth_retention.contains_key(expired),
+            "{route}"
+        );
         for key in [&f.key, recent, future] {
             assert!(
                 reopened.v2().growth_retention.contains_key(key),

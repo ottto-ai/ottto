@@ -26565,6 +26565,21 @@ impl OwnedSourceScan {
             source == SnapshotSource::ClaudeCode && sampled_audit::growth_active(index);
         if growth_active {
             sampled_audit::prune_growth_retention(index, sampled_scan::now_seconds());
+            if state_v2::retain_resume_exclusions(index, roots).is_err() {
+                let mut blocked = Self::new_continuation(
+                    &[],
+                    owned_index,
+                    collected_at,
+                    requested_backfill_window_days,
+                    0,
+                    artifacts_enabled,
+                    context_curve_enabled,
+                    None,
+                    None,
+                );
+                blocked.source = source;
+                return blocked;
+            }
         }
         let next_generation_hints;
         {
@@ -26864,9 +26879,6 @@ impl OwnedSourceScan {
             };
         let mut files = pending_paths
             .into_iter()
-            .filter(|pending| {
-                !state_v2::resume_selection_held(index, &local_index_key(&pending.path))
-            })
             .filter_map(|pending| {
                 candidate_from_traversal_path_with_growth(
                     source,
@@ -26876,6 +26888,13 @@ impl OwnedSourceScan {
                     backfill_window_days,
                     &index.files,
                     sampled_audit::growth_active(index).then_some(&index.v2().growth_retention),
+                )
+            })
+            .filter(|candidate| {
+                !state_v2::resume_selection_held(
+                    index,
+                    &local_index_key(&candidate.path),
+                    Some(candidate.size_bytes),
                 )
             })
             .collect::<Vec<_>>();
@@ -27058,7 +27077,7 @@ impl OwnedSourceScan {
                 .unwrap_or_default();
             let missing_family_paths = family_index_keys
                 .into_iter()
-                .filter(|index_key| !state_v2::resume_selection_held(index, index_key))
+                .filter(|index_key| !state_v2::resume_selection_held(index, index_key, None))
                 .filter(|index_key| !already_identified.contains(index_key))
                 .filter_map(|index_key| {
                     let path = PathBuf::from(&index_key);
@@ -43549,6 +43568,10 @@ fn reconcile_missing_index_entries_with_side(
     }
     let mut growth_queued = false;
     for key in &page {
+        if state_v2::resume_key_retained(index, key) {
+            growth_queued = true;
+            continue;
+        }
         let observed = index
             .traversal
             .as_ref()

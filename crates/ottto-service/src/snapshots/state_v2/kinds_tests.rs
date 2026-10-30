@@ -508,6 +508,7 @@ fn stage_exclusion_discards_settlement_and_preserves_owed_custody() {
     #[derive(Default)]
     struct Hooks {
         opened: bool,
+        exclude: bool,
     }
     impl resume::ResumeHooks for Hooks {
         fn on_open(
@@ -515,7 +516,7 @@ fn stage_exclusion_discards_settlement_and_preserves_owed_custody() {
             generation: u64,
             _: &BTreeMap<String, resume::ResumeCheckpoint>,
         ) -> Result<()> {
-            assert_eq!(generation, 1);
+            assert_eq!(generation, 2);
             self.opened = true;
             Ok(())
         }
@@ -525,19 +526,50 @@ fn stage_exclusion_discards_settlement_and_preserves_owed_custody() {
             next: &ScanIndex,
             current: &BTreeMap<String, resume::ResumeCheckpoint>,
         ) -> Result<resume::StagedCheckpoints> {
-            let _ = (prev, next, current);
-            Ok(Default::default())
+            let _ = current;
+            let mut staged = resume::StagedCheckpoints {
+                bytes: 1,
+                ..Default::default()
+            };
+            for (key, entry) in &next.files {
+                if prev.files.get(key).map(serde_json::to_vec).transpose()?
+                    != Some(serde_json::to_vec(entry)?)
+                {
+                    staged.replacements.insert(
+                        key.clone(),
+                        super::super::money_test_support::checkpoint(
+                            key,
+                            entry,
+                            next.generation,
+                            Scratch::binding(),
+                        ),
+                    );
+                }
+            }
+            Ok(staged)
         }
-        fn stage(
+        fn preflight_selected(
             &mut self,
             _: &ScanIndex,
             _: &ScanIndex,
             _: &BTreeMap<String, resume::ResumeCheckpoint>,
+        ) -> Result<u64> {
+            Ok(1)
+        }
+        fn stage(
+            &mut self,
+            prev: &ScanIndex,
+            next: &ScanIndex,
+            current: &BTreeMap<String, resume::ResumeCheckpoint>,
         ) -> Result<resume::StagedCheckpoints> {
-            Ok(resume::StagedCheckpoints {
-                excluded: BTreeSet::from(["synthetic-file".into()]),
-                ..Default::default()
-            })
+            if self.exclude {
+                Ok(resume::StagedCheckpoints {
+                    excluded: BTreeSet::from(["synthetic-file".into()]),
+                    ..Default::default()
+                })
+            } else {
+                self.plan(prev, next, current)
+            }
         }
     }
     let (_scratch, mut db) = Scratch::live_store();
@@ -545,8 +577,26 @@ fn stage_exclusion_discards_settlement_and_preserves_owed_custody() {
     prev.accepted_rebuild_incidence
         .insert("synthetic-file".into(), BTreeSet::from(["owed".into()]));
     commit_populate(&mut db, &prev);
+    let prior_ref = super::super::money_test_support::checkpoint(
+        "synthetic-file",
+        &prev.files["synthetic-file"],
+        1,
+        Scratch::binding(),
+    );
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    mapper::map_delta(
+        &mut tx,
+        "resume.checkpoint",
+        &BTreeMap::new(),
+        &BTreeMap::from([("synthetic-file".to_owned(), prior_ref.clone())]),
+    )
+    .unwrap();
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
     let mut tx = db.begin(TxnMode::Read).unwrap();
-    let mut hooks = Hooks::default();
+    let mut hooks = Hooks {
+        exclude: true,
+        ..Default::default()
+    };
     let (prev, mut cx) = hydrate_txn_with_hooks(&mut tx, Scratch::binding(), &mut hooks).unwrap();
     drop(tx);
     assert!(hooks.opened);
@@ -583,6 +633,7 @@ fn stage_exclusion_discards_settlement_and_preserves_owed_custody() {
     assert_eq!(next.v2().growth_retention, prev.v2().growth_retention);
     assert!(cx.ambiguous);
     let (restored, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(cx.committed["synthetic-file"], prior_ref);
     assert_eq!(
         serde_json::to_vec(&restored).unwrap(),
         serde_json::to_vec(&prev).unwrap()
@@ -590,16 +641,23 @@ fn stage_exclusion_discards_settlement_and_preserves_owed_custody() {
     // Independent work can commit from a fresh durable graph on the next pass.
     let mut selected = restored.clone();
     selected.upload_context_fingerprint = Some("independent-change".into());
+    selected.files.insert(
+        "independent-file".into(),
+        selected.files["synthetic-file"].clone(),
+    );
     save_graph(
         &mut db,
         &identity,
         &restored,
         &mut selected,
         &mut cx,
-        &mut SaveHooks::default(),
+        &mut Hooks::default(),
     )
     .unwrap();
-    let (reopened, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+    let (reopened, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(cx.committed["synthetic-file"], prior_ref);
+    assert!(reopened.files.contains_key("independent-file"));
+    assert!(cx.committed.contains_key("independent-file"));
     assert_eq!(
         reopened.upload_context_fingerprint.as_deref(),
         Some("independent-change")
@@ -613,6 +671,31 @@ fn stage_exclusion_discards_settlement_and_preserves_owed_custody() {
         serde_json::to_value(&prev.claude_account_family_pending).unwrap()
     );
     assert!(reopened.upload_ack_retirement_handoff.is_none());
+    let mut advanced = reopened.clone();
+    advanced.files.get_mut("synthetic-file").unwrap().size_bytes += 1;
+    save_graph(
+        &mut db,
+        &identity,
+        &reopened,
+        &mut advanced,
+        &mut cx,
+        &mut Hooks::default(),
+    )
+    .unwrap();
+    let (final_graph, final_cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(
+        final_graph.files["synthetic-file"].size_bytes,
+        prev.files["synthetic-file"].size_bytes + 1
+    );
+    assert_ne!(final_cx.committed["synthetic-file"], prior_ref);
+    assert_eq!(
+        final_cx.committed["synthetic-file"].committed_bytes,
+        final_graph.files["synthetic-file"].size_bytes
+    );
+    assert_eq!(
+        final_graph.accepted_rebuild_incidence,
+        prev.accepted_rebuild_incidence
+    );
 }
 
 /// [format] census evidence larger than the projected row cap roundtrips.

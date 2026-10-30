@@ -1232,7 +1232,7 @@ fn f8_damaged_header_refuses_both_lookup_and_scan_before_owned_copy() {
         tx.put(RowInput {
             value_version: 1,
             key: &key,
-            fixed: &Fixed::File { extent: 0, logical_progress: 0 },
+            fixed: &Fixed::None,
             value: &Bytes(vec![]),
         })
         .unwrap();
@@ -1519,7 +1519,7 @@ fn space_recovery_after_restart_purges_before_collection_despite_recent_failure(
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
     age_erasure(&mut db, 25 * 3600);
     {
-        let _full = sqlite::space_for_test(Some(0));
+        sqlite::set_space_reader(&mut db, Some(|_| Some(0)));
         assert!(db.before_collection().is_err());
         assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
         assert_eq!(
@@ -1562,7 +1562,7 @@ fn failed_idle_purge_keeps_paced_debt_without_stopping_collection() {
     db.control("erasure_pending", &1_u64).unwrap();
     age_erasure(&mut db, 13 * 3600);
     {
-        let _full = sqlite::space_for_test(Some(0));
+        sqlite::set_space_reader(&mut db, Some(|_| Some(0)));
         db.maintenance(true).unwrap();
         let failures = db.read_control::<u64>("erasure_failures").unwrap();
         assert!(failures.is_some_and(|n| n > 0));
@@ -1576,6 +1576,7 @@ fn failed_idle_purge_keeps_paced_debt_without_stopping_collection() {
         );
         assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(1));
     }
+    sqlite::set_space_reader(&mut db, None);
     // Under-deadline space recovery does not turn the idle failure into a
     // blocking wake recovery, and it still respects the saved retry clock.
     db.before_collection().unwrap();
@@ -1595,7 +1596,7 @@ fn repeated_overdue_recovery_failure_cannot_stop_collection_indefinitely() {
     let mut db = tmp.live_store();
     db.control("erasure_pending", &1_u64).unwrap();
     age_erasure(&mut db, 25 * 3600);
-    let _full = sqlite::space_for_test(Some(0));
+    sqlite::set_space_reader(&mut db, Some(|_| Some(0)));
     assert!(
         db.before_collection().is_err(),
         "overdue startup tries recovery first"

@@ -1248,7 +1248,7 @@ fn resume_exclusion_survives_reload_and_skips_transcript_before_parse() {
         with_state(&f.path, |state| {
             state
                 .resume_excluded
-                .insert(key.clone(), Instant::now() + Duration::from_secs(60));
+                .insert(key.clone(), ResumeExclusion::new(0, 0));
             state.cached = None;
             Ok(())
         })
@@ -1265,19 +1265,142 @@ fn resume_exclusion_survives_reload_and_skips_transcript_before_parse() {
                 .unwrap(),
             );
         }
-        let scan = super::super::super::scan_source_roots_with_test_limit(
-            super::super::super::SnapshotSource::ClaudeCode,
-            &[roots],
-            &mut index,
-            "2026-10-31T12:00:00Z",
-            30,
-            10,
-            false,
-        )
-        .unwrap();
+        let (scan, records) = crate::local_resource_diagnostics::capture(|| {
+            super::super::super::scan_source_roots_with_test_limit(
+                super::super::super::SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&roots),
+                &mut index,
+                "2026-10-31T12:00:00Z",
+                30,
+                10,
+                false,
+            )
+            .unwrap()
+        });
+        assert!(records.iter().any(|row| row["source"] == "claude_code"
+            && row["counts"]["latest"]["v2_resume_stage_excluded"] == 1));
         assert!(scan.snapshots.is_empty());
         assert_eq!(scan.scanned_file_count, 0);
         assert_eq!(scan.malformed_json_line_count, 0);
         assert!(!index.files.contains_key(&key));
+    }
+}
+
+/// [regress] R1 backoff keeps aged keys and owed debt discoverable, counts growth,
+/// alarms on repeated/long exclusions, and permits the next normal read.
+#[test]
+fn excluded_key_age_growth_alarm_and_retry_keep_owed_debt() {
+    use crate::snapshots::{local_index_key, scan_source_roots_with_test_limit, SnapshotSource};
+    let f = Fixture::new();
+    let roots = f.support.join("transcripts");
+    fs::create_dir(&roots).unwrap();
+    let transcript = roots.join("11111111-1111-4111-8111-111111111111.jsonl");
+    fs::write(&transcript, b"invalid json\n").unwrap();
+    let key = local_index_key(&transcript);
+    let mut seed = ScanIndex::default();
+    seed.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes": 4, "modified_unix_seconds": 1,
+            "source_file_fingerprint": "a".repeat(64),
+            "scan_identity_version": crate::snapshots::LOCAL_SCAN_INDEX_IDENTITY_VERSION
+        }))
+        .unwrap(),
+    );
+    seed.accepted_rebuild_incidence
+        .insert(key.clone(), BTreeSet::from(["owed".into()]));
+    let progress = br#"{"generation":0}"#;
+    let mut index = super::super::money_test_support::publish(&seed, &f.path, progress);
+    let fence_before = fs::read(&f.path).unwrap();
+    with_state(&f.path, |state| {
+        state
+            .resume_excluded
+            .insert(key.clone(), ResumeExclusion::new(index.generation, 4));
+        Ok(())
+    })
+    .unwrap();
+    let scan = |index: &mut ScanIndex| {
+        scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&roots),
+            index,
+            "2050-10-31T12:00:00Z",
+            30,
+            10,
+            false,
+        )
+        .unwrap()
+    };
+    let (_, records) = crate::local_resource_diagnostics::capture(|| {
+        for _ in 0..3 {
+            let result = scan(&mut index);
+            assert_eq!(result.scanned_file_count, 0);
+            assert_eq!(result.malformed_json_line_count, 0);
+            assert_eq!(index.files[&key].size_bytes, 4);
+            assert_eq!(
+                index.accepted_rebuild_incidence[&key],
+                BTreeSet::from(["owed".into()])
+            );
+            assert_eq!(fs::read(&f.path).unwrap(), fence_before);
+        }
+    });
+    assert!(records
+        .iter()
+        .any(|row| row["counts"]["latest"]["v2_resume_excluded_growth_bytes"] == 9));
+    assert!(records
+        .iter()
+        .any(|row| row["counts"]["latest"]["v2_resume_stage_excluded_alarm"] == 1));
+    with_state(&f.path, |state| {
+        let excluded = state.resume_excluded.get_mut(&key).unwrap();
+        excluded.passes = 0;
+        excluded.first_seen = Instant::now() - Duration::from_secs(6 * 3600 + 1);
+        Ok(())
+    })
+    .unwrap();
+    let (_, records) = crate::local_resource_diagnostics::capture(|| scan(&mut index));
+    assert!(records
+        .iter()
+        .any(|row| row["counts"]["latest"]["v2_resume_stage_excluded_alarm"] == 1));
+    with_state(&f.path, |state| {
+        state.resume_excluded.get_mut(&key).unwrap().retry_at = Instant::now();
+        Ok(())
+    })
+    .unwrap();
+    let result = scan(&mut index);
+    assert_eq!(
+        result.malformed_json_line_count, 1,
+        "a due aged key gets a normal read"
+    );
+    assert!(index.files.contains_key(&key));
+    assert_eq!(
+        index.accepted_rebuild_incidence[&key],
+        BTreeSet::from(["owed".into()])
+    );
+}
+
+/// [off=main] a bound v1-only source never opens, creates or migrates SQLite custody.
+#[test]
+fn off_bound_v1_load_and_save_leave_all_database_paths_absent() {
+    let f = Fixture::new();
+    let bytes = serde_json::to_vec(&ScanIndex::default()).unwrap();
+    fs::write(&f.path, &bytes).unwrap();
+    let mut index = ScanIndex::load(&f.path).unwrap();
+    assert!(index.v2().persistence_v2.is_none());
+    index.save(&f.path).unwrap();
+    assert!(f.path.exists());
+    assert!(!states().lock().unwrap().contains_key(&f.path));
+    for suffix in [
+        ".v2.sqlite",
+        ".v2.sqlite.import",
+        ".v2.sqlite.owner",
+        ".v2.sqlite-wal",
+        ".v2.sqlite-shm",
+        ".v2-ack-receipt",
+        ".v1-readonly",
+    ] {
+        assert!(
+            !fence::sibling(&f.path, suffix).exists(),
+            "OFF created {suffix}"
+        );
     }
 }

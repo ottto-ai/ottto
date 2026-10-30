@@ -523,54 +523,6 @@ impl OriginalFile {
     }
 }
 
-// This is the existing outer v1 storage envelope, not a semantic decoder.
-// Strict duplicate/unknown rejection is essential BEFORE calling its normal
-// opener, which may recover fresh initialization or clean up v1 artifacts.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OriginalManifest {
-    schema_version: u16,
-    files: std::collections::BTreeMap<String, serde_json::Value>,
-    storage_format: u16,
-    logical_schema_version: u16,
-    generation: u64,
-    binding: super::super::scan_index_persistence::Binding,
-    padding_bytes: u64,
-    maps: Vec<OriginalMap>,
-    objects: Vec<OriginalObject>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OriginalMap {
-    field: super::super::scan_index_persistence::Field,
-    generation: u64,
-    buckets: Vec<u8>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OriginalObject {
-    slot: super::super::scan_index_persistence::Slot,
-    generation: u64,
-    bytes: u64,
-    digest: String,
-}
-impl OriginalObject {
-    fn name(&self) -> String {
-        use super::super::scan_index_persistence::{Field, Slot};
-        let label = match self.slot {
-            Slot::Metadata => "metadata".into(),
-            Slot::Bucket { field, bucket } => format!(
-                "{}-{bucket:02x}",
-                match field {
-                    Field::AccountPending => "account",
-                    Field::UsagePending => "usage",
-                    Field::RequestCensus => "census",
-                }
-            ),
-        };
-        format!("{label}-{}.json", self.digest)
-    }
-}
 /// Stream root presence and validate JSON grammar without allocating leaf
 /// strings. The hashing pass separately validates their Unicode encoding.
 struct Presence;
@@ -715,9 +667,9 @@ impl Original {
     }
     fn read_inner(path: &Path) -> Result<Self> {
         use super::super::scan_index_persistence::{
-            Field, Slot, LOGICAL_SCHEMA, MAX_ROOT_BYTES, OUTER_SCHEMA, STORAGE_FORMAT,
+            validate_object_digest, Field, Manifest, Slot, LOGICAL_SCHEMA, MAX_ROOT_BYTES,
+            OUTER_SCHEMA,
         };
-        use sha2::Digest;
         use std::io::{BufReader, Seek, SeekFrom};
         let mut result = Self::default();
         if !fence::exists(path)? {
@@ -741,48 +693,16 @@ impl Original {
         } else {
             anyhow::ensure!(schema == OUTER_SCHEMA, Pause::UnknownClass);
             anyhow::ensure!(stamp.2 <= MAX_ROOT_BYTES as u64, Pause::Oversize);
-            let manifest: OriginalManifest = serde_json::from_reader(BufReader::new(
+            let manifest: Manifest = serde_json::from_reader(BufReader::new(
                 (&mut root).take(MAX_ROOT_BYTES as u64 + 1),
             ))?;
             let binding = super::super::scan_index_integration::scan_index_storage_binding(path)
                 .ok_or(Pause::Mismatch)?;
-            anyhow::ensure!(
-                manifest.schema_version == OUTER_SCHEMA
-                    && manifest.storage_format == STORAGE_FORMAT
-                    && manifest.logical_schema_version == LOGICAL_SCHEMA
-                    && manifest.files.is_empty()
-                    && manifest.binding == binding,
-                Pause::Mismatch
-            );
-            anyhow::ensure!(
-                !manifest.objects.is_empty()
-                    && manifest.objects.len() <= 769
-                    && manifest.objects[0].slot == Slot::Metadata
-                    && manifest.objects.windows(2).all(|p| p[0].slot < p[1].slot)
-                    && manifest.maps.len() == 3,
-                Pause::Partial
-            );
-            let mut total = 0_u64;
+            manifest.validate(&binding).map_err(|_| Pause::Mismatch)?;
+            anyhow::ensure!(manifest.maps.len() == 3, Pause::Partial);
             for object in &manifest.objects {
-                anyhow::ensure!(
-                    object.generation == manifest.generation
-                        && object.bytes >= 2
-                        && object.digest.len() == 64
-                        && object
-                            .digest
-                            .bytes()
-                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-                    Pause::Mismatch
-                );
-                total = total.checked_add(object.bytes).ok_or(Pause::Oversize)?;
+                anyhow::ensure!(object.generation == manifest.generation, Pause::Mismatch);
             }
-            anyhow::ensure!(
-                manifest.padding_bytes <= total
-                    && total
-                        .checked_add(manifest.padding_bytes)
-                        .is_some_and(|n| n <= i64::MAX as u64 - MAX_ROOT_BYTES as u64),
-                Pause::Oversize
-            );
             for field in [
                 Field::AccountPending,
                 Field::UsagePending,
@@ -805,7 +725,7 @@ impl Original {
                 anyhow::ensure!(map.buckets == buckets, Pause::Partial);
             }
             for object in &manifest.objects {
-                let shard_path = fence::sibling(path, ".shards").join(object.name());
+                let shard_path = fence::sibling(path, ".shards").join(object.filename());
                 let mut file = original_open(&shard_path).map_err(|e| {
                     if e.downcast_ref::<std::io::Error>()
                         .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
@@ -847,25 +767,7 @@ impl Original {
                     de.end()?;
                 }
                 file.seek(SeekFrom::Start(0))?;
-                let mut hash = sha2::Sha256::new();
-                hash.update(b"ottto.scan-index.storage.v1\0object\0");
-                hash.update(serde_json::to_vec(&(&binding, object.slot))?);
-                hash.update([0]);
-                let mut buf = [0; 32 * 1024];
-                loop {
-                    let n = file.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    hash.update(&buf[..n]);
-                }
-                hash.update(object.bytes.to_le_bytes());
-                let digest = hash
-                    .finalize()
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>();
-                anyhow::ensure!(digest == object.digest, Pause::Mismatch);
+                validate_object_digest(&mut file, &binding, object).map_err(|_| Pause::Mismatch)?;
                 result
                     .files
                     .push(OriginalFile::capture(&shard_path, &mut file, before)?);
@@ -924,7 +826,6 @@ impl Original {
             .ok_or(Pause::Mismatch)?
             .with_sealed_import(path, identity, db, |db| {
                 db.finish_import()?;
-                fence::boundary(fence::Boundary::ImportFinished)?;
                 self.unchanged()?;
                 fence::publish(path, identity, latched)
             })
@@ -979,7 +880,6 @@ impl Original {
         }
         if self.files.len() > 1 {
             super::super::sync_checkpoint_parent(&shards.join("unused"))?;
-            fence::boundary(fence::Boundary::BaselineDirectorySynced)?;
         }
         if !self.files.is_empty() {
             super::super::sync_checkpoint_parent(path)?;
@@ -1320,10 +1220,14 @@ mod application_cases {
             })
             .unwrap();
         let _lock = super::super::super::CheckpointLock::acquire(&c.path).unwrap();
-        let loaded = super::super::runtime::load_locked(&c.path, None)
-            .unwrap()
-            .0
-            .unwrap();
+        let loaded = super::super::runtime::load_locked(
+            &c.path,
+            None,
+            super::super::runtime::published(&c.path).unwrap(),
+        )
+        .unwrap()
+        .0
+        .unwrap();
         assert_eq!(loaded.generation, 10);
         assert!(loaded.v2().persistence_v2.is_some());
         // Only this component fixture publishes. Production conversion keeps
@@ -1576,16 +1480,12 @@ mod application_cases {
     /// [format] f7 baseline failures remain unpublished and keep original authority.
     #[test]
     fn f7_baseline_failures_remain_unpublished_and_keep_original_authority() {
-        for point in [
-            fence::Boundary::BaselineFileSynced,
-            fence::Boundary::BaselineParentSynced,
-            fence::Boundary::BaselineDirectorySynced,
-        ] {
+        for blocked in [".v1-readonly", ".v1-readonly.shards"] {
             let c = Corpus::new();
             c.sharded();
             let original = Original::read(&c.path).unwrap();
             let bytes = fs::read(&c.path).unwrap();
-            fence::fail_at(point);
+            fs::create_dir(fence::sibling(&c.path, blocked)).unwrap();
             assert!(original.preserve(&c.path).is_err());
             assert_eq!(fs::read(&c.path).unwrap(), bytes);
             assert!(!fence::evidence(&c.path).unwrap());

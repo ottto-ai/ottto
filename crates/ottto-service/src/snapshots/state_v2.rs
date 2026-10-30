@@ -20,8 +20,8 @@ pub(super) use runtime::invalidate_tree;
 pub(super) use runtime::Hold;
 pub(super) use runtime::{
     after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
-    idle, load_locked, published, recovery_save_guard, save_locked,
-    save_oversize_active, save_read_admitted, save_read_completed,
+    idle, load_locked, published, recovery_save_guard, save_locked, save_oversize_active,
+    save_read_admitted, save_read_completed,
 };
 mod codec;
 #[cfg(test)]
@@ -562,7 +562,9 @@ impl StorageLimits {
 // ACK recovery owns no routing or import decisions.
 pub(crate) mod ack;
 // OPS-only maintenance and counts/bytes/times diagnostics seams.
-pub(super) use runtime::{before_collection, resume_selection_held};
+pub(super) use runtime::{
+    before_collection, resume_key_retained, resume_selection_held, retain_resume_exclusions,
+};
 
 #[cfg(test)]
 mod money_fault_tests;

@@ -90,6 +90,27 @@ impl Hold {
         hold.into()
     }
 }
+struct ResumeExclusion {
+    first_seen: Instant,
+    retry_at: Instant,
+    passes: u32,
+    failed_generation: u64,
+    observed_len: u64,
+    had_ref: bool,
+}
+impl ResumeExclusion {
+    fn new(generation: u64, len: u64) -> Self {
+        let now = Instant::now();
+        Self {
+            first_seen: now,
+            retry_at: now + Duration::from_secs(60),
+            passes: 0,
+            failed_generation: generation,
+            observed_len: len,
+            had_ref: false,
+        }
+    }
+}
 struct RouteState {
     pace: Pace,
     latched: bool,
@@ -105,7 +126,7 @@ struct RouteState {
     last_read: Option<(String, u64)>,
     save_retry_completed: bool,
     pass_written_start: Option<u64>,
-    resume_excluded: BTreeMap<String, Instant>,
+    resume_excluded: BTreeMap<String, ResumeExclusion>,
 }
 impl RouteState {
     fn reduce_page(&mut self) {
@@ -658,10 +679,15 @@ fn save_with_custody<M: Mapper>(
         if let Err(error) = &save_result {
             if let Some(excluded) = error.downcast_ref::<resume::StageExcluded>() {
                 let now = Instant::now();
-                state.resume_excluded.retain(|_, until| *until > now);
-                let until = now + Duration::from_secs(60);
                 for key in &excluded.0 {
-                    state.resume_excluded.insert(key.clone(), until);
+                    let entry = state.resume_excluded.entry(key.clone()).or_insert_with(|| {
+                        ResumeExclusion::new(
+                            index.generation,
+                            excluded.1.get(key).copied().unwrap_or(0),
+                        )
+                    });
+                    entry.had_ref |= excluded.2.contains(key);
+                    entry.retry_at = now + Duration::from_secs(60);
                 }
             }
             if let Some(hold) = session.db.save_failure() {
@@ -1049,11 +1075,13 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
     }
     super::super::sync_checkpoint_parent(path)?;
     telemetry::event("source_erasure_confirmed", &1);
-    // Keep the latch until process exit. Stale clones cannot fall back to v1.
-    with_state(path, |state| {
-        state.latched = true;
-        Ok(())
-    })
+    // Successful explicit erasure ends this custody lineage. Old clones still
+    // carry closed sessions and cannot save; a fresh setup may create new state.
+    states()
+        .lock()
+        .map_err(|_| Hold::DbUnavailable)?
+        .remove(path);
+    Ok(())
 }
 
 /// Close/erase only live runtimes already owned by this process. The caller's
@@ -1113,7 +1141,9 @@ mod tests;
 // OPS maintenance boundary; routing/import/ACK remain owned by their adapters.
 #[path = "runtime_ops.rs"]
 mod ops;
-pub(in super::super) use ops::{before_collection, resume_selection_held};
+pub(in super::super) use ops::{
+    before_collection, resume_key_retained, resume_selection_held, retain_resume_exclusions,
+};
 
 /// Read-only custody seam for growth receipts. Callers doing CAS retain the
 /// checkpoint lock; never acquire it recursively from the save hook.

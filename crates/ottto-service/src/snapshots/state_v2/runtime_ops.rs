@@ -59,21 +59,69 @@ pub(in super::super::super) fn before_collection(index: &ScanIndex) -> Result<()
     }))
 }
 
-/// Hold failed R1 keys before opening/parsing candidates. The route outlives a
-/// discarded session, so reloading cannot lose the short staging backoff.
-pub(in super::super::super) fn resume_selection_held(index: &ScanIndex, key: &str) -> bool {
-    let Some(runtime) = &index.v2().persistence_v2 else {
-        return false;
+/// Retain source debt and requeue the failed path through the existing bounded
+/// traversal. Backoff suppresses parsing, never discovery or age retention.
+pub(in super::super::super) fn retain_resume_exclusions(
+    index: &mut ScanIndex,
+    roots: &[PathBuf],
+) -> Result<()> {
+    let Some(path) = runtime_path(index)? else {
+        return Ok(());
     };
+    let keys = with_state(&path, |state| {
+        let now = Instant::now();
+        for excluded in state.resume_excluded.values_mut() {
+            excluded.passes = excluded.passes.saturating_add(1);
+            if excluded.passes >= 3
+                || now.saturating_duration_since(excluded.first_seen)
+                    > Duration::from_secs(6 * 3600)
+            {
+                telemetry::event("v2_resume_stage_excluded_alarm", &1);
+            }
+        }
+        if !state.resume_excluded.is_empty() {
+            telemetry::event(
+                "v2_resume_stage_excluded",
+                &(state.resume_excluded.len() as u64),
+            );
+        }
+        Ok(state.resume_excluded.keys().cloned().collect::<Vec<_>>())
+    })?;
+    for key in keys {
+        super::super::super::sampled_audit::retain_resume_excluded(index, &key, roots);
+    }
+    Ok(())
+}
+
+pub(in super::super::super) fn resume_key_retained(index: &ScanIndex, key: &str) -> bool {
+    let Ok(Some(path)) = runtime_path(index) else {
+        return index.v2().persistence_v2.is_some();
+    };
+    with_state(&path, |state| Ok(state.resume_excluded.contains_key(key))).unwrap_or(true)
+}
+
+/// Metadata can count growth while the bounded staging backoff blocks parsing.
+pub(in super::super::super) fn resume_selection_held(
+    index: &ScanIndex,
+    key: &str,
+    len: Option<u64>,
+) -> bool {
     let result = (|| {
-        let path = {
-            let guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
-            guard.as_ref().ok_or(Hold::DbUnavailable)?.path.clone()
+        let Some(path) = runtime_path(index)? else {
+            return Ok(false);
         };
         with_state(&path, |state| {
-            let now = Instant::now();
-            state.resume_excluded.retain(|_, until| *until > now);
-            Ok(state.resume_excluded.contains_key(key))
+            let Some(excluded) = state.resume_excluded.get_mut(key) else {
+                return Ok(false);
+            };
+            if let Some(len) = len.filter(|len| *len > excluded.observed_len) {
+                telemetry::event(
+                    "v2_resume_excluded_growth_bytes",
+                    &(len - excluded.observed_len),
+                );
+                excluded.observed_len = len;
+            }
+            Ok(Instant::now() < excluded.retry_at)
         })
     })();
     result.unwrap_or(true)

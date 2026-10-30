@@ -1124,6 +1124,7 @@ impl Sqlite {
     /// Authenticate the exact committed generation before restart staging.
     /// The caller retains source ownership through COMMIT.
     pub(super) fn validate_save(&mut self, identity: &Identity, generation: u64) -> Result<()> {
+        self.save_failure = None;
         ensure!(self.stamp()?.0 == generation, Hold::ReloadRequired);
         let tx = self.begin(TxnMode::Read)?;
         migrations::check_current(tx.store.conn()?)?;
@@ -1902,5 +1903,3 @@ impl Sqlite {
         Ok(generation)
     }
 }
-#[cfg(test)]
-pub(super) use maintenance::space_for_test;
