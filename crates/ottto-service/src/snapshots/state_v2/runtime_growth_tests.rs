@@ -632,82 +632,88 @@ fn excluded_growth_stock_does_not_evict_overlapping_proofs() {
     use crate::snapshots::claude_request_census::{
         ClaudeRequestCensusRecord, ClaudeRequestCensusShape, MAX_CLAUDE_REQUEST_CENSUS_HASHES,
     };
-    let f = Fixture::new();
-    let mut index = f.load();
-    let cap = MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64;
-    for (key, age, hashes) in [
-        (f.key.clone(), 1, (0..cap / 10).collect()),
-        (
-            "/synthetic/overlap.jsonl".into(),
-            1,
-            (cap / 10..cap / 5).collect(),
-        ),
-        (
-            "/synthetic/copy.jsonl".into(),
-            40 * 86400,
-            (cap / 10..cap * 85 / 100).collect(),
-        ),
-        ("/synthetic/nongrown.jsonl".into(), 1, vec![cap + 1]),
-        ("/synthetic/residue.jsonl".into(), 1, vec![cap + 2]),
-    ] {
-        let entry = index.files[&f.key].clone();
-        index.files.insert(key.clone(), entry);
-        index.claude_request_census.insert_for_test(
-            &key,
-            ClaudeRequestCensusRecord::synthetic_for_test(
-                &"a".repeat(64),
-                1,
-                ClaudeRequestCensusShape::Exact,
-                hashes,
-            )
-            .with_modified_for_test(Some(age)),
+    for prechecked in [true, false] {
+        let f = Fixture::new();
+        let mut index = f.load();
+        if !prechecked {
+            index.v2_mut().growth_retention.clear();
+        }
+        let overlap = crate::snapshots::local_index_key(&f.support.join("overlap.jsonl"));
+        let copy = crate::snapshots::local_index_key(&f.support.join("copy.jsonl"));
+        let nongrown = crate::snapshots::local_index_key(&f.support.join("nongrown.jsonl"));
+        let residue = crate::snapshots::local_index_key(&f.support.join("residue.jsonl"));
+        for key in [&overlap, &copy, &nongrown, &residue] {
+            fs::write(key, b"old\n").unwrap();
+        }
+        let cap = MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64;
+        for (key, age, hashes) in [
+            (f.key.clone(), 1, (0..cap / 10).collect()),
+            (overlap.clone(), 1, (cap / 10..cap / 5).collect()),
+            (
+                copy.clone(),
+                40 * 86400,
+                (cap / 10..cap * 85 / 100).collect(),
+            ),
+            (nongrown.clone(), 1, vec![cap + 1]),
+            (residue.clone(), 1, vec![cap + 2]),
+        ] {
+            let entry = index.files[&f.key].clone();
+            index.files.insert(key.clone(), entry);
+            index.claude_request_census.insert_for_test(
+                &key,
+                ClaudeRequestCensusRecord::synthetic_for_test(
+                    &"a".repeat(64),
+                    1,
+                    ClaudeRequestCensusShape::Exact,
+                    hashes,
+                )
+                .with_modified_for_test(Some(age)),
+            );
+        }
+        crate::snapshots::ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&f.support),
+            &mut index,
+            "2026-10-07T12:00:00Z",
+            30,
+        );
+        let walk = index.traversal.as_mut().unwrap();
+        walk.reconciliation_upper_bound = Some("z".into());
+        walk.reconciliation_after = None;
+        walk.residue.index_keys.insert(residue.clone());
+        let (aged, kept, _, overflow) = index.retire_claude_transcript_records_for_test(40 * 86400);
+        assert_eq!(
+            aged, 2,
+            "neither an unchecked range nor untracked residue is growth debt"
+        );
+        assert_eq!(kept, 1);
+        assert_eq!(overflow, 0);
+        assert_eq!(
+            index
+                .claude_request_census
+                .get(&overlap)
+                .unwrap()
+                .retired_for_test(),
+            None
+        );
+        assert_eq!(
+            index
+                .claude_request_census
+                .get(&f.key)
+                .unwrap()
+                .retired_for_test(),
+            None
+        );
+        sampled_audit::settle_growth(&mut index, &f.key);
+        assert_eq!(
+            index
+                .retire_claude_transcript_records_for_test(40 * 86400)
+                .0,
+            1
+        );
+        assert_eq!(
+            index.claude_request_census.totals_for_test(),
+            index.claude_request_census.recounted_for_test()
         );
     }
-    crate::snapshots::ensure_bounded_traversal(
-        SnapshotSource::ClaudeCode,
-        std::slice::from_ref(&f.support),
-        &mut index,
-        "2026-10-07T12:00:00Z",
-        30,
-    );
-    let walk = index.traversal.as_mut().unwrap();
-    walk.reconciliation_upper_bound = Some("z".into());
-    walk.reconciliation_after = None;
-    walk.residue
-        .index_keys
-        .insert("/synthetic/residue.jsonl".into());
-    let (aged, kept, _, overflow) = index.retire_claude_transcript_records_for_test(40 * 86400);
-    assert_eq!(
-        aged, 2,
-        "neither an unchecked range nor untracked residue is growth debt"
-    );
-    assert_eq!(kept, 1);
-    assert_eq!(overflow, 0);
-    assert_eq!(
-        index
-            .claude_request_census
-            .get("/synthetic/overlap.jsonl")
-            .unwrap()
-            .retired_for_test(),
-        None
-    );
-    assert_eq!(
-        index
-            .claude_request_census
-            .get(&f.key)
-            .unwrap()
-            .retired_for_test(),
-        None
-    );
-    sampled_audit::settle_growth(&mut index, &f.key);
-    assert_eq!(
-        index
-            .retire_claude_transcript_records_for_test(40 * 86400)
-            .0,
-        1
-    );
-    assert_eq!(
-        index.claude_request_census.totals_for_test(),
-        index.claude_request_census.recounted_for_test()
-    );
 }

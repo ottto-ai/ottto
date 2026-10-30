@@ -602,6 +602,7 @@ fn stage_exclusion_discards_settlement_and_preserves_owed_custody() {
     assert!(hooks.opened);
     let mut next = prev.clone();
     next.generation += 1;
+    next.files.get_mut("synthetic-file").unwrap().size_bytes += 7;
     next.file_snapshot_fingerprints.insert(
         "synthetic-file".into(),
         BTreeSet::from(["unpublished".into()]),

@@ -102,6 +102,20 @@ pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIn
         &serde_json::to_vec(index).unwrap(),
     )
     .unwrap();
+    crate::snapshot_sync::with_state_v2_progress_lock(path, |progress_path| {
+        match std::fs::read(progress_path) {
+            Ok(bytes) => assert_eq!(
+                bytes, progress,
+                "synthetic custody must seal the actual original bytes"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ottto_core::write_owner_only_file_atomic(progress_path, progress)?
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    })
+    .unwrap();
     ack::ProgressRecovery::seal_import(
         identity.clone(),
         identity.fence_generation,

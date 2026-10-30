@@ -468,6 +468,10 @@ impl SnapshotUploadProgress {
             // refusal outcomes are bounded independently of source data.
             padding = padding.saturating_add(1024);
         }
+        // self already reserves every retained identity session once. Changed
+        // session snapshots above reserve mixed-response/replacement space;
+        // unchanged cloned sessions must not consume the budget a second time.
+        projected.accepted_identity_buckets = Default::default();
         let mut length = SnapshotPackingLength { bytes: 0 };
         serde_json::to_writer_pretty(&mut length, self)?;
         serde_json::to_writer_pretty(&mut length, &projected)?;

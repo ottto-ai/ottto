@@ -3024,15 +3024,6 @@ fn insert_transcript_record(
         return ClaudeRequestCensusInsert::Refused;
     }
     let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
-    let active = super::sampled_audit::growth_active(index);
-    let growth = &index
-        .v2
-        .as_deref()
-        .unwrap_or(&super::state_v2::EMPTY_INDEX)
-        .growth_retention;
-    let walk = index.traversal.as_ref();
-    let excluded =
-        |key: &str| active && super::sampled_audit::growth_excluded_parts(key, growth, walk, None);
     let retained = super::sampled_audit::growth_retirement_excluded(index, key)
         .then(|| index.claude_request_census.get(key))
         .flatten()
@@ -3045,17 +3036,29 @@ fn insert_transcript_record(
                 )
         })
         .cloned();
-    let files = &index.files;
     let mut released = 0;
-    let outcome =
-        index
-            .claude_request_census
-            .insert_releasing(key.to_owned(), record, |census, fits| {
-                // A release retires; it never marks the key lost or refused.
-                if window > 0 {
-                    released = census.release_aged(files, cutoff, fits, true, &excluded).0;
-                }
-            });
+    // Move the existing owner, without cloning its history, so the rare
+    // pressure callback can update growth custody before releasing any proof.
+    let mut census = std::mem::take(&mut index.claude_request_census);
+    let outcome = census.insert_releasing(key.to_owned(), record, |census, fits| {
+        if window > 0 {
+            revalidate_retirement_growth(index, census, cutoff);
+            let active = super::sampled_audit::growth_active(index);
+            let excluded = |key: &str| {
+                active
+                    && super::sampled_audit::growth_excluded_parts(
+                        key,
+                        &index.v2().growth_retention,
+                        index.traversal.as_ref(),
+                        None,
+                    )
+            };
+            released = census
+                .release_aged(&index.files, cutoff, fits, true, &excluded)
+                .0;
+        }
+    });
+    index.claude_request_census = census;
     note_kept_overlap_admission(released);
     if outcome != ClaudeRequestCensusInsert::Stored {
         if let Some(retained) = retained {
@@ -3279,6 +3282,37 @@ fn transcript_retirement_age(
         .filter(|modified| *modified < cutoff)
 }
 
+/// A later page may own an aged transcript that grew after its last committed
+/// extent. Check only retirement candidates, at most once per graph generation,
+/// through the existing no-follow metadata path before spending their proof.
+fn revalidate_retirement_growth(index: &mut ScanIndex, census: &ClaudeRequestCensus, cutoff: u64) {
+    if !super::sampled_audit::growth_active(index) {
+        return;
+    }
+    let roots = index
+        .traversal
+        .as_ref()
+        .map(|walk| walk.scan_roots.clone())
+        .unwrap_or_default();
+    let keys = census
+        .records
+        .iter()
+        .filter(|(key, record)| {
+            transcript_retirement_age(&index.files, cutoff, key, record).is_some()
+                && !super::sampled_audit::growth_retirement_excluded(index, key)
+                && !index
+                    .v2()
+                    .growth_retention
+                    .get(*key)
+                    .is_some_and(|growth| growth.checked_generation == Some(index.generation))
+        })
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    for key in keys {
+        super::sampled_audit::revalidate_growth(index, &key, &roots);
+    }
+}
+
 /// P1 ledger transcript retirement, by the record's own mtime (never the
 /// index entry's): a record whose file was last modified more than 35 days
 /// before this window keeps its hash count and drops its hashes. A later
@@ -3322,6 +3356,8 @@ fn retire_claude_transcript_records_excluding(
     }
     let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
     let active = super::sampled_audit::growth_active(index);
+    let mut owned_census = std::mem::take(&mut index.claude_request_census);
+    revalidate_retirement_growth(index, &owned_census, cutoff);
     let growth = &index
         .v2
         .as_deref()
@@ -3332,7 +3368,7 @@ fn retire_claude_transcript_records_excluding(
         active && super::sampled_audit::growth_excluded_parts(key, growth, walk, terminal_residue)
     };
     let files = &index.files;
-    let census = &mut index.claude_request_census;
+    let census = &mut owned_census;
     if active {
         for (key, record) in &census.records {
             if excluded(key) && transcript_retirement_age(files, cutoff, key, record).is_some() {
@@ -3409,6 +3445,7 @@ fn retire_claude_transcript_records_excluding(
         retirement.kept_overlap_records -= records;
         retirement.kept_overlap_hashes -= hashes;
     }
+    index.claude_request_census = owned_census;
     retirement
 }
 

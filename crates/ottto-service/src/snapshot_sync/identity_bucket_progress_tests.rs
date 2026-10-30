@@ -175,6 +175,8 @@ fn identity_budget_reserves_predecessor_retractions_without_mutating_local_patch
     );
 }
 
+/// [regress] a maximum valid identity ledger stays bounded and admits a small
+/// v2 upload; unchanged retained sessions must not be charged twice.
 #[test]
 fn maximum_accepted_ledger_progress_json_and_actual_load_peak_are_bounded() {
     let mut progress = progress();
@@ -207,5 +209,27 @@ fn maximum_accepted_ledger_progress_json_and_actual_load_peak_are_bounded() {
     eprintln!("E2_ACCEPTED_PROGRESS_JSON_BYTES={json_bytes} E2_ACCEPTED_PROGRESS_LOAD_PEAK_BYTES={load_peak}");
     assert!(json_bytes < 8 * 1024 * 1024, "json={json_bytes}");
     assert!(load_peak < 32 * 1024 * 1024, "peak={load_peak}");
+    let recovery = crate::snapshots::ProgressRecovery::synthetic(
+        &root.join("index.json"),
+        &progress.destination_namespace_hash,
+        0,
+    );
+    recovery
+        .admit_progress_bytes(serde_json::to_vec_pretty(&progress).unwrap().len() as u64)
+        .unwrap();
+    progress.ack_recovery = Some(Box::new(recovery));
+    let before = progress.clone();
+    let item = body();
+    progress
+        .admit_ack_custody(
+            std::slice::from_ref(&item),
+            &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
+            &|_| "d".repeat(64),
+        )
+        .unwrap();
+    assert_eq!(
+        progress, before,
+        "admission neither evicts accepted shares nor mutates custody"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
