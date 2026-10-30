@@ -618,14 +618,15 @@ fn e2_bound_trace_page(
     unhealthy: bool,
 ) -> (Vec<SnapshotItem>, crate::snapshot_sync::ClaudeLocalEvidenceStats) {
     claude_request_money::e2::with_enabled(|| {
-        let mut scan = scan_source_roots_with_test_limit(
-            SnapshotSource::ClaudeCode,
+        // Sidecar changes must select the root and child even when their
+        // transcript bytes are unchanged (notably malformed -> clean).
+        let mut scan = scan_source_roots_with_test_limit_and_claude_support(
             &[dir.to_path_buf()],
             index,
             "2026-08-02T07:10:00Z",
             7,
             100,
-            false,
+            support,
         )
         .unwrap();
         claude_request_identity::retain_root_accounts(
