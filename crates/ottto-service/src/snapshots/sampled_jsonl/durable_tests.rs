@@ -1341,7 +1341,7 @@ fn budget_bounds_hold() {
     // diagnostic set (512 full 440-byte nodes plus one retained root).
     assert_eq!(
         crate::snapshots::sampled_scan::durable_tail::STORES_RESIDENT_BOUND,
-        1_978_368 + (2 * MAX_RECORDS + 1) * 440
+        2_179_072 + (2 * MAX_RECORDS + 1) * 440
     );
     // Per write pass: at most MAX_BATCH records of at most RECORD_BYTES.
     assert_eq!(MAX_BATCH, 32);
@@ -1386,13 +1386,12 @@ fn codec_budget_receipt() {
 /// Decode all stored sections, excluding the caller's independent source
 /// binding check. This is the structural acceptance oracle for `verify`.
 fn structurally_decodes(body: &[u8]) -> bool {
-    [
-        SnapshotSource::ClaudeCode,
-        SnapshotSource::Codex,
-        SnapshotSource::Pi,
-    ]
-    .into_iter()
-    .any(|source| decode_body(body, source).is_ok())
+    // The generic (Claude/Codex) layout `verify` checks; Pi's section layout
+    // has its own verifier and is not part of this corpus.
+    let mut d = Dec::new(body);
+    CachedJsonlReduction::take(&mut d).is_ok()
+        && Rederive::take(&mut d).is_ok()
+        && d.finish().is_ok()
 }
 
 fn verified_without_allocation(body: &[u8]) -> Result<(), Corrupt> {
@@ -1659,6 +1658,8 @@ fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
         .unwrap()
         .write_all(b"{}\n")
         .unwrap();
+    // Since #870, audit debt alone never forces a Full on a checkpoint; an
+    // independently owed Full (here a scope change) must not touch the gate.
     let mut due = parser(&path, source);
     let mode = due
         .prepare_acquisition_with_reuse_gate(
@@ -1666,7 +1667,7 @@ fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
                 checkpoint: checkpoint.clone(),
                 state: state.clone(),
             }),
-            &scope(),
+            &Scope("durable-codec-test-other-scope".into()),
             Some(crate::transcript_acquisition::AuditDebt {
                 due_unix_seconds: NOW,
             }),
@@ -1674,7 +1675,7 @@ fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
             |_, _| panic!("an owed Full never spends or checks a Tail allowance"),
         )
         .unwrap();
-    assert_eq!(mode, ReadMode::Full(FullReason::AuditDue));
+    assert_eq!(mode, ReadMode::Full(FullReason::ScopeChanged));
     let mut limited = parser(&path, source);
     let calls = std::cell::Cell::new(0);
     let mode = limited

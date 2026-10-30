@@ -63,7 +63,7 @@ fn r7_every_key_map_node_fits_its_prepaid_charge() {
     );
     // One full u64 B-tree node/entry = 256 + 12*8 + 11*8 = 440B;
     // same tree_nodes accounting includes one retained root:
-    // 1,978,368 + (2*256 + 1)*440 = 2,204,088B. The extra 440B
+    // with three durable sources: 2,179,072 + (2*256 + 1)*440 = 2,404,792B. The extra 440B
     // root must also be paid even when the bounded set becomes empty.
     assert_eq!(
         crate::heap_layout_bound::tree_node_bytes::<u64, ()>(),
@@ -75,9 +75,9 @@ fn r7_every_key_map_node_fits_its_prepaid_charge() {
     );
     assert_eq!(
         STORES_RESIDENT_BOUND,
-        1_978_368 + STALE_PREDECESSOR_RESERVE_BYTES
+        2_179_072 + STALE_PREDECESSOR_RESERVE_BYTES
     );
-    assert_eq!(STORES_RESIDENT_BOUND, 2_204_088);
+    assert_eq!(STORES_RESIDENT_BOUND, 2_404_792);
     let full: BTreeSet<u64> = (0..STALE_PREDECESSOR_KEYS as u64).collect();
     // Check the prepaid heap itself; the set's inline owner already lives in
     // Stores. This arithmetic is portable and does not qualify a native layout.
