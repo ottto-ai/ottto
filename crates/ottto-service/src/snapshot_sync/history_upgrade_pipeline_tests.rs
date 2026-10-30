@@ -5686,7 +5686,7 @@ fn e2_production_contract_and_revision_share_one_paced_reread_behind_closed_fenc
 }
 
 #[test]
-#[ignore = "terminal-off ON-readiness: R4"]
+#[ignore = "terminal-off ON-readiness: P5"]
 fn terminal_off_on_e2_production_contract_and_revision_share_one_paced_reread_behind_closed_fence() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -6396,4 +6396,27 @@ fn terminal_off_held_index_rebuild_release_does_not_accept_history_twice() {
         assert_eq!(released.upload_requests, 0);
         assert!(released.uploaded.is_empty());
     });
+}
+
+#[test]
+fn terminal_off_history_upgrade_page_counts_local_reads_beyond_budget() {
+    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    let fixture = HistoryFixture::new("history-read-counter");
+    fixture.baseline();
+    fixture.corrupt_backfill_state();
+    let ((held, rows), budget) = (crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+        crate::snapshots::with_body_witness_adoption_page_budget(1, || {
+            crate::local_resource_diagnostics::capture(|| fixture.cycle("2026-08-02T09:00:00Z", HistoryCycle {
+                upload_context: "history-counter-context", ..HISTORY_REVISION_2
+            }))
+        })
+    }), 1);
+    assert_eq!(held.scan.scanned_file_count, 3);
+    assert_eq!(held.upload_requests, 0);
+    let pages: Vec<_> = rows.iter().filter_map(|row| row["counts"].get("history_upgrade_page")).collect();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0]["admitted_files"], 3);
+    assert_eq!(pages[0]["budget"], budget);
+    assert_eq!(pages[0]["extra_files"], 2, "all history reads beyond the budget are disclosed");
 }

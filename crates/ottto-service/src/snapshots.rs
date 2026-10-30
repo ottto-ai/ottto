@@ -31309,6 +31309,9 @@ impl OwnedSourceScan {
                         .terminal_dropped_usage_record_count
                         .saturating_add(census.terminal_dropped_usage_record_count);
                 }
+                if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+                    history_upgrade.emit_page_diagnostics();
+                }
                 if source == SnapshotSource::Codex {
                     // Count-only attribution of why Codex files were selected
                     // on this page. No path, session, or identifier is named.
@@ -32401,6 +32404,13 @@ impl OwnedSourceScan {
                         index.deny_claude_history_literal(&candidate);
                     }
                     HistoryDecision::NotOwed => {}
+                }
+                if source == SnapshotSource::ClaudeCode
+                    && claude_terminal_off()
+                    && decision == CandidateDecision::Parse
+                    && matches!(history, HistoryDecision::Owed | HistoryDecision::Held(_))
+                {
+                    history_upgrade.note_history_read();
                 }
             }
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {

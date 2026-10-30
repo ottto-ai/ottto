@@ -38,7 +38,7 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_a_re_owed_file_goes_back_through_the_gate", "r25-code-unclassified"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_e2_always_on_contract_reowes_no_uncaptured_history", "P5"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_e2_ok_unhealthy_root_holds_history_then_healthy_read_settles_reported_once", "history-adoption"),
-    ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_e2_production_contract_and_revision_share_one_paced_reread_behind_closed_fence", "R4"),
+    ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_e2_production_contract_and_revision_share_one_paced_reread_behind_closed_fence", "P5"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_e2_refused_twins_keep_prior_tuple_and_stay_owed_while_siblings_settle", "unclassified"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_e2_repaired_between_attachment_and_strict_read_stays_owed_until_next_page", "r25-code-unclassified"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_e2_side_call_census_deadline_holds_root_history_then_counts_side_call_once", "r25-code-unclassified"),
