@@ -431,3 +431,40 @@ objects reachable only from a prior root: a downgrade can lose that future
 restore option while preserving current-root correctness. This reservation
 does not implement retention, restore, an acquisition cause or a repair exit.
 The minimum-N/downgrade-stall release-note requirement above remains binding.
+
+## State-v2 ACK crash reconciliation
+
+The upload body and entity-ACK protocol stay unchanged. For an authenticated v2
+source, an owner-only `<index>.v2-ack-receipt` companion durably records the exact
+next upload-progress bytes before replacing the existing progress file. It binds
+the DB identity (including source and destination namespace), source generation,
+progress generation, and both predecessor and replacement digests. The progress
+file's format remains unchanged. OFF/v1 and Codex/Pi do not create companions.
+The diagnostic `upload_receipts` ring is bounded and truncated; it cannot authorize
+recovery or substitute for a missing exact receipt.
+
+For **receipt-first** crashes, replay the newest companion before applying any
+source-DB handoff. Only its exact predecessor or replacement is accepted; replay
+restores complete cache-head/refusal state as well as exact accepted body witnesses.
+For **DB-first** crashes, the committed `accepted.ack_handoff` retains the original
+exact-body cleanup obligation. Reconcile progress first, durably remove only matching
+ACKs, and then clear the DB handoff. A newer body receipt cannot be retired by an
+older body's handoff. An upload error creates no acceptance, and an index save error
+creates no retirement authority. Delivery is not claimed to be exactly once.
+
+Missing/unbound receipts, identity mismatches, source rollback, corrupted receipts
+and unexpected progress bytes hold the source without quarantine/reset. Counts-only
+`ack_recovery_hold` and `ack_receipt_reconciled` events expose refusal/replay. Receipt
+encoding is capped at 64 MiB; oversize state holds rather than evicting ACKs. Empty v2
+progress remains durable so a missing ledger cannot silently reopen old work.
+
+Before publication, the import owner must seal the proved original progress bytes
+with `ProgressRecovery::seal_import`; this operation does not infer ownership from a
+filename. Backup/recovery owners must use `RecoverySet::capture` in the consistent
+DB snapshot and protect the companion plus every exact `resume.checkpoint` reference.
+The descriptor binds DB identity/generation, the complete receipt digest, ordered
+reference keys/positions and exact value digests. Reconcile newer external receipts
+before restore/collection, and verify the descriptor before GC; any missing or
+mismatched member holds and is counted. These owner hooks do not enable conversion
+or implement backup orchestration. Companions contain private local state and share
+the source's backup, erasure and immediate-removal obligations.

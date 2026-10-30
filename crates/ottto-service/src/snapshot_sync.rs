@@ -1313,6 +1313,9 @@ mod upload_context_resend;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotUploadProgress {
     schema_version: u16,
+    /// V2-only authenticated companion; never serialized into the v1 ledger.
+    #[serde(skip)]
+    ack_recovery: Option<crate::snapshots::ProgressRecovery>,
     #[serde(default)]
     generation: u64,
     destination_namespace_hash: String,
@@ -1404,6 +1407,7 @@ impl SnapshotUploadProgress {
     ) -> Self {
         Self {
             schema_version: SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION,
+            ack_recovery: None,
             generation: 0,
             destination_namespace_hash,
             historical_replay_generation: None,
@@ -1435,12 +1439,31 @@ impl SnapshotUploadProgress {
         expected_destination_namespace_hash: &str,
         active_quarantine_witness: SnapshotQuarantineWitness,
     ) -> Result<Self> {
+        Self::load_with_recovery(
+            path,
+            expected_destination_namespace_hash,
+            active_quarantine_witness,
+            None,
+        )
+    }
+
+    fn load_with_recovery(
+        path: &Path,
+        expected_destination_namespace_hash: &str,
+        active_quarantine_witness: SnapshotQuarantineWitness,
+        ack_recovery: Option<crate::snapshots::ProgressRecovery>,
+    ) -> Result<Self> {
         let _lock = SnapshotProgressLock::acquire(path)?;
+        if let Some(recovery) = &ack_recovery {
+            recovery.recover(path)?;
+        }
         if !path.exists() {
-            return Ok(Self::new(
+            let mut progress = Self::new(
                 expected_destination_namespace_hash.to_string(),
                 active_quarantine_witness,
-            ));
+            );
+            progress.ack_recovery = ack_recovery;
+            return Ok(progress);
         }
         let parsed = std::fs::read(path)
             .context("read snapshot upload progress")
@@ -1526,6 +1549,9 @@ impl SnapshotUploadProgress {
                 progress
             }
             Ok(_) | Err(_) => {
+                if let Some(recovery) = &ack_recovery {
+                    recovery.invalid_progress()?;
+                }
                 quarantine_invalid_progress(path)?;
                 return Ok(Self::new(
                     expected_destination_namespace_hash.to_string(),
@@ -1547,6 +1573,7 @@ impl SnapshotUploadProgress {
                     }),
                 Some(&active_quarantine_witness),
             ) > 0;
+        progress.ack_recovery = ack_recovery;
         progress.active_quarantine_witness = Some(active_quarantine_witness);
         progress.active_quarantine_retries.clear();
         progress.active_reason_reoffers.clear();
@@ -2400,6 +2427,26 @@ impl SnapshotUploadProgress {
             .generation
             .checked_add(1)
             .ok_or_else(|| anyhow!("snapshot upload progress generation overflow"))?;
+        // Persist the exact accepted receipt before replacing progress. If the
+        // second write fails, startup replays this receipt before DB handoffs.
+        if let Some(recovery) = &self.ack_recovery {
+            let result = (|| -> Result<()> {
+                let previous = match std::fs::read(path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) if e.kind() == ErrorKind::NotFound => None,
+                    Err(e) => return Err(e.into()),
+                };
+                let next = serde_json::to_vec_pretty(&*self)?;
+                recovery.before_progress_save(previous.as_deref(), &next)?;
+                ottto_core::write_owner_only_file_atomic(path, &next)?;
+                sync_progress_parent(path)?;
+                Ok(())
+            })();
+            if result.is_err() {
+                self.generation = previous_generation;
+            }
+            return result;
+        }
         let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
         let mut file =
             std::fs::File::create(&temp_path).context("create snapshot upload progress temp")?;
@@ -2671,7 +2718,8 @@ impl SnapshotUploadProgress {
     }
 
     fn finish_cycle(&mut self, path: &Path) -> Result<()> {
-        if self.accepted_fingerprints.is_empty()
+        if self.ack_recovery.is_none()
+            && self.accepted_fingerprints.is_empty()
             && self.permanent_rejections.is_empty()
             && self.accepted_cache_states.is_empty()
             && self.accepted_cache_heads.is_empty()
@@ -3127,6 +3175,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         Err(error) => return Err(error).context("read snapshot progress for partial checkpoint"),
     };
     // These fields are runtime leases, not persisted settlement evidence.
+    durable.ack_recovery = progress.ack_recovery.clone();
     durable.active_quarantine_witness = progress.active_quarantine_witness.clone();
     durable.active_quarantine_retries = progress.active_quarantine_retries.clone();
     durable.active_reason_reoffers = progress.active_reason_reoffers.clone();
@@ -6251,14 +6300,29 @@ fn prepare_sync_source_inner(
     let legacy_upload_progress_path = snapshot_upload_progress_path(&v2_index_path);
     let upload_progress_path = snapshot_upload_progress_path(&index_path);
     adopt_legacy_checkpoint_file(&legacy_upload_progress_path, &upload_progress_path)?;
-    let mut upload_progress = SnapshotUploadProgress::load(
-        &upload_progress_path,
-        &upload_destination_namespace,
-        crate::snapshots::snapshot_quarantine_witness_for_context(source, &upload_context),
-    )?;
+    // Codex/Pi retain their existing load/side-effect order. Claude must
+    // authenticate v2 custody before progress containment can rename a file.
+    let legacy_progress = if source != SnapshotSource::ClaudeCode {
+        Some(SnapshotUploadProgress::load(
+            &upload_progress_path,
+            &upload_destination_namespace,
+            crate::snapshots::snapshot_quarantine_witness_for_context(source, &upload_context),
+        )?)
+    } else {
+        None
+    };
     let (mut index, load_origin) =
         ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
     index.require_persistence_available()?;
+    let mut upload_progress = match legacy_progress {
+        Some(progress) => progress,
+        None => SnapshotUploadProgress::load_with_recovery(
+            &upload_progress_path,
+            &upload_destination_namespace,
+            crate::snapshots::snapshot_quarantine_witness_for_context(source, &upload_context),
+            crate::snapshots::ProgressRecovery::for_index(&index, &index_path)?,
+        )?,
+    };
     upload_progress.recover_ack_retirement_handoff(
         &mut index,
         &index_path,
@@ -25147,7 +25211,7 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates, accepted_account_hashes);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, ack_recovery, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates, accepted_account_hashes);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 

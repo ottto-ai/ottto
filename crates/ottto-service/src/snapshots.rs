@@ -94322,3 +94322,6 @@ fn candidate_from_traversal_path_at(
         source, site, pending, census, now, days, files, None,
     )
 }
+
+// Opaque v2-only companion for the unchanged upload-progress store.
+pub(crate) use state_v2::ack::ProgressRecovery;
