@@ -74,7 +74,10 @@ impl Cache {
             }
         }
         let Some(key) = self.key.clone().or_else(|| generate_control_token().ok()) else {
-            return partial("recent_unavailable");
+            return Response {
+                cli_launchable: cli_launchable(provider),
+                ..partial("recent_unavailable")
+            };
         };
         self.key = Some(key.clone());
         let support = support.to_owned();
@@ -91,9 +94,12 @@ impl Cache {
                 deadline - Duration::from_millis(50),
             ));
         });
-        let response = receive
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or_else(|_| partial("recent_timeout"));
+        let response = Response {
+            cli_launchable: cli_launchable(provider),
+            ..receive
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|_| partial("recent_timeout"))
+        };
         self.saved = Some((
             Instant::now(),
             provider,
@@ -327,25 +333,29 @@ fn collect(
             .then_with(|| bt.cmp(at))
             .then_with(|| a.path.cmp(&b.path))
     });
-    let cli_launchable = launch_user().and_then(|user| {
-        provider.map(|provider| {
-            crate::command_env::interactive_cli_path(
-                if provider == Provider::Codex {
-                    "codex"
-                } else {
-                    "claude"
-                },
-                &user.home,
-            )
-            .is_some()
-        })
-    });
     Response {
         items: Some(items.into_iter().take(100).map(|(item, _)| item).collect()),
         partial: Some(partial_reason.is_some()),
         partial_reason: partial_reason.map(str::to_owned),
-        cli_launchable,
+        ..Default::default()
     }
+}
+
+/// Answered apart from the folder scan: a slow or unavailable history read must
+/// not hide the terminal actions, which only need the CLI itself.
+fn cli_launchable(provider: Option<Provider>) -> Option<bool> {
+    let user = launch_user()?;
+    provider.map(|provider| {
+        crate::command_env::interactive_cli_path(
+            if provider == Provider::Codex {
+                "codex"
+            } else {
+                "claude"
+            },
+            &user.home,
+        )
+        .is_some()
+    })
 }
 
 fn opaque_id(key: &str, path: &Path) -> String {
@@ -420,6 +430,27 @@ fn codex_folders(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn timed_out_folder_scan_still_answers_cli_launchable() {
+        let support = std::env::temp_dir().join(format!(
+            "recent-support-{}",
+            generate_control_token().unwrap()
+        ));
+        let mut cache = Cache::default();
+        let response = cache.get(Some(Provider::ClaudeCode), None, 10, &support);
+        assert_eq!(
+            response.cli_launchable,
+            cli_launchable(Some(Provider::ClaudeCode))
+        );
+        // The CLI answer must not depend on a completed scan.
+        let timed_out = Response {
+            cli_launchable: cli_launchable(Some(Provider::Codex)),
+            ..partial("recent_timeout")
+        };
+        assert_eq!(timed_out.partial_reason.as_deref(), Some("recent_timeout"));
+        assert_eq!(timed_out.cli_launchable.is_some(), launch_user().is_some());
+        assert_eq!(cli_launchable(None), None);
+    }
     #[test]
     fn folder_ids_are_opaque_and_process_key_bound() {
         assert_ne!(
