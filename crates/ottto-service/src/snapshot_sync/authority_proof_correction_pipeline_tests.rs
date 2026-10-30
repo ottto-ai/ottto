@@ -3577,7 +3577,9 @@ fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-f1-last", true);
     let (_, grant) = fixture.reach_grant();
-    let held = BTreeSet::from([apc_member_session(Some(APC_AGENTS[1]))]);
+    // Agent a's requests after the establishing generation changed its body,
+    // so its correction needs an exact ACK.
+    let held = BTreeSet::from([apc_member_session(Some(APC_AGENTS[0]))]);
     let (pages, release) =
         apc_f1_hold_then_release(&fixture, &grant, &held, &held, ApcUpload::Accept);
     let page = &pages[release];
@@ -3612,13 +3614,14 @@ fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
     );
 }
 
-/// F1 (review-942), with another member still owed: the released member's
-/// exact-ACK drain leaves the record, and the account-audit release clears
-/// its saved revision. It stays owed with its pre-drain pair beside the held
-/// member, and drains again as a no-op once the retry re-reads it.
+/// F1 (review-942), proven no-op, with another member still owed. Agent b's
+/// corrected body is its accepted body, so its release page no-op-drains it
+/// without an upload, and the account-audit release then clears its saved
+/// revision. It stays owed with its pre-drain pair beside the held root, and
+/// drains again as a no-op once the retry re-reads it.
 #[test]
 #[serial(source_manifests)]
-fn f1_released_account_hold_audit_clear_keeps_the_member_owed_beside_a_held_one() {
+fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_one() {
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
@@ -3638,13 +3641,29 @@ fn f1_released_account_hold_audit_clear_keeps_the_member_owed_beside_a_held_one(
     let page = &pages[release];
     let transition = ApcFixture::check(page, "release page");
     assert!(transition.granted.is_none() && !transition.failed);
-    let mut acked = BTreeSet::new();
+    let keys = ApcFixture::family_keys(&page.index);
+    let mut accepted = BTreeSet::new();
     for member in &released {
-        let (fingerprint, _) = page.offered_bodies.get(member).expect("offered");
-        assert!(page.uploaded.contains(fingerprint), "{member} is ACKed");
-        acked.insert(fingerprint.clone());
+        assert!(
+            page.captured_members().contains(member),
+            "{member}'s correction is captured"
+        );
+        assert!(
+            !page.offered_bodies.contains_key(member),
+            "{member} is not offered"
+        );
+        let entities = page.index.file_snapshot_fingerprints[&keys[member]].clone();
+        assert!(!entities.is_empty());
+        for fingerprint in &entities {
+            assert!(
+                page.before
+                    .accepted_snapshot_fingerprint_recorded(fingerprint),
+                "{member}'s body was accepted before the page: a no-op"
+            );
+        }
+        accepted.extend(entities);
     }
-    apc_f1_released_members_stay_owed(page, &grant, &released, "beside a held member");
+    apc_f1_released_members_stay_owed(page, &grant, &released, "no-op beside a held member");
     let (_, owed) = page
         .record()
         .and_then(|record| record.correction)
@@ -3655,7 +3674,7 @@ fn f1_released_account_hold_audit_clear_keeps_the_member_owed_beside_a_held_one(
         grant.hour + 3,
         &pages[release + 1..],
         &released,
-        &acked,
+        &accepted,
     );
     let last = ScanIndex::load(&fixture.index_path).expect("restart");
     let (_, owed) = last
@@ -3683,7 +3702,8 @@ fn f1_released_account_hold_audit_clear_keeps_a_permanent_refusal_drain_owed() {
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-f1-permanent", true);
     let (_, grant) = fixture.reach_grant();
-    let held = BTreeSet::from([apc_member_session(Some(APC_AGENTS[1]))]);
+    // Agent a's changed body is offered, so the server can refuse it.
+    let held = BTreeSet::from([apc_member_session(Some(APC_AGENTS[0]))]);
     let (pages, release) = apc_f1_hold_then_release(
         &fixture,
         &grant,
