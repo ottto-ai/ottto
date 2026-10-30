@@ -428,6 +428,7 @@ pub(super) const FIELDS: &[&str] = &[
     "upload_ack_retirement_handoff",
     "held_audit_progress",
     "claude_money_birth_store",
+    "claude_desktop_store_inventory", // Decoded and ignored; never serialized.
     "claude_copy_removals",
 ];
 
@@ -1621,12 +1622,18 @@ impl<R: BufRead + Seek> Decoder<R> {
                     self.family_spans.insert(name, value);
                 }
                 if !seen.insert(name) {
+                    if name == "claude_desktop_store_inventory" && pass == Pass::Full {
+                        with_claude_absence_counters(|counts| {
+                            counts.tombstone_decode_drops =
+                                counts.tombstone_decode_drops.saturating_add(1);
+                        });
+                    }
                     if name == "claude_request_census" {
                         index.claude_request_census = ClaudeRequestCensus::default();
                     } else if name == "claude_request_census_shadow" {
                         index.claude_request_census_shadow =
                             ClaudeRequestCensusShadowState::default();
-                    } else if name != "reread_guard" {
+                    } else if !matches!(name, "reread_guard" | "claude_desktop_store_inventory") {
                         return Err(Error::Refused("duplicate index field"));
                     }
                 } else {
@@ -1641,6 +1648,24 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "schema_version" => index.schema_version = self.typed(value)?,
                         "generation" => index.generation = self.typed(value)?,
                         "reread_guard" => {} // TOMBSTONE: decode-and-drop.
+                        "claude_desktop_store_inventory" => {
+                            // No new refusal: this key was unknown to the last
+                            // release. A digest is 64 bytes plus its quotes, so
+                            // nothing wider is buffered; a bad value is dropped.
+                            let inventory: Option<String> = if value.len > 66 {
+                                Some(String::new())
+                            } else {
+                                self.history_scalar(value, Some(String::new()))?
+                            };
+                            if inventory.as_ref().is_some_and(|digest| digest.len() != 64) {
+                                with_claude_absence_counters(|counts| {
+                                    counts.tombstone_decode_drops =
+                                        counts.tombstone_decode_drops.saturating_add(1);
+                                });
+                            } else {
+                                index.claude_desktop_store_inventory = inventory;
+                            }
+                        }
                         "upload_ack_retirement_handoff" => {
                             // Damaged cleanup authority delays retirement; it must
                             // never discard identity custody or pause ingestion.
