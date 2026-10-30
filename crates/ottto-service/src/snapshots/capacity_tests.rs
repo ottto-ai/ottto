@@ -86,3 +86,20 @@ fn capacity_debt_carries_through_a_subset_that_withholds_delivery_entries() {
     assert_eq!(subset.tail_capacity_debt.get("synthetic"), Some(&99));
     assert!(subset.files.is_empty());
 }
+
+#[test]
+fn capacity_full_defers_to_each_existing_admission_owner() {
+    // A Claude resource read paid inside restore; a Codex selection-clear
+    // read pays at its later start. Neither can be charged by capacity too.
+    assert_eq!(capacity_full_phase(true, true, false, false, None), None);
+    assert_eq!(capacity_full_phase(true, false, true, false, None), None);
+    assert_eq!(capacity_full_phase(true, false, false, true, None), None);
+    assert_eq!(
+        capacity_full_phase(true, false, false, false, None),
+        Some("capacity")
+    );
+    assert_eq!(
+        capacity_full_phase(false, false, false, false, Some("cache_transit")),
+        Some("cache_transit")
+    );
+}

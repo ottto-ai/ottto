@@ -34364,6 +34364,14 @@ impl OwnedSourceScan {
                                         }
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Miss(class) => {
+                                        // Non-Codex resource recovery already starts its
+                                        // shared pace inside restore_resource_pending.
+                                        if source != SnapshotSource::Codex
+                                            && index.tail_capacity_debt.contains_key(&key)
+                                            && matches!(class, sampled_scan::durable_tail::MissClass::Resource(_))
+                                        {
+                                            paced_full_granted = true;
+                                        }
                                         if source == SnapshotSource::Codex {
                                             if let sampled_scan::durable_tail::MissClass::Resource(phase) = class {
                                                 resource_full_pending = Some(phase);
@@ -35063,15 +35071,16 @@ impl OwnedSourceScan {
                     }
                 }
             }
+            // There is one shared admission for this actual Full. Earlier
+            // grants and later structural/stale-selection owners take priority.
             #[cfg(unix)]
-            if capacity_growth {
-                resource_full_pending = Some("capacity");
-            }
-            // Retail/stale and active-bound paths already own this read's pace.
-            // Capacity and other resource labels cannot spend it a second time.
-            #[cfg(unix)]
-            let resource_full_pending =
-                resource_full_pending.filter(|_| !paced_full_granted && !active_bound_degraded);
+            let resource_full_pending = capacity_full_phase(
+                capacity_growth,
+                paced_full_granted,
+                active_bound_degraded,
+                stale_selection_pending,
+                resource_full_pending,
+            );
             if let (Some(phase), Some(context)) = (resource_full_pending, sampling.as_ref()) {
                 let key = local_index_key(&active.candidate.path);
                 if !context.cache.start_resource_full(
@@ -96370,6 +96379,24 @@ impl ScanIndex {
                 *root = root.unavailable();
             }
         }
+    }
+}
+
+/// Existing Full owners take priority over capacity's fallback label.
+#[cfg(unix)]
+fn capacity_full_phase(
+    capacity_growth: bool,
+    paid: bool,
+    active_bound: bool,
+    stale_selection: bool,
+    resource: Option<&'static str>,
+) -> Option<&'static str> {
+    if paid || active_bound || stale_selection {
+        None
+    } else if capacity_growth {
+        Some("capacity")
+    } else {
+        resource
     }
 }
 

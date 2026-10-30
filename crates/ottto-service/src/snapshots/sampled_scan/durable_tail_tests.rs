@@ -403,6 +403,13 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
             .unwrap()
             .write_all(suffix.as_bytes())
             .unwrap();
+        if phase == "cache" {
+            // A resource grant already spent Full pacing; capacity must not
+            // reject the same production acquisition at the input boundary.
+            index
+                .tail_capacity_debt
+                .insert(key.clone(), index.files[&key].size_bytes);
+        }
         let before = cache.durable_counters(source).unwrap();
         let old_bytes = (retail_bytes(source, 0), retail_bytes(source, 1));
         store::active::set_active_budget_for_test(Some(limit));
