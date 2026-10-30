@@ -2082,6 +2082,8 @@ fn other_evidence_defects_and_other_reasons_are_not_candidates() {
 fn the_child_finalize_row_is_counts_under_fixed_names() {
     let (mut index, keys, _) = child_candidate();
     let other = add_family(&mut index, "dir-c", 3, 1);
+    // `add_family` rebinds every family, so drop the candidate's revisions again.
+    unfinalize_children(&mut index, &root_id(1));
     unfinalize_children(&mut index, &root_id(3));
     index.claude_account_family_witnesses.insert(
         root_id(3),
