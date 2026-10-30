@@ -372,6 +372,21 @@ impl ApcFixture {
         Self::append(&self.sidecar_path("claude-code-trace-ownership"), &trace);
     }
 
+    /// A sidecar write that adds no evidence: only the root's API sidecar
+    /// stat moves, and with it every family member's revision.
+    fn touch_api_sidecar(&self) {
+        let file = std::fs::File::options()
+            .append(true)
+            .open(self.sidecar_path("claude-code-effort"))
+            .expect("open the API sidecar");
+        let modified = file
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .expect("API sidecar mtime");
+        file.set_modified(modified + Duration::from_secs(60))
+            .expect("touch the API sidecar");
+    }
+
     fn corrupt_api_sidecar(&self) {
         Self::append(&self.sidecar_path("claude-code-effort"), "{\"truncated\n");
     }
@@ -748,7 +763,7 @@ impl ApcFixture {
         // Production order: exact upload progress is durable before this seam,
         // and the following save commits both body state and correction
         // progress, or neither.
-        index.settle_claude_proof_corrections(
+        let body_drains = index.settle_claude_proof_corrections(
             &committed_index,
             &candidates,
             &progress.accepted_fingerprints,
@@ -759,7 +774,7 @@ impl ApcFixture {
             progress
                 .save(&self.progress_path)
                 .expect("persist upload progress");
-            checkpoint_partial_snapshot_index(
+            checkpoint_partial_snapshot_index_with_audit_release(
                 &index,
                 &committed_index,
                 &progress,
@@ -769,6 +784,11 @@ impl ApcFixture {
                 &self.index_path,
                 &self.progress_path,
                 || Ok(()),
+                None,
+                None,
+                None,
+                None,
+                body_drains,
             )
             .expect("checkpoint shed page");
             if !persist_refusal {
@@ -806,7 +826,7 @@ impl ApcFixture {
         };
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
-        let fully_settled = settle_upload_corrections_after_selection(
+        let mut fully_settled = settle_upload_corrections_after_selection(
             &mut index,
             &scan,
             &committed_index,
@@ -815,6 +835,9 @@ impl ApcFixture {
             &cutoff_candidates,
             settlement.fully_settled,
         );
+        if index.restore_unselected_claude_proof_body_drains(body_drains) {
+            fully_settled = false;
+        }
         let census_complete = scan.census_complete;
         settle_context_curve_replay_state(
             &mut index,
@@ -3097,4 +3120,225 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
             "nothing is offered again"
         );
     }
+}
+
+/// R2 seam pages: checks every page and returns each owed member that was
+/// captured at a moved revision with its accepted body unchanged (a no-op),
+/// was not offered, and whose committed entry the page's save kept. Each
+/// stays owed, and the saved record names the saved file's revision.
+fn apc_r2_reverted(pages: &[ApcPage], label: &str) -> BTreeSet<String> {
+    let mut reverted = BTreeSet::new();
+    for (number, page) in pages.iter().enumerate() {
+        let label = format!("{label} page {number}");
+        let transition = ApcFixture::check(page, &label);
+        assert!(transition.granted.is_none(), "{label}: no fresh grant");
+        assert!(!transition.failed, "{label}: no failure");
+        assert!(transition.acked.is_empty(), "{label}: nothing was ACKed");
+        let Some((_, owed_before)) = page.record_before().and_then(|record| record.correction)
+        else {
+            continue;
+        };
+        let keys = ApcFixture::family_keys(&page.before);
+        for candidate in &page.candidates {
+            let member = candidate.member_for_test();
+            let Some(key) = keys.get(member) else {
+                continue;
+            };
+            let committed = &page.before.files[key].source_file_fingerprint;
+            let offered = page
+                .offered_bodies
+                .get(member)
+                .is_some_and(|(fingerprint, _)| page.offered.contains(fingerprint));
+            let unchanged =
+                page.before
+                    .file_snapshot_fingerprints
+                    .get(key)
+                    .is_some_and(|entities| {
+                        !entities.is_empty()
+                            && entities.iter().all(|fingerprint| {
+                                page.before
+                                    .accepted_snapshot_fingerprint_recorded(fingerprint)
+                            })
+                    });
+            if candidate.revision_for_test() == committed
+                || offered
+                || !unchanged
+                || !owed_before.contains(member)
+                || page.index.files[key].source_file_fingerprint != *committed
+            {
+                continue;
+            }
+            let record = page.record().expect("the record is kept");
+            let (_, owed) = record.correction.clone().expect("still owed");
+            assert!(
+                owed.contains(member),
+                "{label}: {member}'s no-op at an unselected revision stays owed"
+            );
+            assert_eq!(
+                record.member_source_file_fingerprints.get(member),
+                Some(committed),
+                "{label}: {member}'s saved record names the saved file's revision"
+            );
+            reverted.insert(member.to_string());
+        }
+    }
+    reverted
+}
+
+/// The clean generation after an R2 page: every reverted member re-drains as
+/// the same no-op at its current, saved revision (`check` asserts the pair),
+/// its exact accepted body (tokens and cost) is never re-uploaded or changed,
+/// and the family is re-read at most once.
+fn apc_r2_redrain(
+    fixture: &ApcFixture,
+    hour: u32,
+    reverted: &BTreeSet<String>,
+    entities: &BTreeMap<String, BTreeSet<String>>,
+) {
+    let family = apc_family_sessions();
+    let pages = fixture.generation(hour, |_| ApcUpload::Accept);
+    let mut noop = BTreeSet::new();
+    let mut family_parses = 0;
+    for (number, page) in pages.iter().enumerate() {
+        let label = format!("re-drain page {number}");
+        let transition = ApcFixture::check(page, &label);
+        assert!(transition.granted.is_none(), "{label}: no fresh grant");
+        assert!(!transition.failed, "{label}: no failure");
+        noop.extend(transition.noop);
+        family_parses += page.parsed.intersection(&family).count();
+        for member in reverted {
+            assert!(
+                page.uploaded.is_disjoint(&entities[member]),
+                "{label}: {member}'s accepted body is not uploaded again"
+            );
+        }
+    }
+    assert!(
+        reverted.is_subset(&noop),
+        "every reverted member re-drains as a no-op: reverted {reverted:?} no-op {noop:?}"
+    );
+    assert!(
+        family_parses <= family.len(),
+        "the family is re-read at most once: {family_parses} member parses"
+    );
+    let last = pages.last().expect("terminal page");
+    let current = ApcFixture::family_entities(&last.index);
+    for member in reverted {
+        assert_eq!(
+            current[member], entities[member],
+            "{member}: the same exact body, so tokens and cost are unchanged"
+        );
+        for fingerprint in &entities[member] {
+            assert!(last
+                .index
+                .accepted_snapshot_fingerprint_recorded(fingerprint));
+        }
+    }
+}
+
+/// R2 on main at the production default, shed seam. A write to the root's
+/// API sidecar that adds no evidence moves every member's revision with no
+/// body or proof change. On the next shed page the owed members with
+/// unchanged accepted bodies no-op-drain on the working index, and the
+/// partial checkpoint keeps their committed entries: each stays owed with its
+/// pre-page pair, through restart, with proof, counter and deadline unchanged.
+/// The next clean generation re-drains each at its current revision.
+#[test]
+#[serial(source_manifests)]
+// A shed page records RatelimitBackoff in the shared client_report counters.
+#[serial(client_report)]
+fn r2_sidecar_only_revision_move_then_a_shed_page_keeps_no_op_members_owed() {
+    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = ApcFixture::new("claude-authority-proof-correction-r2-shed", false);
+    let (_, grant) = fixture.reach_grant();
+    let entities = ApcFixture::family_entities(
+        &ScanIndex::load(&fixture.index_path).expect("load the granted index"),
+    );
+    fixture.touch_api_sidecar();
+    let pages = fixture.generation(grant.hour + 1, |_| ApcUpload::Shed);
+    assert!(pages.iter().any(|page| page.shed), "a page shed");
+    let reverted = apc_r2_reverted(&pages, "shed");
+    assert!(
+        !reverted.is_empty(),
+        "a no-op drain at a moved revision met a kept committed entry"
+    );
+    let restarted = ScanIndex::load(&fixture.index_path).expect("restart after the shed");
+    let record = restarted
+        .claude_authority_record_for_test(APC_ROOT)
+        .expect("the record survives the shed and the restart");
+    let (proof, owed) = record.correction.clone().expect("the correction is owed");
+    assert_eq!(proof, grant.proof);
+    assert!(reverted.is_subset(&owed), "the correction is not lost");
+    let keys = ApcFixture::family_keys(&restarted);
+    for member in &reverted {
+        assert_eq!(
+            record.member_source_file_fingerprints.get(member),
+            Some(&restarted.files[&keys[member]].source_file_fingerprint),
+            "{member}: the restarted record names the saved file's revision"
+        );
+    }
+    assert_eq!(
+        record.failed_reconstruction_count,
+        grant.record.failed_reconstruction_count
+    );
+    assert_eq!(
+        record.retry_after_unix_seconds,
+        grant.record.retry_after_unix_seconds
+    );
+    apc_r2_redrain(&fixture, grant.hour + 2, &reverted, &entities);
+}
+
+/// R2 on main at the production default, held seam: the same sidecar-only
+/// revision move, then a Deferred page that holds an account-deferred owed
+/// member. The finish selection keeps the committed entries of the unsettled
+/// keys, so the no-op-drained members stay owed with their pre-page pairs;
+/// the next clean generation re-drains them at their current revisions.
+#[test]
+#[serial(source_manifests)]
+#[serial(client_report)]
+fn r2_sidecar_only_revision_move_then_a_held_page_keeps_no_op_members_owed() {
+    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
+    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = ApcFixture::new("claude-authority-proof-correction-r2-held", true);
+    let (_, grant) = fixture.reach_grant();
+    let held_member = apc_member_session(Some(APC_AGENTS[1]));
+    assert!(grant.owed.contains(&held_member), "{:?}", grant.owed);
+    let entities = ApcFixture::family_entities(
+        &ScanIndex::load(&fixture.index_path).expect("load the granted index"),
+    );
+    fixture
+        .withheld_owners
+        .borrow_mut()
+        .insert(held_member.clone());
+    fixture.touch_api_sidecar();
+    let pages = fixture.generation(grant.hour + 1, |_| ApcUpload::RetryableRejection);
+    assert!(
+        pages
+            .iter()
+            .any(|page| !page.shed && page.held_sessions.contains(&held_member)),
+        "a settled page held the withheld member"
+    );
+    let reverted = apc_r2_reverted(&pages, "held");
+    assert!(
+        !reverted.is_empty(),
+        "a no-op drain at a moved revision met a kept committed entry"
+    );
+    assert!(
+        !reverted.contains(&held_member),
+        "a held member never drains"
+    );
+    let restarted = ScanIndex::load(&fixture.index_path).expect("restart after the held page");
+    let (proof, owed) = restarted
+        .claude_authority_record_for_test(APC_ROOT)
+        .and_then(|record| record.correction)
+        .expect("the correction is owed");
+    assert_eq!(proof, grant.proof);
+    assert!(reverted.is_subset(&owed), "the correction is not lost");
+    fixture.withheld_owners.borrow_mut().clear();
+    apc_r2_redrain(&fixture, grant.hour + 2, &reverted, &entities);
 }
