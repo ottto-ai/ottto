@@ -355,8 +355,11 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             return Ok(());
         }
         let result = (|| -> Result<KindCx> {
-            if let Some(original) = &state.original {
+            if let Some(original) = &mut state.original {
                 original.unchanged()?;
+                // Progress locking belongs to the actual conversion attempt,
+                // never the read-only inventory or a paused conversion.
+                original.capture_progress(path)?;
             }
             telemetry::event(
                 "orphan_removed",
@@ -364,11 +367,16 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             );
             let mut random = [0_u8; 16];
             std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+            let generation = mapper.import_generation(index)?;
             let identity = Identity {
                 format: FORMAT,
                 db_id: random.iter().map(|b| format!("{b:02x}")).collect(),
                 binding,
-                fence_generation: index.generation,
+                fence_generation: generation,
+            };
+            let identity = match &state.original {
+                Some(original) => original.retry_identity(identity)?,
+                None => identity,
             };
             preserve_baseline(path, state.original.as_ref())?;
             let import = fence::sibling(path, ".v2.sqlite.import");
@@ -377,14 +385,15 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             db.reference_extractor(M::references);
             db.control("identity", &identity)?;
             db.control("generation", &index.generation)?;
-            let cx = mapper.populate_original(&mut db, index, state.original.as_ref())?;
-            mapper.verify(&mut db, index)?;
-            db.finish_import()?;
-            fence::boundary(fence::Boundary::ImportFinished)?;
+            let cx = mapper.import_graph(&mut db, index, state.original.as_ref())?;
             if let Some(original) = &state.original {
                 original.unchanged()?;
+                original.publish_import(path, &identity, db, &mut state.latched)?;
+            } else {
+                db.finish_import()?;
+                fence::boundary(fence::Boundary::ImportFinished)?;
+                fence::publish(path, &identity, &mut state.latched)?;
             }
-            fence::publish(path, &identity, &mut state.latched)?;
             Ok(cx)
         })();
         let cx = match result {
@@ -409,6 +418,11 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
         db.reference_extractor(M::references);
         db.prime_headers()?;
         let stamp = db.stamp()?;
+        ensure!(
+            stamp.0 == mapper.import_generation(index)?,
+            Hold::DbUnavailable
+        );
+        index.generation = stamp.0;
         index.persistence_v2 = Some(Arc::new(Runtime {
             active: true,
             session: Mutex::new(Some(Session {
@@ -722,6 +736,11 @@ fn erasure_inventory(path: &Path) -> Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
+        if class == "ack_receipt_inventory" {
+            let (failed_count, failed_bytes) = super::ack::failed_import_inventory(path)?;
+            count = count.saturating_add(failed_count);
+            bytes = bytes.saturating_add(failed_bytes);
+        }
         telemetry::event(
             class,
             &serde_json::json!({"count":count,"bytes":bytes,"bounded":bounded}),
@@ -803,6 +822,7 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
             Err(e) => return Err(e.into()),
         }
     }
+    super::ack::erase_failed_imports(path)?;
     super::super::sync_checkpoint_parent(path)?;
     let records = crate::durable_tail_store::store_dir_for_index(path);
     match fs::symlink_metadata(&records) {

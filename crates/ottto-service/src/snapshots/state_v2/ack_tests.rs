@@ -206,3 +206,71 @@ fn post_commit_cleanup_receipt_binds_latest_db_generation_and_refuses_rollback()
     assert!(binding.recover(&path).is_err());
     assert_eq!(std::fs::read(&path).unwrap(), cleaned);
 }
+
+#[test]
+fn obsolete_unpublished_seal_preserves_custody_then_retries_after_v1_advances() {
+    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-obsolete-import");
+    let parent = scratch.join("a".repeat(64));
+    std::fs::create_dir(&parent).unwrap();
+    let index = parent.join("claude_code-synthetic-scan-index.json");
+    let path = parent.join("claude_code-synthetic-scan-index-upload-progress.json");
+    let progress = |generation| {
+        serde_json::to_vec(&serde_json::json!({"schema_version":3,
+        "destination_namespace_hash":"a".repeat(64),"generation":generation}))
+        .unwrap()
+    };
+    let old = progress(1);
+    write(&path, &old);
+    let previous = ProgressRecovery::synthetic(&index, &"a".repeat(64), 1);
+    let mut identity = previous.scope.identity.clone();
+    identity.fence_generation = 1;
+    ProgressRecovery::seal_import(identity.clone(), 1, &index, Some(&old)).unwrap();
+    let companion = fence::sibling(&index, ".v2-ack-receipt");
+    let old_seal = std::fs::read(&companion).unwrap();
+    // V1 collection continues after a pre-fence failure and advances progress.
+    write(&path, &progress(2));
+    let original = OriginalProgress::capture(&index).unwrap();
+    identity.fence_generation = 2;
+    identity.db_id = "new-attempt".into();
+    assert_eq!(original.retry_identity(identity.clone()).unwrap(), identity);
+    assert!(!companion.exists());
+    let archived = failed_imports(&index).unwrap();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(std::fs::read(&archived[0]).unwrap(), old_seal);
+    // Restart with the predecessor archive but no new seal remains retryable.
+    let resumed = OriginalProgress::capture(&index).unwrap();
+    assert_eq!(resumed.retry_identity(identity.clone()).unwrap(), identity);
+    let mut db = sqlite::Sqlite::create_import(&scratch.join("retry.v2.sqlite.import")).unwrap();
+    db.control("identity", &identity).unwrap();
+    db.control("generation", &2_u64).unwrap();
+    resumed
+        .seal_and_capture(&index, &identity, &mut db)
+        .unwrap();
+    assert!(failed_imports(&index).unwrap().is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), progress(2));
+    let sealed = std::fs::read(&companion).unwrap();
+    write(&path, &progress(3));
+    let newest = OriginalProgress::capture(&index).unwrap();
+    identity.fence_generation = 3;
+    // Any final-DB evidence forbids treating the existing seal as unpublished.
+    write(&fence::sibling(&index, ".v2.sqlite"), b"published-evidence");
+    assert!(newest.retry_identity(identity).is_err());
+    assert_eq!(std::fs::read(&companion).unwrap(), sealed);
+}
+#[test]
+fn interrupted_predecessor_copy_retries_without_losing_exact_companion() {
+    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-import-copy-retry");
+    let index = scratch.join("index");
+    let companion = fence::sibling(&index, ".v2-ack-receipt");
+    let original = b"exact-owned-companion";
+    write(&companion, original);
+    let suffix: String = digest(original)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let partial = fence::sibling(&index, &format!(".v2-ack-receipt.failed-import-{suffix}"));
+    write(&partial, &original[..5]);
+    preserve_failed_import(&index, &companion, original).unwrap();
+    assert_eq!(std::fs::read(&partial).unwrap(), original);
+    assert!(!companion.exists());
+}

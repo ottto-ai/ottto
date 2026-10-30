@@ -110,6 +110,19 @@ pub(super) trait Mapper {
         let _ = original;
         self.populate_context(store, index)
     }
+    fn import_generation(&self, index: &ScanIndex) -> Result<u64> {
+        Ok(index.generation)
+    }
+    fn import_graph<S: Store>(
+        &self,
+        store: &mut S,
+        index: &ScanIndex,
+        original: Option<&Original>,
+    ) -> Result<KindCx> {
+        let cx = self.populate_original(store, index, original)?;
+        self.verify(store, index)?;
+        Ok(cx)
+    }
     // Proof mismatch/oversize must return a typed Pause; engine/IO failures
     // remain transient. The framework never guesses from provider text.
     fn verify<S: Store>(&self, store: &mut S, index: &ScanIndex) -> Result<()>;
@@ -165,6 +178,37 @@ impl Mapper for ClaudeMapper {
     fn verify<S: Store>(&self, _: &mut S, _: &ScanIndex) -> Result<()> {
         bail!(Pause::PublicationPending)
     }
+    fn import_generation(&self, index: &ScanIndex) -> Result<u64> {
+        index
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| Pause::Oversize.into())
+    }
+    fn import_graph<S: Store>(
+        &self,
+        store: &mut S,
+        index: &ScanIndex,
+        original: Option<&Original>,
+    ) -> Result<KindCx> {
+        let original = original.ok_or(Pause::Mismatch)?;
+        original.unchanged()?;
+        let mut tx = store.begin(TxnMode::Write)?;
+        let identity = identity(&mut tx)?;
+        let generation = self.import_generation(index)?;
+        anyhow::ensure!(identity.fence_generation == generation, Pause::Mismatch);
+        let mut cx = KindCx::default();
+        cx.binding = Some(identity.binding.clone());
+        cx.presence = original.presence.clone();
+        kinds::populate(index, &mut tx, &mut cx)?;
+        anyhow::ensure!(
+            tx.commit(index.generation, generation) == DurableCommitOutcome::Committed(generation),
+            Pause::Mismatch
+        );
+        // A COMMIT advanced control.generation; the proof must compare the
+        // normalized G graph against that one deliberate G+1 control change.
+        let mut tx = store.begin(TxnMode::Read)?;
+        verify_normalized_at(&mut tx, index, original, identity.binding, generation)
+    }
     fn hydrate<S: Store>(&self, store: &mut S) -> Result<ScanIndex> {
         self.hydrate_context(store).map(|(index, _)| index)
     }
@@ -183,12 +227,23 @@ impl Mapper for ClaudeMapper {
         );
         kinds::hydrate_txn(&mut tx, identity.binding)
     }
-    fn merge_cas<T: Transaction>(&self, _: &mut T, _: &mut ScanIndex) -> Result<()> {
-        bail!(Pause::PublicationPending)
+    fn merge_cas<T: Transaction>(&self, tx: &mut T, index: &mut ScanIndex) -> Result<()> {
+        kinds_misc::merge_cas(tx, index)?;
+        kinds_files::merge_growth_cas(tx, index)
     }
     fn delta<T: Transaction>(&self, _: &mut T, _: &ScanIndex) -> Result<()> {
         bail!(Pause::PublicationPending)
     }
+}
+
+fn identity(tx: &mut dyn Transaction) -> Result<Identity> {
+    let h = tx
+        .get(&RowKey::Meta("identity".into()))?
+        .ok_or(Hold::ForeignBinding)?;
+    anyhow::ensure!(h.len <= CONTROL_BYTES, Hold::ForeignBinding);
+    let mut bytes = Vec::new();
+    tx.read_value(&h, &mut bytes)?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 #[cfg(test)]
@@ -224,6 +279,7 @@ mod tests {
 /// Kept private; filenames, commitments and namespace bindings are not telemetry.
 #[derive(Default, Debug)]
 pub(super) struct Original {
+    progress: Option<super::ack::OriginalProgress>,
     pub(super) presence: std::collections::BTreeMap<String, bool>,
     files: Vec<OriginalFile>,
     missing: Option<std::path::PathBuf>,
@@ -783,6 +839,60 @@ impl Original {
         result.unchanged()?;
         Ok(result)
     }
+    pub(super) fn capture_progress(&mut self, path: &Path) -> Result<()> {
+        self.progress = Some(super::ack::OriginalProgress::capture(path)?);
+        Ok(())
+    }
+    pub(super) fn retry_identity(&self, proposed: Identity) -> Result<Identity> {
+        self.progress
+            .as_ref()
+            .ok_or(Pause::Mismatch)?
+            .retry_identity(proposed)
+    }
+    #[cfg(test)]
+    pub(super) fn seal_progress<S: Store>(
+        &self,
+        path: &Path,
+        identity: &Identity,
+        store: &mut S,
+    ) -> Result<super::ack::RecoverySet> {
+        self.verify_baseline(path)?;
+        self.progress
+            .as_ref()
+            .ok_or(Pause::Mismatch)?
+            .seal_and_capture(path, identity, store)
+    }
+    pub(super) fn publish_import(
+        &self,
+        path: &Path,
+        identity: &Identity,
+        db: sqlite::Sqlite,
+        latched: &mut bool,
+    ) -> Result<()> {
+        self.verify_baseline(path)?;
+        self.progress
+            .as_ref()
+            .ok_or(Pause::Mismatch)?
+            .with_sealed_import(path, identity, db, |db, _recovery| {
+                db.finish_import()?;
+                fence::boundary(fence::Boundary::ImportFinished)?;
+                self.unchanged()?;
+                fence::publish(path, identity, latched)
+            })
+    }
+    fn verify_baseline(&self, path: &Path) -> Result<()> {
+        for (n, source) in self.files.iter().enumerate() {
+            let target = if n == 0 {
+                fence::sibling(path, ".v1-readonly")
+            } else {
+                fence::sibling(path, ".v1-readonly.shards")
+                    .join(source.path.file_name().ok_or(Pause::Mismatch)?)
+            };
+            let mut file = original_open(&target)?;
+            anyhow::ensure!(source.digest == original_hash(&mut file)?, Pause::Mismatch);
+        }
+        Ok(())
+    }
     pub(super) fn unchanged(&self) -> Result<()> {
         if let Some(path) = &self.missing {
             anyhow::ensure!(
@@ -842,8 +952,18 @@ fn verify_normalized(
     original: &Original,
     binding: super::super::scan_index_persistence::Binding,
 ) -> Result<KindCx> {
+    verify_normalized_at(tx, index, original, binding, index.generation)
+}
+fn verify_normalized_at(
+    tx: &mut dyn Transaction,
+    index: &ScanIndex,
+    original: &Original,
+    binding: super::super::scan_index_persistence::Binding,
+    generation: u64,
+) -> Result<KindCx> {
     let mut proof = ReadBack {
         inner: tx,
+        generation,
         records: 0,
         refs: std::collections::BTreeMap::new(),
     };
@@ -895,6 +1015,7 @@ fn verify_normalized(
 }
 struct ReadBack<'a> {
     inner: &'a mut dyn Transaction,
+    generation: u64,
     records: u64,
     refs: std::collections::BTreeMap<RowKey, u64>,
 }
@@ -909,10 +1030,16 @@ impl Transaction for ReadBack<'_> {
     }
     fn put(&mut self, row: RowInput<'_>) -> Result<Header> {
         let h = self.inner.get(row.key)?.ok_or(Pause::Mismatch)?;
+        let generation = ControlJson(&self.generation);
+        let value = if row.key == &RowKey::Meta("generation".into()) {
+            &generation as &dyn Value
+        } else {
+            row.value
+        };
         anyhow::ensure!(
             h.value_version == row.value_version
                 && &h.fixed == row.fixed
-                && self.inner.value_matches(&h, row.value)?,
+                && self.inner.value_matches(&h, value)?,
             Pause::Mismatch
         );
         if matches!(row.key, RowKey::Record { .. }) {
@@ -936,6 +1063,10 @@ impl Transaction for ReadBack<'_> {
     }
     fn adjust_refs(&mut self, key: &RowKey, delta: i64) -> Result<u64> {
         anyhow::ensure!(delta == 1, Pause::Mismatch);
+        anyhow::ensure!(
+            self.refs.contains_key(key) || self.refs.len() < 8 * 1024 * 1024 / 128,
+            Pause::Oversize
+        );
         let count = self.refs.entry(key.clone()).or_default();
         *count = count.checked_add(1).ok_or(Pause::Oversize)?;
         Ok(*count)
@@ -1034,6 +1165,168 @@ mod application_cases {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn composed_import_advances_once_and_seals_owned_progress_before_final_path_exists() {
+        for generation in [0_u64, 41] {
+            let c = Corpus::new();
+            let index = ScanIndex {
+                generation,
+                ..Default::default()
+            };
+            ottto_core::write_owner_only_file_atomic(&c.path, &serde_json::to_vec(&index).unwrap())
+                .unwrap();
+            let mut original = Original::read(&c.path).unwrap();
+            original.capture_progress(&c.path).unwrap();
+            original.preserve(&c.path).unwrap();
+            let identity = Identity {
+                format: FORMAT,
+                db_id: "composed-import".into(),
+                binding: c.binding(),
+                fence_generation: generation + 1,
+            };
+            let mut db =
+                sqlite::Sqlite::create_import(&fence::sibling(&c.path, ".v2.sqlite.import"))
+                    .unwrap();
+            db.path_extractor(kinds::private_paths);
+            db.reference_extractor(kinds::references);
+            db.control("identity", &identity).unwrap();
+            db.control("generation", &generation).unwrap();
+            let verified = ClaudeMapper
+                .import_graph(&mut db, &index, Some(&original))
+                .unwrap();
+            assert_eq!(
+                index.generation, generation,
+                "unpublished input is unchanged"
+            );
+            assert_eq!(
+                db.read_control::<u64>("generation").unwrap(),
+                Some(generation + 1)
+            );
+            assert_eq!(verified.presence, original.presence);
+            let (mut loaded, _) = kinds::hydrate(&mut db, c.binding()).unwrap();
+            assert_eq!(loaded.generation, generation + 1);
+            loaded.generation = generation;
+            assert_eq!(
+                serde_json::to_vec(&loaded).unwrap(),
+                serde_json::to_vec(&index).unwrap()
+            );
+            // Capture and verify on the import snapshot, before final DB exists.
+            original.seal_progress(&c.path, &identity, &mut db).unwrap();
+            original.seal_progress(&c.path, &identity, &mut db).unwrap();
+            let receipt = fs::read(fence::sibling(&c.path, ".v2-ack-receipt")).unwrap();
+            assert!(!fence::sibling(&c.path, ".v2.sqlite").exists());
+            db.finish_import().unwrap();
+            let mut proposed = identity.clone();
+            proposed.db_id = "different-attempt".into();
+            assert_eq!(original.retry_identity(proposed).unwrap(), identity);
+            fence::cleanup_unpublished(&c.path, false).unwrap();
+            assert_eq!(
+                fs::read(fence::sibling(&c.path, ".v2-ack-receipt")).unwrap(),
+                receipt,
+                "failed-import companion custody survives ordinary orphan cleanup"
+            );
+        }
+    }
+
+    #[test]
+    fn import_publication_holds_progress_owner_and_reopens_real_claude_mapper_at_new_generation() {
+        let c = Corpus::new();
+        let index = ScanIndex {
+            generation: 9,
+            ..Default::default()
+        };
+        ottto_core::write_owner_only_file_atomic(&c.path, &serde_json::to_vec(&index).unwrap())
+            .unwrap();
+        let mut original = Original::read(&c.path).unwrap();
+        original.capture_progress(&c.path).unwrap();
+        original.preserve(&c.path).unwrap();
+        let identity = Identity {
+            format: FORMAT,
+            db_id: "real-publication".into(),
+            binding: c.binding(),
+            fence_generation: 10,
+        };
+        let mut db =
+            sqlite::Sqlite::create_import(&fence::sibling(&c.path, ".v2.sqlite.import")).unwrap();
+        db.path_extractor(kinds::private_paths);
+        db.reference_extractor(kinds::references);
+        db.control("identity", &identity).unwrap();
+        db.control("generation", &9_u64).unwrap();
+        ClaudeMapper
+            .import_graph(&mut db, &index, Some(&original))
+            .unwrap();
+        original
+            .progress
+            .as_ref()
+            .unwrap()
+            .with_sealed_import(&c.path, &identity, db, |db, _set| {
+                assert!(
+                    crate::snapshot_sync::with_state_v2_progress_lock(&c.path, |_| Ok(())).is_err(),
+                    "the post-seal callback still owns the progress lock"
+                );
+                db.finish_import()?;
+                original.unchanged()?;
+                fence::publish(&c.path, &identity, &mut false)
+            })
+            .unwrap();
+        let _lock = super::super::super::CheckpointLock::acquire(&c.path).unwrap();
+        let loaded = super::super::runtime::load_locked(&c.path, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.generation, 10);
+        assert!(loaded.persistence_v2.is_some());
+        // Only this component fixture publishes. Production conversion keeps
+        // its explicit PublicationPending prerequisite until save parity lands.
+        assert_eq!(
+            ClaudeMapper.preflight(&loaded),
+            Err(Pause::PublicationPending)
+        );
+    }
+
+    #[test]
+    fn original_progress_requires_owner_and_unchanged_bytes_and_baseline() {
+        let c = Corpus::new();
+        let progress_path = c
+            .path
+            .with_file_name("claude_code-synthetic-scan-index-upload-progress.json");
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema_version":3, "generation":7, "destination_namespace_hash":c.binding().namespace_hash,
+            "opaque_extension":{"exact":"bytes"}
+        })).unwrap();
+        ottto_core::write_owner_only_file_atomic(&progress_path, &bytes).unwrap();
+        let mut original = Original::read(&c.path).unwrap();
+        original.capture_progress(&c.path).unwrap();
+        let identity = Identity {
+            format: FORMAT,
+            db_id: "owned-import".into(),
+            binding: c.binding(),
+            fence_generation: 1,
+        };
+        // An existing companion belongs to the exact original owner, not a name.
+        let recovery = super::super::ack::ProgressRecovery::seal_import(
+            identity.clone(),
+            1,
+            &c.path,
+            Some(&bytes),
+        )
+        .unwrap();
+        drop(recovery);
+        assert_eq!(original.retry_identity(identity.clone()).unwrap(), identity);
+        let mut changed = bytes.clone();
+        changed.push(b' ');
+        ottto_core::write_owner_only_file_atomic(&progress_path, &changed).unwrap();
+        assert!(original.retry_identity(identity.clone()).is_err());
+        ottto_core::write_owner_only_file_atomic(&progress_path, &bytes).unwrap();
+        let foreign = serde_json::to_vec(
+            &serde_json::json!({"schema_version":3,"destination_namespace_hash":"b".repeat(64)}),
+        )
+        .unwrap();
+        ottto_core::write_owner_only_file_atomic(&progress_path, &foreign).unwrap();
+        assert!(super::super::ack::OriginalProgress::capture(&c.path).is_err());
+        assert_eq!(fs::read(&progress_path).unwrap(), foreign);
+        assert!(!fence::sibling(&c.path, ".v2.sqlite").exists());
     }
 
     #[test]

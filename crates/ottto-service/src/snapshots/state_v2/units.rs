@@ -455,6 +455,9 @@ pub(super) struct Selection {
     holds: BTreeMap<[u8; 32], UnitHold>,
 }
 impl Selection {
+    pub(super) fn staging_bytes(&self) -> u64 {
+        self.stage_bytes
+    }
     pub(super) fn holds(&self) -> &BTreeMap<[u8; 32], UnitHold> {
         &self.holds
     }

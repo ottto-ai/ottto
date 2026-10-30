@@ -116,6 +116,7 @@ impl Holds {
             matches!(
                 field,
                 "files"
+                    | "growth_retention"
                     | "claude_account_family_witnesses"
                     | "claude_account_family_pending"
                     | "claude_usage_family_witnesses"

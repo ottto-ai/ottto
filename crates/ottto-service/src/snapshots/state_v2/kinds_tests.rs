@@ -286,3 +286,204 @@ fn shared_privacy_dispatch_preserves_both_census_domains_and_account_exclusion_l
         assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
     }
 }
+
+#[derive(Default)]
+struct SelectedHooks(Vec<&'static str>);
+impl kinds_files::ResumeHooks for SelectedHooks {
+    fn preflight_selected(
+        &mut self,
+        _: &ScanIndex,
+        _: &ScanIndex,
+        _: &BTreeMap<String, kinds_files::ResumeCheckpoint>,
+    ) -> Result<u64> {
+        self.0.push("preflight");
+        Ok(0)
+    }
+    fn stage(
+        &mut self,
+        _: &ScanIndex,
+        _: &ScanIndex,
+        _: &BTreeMap<String, kinds_files::ResumeCheckpoint>,
+    ) -> Result<kinds_files::StagedCheckpoints> {
+        self.0.push("stage");
+        Ok(Default::default())
+    }
+    fn post_commit(
+        &mut self,
+        _: u64,
+        _: &BTreeMap<String, kinds_files::ResumeCheckpoint>,
+    ) -> Result<()> {
+        self.0.push("post_commit");
+        Ok(())
+    }
+}
+fn empty_selection(db: &mut sqlite::Sqlite, generation: u64) -> units::Selection {
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let schedule = units::Schedule::read(&mut tx).unwrap();
+    units::Planner::new(identity, generation, schedule)
+        .select()
+        .unwrap()
+}
+#[test]
+fn selected_save_installs_context_and_calls_r1_only_after_confirmed_commit() {
+    let (_scratch, mut db) = Scratch::live_store();
+    commit_populate(&mut db, &fixture());
+    let (prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    let mut next = prev.clone();
+    next.generation += 1;
+    let selection = empty_selection(&mut db, prev.generation);
+    let mut hooks = SelectedHooks::default();
+    save_selected(&mut db, &prev, &mut next, &mut cx, selection, &mut hooks).unwrap();
+    assert_eq!(hooks.0, ["preflight", "stage", "post_commit"]);
+    assert!(cx.valid && !cx.ambiguous && cx.prepared.is_none());
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let key = RowKey::Meta("generation".into());
+    assert_eq!(cx.misc_rows[&key].0, tx.get(&key).unwrap().unwrap());
+}
+#[test]
+fn unplanned_semantic_write_rolls_back_and_invalidates_context_without_r1_gc() {
+    let (_scratch, mut db) = Scratch::live_store();
+    commit_populate(&mut db, &fixture());
+    let (prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    let mut next = prev.clone();
+    next.generation += 1;
+    next.upload_context_fingerprint = Some("selected-but-not-admitted".into());
+    let selection = empty_selection(&mut db, prev.generation);
+    let mut hooks = SelectedHooks::default();
+    assert!(save_selected(&mut db, &prev, &mut next, &mut cx, selection, &mut hooks).is_err());
+    assert_eq!(hooks.0, ["preflight", "stage"]);
+    assert!(!cx.valid && cx.ambiguous);
+    let (current, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(current.generation, prev.generation);
+    assert_eq!(
+        current.upload_context_fingerprint,
+        prev.upload_context_fingerprint
+    );
+}
+#[test]
+fn stale_selected_generation_refuses_before_r1_preflight_or_staging() {
+    let (_scratch, mut db) = Scratch::live_store();
+    commit_populate(&mut db, &fixture());
+    let (prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    let mut next = prev.clone();
+    next.generation += 1;
+    let selection = empty_selection(&mut db, 0);
+    let mut hooks = SelectedHooks::default();
+    assert!(save_selected(&mut db, &prev, &mut next, &mut cx, selection, &mut hooks).is_err());
+    assert!(hooks.0.is_empty());
+    assert!(!cx.valid);
+}
+#[test]
+fn complete_misc_dirty_plan_covers_scalar_map_ack_and_raw_hold_changes() {
+    let prev = fixture();
+    let mut next = prev.clone();
+    next.generation += 1;
+    assert!(kinds_misc::dirty_fields(&prev, &next).unwrap().is_empty());
+    next.upload_context_fingerprint = Some("different-context".into());
+    next.accepted_snapshot_fingerprints.insert("e".repeat(64));
+    next.decode_holds
+        .v2_insert(
+            "files",
+            "/synthetic/held".into(),
+            b"false".to_vec(),
+            None,
+            128,
+        )
+        .unwrap();
+    assert_eq!(
+        kinds_misc::dirty_fields(&prev, &next).unwrap(),
+        BTreeSet::from([
+            "upload_context_fingerprint".into(),
+            "accepted_snapshot_fingerprints".into(),
+            "decode_holds".into()
+        ])
+    );
+}
+
+#[test]
+fn streamed_cas_merges_retry_and_growth_maxima_without_resurrecting_removed_quarantine() {
+    let (_scratch, mut db) = Scratch::store();
+    let mut index = fixture();
+    let mut record =
+        crate::snapshots::snapshot_quarantine_record(crate::snapshots::SnapshotSource::ClaudeCode);
+    record.contract_retry_claims = Some(7);
+    let key = "a".repeat(64);
+    index
+        .quarantined_snapshot_fingerprints
+        .insert(key.clone(), record.clone());
+    index
+        .quarantined_snapshot_fingerprints
+        .insert("b".repeat(64), record);
+    index.growth_retention.insert(
+        "/synthetic/grown".into(),
+        serde_json::from_value(serde_json::json!({"last_growth_full_unix":20})).unwrap(),
+    );
+    commit_populate(&mut db, &index);
+    let (mut working, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+    let current_claims = working.quarantined_snapshot_fingerprints[&key].contract_retry_claims;
+    working
+        .quarantined_snapshot_fingerprints
+        .get_mut(&key)
+        .unwrap()
+        .contract_retry_claims = Some(0);
+    working
+        .quarantined_snapshot_fingerprints
+        .remove(&"b".repeat(64));
+    working.growth_retention.clear();
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    kinds_misc::merge_cas(&mut tx, &mut working).unwrap();
+    kinds_files::merge_growth_cas(&mut tx, &mut working).unwrap();
+    assert_eq!(
+        working.quarantined_snapshot_fingerprints[&key].contract_retry_claims,
+        current_claims
+    );
+    assert!(!working
+        .quarantined_snapshot_fingerprints
+        .contains_key(&"b".repeat(64)));
+    assert_eq!(
+        serde_json::to_value(&working.growth_retention["/synthetic/grown"]).unwrap()
+            ["last_growth_full_unix"],
+        20
+    );
+    working.generation += 1;
+    assert!(kinds_misc::merge_cas(&mut tx, &mut working).is_err());
+}
+#[test]
+fn growth_raw_hold_survives_composed_hydration_and_cas_cannot_release_it() {
+    let (_scratch, mut db) = Scratch::store();
+    let mut index = fixture();
+    index
+        .decode_holds
+        .v2_insert(
+            "growth_retention",
+            "/synthetic/grown".into(),
+            br#""opaque-clock""#.to_vec(),
+            None,
+            256,
+        )
+        .unwrap();
+    index.decode_holds.v2_finish((19, 3));
+    commit_populate(&mut db, &index);
+    let (mut working, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert!(working.decode_holds.same_as(&index.decode_holds));
+    assert_eq!(working.decode_holds.v2_provenance(), (19, 3));
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    kinds_misc::merge_cas(&mut tx, &mut working).unwrap();
+    working.decode_holds = Default::default();
+    assert!(kinds_misc::merge_cas(&mut tx, &mut working).is_err());
+}
+#[test]
+fn writer_capability_refuses_selected_save_before_any_r1_side_effect() {
+    let (_scratch, mut db) = Scratch::live_store();
+    commit_populate(&mut db, &fixture());
+    let (prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    let mut next = prev.clone();
+    next.generation += 1;
+    let selection = empty_selection(&mut db, prev.generation);
+    sqlite::future_writer_for_test(&mut db);
+    let mut hooks = SelectedHooks::default();
+    assert!(save_selected(&mut db, &prev, &mut next, &mut cx, selection, &mut hooks).is_err());
+    assert!(hooks.0.is_empty());
+    assert_eq!(next.generation, prev.generation);
+}

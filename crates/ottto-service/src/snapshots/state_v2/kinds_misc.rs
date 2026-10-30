@@ -530,6 +530,7 @@ struct JsonReader<'a> {
     started: bool,
     done: bool,
     scalar_bytes: u64,
+    retain_headers: bool,
 }
 impl<'a> JsonReader<'a> {
     fn new(
@@ -550,7 +551,18 @@ impl<'a> JsonReader<'a> {
             started: false,
             done: false,
             scalar_bytes: 0,
+            retain_headers: true,
         })
+    }
+    fn transient(
+        txn: &'a mut dyn Transaction,
+        cx: &'a mut KindCx,
+        kind: &str,
+        slot: &'a str,
+    ) -> Result<Self> {
+        let mut reader = Self::new(txn, cx, kind, slot)?;
+        reader.retain_headers = false;
+        Ok(reader)
     }
     fn consume(&mut self, h: Header) -> Result<Vec<u8>> {
         ensure!(
@@ -559,7 +571,9 @@ impl<'a> JsonReader<'a> {
         );
         let mut bytes = Vec::new();
         self.txn.read_value(&h, &mut bytes)?;
-        self.cx.misc_rows.insert(h.key.clone(), (h, true));
+        if self.retain_headers {
+            self.cx.misc_rows.insert(h.key.clone(), (h, true));
+        }
         Ok(bytes)
     }
     fn piece(&mut self) -> Result<Option<Vec<u8>>> {
@@ -1058,6 +1072,7 @@ pub(super) const KINDS: &[&str] = &[
     "v1_field.claude_desktop_store_inventory",
     "v1_field.repair_provenance",
     "raw_hold.files",
+    "raw_hold.growth_retention",
     "raw_hold.claude_account_family_witnesses",
     "raw_hold.claude_account_family_pending",
     "raw_hold.claude_usage_family_witnesses",
@@ -1119,7 +1134,14 @@ fn read_holds(index: &mut ScanIndex, txn: &mut dyn Transaction, cx: &mut KindCx)
             let key = RowKey::record(&kind, key.as_bytes().to_vec(), 0)?;
             let h = txn.get(&key)?.context("state_v2_misc_missing_hold")?;
             ensure!(
-                h.fixed == Fixed::None && h.value_version == 1 && h.len <= VALUE_BYTES,
+                h.fixed == Fixed::None
+                    && h.value_version == 1
+                    && h.len <= slot.charge
+                    && slot.charge <= 8 * 1024 * 1024
+                    && holds
+                        .held_bytes()
+                        .checked_add(slot.charge)
+                        .is_some_and(|n| n <= 8 * 1024 * 1024),
                 "state_v2_misc_hold_admission"
             );
             let mut raw = Vec::new();
@@ -1176,6 +1198,70 @@ fn read_control<T: serde::de::DeserializeOwned>(
     let value = serde_json::from_slice(&bytes)?;
     cx.misc_rows.insert(h.key.clone(), (h, true));
     Ok(value)
+}
+
+/// Read only the CAS custody controls/holds and stream quarantine records.
+/// No current ScanIndex graph or history-wide quarantine map is constructed.
+pub(super) fn merge_cas(tx: &mut dyn Transaction, working: &mut ScanIndex) -> Result<()> {
+    merge_cas_at(tx, working, working.generation)
+}
+pub(super) fn merge_cas_at(
+    tx: &mut dyn Transaction,
+    working: &mut ScanIndex,
+    expected: u64,
+) -> Result<()> {
+    use super::super::terminal_contract_retry;
+    use serde::de::{DeserializeSeed, MapAccess, Visitor};
+    let mut cx = KindCx::default();
+    let generation: u64 = read_control("generation", tx, &mut cx)?;
+    let schema: u16 = read_control("schema_version", tx, &mut cx)?;
+    ensure!(
+        generation == expected && schema == working.schema_version,
+        "state_v2_concurrent_change"
+    );
+    let mut custody = ScanIndex::default();
+    read_holds(&mut custody, tx, &mut cx)?;
+    ensure!(
+        custody.decode_holds.same_as(&working.decode_holds)
+            && custody.decode_repairs_match(working),
+        "current_index_requires_reload"
+    );
+    struct Claims<'a>(&'a mut ScanIndex);
+    impl<'de> Visitor<'de> for Claims<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("quarantine map")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<(), A::Error> {
+            while let Some((key, current)) =
+                map.next_entry::<String, super::super::SnapshotQuarantineRecord>()?
+            {
+                if let Some(working) = self.0.quarantined_snapshot_fingerprints.get_mut(&key) {
+                    terminal_contract_retry::merge_claims(working, &current);
+                }
+            }
+            Ok(())
+        }
+    }
+    impl<'de> DeserializeSeed<'de> for Claims<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            de: D,
+        ) -> std::result::Result<(), D::Error> {
+            de.deserialize_map(self)
+        }
+    }
+    let reader = JsonReader::transient(
+        tx,
+        &mut cx,
+        "refusal.snapshot",
+        "quarantined_snapshot_fingerprints",
+    )?;
+    let mut de = serde_json::Deserializer::from_reader(reader);
+    Claims(working).deserialize(&mut de)?;
+    de.end()?;
+    Ok(())
 }
 
 pub(super) fn populate(
@@ -1386,6 +1472,48 @@ pub(super) fn field_kind(field: &str) -> Option<&'static str> {
     fields!(lookup);
     kind
 }
+/// Complete field plan derived from the two owner graphs. Hashing is streamed
+/// with fixed scratch; no JSON history copy or payload read is used to decide
+/// which of the MISC fields the selected graph actually changed.
+pub(super) fn dirty_fields(prev: &ScanIndex, next: &ScanIndex) -> Result<BTreeSet<String>> {
+    fn commitment(value: &impl Serialize) -> Result<[u8; 32]> {
+        use sha2::Digest;
+        struct Sink(sha2::Sha256);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = Sink(sha2::Sha256::new());
+        serde_json::to_writer(&mut sink, value)?;
+        Ok(sink.0.finalize().into())
+    }
+    let mut dirty = BTreeSet::new();
+    macro_rules! compare {
+        (claude_desktop_store_inventory, $kind:literal) => {};
+        ($field:ident, $kind:literal) => {
+            if commitment(&prev.$field)? != commitment(&next.$field)? {
+                dirty.insert(stringify!($field).to_owned());
+            }
+        };
+    }
+    fields!(compare);
+    if prev.schema_version != next.schema_version {
+        dirty.insert("schema_version".into());
+    }
+    if !prev.decode_holds.same_as(&next.decode_holds)
+        || prev.decode_holds.v2_provenance() != next.decode_holds.v2_provenance()
+    {
+        dirty.insert("decode_holds".into());
+    }
+    // COMMIT, rather than semantic delta, owns the single generation advance.
+    Ok(dirty)
+}
+
 pub(super) fn delta(
     _prev: &ScanIndex,
     next: &ScanIndex,
@@ -1830,6 +1958,35 @@ mod tests {
             1
         );
     }
+    #[test]
+    fn transient_reader_pages_without_retaining_resident_header_inventory() {
+        let (_tmp, mut db) = Scratch::store();
+        let mut index = fixture();
+        index.accepted_snapshot_fingerprints = (0..512).map(|n| format!("{n:064x}")).collect();
+        let mut cx = KindCx::default();
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        populate(&index, &mut tx, &mut cx).unwrap();
+        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let mut disposable = KindCx::default();
+        let reader = JsonReader::transient(
+            &mut tx,
+            &mut disposable,
+            "accepted.entity",
+            "accepted_snapshot_fingerprints",
+        )
+        .unwrap();
+        let actual: BTreeMap<String, ()> = serde_json::from_reader(reader).unwrap();
+        assert_eq!(
+            actual.into_keys().collect::<BTreeSet<_>>(),
+            index.accepted_snapshot_fingerprints
+        );
+        assert!(
+            disposable.misc_rows.is_empty(),
+            "paging must not build another resident header map"
+        );
+    }
+
     #[test]
     fn unchanged_delta_writes_nothing_and_member_insertion_keeps_neighbor_rows() {
         let (_tmp, mut db) = Scratch::store();

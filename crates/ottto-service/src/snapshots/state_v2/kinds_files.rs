@@ -254,6 +254,21 @@ fn read_map<T: DeserializeOwned + Serialize>(
     Ok(result)
 }
 
+pub(super) fn merge_growth_cas(tx: &mut dyn Transaction, working: &mut ScanIndex) -> Result<()> {
+    rows(tx, "file.growth_retention", |header, path, bytes| {
+        singleton(header)?;
+        ensure!(header.fixed == Fixed::None, "state_v2_files_projection");
+        let state: super::super::sampled_audit::GrowthRetention = typed(bytes)?;
+        // Reuse the v1 maxima rule, one record at a time, including claim-only
+        // predecessors that a native subset restored to an older file entry.
+        super::super::sampled_audit::merge_growth_claims(
+            &mut working.growth_retention,
+            &BTreeMap::from([(path.to_owned(), state)]),
+        );
+        Ok(())
+    })
+}
+
 // A stable hash partition bounds independently mutable entity sets. Position 0
 // is the complete presence/ownership manifest (including Some(empty)); positions
 // 1..=256 are buckets. All are published in the caller's SAME transaction.
@@ -554,6 +569,17 @@ pub(super) struct StagedCheckpoints {
 /// immutable file and its directory before returning staging proof. The mapper
 /// owns no filesystem handles and never implements a promote step.
 pub(super) trait ResumeHooks {
+    /// Called on the already-selected graph, before staging or Store::begin.
+    /// R1 admits immutable output bytes without writing them in this callback.
+    fn preflight_selected(
+        &mut self,
+        prev: &ScanIndex,
+        next: &ScanIndex,
+        current: &BTreeMap<String, ResumeCheckpoint>,
+    ) -> Result<u64> {
+        let _ = (prev, next, current);
+        Ok(0)
+    }
     fn stage(
         &mut self,
         prev: &ScanIndex,
@@ -587,6 +613,37 @@ pub(super) struct Prepared {
 impl KindCx {
     pub(super) fn checkpoints(&self) -> &BTreeMap<String, ResumeCheckpoint> {
         &self.committed
+    }
+    pub(super) fn preflight_selected(
+        &mut self,
+        prev: &ScanIndex,
+        next: &ScanIndex,
+        selection: &units::Selection,
+        hooks: &mut dyn ResumeHooks,
+    ) -> Result<()> {
+        ensure!(
+            self.binding.as_ref() == Some(&selection.identity.binding)
+                && prev.generation == selection.generation
+                && prev.generation.checked_add(1) == Some(next.generation),
+            "state_v2_resume_selected_generation"
+        );
+        let selected: BTreeSet<_> = selection.keys().collect();
+        for path in prev.files.keys().chain(next.files.keys()) {
+            if prev.files.get(path).map(publication).transpose()?
+                != next.files.get(path).map(publication).transpose()?
+            {
+                ensure!(
+                    selected.contains(&key("file.progress", path, 0)?),
+                    "state_v2_resume_unselected_file"
+                );
+            }
+        }
+        let bytes = hooks.preflight_selected(prev, next, &self.committed)?;
+        ensure!(
+            bytes <= selection.staging_bytes(),
+            "state_v2_resume_staging_admission"
+        );
+        self.preflight_reserved(prev, next, hooks, bytes)
     }
     pub(super) fn preflight(
         &mut self,

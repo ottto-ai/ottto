@@ -61,12 +61,15 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
     hash.finalize().into()
 }
 fn read(path: &Path) -> Result<Option<Vec<u8>>> {
+    read_limited(path, MAX_BYTES)
+}
+fn read_limited(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
         Ok(meta) => {
             require(meta.is_file() && !meta.file_type().is_symlink(), "file")?;
-            require(meta.len() <= MAX_BYTES, "size")?;
+            require(meta.len() <= limit, "size")?;
         }
     }
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -83,8 +86,8 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>> {
         "permissions",
     )?;
     let mut bytes = Vec::new();
-    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-    require(bytes.len() as u64 <= MAX_BYTES, "size")?;
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    require(bytes.len() as u64 <= limit, "size")?;
     Ok(Some(bytes))
 }
 fn progress_generation(bytes: &[u8]) -> Result<u64> {
@@ -95,6 +98,236 @@ fn progress_generation(bytes: &[u8]) -> Result<u64> {
     }
     Ok(serde_json::from_slice::<Generation>(bytes)?.generation)
 }
+/// Bounded temporary custody for an obsolete, provably unpublished seal. Keep
+/// exact predecessor bytes until a new seal + RecoverySet have been verified.
+/// A crash leaves both copies, never an overwritten companion. New successful
+/// sealing removes these remnants under the same progress/checkpoint owners.
+fn failed_imports(index_path: &Path) -> Result<Vec<PathBuf>> {
+    let parent = index_path.parent().context("state_v2_ack_parent")?;
+    let prefix = fence::sibling(index_path, ".v2-ack-receipt.failed-import-");
+    let prefix = prefix
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("state_v2_ack_name")?;
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .and_then(|s| s.strip_prefix(prefix))
+            .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            require(paths.len() < 8, "failed_import_capacity")?;
+            paths.push(entry.path());
+        }
+    }
+    Ok(paths)
+}
+pub(super) fn failed_import_inventory(index_path: &Path) -> Result<(u64, u64)> {
+    let mut count = 0;
+    let mut bytes = 0_u64;
+    for path in failed_imports(index_path)? {
+        count += 1;
+        bytes = bytes
+            .checked_add(std::fs::symlink_metadata(path)?.len())
+            .context("state_v2_ack_size")?;
+    }
+    Ok((count, bytes))
+}
+pub(super) fn erase_failed_imports(index_path: &Path) -> Result<()> {
+    for path in failed_imports(index_path)? {
+        std::fs::remove_file(path)?;
+    }
+    super::super::sync_checkpoint_parent(index_path)
+}
+fn preserve_failed_import(index_path: &Path, companion: &Path, bytes: &[u8]) -> Result<()> {
+    let suffix: String = digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
+    let target = fence::sibling(
+        index_path,
+        &format!(".v2-ack-receipt.failed-import-{suffix}"),
+    );
+    if let Some(existing) = read(&target)? {
+        if existing != bytes {
+            // An interrupted copy is redundant with the complete, still-owned
+            // companion. Only its exact prefix may be replaced on retry.
+            require(bytes.starts_with(&existing), "failed_import_custody")?;
+            std::fs::remove_file(&target)?;
+            fence::preserve_file(companion, &target)?;
+        }
+    } else {
+        let (count, size) = failed_import_inventory(index_path)?;
+        require(
+            count < 8 && size.saturating_add(bytes.len() as u64) <= MAX_BYTES,
+            "failed_import_capacity",
+        )?;
+        fence::preserve_file(companion, &target)?;
+        require(
+            read(&target)?.as_deref() == Some(bytes),
+            "failed_import_custody",
+        )?;
+    }
+    require(
+        read(&target)?.as_deref() == Some(bytes),
+        "failed_import_custody",
+    )?;
+    // Retry every durability barrier after an interrupted copy/rename sequence.
+    std::fs::File::open(&target)?.sync_all()?;
+    super::super::sync_checkpoint_parent(&target)?;
+    std::fs::remove_file(companion)?;
+    super::super::sync_checkpoint_parent(companion)
+}
+
+/// Original upload-progress ownership is independent of the import filename.
+/// Retain only a commitment; reacquire the existing progress lock and compare
+/// exact bytes before sealing. Missing is an exact, separately proved state.
+#[derive(Debug)]
+pub(super) struct OriginalProgress {
+    index_path: PathBuf,
+    namespace: String,
+    commitment: Option<[u8; 32]>,
+}
+impl OriginalProgress {
+    pub(super) fn capture(index_path: &Path) -> Result<Self> {
+        let binding = super::super::scan_index_integration::scan_index_storage_binding(index_path)
+            .context("state_v2_original_progress_binding")?;
+        require(
+            binding.source == super::super::scan_index_persistence::Source::Claude,
+            "source",
+        )?;
+        let mut original = Self {
+            index_path: index_path.to_owned(),
+            namespace: binding.namespace_hash,
+            commitment: None,
+        };
+        original.commitment =
+            crate::snapshot_sync::with_state_v2_progress_lock(index_path, |path| {
+                let bytes = original.read_owned(path)?;
+                Ok(bytes.as_deref().map(digest))
+            })?;
+        Ok(original)
+    }
+    fn read_owned(&self, path: &Path) -> Result<Option<Vec<u8>>> {
+        let bytes = read_limited(path, (MAX_BYTES - CONTROL_BYTES) / 6)?;
+        if let Some(bytes) = &bytes {
+            crate::snapshot_sync::validate_state_v2_original_progress(bytes, &self.namespace)?;
+        }
+        Ok(bytes)
+    }
+    fn unchanged(&self, bytes: Option<&[u8]>) -> Result<()> {
+        require(
+            bytes.map(digest) == self.commitment,
+            "import_progress_changed",
+        )
+    }
+    pub(super) fn retry_identity(&self, proposed: Identity) -> Result<Identity> {
+        require(
+            proposed.binding.namespace_hash == self.namespace,
+            "identity",
+        )?;
+        crate::snapshot_sync::with_state_v2_progress_lock(&self.index_path, |path| {
+            let progress = self.read_owned(path)?;
+            self.unchanged(progress.as_deref())?;
+            let companion = fence::sibling(&self.index_path, ".v2-ack-receipt");
+            let Some(bytes) = read(&companion)? else {
+                return Ok(proposed);
+            };
+            let receipt: Receipt = serde_json::from_slice(&bytes)?;
+            let recovery = ProgressRecovery {
+                scope: Scope {
+                    identity: receipt.scope.identity.clone(),
+                    generation: proposed.fence_generation,
+                },
+                path: companion,
+                db_path: None,
+            };
+            let checked = recovery.receipt_at(&recovery.scope)?;
+            let progress = progress.as_deref().unwrap_or(b"{\"generation\":0}");
+            require(
+                checked.scope.identity.binding == proposed.binding
+                    && checked.scope.identity.format == proposed.format
+                    && checked.scope.generation == checked.scope.identity.fence_generation
+                    && checked.previous_generation == checked.generation
+                    && (checked.previous_digest == Some(checked.digest)
+                        || (checked.generation == 0 && checked.previous_digest.is_none())),
+                "failed_import_custody",
+            )?;
+            if checked.scope.identity.fence_generation == proposed.fence_generation
+                && checked.digest == digest(progress)
+                && checked.previous_digest == self.commitment
+            {
+                return Ok(checked.scope.identity);
+            }
+            // Under the checkpoint owner, BOTH publication artifacts must be
+            // absent. Published/ambiguous routes never reach this rotation.
+            // Future generations and ACK-updated receipts cannot be rotated.
+            require(
+                checked.scope.generation <= proposed.fence_generation
+                    && !fence::evidence(&self.index_path)?,
+                "failed_import_published",
+            )?;
+            preserve_failed_import(&self.index_path, &recovery.path, &bytes)?;
+            Ok(proposed)
+        })
+    }
+    fn seal_locked<S: Store>(
+        &self,
+        index_path: &Path,
+        identity: &Identity,
+        progress_path: &Path,
+        store: &mut S,
+    ) -> Result<RecoverySet> {
+        require(
+            index_path == self.index_path && identity.binding.namespace_hash == self.namespace,
+            "identity",
+        )?;
+        let bytes = self.read_owned(progress_path)?;
+        self.unchanged(bytes.as_deref())?;
+        let recovery = ProgressRecovery::seal_import(
+            identity.clone(),
+            identity.fence_generation,
+            index_path,
+            bytes.as_deref(),
+        )?;
+        let mut tx = store.begin(TxnMode::Read)?;
+        let set = RecoverySet::capture(&mut tx, &recovery, progress_path)?;
+        set.verify(&mut tx, &recovery, progress_path)?;
+        drop(tx);
+        erase_failed_imports(index_path)?;
+        Ok(set)
+    }
+    #[cfg(test)]
+    pub(super) fn seal_and_capture<S: Store>(
+        &self,
+        index_path: &Path,
+        identity: &Identity,
+        store: &mut S,
+    ) -> Result<RecoverySet> {
+        crate::snapshot_sync::with_state_v2_progress_lock(index_path, |path| {
+            self.seal_locked(index_path, identity, path, store)
+        })
+    }
+    /// Retain the existing progress owner through import close/fsync and fence
+    /// publication. A progress save cannot slip between sealing and the fence.
+    pub(super) fn with_sealed_import<S: Store, T>(
+        &self,
+        index_path: &Path,
+        identity: &Identity,
+        mut store: S,
+        publish: impl FnOnce(S, RecoverySet) -> Result<T>,
+    ) -> Result<T> {
+        crate::snapshot_sync::with_state_v2_progress_lock(index_path, |path| {
+            let set = self.seal_locked(index_path, identity, path, &mut store)?;
+            publish(store, set)
+        })
+    }
+}
+
 impl ProgressRecovery {
     /// Runtime load already holds CheckpointLock and has authenticated the DB.
     /// Replay before returning either a hydrated or cached graph, without
@@ -325,7 +558,7 @@ impl RecoverySet {
             generation: control(tx, "generation")?,
         };
         recovery.scope.check(&scope)?;
-        let receipt = recovery.receipt()?;
+        let receipt = recovery.receipt_at(&scope)?;
         receipt.scope.check(&scope)?;
         let progress = read(progress_path)?;
         require(

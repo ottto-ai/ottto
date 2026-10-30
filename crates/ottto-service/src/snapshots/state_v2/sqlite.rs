@@ -1068,6 +1068,22 @@ impl Sqlite {
     }
 }
 impl Sqlite {
+    pub(super) fn validate_selection(&mut self, selection: &units::Selection) -> Result<()> {
+        ensure!(
+            self.stamp()?.0 == selection.generation,
+            "state_v2_unit_stale_plan"
+        );
+        let mut tx = self.begin(TxnMode::Read)?;
+        migrations::check_current(tx.store.conn()?)?;
+        migrations::writer_supported(tx.store.conn()?)?;
+        ensure!(
+            tx.store.read_control::<Identity>("identity")?.as_ref() == Some(&selection.identity)
+                && tx.store.read_control::<u64>("generation")? == Some(selection.generation)
+                && units::Schedule::read(&mut tx)? == selection.prior_schedule,
+            "state_v2_unit_stale_plan"
+        );
+        Ok(())
+    }
     /// The caller holds source ownership, has selected the complete committable
     /// subset, and has durably staged its R1 files BEFORE entering this method.
     /// Ordinary callers keep their existing conservative transaction limits.

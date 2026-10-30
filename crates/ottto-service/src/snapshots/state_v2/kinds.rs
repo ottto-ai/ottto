@@ -138,6 +138,70 @@ pub(super) fn delta(
     result
 }
 
+/// Execute one owner-selected graph under the caller's source/checkpoint lock.
+/// Selection must already include the exact planned resume rows. The backend
+/// rejects missing, stale, extra or undercharged mutations atomically. R1's real
+/// admission/staging/GC implementation belongs to the owner of ResumeHooks.
+pub(super) fn save_selected(
+    store: &mut sqlite::Sqlite,
+    prev: &ScanIndex,
+    next: &mut ScanIndex,
+    committed: &mut KindCx,
+    selection: units::Selection,
+    hooks: &mut dyn kinds_files::ResumeHooks,
+) -> Result<()> {
+    ensure!(committed.valid, "state_v2_context_invalid");
+    // Move, never clone, resident metadata. No pending header map can masquerade
+    // as committed state after rollback or an ambiguous external/COMMIT error.
+    let mut pending = std::mem::take(committed);
+    let mut publication_possible = false;
+    let result = (|| {
+        store.validate_selection(&selection)?;
+        {
+            let mut tx = store.begin(TxnMode::Read)?;
+            kinds_misc::merge_cas_at(&mut tx, next, prev.generation)?;
+            kinds_files::merge_growth_cas(&mut tx, next)?;
+        }
+        super::super::lenient_decode::check_held_output(next)?;
+        pending.preflight_selected(prev, next, &selection, hooks)?;
+        let dirty = kinds_misc::dirty_fields(prev, next)?;
+        let mut tx = store.begin_selected(selection)?;
+        delta(prev, next, &mut tx, &mut pending, dirty)?;
+        let outcome = tx.commit(prev.generation, next.generation);
+        publication_possible = !matches!(outcome, DurableCommitOutcome::NotPublished);
+        if let DurableCommitOutcome::Committed(generation) = outcome {
+            // COMMIT updates this control outside the semantic encoder. Keep
+            // the resident header aligned before installing the new context.
+            let key = RowKey::Meta("generation".into());
+            let header = preflight(&RowInput {
+                key: &key,
+                fixed: &Fixed::None,
+                value_version: 1,
+                value: &ControlJson(&generation),
+            })?;
+            pending.misc_rows.insert(key, (header, true));
+            pending.post_commit(&outcome, hooks)?;
+            Ok(())
+        } else {
+            // Published/Ambiguous suppress GC and require an exact-ref reopen.
+            // A definite rollback also discards speculative context metadata.
+            pending.post_commit(&outcome, hooks)?;
+            bail!("state_v2_selected_save_requires_reload")
+        }
+    })();
+    if result.is_ok() {
+        *committed = pending;
+    } else {
+        // Preserve the graph generation on published ambiguity; every error
+        // invalidates the context, so callers cannot ACK or retry it as current.
+        committed.ambiguous = true;
+        if !publication_possible {
+            next.generation = prev.generation;
+        }
+    }
+    result
+}
+
 pub(super) fn private_paths(
     header: &Header,
     value: &dyn Value,

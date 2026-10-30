@@ -11841,6 +11841,38 @@ pub(crate) fn recover_state_v2_progress(
     recovery.recover(&path)
 }
 
+/// Import only inspects original bytes under the same progress owner as CAS.
+/// The checkpoint owner already holds its lock; no progress store is rewritten.
+pub(crate) fn with_state_v2_progress_lock<T>(
+    index_path: &Path,
+    action: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
+    let path = snapshot_upload_progress_path(index_path);
+    let _lock = SnapshotProgressLock::acquire(&path)?;
+    action(&path)
+}
+
+pub(crate) fn validate_state_v2_original_progress(bytes: &[u8], namespace: &str) -> Result<()> {
+    // Unknown payload slots are carried byte-exactly. Decode only the owner
+    // headers; Serde rejects duplicate headers and consumes the entire object.
+    #[derive(Deserialize)]
+    struct Owner {
+        schema_version: u16,
+        destination_namespace_hash: String,
+        #[serde(default)]
+        generation: u64,
+    }
+    let owner: Owner = serde_json::from_slice(bytes)?;
+    anyhow::ensure!(
+        owner.schema_version == SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
+            && is_snapshot_fingerprint(namespace)
+            && owner.destination_namespace_hash == namespace
+            && owner.generation < u64::MAX,
+        "state_v2_original_progress_owner"
+    );
+    Ok(())
+}
+
 fn snapshot_upload_progress_path(index_path: &Path) -> PathBuf {
     let stem = index_path
         .file_stem()
