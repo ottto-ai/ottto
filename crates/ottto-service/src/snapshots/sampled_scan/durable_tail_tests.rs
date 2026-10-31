@@ -12184,7 +12184,8 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
     ));
     assert_eq!(
         fresh.durable_counters(source).unwrap().1.guard_verify_bytes,
-        0
+        (std::fs::metadata(&record_path).unwrap().len() - store::HEADER_BYTES as u64),
+        "cold classification verifies the v1 body before the quiet decode deferral"
     );
     std::io::Write::write_all(
         &mut std::fs::OpenOptions::new()
