@@ -559,6 +559,11 @@ impl UploadFailureDiagnostics {
         self.status_family
     }
 
+    /// A batch HTTP response proves a send; transport/token failures do not.
+    pub(crate) fn is_snapshot_batch_response(&self) -> bool {
+        self.endpoint == "snapshot_batch" && self.http_status.is_some()
+    }
+
     /// Whether a snapshot page exceeded the client or gateway read deadline.
     ///
     /// Keep this endpoint-scoped: a relay-token timeout happened before the

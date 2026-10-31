@@ -361,6 +361,8 @@ fn h357_terminal_partial_reports_exact_progress_without_a_clean_success_clock() 
     assert_eq!(clean.last_success_at, clean.last_scan_finished_at);
 }
 
+/// [regress] H359 server-permanent exact bodies cannot resend after restart,
+/// even when version-only witness normalization needs a diagnostic save.
 #[test]
 #[serial_test::serial(client_report)]
 fn h359_permanent_exact_body_survives_retirement_epoch_restart_and_premature_timer() {
@@ -397,7 +399,19 @@ fn h359_permanent_exact_body_survives_retirement_epoch_restart_and_premature_tim
     let mut stale = crate::snapshots::snapshot_quarantine_record(SnapshotSource::Codex);
     stale.upload_body_witness = Some(body.clone());
     stale.retry_after_unix_seconds = 0; // Earlier deadline cannot revoke server permanence.
-    assert!(!restarted.prepare_quarantine_retries(&BTreeMap::from([(fp.clone(), stale)])));
+    let stale_index = BTreeMap::from([(fp.clone(), stale)]);
+    assert!(restarted.prepare_quarantine_retries(&stale_index));
+    assert!(restarted.active_quarantine_retries.is_empty());
+    assert_eq!(restarted.quarantined_fingerprints[&fp].witness, witness);
+    assert_eq!(
+        restarted.quarantined_fingerprints[&fp].failed_reconstruction_count,
+        MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+    );
+    assert_eq!(
+        restarted.quarantined_fingerprints[&fp].retry_after_unix_seconds,
+        0
+    );
+    assert!(!restarted.prepare_quarantine_retries(&stale_index));
     // A replay can also have no surviving index quarantine to normalize.
     restarted.quarantined_fingerprints.clear();
     let mut accepted = 0;

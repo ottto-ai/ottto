@@ -3905,7 +3905,8 @@ pub struct ScanIndex {
     /// scheduling permission only, never acceptance evidence.
     #[serde(skip)]
     reason_reoffer_retries: BTreeMap<String, String>,
-    /// Runtime leases backed by claims saved in both checkpoints before scanning.
+    /// Runtime file owners for this cycle's quarantine retries. Contract-origin
+    /// leases additionally have claims saved in both checkpoints before scanning.
     #[serde(skip)]
     terminal_contract_retries: BTreeMap<String, String>,
     /// Runtime-only: this index's path was loaded in this process with no
@@ -4356,6 +4357,17 @@ pub struct SnapshotQuarantineWitness {
     pub item_wire_byte_limit: usize,
 }
 
+impl SnapshotQuarantineWitness {
+    /// Build/parser labels alone neither correct a body nor change its retry contract.
+    pub(crate) fn same_retry_contract(&self, other: &Self) -> bool {
+        self.contract == other.contract
+            && self.scan_identity_version == other.scan_identity_version
+            && self.snapshot_schema_version == other.snapshot_schema_version
+            && self.entity_ack_contract == other.entity_ack_contract
+            && self.item_wire_byte_limit == other.item_wire_byte_limit
+    }
+}
+
 const fn legacy_snapshot_item_wire_byte_limit() -> usize {
     128 * 1024
 }
@@ -4440,7 +4452,7 @@ pub(crate) fn quarantine_context_only_changed(
     }
     let mut normalized = previous.clone();
     normalized.contract.clone_from(&active.contract);
-    normalized == *active
+    normalized.same_retry_contract(active)
 }
 
 pub fn snapshot_quarantine_record(source: SnapshotSource) -> SnapshotQuarantineRecord {
@@ -31482,6 +31494,40 @@ impl OwnedSourceScan {
             }
             let Some(mut candidate) = identified_candidates.pop_front() else {
                 context_read_budget.flush(index, &codex_selected_flags);
+                // A failed/held ordinary owner cannot strand a readable copy.
+                // At this boundary every selected candidate has ended; queued
+                // work still owns its lease. Reuse the existing hint queue for
+                // the next incidence, leaving the unsent deadline due.
+                let retry_copies = index
+                    .terminal_contract_retries
+                    .iter()
+                    .filter(|(fp, _)| {
+                        index
+                            .quarantined_snapshot_fingerprints
+                            .get(*fp)
+                            .is_some_and(|r| r.contract_retry_claims.is_none())
+                            && !snapshots
+                                .iter()
+                                .any(|item| &item.snapshot_fingerprint == *fp)
+                            && !index.quarantine_retry_is_queued(fp)
+                    })
+                    .filter_map(|(fp, owner)| {
+                        index
+                            .file_snapshot_fingerprints
+                            .range((
+                                std::ops::Bound::Excluded(owner.clone()),
+                                std::ops::Bound::Unbounded,
+                            ))
+                            .find(|(_, fingerprints)| fingerprints.contains(fp))
+                            .map(|(key, _)| (fp.clone(), key.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                for (fp, key) in retry_copies {
+                    index.terminal_contract_retries.insert(fp, key.clone());
+                    if let Some(traversal) = index.traversal.as_mut() {
+                        enqueue_watcher_hints(source, traversal, &[PathBuf::from(key)], false);
+                    }
+                }
                 if codex_page.continuation() {
                     let continuation_evidence = codex_join_inventory.map(|inventory| {
                         Arc::new(Mutex::new(Some(CodexContinuationEvidence {
@@ -49056,7 +49102,9 @@ impl ScanIndex {
                     return self.terminal_contract_retries.contains_key(fingerprint);
                 }
                 persisted.disposition == SnapshotQuarantineDisposition::RetryPending
-                    && (&persisted.witness != active || persisted.retry_after_unix_seconds <= now)
+                    && (self.terminal_contract_retries.contains_key(fingerprint)
+                        || !persisted.witness.same_retry_contract(active)
+                        || persisted.retry_after_unix_seconds <= now)
             })
     }
 
@@ -49069,7 +49117,10 @@ impl ScanIndex {
         terminal_contract_retry::merge_maps(&mut self.quarantined_snapshot_fingerprints, records)
     }
 
-    pub(crate) fn activate_terminal_contract_retries(&mut self, leases: BTreeSet<String>) {
+    pub(crate) fn activate_terminal_contract_retries(
+        &mut self,
+        leases: BTreeSet<String>,
+    ) -> Vec<PathBuf> {
         self.terminal_contract_retries.clear();
         // A fingerprint can have more than one indexed incidence. One claim
         // selects one owning file, never every duplicate incidence.
@@ -49080,6 +49131,50 @@ impl ScanIndex {
                     .or_insert_with(|| key.clone());
             }
         }
+        // A prior page's failed owner queued its next copy. That durable queue
+        // keeps the fallback ahead of the first incidence after save/reload.
+        for (fingerprint, owner) in &mut self.terminal_contract_retries {
+            if self
+                .quarantined_snapshot_fingerprints
+                .get(fingerprint)
+                .is_some_and(|r| r.contract_retry_claims.is_none())
+            {
+                if let Some(pending) = self
+                    .traversal
+                    .iter()
+                    .flat_map(|walk| walk.pending_candidates.iter())
+                    .chain(self.claude_stale_family_carry.replay.iter())
+                    .find(|pending| {
+                        self.file_snapshot_fingerprints
+                            .get(&local_index_key(&pending.path))
+                            .is_some_and(|fingerprints| fingerprints.contains(fingerprint))
+                    })
+                {
+                    *owner = local_index_key(&pending.path);
+                }
+            }
+        }
+        // Use the same revalidated candidate admission as exact refusal re-offers.
+        // Distinct entities in one file and duplicate incidences own one hint.
+        self.terminal_contract_retries
+            .values()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    /// A leased file still queued for a bounded page has not reached a hold.
+    pub(crate) fn quarantine_retry_is_queued(&self, fingerprint: &str) -> bool {
+        self.terminal_contract_retries
+            .get(fingerprint)
+            .is_some_and(|key| {
+                self.traversal
+                    .iter()
+                    .flat_map(|traversal| traversal.pending_candidates.iter())
+                    .chain(self.claude_stale_family_carry.replay.iter())
+                    .any(|pending| pending.path == Path::new(key))
+            })
     }
 
     /// Arm this cycle's exact refusal re-offer leases and return the indexed
@@ -49142,7 +49237,10 @@ impl ScanIndex {
                 .is_some_and(|(body_witness, record)| {
                     record.disposition == SnapshotQuarantineDisposition::RetryPending
                         && record.upload_body_witness.as_deref() == Some(body_witness.as_str())
-                        && self.active_quarantine_witness.as_ref() == Some(&record.witness)
+                        && self
+                            .active_quarantine_witness
+                            .as_ref()
+                            .is_some_and(|active| record.witness.same_retry_contract(active))
                 })
     }
 
@@ -52424,10 +52522,9 @@ impl ScanIndex {
                                 self.quarantined_snapshot_fingerprints
                                     .get(fingerprint)
                                     .is_some_and(|record| {
-                                        self.active_quarantine_witness.as_ref()
-                                            == Some(&record.witness)
-                                            && !self
-                                                .quarantine_retry_selects_file(fingerprint, &key)
+                                        self.active_quarantine_witness.as_ref().is_some_and(
+                                            |active| record.witness.same_retry_contract(active),
+                                        ) && !self.quarantine_retry_selects_file(fingerprint, &key)
                                     })
                             })
                     });
@@ -56323,6 +56420,7 @@ mod tests {
         assert_eq!(index.manifest(SnapshotSource::Codex, 183).entity_count, 2);
     }
 
+    /// [regress] A release label keeps the deadline; a contract change retries.
     #[test]
     fn scan_index_retries_same_fingerprint_after_quarantine_contract_upgrade() {
         let path = PathBuf::from("/opaque/session.jsonl");
@@ -56396,6 +56494,18 @@ mod tests {
             ..ScanIndex::default()
         };
         index.activate_quarantine_witness(SnapshotSource::Codex);
+        assert_eq!(
+            index.candidate_decision(&candidate),
+            CandidateDecision::Skip
+        );
+        index
+            .quarantined_snapshot_fingerprints
+            .values_mut()
+            .next()
+            .unwrap()
+            .witness
+            .contract
+            .push_str("-old");
         assert_eq!(
             index.candidate_decision(&candidate),
             CandidateDecision::Parse
@@ -82839,9 +82949,9 @@ mod tests {
             .is_empty());
     }
 
-    /// O1: an exact-body cooldown defers only the ordinary retry of its own
+    /// [regress] O1: an exact-body cooldown defers only the ordinary retry of its own
     /// retained conflict on an unchanged file. A changed file, a lease, a
-    /// changed quarantine witness, another body or an unrelated due sibling
+    /// changed quarantine contract, another body or an unrelated due sibling
     /// in the same file still selects it. The conflict debt is untouched,
     /// the view is runtime only, and deferrals count distinct entities.
     #[test]
@@ -82983,10 +83093,18 @@ mod tests {
             reread
         );
 
-        // A changed quarantine witness (a new parser or contract) re-reads.
+        // A release label alone keeps the cooldown; a changed contract re-reads.
         index.activate_reason_reoffer_cooldowns(cooldown.clone());
         let mut older = conflict.clone();
         older.witness.parser_version.push_str("-older");
+        index
+            .quarantined_snapshot_fingerprints
+            .insert("refused-entity".into(), older.clone());
+        assert_eq!(
+            index.candidate_decision_with_reason_at(&candidate, 0),
+            (CandidateDecision::Skip, None)
+        );
+        older.witness.contract.push_str("-older");
         index
             .quarantined_snapshot_fingerprints
             .insert("refused-entity".into(), older);
