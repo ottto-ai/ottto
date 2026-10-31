@@ -1087,11 +1087,14 @@ impl DurableTailStore {
             if work == "off_invalidate" {
                 // Header identity alone is the OFF exception. Never acquire a
                 // body or mutation authority for any other representation.
+                if !retired {
+                    return Ok(None);
+                }
                 if metadata.mode() & 0o777 != 0o600 {
                     return Err(Refusal::Undecodable);
                 }
                 binding.stamp = Some(Stamp::of(&metadata));
-                return Ok(retired.then_some(binding));
+                return Ok(Some(binding));
             }
             if retired && work != "overwrite" && work != "guard" {
                 return Err(Refusal::Repin); // Missing to readers, opaque to current decoders.
@@ -2612,7 +2615,8 @@ impl DurableTailStore {
             }
             let header = match self.classify(key, "off_invalidate", Some(writer)) {
                 Ok(Some(header)) => header,
-                _ => return Ok(self.record_missing(key)), // Never infer removal from a refusal.
+                Ok(None) => return Ok(self.record_missing(key)),
+                Err(_) => return Err(io::Error::other("OFF v1 classification refused")),
             };
             if published_end <= header.record.certificate.length {
                 return Ok(false);
