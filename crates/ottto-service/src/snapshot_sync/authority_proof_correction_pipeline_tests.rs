@@ -252,10 +252,6 @@ impl ApcFixture {
         for directory in [&subagents, &terminal, &support] {
             std::fs::create_dir_all(directory).expect("create synthetic directory");
         }
-        crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(
-            &support,
-            &[APC_ROOT, APC_SIBLING, APC_TERMINAL],
-        );
         let fixture = Self {
             case,
             index_path: base.join("claude-scan-index.json"),
@@ -353,6 +349,22 @@ impl ApcFixture {
 
     fn sibling_path(&self) -> PathBuf {
         self.root.join(format!("{APC_SIBLING}.jsonl"))
+    }
+
+    /// The real exclusion list, in `finish_sync_source`'s order after the
+    /// revision activates: adopt, load the list from the support directory,
+    /// then the money rules. The list is runtime-only, so every reload of the
+    /// index needs it again.
+    fn load_exclusion_list(&self, index: &mut ScanIndex) {
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+        index.load_claude_reemission_exclusions(&self.support);
+        crate::snapshots::claude_request_money::e2::apply_money_rules(index);
+    }
+
+    /// Lists only the family root (its subagents follow through the family
+    /// closure), as a real list the next page loads.
+    fn list_family(&self) {
+        crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&self.support, &[APC_ROOT]);
     }
 
     /// CONTROLLED seeding, never a natural state: rewrite the saved correction
@@ -545,6 +557,7 @@ impl ApcFixture {
         index.activate_effective_upload_body_witness_revision(
             effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
+        self.load_exclusion_list(&mut index);
         let committed_index = index.clone();
         let (mut scan, mut native_completion) = if self.retain_native_terminal.get() {
             let mut state = crate::snapshots::OwnedSourceScan::new(
@@ -959,6 +972,7 @@ impl ApcFixture {
         index.activate_effective_upload_body_witness_revision(
             effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
+        self.load_exclusion_list(&mut index);
         let empty_progress = test_upload_progress();
         let mut progress = SnapshotUploadProgress::load(
             &self.progress_path,
@@ -1496,9 +1510,14 @@ impl ApcFixture {
             .expect("write receipt");
     }
 
-    /// The first generation proves the family on its terminal page and
-    /// re-arms its earlier-page members; the next one rebuilds them from that
-    /// proof and delivers the reported bodies.
+    /// Unlisted revision-3 baseline, as production runs it: the first
+    /// generation proves the family on its terminal page and the always-on
+    /// path delivers each member's request-owned body; the next generation
+    /// settles. Then the real list names the family root, so every later page
+    /// reads the family on ordinary (fold-absent) money, where the reported
+    /// authority, its demotion and its correction are live. Listing only
+    /// after the stamped baseline keeps unchanged members settled instead of
+    /// history-held as listed.
     fn establish(&self) -> ApcEstablished {
         let family = apc_family_sessions();
         let first = self.generation(8, |_| ApcUpload::Accept);
@@ -1519,8 +1538,8 @@ impl ApcFixture {
         let last = corrected.last().expect("terminal page");
         assert!(last.scan.census_complete);
         assert!(last.fully_settled);
-        let mut reported = BTreeMap::new();
-        for page in &corrected {
+        let mut delivered = BTreeMap::new();
+        for page in first.iter().chain(&corrected) {
             assert!(page.held.is_empty());
             for item in page
                 .scan
@@ -1528,21 +1547,25 @@ impl ApcFixture {
                 .iter()
                 .filter(|item| family.contains(&item.source_session_id))
             {
-                assert_eq!(item.usage_accounting_contract.as_deref(), APC_REPORTED);
+                assert_eq!(
+                    item.usage_accounting_contract.as_deref(),
+                    Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT),
+                    "the unlisted baseline delivers request-owned bodies"
+                );
                 assert!(page.uploaded.contains(&item.snapshot_fingerprint));
-                reported.insert(
+                delivered.insert(
                     item.source_session_id.clone(),
                     Some(item.snapshot_fingerprint.clone()),
                 );
             }
         }
         assert_eq!(
-            reported.keys().cloned().collect::<BTreeSet<_>>(),
+            delivered.keys().cloned().collect::<BTreeSet<_>>(),
             family,
-            "every member's reported body is delivered once"
+            "every member's body is delivered once"
         );
         let heads = Self::family_heads(&last.index);
-        assert_eq!(heads, reported, "every head is its ACKed reported body");
+        assert_eq!(heads, delivered, "every head is its ACKed delivered body");
         assert_eq!(
             last.index
                 .claude_usage_family_witness_digest_for_test(APC_ROOT)
@@ -1550,6 +1573,7 @@ impl ApcFixture {
             Some(proven.as_str())
         );
         assert!(last.record().is_none());
+        self.list_family();
         ApcEstablished { proven, heads }
     }
 
@@ -1994,6 +2018,21 @@ impl ApcFixture {
                 drained.extend(transition.noop);
                 drained.extend(transition.empty);
                 drained.extend(transition.retired);
+                // The listed family's corrected bodies carry the reported
+                // contract (the establish check before the real list).
+                for item in page
+                    .scan
+                    .snapshots
+                    .iter()
+                    .filter(|item| page.uploaded.contains(&item.snapshot_fingerprint))
+                    .filter(|item| grant.owed.contains(&item.source_session_id))
+                {
+                    assert_eq!(
+                        item.usage_accounting_contract.as_deref(),
+                        APC_REPORTED,
+                        "hour {hour}: an uploaded corrected body is reported"
+                    );
+                }
                 for fingerprint in &grant.held {
                     assert!(!page
                         .index
@@ -2215,6 +2254,12 @@ fn superseded_revision_ack_never_drains_the_current_revision() {
         .expect("the current revision is captured");
     assert_ne!(current_candidate.revision_for_test(), stale_revision);
     let mut index = ScanIndex::load(&fixture.index_path).expect("load scan index");
+    // The settlement seam sees the index as a page does: revision active and
+    // the real list loaded in production order.
+    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
+        SnapshotSource::ClaudeCode,
+    ));
+    fixture.load_exclusion_list(&mut index);
     let previous = index.clone();
     let owed_before = index
         .claude_authority_record_for_test(APC_ROOT)
@@ -3421,8 +3466,9 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
         panic!("PRECONDITION_NOT_REACHED: {label}");
     };
 
-    // Before the flip: a held family is removed and retired as absent.
-    crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&fixture.support, &[APC_ROOT]);
+    // Before the flip: an unlisted baseline, then the real list names the
+    // family (`establish`), and the listed family is held, removed and
+    // retired as absent.
     let established = fixture.establish();
     crate::snapshots::forget_claude_unverified_history_indexes_for_test();
     crate::snapshots::restart_claude_reemission_stop_for_test();

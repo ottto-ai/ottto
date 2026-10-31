@@ -109,9 +109,11 @@ fn c1a_invalid_path(fixture: &RearmFixture) -> PathBuf {
 }
 
 /// The re-arm fixture plus the request-id-less transcript, under a contract-5
-/// identity permit unless the test changes it.
+/// identity permit unless the test changes it. No exclusion list is installed
+/// (production's always-on path); a test that needs a family on ordinary
+/// money lists only that family with `list_held` after an unlisted baseline.
 fn c1a_fixture(case: &'static str) -> RearmFixture {
-    let mut fixture = RearmFixture::ordinary(case);
+    let mut fixture = RearmFixture::new(case);
     fixture.request_identity = true;
     std::fs::write(
         c1a_invalid_path(&fixture),
@@ -325,8 +327,9 @@ fn c1a_closed_fence_unchanged_proof_rearms_nothing_after_its_reproof() {
 #[test]
 #[serial(source_manifests)]
 fn c1a_refused_budget_fallback_equals_base() {
-    // BASE re-offers the unchanged family at 08:10; gate on it is a semantic no-op (no re-upload).
-
+    // BASE (recorded gate-off) re-offered the unchanged family at 08:10. On
+    // the always-on path the re-read family is a semantic no-op: no re-upload,
+    // so the accepted heads stay those of 08:00.
     if !c1a_layout_supported("c1a_refused_budget_fallback") {
         return;
     }
@@ -347,15 +350,28 @@ fn c1a_refused_budget_fallback_equals_base() {
     };
     let base = [
         window(6, 3, 0, false, true),
-        window(6, 3, 3, true, false),
+        window(6, 0, 6, true, false),
         window(3, 0, 3, true, false),
     ];
     let refused = c1a_fixture("c1a-fallback-refused");
     let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
     let fallbacks = crate::snapshots::claude_unchanged_proof_budget_fallbacks_for_test();
-    let windows = [(8, 0), (8, 10), (8, 20)]
-        .map(|clock| c1a_window(&c1a_generation(&refused, "refused", clock)));
+    let mut heads = Vec::new();
+    let windows = [(8, 0), (8, 10), (8, 20)].map(|clock| {
+        let pages = c1a_generation(&refused, "refused", clock);
+        heads.push(RearmFixture::family_heads(
+            &pages.last().expect("terminal page").index,
+        ));
+        c1a_window(&pages)
+    });
     assert_eq!(windows, base, "the refused fallback is BASE");
+    assert_eq!(heads[0].len(), rearm_family_sessions().len());
+    assert!(
+        heads[0].values().all(Option::is_some),
+        "08:00 accepts every member's body"
+    );
+    assert_eq!(heads[1], heads[0], "08:10 re-uploads nothing");
+    assert_eq!(heads[2], heads[0], "08:20 re-uploads nothing");
     assert!(
         crate::snapshots::claude_unchanged_proof_budget_fallbacks_for_test() > fallbacks,
         "the fallback is counted"
@@ -875,8 +891,11 @@ fn c1a_assert_family_emitted_and_tagged(
 #[test]
 #[serial(source_manifests)]
 fn c1a_contract_v1_to_v2_reemits_tagged_bodies_after_unchanged_terminal() {
-    // Contract-5 tagging oracle; markerless single-account E2 bodies keep the D1 wire shape.
-
+    // Contract-5 tagging oracle on ordinary money: a markerless single-account
+    // request-owned (E2) body keeps the D1 wire shape and never carries the
+    // cycle collector. The family is listed after an unlisted baseline, as a
+    // protected family is in production; listed bodies take the cycle
+    // contract and its row tags.
     use crate::snapshots::claude_request_identity::with_cycle_contract_for_test;
     if !c1a_layout_supported("c1a_contract_v1_to_v2_reemits") {
         return;
@@ -887,12 +906,40 @@ fn c1a_contract_v1_to_v2_reemits_tagged_bodies_after_unchanged_terminal() {
     let fixture = c1a_fixture("c1a-contract-v1-to-v2-reemits");
     c1a_add_family_request_identity(&fixture);
     let family = rearm_family_sessions();
+    // Unlisted baseline: the first complete census closes the fence with a
+    // full re-arm, so the next window re-reads every member.
+    let baseline = with_cycle_contract_for_test(V1, || c1a_generation(&fixture, "v1", (7, 55)));
+    let baseline_window = c1a_window(&baseline);
+    assert!(baseline_window.census_complete && baseline_window.full_rearm);
+    assert_eq!(
+        baseline_window.debt,
+        family.len(),
+        "the first proof re-arms"
+    );
+    // Positive control for the listed collector below: unlisted, the same
+    // family bodies are request-owned and never carry the V1 collector.
+    let unlisted_bodies = c1a_family_bodies(&baseline);
+    assert_eq!(unlisted_bodies.len(), family.len());
+    for (session, (_, item)) in &unlisted_bodies {
+        assert_eq!(
+            item.usage_accounting_contract.as_deref(),
+            Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT),
+            "{session}: unlisted body is request-owned"
+        );
+        assert_ne!(item.provenance.collector, V1, "{session}");
+    }
+    fixture.list_held(&[REARM_ROOT]);
     let closing = with_cycle_contract_for_test(V1, || c1a_generation(&fixture, "v1", (8, 0)));
     let v1_bodies = c1a_family_bodies(&closing)
         .into_iter()
         .map(|(session, (_, item))| {
             assert_eq!(item.provenance.collector, V1);
             assert!(!item.request_evidence.is_empty());
+            assert_ne!(
+                item.usage_accounting_contract.as_deref(),
+                Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT),
+                "{session}: the listed family is on ordinary money"
+            );
             (session, item)
         })
         .collect::<BTreeMap<_, _>>();

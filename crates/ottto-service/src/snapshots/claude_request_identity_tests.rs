@@ -2230,12 +2230,19 @@ fn legacy_fork_fixture(
             + &legacy_line(LEGACY_CHILD, 4, "req_child_2", 14, 5),
     )
     .unwrap();
-    let mut items =
-        parse_claude_code_jsonl_file(&parent_path, "2026-08-02T07:01:00Z", "parent-fp".into())
-            .unwrap();
+    let mut items = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+        &parent_path,
+        "2026-08-02T07:01:00Z",
+        "parent-fp".into(),
+    )
+    .unwrap();
     items.extend(
-        parse_claude_code_jsonl_file(&child_path, "2026-08-02T07:01:00Z", "child-fp".into())
-            .unwrap(),
+        crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+            &child_path,
+            "2026-08-02T07:01:00Z",
+            "child-fp".into(),
+        )
+        .unwrap(),
     );
     assert_eq!(items[1].request_count, 3, "the raw child counts the prefix");
 
@@ -2279,7 +2286,8 @@ fn legacy_fork_fixture(
         ]),
         health: Default::default(),
     };
-    let mut index = ScanIndex::default();
+    let mut index =
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
     for path in [&parent_path, &child_path] {
         index
             .files
@@ -2870,7 +2878,7 @@ fn bound_case(
     Vec<SnapshotItem>,
     claude_request_accounts::MixedUploads,
 ) {
-    let (dir, root, mut items) = claude_account_family_fixture(false);
+    let (dir, root, mut items) = claude_account_family_fixture(true);
     items.truncate(1);
     items[0].session_account_evidence = Some(SessionAccountEvidence {
         provider: "anthropic",
@@ -3467,6 +3475,26 @@ fn parse_session(folder: &Path, lines: &[Value]) -> Vec<SnapshotItem> {
     parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "fp".into()).unwrap()
 }
 
+fn parse_ordinary_session(folder: &Path, lines: &[Value]) -> Vec<SnapshotItem> {
+    let project = folder.join("projects").join("-synthetic-repo");
+    fs::create_dir_all(&project).unwrap();
+    let path = project.join(format!("{ROOT}.jsonl"));
+    fs::write(
+        &path,
+        lines
+            .iter()
+            .map(|line| line.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+        &path,
+        "2026-08-02T07:01:00Z",
+        "fp".into(),
+    )
+    .unwrap()
+}
+
 #[test]
 fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
@@ -3478,7 +3506,7 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
     let org = org_hash(ORG_1);
     let request_at = rfc3339_unix_seconds("2026-08-02T07:00:01Z").unwrap();
     let start = rfc3339_unix_seconds(
-        parse_session(&slot, &email_session(true, false))[0]
+        parse_ordinary_session(&slot, &email_session(true, false))[0]
             .source_started_at
             .as_deref()
             .unwrap(),
@@ -3495,7 +3523,7 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
             .and_then(|markers| markers.email_home(sequence))
             .copied()
     };
-    let parsed = parse_session(&slot, &email_session(true, false));
+    let parsed = parse_ordinary_session(&slot, &email_session(true, false));
     assert_eq!(email_home(&parsed), Some(home));
     assert!(
         !serde_json::to_string(&parsed[0])
@@ -3504,18 +3532,18 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
         "no email on the item"
     );
     assert_eq!(
-        email_home(&parse_session(&slot, &email_session(false, false))),
+        email_home(&parse_ordinary_session(&slot, &email_session(false, false))),
         None,
         "email after the request"
     );
     assert_eq!(
-        email_home(&parse_session(&slot, &email_session(true, true))),
+        email_home(&parse_ordinary_session(&slot, &email_session(true, true))),
         None,
         "email switched before it"
     );
     let (api, trace) = reports(Vec::new(), Vec::new());
     let scan_lines = |folder: &Path, lines: &[Value], ledger: &Ledger| {
-        let mut items = parse_session(folder, lines);
+        let mut items = parse_ordinary_session(folder, lines);
         let before = items[0].clone();
         let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None)
             .with_status_coverage(Some(ledger.clone()));
@@ -3848,7 +3876,7 @@ fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
         };
         let ownership = identity::TranscriptOwnership::after_census(index, &disposition);
         for reported in [false, true] {
-            let mut item = parse_session(&dir, &lines).remove(0);
+            let mut item = parse_ordinary_session(&dir, &lines).remove(0);
             let groupings = if reported {
                 item.usage_accounting_contract = Some("session_exclusive_reported_usage:v1".into());
                 let mut sink =
@@ -4050,8 +4078,8 @@ fn zero_usage_api_error_with_request_id_keeps_contract5_and_claims_nothing() {
     let base = owned_session();
     let mut appended = base.clone();
     appended.push(api_error_response(Some("req_error"), &second(4)));
-    let raw_before = parse_session(&dir, &base).remove(0);
-    let raw_after = parse_session(&dir, &appended).remove(0);
+    let raw_before = parse_ordinary_session(&dir, &base).remove(0);
+    let raw_after = parse_ordinary_session(&dir, &appended).remove(0);
     // The trigger: the parser keeps the error's id but counts no request.
     assert_eq!(raw_before.request_count, 3);
     assert_eq!(raw_after.request_count, 3);
@@ -4066,9 +4094,11 @@ fn zero_usage_api_error_with_request_id_keeps_contract5_and_claims_nothing() {
     // nothing to attribute to its hour: it adds no request and no bucket,
     // and the hour keeps its first owned activity.
     let mut token_less = base.clone();
-    token_less.push(json!({"timestamp": second(5), "type": "assistant", "sessionId": ROOT,
-        "message": {"model": "claude-haiku-4-5", "usage": {}}}));
-    let raw_token_less = parse_session(&dir, &token_less).remove(0);
+    token_less.push(
+        json!({"timestamp": second(5), "type": "assistant", "sessionId": ROOT,
+        "message": {"model": "claude-haiku-4-5", "usage": {}}}),
+    );
+    let raw_token_less = parse_ordinary_session(&dir, &token_less).remove(0);
     assert_eq!(raw_token_less.request_count, 3);
     assert_eq!(raw_token_less.usage_buckets.len(), 1);
     assert_eq!(
@@ -4113,7 +4143,7 @@ fn zero_usage_api_error_with_request_id_keeps_contract5_and_claims_nothing() {
     let mut progressive = base.clone();
     progressive.insert(2, owned_response("req_3", "2026-08-02T07:00:02.500Z", 0, 0));
     for (case, lines) in [("without id", without_id), ("progressive", progressive)] {
-        let raw = parse_session(&dir, &lines).remove(0);
+        let raw = parse_ordinary_session(&dir, &lines).remove(0);
         assert_eq!(raw.request_count, 3, "{case}");
         assert_eq!(raw.claude_usage_request_ids.len(), 3, "{case}");
         assert!(
@@ -4179,8 +4209,16 @@ fn zero_usage_record_never_admits_unowned_or_uncounted_usage() {
         let mut lines = owned_session();
         lines.push(api_error_response(Some("req_error"), &second(4)));
         lines.extend(extra);
-        parse_session(&dir, &lines).remove(0)
+        parse_ordinary_session(&dir, &lines).remove(0)
     };
+    let control = with_error(None);
+    let (outcome, tagged) = tag_one(&control, &api, &trace);
+    assert_eq!(
+        outcome.sent, 1,
+        "the same ordinary body tags before corruption"
+    );
+    assert_eq!(control.request_count, 3);
+    assert!(!tagged.request_evidence.is_empty());
     let without_id = json!({"timestamp": second(5), "type": "assistant", "sessionId": ROOT,
         "message": {"id": "msg_without_id", "model": "claude-haiku-4-5",
         "usage": {"input_tokens": 10, "output_tokens": 10}}});
@@ -4252,7 +4290,7 @@ fn zero_usage_record_never_admits_unowned_or_uncounted_usage() {
 
     let mut bodies = Vec::new();
     for lines in [base, appended] {
-        let raw = parse_session(&dir, &lines).remove(0);
+        let raw = parse_ordinary_session(&dir, &lines).remove(0);
         let (outcome, tagged) = tag_one(&raw, &api_report, &trace_report);
         assert_eq!(outcome.sent, 1, "{outcome:?}");
         assert_usage_conserved(&tagged, &raw);

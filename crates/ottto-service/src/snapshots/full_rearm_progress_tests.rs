@@ -35,7 +35,23 @@ struct Rearm {
 
 impl Rearm {
     fn new() -> Self {
-        let (root, parent, mut items) = claude_account_family_fixture(false);
+        Self::with_money(false)
+    }
+
+    /// The same family on ordinary money: parsed through the real paused
+    /// (fail-closed) exclusion list, the listed/paused path production still
+    /// reaches. Pair it with `e2_pipeline_scan_fixture::ordinary_index`.
+    fn ordinary() -> Self {
+        let rearm = Self::with_money(true);
+        assert!(
+            rearm.items.iter().all(|item| item.claude_money.is_none()),
+            "ordinary money carries no request-owned fold"
+        );
+        rearm
+    }
+
+    fn with_money(ordinary_money: bool) -> Self {
+        let (root, parent, mut items) = claude_account_family_fixture(ordinary_money);
         let valid_parent = items[0].clone();
         items[1].claude_usage_occurrences.clear();
         assert!(claude_member_invalidity_is_structural(&items[1]));
@@ -1813,10 +1829,11 @@ fn a_dropped_cutover_field_with_recorded_empty_spends_one_more_run() {
 /// canonical BadClock refusal stays visible without forcing whole-index Full.
 #[test]
 fn pipeline_auxiliary_bad_clock_preserves_refusal_without_whole_index_rearm() {
-    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy
+    // demotion, so the family reads ordinary money under the paused list.
 
-    let mut rearm = Rearm::new();
-    let mut index = rearm.index();
+    let mut rearm = Rearm::ordinary();
+    let mut index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(rearm.index());
     rearm.add_other_family(&mut index);
     index.claude_request_identity_contract =
         Some(claude_request_identity::cycle_contract(true).to_string());
@@ -2409,10 +2426,17 @@ fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
                 &scan.census_window_end,
             );
         };
-        let mut index = rearm.index();
+        // Ordinary money through the real paused (fail-closed) list: the
+        // account-withholding path below is the legacy one.
+        let mut index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(rearm.index());
         let mut initial = scan(&mut index, WINDOW);
         assert_eq!(initial.scanned_file_count, 4);
         assert!(initial.census_complete);
+        assert!(initial.snapshots.iter().all(|item| {
+            item.claude_money.is_none()
+                && item.usage_accounting_contract.as_deref()
+                    != Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT)
+        }));
         enrich(&mut initial, &mut index);
         let family = |items: &[SnapshotItem]| {
             items
@@ -2865,8 +2889,10 @@ fn each_canonical_telemetry_refusal_is_counted_without_whole_index_rearm() {
 
 #[test]
 fn bound_retry_pending_authority_survives_unrelated_suppression_and_offers_its_own_due_retry() {
-    let mut rearm = Rearm::new();
-    let mut index = rearm.index();
+    // The legacy fold quarantines malformed authority; a request-owned body
+    // settles it instead, so the family reads ordinary money (paused list).
+    let mut rearm = Rearm::ordinary();
+    let mut index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(rearm.index());
     rearm.add_other_family(&mut index);
     let mut items = rearm.items.clone();
     let revision = "1".repeat(64);

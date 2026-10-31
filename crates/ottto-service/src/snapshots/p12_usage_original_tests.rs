@@ -37,7 +37,9 @@ struct Family {
 
 impl Family {
     fn new() -> Self {
-        let (dir, root_session_id, _) = claude_account_family_fixture(false);
+        // Ordinary (legacy reported-usage) money: the oracle's family
+        // members are parsed through the real paused-adoption input.
+        let (dir, root_session_id, _) = claude_account_family_fixture(true);
         let parent_path = dir.join(format!("{root_session_id}.jsonl"));
         let child_path = dir
             .join(&root_session_id)
@@ -76,8 +78,12 @@ impl Family {
         }
     }
 
+    /// Parses through the real paused-adoption exclusion input, so the
+    /// member keeps its ordinary reported body (the oracle's legacy money),
+    /// as production does for a listed family.
     fn parse(&self, path: &Path, window: &str, seed: u64) -> Vec<SnapshotItem> {
-        parse_claude_code_jsonl_file(path, window, revision(seed)).expect("parse family member")
+        crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(path, window, revision(seed))
+            .expect("parse family member")
     }
 
     fn parent(&self, window: &str) -> Vec<SnapshotItem> {

@@ -186,7 +186,16 @@ fn next_full(
     assert_eq!(seen.unreadable, 0, "{id}: causes={:?}", seen.causes);
     assert_eq!(
         content(production_body(CLAUDE, next.clone())),
-        content(full_body(&base.fixture, CLAUDE)),
+        content({
+            let (_, full, _) = production_scan(
+                &base.fixture,
+                CLAUDE,
+                crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default()),
+                None,
+                "stage2pre-ordinary-oracle",
+            );
+            production_body(CLAUDE, full)
+        }),
         "{id}: next body == Full parse"
     );
     (index, next)
@@ -206,7 +215,8 @@ fn grown_full() -> Grown {
     base.cache.clear();
     let path = base.path.clone();
     let appended = row_bytes(CLAUDE, 6..9);
-    let index = std::mem::take(&mut base.index);
+    let index =
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(std::mem::take(&mut base.index));
     let (index, result, seen, read) =
         page_injecting(&base.fixture, CLAUDE, index, &base.cache, is_full, |_| {
             append_raw(&path, &appended)
@@ -229,7 +239,12 @@ fn quiescent() -> (ScanFixture, ScanIndex, SourceScanResult) {
     let fixture = ScanFixture::new(CLAUDE);
     append_raw(&fixture.file.0, &row_bytes(CLAUDE, 0..6));
     let cache = Arc::new(sampled_scan::SharedCache::default());
-    let (index, result, seen) = plain(&fixture, CLAUDE, ScanIndex::default(), &cache);
+    let (index, result, seen) = plain(
+        &fixture,
+        CLAUDE,
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default()),
+        &cache,
+    );
     assert_eq!(seen.modes, (1, 0, 0), "precondition: one Full read");
     assert_eq!(seen.unreadable, 0, "causes={:?}", seen.causes);
     assert!(result.census_complete, "precondition: a healthy terminal");
@@ -1015,6 +1030,12 @@ fn fe_claude_source_prefix_never_mints_v1_or_witness() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    let (control_fixture, mut control_index, control_body) = quiescent();
+    assert!(
+        mints_v1(&mut control_index, &control_body, 0..6),
+        "healthy ordinary EOF mints the authority denied to this prefix"
+    );
+    drop(control_fixture);
     let mut grown = grown_full();
     assert_eq!(
         grown.seen.unreadable, 0,
@@ -1140,6 +1161,12 @@ fn fe_claude_unverified_source_api_rows_beyond_prefix_cannot_mint_v1() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    let (control_fixture, mut control_index, control_body) = quiescent();
+    assert!(
+        mints_v1(&mut control_index, &control_body, 0..6),
+        "healthy ordinary EOF mints the authority denied to this prefix"
+    );
+    drop(control_fixture);
     let mut grown = grown_full();
     assert_eq!(grown.seen.unreadable, 0);
     assert!(!grown.result.snapshots.is_empty());
@@ -1162,6 +1189,12 @@ fn fe_claude_prefix_without_d1_record_still_cannot_mint_v1() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    let (control_fixture, mut control_index, control_body) = quiescent();
+    assert!(
+        mints_v1(&mut control_index, &control_body, 0..6),
+        "healthy ordinary EOF mints the authority denied to this prefix"
+    );
+    drop(control_fixture);
     let mut grown = grown_full();
     assert_eq!(grown.seen.unreadable, 0);
     assert!(grown.index.files[&grown.base.key].has_unverified_source());
@@ -1310,9 +1343,9 @@ fn fe_claude_finalizer_only_response_loss_refuses_the_grown_prefix() {
         "no loss before finalization"
     );
     reducer.finalize_claude_responses();
-    assert!(
-        reducer.dropped_usage_record_count > 0,
-        "incomparable usage loses at finalization"
+    assert_eq!(
+        reducer.dropped_usage_record_count, 0,
+        "unlisted E2 retains the disclosed resolver conflict"
     );
     let mut bytes = serde_json::to_vec(&conflict).unwrap();
     bytes.push(b'\n');
@@ -1321,7 +1354,7 @@ fn fe_claude_finalizer_only_response_loss_refuses_the_grown_prefix() {
     let (_, result, seen, _) = page_injecting(
         &base.fixture,
         CLAUDE,
-        base.index,
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(base.index),
         &base.cache,
         is_full,
         |_| append_raw(&path, &row_bytes(CLAUDE, 6..9)),
@@ -1414,6 +1447,12 @@ fn fe_claude_old_unknown_and_malformed_provenance_exclude() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    let (control_fixture, mut control_index, control_body) = quiescent();
+    assert!(
+        mints_v1(&mut control_index, &control_body, 0..6),
+        "healthy ordinary EOF mints the authority denied to this prefix"
+    );
+    drop(control_fixture);
     for tag in [
         "semantic_sync:v2+sampled_unverified:v1:9999999999",
         "semantic_sync:v2+sampled_unverified:v99:9999999999:c",
@@ -1433,6 +1472,12 @@ fn fe_claude_prefix_provenance_round_trips_without_d1() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    let (control_fixture, mut control_index, control_body) = quiescent();
+    assert!(
+        mints_v1(&mut control_index, &control_body, 0..6),
+        "healthy ordinary EOF mints the authority denied to this prefix"
+    );
+    drop(control_fixture);
     let mut grown = grown_full();
     let tag = grown.index.files[&grown.base.key]
         .scan_identity_version
@@ -1446,7 +1491,8 @@ fn fe_claude_prefix_provenance_round_trips_without_d1() {
     grown.index.files.insert(moved.clone(), entry);
     let path = grown.base.fixture.root.join("prefix-index.json");
     grown.index.save(&path).unwrap();
-    let mut loaded = ScanIndex::load(&path).unwrap();
+    let mut loaded =
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::load(&path).unwrap());
     assert_eq!(loaded.files[&moved].scan_identity_version, tag);
     assert!(!mints_v1(&mut loaded, &grown.result, 0..9));
 }
@@ -1466,7 +1512,7 @@ fn fe_claude_prefix_then_complete_tail_at_eof_is_positive_again() {
     let (index, result, seen, _) = page_injecting(
         &base.fixture,
         CLAUDE,
-        std::mem::take(&mut base.index),
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(std::mem::take(&mut base.index)),
         &base.cache,
         is_full,
         |_| append_raw(&path, &row_bytes(CLAUDE, 6..9)),
@@ -1721,7 +1767,12 @@ fn erased_hold(due: u64) -> ErasedHold {
     append_raw(&fixture.file.0, &row_bytes(CLAUDE, 0..6));
     let key = local_index_key(&fixture.file.0);
     let cache = Arc::new(sampled_scan::SharedCache::default());
-    let (mut index, first, seen) = plain(&fixture, CLAUDE, ScanIndex::default(), &cache);
+    let (mut index, first, seen) = plain(
+        &fixture,
+        CLAUDE,
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default()),
+        &cache,
+    );
     assert_eq!(seen.modes, (1, 0, 0));
     assert_eq!(seen.unreadable, 0);
     assert!(cache.retained_checkpoint(&key).is_some());
@@ -1773,7 +1824,8 @@ fn erased_hold(due: u64) -> ErasedHold {
     index.save(&path).unwrap();
     drop(index);
     cache.clear();
-    let index = ScanIndex::load(&path).unwrap();
+    let index =
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::load(&path).unwrap());
     assert!(cache.retained_checkpoint(&key).is_none());
     assert_eq!(
         index.files[&key].scan_identity_version.as_deref(),
@@ -1856,7 +1908,9 @@ fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
     assert_eq!(restored_index.files[&key].unverified_deadline(), Some(due));
     restored_index.save(&hold.index_path).unwrap();
     drop(restored_index);
-    let mut loaded = ScanIndex::load(&hold.index_path).unwrap();
+    let mut loaded = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(
+        ScanIndex::load(&hold.index_path).unwrap(),
+    );
     loaded = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(loaded);
     assert_eq!(loaded.files[&key].unverified_deadline(), Some(due));
     assert_eq!(restore_dated(&mut loaded, due), 0);
@@ -2036,7 +2090,9 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
     assert_eq!(restored_index.files[&key].unverified_deadline(), Some(due));
     restored_index.save(&hold.index_path).unwrap();
     drop(restored_index);
-    let loaded = ScanIndex::load(&hold.index_path).unwrap();
+    let loaded = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(
+        ScanIndex::load(&hold.index_path).unwrap(),
+    );
 
     sampled_scan::set_test_now(Some(due));
     let (mut audited, result, seen, read) = page_injecting(
@@ -2161,7 +2217,9 @@ fn fe_n1_option_b_saturated_non_draining_debts_do_not_starve_many_readable_holds
         attempted: false,
     });
     index.save(&hold.index_path).unwrap();
-    index = ScanIndex::load(&hold.index_path).unwrap();
+    index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(
+        ScanIndex::load(&hold.index_path).unwrap(),
+    );
     let mut completed = BTreeSet::new();
     let mut fulls = 0;
     for turn in 0..(readable.len() * 2 + 4) {
@@ -2192,7 +2250,9 @@ fn fe_n1_option_b_saturated_non_draining_debts_do_not_starve_many_readable_holds
             &unavailable_key
         ));
         index.save(&hold.index_path).unwrap();
-        index = ScanIndex::load(&hold.index_path).unwrap();
+        index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(
+            ScanIndex::load(&hold.index_path).unwrap(),
+        );
         if completed == readable {
             break;
         }
@@ -2257,7 +2317,9 @@ fn fe_n1_option_b_failed_virtual_audits_keep_hold_and_reserved_slot_then_reprove
         let (mut index, _, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
         assert_eq!(seen.modes, (0, 0, 0), "scheduling is zero reads");
         index.save(&hold.index_path).unwrap();
-        let index = ScanIndex::load(&hold.index_path).unwrap();
+        let index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(
+            ScanIndex::load(&hold.index_path).unwrap(),
+        );
         sampled_scan::set_test_now(Some(due - 3 * INTERVAL));
         let mut index = if failure != 0 {
             let (index, result, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
@@ -2303,7 +2365,9 @@ fn fe_n1_option_b_failed_virtual_audits_keep_hold_and_reserved_slot_then_reprove
             CACHE_ENTRIES - 1
         );
         index.save(&hold.index_path).unwrap();
-        let index = ScanIndex::load(&hold.index_path).unwrap();
+        let index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(
+            ScanIndex::load(&hold.index_path).unwrap(),
+        );
         assert!(sampled_audit::awaits_hold_deadline_restoration(
             &index, &key
         ));
@@ -2318,7 +2382,9 @@ fn fe_n1_option_b_failed_virtual_audits_keep_hold_and_reserved_slot_then_reprove
         let (mut index, _, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
         assert_eq!(seen.modes, (0, 0, 0), "retry waits a fresh interval");
         index.save(&hold.index_path).unwrap();
-        let index = ScanIndex::load(&hold.index_path).unwrap();
+        let index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(
+            ScanIndex::load(&hold.index_path).unwrap(),
+        );
         sampled_scan::set_test_now(Some(due - INTERVAL));
         let (mut index, result, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
         assert_eq!(seen.full_reasons[STATE_MISSING], 1);

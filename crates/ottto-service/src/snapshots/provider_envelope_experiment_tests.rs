@@ -826,7 +826,8 @@ fn native_comparison_seeded_index_is_not_an_actual_skip_certificate() {
 fn native_comparison_current_nonreported_member_withdraws_whole_family() {
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
 
-    let fixture = NativePreparationFixture::new();
+    let mut fixture = NativePreparationFixture::new();
+    fixture.index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(fixture.index);
     let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
     let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
     writeln!(file, "{{\"timestamp\":\"2026-08-02T07:00:08Z\",\"type\":\"assistant\",\"sessionId\":\"{}\",\"requestId\":\"new_native_request\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}", fixture.parent).unwrap();
@@ -890,7 +891,8 @@ fn write_native_preparation_pair(support: &Path, root: &str, api: &Api, trace: &
 }
 
 fn native_preparation_pair_roundtrip(replace: bool) {
-    let fixture = NativePreparationFixture::new();
+    let mut fixture = NativePreparationFixture::new();
+    fixture.index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(fixture.index);
     let support = crate::test_scratch::ScratchDir::new("native-preparation-pairs");
     write_native_preparation_pair(&support, &fixture.parent, &fixture.api, &fixture.trace);
     crate::claude_local_otel::reset_evidence_read_counts_for_test();
@@ -3148,6 +3150,7 @@ fn native_comparison_corrected_native_receipt_fixture(
     } else {
         NativePreparationFixture::new()
     };
+    fixture.index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(fixture.index);
     let key = local_index_key(&fixture.dir.join(format!("{}.jsonl", fixture.parent)));
     fixture
         .index

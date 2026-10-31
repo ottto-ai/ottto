@@ -203,6 +203,10 @@ fn native_comparison_real_source_preparation_stays_base_without_paired_evidence(
 
     let fixture = IdentityPipelineHome::new();
     let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
+    crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(
+        &fixture.base.join("support-native-preparation"),
+        &[IDENTITY_PIPELINE_ROOT],
+    );
     let cycle = identity_pipeline_cycle(&fixture, "native-preparation", "").unwrap();
     if crate::heap_layout_bound::layout_supported() {
         assert!(cycle.prepared_before_body);
@@ -269,6 +273,10 @@ fn always_on_emits_contract5_whatever_the_hint_token() {
             r#","session_request_identity_contract":"claude_code_jsonl:own_request_identity_rows:v1""#,
         ),
     ] {
+        crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(
+            &fixture.base.join(format!("support-{name}")),
+            &[IDENTITY_PIPELINE_ROOT],
+        );
         let cycle = identity_pipeline_cycle(&fixture, name, extra).expect("cycle");
         let item = session(&cycle);
         assert_eq!(item.provenance.collector, identity::COLLECTOR, "{name}");
@@ -339,6 +347,10 @@ fn always_on_emits_contract5_whatever_the_hint_token() {
     let mut telemetry_bodies = BTreeSet::new();
     for name in ["telemetry-first", "telemetry-again"] {
         write_native_bootstrap_sidecars(&fixture, &fixture.base.join(format!("support-{name}")));
+        crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(
+            &fixture.base.join(format!("support-{name}")),
+            &[IDENTITY_PIPELINE_ROOT],
+        );
         let cycle = identity_pipeline_cycle(&fixture, name, "").expect("cycle");
         let item = session(&cycle);
         assert_eq!(item.provenance.collector, identity::COLLECTOR, "{name}");
@@ -759,7 +771,11 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
     );
     assert!(bodies
         .iter()
-        .any(|body| body["usage_accounting_contract"] == "session_exclusive_reported_usage:v1"));
+        .any(|body| body["usage_accounting_contract"]
+            == crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT));
+    assert!(bodies
+        .iter()
+        .all(|body| body["usage_accounting_contract"] != "session_exclusive_reported_usage:v1"));
     drop(bodies);
     let abandoned = crate::agent_status_refresh::with_test_collection(collection(), || {
         prepare_sync_source(

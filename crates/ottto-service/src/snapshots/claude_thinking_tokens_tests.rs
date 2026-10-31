@@ -30,9 +30,13 @@ fn write_family(dir: &Path, root_thinking: Option<u64>) -> (PathBuf, PathBuf) {
 }
 
 fn parse_member(path: &Path, fingerprint: &str) -> SnapshotItem {
-    parse_claude_code_jsonl_file(path, "2026-08-02T07:01:00Z", fingerprint.to_string())
-        .expect("parse member")
-        .remove(0)
+    crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+        path,
+        "2026-08-02T07:01:00Z",
+        fingerprint.to_string(),
+    )
+    .expect("parse member")
+    .remove(0)
 }
 
 /// [regress] Reader-upgrade recovery: a family proven before the thinking reader hashed reasoning 0 into its

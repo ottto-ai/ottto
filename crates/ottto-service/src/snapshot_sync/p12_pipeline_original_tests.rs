@@ -224,10 +224,21 @@ impl RearmFixture {
         fixture
     }
 
-    fn ordinary(case: &'static str) -> Self {
-        let fixture = Self::new(case);
-        crate::snapshots::e2_pipeline_scan_fixture::pause_adoption(&fixture.support);
-        fixture
+    /// The real exclusion list, in `finish_sync_source`'s order after the
+    /// revision activates: adopt, load the list from the support directory,
+    /// then the money rules. The list is runtime-only (`#[serde(skip)]`), so
+    /// every reload of the index needs it again.
+    fn load_exclusion_list(&self, index: &mut ScanIndex) {
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+        index.load_claude_reemission_exclusions(&self.support);
+        crate::snapshots::claude_request_money::e2::apply_money_rules(index);
+    }
+
+    /// Lists only these sessions (a listed root's subagents follow through the
+    /// family closure), as a real list the next page loads. Call it after an
+    /// unlisted baseline.
+    fn list_held(&self, sessions: &[&str]) {
+        crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&self.support, sessions);
     }
 
     fn member_path(&self, agent: Option<&str>) -> PathBuf {
@@ -464,6 +475,7 @@ impl RearmFixture {
         index.activate_effective_upload_body_witness_revision(
             effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
+        self.load_exclusion_list(&mut index);
         let (mut native_preparation, mut index, mut scan, committed_index) =
             if crate::snapshots::claude_native_comparison::enabled()
                 || self.request_identity
@@ -1054,7 +1066,22 @@ impl RearmFixture {
     /// re-arms its earlier-page members; the next one rebuilds them from that
     /// proof and delivers the reported bodies. Only what both the original and
     /// the optimized re-arm rule produce is asserted here.
+    ///
+    /// The first generation is the unlisted baseline (request-owned money,
+    /// stamped at revision 3, as a revision-3 daemon leaves it). The family is
+    /// then listed through the real exclusion file, so the correction delivers
+    /// its ordinary reported bodies, as production does for a listed family.
     fn establish(&self) -> RearmEstablished {
+        let proven = self.establish_baseline();
+        self.list_held(&[REARM_ROOT]);
+        self.establish_listed(&proven)
+    }
+
+    /// `establish`'s unlisted baseline generation. Fixtures that share one
+    /// support directory (`native_comparison_independent_history`) each run
+    /// it before the family is listed, then `establish_listed`. Returns the
+    /// first exact family proof.
+    fn establish_baseline(&self) -> String {
         let family = rearm_family_sessions();
         let first = self.generation(8);
         let last = first.last().expect("terminal page");
@@ -1079,7 +1106,14 @@ impl RearmFixture {
             family.len(),
             "the first exact proof re-arms every earlier-page member"
         );
+        proven
+    }
 
+    /// `establish`'s correction generation, once the family is listed: it
+    /// rebuilds the re-armed members from the baseline proof and delivers
+    /// their ordinary reported bodies.
+    fn establish_listed(&self, proven: &str) -> RearmEstablished {
+        let family = rearm_family_sessions();
         let corrected = self.generation(9);
         let last = corrected.last().expect("terminal page");
         assert!(last.scan.census_complete);
@@ -1115,7 +1149,7 @@ impl RearmFixture {
             last.index
                 .claude_usage_family_witness_digest_for_test(REARM_ROOT)
                 .as_deref(),
-            Some(proven.as_str())
+            Some(proven)
         );
         RearmEstablished { heads }
     }
@@ -1422,10 +1456,7 @@ fn native_comparison_assert_old_bindings(before: &serde_json::Value, index: &Sca
 
 /// Every family member's latest finalized effective body has its own strict
 /// ACK at its native read time, and the selected group is derived from it.
-fn native_comparison_assert_ack_conservation(
-    fixture: &RearmFixture,
-    selected: &serde_json::Value,
-) {
+fn native_comparison_assert_ack_conservation(fixture: &RearmFixture, selected: &serde_json::Value) {
     use sha2::{Digest, Sha256};
     let trace = fixture.body_trace.borrow();
     for (session, witness) in &trace.finalizer_witnesses {
@@ -1468,16 +1499,27 @@ fn native_comparison_novel_import_base_parity() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let base = RearmFixture::ordinary("native-parity-shared-source");
+    let base = RearmFixture::new("native-parity-shared-source");
     let candidate = native_comparison_independent_history(&base);
-    let base_established = base.establish();
+    // Both histories share one support directory, so both run their unlisted
+    // baseline before the real list names the family (`establish`).
+    let base_proven = base.establish_baseline();
+    let candidate_proven = {
+        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+        candidate.establish_baseline()
+    };
+    base.list_held(&[REARM_ROOT]);
+    let base_established = base.establish_listed(&base_proven);
     let base_quiet = base.generation(10);
     assert_eq!(rearm_reads(&base_quiet), 3);
     let base_before = serde_json::to_value(&base_quiet.last().unwrap().index).unwrap();
     let base_selected = native_comparison_selected_family(&base_quiet.last().unwrap().index);
     let candidate_selected = {
         let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-        assert_eq!(candidate.establish().heads, base_established.heads);
+        assert_eq!(
+            candidate.establish_listed(&candidate_proven).heads,
+            base_established.heads
+        );
         let quiet = candidate.generation(10);
         assert_eq!(rearm_reads(&quiet), 0);
         native_comparison_selected_family(&quiet.last().unwrap().index)
@@ -1485,6 +1527,9 @@ fn native_comparison_novel_import_base_parity() {
     assert_eq!(base_selected, candidate_selected);
     const IMPORT: &str = "d4444444-4444-4444-8444-444444444444";
     let import_path = native_comparison_add_import(&base, IMPORT, "req_novel_import");
+    // The novel import's ordinary reported body is the oracle: list its own
+    // root too, before its first read.
+    base.list_held(&[REARM_ROOT, IMPORT]);
     let base_import = base.generation(11);
     let candidate_import = {
         let _native = crate::snapshots::claude_native_comparison::enable_for_test();
@@ -1629,6 +1674,7 @@ fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
     index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
         SnapshotSource::ClaudeCode,
     ));
+    fixture.load_exclusion_list(&mut index);
     let frame = fixture.native_preparation(index, "2026-08-02T14:00:00Z");
     let target_hook =
         crate::snapshots::claude_native_comparison::target_unknown_allowance_for_test();
@@ -1678,7 +1724,7 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     }
     let _source_manifests = SourceManifestTestGuard::new();
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    let mut fixture = RearmFixture::ordinary("native-real-copy-after-quiet");
+    let mut fixture = RearmFixture::new("native-real-copy-after-quiet");
     // The deferred-only contract applies to families that fit a native page.
     // The ORIGINAL two required oracles remain at REARM_PAGE_FILES=2.
     fixture.native_file_limit = 4;
@@ -1689,6 +1735,9 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     assert_eq!(rearm_reads(&fixture.generation(10)), 0);
     const COPY: &str = "e5555555-5555-4555-8555-555555555555";
     let path = native_comparison_add_import(&fixture, COPY, "req_root_1");
+    // The copy keeps the pre-E2 ordinary body this oracle compares: list its
+    // own root beside the family, before its first read.
+    fixture.list_held(&[REARM_ROOT, COPY]);
     let family = rearm_family_sessions();
     let mut seen = BTreeMap::<String, BTreeSet<String>>::new();
     let first = fixture.generation(11);
@@ -1842,16 +1891,27 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
                                    // independent BASE history sees the same physical source and native input.
     fixture.owned_base_preparation = true;
     let baseline = restart.then(|| native_comparison_independent_history(&fixture));
-    if let Some(base) = baseline.as_ref() {
-        base.establish();
+    // BASE shares the fixture's support directory, so both run their unlisted
+    // baseline before the real list names the family (`establish`).
+    let base_proven = baseline.as_ref().map(RearmFixture::establish_baseline);
+    let proven = {
+        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+        fixture.establish_baseline()
+    };
+    fixture.list_held(&[REARM_ROOT]);
+    if let (Some(base), Some(base_proven)) = (baseline.as_ref(), base_proven.as_deref()) {
+        base.establish_listed(base_proven);
     }
     let native = crate::snapshots::claude_native_comparison::enable_for_test();
-    fixture.establish();
+    fixture.establish_listed(&proven);
     let quiet = fixture.generation(10);
     assert_eq!(rearm_reads(&quiet), 0);
     let before = serde_json::to_value(&quiet.last().unwrap().index).unwrap();
     const COPY: &str = "f6666666-6666-4666-8666-666666666666";
     let copy_path = native_comparison_add_import(&fixture, COPY, "req_root_1");
+    // The copy keeps the pre-E2 ordinary body this oracle compares: list its
+    // own root beside the family, before its first read (BASE shares it).
+    fixture.list_held(&[REARM_ROOT, COPY]);
     drop(native);
     let baseline_outcome = baseline.as_ref().map(|base| {
         let imported = base.generation(11);
@@ -1908,7 +1968,10 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
             assert!(!page.uploaded.contains(&copy.snapshot_fingerprint));
             // Transferred from the retired corrective-parse interruption
             // variants (E2-043/044): an offered, unACKed page never mints.
-            assert_eq!(page.native_receipts, 0, "offered/shed/pending ACK never mint");
+            assert_eq!(
+                page.native_receipts, 0,
+                "offered/shed/pending ACK never mint"
+            );
             assert_eq!(copy.first_turn_context_tokens, None);
             assert_eq!(copy.peak_context_fill_tokens, None);
             assert_eq!(copy.last_turn_context_tokens, None);
@@ -2031,18 +2094,29 @@ fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let mut base = RearmFixture::ordinary("native-positive-own-C5");
+    let mut base = RearmFixture::new("native-positive-own-C5");
     base.request_identity = true;
     let candidate = native_comparison_independent_history(&base);
-    base.establish();
+    // Both histories share one support directory, so both run their unlisted
+    // baseline before the real list names the family (`establish`).
+    let base_proven = base.establish_baseline();
+    let candidate_proven = {
+        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+        candidate.establish_baseline()
+    };
+    base.list_held(&[REARM_ROOT]);
+    base.establish_listed(&base_proven);
     base.generation(10);
     {
         let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-        candidate.establish();
+        candidate.establish_listed(&candidate_proven);
         assert_eq!(rearm_reads(&candidate.generation(10)), 0);
     }
     const OWN: &str = "d7777777-7777-4777-8777-777777777777";
     native_comparison_add_import(&base, OWN, "req_own_C5");
+    // The own-identity body is the pre-E2 ordinary body under test: list its
+    // own root beside the family, before its first read.
+    base.list_held(&[REARM_ROOT, OWN]);
     // Own request-scoped OTEL identity, never an A marker or possible owner.
     let api_path = base
         .support
