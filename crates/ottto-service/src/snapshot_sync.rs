@@ -50,7 +50,7 @@ use ottto_protocol::{AgentStatusSnapshot, DetectedUse, SourceKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -2816,7 +2816,7 @@ impl SnapshotUploadProgress {
         {
             return Err(anyhow!("snapshot upload progress changed concurrently"));
         }
-        let tombstone = unique_progress_sibling(path, "cleared");
+        let tombstone = crate::locked_state_dir::unique_sibling(path, "cleared");
         std::fs::rename(path, &tombstone).context("atomically clear snapshot upload progress")?;
         sync_progress_parent(path)?;
         std::fs::remove_file(&tombstone).context("remove cleared snapshot upload progress")?;
@@ -2863,14 +2863,6 @@ impl Drop for SnapshotProgressLock {
     }
 }
 
-fn unique_progress_sibling(path: &Path, kind: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    path.with_extension(format!("{kind}.{}.{nanos}.json", std::process::id()))
-}
-
 fn sync_progress_parent(path: &Path) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -2881,7 +2873,7 @@ fn sync_progress_parent(path: &Path) -> Result<()> {
 }
 
 fn quarantine_invalid_progress(path: &Path) -> Result<()> {
-    let quarantine_path = unique_progress_sibling(path, "corrupt");
+    let quarantine_path = crate::locked_state_dir::unique_sibling(path, "corrupt");
     std::fs::rename(path, quarantine_path)
         .context("quarantine invalid local snapshot upload progress")?;
     sync_progress_parent(path)
@@ -11238,15 +11230,12 @@ fn update_detected_uses_cache(
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create detected_uses dir {}", dir.display()))?;
     let payload = serde_json::to_vec_pretty(&merged).context("serialize detected uses to JSON")?;
-    let temp_path = path.with_extension("json.tmp");
-    let mut temp = std::fs::File::create(&temp_path)
-        .with_context(|| format!("create detected_uses temp {}", temp_path.display()))?;
-    temp.write_all(&payload)
-        .with_context(|| format!("write detected_uses temp {}", temp_path.display()))?;
-    temp.sync_all().ok();
-    std::fs::rename(&temp_path, &path)
-        .with_context(|| format!("rename detected_uses cache into place {}", path.display()))?;
-    Ok(())
+    crate::locked_state_dir::replace_json_cache(
+        &path,
+        &payload,
+        "detected_uses",
+        "detected_uses cache",
+    )
 }
 
 /// Read the persisted detected-uses cache, or an empty list when it is missing
@@ -11581,7 +11570,7 @@ fn save_terminal_status_journal_with_diagnostics(
         std::fs::create_dir_all(parent).context("create terminal status journal directory")?;
     }
     let _lock = SnapshotProgressLock::acquire(path)?;
-    let temp_path = unique_progress_sibling(path, "tmp");
+    let temp_path = crate::locked_state_dir::unique_sibling(path, "tmp");
     let mut file = std::fs::File::create(&temp_path).context("create terminal status journal")?;
     let result = (|| -> Result<()> {
         serde_json::to_writer_pretty(&mut file, &journal)

@@ -1,4 +1,5 @@
 use crate::claude_status_coverage::Observation as CoverageObservation;
+use crate::locked_state_dir::{open_private_lock_file, FileLock};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 #[cfg(test)]
 use ottto_core::claude_account_identifier_hash;
@@ -38,7 +39,6 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1137,36 +1137,15 @@ struct PersistedClaudeSlotCollectionStateV1 {
     anchor_transitions: Vec<ottto_protocol::ClaudeAccountAnchorTransitionV1>,
 }
 
+// Fields drop in order: the flock is released before the process mutex.
 struct ClaudeSlotCollectionStateGuard {
+    _file: FileLock,
     _process: std::sync::MutexGuard<'static, ()>,
-    file: Option<File>,
 }
 
 struct ClaudeOAuthCollectionAttemptGuard {
+    _file: FileLock,
     _process: std::sync::MutexGuard<'static, ()>,
-    file: File,
-}
-
-impl Drop for ClaudeOAuthCollectionAttemptGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-        }
-    }
-}
-
-impl Drop for ClaudeSlotCollectionStateGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            if let Some(file) = &self.file {
-                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-            }
-        }
-    }
 }
 
 /// The failure classes that count toward opening the breaker. Everything else
@@ -9278,31 +9257,12 @@ fn claude_slot_collection_state_guard() -> std::io::Result<ClaudeSlotCollectionS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     fs::create_dir_all(default_support_dir())?;
-    #[cfg(unix)]
-    let file = {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(default_support_dir().join(CLAUDE_CONFIG_SLOT_COLLECTION_STATE_LOCK_FILE))?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        file
-    };
-    #[cfg(not(unix))]
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(default_support_dir().join(CLAUDE_CONFIG_SLOT_COLLECTION_STATE_LOCK_FILE))?;
+    let file = open_private_lock_file(
+        &default_support_dir().join(CLAUDE_CONFIG_SLOT_COLLECTION_STATE_LOCK_FILE),
+    )?;
     Ok(ClaudeSlotCollectionStateGuard {
+        _file: FileLock::exclusive(file)?,
         _process: process,
-        file: Some(file),
     })
 }
 
@@ -12812,34 +12772,10 @@ fn try_claude_oauth_collection_attempt(
     if fs::create_dir_all(&account_root).is_err() {
         return None;
     }
-    let lock_path = account_root.join(".collection-attempt.lock");
-    #[cfg(unix)]
-    let file = {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(lock_path)
-            .ok()?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return None;
-        }
-        file
-    };
-    #[cfg(not(unix))]
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(lock_path)
-        .ok()?;
+    let file = open_private_lock_file(&account_root.join(".collection-attempt.lock")).ok()?;
     Some(ClaudeOAuthCollectionAttemptGuard {
+        _file: FileLock::try_exclusive(file).ok()?,
         _process: process,
-        file,
     })
 }
 

@@ -45261,14 +45261,6 @@ fn sync_checkpoint_parent(path: &Path) -> Result<()> {
         .with_context(|| format!("sync checkpoint directory {}", parent.display()))
 }
 
-fn unique_checkpoint_sibling(path: &Path, kind: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    path.with_extension(format!("{kind}.{}.{nanos}.json", std::process::id()))
-}
-
 /// A malformed stored Claude history cutoff decodes as this; the load drops
 /// it with the gate marker (`drop_malformed_claude_history_cutoff`). A real
 /// cutoff is clamped to the clock, so it never reaches this value.
