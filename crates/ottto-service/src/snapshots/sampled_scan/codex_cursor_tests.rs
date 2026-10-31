@@ -10903,7 +10903,18 @@ fn held_growth_survives_old_window_cap_and_reload_then_synthetic_release_tails()
                 assert!(index.files.contains_key(&key));
                 assert_eq!(index.files[&key].size_bytes, prefix_len);
                 assert_eq!(index.files[&key].last_upload_body_witness, witness);
-                assert!(index.codex_counting_tombstones.contains_key(&owner));
+                // C's collect_tombstones absorbs the Legacy tombstone into the
+                // live proven-owner entry; either way the evidence survives.
+                assert!(
+                    index.codex_counting_tombstones.contains_key(&owner)
+                        || (codex_counting_version::proven_owner(&index.files[&key])
+                            == Some(owner.as_str())
+                            && codex_counting_version::AckEvidence::of_view(Some(
+                                &index.files[&key]
+                            )) == codex_counting_version::AckEvidence::LegacyAcked),
+                    "counting evidence lost: tombstones={}",
+                    index.codex_counting_tombstones.len()
+                );
                 let traversal = index.traversal.as_ref().expect("census checkpoint");
                 assert!(traversal.codex_rollout_paths.contains(&key));
                 assert!(traversal.observed_index_keys.contains(&key));
@@ -13558,7 +13569,12 @@ fn deferred_group_preserves_accepted_extent_and_releases_through_existing_ends()
                 let (_, output) = page(&fixture, restarted, Some(Arc::clone(&cold)));
                 assert!(output.snapshots.is_empty());
             });
-            assert_eq!(counter(&cold, |c| c.jobs_started), 0);
+            assert_eq!(
+                counter(&cold, |c| c.jobs_started),
+                0,
+                "cold restart; {}",
+                counters(&cold)
+            );
         });
     }
 }
@@ -13703,9 +13719,15 @@ fn custody_negative_payload_survives_save_failure_funding_refusal_and_restart() 
                 assert!(!committed
                     .codex_state_only_blocked_by_file
                     .contains_key(&key));
-                assert!(!committed
-                    .codex_state_only_blocked_session_ids
-                    .contains(SESSION));
+                assert!(
+                    !committed
+                        .codex_state_only_blocked_session_ids
+                        .contains(SESSION),
+                    "failure={failure} blocked_ids={} blocked_files={} {}",
+                    committed.codex_state_only_blocked_session_ids.len(),
+                    committed.codex_state_only_blocked_by_file.len(),
+                    counters(&cache)
+                );
                 drop(scan); // Real Refused preparation loss.
                 if failure == 2 {
                     cache.with_cursor(|cursor| cursor.reserved = 0);
@@ -13884,7 +13906,18 @@ fn shared_refused_file_obligation_survives_growth_age_cap_and_reloads_then_tails
                 assert!(index.files.contains_key(&key));
                 assert_eq!(index.files[&key].size_bytes, prefix_len);
                 assert_eq!(index.files[&key].last_upload_body_witness, witness);
-                assert!(index.codex_counting_tombstones.contains_key(&owner));
+                // C's collect_tombstones absorbs the Legacy tombstone into the
+                // live proven-owner entry; either way the evidence survives.
+                assert!(
+                    index.codex_counting_tombstones.contains_key(&owner)
+                        || (codex_counting_version::proven_owner(&index.files[&key])
+                            == Some(owner.as_str())
+                            && codex_counting_version::AckEvidence::of_view(Some(
+                                &index.files[&key]
+                            )) == codex_counting_version::AckEvidence::LegacyAcked),
+                    "counting evidence lost: tombstones={}",
+                    index.codex_counting_tombstones.len()
+                );
                 let traversal = index.traversal.as_ref().expect("census checkpoint");
                 assert!(traversal.codex_rollout_paths.contains(&key));
                 assert!(traversal.observed_index_keys.contains(&key));
@@ -14370,7 +14403,11 @@ fn deferred_custody_tail_priority_eof_never_reopens_as_full() {
                 }
             },
         );
-        assert!(reached.get(), "held Tail reached genuine priority EOF");
+        assert!(
+            reached.get(),
+            "held Tail reached genuine priority EOF; {}",
+            counters(&cache)
+        );
         assert!(cache.cursor_slot_free());
         assert_eq!(counter(&cache, |c| c.jobs_started), started);
         assert_eq!(
@@ -14417,6 +14454,16 @@ fn deferred_custody_group_money_main_pass_and_withhold_then_quiet_restart() {
         } else {
             vec![serde_json::to_vec(&request).unwrap()]
         };
+        // Diagnostic (counts only) ahead of the oracle's duplicate check.
+        eprintln!(
+            "route {mode:?}: items={} unique_fingerprints={}",
+            items.len(),
+            items
+                .iter()
+                .map(|i| &i.snapshot_fingerprint)
+                .collect::<BTreeSet<_>>()
+                .len()
+        );
         let mut result = RouteResult::emitted(mode, SnapshotSource::Codex, batches, items);
         result.codex_evidence = json!({
             "TierReplay": index.files.iter().map(|(k,e)| (k.clone(),
@@ -14923,7 +14970,8 @@ fn omitted_raw_archive_fences_paused_singleton_and_group_across_reload() {
                     assert_eq!(
                         counter(&cache, |c| c.jobs_resumed),
                         resumed + 1,
-                        "positive control: same job/context is compatible before raw reload"
+                        "positive control: same job/context is compatible before raw reload; {}",
+                        counters(&cache)
                     );
                     assert!(control_output.snapshots.is_empty());
                     assert!(cache.paused_members_for_test().is_some());
