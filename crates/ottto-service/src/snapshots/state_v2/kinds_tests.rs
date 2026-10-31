@@ -771,7 +771,10 @@ fn copy_removals_roundtrip_checked_v1_bytes_through_v2() {
         assert_eq!(removals.metadata_lost(), metadata_lost);
         if golden.is_some() {
             let holder = location_key("/synthetic/original.jsonl");
-            assert_eq!(removals.get(copy), &[(holder, Box::<[u64]>::from([1_u64, 2]))]);
+            assert_eq!(
+                removals.get(copy),
+                &[(holder, Box::<[u64]>::from([1_u64, 2]))]
+            );
             assert!(removals.get(held).is_empty() && removals.pending(held));
             assert!(!removals.pending(copy));
         } else {

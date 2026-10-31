@@ -7847,6 +7847,8 @@ fn finish_sync_source(
                 roots: claude_scan_roots.as_deref().unwrap_or_default(),
                 backfill_window_days: receipt_window_days,
             }),
+            // Pre-upload recovery: no proof corrections were drained yet.
+            Default::default(),
         )?;
         // A new pass reconstructs external guards from the saved generation.
         return Err(anyhow!("state_v2_save_recovered_retry"));
