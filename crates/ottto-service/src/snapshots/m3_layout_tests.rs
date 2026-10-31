@@ -202,6 +202,10 @@ fn unsupported_native_finish_keeps_legacy_path_without_a_v3_record() {
 /// [regress] a Pi layout skip is counted and alarmed as Pi, never as Codex.
 #[test]
 fn pi_layout_skip_is_not_counted_as_codex() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let root = crate::test_scratch::ScratchDir::new("m3-layout-pi-skip");
     let _writer = crate::locked_state_dir::test_locks::hold(&root);
     let cache = SharedCache::default();
