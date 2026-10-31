@@ -19,17 +19,17 @@ pub(crate) struct Counts {
 }
 crate::heap_layout_bound::fields!(Counts; roots_collapsed, windows_collapsed, window_bytes_saved, roots_refused, window_bytes_before, window_bytes_after);
 
-/// Historical evidence view used by retirement and the load self-check.
-/// Borrowed maps avoid allocating a second per-member representation.
+/// Per-window evidence view folded by `HistorySummary`: the window's account
+/// and invalid flag, and each member with its identity revision.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ConsumerProjection<'a> {
-    pub(super) account_identifier_hash: &'a str,
-    pub(super) invalid: bool,
+struct ConsumerProjection<'a> {
+    account_identifier_hash: &'a str,
+    invalid: bool,
     member_keys: &'a BTreeMap<String, u64>,
     requests: &'a BTreeMap<String, ClaudeAccountRequestSet>,
 }
 impl<'a> ConsumerProjection<'a> {
-    pub(super) fn members(self) -> impl Iterator<Item = (&'a String, Option<&'a String>)> {
+    fn members(self) -> impl Iterator<Item = (&'a String, Option<&'a String>)> {
         self.member_keys.keys().map(move |member| {
             (
                 member,
@@ -69,7 +69,7 @@ impl ClaudeAccountFamilyPendingWindow {
 }
 
 impl ClaudeAccountFamilyPendingWindow {
-    pub(super) fn consumer_projection(&self) -> ConsumerProjection<'_> {
+    fn consumer_projection(&self) -> ConsumerProjection<'_> {
         ConsumerProjection {
             account_identifier_hash: &self.account_identifier_hash,
             invalid: self.invalid,
