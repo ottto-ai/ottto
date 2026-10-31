@@ -2,7 +2,6 @@
 //! loads and saves every graph; these tests make no hydration parity claim.
 use super::*;
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Release synthetic custody and its registry slot when a fixture is finished.
 pub(in crate::snapshots) fn erase_published(path: &Path) {
@@ -55,12 +54,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let support = std::env::temp_dir().canonicalize().unwrap().join(format!(
-            "ottto-v2-route-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let support = crate::test_scratch::private_dir("ottto-v2-route")
+            .canonicalize()
+            .unwrap();
         let parent = support.join("snapshots/destinations").join("b".repeat(64));
         fs::create_dir_all(&parent).unwrap();
         Self {

@@ -2471,15 +2471,7 @@ mod growth_tests {
     }
     impl Fixture {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "ottto-v2-growth-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            fs::create_dir(&root).unwrap();
+            let root = crate::test_scratch::private_dir("ottto-v2-growth");
             let path = root.join("session.jsonl");
             fs::write(&path, b"old\n").unwrap();
             let key = local_index_key(&path);

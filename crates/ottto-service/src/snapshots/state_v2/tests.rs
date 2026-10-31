@@ -3,19 +3,15 @@
 use super::*;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
-            "ottto-state-v2-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        Self(path)
+        Self(
+            crate::test_scratch::private_dir("ottto-state-v2")
+                .canonicalize()
+                .unwrap(),
+        )
     }
     fn path(&self) -> PathBuf {
         self.0.join("index.v2.sqlite.import")
