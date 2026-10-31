@@ -58,14 +58,7 @@ impl Input {
                 }
             });
         }
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NONBLOCK);
-        }
-        let mut file = options.open(path).ok()?;
+        let mut file = open_strict(path).ok()?;
         #[cfg(test)]
         match kind {
             Some(ReadKind::Api) => API_READ_RECEIPT.with(|receipt| {
@@ -123,10 +116,7 @@ impl Input {
                 }
             });
         }
-        if extra != 0
-            || api_file_generation(&file.metadata().ok()?)? != opened
-            || api_file_generation(&fs::metadata(path).ok()?)? != opened
-        {
+        if extra != 0 || !generation_unchanged(&file, path, Some(&opened)) {
             return None;
         }
         Some(Self {

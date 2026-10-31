@@ -782,6 +782,28 @@ fn api_file_generation(metadata: &fs::Metadata) -> Option<ApiFileGeneration> {
     }
 }
 
+/// Read-only open; O_NONBLOCK so a stat/open race to a FIFO refuses without
+/// blocking at open. Each strict reader keeps its own stat/cap/error policy.
+fn open_strict(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    options.open(path)
+}
+
+/// The opened file, then the path, still carry `generation` (file first).
+fn generation_unchanged(file: &File, path: &Path, generation: Option<&ApiFileGeneration>) -> bool {
+    let current = |metadata: std::io::Result<fs::Metadata>| {
+        metadata.ok().and_then(|m| api_file_generation(&m))
+    };
+    current(file.metadata()).as_ref() == generation
+        && current(fs::metadata(path)).as_ref() == generation
+}
+
 impl ClaudeApiEvidenceRead {
     /// Borrow the existing decode and its full health witness without I/O.
     /// Missing/capped/malformed reads remain present but incomplete; a root
@@ -1138,15 +1160,7 @@ fn decode_api_sidecar(
             hook(&path);
         }
     });
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // A stat/open race to a FIFO must refuse without blocking at open.
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let file = options.open(&path).context("open Claude effort evidence")?;
+    let file = open_strict(&path).context("open Claude effort evidence")?;
     #[cfg(test)]
     API_READ_RECEIPT.with(|r| {
         let (opens, bytes, force) = r.get();
@@ -1185,17 +1199,10 @@ fn decode_api_sidecar(
         health.oversized_files += 1;
         return Ok(empty(health));
     }
-    let after_opened = file
-        .metadata()
-        .ok()
-        .and_then(|metadata| api_file_generation(&metadata));
-    let after_path = fs::metadata(&path)
-        .ok()
-        .and_then(|metadata| api_file_generation(&metadata));
+    let unchanged = generation_unchanged(&file, &path, before_opened.as_ref());
     let generation = if before_opened.is_some()
         && before_path == before_opened
-        && before_opened == after_opened
-        && before_opened == after_path
+        && unchanged
         && bytes == opened.len()
         && health.is_complete()
     {
@@ -1316,15 +1323,7 @@ pub fn load_claude_trace_ownership_evidence(
             report.oversized_files += 1;
             continue;
         }
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // A stat/open race to a FIFO must refuse without blocking at open.
-            options.custom_flags(libc::O_NONBLOCK);
-        }
-        let Ok(file) = options.open(&path) else {
+        let Ok(file) = open_strict(&path) else {
             report.unreadable_lines += 1;
             continue;
         };
@@ -1364,12 +1363,7 @@ pub fn load_claude_trace_ownership_evidence(
         strict_budget::consumed(bytes);
         #[cfg(test)]
         TRACE_BYTES_FOR_TEST.with(|count| count.set(count.get() + bytes));
-        let generation = api_file_generation(&opened);
-        let unchanged = file.metadata().ok().and_then(|m| api_file_generation(&m)) == generation
-            && fs::metadata(&path)
-                .ok()
-                .and_then(|m| api_file_generation(&m))
-                == generation;
+        let unchanged = generation_unchanged(&file, &path, api_file_generation(&opened).as_ref());
         // A grown or replaced file is neither complete evidence nor a
         // trustworthy prefix: drop its rows and fail the read's health.
         if bytes >= limit || !unchanged {
