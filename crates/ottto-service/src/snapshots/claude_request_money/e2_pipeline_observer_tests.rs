@@ -208,3 +208,56 @@ pub(crate) fn assert_held_new_file_has_no_money_authority(index: &ScanIndex, pat
         (i128::MAX, location_key(&key))
     ));
 }
+
+// Observe this thread's actual counter additions without draining the shared
+// process counters (parallel scanner tests also write those).
+thread_local! {
+    static COUNTER_ADDITIONS: std::cell::RefCell<Option<Counts>> = const { std::cell::RefCell::new(None) };
+}
+pub(crate) fn capture_counts<T>(run: impl FnOnce() -> T) -> (T, serde_json::Value) {
+    struct Restore(Option<Counts>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COUNTER_ADDITIONS.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore =
+        Restore(COUNTER_ADDITIONS.with(|slot| slot.borrow_mut().replace(Counts::default())));
+    let result = run();
+    let counts = COUNTER_ADDITIONS
+        .with(|slot| serde_json::to_value(slot.borrow().as_ref().unwrap()).unwrap());
+    (result, counts)
+}
+pub(super) fn recording_counts(counts: &Counts) {
+    COUNTER_ADDITIONS.with(|slot| {
+        if let Some(observed) = slot.borrow_mut().as_mut() {
+            observed.add(counts);
+        }
+    });
+}
+
+pub(crate) fn assert_holder_evidence(index: &ScanIndex, file_name: &str, expected: &str) {
+    let key = census_key(index, file_name);
+    let record = index
+        .claude_request_census
+        .get(&key)
+        .expect("holder record");
+    assert_eq!(
+        format!("{:?}", scan_evidence(index, &key, record)),
+        expected
+    );
+}
+
+/// Fault injection at the emitter's certificate guard, after a real native
+/// scan. Copy ownership still resolves normally; publication must refuse.
+pub(crate) fn refuse_emission(items: &mut [SnapshotItem], session: &str) {
+    let item = items
+        .iter_mut()
+        .find(|item| item.source_session_id == session)
+        .unwrap();
+    item.claude_money
+        .as_deref_mut()
+        .expect("real native fold")
+        .entity
+        .certificate_ok = false;
+}

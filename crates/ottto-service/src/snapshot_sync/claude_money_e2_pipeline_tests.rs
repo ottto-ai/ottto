@@ -1645,75 +1645,282 @@ fn e2_pipeline_real_family_crosses_two_mib_root_first() {
     });
 }
 
+// State axis only: every arm has one shared request, two UUID roots, no
+// own copy response or fork ref, and an uncertified historical writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AllPrebirthState {
+    Current,
+    PersistedMinimum,
+    Stale,
+    Queued,
+    Deadline,
+    Unavailable,
+    EmissionHold,
+}
+
+fn all_prebirth_copy(state: AllPrebirthState) {
+    use e2::pipeline_test_observer as observe;
+    with_e2(|| {
+        const T0: &str = "2026-08-02T07:00:00Z";
+        const RESPONSE: &str = "2026-08-02T07:00:01Z";
+        const COPY_BIRTH: &str = "2026-08-02T07:15:00Z";
+        // LATE sorts after COPY, so a one-file page queues the holder.
+        let mut c = Corpus::new(&format!("e2-pipeline-allprebirth-{state:?}"));
+        let original = c.root(LATE, &line_by(LATE, "shared", RESPONSE, 10, "2.1.229"));
+        let mut price = api_for(LATE, "shared", 10, 123);
+        price.observed_at = RESPONSE.into();
+        price.app_version = "2.1.229".into();
+        price.fingerprint.clear();
+        price.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&price).unwrap())
+        );
+        let mut ownership = trace_for(LATE, "shared", "");
+        ownership.observed_at = RESPONSE.into();
+        ownership.fingerprint.clear();
+        ownership.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&ownership).unwrap())
+        );
+        c.evidence_for(LATE, &[price], &[ownership]);
+        let mut progress = e2_progress();
+        let empty = ScanIndex::default();
+        let first = ready(&c, &E2ScanFixture::default(), empty.clone(), 100, false);
+        literal(&first);
+        let original_body = body(&first, LATE).unwrap();
+        assert_eq!(original_body.request_count, 1);
+        assert_eq!(
+            original_body
+                .cost
+                .as_ref()
+                .unwrap()
+                .total_cost_usd
+                .as_deref(),
+            Some("0.000123")
+        );
+        let mut prior = settle_captured_holds(&c, &empty, first, &mut progress);
+        // Consume the existing one-time identity-contract re-arm before the
+        // copy arrives, leaving only the copy's decided counters on its page.
+        let warm = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        prior = settle_captured_holds(&c, &prior, warm, &mut progress);
+        let accepted_original = stored_bodies(&prior);
+        let copy = c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line_by(COPY, "shared", RESPONSE, 10, "2.1.229"),
+            COPY_BIRTH,
+        );
+        match state {
+            AllPrebirthState::PersistedMinimum => {
+                prior.claude_money_birth_store.record_observation(
+                    COPY,
+                    copy.to_str().unwrap(),
+                    nanos(T0),
+                );
+                // Save prunes absent-path bookkeeping. The contract is the
+                // effective minimum, not byte identity before that pruning.
+                assert_eq!(
+                    prior
+                        .claude_money_birth_store
+                        .effective_cutoff(COPY, copy.to_str().unwrap()),
+                    Some(nanos(T0))
+                );
+                prior = c.reload(&mut prior);
+                assert_eq!(
+                    prior
+                        .claude_money_birth_store
+                        .effective_cutoff(COPY, copy.to_str().unwrap()),
+                    Some(nanos(T0))
+                );
+            }
+            AllPrebirthState::Stale => {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&original)
+                    .unwrap()
+                    .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+                    .unwrap();
+            }
+            AllPrebirthState::Queued => {
+                let modified = std::fs::metadata(&original).unwrap().modified().unwrap();
+                append(&original, "\n");
+                std::fs::File::options()
+                    .write(true)
+                    .open(&original)
+                    .unwrap()
+                    .set_modified(modified)
+                    .unwrap();
+            }
+            AllPrebirthState::Unavailable => {
+                observe::retire_census(&mut prior, &format!("{LATE}.jsonl"));
+                prior = c.reload(&mut prior);
+            }
+            _ => {}
+        }
+        let delayed = matches!(
+            state,
+            AllPrebirthState::Stale | AllPrebirthState::Queued | AllPrebirthState::Deadline
+        );
+        let scanner = E2ScanFixture::default();
+        e2::take_diag();
+        let mut page = c.raw(
+            &scanner,
+            prior.clone(),
+            if delayed { 1 } else { 100 },
+            false,
+            &[],
+        );
+        assert_eq!(scanner.paths(), vec![copy.clone()], "only the copy is read");
+        if matches!(
+            state,
+            AllPrebirthState::Stale | AllPrebirthState::Queued | AllPrebirthState::Current
+        ) {
+            observe::assert_holder_evidence(
+                &page.index,
+                &format!("{LATE}.jsonl"),
+                match state {
+                    AllPrebirthState::Stale => "Stale",
+                    AllPrebirthState::Queued => "Queued",
+                    _ => "Current",
+                },
+            );
+        }
+        if state == AllPrebirthState::Unavailable {
+            assert!(
+                page.scan.census_complete,
+                "unavailable evidence decides only after traversal drains"
+            );
+        }
+        if state == AllPrebirthState::EmissionHold {
+            observe::refuse_emission(&mut page.scan.snapshots, COPY);
+        }
+        let (_, mut counts) = observe::capture_counts(|| {
+            if state == AllPrebirthState::Deadline {
+                crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
+                    page.enrich(&c)
+                });
+            } else {
+                page.enrich(&c);
+            }
+        });
+        let diag = e2::take_diag();
+        if delayed || state == AllPrebirthState::EmissionHold {
+            assert_withheld(&page, COPY, &format!("{state:?}"));
+            assert_eq!(
+                counts.get("copy_skipped"),
+                None,
+                "undecided skips never publish: {diag:?}"
+            );
+            assert_eq!(counts.get("disclosed"), None);
+            let reason = match state {
+                AllPrebirthState::Deadline => "held_copy_deadline",
+                AllPrebirthState::EmissionHold => "withheld_sessions",
+                _ => "held_copy_stale_holder",
+            };
+            assert_eq!(diag.get(reason), Some(&1));
+            prior = settle_captured_holds(&c, &prior, page, &mut progress);
+            assert_eq!(
+                stored_bodies(&prior),
+                accepted_original,
+                "no replacement on hold"
+            );
+            assert!(
+                !prior.files.contains_key(copy.to_str().unwrap()),
+                "held NEW copy remains owed"
+            );
+            if state == AllPrebirthState::EmissionHold {
+                return;
+            }
+            // The holder is read fresh before a delayed copy can decide. The
+            // bounded next traversal reoffers the unchanged copy after restart.
+            let mut decided = None;
+            for _ in 0..4 {
+                let mut retry = c.raw(&E2ScanFixture::default(), prior.clone(), 100, false, &[]);
+                let (_, counts) = observe::capture_counts(|| retry.enrich(&c));
+                if body(&retry, COPY)
+                    .is_some_and(crate::snapshots::claude_request_money::is_request_owned_literal)
+                {
+                    decided = Some((retry, counts));
+                    break;
+                }
+                prior = settle_captured_holds(&c, &prior, retry, &mut progress);
+            }
+            (page, counts) =
+                decided.unwrap_or_else(|| panic!("{state:?}: fresh evidence never decided"));
+        }
+        let expected = if matches!(
+            state,
+            AllPrebirthState::PersistedMinimum | AllPrebirthState::Unavailable
+        ) {
+            (1, Some(0))
+        } else {
+            (0, Some(1))
+        };
+        literal(&page);
+        let found = body(&page, COPY).expect("copy publishes a literal replacement");
+        assert_eq!((found.request_count, found.removed_request_count), expected,
+            "{state:?}: baseline must use all-prebirth cross-session holder proof; failure is a money finding, not permission to change production; native branch diagnostics={diag:?}");
+        assert_eq!(
+            counts
+                .get("copy_skipped")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            expected.1.unwrap()
+        );
+        assert_eq!(
+            counts
+                .get("disclosed")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            u64::from(state == AllPrebirthState::Unavailable)
+        );
+        page.finish();
+        let receipt = page.receipt();
+        let finalized = stored_bodies(&page.index);
+        let settled = settle_captured_holds(&c, &prior, page, &mut progress);
+        for (session, fingerprint, witness) in receipt {
+            if session == COPY {
+                assert_eq!(
+                    progress.accepted_body_witnesses.get(&fingerprint),
+                    Some(&witness),
+                    "copy's exact emitted body receives an ACK"
+                );
+                assert_eq!(
+                    stored_bodies(&settled).get(copy.to_str().unwrap()),
+                    finalized.get(copy.to_str().unwrap()),
+                    "finalized file body survives ACK settlement and reload"
+                );
+            }
+        }
+    });
+}
+
 #[test]
 fn e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-branch-no-new-reply");
-        c.root(ROOT, &line(ROOT, "original", AT, 10));
-        let scanner = E2ScanFixture::default();
-        let sum = |items: &[SnapshotItem]| {
-            items.iter().fold([0_u64; 8], |mut sum, s| {
-                for (target, n) in sum.iter_mut().zip([
-                    s.request_count,
-                    s.input_tokens,
-                    s.output_tokens,
-                    s.cache_read_tokens,
-                    s.cache_creation_5m_tokens,
-                    s.cache_creation_1h_tokens,
-                    s.reasoning_output_tokens,
-                    s.unattributed_total_tokens,
-                ]) {
-                    *target += n;
-                }
-                sum
-            })
-        };
-        let mut original = ready(&c, &scanner, ScanIndex::default(), 100, false);
-        assert_eq!(total(&original), 1);
-        let original_totals = sum(&original.scan.snapshots);
-        original.finish();
-        let prior = c.reload(&mut original.index);
-        c.write_at(
-            &format!("{COPY}.jsonl"),
-            &line(COPY, "original", AT, 10),
-            "2026-08-02T07:03:00Z",
-        );
-        let branch = ready(&c, &scanner, prior, 100, false);
-        literal(&branch);
-        // The unchanged original is not re-emitted on the branch page (it
-        // holds only the copy), so the money published is the original page
-        // plus the branch page: the original's exactly once, the branch none.
-        let branch_totals = sum(&branch.scan.snapshots);
-        let totals: [u64; 8] = std::array::from_fn(|at| original_totals[at] + branch_totals[at]);
-        let shape = branch
-            .scan
-            .snapshots
-            .iter()
-            .map(|s| {
-                (
-                    s.source_session_id == ROOT,
-                    s.request_count,
-                    s.removed_request_count,
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            totals,
-            [1, 10, 10, 3, 5, 2, 0, 0],
-            "a /branch containing only copied history cannot duplicate original money; \
-             page (is_root, requests, removed) = {shape:?}"
-        );
-        assert!(
-            branch
-                .scan
-                .snapshots
-                .iter()
-                .map(|s| s.removed_request_count.unwrap_or(0))
-                .sum::<u64>()
-                > 0,
-            "deliberate /branch must expose copy_skipped > 0; page (is_root, requests, removed) = {shape:?}"
-        );
-    });
+    all_prebirth_copy(AllPrebirthState::Current);
+}
+#[test]
+fn e2_pipeline_allprebirth_persisted_minimum_counts() {
+    all_prebirth_copy(AllPrebirthState::PersistedMinimum);
+}
+#[test]
+fn e2_pipeline_allprebirth_stale_holder_waits_for_fresh_evidence() {
+    all_prebirth_copy(AllPrebirthState::Stale);
+}
+#[test]
+fn e2_pipeline_allprebirth_queued_holder_waits_for_fresh_evidence() {
+    all_prebirth_copy(AllPrebirthState::Queued);
+}
+#[test]
+fn e2_pipeline_allprebirth_census_deadline_waits_for_fresh_evidence() {
+    all_prebirth_copy(AllPrebirthState::Deadline);
+}
+#[test]
+fn e2_pipeline_allprebirth_unavailable_census_counts_and_discloses() {
+    all_prebirth_copy(AllPrebirthState::Unavailable);
+}
+#[test]
+fn e2_pipeline_allprebirth_emission_hold_publishes_no_replacement_or_counter() {
+    all_prebirth_copy(AllPrebirthState::EmissionHold);
 }
 
 #[test]
