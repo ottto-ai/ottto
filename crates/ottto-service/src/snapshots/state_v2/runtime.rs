@@ -349,8 +349,12 @@ fn load_with_custody<M: Mapper>(
             if let Some(runtime) = state.current.clone() {
                 let mut guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
                 if let Some(session) = guard.as_mut() {
-                    let stamp = session.db.stamp()?;
-                    if !session.reload && session.identity == identity && session.stamp == stamp {
+                    // A store marked for reload refuses reads; reopen it
+                    // below instead of probing its stamp.
+                    let stamp = (!session.reload).then(|| session.db.stamp()).transpose()?;
+                    if let Some(stamp) = stamp
+                        .filter(|stamp| session.identity == identity && session.stamp == *stamp)
+                    {
                         super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
                         if let Some(index) = state.cached.as_ref() {
                             if index.generation == stamp.0 {
