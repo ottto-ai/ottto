@@ -772,6 +772,147 @@ fn census_admission_releases_kept_records_oldest_first() {
     );
 }
 
+/// [money] X3, #920 under ON: ON starts no generation, so its census window
+/// stays frozen (here 40 days back, where every record is young). With the
+/// terminal withheld, the same aged retirement runs on the service clock: it
+/// retires and keeps what main's terminal does at that time, admission then
+/// releases kept stock oldest first, and the census bytes equal main's. A
+/// clock not past the frozen window ages nothing. No transcript is read.
+#[test]
+fn census_retirement_ages_on_the_service_clock_when_the_terminal_is_withheld() {
+    const FROZEN_WINDOW: &str = "2026-06-23T09:00:00Z";
+    let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
+    let frozen = crate::snapshots::rfc3339_unix_seconds(FROZEN_WINDOW).unwrap();
+    assert_eq!(frozen, window - 40 * 86_400);
+    let mut stored = Vec::new();
+    // (row, ON, service clock). OFF's terminal ages at MONEY_WINDOW itself.
+    for (row, on, now) in [
+        ("off_terminal", false, window),
+        ("on_withheld", true, window),
+        ("on_clock_not_advanced", true, frozen),
+    ] {
+        let _terminal_off = on.then(crate::snapshots::ClaudeTerminalOffForTest::enabled);
+        crate::snapshots::with_terminal_off_audit_now_for_test(now, || {
+            let mut index = ScanIndex::default();
+            let holder = indexed_census(&mut index, "h", 'a', 52, vec![1, 2]);
+            let copy = indexed_census(&mut index, "c", 'b', 50, vec![2, 3]);
+            let lone = indexed_census(&mut index, "lone", 'd', 50, vec![20, 21]);
+            let young = indexed_census(&mut index, "y", 'c', 5, vec![100]);
+            fill_census_to(&mut index, KEEP_OCCUPANCY);
+            let before = serde_json::to_vec(index.claude_request_census_for_test()).unwrap();
+            let rows = if on {
+                let opens = crate::snapshots::all_transcript_opens_for_test();
+                let (_, rows) = crate::snapshots::with_transcript_io_denied(|| {
+                    crate::local_resource_diagnostics::capture(|| {
+                        crate::snapshots::claude_request_census::retire_aged_while_terminal_withheld(
+                            &mut index,
+                            FROZEN_WINDOW,
+                        )
+                    })
+                });
+                assert_eq!(
+                    crate::snapshots::all_transcript_opens_for_test(),
+                    opens,
+                    "{row}: retirement reads no transcript"
+                );
+                let census = index.claude_request_census_for_test();
+                assert_eq!(
+                    census.totals_for_test(),
+                    census.recounted_for_test(),
+                    "{row}"
+                );
+                rows
+            } else {
+                retirement_terminal(&mut index)
+            };
+            if row == "on_clock_not_advanced" {
+                assert!(rows.is_empty(), "{row}: nothing kept, nothing reported");
+                assert_eq!(
+                    serde_json::to_vec(index.claude_request_census_for_test()).unwrap(),
+                    before,
+                    "{row}: nothing ages"
+                );
+                return;
+            }
+            let stage = "claude_census_retire_kept_overlap";
+            let kept = if on {
+                // ON measures no census-full tombstones (the join is
+                // terminal-only): the count is absent, never 0.
+                let [kept] = rows.as_slice() else {
+                    panic!("{row}: one {stage} row: {rows:?}");
+                };
+                assert_eq!(kept["stage"], stage, "{row}");
+                let counts = &kept["counts"];
+                assert!(counts.get("census_missing_over_budget").is_none(), "{row}");
+                assert_eq!(counts["census_record_limit_refused"], 0, "{row}");
+                let count = |name: &str| counts[name].as_u64().unwrap();
+                Some((
+                    count("census_retire_kept_overlap_records"),
+                    count("census_retire_kept_overlap_hashes"),
+                    count("census_retire_kept_overflow"),
+                ))
+            } else {
+                kept_overlap(&rows, stage)
+            };
+            assert_eq!(kept, Some((2, 4, 0)), "{row}");
+            let census = index.claude_request_census_for_test();
+            let record = |key: &str| census.record_for_test(key).unwrap();
+            assert_eq!(
+                record(&lone).retired_for_test(),
+                Some(2),
+                "{row}: no overlap: retires"
+            );
+            assert_eq!(record(&holder).request_hashes_for_test(), &[1, 2], "{row}");
+            assert_eq!(record(&copy).request_hashes_for_test(), &[2, 3], "{row}");
+            fill_census_to(&mut index, MAX_CLAUDE_REQUEST_CENSUS_HASHES);
+            // The parse path passes the traversal's window: ON's is frozen.
+            let traversal_window = if on { frozen } else { window };
+            let (outcome, rows) = crate::local_resource_diagnostics::capture(|| {
+                index.insert_transcript_record_for_test(
+                    &young,
+                    young_parse(vec![100, 101]),
+                    traversal_window,
+                )
+            });
+            assert_eq!(outcome, ClaudeRequestCensusInsert::Stored, "{row}");
+            assert_eq!(
+                admission_overflow(&rows, "claude_census_retire_kept_overlap"),
+                1,
+                "{row}"
+            );
+            let census = index.claude_request_census_for_test();
+            assert_eq!(
+                census.totals_for_test(),
+                census.recounted_for_test(),
+                "{row}"
+            );
+            let record = |key: &str| census.record_for_test(key).unwrap();
+            assert_eq!(
+                record(&young).shape_for_test(),
+                ClaudeRequestCensusShape::Exact,
+                "{row}"
+            );
+            assert_eq!(
+                record(&young).request_hashes_for_test(),
+                &[100, 101],
+                "{row}"
+            );
+            assert_eq!(
+                record(&holder).retired_for_test(),
+                Some(2),
+                "{row}: the oldest goes"
+            );
+            assert_eq!(record(&copy).request_hashes_for_test(), &[2, 3], "{row}");
+            stored.push(serde_json::to_vec(census).unwrap());
+        });
+    }
+    assert_eq!(stored.len(), 2);
+    assert_eq!(
+        stored[0], stored[1],
+        "ON at the service clock stores main's census"
+    );
+}
+
 /// Release order is (mtime, key): of two equally old kept records the first
 /// by key retires, whatever order the index was built in, on every run.
 #[test]

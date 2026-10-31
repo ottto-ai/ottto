@@ -2935,7 +2935,7 @@ pub(crate) fn record_claude_request_census(
         // An unchanged re-parse of a retired record (a backfill, a resume
         // miss) stays retired while its file is still past the cutoff: its
         // hashes, and the index bytes, do not bounce back.
-        let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
+        let cutoff = retirement_window(window).saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
         if old.retired.is_some()
             && window > 0
             && old.derivation == record.derivation
@@ -2989,7 +2989,7 @@ fn insert_transcript_record(
         note_record_limit_refused();
         return ClaudeRequestCensusInsert::Refused;
     }
-    let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
+    let cutoff = retirement_window(window).saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
     let files = &index.files;
     let mut released = 0;
     let outcome =
@@ -3076,7 +3076,7 @@ pub(crate) fn settle_claude_request_census_terminal(
     note_transcript_retirements(retirement.aged, vanished);
     let join = ClaudeRequestCensusJoin::new(index, window, residue_index_keys);
     let mut counts = join.counts(true);
-    note_kept_overlap(retirement, counts.missing_over_budget);
+    note_kept_overlap(retirement, Some(counts.missing_over_budget));
     let state = &mut index.claude_request_census_shadow;
     if state
         .would_open
@@ -3094,8 +3094,36 @@ pub(crate) fn settle_claude_request_census_terminal(
     counts
 }
 
+/// X3 (ON only): the terminal that runs #920's aged retirement is withheld.
+/// Run the same retirement (keep overlap, 90% occupancy release) at the
+/// service clock. No vanished prune, join or shadow counts: those stay
+/// terminal-only (Lead B Q-LB-4). Zero transcript reads.
+pub(crate) fn retire_aged_while_terminal_withheld(index: &mut ScanIndex, census_window_end: &str) {
+    if !super::claude_terminal_off() {
+        return;
+    }
+    let window = retirement_window(rfc3339_unix_seconds(census_window_end).unwrap_or_default());
+    let retirement = retire_claude_transcript_records(index, window);
+    note_transcript_retirements(retirement.aged, 0);
+    // Census-full tombstones are measured by the terminal-only join:
+    // not measured here, so None, never 0.
+    note_kept_overlap(retirement, None);
+}
+
 /// A transcript is retired 35 days after its last modification.
 pub(crate) const CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS: u64 = 35 * 24 * 60 * 60;
+
+/// The window #920's retirement ages against. OFF: the traversal's census
+/// window (main). ON: no new generation starts, so that window is frozen;
+/// age against the service clock instead, floored to a day so the
+/// admission release memo (keyed by cutoff) keeps holding within a day.
+fn retirement_window(window: u64) -> u64 {
+    if !super::claude_terminal_off() {
+        return window;
+    }
+    let now = super::sampled_scan::now_seconds();
+    window.max(now - now % 86_400)
+}
 
 /// Process counters of transcript retirements (aged, vanished) for the P1
 /// shadow line; D1's counts are unchanged.
@@ -3111,8 +3139,9 @@ fn note_transcript_retirements(aged: u64, vanished: u64) {
 }
 
 /// The terminal's kept-overlap row, beside the same terminal's census-full
-/// tombstone count (the shadow's `missing_over_budget`).
-fn note_kept_overlap(retirement: TranscriptRetirement, missing_over_budget: usize) {
+/// tombstone count (the shadow's `missing_over_budget`); None where no
+/// terminal measured it.
+fn note_kept_overlap(retirement: TranscriptRetirement, missing_over_budget: Option<usize>) {
     if retirement.kept_overlap_records > 0 || retirement.overflow_occupancy > 0 {
         crate::local_resource_diagnostics::claude_census_retire_kept_overlap(
             crate::local_resource_diagnostics::CensusRetireKeptOverlapCounts {
@@ -3121,7 +3150,7 @@ fn note_kept_overlap(retirement: TranscriptRetirement, missing_over_budget: usiz
                 overflow_occupancy: retirement.overflow_occupancy,
                 overflow_admission: 0,
                 record_limit_refused: 0,
-                missing_over_budget: Some(missing_over_budget as u64),
+                missing_over_budget: missing_over_budget.map(|count| count as u64),
             },
         );
     }

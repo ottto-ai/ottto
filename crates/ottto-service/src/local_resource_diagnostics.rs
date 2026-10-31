@@ -1054,7 +1054,8 @@ pub(crate) struct CensusRetireKeptOverlapCounts {
     pub(crate) overflow_admission: u64,
     /// New keys refused at the live census record bound.
     pub(crate) record_limit_refused: u64,
-    /// The terminal's shadow `missing_over_budget`; None on admission rows.
+    /// The terminal's shadow `missing_over_budget`; None where nothing
+    /// measured it (admission rows, ON's withheld-terminal retirement).
     pub(crate) missing_over_budget: Option<u64>,
 }
 
@@ -1122,6 +1123,11 @@ pub(crate) fn claude_census_retire_kept_overlap(counts: CensusRetireKeptOverlapC
             &row,
         );
     }
+}
+/// Process total of new keys refused at the live census record bound
+/// (`census_record_limit_refused_total`).
+pub(crate) fn census_record_limit_refused_total() -> u64 {
+    CENSUS_RETIRE_KEPT_OVERLAP_TOTAL[5].load(std::sync::atomic::Ordering::Relaxed)
 }
 /// Local alarm: the one-time Claude history re-read latched its stop until
 /// the daemon restarts (SOURCE Amendment 10), once when it sets and at most

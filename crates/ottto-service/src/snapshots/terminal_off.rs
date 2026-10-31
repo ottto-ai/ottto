@@ -400,7 +400,10 @@ fn terminal_off_offer(index: &ScanIndex, window: &str) {
     let offers = CLAUDE_TERMINAL_OFF_OFFERS.fetch_add(1, Relaxed) + 1;
     static SINCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let since = SINCE.get_or_init(|| unix_seconds(SystemTime::now()).unwrap_or_default());
-    eprintln!("ALARM claude_terminal_off offers={offers} since_unix_seconds={since} rearm_full_suppressed=1: terminal authority withheld; ordinary page upload/ACK/save continues");
+    // X3-R: above the live record bound a new key is refused (fail-closed,
+    // money proof lost); > 0 is the M4 alarm.
+    let refused = crate::local_resource_diagnostics::census_record_limit_refused_total();
+    eprintln!("ALARM claude_terminal_off offers={offers} since_unix_seconds={since} rearm_full_suppressed=1 census_record_limit_refused_total={refused}: terminal authority withheld; ordinary page upload/ACK/save continues");
     START_IDENTITY_SAMPLES.with(|counts| {
         let counts = counts.borrow();
         eprintln!(

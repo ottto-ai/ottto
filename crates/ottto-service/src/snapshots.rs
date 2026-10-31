@@ -31488,6 +31488,10 @@ impl OwnedSourceScan {
                     })
                 {
                     terminal_off_offer(index, &census_window_end);
+                    claude_request_census::retire_aged_while_terminal_withheld(
+                        index,
+                        &census_window_end,
+                    );
                 }
                 if let Some(traversal) = index.traversal.as_mut() {
                     traversal.codex_parent_resolution_retry_required |=
