@@ -188,13 +188,6 @@ impl HistoryFixture {
         cycle: HistoryCycle<'_>,
         before_evidence: impl FnOnce(&mut crate::snapshots::SourceScanResult),
     ) -> HistoryOutcome {
-        // A cycle below revision 3 stands in for a daemon from before the
-        // switch-on, whose E2 gate was off (the flip raised both together).
-        if cycle.revision < 3 {
-            return crate::snapshots::claude_request_money::e2::with_disabled(|| {
-                self.cycle_at_gate(collected_at, cycle, before_evidence)
-            });
-        }
         self.cycle_at_gate(collected_at, cycle, before_evidence)
     }
 

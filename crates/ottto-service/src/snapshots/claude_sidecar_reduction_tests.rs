@@ -394,8 +394,9 @@ fn assert_layout_mode(actual: (usize, usize, usize), reuse: (usize, usize, usize
 #[test]
 fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let f = Fixture::new(2);
+    crate::snapshots::e2_pipeline_scan_fixture::pause_adoption(&f.support);
     let cache = Arc::new(SharedCache::default());
     let prior = seed_predecessor(&f, &cache);
     f.evidence(2); // Includes req_1 from before the latest transcript response.
@@ -540,8 +541,9 @@ fn child_metadata_and_desktop_identity_still_invalidate_native_scope() {
 #[test]
 fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let f = Fixture::new(2);
+    crate::snapshots::e2_pipeline_scan_fixture::pause_adoption(&f.support);
     let cache = Arc::new(SharedCache::default());
     f.evidence(2);
     let prior = seed_predecessor(&f, &cache);
@@ -623,8 +625,9 @@ fn true_scope_change_at_completion_still_refuses_cached_publication() {
 #[test]
 fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let f = Fixture::new(2);
+    crate::snapshots::e2_pipeline_scan_fixture::pause_adoption(&f.support);
     let cache = Arc::new(SharedCache::default());
     f.evidence(2);
     let prior = seed_predecessor(&f, &cache);
@@ -736,9 +739,10 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
 #[test]
 fn missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     for conflict in [false, true] {
         let f = Fixture::new(2);
+        crate::snapshots::e2_pipeline_scan_fixture::pause_adoption(&f.support);
         let cache = Arc::new(SharedCache::default());
         let prior = seed_predecessor(&f, &cache);
         if conflict {
@@ -1425,7 +1429,6 @@ fn desktop_bucket(home: &Path, root: &str, account: &str, org: &str) -> PathBuf 
 // [behaviour] Deferred: adjacent restore trait is removed by active e5/pi-b2.
 #[test]
 fn desktop_completed_census_counts_existing_held_retry_reads() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let home = crate::test_scratch::ScratchDir::new("desktop-held-recovery");
     let f = fixture_in_home(&home);
     let store = desktop_bucket(&home, "Claude", DESKTOP_ACCOUNT, DESKTOP_ORG);
@@ -1437,7 +1440,7 @@ fn desktop_completed_census_counts_existing_held_retry_reads() {
     let cache = Arc::new(SharedCache::default());
     let mut index = settle(raw_scan_at(
         &f,
-        ScanIndex::default(),
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default()),
         Some(cache),
         true,
         COLLECTED,

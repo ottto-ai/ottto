@@ -63064,7 +63064,7 @@ mod tests {
     #[test]
     fn claude_local_otel_does_not_supply_missing_transcript_effort() {
         // Parse-stage native hours: gate on, e2::finish_page emits the hours.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let path = temp_file("claude-local-otel-effort-unknown");
         fs::write(
             &path,
@@ -63074,9 +63074,12 @@ mod tests {
             ),
         )
         .expect("write fixture");
-        let mut items =
-            parse_claude_code_jsonl_file(&path, "2026-07-11T10:04:00Z", "fp".to_string())
-                .expect("parse");
+        let mut items = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+            &path,
+            "2026-07-11T10:04:00Z",
+            "fp".to_string(),
+        )
+        .expect("parse");
         let evidence = BTreeMap::from([(
             "claude-effort-1".to_string(),
             vec![crate::claude_local_otel::ClaudeLocalOtelEvidence {
@@ -63118,7 +63121,7 @@ mod tests {
     #[test]
     fn claude_local_otel_does_not_split_unknown_cache_creation() {
         // Parse-stage native hours: gate on, e2::finish_page emits the hours.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let path = temp_file("claude-effort-cache-ttl");
         fs::write(
             &path,
@@ -63128,9 +63131,12 @@ mod tests {
             ),
         )
         .expect("write fixture");
-        let mut items =
-            parse_claude_code_jsonl_file(&path, "2026-07-12T15:08:00Z", "fp".to_string())
-                .expect("parse");
+        let mut items = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+            &path,
+            "2026-07-12T15:08:00Z",
+            "fp".to_string(),
+        )
+        .expect("parse");
         let evidence = BTreeMap::from([(
             "claude-effort-cache-1".to_string(),
             vec![crate::claude_local_otel::ClaudeLocalOtelEvidence {
@@ -63161,9 +63167,12 @@ mod tests {
         assert_eq!(rows[0].cache_creation_1h_tokens, 2014);
         validate_snapshot_item(0, &items[0]).expect("unchanged snapshot remains byte-exact");
 
-        let mut scoped_items =
-            parse_claude_code_jsonl_file(&path, "2026-07-12T15:08:00Z", "fp".to_string())
-                .expect("parse scoped fixture");
+        let mut scoped_items = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+            &path,
+            "2026-07-12T15:08:00Z",
+            "fp".to_string(),
+        )
+        .expect("parse scoped fixture");
         let scoped_evidence = BTreeMap::from([(
             "claude-effort-cache-1".to_string(),
             vec![crate::claude_local_otel::ClaudeLocalOtelEvidence {
@@ -63465,7 +63474,7 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    fn claude_account_family_fixture() -> (PathBuf, String, Vec<SnapshotItem>) {
+    fn claude_account_family_fixture(ordinary_money: bool) -> (PathBuf, String, Vec<SnapshotItem>) {
         let root = crate::test_scratch::private_dir("claude-account-family");
         let parent = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5".to_string();
         let parent_path = root.join(format!("{parent}.jsonl"));
@@ -63487,19 +63496,20 @@ mod tests {
             "{\"timestamp\":\"2026-08-02T07:00:04Z\",\"type\":\"assistant\",\"sessionId\":\"1338a80a-f36e-4cbc-a5bb-50fc66430ba5\",\"agentId\":\"a4d1585d310070d0f\",\"isSidechain\":true,\"requestId\":\"req_5\",\"message\":{\"model\":\"claude-haiku-4-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n",
         )
         .expect("write child fixture");
-        let mut items = parse_claude_code_jsonl_file(
+        let parse = if ordinary_money {
+            crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary
+        } else {
+            parse_claude_code_jsonl_file
+        };
+        let mut items = parse(
             &parent_path,
             "2026-08-02T07:01:00Z",
             "parent-fp".to_string(),
         )
         .expect("parse parent");
         items.extend(
-            parse_claude_code_jsonl_file(
-                &child_path,
-                "2026-08-02T07:01:00Z",
-                "child-fp".to_string(),
-            )
-            .expect("parse child"),
+            parse(&child_path, "2026-08-02T07:01:00Z", "child-fp".to_string())
+                .expect("parse child"),
         );
         assert_eq!(items.iter().map(|item| item.request_count).sum::<u64>(), 5);
         assert!(items[1]
@@ -63771,7 +63781,7 @@ mod tests {
     #[test]
     fn claude_cache_split_new_family_proves_at_healthy_terminal() {
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let (root, parent, mut items) = cache_split_fixture();
         let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
             evidence: BTreeMap::from([(parent.clone(), vec![cache_split_api_row(&parent, true)])]),
@@ -63784,7 +63794,8 @@ mod tests {
             )]),
             ..Default::default()
         };
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         index.files.insert(
             local_index_key(&root.join(format!("{parent}.jsonl"))),
             manifest_index_entry(None),
@@ -63880,8 +63891,8 @@ mod tests {
     #[test]
     fn claude_reported_usage_union_assigns_aux_and_preserves_graph() {
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-        let (root, parent, mut items) = claude_account_family_fixture();
+
+        let (root, parent, mut items) = claude_account_family_fixture(true);
         let occurrences = items[0]
             .claude_usage_occurrences
             .iter()
@@ -63939,7 +63950,8 @@ mod tests {
             evidence: BTreeMap::from([(parent.clone(), trace_rows)]),
             ..Default::default()
         };
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         index.files.insert(
             local_index_key(&root.join(format!("{parent}.jsonl"))),
             manifest_index_entry(None),
@@ -64078,7 +64090,7 @@ mod tests {
         // The terminal page mints a content-free family witness. A later
         // child-only correction can reconstruct the same exact ledger without
         // pretending the bounded page is a new complete census.
-        let (reparsed_root, _, mut reparsed) = claude_account_family_fixture();
+        let (reparsed_root, _, mut reparsed) = claude_account_family_fixture(true);
         let mut child_only = vec![reparsed.remove(1)];
         apply_claude_reported_usage_with_index(
             &mut child_only,
@@ -64108,7 +64120,7 @@ mod tests {
         );
         let mut unhealthy_trace = trace_report.clone();
         unhealthy_trace.malformed_lines = 1;
-        let (unhealthy_root, _, mut unhealthy_reparse) = claude_account_family_fixture();
+        let (unhealthy_root, _, mut unhealthy_reparse) = claude_account_family_fixture(true);
         let mut unhealthy_child = vec![unhealthy_reparse.remove(1)];
         let disposition = apply_claude_reported_usage_with_index(
             &mut unhealthy_child,
@@ -64141,7 +64153,7 @@ mod tests {
     #[test]
     fn exact_seven_entity_authority_demotion_cohort_reproves_before_upload() {
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let fixture: Value = serde_json::from_str(include_str!(
             "../../../fixtures/snapshot-audit/claude-authority-demotion-cohort.v1.json"
         ))
@@ -64164,7 +64176,8 @@ mod tests {
 
         let root = temp_dir("claude-authority-demotion-seven");
         let mut items = Vec::new();
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         let mut api_rows = Vec::new();
         let mut trace_rows = Vec::new();
         for (offset, member) in members.iter().enumerate() {
@@ -64215,7 +64228,7 @@ mod tests {
                 ),
             )
             .expect("write exact cohort member");
-            let mut parsed = parse_claude_code_jsonl_file(
+            let mut parsed = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
                 &path,
                 "2026-08-23T18:40:00Z",
                 rejected_fingerprint.to_string(),
@@ -64408,7 +64421,8 @@ mod tests {
             7
         );
         let health_root = temp_dir("claude-authority-terminal-health");
-        let mut health_index = ScanIndex::default();
+        let mut health_index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         let mut terminal_health = scan_source_roots(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&health_root),
@@ -64467,8 +64481,8 @@ mod tests {
     #[test]
     fn claude_invalid_family_can_hide_copy_from_provider_owned_session() {
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-        let (root, parent, mut items) = claude_account_family_fixture();
+
+        let (root, parent, mut items) = claude_account_family_fixture(true);
         let hidden_copy_id = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5";
         let hidden_copy_path = root.join(format!("{hidden_copy_id}.jsonl"));
         fs::write(
@@ -64478,7 +64492,7 @@ mod tests {
             ),
         )
         .expect("write hidden-copy fixture");
-        let mut hidden_copy = parse_claude_code_jsonl_file(
+        let mut hidden_copy = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
             &hidden_copy_path,
             "2026-08-02T07:01:00Z",
             "hidden-copy-fp".to_string(),
@@ -64513,7 +64527,8 @@ mod tests {
             evidence: BTreeMap::from([(parent.clone(), trace_rows)]),
             ..Default::default()
         };
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         index.files.insert(
             local_index_key(&root.join(format!("{parent}.jsonl"))),
             manifest_index_entry(None),
@@ -64699,7 +64714,7 @@ mod tests {
 
     #[test]
     fn claude_duplicate_census_counts_separate_complete_invalid_and_owner_bound() {
-        let (root, parent, items) = claude_account_family_fixture();
+        let (root, parent, items) = claude_account_family_fixture(false);
 
         // The fixture census clock; a fresh closure schedules its next full
         // re-arm one base backoff later.
@@ -64958,7 +64973,7 @@ mod tests {
 
     #[test]
     fn claude_duplicate_census_counts_name_each_pending_invalidation_once() {
-        let (root, _, items) = claude_account_family_fixture();
+        let (root, _, items) = claude_account_family_fixture(false);
         let window = "2026-08-02T07:10:00Z";
         let accumulate = |page: &[SnapshotItem], max_occurrences: usize| {
             let mut pending = BTreeMap::new();
@@ -65052,7 +65067,7 @@ mod tests {
 
     #[test]
     fn claude_reported_usage_union_refuses_unknown_trace_owner() {
-        let (root, parent, mut items) = claude_account_family_fixture();
+        let (root, parent, mut items) = claude_account_family_fixture(false);
         let api_rows = vec![complete_api_row(&parent, "req_1", 1, 10, 10, 0)];
         let trace_rows = vec![complete_trace_row(&parent, "req_1", "not-a-member")];
         let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
@@ -65094,7 +65109,7 @@ mod tests {
 
     #[test]
     fn claude_reported_usage_union_checks_earlier_page_occurrences() {
-        let (root, parent, mut items) = claude_account_family_fixture();
+        let (root, parent, mut items) = claude_account_family_fixture(false);
         let child_agent = "a4d1585d310070d0f";
         let mut api_rows = (1..=4)
             .map(|index| {
@@ -65162,7 +65177,7 @@ mod tests {
     #[test]
     fn claude_legacy_fork_prefix_is_excluded_only_with_exact_external_owner() {
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let root = temp_dir("claude-legacy-fork-prefix");
         let parent = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let child = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
@@ -65193,14 +65208,14 @@ mod tests {
             ),
         )
         .expect("write legacy child branch");
-        let mut items = parse_claude_code_jsonl_file(
+        let mut items = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
             &parent_path,
             "2026-08-02T07:10:00Z",
             "parent-fp".to_string(),
         )
         .expect("parse parent");
         items.extend(
-            parse_claude_code_jsonl_file(
+            crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
                 &child_path,
                 "2026-08-02T07:10:00Z",
                 "child-fp".to_string(),
@@ -65256,7 +65271,8 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         index
             .files
             .insert(local_index_key(&parent_path), manifest_index_entry(None));
@@ -65310,7 +65326,7 @@ mod tests {
 
         // A later child-only correction must revalidate the exact external
         // owner evidence, not trust the persisted prefix decision by itself.
-        let mut child_only = parse_claude_code_jsonl_file(
+        let mut child_only = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
             &child_path,
             "2026-08-02T07:11:00Z",
             "child-fp-2".to_string(),
@@ -65350,9 +65366,12 @@ mod tests {
             )]),
             ..Default::default()
         };
-        let mut unproven =
-            parse_claude_code_jsonl_file(&child_path, "2026-08-02T07:12:00Z", "3".repeat(64))
-                .expect("reparse unproven child");
+        let mut unproven = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+            &child_path,
+            "2026-08-02T07:12:00Z",
+            "3".repeat(64),
+        )
+        .expect("reparse unproven child");
         let unproven_disposition = apply_claude_reported_usage_with_index(
             &mut unproven,
             &child_only_report,
@@ -65573,8 +65592,8 @@ mod tests {
     #[test]
     fn claude_d1_subagent_own_request_qualification() {
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-        let (dir, root, items) = claude_account_family_fixture();
+
+        let (dir, root, items) = claude_account_family_fixture(true);
         let child = items[1].clone();
         let make_api = |request: &str, seq: u64, account: &str| {
             let mut row = complete_api_row(&root, request, seq, 10, 1, 0);
@@ -65600,7 +65619,8 @@ mod tests {
         let trace = vec![complete_trace_row(&root, "req_5", "a4d1585d310070d0f")];
         let evidence = BTreeMap::from([(root.clone(), api.clone())]);
         let mut current = vec![child.clone()];
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         apply_claude_effort_evidence_with_index(
             &mut current,
             &evidence,
@@ -65776,8 +65796,8 @@ mod tests {
     #[test]
     fn claude_d1_subagent_coverage_lifecycle_and_shapes() {
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-        let (dir, root, items) = claude_account_family_fixture();
+
+        let (dir, root, items) = claude_account_family_fixture(true);
         // Positive request evidence needs no parent transcript or family census.
         fs::remove_file(dir.join(format!("{root}.jsonl"))).unwrap();
         let mut child = items[1].clone();
@@ -65818,10 +65838,13 @@ mod tests {
             r#"{"agentType":"Explore","spawnDepth":2,"parentAgentId":"a4d1585d310070d0f"}"#,
         )
         .unwrap();
-        let mut nested =
-            parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "d".repeat(64))
-                .unwrap()
-                .remove(0);
+        let mut nested = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+            &path,
+            "2026-08-02T07:01:00Z",
+            "d".repeat(64),
+        )
+        .unwrap()
+        .remove(0);
         assert!(nested
             .attribution_facts
             .iter()
@@ -65893,16 +65916,20 @@ mod tests {
     #[test]
     fn claude_d1_multiple_requests_typed_identity_and_unreadable_import() {
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-        let (dir, root, items) = claude_account_family_fixture();
+
+        let (dir, root, items) = claude_account_family_fixture(true);
         let path = dir
             .join(&root)
             .join("subagents/agent-a4d1585d310070d0f.jsonl");
         let first = String::from_utf8(fs::read(&path).unwrap()).unwrap();
         fs::write(&path, format!("{first}{}", first.replace("req_5", "req_6"))).unwrap();
-        let child = parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "d".repeat(64))
-            .unwrap()
-            .remove(0);
+        let child = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+            &path,
+            "2026-08-02T07:01:00Z",
+            "d".repeat(64),
+        )
+        .unwrap()
+        .remove(0);
         assert_eq!(child.request_count, 2);
         let mut api = vec![
             complete_api_row(&root, "req_5", 5, 10, 1, 0),
@@ -65977,21 +66004,26 @@ mod tests {
     #[test]
     fn claude_d1_fresh_reparse_retains_binding_refusal_until_exact_proof_returns() {
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-        let (dir, root, items) = claude_account_family_fixture();
+
+        let (dir, root, items) = claude_account_family_fixture(true);
         let child_path = dir
             .join(&root)
             .join("subagents/agent-a4d1585d310070d0f.jsonl");
         let parse = || {
-            parse_claude_code_jsonl_file(&child_path, "2026-08-02T07:01:00Z", "d".repeat(64))
-                .unwrap()
-                .remove(0)
+            crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+                &child_path,
+                "2026-08-02T07:01:00Z",
+                "d".repeat(64),
+            )
+            .unwrap()
+            .remove(0)
         };
         let api = vec![complete_api_row(&root, "req_5", 5, 10, 1, 0)];
         let trace = vec![complete_trace_row(&root, "req_5", "a4d1585d310070d0f")];
         let mut proved = items[1].clone();
         assert!(d1_subagent_account_specimen(&mut proved, &api, &trace));
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         assert!(index
             .bind_session_accounts(
                 SnapshotSource::ClaudeCode,
@@ -66003,6 +66035,7 @@ mod tests {
         let index_path = dir.join("account-index.json");
         index.save(&index_path).unwrap();
         let mut restarted = ScanIndex::load(&index_path).unwrap();
+        restarted = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(restarted);
         let before_bindings = restarted.session_account_bindings.clone();
         let mut fresh = parse();
         assert!(!d1_subagent_account_specimen(&mut fresh, &[], &[]));
@@ -66025,7 +66058,8 @@ mod tests {
             uploadable.is_empty(),
             "unproved fresh usage cannot inherit a cached account"
         );
-        let mut import_index = ScanIndex::default();
+        let mut import_index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         assert!(
             import_index
                 .bind_session_accounts(
@@ -66123,7 +66157,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_v2_parity_and_old_index_upgrade() {
-        let (dir, root, items) = claude_account_family_fixture();
+        let (dir, root, items) = claude_account_family_fixture(false);
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let mut index = d2_family_index(&dir, &root);
         index.session_account_bindings.insert(
@@ -66259,7 +66293,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_storage_upgrade_keeps_canonical_witness_without_reread() {
-        let (dir, root, items) = claude_account_family_fixture();
+        let (dir, root, items) = claude_account_family_fixture(false);
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let mut index = d2_family_index(&dir, &root);
         apply_claude_effort_evidence_with_index(
@@ -66317,7 +66351,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_v2_old_fingerprint_is_unknown_and_collision_revokes_family_proof() {
-        let (dir, root, items) = claude_account_family_fixture();
+        let (dir, root, items) = claude_account_family_fixture(false);
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let mut index = d2_family_index(&dir, &root);
         apply_claude_effort_evidence_with_index(
@@ -66395,7 +66429,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_old_windows_survive_held_incomplete_and_retry_save() {
-        let (dir, root, items) = claude_account_family_fixture();
+        let (dir, root, items) = claude_account_family_fixture(false);
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let mut index = d2_family_index(&dir, &root);
         apply_claude_effort_evidence_with_index(
@@ -66532,7 +66566,7 @@ mod tests {
     }
 
     fn d2_assert_current_window_blocks_older_unfinished_retirement(blocker: &str) {
-        let (dir, root, items) = claude_account_family_fixture();
+        let (dir, root, items) = claude_account_family_fixture(false);
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let mut index = d2_family_index(&dir, &root);
         apply_claude_effort_evidence_with_index(
@@ -66622,7 +66656,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_new_identity_cannot_retire_using_prior_revision_acks() {
-        let (dir, root, items) = claude_account_family_fixture();
+        let (dir, root, items) = claude_account_family_fixture(false);
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let mut previous = d2_family_index(&dir, &root);
         apply_claude_effort_evidence_with_index(
@@ -66684,7 +66718,7 @@ mod tests {
     fn terminal_off_account_finalizer_withholds_the_unproven_member_revision() {
         let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
         assert!(claude_terminal_off());
-        let (dir, root, _) = claude_account_family_fixture();
+        let (dir, root, _) = claude_account_family_fixture(false);
         let mut index = ScanIndex::default();
         let mut result = scan_source_roots_with_limit(
             SnapshotSource::ClaudeCode,
@@ -66772,7 +66806,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_root_only_windows_and_cross_window_members_settle() {
-        let (dir, root, items) = claude_account_family_fixture();
+        let (dir, root, items) = claude_account_family_fixture(false);
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let mut index = d2_family_index(&dir, &root);
         apply_claude_effort_evidence_with_index(
@@ -66853,7 +66887,7 @@ mod tests {
     fn claude_account_pending_disappearance_and_empty_members_respect_partial_checkpoints() {
         for removal in ["guarded", "bounded", "empty"] {
             let empty = removal == "empty";
-            let (dir, root, items) = claude_account_family_fixture();
+            let (dir, root, items) = claude_account_family_fixture(false);
             let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
             let mut previous = d2_family_index(&dir, &root);
             apply_claude_effort_evidence_with_index(
@@ -66969,7 +67003,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_disappearance_without_newer_live_identity_retains_old_window() {
-        let (dir, root, items) = claude_account_family_fixture();
+        let (dir, root, items) = claude_account_family_fixture(false);
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let mut index = d2_family_index(&dir, &root);
         apply_claude_effort_evidence_with_index(
@@ -67010,7 +67044,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_new_unaccepted_child_omission_is_not_disappearance() {
-        let (dir, root, items) = claude_account_family_fixture();
+        let (dir, root, items) = claude_account_family_fixture(false);
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let full = d2_family_index(&dir, &root);
         let child_key = full
@@ -67100,7 +67134,7 @@ mod tests {
             member_request_id_hashes: BTreeMap<String, BTreeSet<String>>,
             invalid: bool,
         }
-        let (dir, root, items) = claude_account_family_fixture();
+        let (dir, root, items) = claude_account_family_fixture(false);
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let mut index = d2_family_index(&dir, &root);
         apply_claude_effort_evidence_with_index(
@@ -67126,7 +67160,7 @@ mod tests {
 
     #[test]
     fn claude_account_family_legacy_witness_schedules_reparse_and_rebuilds() {
-        let (root, parent, items) = claude_account_family_fixture();
+        let (root, parent, items) = claude_account_family_fixture(false);
         let account_hash = "a".repeat(64);
         let evidence = claude_account_family_evidence(&parent, &vec![account_hash.clone(); 5]);
         let parent_index_key = local_index_key(&root.join(format!("{parent}.jsonl")));
@@ -67220,7 +67254,7 @@ mod tests {
 
     #[test]
     fn claude_account_hash_converges_family_split_across_census_pages() {
-        let (root, parent, mut items) = claude_account_family_fixture();
+        let (root, parent, mut items) = claude_account_family_fixture(false);
         let account_hash = "a".repeat(64);
         let evidence = claude_account_family_evidence(&parent, &vec![account_hash.clone(); 5]);
         let parent_index_key = local_index_key(&root.join(format!("{parent}.jsonl")));
@@ -67282,7 +67316,7 @@ mod tests {
             .source_file_fingerprint
             .is_empty());
 
-        let (reparsed_root, _, mut reparsed) = claude_account_family_fixture();
+        let (reparsed_root, _, mut reparsed) = claude_account_family_fixture(false);
         let mut retried_parent = vec![reparsed.remove(0)];
         apply_claude_effort_evidence_with_index(
             &mut retried_parent,
@@ -67301,7 +67335,7 @@ mod tests {
 
     #[test]
     fn claude_account_hash_refuses_incomplete_or_conflicting_family_evidence() {
-        let (root, parent, items) = claude_account_family_fixture();
+        let (root, parent, items) = claude_account_family_fixture(false);
         let assert_unknown = |items: &[SnapshotItem]| {
             assert!(items.iter().all(|item| item
                 .model_usage
@@ -67404,7 +67438,7 @@ mod tests {
             (&[Some("claude_desktop_spawn:v1"), None], false),
         ];
         for (source_versions, family_proves) in cases {
-            let (root, parent, mut items) = claude_account_family_fixture();
+            let (root, parent, mut items) = claude_account_family_fixture(false);
             let nested_fact = items[1]
                 .attribution_facts
                 .iter()
@@ -68462,7 +68496,7 @@ mod tests {
     #[test]
     fn claude_code_parser_sums_message_usage_and_uses_summary_title() {
         // Parse-stage native hours: gate on, e2::finish_page emits the hours.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let path = temp_file("claude");
         fs::write(
             &path,
@@ -68474,7 +68508,7 @@ mod tests {
         )
         .expect("write fixture");
 
-        let item = parse_claude_code_jsonl_file(
+        let item = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
             &path,
             "2026-05-06T10:04:00Z",
             "file-fingerprint".to_string(),
@@ -68722,7 +68756,7 @@ mod tests {
     #[test]
     fn claude_true_chronological_usage_regression_quarantines_the_file() {
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let root = temp_dir("claude-progressive-conflict");
         let path = root.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
         fs::write(
@@ -68733,7 +68767,8 @@ mod tests {
             ),
         )
         .expect("write fixture");
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         let scan = scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&root),
@@ -68755,7 +68790,7 @@ mod tests {
     #[test]
     fn claude_equal_provider_time_usage_conflict_quarantines_the_file() {
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let root = temp_dir("claude-progressive-equal-time-conflict");
         let path = root.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
         fs::write(
@@ -68766,7 +68801,8 @@ mod tests {
             ),
         )
         .expect("write fixture");
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         let scan = scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&root),
@@ -69778,7 +69814,7 @@ mod tests {
     #[test]
     fn claude_nonforked_owned_start_accepts_minimal_paired_request_evidence() {
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let path = temp_file("claude-nonforked-paired-owned-start");
         let source_session_id = path
             .file_stem()
@@ -69792,9 +69828,12 @@ mod tests {
             ),
         )
         .expect("write fixture");
-        let mut items =
-            parse_claude_code_jsonl_file(&path, "2026-08-20T11:02:00Z", "source".to_string())
-                .expect("parse");
+        let mut items = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+            &path,
+            "2026-08-20T11:02:00Z",
+            "source".to_string(),
+        )
+        .expect("parse");
         let mut api = complete_api_row(&source_session_id, "req_owned", 1, 10, 2, 0);
         api.client_request_id.clear();
         api.cost_usd_micros = None;
@@ -69812,7 +69851,8 @@ mod tests {
             "sha256:{:x}",
             Sha256::digest(serde_json::to_vec(&trace).expect("serialize trace evidence"))
         );
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         index.files.insert(
             local_index_key(&path),
             manifest_index_entry(Some("unresolved")),
@@ -72916,7 +72956,7 @@ mod tests {
             "requestId":"copied-request", "message":{"id":"copied-message", "model":"claude-opus-4-8",
             "usage":{"input_tokens":100,"output_tokens":50}}});
         fs::write(&path, format!("{prefix}{owned_start}\n{record}\n")).unwrap();
-        let mut item = parse_claude_code_jsonl_file_with_title_metadata(
+        let mut item = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary_with_metadata(
             &path,
             "2026-09-30T10:05:00Z",
             "f".repeat(64),
@@ -73486,7 +73526,7 @@ mod tests {
     #[test]
     fn claude_original_carrier_source_generated_wire_corpus() {
         // Released pre-flip bytes built without e2::finish_page, which emits the hours gate on.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let complete = claude_original_carrier_fixture(&claude_original_carrier_metadata(), "");
         assert!(complete
             .tool_usage
@@ -73957,13 +73997,12 @@ mod tests {
 
     #[test]
     fn finalized_parentless_desktop_child_counts_only_incomplete_emission() {
-        let _gate = claude_request_money::e2::GateForTest::off();
         for complete in [false, true] {
             let child = spawn_cli("parentless-count-child");
             let parent = spawn_cli("parentless-count-parent");
             let mut index = ScanIndex {
                 claude_desktop_lineage_census_complete: complete,
-                ..ScanIndex::default()
+                ..crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default())
             };
             index.claude_desktop_title_files.insert(
                 "child".into(),
@@ -73985,7 +74024,7 @@ mod tests {
                 .to_string(),
             )
             .unwrap();
-            let item = parse_claude_code_jsonl_file_with_title_metadata(
+            let item = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary_with_metadata(
                 &path,
                 "2026-09-30T10:05:00Z",
                 "f".repeat(64),
@@ -74994,7 +75033,7 @@ mod tests {
     #[test]
     fn claude_code_zero_token_usage_events_drop_from_buckets() {
         // Parse-stage native hours: gate on, e2::finish_page emits the hours.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let path = temp_file("claude-zero-token-activity");
         fs::write(
             &path,
@@ -75005,7 +75044,7 @@ mod tests {
         )
         .expect("write fixture");
 
-        let item = parse_claude_code_jsonl_file(
+        let item = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
             &path,
             "2026-05-06T10:04:00Z",
             "file-fingerprint".to_string(),
@@ -75033,7 +75072,7 @@ mod tests {
     #[test]
     fn claude_code_parser_builds_distinct_hourly_usage_buckets() {
         // Parse-stage native hours: gate on, e2::finish_page emits the hours.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let path = temp_file("claude-activity-buckets");
         fs::write(
             &path,
@@ -75044,7 +75083,7 @@ mod tests {
         )
         .expect("write fixture");
 
-        let item = parse_claude_code_jsonl_file(
+        let item = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
             &path,
             "2026-05-06T11:04:00Z",
             "file-fingerprint".to_string(),
@@ -76367,7 +76406,7 @@ mod tests {
     #[test]
     fn claude_code_parser_splits_long_and_short_context_into_distinct_rows() {
         // Parse-stage native hours: gate on, e2::finish_page emits the hours.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         // One first-party Anthropic session (same model, same gateway, same
         // hour) whose turns differ ONLY in prompt size. The daemon derives a
         // per-turn `context_bucket` from effective input volume (input +
@@ -76392,7 +76431,7 @@ mod tests {
         )
         .expect("write fixture");
 
-        let items = parse_claude_code_jsonl_file(
+        let items = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
             &path,
             "2026-05-29T09:10:00Z",
             "context-bucket-fingerprint".to_string(),
@@ -84376,7 +84415,7 @@ pub(crate) mod cache_adapter_tests {
     #[test]
     fn cache_claude_owned_fixture_is_independent_of_curve_sampling() {
         // Released pre-flip bytes built without e2::finish_page, which emits the hours gate on.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let session = "00000000-0000-7000-8000-000000000002";
         let mut parser = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
         parser.context_curve_enabled = false;
@@ -84399,7 +84438,8 @@ pub(crate) mod cache_adapter_tests {
             "f".repeat(64),
             None,
         );
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         apply_claude_reported_usage_with_index(
             &mut items,
             &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),

@@ -46,7 +46,7 @@ fn hold_released(index: &ScanIndex, key: &str) -> bool {
 #[test]
 fn fe_n1_virtual_due_carries_into_marker_when_capacity_opens_at_due() {
     // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -120,7 +120,6 @@ fn fe_n1_virtual_due_carries_into_marker_when_capacity_opens_at_due() {
 /// Creating the parked file (a stat change) retries it once.
 #[test]
 fn fe_n1_failing_held_open_backs_off_parks_and_never_blocks_healthy_key() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -232,7 +231,6 @@ fn fe_n1_failing_held_open_backs_off_parks_and_never_blocks_healthy_key() {
 /// captured clock, even when the live clock crosses D before secure open.
 #[test]
 fn fe_n1_rescue_and_failed_open_use_captured_due_across_clock_edge() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }

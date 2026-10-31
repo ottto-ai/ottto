@@ -1614,8 +1614,8 @@ fn parser_captures_owned_markers_and_never_inherited_ones() {
 #[test]
 fn transcript_path_tags_parsed_requests_from_their_own_telemetry() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let (dir, root, mut items) = claude_account_family_fixture();
+
+    let (dir, root, mut items) = claude_account_family_fixture(true);
     items.truncate(1);
     let api = (1..=4)
         .map(|n| {
@@ -1666,8 +1666,8 @@ fn transcript_path_tags_parsed_requests_from_their_own_telemetry() {
 #[test]
 fn contract5_lifecycle_matches_the_legacy_qualification_path() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let (dir, root, mut items) = claude_account_family_fixture();
+
+    let (dir, root, mut items) = claude_account_family_fixture(true);
     items.truncate(1);
     items[0].source_started_at = Some("2026-08-02T10:00:00.500+03:00".to_string());
     items[0].source_ended_at = Some("2026-08-02T10:30:00+03:00".to_string());
@@ -1721,8 +1721,8 @@ fn contract5_lifecycle_matches_the_legacy_qualification_path() {
 #[test]
 fn reported_path_tags_from_rebuild_groupings() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let (dir, root, mut items) = claude_account_family_fixture();
+
+    let (dir, root, mut items) = claude_account_family_fixture(true);
     items.truncate(1);
     let mut item = items.remove(0);
     let mut api = Vec::new();
@@ -1937,12 +1937,13 @@ fn assert_usage_conserved(tagged: &SnapshotItem, before: &SnapshotItem) {
 #[test]
 fn reported_rebuild_groups_requests_without_changing_its_output() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     for (with_aux, aux_login) in [(false, true), (true, true), (true, false)] {
-        let (dir, parent, items) = claude_account_family_fixture();
+        let (dir, parent, items) = claude_account_family_fixture(true);
         let (api, trace) = family_reports(&parent, with_aux, aux_login);
         let index = || {
-            let mut index = ScanIndex::default();
+            let mut index =
+                crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
             for key in family_index_keys(&dir, &parent) {
                 index.files.insert(key, manifest_index_entry(None));
             }
@@ -2054,15 +2055,16 @@ fn reported_rebuild_groups_requests_without_changing_its_output() {
 #[test]
 fn proven_reported_members_are_rearmed_and_reoffered_as_contract5() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     use crate::snapshots::claude_request_accounts as accounts;
     const WINDOW: &str = "2026-08-02T07:10:00Z";
     const NEXT_WINDOW: &str = "2026-08-02T07:20:00Z";
-    let (dir, parent, items) = claude_account_family_fixture();
+    let (dir, parent, items) = claude_account_family_fixture(true);
     let (api, trace) = family_reports(&parent, true, true);
     let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
     let keys = family_index_keys(&dir, &parent);
-    let mut index = ScanIndex::default();
+    let mut index =
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
     for key in &keys {
         index.files.insert(key.clone(), manifest_index_entry(None));
     }
@@ -2279,7 +2281,7 @@ fn request_hash(request_id: &str) -> String {
 #[test]
 fn legacy_excluded_reported_fork_stays_contract5_by_owned_requests() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let parent_login = "b".repeat(64);
     // One auxiliary request first: the item 0.1.172 already sent as contract 5.
     for aux in [1, 0, 2] {
@@ -2588,7 +2590,7 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
 #[test]
 fn legacy_exclusion_skew_never_tags_or_borrows_the_parent() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     // Two telemetry-only requests: the 0.1.172 count guard (4 != 3) is
     // negative, so only exact owned accounting could admit the child.
     let (dir, mut items, api, trace, mut index) = legacy_fork_fixture(2);
@@ -2714,8 +2716,8 @@ fn legacy_exclusion_skew_never_tags_or_borrows_the_parent() {
 #[test]
 fn unreadable_sidecars_refuse_and_unqualified_items_keep_todays_bytes() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let (dir, _root, items) = claude_account_family_fixture();
+
+    let (dir, _root, items) = claude_account_family_fixture(true);
     let (api, trace) = reports(Vec::new(), Vec::new());
     let unreadable = ScanEvidence::new(&api, &trace, root_set(), None);
     let mut refused = items.clone();
@@ -2847,7 +2849,7 @@ fn bound_case(
     Vec<SnapshotItem>,
     claude_request_accounts::MixedUploads,
 ) {
-    let (dir, root, mut items) = claude_account_family_fixture();
+    let (dir, root, mut items) = claude_account_family_fixture(false);
     items.truncate(1);
     items[0].session_account_evidence = Some(SessionAccountEvidence {
         provider: "anthropic",
@@ -2936,7 +2938,7 @@ fn bind_owner_a(
 #[test]
 fn bound_sessions_admit_contract5_only_with_absent_or_matching_creator() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let login_b = "b".repeat(64);
     for mixed in [true, false] {
         for (creator, admitted) in [
@@ -3335,7 +3337,7 @@ fn parse_session(folder: &Path, lines: &[Value]) -> Vec<SnapshotItem> {
 #[test]
 fn unmatched_email_in_a_registered_folder_is_refused_end_to_end_with_usage_conserved() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let dir = temp_dir("claude-request-identity-email");
     let slot = dir.join("slot");
     let home = crate::claude_status_coverage::home_key(&slot);
@@ -3427,7 +3429,7 @@ fn unmatched_email_in_a_registered_folder_is_refused_end_to_end_with_usage_conse
 #[test]
 fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     use crate::claude_status_coverage::{home_key, Ledger, Registration, MAX_LOST};
     let dir = temp_dir("claude-request-identity-removed-slot");
     let (slot, loose) = (dir.join("slot"), dir.join("loose"));
@@ -3670,7 +3672,7 @@ fn rows_under_another_root_own_the_request() {
 #[test]
 fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     use crate::snapshots::ClaudeDuplicateCensusCounts;
     let dir = temp_dir("claude-i1b-copied-markers");
     let org = org_hash(ORG_1);
@@ -3712,7 +3714,7 @@ fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
         coverage_complete: true,
         ..Default::default()
     };
-    let clean = ScanIndex::default();
+    let clean = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
     let mut saved = clean.clone();
     saved.claude_duplicate_request_owners.insert(
         format!("{:x}", Sha256::digest(b"req_5")),
@@ -3879,7 +3881,7 @@ fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
 #[test]
 fn capture_on_non_marker_body_matches_main_before_withdrawal() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let dir = temp_dir("claude-i1b-non-marker-parity");
     let lines = vec![
         json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment", "sessionId": ROOT,
@@ -4007,7 +4009,7 @@ fn tagged_body(item: &SnapshotItem) -> (Value, Value, Value, u64) {
 #[test]
 fn zero_usage_api_error_with_request_id_keeps_contract5_and_claims_nothing() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let dir = temp_dir("claude-request-identity-zero-usage");
     let other_login = "b".repeat(64);
     let base = owned_session();
@@ -4092,7 +4094,7 @@ fn zero_usage_api_error_with_request_id_keeps_contract5_and_claims_nothing() {
 #[test]
 fn zero_usage_without_an_id_or_before_final_usage_keeps_todays_contract5() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let dir = temp_dir("claude-request-identity-zero-usage-unchanged");
     let (api, trace) = owned_session_reports();
     let base = owned_session();
@@ -4130,7 +4132,7 @@ fn zero_usage_without_an_id_or_before_final_usage_keeps_todays_contract5() {
 #[test]
 fn zero_usage_record_never_admits_unowned_or_uncounted_usage() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let dir = temp_dir("claude-request-identity-zero-usage-negatives");
     let (api, trace) = owned_session_reports();
     let with_error = |extra: Option<Value>| {
@@ -4184,7 +4186,7 @@ fn zero_usage_record_never_admits_unowned_or_uncounted_usage() {
 #[test]
 fn zero_usage_record_keeps_a_foreign_owned_request_refused() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let dir = temp_dir("claude-request-identity-zero-usage-foreign");
     let foreign_login = "b".repeat(64);
     let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
@@ -4432,7 +4434,7 @@ fn desktop_recent_cli_to_desktop_and_missing_entrypoint_fail_closed() {
 #[test]
 fn desktop_recent_survives_same_account_org_switch_through_enrichment_and_both_folds() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let dir = temp_dir("desktop-recent-enrichment");
     let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
     let first = now - time::Duration::seconds(60);
@@ -4460,9 +4462,10 @@ fn desktop_recent_survives_same_account_org_switch_through_enrichment_and_both_f
             .collect::<String>(),
     )
     .unwrap();
-    let mut item = parse_claude_code_jsonl_file(&path, &stamp(now), "fp".into())
-        .unwrap()
-        .remove(0);
+    let mut item =
+        crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(&path, &stamp(now), "fp".into())
+            .unwrap()
+            .remove(0);
     item.session_account_evidence = Some(SessionAccountEvidence {
         provider: "anthropic",
         account_identifier_hash: Some(account.clone()),
@@ -4495,7 +4498,8 @@ fn desktop_recent_survives_same_account_org_switch_through_enrichment_and_both_f
             complete_trace_row(ROOT, "req_2", ""),
         ],
     );
-    let mut index = ScanIndex::default();
+    let mut index =
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
     let mut enriched = vec![item];
     apply_claude_effort_evidence_with_index(
         &mut enriched,
@@ -4573,7 +4577,7 @@ fn desktop_recent_survives_same_account_org_switch_through_enrichment_and_both_f
 #[test]
 fn desktop_recent_refuses_foreign_conflicting_and_other_account_requests_without_duplicate_index() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let dir = temp_dir("desktop-recent-foreign");
     let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
     let at = now - time::Duration::seconds(30);
@@ -4593,9 +4597,10 @@ fn desktop_recent_refuses_foreign_conflicting_and_other_account_requests_without
             .collect::<String>(),
     )
     .unwrap();
-    let base = parse_claude_code_jsonl_file(&path, &stamp(now), "fp".into())
-        .unwrap()
-        .remove(0);
+    let base =
+        crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(&path, &stamp(now), "fp".into())
+            .unwrap()
+            .remove(0);
     for (case, account) in [
         ("foreign", "f3".repeat(32)),
         ("conflict", "f4".repeat(32)),
@@ -5456,7 +5461,7 @@ fn fallback_withholds_and_ineligible_items_carry_no_display() {
 /// current, and a response without a complete event clock proves no order.
 #[test]
 fn transcript_path_current_account_is_the_newest_parsed_request() {
-    let (dir, root, mut items) = claude_account_family_fixture();
+    let (dir, root, mut items) = claude_account_family_fixture(false);
     items.truncate(1);
     let api = (1..=4)
         .map(|n| {

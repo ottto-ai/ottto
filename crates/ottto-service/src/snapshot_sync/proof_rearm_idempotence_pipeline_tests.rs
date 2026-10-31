@@ -111,7 +111,7 @@ fn c1a_invalid_path(fixture: &RearmFixture) -> PathBuf {
 /// The re-arm fixture plus the request-id-less transcript, under a contract-5
 /// identity permit unless the test changes it.
 fn c1a_fixture(case: &'static str) -> RearmFixture {
-    let mut fixture = RearmFixture::new(case);
+    let mut fixture = RearmFixture::ordinary(case);
     fixture.request_identity = true;
     std::fs::write(
         c1a_invalid_path(&fixture),
@@ -326,7 +326,7 @@ fn c1a_closed_fence_unchanged_proof_rearms_nothing_after_its_reproof() {
 #[serial(source_manifests)]
 fn c1a_refused_budget_fallback_equals_base() {
     // BASE re-offers the unchanged family at 08:10; gate on it is a semantic no-op (no re-upload).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !c1a_layout_supported("c1a_refused_budget_fallback") {
         return;
     }
@@ -437,7 +437,7 @@ fn c1a_changed_witness_rearms_like_base() {
 #[serial(source_manifests)]
 fn c1a_late_identity_row_reselects_and_tags_skipped_family() {
     // Contract-5 tagging oracle; markerless single-account E2 bodies keep the D1 wire shape.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     use sha2::{Digest, Sha256};
     if !c1a_layout_supported("c1a_late_identity_row") {
         return;
@@ -891,7 +891,7 @@ fn c1a_late_account_row(fixture: &RearmFixture) {
 #[serial(source_manifests)]
 fn c1a_late_row_between_windows_equals_base() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !c1a_layout_supported("c1a_late_row_between_windows") {
         return;
     }
@@ -1046,7 +1046,7 @@ fn c1a_assert_family_emitted_and_tagged(
 #[serial(source_manifests)]
 fn c1a_contract_off_to_on_reemits_family_bodies_under_new_contract() {
     // Contract-5 tagging oracle; markerless single-account E2 bodies keep the D1 wire shape.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !c1a_layout_supported("c1a_contract_off_to_on_reemits") {
         return;
     }
@@ -1121,7 +1121,7 @@ fn c1a_contract_off_to_on_reemits_family_bodies_under_new_contract() {
 #[serial(source_manifests)]
 fn c1a_contract_v1_to_v2_reemits_tagged_bodies_after_unchanged_terminal() {
     // Contract-5 tagging oracle; markerless single-account E2 bodies keep the D1 wire shape.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     use crate::snapshots::claude_request_identity::with_cycle_contract_for_test;
     if !c1a_layout_supported("c1a_contract_v1_to_v2_reemits") {
         return;

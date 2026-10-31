@@ -140,7 +140,7 @@ fn e2_assert_identity_consistent(item: &SnapshotItem, label: &str) {
 
 #[test]
 fn e2_pipeline_tags_the_final_root_and_agent_rows() {
-    let (dir, root, _) = claude_account_family_fixture();
+    let (dir, root, _) = claude_account_family_fixture(false);
     let support = dir.join("support");
     let (api, trace) = e2_family_evidence(&root);
     e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
@@ -183,7 +183,7 @@ fn e2_pipeline_tags_the_final_root_and_agent_rows() {
 
 #[test]
 fn e2_pipeline_tags_a_copied_transcript_once() {
-    let (dir, root, _) = claude_account_family_fixture();
+    let (dir, root, _) = claude_account_family_fixture(false);
     let support = dir.join("support");
     let (api, trace) = e2_family_evidence(&root);
     e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
@@ -260,7 +260,7 @@ fn e2_pipeline_tags_a_copied_transcript_once() {
 
 #[test]
 fn e2_pipeline_telemetry_read_failure_is_never_complete_and_withholds_nothing() {
-    let (dir, root, _) = claude_account_family_fixture();
+    let (dir, root, _) = claude_account_family_fixture(false);
     let support = dir.join("support");
     let (_, trace) = e2_family_evidence(&root);
     e2_write_rows(
@@ -334,7 +334,7 @@ fn e2_login_counts(item: &SnapshotItem) -> BTreeMap<Option<String>, u64> {
 
 #[test]
 fn e2_pipeline_root_and_child_keep_independent_own_telemetry_logins() {
-    let (dir, root, _) = claude_account_family_fixture();
+    let (dir, root, _) = claude_account_family_fixture(false);
     let support = dir.join("support");
     let (mut api, trace) = e2_family_evidence(&root);
     api[4].account_identifier_hash = Some("b".repeat(64));
@@ -372,7 +372,7 @@ fn e2_pipeline_root_and_child_keep_independent_own_telemetry_logins() {
 #[test]
 fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
     for (bound, partial) in [(false, false), (true, false), (false, true), (true, true)] {
-        let (dir, root, _) = claude_account_family_fixture();
+        let (dir, root, _) = claude_account_family_fixture(false);
         let support = dir.join("support");
         let (mut api, trace) = e2_family_evidence(&root);
         for row in &mut api[2..4] {
@@ -566,7 +566,7 @@ fn e2_assert_family_deferred(
 #[test]
 fn e2_pipeline_discarded_trace_read_leaves_requests_unbound_never_another_account() {
     for discard in [false, true] {
-        let (dir, root, _) = claude_account_family_fixture();
+        let (dir, root, _) = claude_account_family_fixture(false);
         let support = dir.join("support");
         let (mut api, trace) = e2_family_evidence(&root);
         api[4].account_identifier_hash = Some("b".repeat(64));
@@ -839,7 +839,7 @@ fn e2_bound_trace_case(
     accepted_ledger: bool,
     listed: bool,
 ) {
-    let (dir, root, _) = claude_account_family_fixture();
+    let (dir, root, _) = claude_account_family_fixture(false);
     e2_set_billing(&dir, &root, billing);
     let support = dir.join("support");
     let (mut api, trace) = e2_family_evidence(&root);

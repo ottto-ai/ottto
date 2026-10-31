@@ -342,7 +342,7 @@ fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Val
 #[serial(source_manifests)]
 fn census_every_offered_and_held_body_matches_control() {
     // Pre-E2 invariant: E2 reads census records as copy-holder evidence.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let (records, records_held, records_reset_owed) =
         census_pre_hold_parity_arm("census-all-bodies-records", true);
     let (control, control_held, control_reset_owed) =

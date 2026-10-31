@@ -695,7 +695,7 @@ struct NativePreparationFixture {
 }
 impl NativePreparationFixture {
     fn new() -> Self {
-        let (dir, parent, _) = claude_account_family_fixture();
+        let (dir, parent, _) = claude_account_family_fixture(false);
         let native = OwnedSourceScan::new_with_identity_capture(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&dir),
@@ -825,7 +825,7 @@ fn native_comparison_seeded_index_is_not_an_actual_skip_certificate() {
 #[test]
 fn native_comparison_current_nonreported_member_withdraws_whole_family() {
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let fixture = NativePreparationFixture::new();
     let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
     let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
@@ -3330,7 +3330,7 @@ fn native_comparison_corrected_native_receipt_fixture(
 #[test]
 fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save() {
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !native_positive_layout_for_test(
         "native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save",
     ) {
@@ -3352,7 +3352,7 @@ fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_se
 #[test]
 fn native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base() {
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !native_positive_layout_for_test(
         "native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base",
     ) {

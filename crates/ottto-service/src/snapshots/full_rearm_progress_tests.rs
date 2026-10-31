@@ -35,7 +35,7 @@ struct Rearm {
 
 impl Rearm {
     fn new() -> Self {
-        let (root, parent, mut items) = claude_account_family_fixture();
+        let (root, parent, mut items) = claude_account_family_fixture(false);
         let valid_parent = items[0].clone();
         items[1].claude_usage_occurrences.clear();
         assert!(claude_member_invalidity_is_structural(&items[1]));
@@ -1605,7 +1605,6 @@ fn a_contract_change_rearms_at_most_once_then_skips() {
 /// the latch.
 #[test]
 fn a_never_permitted_cutover_rearms_once_and_is_counted() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     claude_request_identity::with_cycle_contract_for_test(
         claude_request_identity::COLLECTOR,
         || {
@@ -1718,7 +1717,6 @@ fn a_never_permitted_cutover_rearms_once_and_is_counted() {
 /// through another terminal and restart. An unknown contract is not this case.
 #[test]
 fn a_dropped_cutover_field_with_recorded_empty_spends_one_more_run() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     claude_request_identity::with_cycle_contract_for_test(
         claude_request_identity::COLLECTOR,
         || {
@@ -1820,7 +1818,7 @@ fn a_dropped_cutover_field_with_recorded_empty_spends_one_more_run() {
 #[test]
 fn pipeline_auxiliary_bad_clock_preserves_refusal_without_whole_index_rearm() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let mut rearm = Rearm::new();
     let mut index = rearm.index();
     rearm.add_other_family(&mut index);
@@ -1880,7 +1878,7 @@ fn pipeline_auxiliary_bad_clock_preserves_refusal_without_whole_index_rearm() {
         let mut scan = scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
             &[],
-            &mut ScanIndex::default(),
+            &mut crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default()),
             WINDOW,
             7,
             100,
@@ -2341,7 +2339,6 @@ fn scanner_does_not_seal_capped_or_failed_rebuild_reads() {
 /// sidecar fingerprint. An unrelated, structurally invalid family stays quiet.
 #[test]
 fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
-    let _gate = claude_request_money::e2::GateForTest::off();
     claude_request_identity::with_cycle_contract_for_test("", || {
         let mut rearm = Rearm::new();
         let support = temp_dir("full-rearm-late-account");
@@ -2554,7 +2551,7 @@ fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
 fn dormant_owner_hold_returns_when_unrelated_sidecar_gap_is_fixed() {
     const DORMANT: &str = "d6666666-6666-4666-8666-666666666666";
     const GAP: &str = "b7777777-7777-4777-8777-777777777777";
-    let _gate = claude_request_money::e2::GateForTest::off();
+
     let mut rearm = Rearm::new();
     let mut index = rearm.index();
     rearm.add_other_family(&mut index);
@@ -2574,7 +2571,8 @@ fn dormant_owner_hold_returns_when_unrelated_sidecar_gap_is_fixed() {
     // Mint the dormant owner's witness through the real canonical proof.
     let mut owner = rearm.valid_parent.clone();
     owner.source_session_id = DORMANT.to_string();
-    let mut owner_index = ScanIndex::default();
+    let mut owner_index =
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
     insert_file(
         &mut owner_index,
         &local_index_key(&rearm.root.join(format!("{DORMANT}.jsonl"))),
@@ -2871,7 +2869,6 @@ fn each_canonical_telemetry_refusal_is_counted_without_whole_index_rearm() {
 
 #[test]
 fn bound_retry_pending_authority_survives_unrelated_suppression_and_offers_its_own_due_retry() {
-    let _gate = claude_request_money::e2::GateForTest::off();
     let mut rearm = Rearm::new();
     let mut index = rearm.index();
     rearm.add_other_family(&mut index);

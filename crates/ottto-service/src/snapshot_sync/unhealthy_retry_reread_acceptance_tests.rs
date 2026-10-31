@@ -160,7 +160,7 @@ fn at_next_start(fixture: &RearmFixture, previous: &AtWindow) -> i64 {
 #[serial(source_manifests)]
 fn unhealthy_retries_reread_only_unsettled_files() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !c1a_layout_supported("unhealthy_retry_reread_acceptance") {
         return;
     }
@@ -190,6 +190,7 @@ fn unhealthy_retries_reread_only_unsettled_files() {
     .expect("the closed fence schedules its next full replay");
 
     let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+    index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(index);
     let held_head = c1b_terminal_head(&index);
     assert!(
         held_head.is_some(),

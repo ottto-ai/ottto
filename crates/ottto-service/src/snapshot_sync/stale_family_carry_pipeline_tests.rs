@@ -472,7 +472,7 @@ fn c1b_invalid_pending_keeps_base_rearm() {
 #[serial(source_manifests)]
 fn c1b_sidecar_changed_family_is_reread_like_base() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !c1a_layout_supported("c1b_sidecar_changed") {
         return;
     }
@@ -670,7 +670,7 @@ fn c1b_recoverable_member_change_cancels_the_carry_like_base() {
 #[serial(source_manifests)]
 fn c1b_member_change_on_the_walk_ending_page_keeps_the_held_path() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !c1a_layout_supported("c1b_terminal_page_member_change") {
         return;
     }
@@ -856,7 +856,7 @@ fn c1b_held_retry_chain(
 #[serial(source_manifests)]
 fn c1b_retry_pending_family_beside_witnessed_family_carries_only_the_witnessed_one() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !c1a_layout_supported("c1b_retry_pending_beside_witnessed") {
         return;
     }
@@ -920,7 +920,7 @@ fn c1b_retry_pending_family_beside_witnessed_family_carries_only_the_witnessed_o
 #[serial(source_manifests)]
 fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !c1a_layout_supported("c1b_retry_pending_existing_mark") {
         return;
     }
@@ -986,7 +986,7 @@ fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
 #[serial(source_manifests)]
 fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !c1a_layout_supported("c1b_held_mark_full_rearm_window") {
         return;
     }
@@ -1095,7 +1095,7 @@ fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry(
 #[serial(source_manifests)]
 fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !c1a_layout_supported("c1a_latch_retry_pending_debt") {
         return;
     }
@@ -1110,6 +1110,7 @@ fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
         saved.remove("claude_request_identity_contract_changed");
     });
     let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+    index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(index);
     index.insert_retry_pending_claude_authority_for_test(REARM_TERMINAL);
     index.save(&fixture.index_path).unwrap();
     c1a_full_rearm_due(&fixture);
@@ -1241,7 +1242,7 @@ fn fix2_clean_followup_after_full_rearm_carries_unchanged_family() {
 #[serial(source_manifests)]
 fn fix2_late_api_row_rereads_the_family_like_base() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !c1a_layout_supported("fix2_late_api_row") {
         return;
     }
@@ -1272,7 +1273,7 @@ fn fix2_late_api_row_rereads_the_family_like_base() {
 #[serial(source_manifests)]
 fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
     // Contract-5 tagging oracle; markerless single-account E2 bodies keep the D1 wire shape.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     use sha2::{Digest, Sha256};
     if !c1a_layout_supported("scoped_retry_late_identity") {
         return;
@@ -1292,6 +1293,7 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
         c1b_without_full_rearm_window(&fixture);
         c1b_without_unrelated_upload_witnesses(&fixture);
         let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+        index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(index);
         index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
         index.save(&fixture.index_path).unwrap();
     };
@@ -1389,7 +1391,7 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
 #[serial(source_manifests)]
 fn scoped_unhealthy_retry_beside_a_mark_and_authority_debt_carries_accepted_family() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !c1a_layout_supported("scoped_retry_mark_and_authority") {
         return;
     }
@@ -1480,7 +1482,6 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
     }
     let _manifests = SourceManifestTestGuard::new();
     for e2 in [false, true] {
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(e2);
         let contract = if e2 {
             crate::snapshots::claude_request_identity::E2_GROUPING
         } else {
@@ -1507,7 +1508,7 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
                         .support
                         .join("snapshots/claude_code-reemission-exclusions.txt");
                     std::fs::create_dir_all(list.parent().unwrap()).unwrap();
-                    let listed = if case == "listed" {
+                    let listed = if case == "listed" || !e2 {
                         format!("{:x}\n", sha2::Sha256::digest(session.as_bytes()))
                     } else {
                         String::new()
@@ -1598,7 +1599,6 @@ fn source_latch_clear_count(rows: &[serde_json::Value]) -> u64 {
 #[test]
 #[serial(source_manifests)]
 fn source_t1_started_a_then_b_keeps_placeholder_through_terminal() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("source-t1-started-a-b") {
         return;
     }
@@ -1669,7 +1669,6 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
         fixture.native_file_limit = 2;
         c1a_add_family_request_identity(&fixture);
         {
-            let _a = crate::snapshots::claude_request_money::e2::GateForTest::off();
             crate::snapshots::claude_request_identity::with_cycle_contract_for_test(
                 crate::snapshots::claude_request_identity::COLLECTOR,
                 || {
@@ -1691,6 +1690,7 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                 // every file as its removed adoption loop did; another re-owe
                 // path (path B, a money rule) leaves the same owed state.
                 let mut owed = ScanIndex::load(&fixture.index_path).unwrap();
+                owed = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(owed);
                 for key in owed.files.keys().cloned().collect::<Vec<_>>() {
                     owed.re_owe_effective_upload_body_witness_revision(&key, 2);
                 }

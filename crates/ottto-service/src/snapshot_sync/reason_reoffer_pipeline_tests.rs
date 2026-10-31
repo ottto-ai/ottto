@@ -1087,7 +1087,7 @@ fn capture_late_identity_rows(pipeline: &ReofferPipeline, login: &str, org: &str
 #[serial(client_report)]
 fn late_api_row_tags_the_reoffered_body_once_the_pair_is_proven() {
     // R2-N2: gate on, conflicting org markers go to the starting account; the login is dropped.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !supported("late_api_row_tags_the_reoffered_body_once_the_pair_is_proven") {
         return;
     }
@@ -2153,7 +2153,7 @@ fn first_nonempty_list_read_records_durable_intent_through_prepare_finish() {
 #[serial(client_report)]
 fn tombstoned_returning_history_obeys_the_move_hold() {
     // Tombstone hold until reported proof is gate-off policy; an E2 body replaces its session.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !supported("tombstoned_returning_history_obeys_the_move_hold") {
         return;
     }
@@ -2170,6 +2170,7 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
         .cloned()
         .expect("the root is indexed");
     let mut index = ScanIndex::load(&first.index_path).unwrap();
+    index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(index);
     index.tombstone_claude_family_for_test(root);
     index.save(&first.index_path).unwrap();
     let transcript = pipeline
@@ -2207,6 +2208,7 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
     // retained-tombstone case: the history hold and the authority debt both
     // stay owed. Keep all the original retention and wire assertions below.
     let mut index = ScanIndex::load(&proved_return.index_path).unwrap();
+    index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(index);
     index.tombstone_claude_family_for_test(root);
     index.save(&proved_return.index_path).unwrap();
     std::fs::remove_file(&transcript).unwrap();
@@ -2261,7 +2263,7 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
 #[serial(client_report)]
 fn returning_tombstoned_family_is_held_until_proof_then_reoffered_once() {
     // Tombstone hold until reported proof is gate-off policy; an E2 body replaces its session.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !supported("returning_tombstoned_family_is_held_until_proof_then_reoffered_once") {
         return;
     }
@@ -2293,6 +2295,7 @@ fn returning_tombstoned_family_is_held_until_proof_then_reoffered_once() {
 
     // Retire the family: its tombstone stands while it is absent.
     let mut index = ScanIndex::load(&first.index_path).unwrap();
+    index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(index);
     index.tombstone_claude_family_for_test(root);
     index.save(&first.index_path).unwrap();
     let transcript = pipeline
@@ -2383,7 +2386,7 @@ fn returning_tombstoned_family_is_held_until_proof_then_reoffered_once() {
 #[serial(client_report)]
 fn returning_tombstoned_family_that_grew_reproves_in_a_fresh_window() {
     // Tombstone hold until reported proof is gate-off policy; an E2 body replaces its session.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !supported("returning_tombstoned_family_that_grew_reproves_in_a_fresh_window") {
         return;
     }
@@ -2415,6 +2418,7 @@ fn returning_tombstoned_family_that_grew_reproves_in_a_fresh_window() {
 
     // Retire the family: its tombstone stands while it is absent.
     let mut index = ScanIndex::load(&first.index_path).unwrap();
+    index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(index);
     index.tombstone_claude_family_for_test(root);
     index.save(&first.index_path).unwrap();
     let transcript = pipeline

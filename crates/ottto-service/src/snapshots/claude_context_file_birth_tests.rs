@@ -1496,7 +1496,7 @@ fn api_row_without_trace_row_counts_as_owned() {
 #[test]
 fn telemetry_proven_session_keeps_todays_numbers() {
     // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let dir = temp_dir("claude-file-birth-parity");
     let now = OffsetDateTime::now_utc();
     let (path, parsed) = root_session(
@@ -1617,7 +1617,7 @@ fn last_turn_alone_does_not_change_the_upload_fingerprint() {
 #[test]
 fn capture_on_bodies_match_the_clear_outside_context_scalars() {
     // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     use crate::snapshots::claude_request_identity as identity;
     let (dir, root, api, trace) = h296_root_evidence();
     let support = dir.join("support");
@@ -1672,7 +1672,8 @@ fn capture_on_bodies_match_the_clear_outside_context_scalars() {
     .unwrap();
     let claude = SnapshotSource::ClaudeCode;
     let run = |rule_on: bool, fence_closed: bool| {
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         let mut scan = scan_source_roots_with_test_limit(
             claude,
             std::slice::from_ref(&dir),

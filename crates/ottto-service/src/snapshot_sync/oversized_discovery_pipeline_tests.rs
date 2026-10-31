@@ -412,7 +412,7 @@ fn oversized_shed_upload_is_reoffered_at_the_original_retry_deadline() {
 fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
     // Legacy demotion hold; E2 literals bypass it. Gate-on local holds and the
     // same six-hour floor: oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("oversized-blocking-hold-floor");
     fixture.baseline();
@@ -731,7 +731,7 @@ fn oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor() {
 #[serial(source_manifests)]
 fn terminal_off_real_hold_renews_floor_and_three_pages_do_not_requeue_it() {
     let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("terminal-off-real-hold-renewal");
     fixture.baseline();

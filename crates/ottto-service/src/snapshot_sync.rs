@@ -18019,7 +18019,7 @@ mod tests {
     #[serial(client_report)]
     fn admission_native_hourly_bodies_recover_without_losing_usage_or_siblings() {
         // Parse-stage native hours: gate on, e2::finish_page emits the hours.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let root = test_dir("admission-native-hourly");
         std::fs::create_dir_all(&root).unwrap();
         let source = SnapshotSource::ClaudeCode;
@@ -18043,7 +18043,7 @@ mod tests {
                 lines.push('\n');
             }
             std::fs::write(&path, lines).unwrap();
-            let mut parsed = crate::snapshots::parse_claude_code_jsonl_file(
+            let mut parsed = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
                 &path,
                 "2026-10-05T00:00:00Z",
                 format!("{hours:064x}"),
@@ -18087,7 +18087,8 @@ mod tests {
                 &snapshot_upload_body_witness(large),
             );
         }
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         index.file_snapshot_fingerprints.insert(
             "synthetic-large.jsonl".into(),
             BTreeSet::from([large.snapshot_fingerprint.clone()]),
@@ -23346,12 +23347,13 @@ mod tests {
         // Subject: the legacy account path contract 5 now leaves to untagged bodies.
         let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         use crate::claude_local_otel::ClaudeIdentityDisposition;
         use sha2::{Digest, Sha256};
         let (dir, raw, api, trace) =
             crate::snapshots::claude_request_account_mixed_fixture(4, false);
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&dir),
@@ -23469,7 +23471,9 @@ mod tests {
                     .iter()
                     .chain(item.usage_buckets.iter().flat_map(|b| &b.model_usage))
                     .all(|row| row.account_identifier_hash.is_none()));
-                let mut retained = ScanIndex::default();
+                let mut retained = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(
+                    ScanIndex::default(),
+                );
                 let (prior_dir, mut prior, _, _) =
                     crate::snapshots::claude_request_account_mixed_fixture(2, true);
                 retained.bind_session_accounts(
@@ -23507,12 +23511,13 @@ mod tests {
     #[serial(client_report)]
     fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let (root, mut prior, _, _) =
             crate::snapshots::claude_request_account_mixed_fixture(2, true);
         let (candidate_root, mut candidate, api, trace) =
             crate::snapshots::claude_request_account_mixed_fixture(4, true);
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         index.bind_session_accounts(
             SnapshotSource::ClaudeCode,
             "machine",
@@ -23587,6 +23592,7 @@ mod tests {
         )
         .unwrap();
         let mut restarted = ScanIndex::load(&index_path).unwrap();
+        restarted = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(restarted);
         assert!(restarted
             .bind_session_accounts(
                 SnapshotSource::ClaudeCode,

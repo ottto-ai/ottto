@@ -125,7 +125,7 @@ fn rebuild_first_family(families: &Families) -> SnapshotItem {
 #[test]
 fn unrelated_witnessed_families_do_not_change_page_family_rebuild() {
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let alone = proven_families("witness-scope-alone", 1);
     let crowded = proven_families("witness-scope-crowded", 9);
     let expected = rebuild_first_family(&alone);

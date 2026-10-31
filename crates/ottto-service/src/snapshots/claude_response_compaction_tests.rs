@@ -877,7 +877,7 @@ fn assert_x_out_covers_finish_with(
             usize::MAX,
         )
         .unwrap_or_else(|| panic!("{label}: X_out refused"));
-    let money = claude_request_money::e2::enabled().then(|| {
+    let money = Some({
         let keys = parser
             .accumulator
             .claude_responses

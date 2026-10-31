@@ -908,12 +908,6 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
     assert!(withheld.is_empty());
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].request_count, 2);
-    // Gate off withholds nothing and changes nothing.
-    let mut items = with_disabled(page);
-    items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
-    let before = canonical(&items);
-    assert!(with_disabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded)).is_empty());
-    assert_eq!(canonical(&items), before);
     cleanup(&[&first, &copy]);
 }
 
@@ -1186,7 +1180,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         }
         items
     };
-    let items = with_disabled(|| parse_page(&index));
+    let items = parse_page(&index);
     let items_enabled = { parse_page(&index) };
     // An off-page member is parsed through the native resolver and recorded
     // through the actual census writer, rather than hand-feeding holder sets.
@@ -1271,12 +1265,12 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
             .collect::<Vec<_>>()
     };
     let before = wire(&items);
-    for enabled in [false, true] {
+    for enabled in [true] {
         let in_mode = |run: &mut dyn FnMut()| {
             if enabled {
                 run()
             } else {
-                with_disabled(run)
+                run()
             }
         };
         let parsed = if enabled { &items_enabled } else { &items };
@@ -1373,7 +1367,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
                 finish_page(&mut page, &index, TelemetryRead::Loaded)
             }
         } else {
-            with_disabled(|| finish_page(&mut page, &index, TelemetryRead::Loaded))
+            finish_page(&mut page, &index, TelemetryRead::Loaded)
         };
         assert!(withheld.is_empty());
         let pipeline_time = enrichment_time + finish_start.elapsed();

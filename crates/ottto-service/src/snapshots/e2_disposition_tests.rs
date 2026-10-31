@@ -15,7 +15,7 @@ struct Proven {
 /// The family proven by today's reported fold (gate off), as on a Mac
 /// before the switch-on.
 fn proven_family() -> Proven {
-    let (root, parent, mut items) = claude_account_family_fixture();
+    let (root, parent, mut items) = claude_account_family_fixture(true);
     let mut api_rows = (1..=4)
         .map(|n| complete_api_row(&parent, &format!("req_{n}"), n, 10, 10, 0))
         .collect::<Vec<_>>();
@@ -66,8 +66,9 @@ fn proven_family() -> Proven {
 fn child_page(
     proven: &mut Proven,
     healthy: bool,
+    ordinary_money: bool,
 ) -> (Vec<SnapshotItem>, ClaudeUsageAuthorityDisposition) {
-    let (_, _, mut reparsed) = claude_account_family_fixture();
+    let (_, _, mut reparsed) = claude_account_family_fixture(ordinary_money);
     let mut child = vec![reparsed.remove(1)];
     let mut trace = proven.trace.clone();
     if !healthy {
@@ -90,8 +91,7 @@ fn e2_body_of_previously_proven_family_is_not_a_demotion() {
         // Today (gate off): an unreconstructable revision is a demotion and
         // is held; a healthy one rebuilds the exclusive body.
         let mut proven = proven_family();
-        let (child, disposition) =
-            claude_request_money::e2::with_disabled(|| child_page(&mut proven, healthy));
+        let (child, disposition) = child_page(&mut proven, healthy, true);
         assert_eq!(
             disposition.quarantined_entity_count(),
             usize::from(!healthy),
@@ -108,7 +108,7 @@ fn e2_body_of_previously_proven_family_is_not_a_demotion() {
         // reaches upload selection whatever the reports' health.
         let mut proven = proven_family();
         {
-            let (mut child, disposition) = child_page(&mut proven, healthy);
+            let (mut child, disposition) = child_page(&mut proven, healthy, false);
             assert!(
                 child[0].claude_money.is_some(),
                 "the E2 fold rides on the item"

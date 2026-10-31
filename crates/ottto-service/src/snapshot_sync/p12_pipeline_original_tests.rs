@@ -226,6 +226,12 @@ impl RearmFixture {
         fixture
     }
 
+    fn ordinary(case: &'static str) -> Self {
+        let fixture = Self::new(case);
+        crate::snapshots::e2_pipeline_scan_fixture::pause_adoption(&fixture.support);
+        fixture
+    }
+
     fn member_path(&self, agent: Option<&str>) -> PathBuf {
         match agent {
             Some(agent) => self
@@ -1415,7 +1421,7 @@ fn native_comparison_interrupted_correction_is_terminal_base(upload: RearmUpload
 #[serial(client_report)]
 fn native_comparison_shed_corrective_parse_partial_save_and_terminal_use_base() {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     native_comparison_interrupted_correction_is_terminal_base(RearmUpload::Shed);
 }
 
@@ -1423,7 +1429,7 @@ fn native_comparison_shed_corrective_parse_partial_save_and_terminal_use_base() 
 #[serial(source_manifests)]
 fn native_comparison_pending_ack_corrective_parse_partial_save_and_terminal_use_base() {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     native_comparison_interrupted_correction_is_terminal_base(RearmUpload::AckLost);
 }
 
@@ -1524,7 +1530,7 @@ fn native_comparison_assert_old_bindings(before: &serde_json::Value, index: &Sca
 #[serial(source_manifests)]
 fn native_comparison_novel_import_base_parity() {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(
             std::io::stderr().lock(),
@@ -1534,7 +1540,7 @@ fn native_comparison_novel_import_base_parity() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let base = RearmFixture::new("native-parity-shared-source");
+    let base = RearmFixture::ordinary("native-parity-shared-source");
     let candidate = native_comparison_independent_history(&base);
     let base_established = base.establish();
     let base_quiet = base.generation(10);
@@ -1732,7 +1738,7 @@ fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
 #[serial(source_manifests)]
 fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     use sha2::{Digest, Sha256};
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(
@@ -1744,7 +1750,7 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     }
     let _source_manifests = SourceManifestTestGuard::new();
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    let mut fixture = RearmFixture::new("native-real-copy-after-quiet");
+    let mut fixture = RearmFixture::ordinary("native-real-copy-after-quiet");
     // The deferred-only contract applies to families that fit a native page.
     // The ORIGINAL two required oracles remain at REARM_PAGE_FILES=2.
     fixture.native_file_limit = 4;
@@ -2067,14 +2073,14 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
 #[serial(client_report)]
 fn native_comparison_copy_offer_shed_partial_save_recovers() {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     native_comparison_copy_offer_interruption(RearmUpload::Shed, false);
 }
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_copy_offer_ack_loss_partial_save_recovers() {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     native_comparison_copy_offer_interruption(RearmUpload::AckLost, false);
 }
 #[test]
@@ -2083,14 +2089,14 @@ fn native_comparison_copy_offer_ack_loss_partial_save_recovers() {
 #[serial(client_report)]
 fn native_comparison_copy_offer_shed_restart_recovers() {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     native_comparison_copy_offer_interruption(RearmUpload::Shed, true);
 }
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_copy_offer_ack_loss_restart_recovers() {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     native_comparison_copy_offer_interruption(RearmUpload::AckLost, true);
 }
 
@@ -2098,7 +2104,7 @@ fn native_comparison_copy_offer_ack_loss_restart_recovers() {
 #[serial(source_manifests)]
 fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     use sha2::{Digest, Sha256};
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(
@@ -2109,7 +2115,7 @@ fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let mut base = RearmFixture::new("native-positive-own-C5");
+    let mut base = RearmFixture::ordinary("native-positive-own-C5");
     base.request_identity = true;
     let candidate = native_comparison_independent_history(&base);
     base.establish();
@@ -2202,7 +2208,7 @@ fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
 #[serial(source_manifests)]
 fn native_comparison_deferred_policy_resource_usefulness() {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !crate::heap_layout_bound::layout_supported() {
         eprintln!("native_comparison_deferred_usefulness: supported_positive=UNEXECUTED");
         return;
@@ -2235,7 +2241,7 @@ fn native_comparison_deferred_policy_resource_usefulness() {
             .sum()
     }
     let _manifests = SourceManifestTestGuard::new();
-    let mut base = RearmFixture::new("native-deferred-usefulness");
+    let mut base = RearmFixture::ordinary("native-deferred-usefulness");
     base.native_file_limit = 4;
     // Use the SAME production SourcePreparation constructor and explicit
     // capture=false input on BASE and candidate. The legacy test convenience
