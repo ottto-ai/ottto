@@ -1368,7 +1368,10 @@ fn codex_24b_old_writer_row() {
         .durable_counters(source)
         .unwrap()
         .0;
-    assert_eq!(counters.upgrade_missing_full, 1);
+    // The public counter projection zeros this Claude-only scalar for Codex.
+    // The per-source recovery Full and its repin cause carry this admission.
+    assert_eq!(counters.upgrade_missing_full, 0);
+    assert_eq!(counters.retail_full[0], 1);
     assert_eq!(counters.resource_full.get("repin"), Some(&1));
     driver.save_gc(Mode::DiskRestore);
     assert!(driver

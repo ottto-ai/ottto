@@ -255,8 +255,13 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
                 }
                 match scan.step(None) {
                     OwnedSourceScanStep::Pending(next) => scan = next,
-                    OwnedSourceScanStep::Complete { index, scan, .. } => {
-                        return (index, scan, modes)
+                    OwnedSourceScanStep::Complete {
+                        mut index,
+                        mut scan,
+                        ..
+                    } => {
+                        finalize_scan_after_policy(source, &mut scan, &mut index);
+                        return (index, scan, modes);
                     }
                 }
             }
@@ -397,6 +402,8 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
         "spent",
         "funding",
         "funding_spent",
+        "audit_cap",
+        "prepare_io",
     ] {
         let refuse_return = matches!(return_mode, "capacity" | "poison" | "persistent_capacity");
         let root = crate::test_scratch::ScratchDir::new("cold-prepare-return-tail");
@@ -476,6 +483,51 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
             .unwrap()
             .write_all(suffix.as_bytes())
             .unwrap();
+        if matches!(return_mode, "audit_cap" | "prepare_io") {
+            struct ClearOldSampleIo;
+            impl Drop for ClearOldSampleIo {
+                fn drop(&mut self) {
+                    crate::transcript_acquisition::OLD_SAMPLE_IO_ERROR
+                        .with(|fault| fault.set(false));
+                }
+            }
+            let _clear_io = ClearOldSampleIo;
+            let before = (retail_bytes(source, 0), retail_bytes(source, 1));
+            let mut scan = start(index);
+            if return_mode == "audit_cap" {
+                scan.sampling.as_mut().unwrap().audit_slots = 0;
+                // Like the resident audit-cap regression, offer NEW debt;
+                // an existing unverified marker intentionally bypasses the cap.
+                scan.index
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+            } else {
+                crate::transcript_acquisition::OLD_SAMPLE_IO_ERROR.with(|fault| fault.set(true));
+            }
+            let (_, result, modes) = finish(scan);
+            assert_eq!(modes.0, 1, "cold refusal must reach a fresh Full");
+            assert_eq!(modes.1, 0);
+            assert_eq!(result.snapshots.len(), 1);
+            assert_eq!(result.snapshots[0].input_tokens, 125);
+            let stores = cache.durable().unwrap();
+            assert_eq!(stores.counters.restored, 1, "actual cold transfer");
+            assert_eq!(stores.counters.retail_attempts, 0, "no unused Q11 spend");
+            assert!(stores
+                .retail_spent
+                .values()
+                .all(|custody| custody.spent.is_none()));
+            drop(stores);
+            assert_eq!((retail_bytes(source, 0), retail_bytes(source, 1)), before);
+            let store::LeaseWait::Granted(lease) =
+                cache.acquire_active(source, store::ACTIVE_BYTES)
+            else {
+                panic!("cold Full fallback leaked transfer funding")
+            };
+            lease.release();
+            continue;
+        }
         if return_mode.starts_with("funding") {
             let spent = return_mode == "funding_spent";
             let suffix_bytes = suffix.len() as u64;
@@ -1203,7 +1255,7 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(crate::heap_layout_bound::layout_supported());
     for cause in [
-        "obligation_overflow",
+        "write_cleanup_failed",
         "namespace_pending",
         "receipt_unreconciled",
     ] {
@@ -1324,17 +1376,11 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
                         .is_err());
                 }
             }
-            if cause == "obligation_overflow" {
-                let mut next = records[store::MAX_BATCH].clone();
-                next.body =
-                    store::tests::pending(next.binding.clone(), next.certificate.clone(), 2).body;
-                assert_eq!(
-                    slot.store
-                        .write_after_save(lock, 2, 0, vec![next])
-                        .unwrap()
-                        .written,
-                    0
-                );
+            if cause == "write_cleanup_failed" {
+                // Capacity now defers before I/O; it no longer disables the
+                // store. Establish the disabled-store precondition directly,
+                // preserving the real pending obligations built above.
+                slot.store.disable(cause);
             }
         }
         // Remove the injected failure: no retirement/reconciliation may erase custody.
@@ -4400,6 +4446,7 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                                 SnapshotUploadPolicy::default(),
                             );
                             finalize_scan_after_policy(source, &mut projected, &mut index);
+                            projected.finish_codex_capture_boundary(&mut index);
                             let accepted = projected
                                 .snapshots
                                 .iter()
@@ -4712,9 +4759,13 @@ fn a1a_scan_at(
     owner: &crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture,
     roots: &[PathBuf],
     support: &Path,
-    index: ScanIndex,
+    mut index: ScanIndex,
     at: &str,
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    // Match the sync cycle before the literal-emission guard runs.
+    index.activate_effective_upload_body_witness_revision(effective_revision(
+        SnapshotSource::ClaudeCode,
+    ));
     // Model an ordinary file born before its fixed August response timestamps.
     // The fold is constructed before the driver's per-file birth setter runs.
     claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
@@ -4964,8 +5015,11 @@ fn a0h_scan(
     owner: &crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture,
     roots: &[PathBuf],
     root: &Path,
-    index: ScanIndex,
+    mut index: ScanIndex,
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    index.activate_effective_upload_body_witness_revision(effective_revision(
+        SnapshotSource::ClaudeCode,
+    ));
     claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
         owner.scan(roots, root, index, 100, true, &BTreeMap::new(), &[])
     })
@@ -7228,7 +7282,8 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
     ));
     assert_eq!(
         fresh.durable_counters(source).unwrap().1.guard_verify_bytes,
-        0
+        (std::fs::metadata(&record_path).unwrap().len() - store::HEADER_V3_BYTES as u64),
+        "cold classification verifies the v3 body before the quiet decode deferral"
     );
     std::io::Write::write_all(
         &mut std::fs::OpenOptions::new()
@@ -10005,8 +10060,13 @@ fn content_v3_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
                 }
                 match scan.step(None) {
                     OwnedSourceScanStep::Pending(next) => scan = next,
-                    OwnedSourceScanStep::Complete { index, scan, .. } => {
-                        return (index, scan, modes)
+                    OwnedSourceScanStep::Complete {
+                        mut index,
+                        mut scan,
+                        ..
+                    } => {
+                        finalize_scan_after_policy(source, &mut scan, &mut index);
+                        return (index, scan, modes);
                     }
                 }
             }
@@ -10069,6 +10129,10 @@ fn content_v3_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
                 std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_275_201),
             ))
             .unwrap();
+        // Exercise the certificate path even when the optional current census
+        // is absent. Main's independent native shrink proof otherwise bypasses
+        // the durable record (and its certificate-refusal diagnostic).
+        index.claude_request_census.remove(&key);
         let (mut changed, body, modes) = run(cache.clone(), index, "2026-10-29T12:00:00Z");
         assert_eq!(body.snapshots.len(), 1, "{edit}: changed body acquired");
         assert_eq!(

@@ -215,7 +215,15 @@ impl ColdReplay {
             let fulls = owned.sampling.as_ref().unwrap().full_files;
             match owned.step(None) {
                 OwnedSourceScanStep::Pending(next) => owned = next,
-                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, fulls),
+                OwnedSourceScanStep::Complete {
+                    mut index,
+                    mut scan,
+                    ..
+                } => {
+                    finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+                    scan.finish_codex_capture_boundary(&mut index);
+                    return (index, scan, fulls);
+                }
             }
         }
         panic!("scan did not complete");

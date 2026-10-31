@@ -22878,7 +22878,9 @@ mod tests {
                 // An ordinary entity ACK for a different body cannot credit this
                 // revision. Keep fingerprint fixed to exercise body equality.
                 let mut changed = items.clone();
-                changed[0].output_tokens += 1;
+                // The body witness covers additive evidence; usage is in the
+                // semantic fingerprint, which this row deliberately keeps fixed.
+                changed[0].tool_usage_truncated = !changed[0].tool_usage_truncated;
                 assert!(!loaded.contains_body(
                     &changed[0].snapshot_fingerprint,
                     &snapshot_upload_body_witness(&changed[0])

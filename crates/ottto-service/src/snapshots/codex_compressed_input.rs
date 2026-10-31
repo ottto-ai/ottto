@@ -285,7 +285,7 @@ impl OpenedInput {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(test, unix))]
     pub(super) fn put_retail(&mut self, attempt: super::sampled_scan::durable_tail::RetailAttempt) {
         if let Self::Durable(reader) = self {
             reader.get_mut().custody.put_retail(attempt);

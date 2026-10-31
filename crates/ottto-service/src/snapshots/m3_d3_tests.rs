@@ -103,12 +103,23 @@ fn scan(
     cache: Arc<SharedCache>,
     namespace: &Scope,
 ) -> (ScanIndex, Vec<SnapshotItem>) {
+    scan_with_window(source, sessions, index, cache, namespace, 365)
+}
+
+fn scan_with_window(
+    source: SnapshotSource,
+    sessions: &Path,
+    index: ScanIndex,
+    cache: Arc<SharedCache>,
+    namespace: &Scope,
+    backfill_window_days: u64,
+) -> (ScanIndex, Vec<SnapshotItem>) {
     let mut scan = OwnedSourceScan::new(
         source,
         &[sessions.to_path_buf()],
         index,
         COLLECTED,
-        365,
+        backfill_window_days,
         100,
         false,
         None,
@@ -421,12 +432,15 @@ fn owed_shrink_fulls(pass: &Pass) -> u64 {
 }
 
 fn assert_cold_body(rig: &Rig, pass: &Pass) {
-    let (_, mut cold) = scan(
+    // The cold oracle has no recovery debt to discover this test's
+    // 400-day-old input. Include it in the oracle's enumeration window.
+    let (_, mut cold) = scan_with_window(
         rig.source,
         &rig.sessions,
         ScanIndex::default(),
         Arc::new(SharedCache::default()),
         &rig.namespace,
+        730,
     );
     let mut actual = pass.snapshots.clone();
     apply_upload_policy(rig.source, &mut actual, SnapshotUploadPolicy::default());

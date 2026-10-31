@@ -4212,6 +4212,7 @@ mod audit_retirement_tests;
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn no_record_keys_keep_existing_full_admission_after_restart() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(crate::heap_layout_bound::layout_supported());
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
@@ -4256,6 +4257,8 @@ fn no_record_keys_keep_existing_full_admission_after_restart() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
+    use crate::durable_tail_store as store;
+
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(crate::heap_layout_bound::layout_supported());
     // Match OwnedSourceScan::new capture mode for both sources.
@@ -4310,7 +4313,15 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
             .unwrap()
             .path();
         let old = fs::read(&record_path).unwrap();
-        assert_eq!(old[311], 1, "predecessor owes an audit");
+        let ds = sampled_scan::durable_tail::durable_source(source).unwrap();
+        let digest = store::key_digest(ds, &key);
+        let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+        let predecessor = store::tests::found(disk.read(&digest));
+        assert_eq!(predecessor.format, store::FORMAT_V3);
+        assert!(
+            predecessor.envelope_audit_debt.is_some(),
+            "predecessor owes an audit"
+        );
         let now = unix_seconds(SystemTime::now()).unwrap();
         let fingerprint = index.files[&key].source_file_fingerprint.clone();
         assert!(index.stage_sampled_audit(
@@ -4340,7 +4351,12 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
         drop(audit);
         let successor = fs::read(&record_path).unwrap();
         assert_ne!(successor, old);
-        assert_eq!(successor[311], 0, "the completed Full retired the old debt");
+        let successor_record = store::tests::found(disk.read(&digest));
+        assert_eq!(successor_record.format, store::FORMAT_V3);
+        assert_eq!(
+            successor_record.envelope_audit_debt, None,
+            "the completed Full retired the old debt"
+        );
         fixture.file.append(&usage(source, 160, 2, "fixture-model"));
         let restart = begin();
         let loaded = ScanIndex::load(&index_path).unwrap();
@@ -5656,7 +5672,7 @@ fn native_v3_ordinary_save_then_second_restart_tails_without_a_full() {
             "actual post-save adapter takes CURRENT index debt"
         );
         assert_eq!(record.record.certificate.audit_debt_unix_seconds, None);
-        assert_eq!(record.format, crate::durable_tail_store::FORMAT_V3);
+        assert_eq!(record.format, store::FORMAT_V3);
         drop(second);
         fixture.file.append(&usage(source, 160, 2, "fixture-model"));
         let third = Arc::new(sampled_scan::SharedCache::default());
