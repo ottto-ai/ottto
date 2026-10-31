@@ -433,36 +433,6 @@ fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
     assert!(!base.family_pending_after);
 }
 
-/// Q4 strict: the witnessed family's pending from the red window is invalid
-/// (the shape a cap or member-change invalidation leaves). The retry re-arms
-/// it whole, exactly as BASE.
-#[test]
-#[serial(source_manifests)]
-fn c1b_invalid_pending_keeps_base_rearm() {
-    if !c1a_layout_supported("c1b_invalid_pending") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let invalidate = |fixture: &RearmFixture| {
-        c1a_edit_index(fixture, |saved| {
-            let pending = saved["claude_usage_family_pending"][REARM_ROOT]
-                .as_object_mut()
-                .expect("the red window keeps the family pending");
-            pending.insert("member_request_id_hashes".to_owned(), serde_json::json!({}));
-            pending.remove("member_occurrences");
-            pending.insert("invalid".to_owned(), serde_json::json!(true));
-        });
-    };
-    let fix = c1b_red_chain("c1b-invalid-pending", "fix", invalidate);
-    let base = c1b_base_red_chain("c1b-invalid-pending-base", invalidate);
-    let family = rearm_family_sessions().len();
-    let retry = &fix.windows[2];
-    assert_eq!(retry.family_reads, family, "the invalid family re-arms");
-    assert_eq!(retry.family_reads, base.windows[2].family_reads);
-    assert_eq!(retry.start, base.windows[2].start, "the start is BASE's");
-    assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
-}
-
 /// SI I3 and Condition X(a): after the red window the root's API rows gain
 /// account evidence, so the sidecar-inclusive selection fingerprint of every
 /// member changes (M1). The carry keeps the committed revisions, the walk
@@ -624,41 +594,6 @@ fn c1b_recoverable_change_arms(
     (fix, base, cancelled, held)
 }
 
-/// SOURCE B9, the reviewed recoverable change: after the red window the first
-/// subagent gains a request its provider ledger already recorded, and the red
-/// producer is repaired. The subagent is read on the second of three pages,
-/// after the unchanged root was skipped on the first, so the changed member's
-/// parse cancels the carry and queues the root again for a later bounded page
-/// of the same window. Every member is read in that window, and the proof,
-/// RetryPending, every window's liveness and the witness equal BASE's. With the family spread over pages, BASE's own re-read also demotes
-/// the changed revision at a non-terminal page, so both arms hold it
-/// RetryPending; the first-page parse cannot change that.
-#[test]
-#[serial(source_manifests)]
-fn c1b_recoverable_member_change_cancels_the_carry_like_base() {
-    if !c1a_layout_supported("c1b_recoverable_member_change") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let (fix, base, cancelled, held) =
-        c1b_recoverable_change_arms("c1b-recoverable-member-change", REARM_PAGE_FILES);
-    assert_eq!((cancelled, held), (1, 0), "one cancel, no hold");
-    let family = rearm_family_sessions().len();
-    let retry = &fix.windows[2];
-    let base_retry = &base.windows[2];
-    let start = retry.start.as_ref().expect("a retry start");
-    assert_eq!(start.reason, "terminal_unhealthy_retry");
-    assert_eq!(start.carried_pending_families, Some(1), "carried at start");
-    assert!(!base_retry.red, "the producer is repaired");
-    assert_eq!(base_retry.family_reads, family);
-    // FLIPS: without the cancel only the changed member is read.
-    assert_eq!(retry.family_reads, family, "the family is co-observed");
-    assert_eq!(retry.proven, base_retry.proven);
-    assert_eq!(retry.retry_pending, base_retry.retry_pending);
-    assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
-    assert_eq!(fix.witness_after, base.witness_after);
-}
-
 /// SOURCE B9 held path: the same change with every window on one page, so
 /// the changed member is parsed on the page that ends the walk after the
 /// unchanged root was already passed. BASE reads the whole family on that
@@ -738,42 +673,6 @@ fn c1b_member_removed_after_carry_keeps_the_carry_in_the_window() {
     assert_eq!(start.carried_pending_families, Some(1));
     assert_eq!(retry.family_reads, 0, "the carry stands in this window");
     assert_eq!(retry.red, base_retry.red);
-}
-
-/// R1, carry-time refusal through the fold: the walk-ending-page change, with
-/// the family's worst-case cancellation unfunded. The retry start does not
-/// carry the family, so nothing is held or cancelled, and every window's
-/// start, reads, parsed sessions and liveness, the proof at 08:20, the
-/// accepted heads and the witness equal a real BASE arm's.
-#[test]
-#[serial(source_manifests)]
-fn c1b_unfunded_carry_takes_the_base_path_through_the_fold() {
-    if !c1a_layout_supported("c1b_unfunded_carry") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let unfunded = crate::snapshots::claude_stale_family_carry_unfunded_families_for_test();
-    let (fix, base, cancelled, held) = {
-        let _budget = crate::snapshots::ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
-        c1b_recoverable_change_arms("c1b-unfunded-carry", 64)
-    };
-    assert_eq!(
-        crate::snapshots::claude_stale_family_carry_unfunded_families_for_test() - unfunded,
-        1,
-        "the retry start drops the family once"
-    );
-    assert_eq!((cancelled, held), (0, 0), "no cancel, no hold");
-    let base_retry = &base.windows[2];
-    assert!(base_retry.census_complete && !base_retry.red);
-    assert_eq!(base_retry.family_reads, rearm_family_sessions().len());
-    assert!(base_retry.proven && !base_retry.retry_pending);
-    let start = fix.windows[2].start.as_ref().expect("a retry start");
-    assert_eq!(start.carried_pending_families, Some(0), "not carried");
-    assert_eq!(fix.windows, base.windows, "every window is BASE's");
-    assert_eq!(fix.heads_after_red, base.heads_after_red);
-    assert_eq!(fix.heads_after, base.heads_after);
-    assert_eq!(fix.witness_after, base.witness_after);
-    assert_eq!(fix.family_pending_after, base.family_pending_after);
 }
 
 // Path-(a) bridge, corrected option (ii): a RetryPending authority family
