@@ -1269,9 +1269,13 @@ pub(crate) fn strict_cohort_bytes(support_dir: &Path, root: &str) -> u64 {
     ]
     .iter()
     .fold(0u64, |sum, path| {
-        sum.saturating_add(
-            fs::metadata(path).map_or(MAX_EVIDENCE_FILE_BYTES, |m| m.len().saturating_add(1)),
-        )
+        sum.saturating_add(match fs::metadata(path) {
+            Ok(metadata) => metadata.len().saturating_add(1),
+            // Absence consumes no input; the loaders still report missing
+            // evidence. Do not turn a missing peer into size pressure.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(_) => MAX_EVIDENCE_FILE_BYTES,
+        })
     })
 }
 
