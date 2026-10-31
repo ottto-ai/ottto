@@ -76,12 +76,16 @@ fn select(
     let mut next = None;
     for root in ordered {
         let bytes = crate::claude_local_otel::strict_cohort_bytes(support, root);
-        if !page.contains(root) && next.is_none() {
+        // The first off-page root after the cursor is planned even over the
+        // pass allowance (per-file caps still bound it), so none waits forever.
+        let first_offpage = !page.contains(root) && next.is_none();
+        if first_offpage {
             next = Some(root.clone());
         }
         // Page roots are never deferred here: the reader's allowance defers a
         // read it cannot cover through the #932 hold, never as unhealthy.
         if page.contains(root)
+            || first_offpage
             || plan.roots.len() < ROOTS_PER_PASS && reserved.saturating_add(bytes) <= BYTES_PER_PASS
         {
             reserved = reserved.saturating_add(bytes);
@@ -233,6 +237,45 @@ mod tests {
                     ..Default::default()
                 },
                 "terminal_off={terminal_off}"
+            );
+        }
+    }
+
+    /// [behaviour] X2: a root whose pair alone exceeds the pass allowance is
+    /// planned on its page, or as the first off-page root after the cursor,
+    /// instead of being deferred on every pass. The OFF row is main.
+    #[test]
+    fn strict_cohort_plans_root_over_pass_allowance() {
+        // (terminal_off, page roots, planned, deferred)
+        type Row = (
+            bool,
+            &'static [&'static str],
+            &'static [&'static str],
+            &'static [&'static str],
+        );
+        let rows: [Row; 3] = [
+            (true, &["big", "page"], &["big", "page", "tail"], &[]),
+            (true, &["page"], &["page", "big"], &["tail"]),
+            (false, &["page"], &["big", "page", "tail"], &[]),
+        ];
+        for (terminal_off, page, planned, deferred) in rows {
+            let _terminal_off =
+                terminal_off.then(crate::snapshots::ClaudeTerminalOffForTest::enabled);
+            let scratch = crate::test_scratch::ScratchDir::new("strict-cohort-big-root");
+            write_pair(&scratch, "big", 10 << 20, 8 << 20);
+            write_pair(&scratch, "page", 0, 0);
+            write_pair(&scratch, "tail", 0, 0);
+            let roots = ["big", "page", "tail"].map(String::from).to_vec();
+            let page = page.iter().map(|r| r.to_string()).collect::<BTreeSet<_>>();
+            let result = plan(&scratch, roots, &page, "big-root");
+            assert_eq!(
+                result.roots, planned,
+                "terminal_off={terminal_off} page={page:?}"
+            );
+            assert_eq!(
+                result.deferred.iter().collect::<Vec<_>>(),
+                deferred,
+                "terminal_off={terminal_off} page={page:?}"
             );
         }
     }
