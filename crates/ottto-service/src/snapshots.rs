@@ -8919,7 +8919,7 @@ pub fn claude_pending_family_session_ids(index: &ScanIndex) -> Vec<String> {
         .iter()
         .filter(|(_, pending)| {
             pending.invalid
-                || !pending.previous_windows.is_empty()
+                || pending.has_history()
                 || pending
                     .member_requests
                     .values()
@@ -49579,9 +49579,6 @@ impl ScanIndex {
             {
                 continue;
             }
-            let Some(current_window) = rfc3339_unix_seconds(&pending.census_window_end) else {
-                continue;
-            };
             // Retiring old windows requires an identity committed for this
             // newer window, not only unchanged survivors from an older one.
             if !pending.member_requests.iter().any(|(member, requests)| {
@@ -49592,56 +49589,35 @@ impl ScanIndex {
             }) {
                 continue;
             }
-            let mut latest: BTreeMap<
-                String,
-                (
-                    u64,
-                    account_pending_retention::ConsumerProjection<'_>,
-                    Option<&String>,
-                ),
-            > = BTreeMap::new();
-            let mut valid = true;
-            for (boundary, projection, is_current) in pending.retirement_observations() {
-                let Some(time) = boundary else {
-                    valid = false;
-                    break;
-                };
-                if time > current_window || (time == current_window && !is_current) {
-                    valid = false;
-                    break;
-                }
-                for (member, revision) in projection.members() {
-                    if !live_members
-                        .get(root)
-                        .is_some_and(|members| members.contains(member))
-                    {
-                        if !pending.confirmed_absent_members.contains(member)
-                            && !empty_members
-                                .get(root)
-                                .is_some_and(|members| members.contains(member))
-                        {
-                            valid = false;
-                        }
-                        continue;
-                    }
-                    if latest
-                        .get(member)
-                        .map_or(true, |(previous, _, _)| time > *previous)
-                    {
-                        latest.insert(member.clone(), (time, projection, revision));
-                    }
-                }
-            }
+            let Some(latest) = pending.history_summary().with_current(pending) else {
+                continue;
+            };
             let mut revisions = BTreeMap::new();
-            for (member, (_, window, revision)) in latest {
-                if window.invalid
-                    || window.account_identifier_hash != pending.account_identifier_hash
-                    || revision.is_none()
+            let mut valid = true;
+            for (member, (_, account, invalid, revision)) in latest {
+                if !live_members
+                    .get(root)
+                    .is_some_and(|members| members.contains(&member))
                 {
-                    valid = false;
-                    break;
+                    if !pending.confirmed_absent_members.contains(&member)
+                        && !empty_members
+                            .get(root)
+                            .is_some_and(|members| members.contains(&member))
+                    {
+                        valid = false;
+                        break;
+                    }
+                    continue;
                 }
-                revisions.insert(member, revision.expect("checked revision").clone());
+                match revision {
+                    Some(revision) if !invalid && account == pending.account_identifier_hash => {
+                        revisions.insert(member, revision);
+                    }
+                    _ => {
+                        valid = false;
+                        break;
+                    }
+                }
             }
             if valid && !revisions.is_empty() {
                 candidates.insert(root.clone(), revisions);
