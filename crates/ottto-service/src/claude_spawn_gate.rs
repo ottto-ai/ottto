@@ -1003,29 +1003,25 @@ pub(crate) mod test_support {
             }
             let spawn_log = root.join("claude-spawns.log");
             let item = root.join("default-item.json");
-            let claude = bin.join("claude");
-            std::fs::write(
-                &claude,
+            // Both fakes are executed: written out of process (no ETXTBSY).
+            crate::test_scratch::write_executable(
+                &bin.join("claude"),
                 format!(
                     "#!/bin/sh\necho \"$CLAUDE_CONFIG_DIR|$*\" >> '{}'\necho '{{}}'\nexit 0\n",
                     spawn_log.display()
-                ),
-            )
-            .expect("fake claude");
-            let security = bin.join("security");
-            std::fs::write(
-                &security,
+                )
+                .as_bytes(),
+                0o755,
+            );
+            crate::test_scratch::write_executable(
+                &bin.join("security"),
                 format!(
                     "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = 'Claude Code-credentials' ] && [ -f '{item}' ]; then /bin/cat '{item}'; exit 0; fi\ndone\nexit 44\n",
                     item = item.display()
-                ),
-            )
-            .expect("fake security");
-            for executable in [&claude, &security] {
-                let mut permissions = std::fs::metadata(executable).expect("meta").permissions();
-                permissions.set_mode(0o755);
-                std::fs::set_permissions(executable, permissions).expect("chmod");
-            }
+                )
+                .as_bytes(),
+                0o755,
+            );
             let guards = vec![
                 guard("HOME", &home),
                 guard("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS", &home),
@@ -1125,11 +1121,10 @@ pub(crate) mod test_support {
                 _ => "exec /bin/sleep 4\n".to_string(),
             };
             let script = root.join("bin/claude");
-            std::fs::write(&script, format!(
+            crate::test_scratch::write_executable(&script, format!(
                 "#!/bin/sh\nif [ \"$1\" = '--version' ]; then echo 'fixture'; exit 0; fi\necho $$ > {}\nprintf '%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$@\" > {}\n{body}",
                 quote(&root.join("direct")), quote(&root.join("arguments")),
-            )).unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            ).as_bytes(), 0o700);
             Self {
                 policy,
                 fake,

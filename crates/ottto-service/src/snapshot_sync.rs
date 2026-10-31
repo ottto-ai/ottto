@@ -63,6 +63,8 @@ mod continuation;
 mod identity_bucket_progress_tests;
 mod reason_reoffer;
 mod rejection_log;
+mod strict_cohort;
+mod terminal_retention;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
@@ -979,6 +981,7 @@ pub(crate) fn checkpoint_account_release_for_test(
             roots,
             backfill_window_days: crate::snapshots::BACKFILL_WINDOW_DAYS,
         }),
+        Default::default(),
     )
 }
 
@@ -1064,6 +1067,7 @@ fn settle_index_after_upload(
 
 /// Correction completion depends on the final selected file/empty facts. In
 /// particular, the last M2 no-body drain must precede the completion decision.
+#[allow(clippy::too_many_arguments)]
 fn settle_upload_corrections_after_selection(
     index: &mut ScanIndex,
     scan: &SourceScanResult,
@@ -1072,11 +1076,14 @@ fn settle_upload_corrections_after_selection(
     candidates: &[crate::snapshots::ClaudeProofCorrectionCandidate],
     cutoff_candidates: &[crate::snapshots::ClaudeCutoffCorrectionCandidate],
     transport_fully_settled: bool,
+    body_drains: &mut crate::snapshots::ClaudeProofBodyDrains,
 ) -> bool {
     // D1 is deliberately unavailable to partial/deferred/shed/error outcomes.
     // Both existing durable refusal carriers must bind the exact current body.
+    // It settles against the selected entries, but a later account-audit
+    // release can still clear one; its drains join the finish restore.
     if transport_fully_settled {
-        index.settle_claude_proof_corrections_with_permanent(
+        let drains = index.settle_claude_proof_corrections_with_permanent(
             committed_index,
             candidates,
             &progress.accepted_fingerprints,
@@ -1095,6 +1102,7 @@ fn settle_upload_corrections_after_selection(
                         })
             },
         );
+        body_drains.append(drains);
     }
     index.settle_cutoff_claude_proof_corrections(cutoff_candidates);
     index.settle_empty_claude_proof_corrections(scan);
@@ -2156,6 +2164,7 @@ impl SnapshotUploadProgress {
             self.reason_reoffer_counts.accepted += 1;
         }
         self.permanent_rejections.remove(fingerprint);
+        terminal_retention::accepted(&self.destination_namespace_hash, fingerprint, body_witness);
         self.accepted_fingerprints.insert(fingerprint.to_string());
         self.accepted_body_witnesses
             .insert(fingerprint.to_string(), body_witness.to_string());
@@ -2969,6 +2978,8 @@ fn save_index_and_publish_manifest(
     window_start: &str,
     window_end: &str,
 ) -> Result<()> {
+    let census_complete = census_complete
+        && (source != SnapshotSource::ClaudeCode || !crate::snapshots::claude_terminal_off());
     // The server may already hold this pass's new entities. Keep the previous
     // process-cache witness withdrawn until the exact replacement index is
     // durable; a failed CAS/save or manifest derivation must not let a
@@ -3174,6 +3185,7 @@ fn checkpoint_partial_snapshot_index_with_comparison(
         fallback,
         cause,
         None,
+        Default::default(),
     )
 }
 
@@ -3192,6 +3204,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     fallback: Option<NativeSelectedRestore<'_>>,
     cause: Option<UnsettledUploadCause>,
     audit_release: Option<AccountAuditRelease<'_>>,
+    body_drains: crate::snapshots::ClaudeProofBodyDrains,
 ) -> Result<ScanIndex> {
     let _lock = SnapshotProgressLock::acquire(progress_path)?;
     let mut durable: SnapshotUploadProgress = match match read_limit {
@@ -3295,6 +3308,9 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
             release.backfill_window_days,
         );
     }
+    // After every selected-entry restore above: a drain whose entry this
+    // save does not keep stays owed.
+    committable.restore_unselected_claude_proof_body_drains(body_drains);
     match cause {
         Some(cause) => committable.mark_bounded_sweep_unsettled_by(cause),
         None => committable.mark_bounded_sweep_unsettled(),
@@ -4869,6 +4885,12 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     type Source = SnapshotSource;
     type Frame = SourcePreparation;
     type Completed = (SourcePreparation, ScanIndex, SourceScanResult);
+    fn serial_fallback(&mut self, source: SnapshotSource) {
+        crate::local_resource_diagnostics::source_rotation_serial_fallback(
+            source.api_slug(),
+            crate::heap_layout_bound::layout_supported(),
+        );
+    }
     fn prepare(
         &mut self,
         source: SnapshotSource,
@@ -6416,8 +6438,10 @@ fn prepare_sync_source_inner(
     continuation::observe(source, &upload_context, upload_policy);
     activate_source_upload_context(source, upload_context, &mut index, &mut upload_progress);
     index.copy_unproven_enabled = copy_unproven_enabled;
-    index.copy_prefix_base_upload_context =
-        (source == SnapshotSource::ClaudeCode).then_some(base_upload_context);
+    index.set_copy_prefix_base_upload_context(
+        (source == SnapshotSource::ClaudeCode).then_some(base_upload_context),
+        resumed_prefix_enabled,
+    );
     if !context_curve_enabled {
         // Stamp the off transition before taking the partial-commit baseline.
         // If an ordinary no-curve upload is partially accepted and then shed,
@@ -6579,6 +6603,7 @@ fn prepare_sync_source_inner(
         upload_progress.reason_reoffer_cooldowns(reoffer_now)
     });
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
+    index.count_mixed_file_context_holds();
     let mut watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
     // Leased unchanged files join the same bounded, revalidated hint queue.
     watcher_hints.paths.extend(reoffer_paths);
@@ -7038,6 +7063,7 @@ fn prepare_continuation_source(
     debug_assert!(leased_paths.is_empty());
     index.activate_reason_reoffer_cooldowns(upload_progress.reason_reoffer_cooldowns(reoffer_now));
     upload_progress.reselect_pending_cache_heads(&mut index, inputs.cache_observations_enabled);
+    index.count_mixed_file_context_holds();
     let roots = crate::snapshot_roots::scan_roots(
         source,
         home,
@@ -7201,6 +7227,9 @@ fn finish_sync_source(
         preparation.source == SnapshotSource::ClaudeCode,
         preparation.native_comparison_lease.is_some(),
     );
+    if preparation.source == SnapshotSource::ClaudeCode && crate::snapshots::claude_terminal_off() {
+        terminal_retention::note(&index, &preparation.upload_progress);
+    }
     let SourcePreparation {
         mut native_comparison_reservation,
         mut native_comparison_lease,
@@ -7968,10 +7997,13 @@ fn finish_sync_source(
     // Exact progress is durable before this seam. The same subsequent index
     // save carries settled file bodies and correction progress; local-state
     // errors cannot certify an uncertain ACK. UnACKed/held members stay owed.
+    // Selection below may keep a drained member's committed entry; each save
+    // then restores that member's debt (R2).
+    let mut claude_proof_body_drains = crate::snapshots::ClaudeProofBodyDrains::default();
     if !upload_result.as_ref().err().is_some_and(|error| {
         snapshot_upload_error_class(error) == Some(SnapshotUploadErrorClass::LocalState)
     }) {
-        index.settle_claude_proof_corrections(
+        claude_proof_body_drains = index.settle_claude_proof_corrections(
             &committed_index,
             &claude_proof_correction_candidates,
             &upload_progress.accepted_fingerprints,
@@ -8071,6 +8103,7 @@ fn finish_sync_source(
                     roots: claude_scan_roots.as_deref().unwrap_or_default(),
                     backfill_window_days: receipt_window_days,
                 }),
+                std::mem::take(&mut claude_proof_body_drains),
             ) {
                 Ok(committable) => {
                     note_codex_side_saved(daemon, &index_path, false, side_mark);
@@ -8205,6 +8238,7 @@ fn finish_sync_source(
                         roots: claude_scan_roots.as_deref().unwrap_or_default(),
                         backfill_window_days: receipt_window_days,
                     }),
+                    std::mem::take(&mut claude_proof_body_drains),
                 ) {
                     Ok(committable) => {
                         note_codex_side_saved(daemon, &index_path, false, side_mark);
@@ -8397,6 +8431,7 @@ fn finish_sync_source(
         &claude_proof_correction_candidates,
         &claude_cutoff_corrections,
         upload_fully_settled,
+        &mut claude_proof_body_drains,
     );
     if let Some(comparison) = comparison_completion.as_mut() {
         if comparison.restore_selected_paid(&mut index, &committed_index)? {
@@ -8411,6 +8446,12 @@ fn finish_sync_source(
             claude_scan_roots.as_deref().unwrap_or_default(),
             receipt_window_days,
         );
+    }
+    // After every selected-entry restore and the account-audit release, which
+    // can clear a drained entry's revision: a drain (pre-selection or D1)
+    // whose entry this save does not keep stays owed.
+    if index.restore_unselected_claude_proof_body_drains(claude_proof_body_drains) {
+        upload_fully_settled = false;
     }
     let mut retired_upload_acks = upload_progress.stage_selected_ack_retirement(
         &committed_index,
@@ -8807,6 +8848,20 @@ fn activate_source_upload_context(
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &context),
     );
     index.activate_file_upload_context(source, context.clone());
+    index.prepare_mixed_file_context_view(
+        source,
+        progress.historical_replay_generation.as_deref(),
+        |entity| {
+            (progress.accepted_body_contexts.get(entity) == Some(&context))
+                .then(|| {
+                    progress
+                        .accepted_body_witnesses
+                        .get(entity)
+                        .map(String::as_str)
+                })
+                .flatten()
+        },
+    );
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();
     progress.context_resend =
@@ -8911,6 +8966,10 @@ fn claude_evidence_root_session_ids(snapshots: &[SnapshotItem]) -> Vec<String> {
         .collect()
 }
 
+fn trace_discard_count_is_zero(count: &u64) -> bool {
+    *count == 0
+}
+
 /// Apply the exact local Claude API/trace evidence path used by production.
 ///
 /// Kept as one shared derivation so privacy-safe offline audits cannot drift
@@ -8926,6 +8985,16 @@ pub struct ClaudeLocalEvidenceStats {
     pub complete_sidecar_root_count: usize,
     pub api_incomplete_root_count: usize,
     pub trace_incomplete_root_count: usize,
+    /// Strict trace reads dropped as grown or replaced; absent while empty.
+    #[serde(skip_serializing_if = "crate::claude_local_otel::ClaudeTraceRowsDiscarded::is_empty")]
+    pub trace_rows_discarded: crate::claude_local_otel::ClaudeTraceRowsDiscarded,
+    /// Requests placed Unknown because this page discarded their strict trace.
+    #[serde(skip_serializing_if = "trace_discard_count_is_zero")]
+    pub trace_discard_no_fallback_requests: u64,
+    /// Items whose upload this page deferred because it discarded their
+    /// family's strict trace read.
+    #[serde(skip_serializing_if = "trace_discard_count_is_zero")]
+    pub trace_discard_deferred_items: u64,
     pub api_evidence_row_count: usize,
     pub trace_evidence_row_count: usize,
     pub exact_request_set_root_count: usize,
@@ -8940,6 +9009,10 @@ pub struct ClaudeLocalEvidenceStats {
     pub own_request_complete_root_count: usize,
     pub own_request_unknown_root_count: usize,
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
+    /// Containment's withheld full re-arm; absent from the line while zero,
+    /// which it always is under the default OFF.
+    #[serde(skip_serializing_if = "claude_rearm_full_suppressed_is_zero")]
+    pub rearm_full_suppressed: u64,
     pub first_proof_hold: crate::snapshots::ClaudeFirstProofHoldCounts,
     /// RetryPending families whose returning root retains a retirement
     /// tombstone, separate from all other RetryPending causes. Local only.
@@ -8953,6 +9026,10 @@ pub struct ClaudeLocalEvidenceStats {
     /// the counts line and snapshot-audit stay unchanged.
     #[serde(skip)]
     pub context_file_birth: crate::snapshots::ClaudeContextFileBirthCounts,
+}
+
+fn claude_rearm_full_suppressed_is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 struct PreparedTraceRead {
@@ -9305,6 +9382,32 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
     apply_claude_local_evidence_to_scan_with_prepared(support_dir, scan_result, index, None)
 }
 
+/// The production evidence stage with this cycle's accepted-identity ledger.
+#[cfg(test)]
+pub(crate) fn apply_claude_local_evidence_to_scan_with_accepted_for_test(
+    support_dir: &Path,
+    scan_result: &mut crate::snapshots::SourceScanResult,
+    index: &mut ScanIndex,
+    accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
+) -> (
+    crate::snapshots::ClaudeUsageAuthorityDisposition,
+    bool,
+    ClaudeLocalEvidenceStats,
+) {
+    try_apply_claude_local_evidence_to_scan_with_comparison(
+        support_dir,
+        scan_result,
+        index,
+        None,
+        None,
+        None,
+        None,
+        accepted_identity_buckets,
+        None,
+    )
+    .expect("evidence fixture has no resource refusal")
+}
+
 fn apply_claude_local_evidence_to_scan_with_prepared(
     support_dir: &Path,
     scan_result: &mut crate::snapshots::SourceScanResult,
@@ -9391,6 +9494,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         fallback.withhold(scan_result);
     }
     let builds_evidence = crate::snapshots::claude_request_identity::builds_evidence();
+    scan_result.census_complete = crate::snapshots::claude_terminal_authority(
+        index,
+        scan_result.census_complete,
+        &scan_result.census_window_end,
+    );
     let census_complete = scan_result.census_complete;
     // Preserve this scan's original carrier independently from later request
     // logins; only a fully qualified mixed body may undo the legacy login veto.
@@ -9508,6 +9616,38 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         })
         .collect::<Vec<_>>();
     stats.paired_sidecar_root_count = usage_roots.len();
+    // Account the actual all-pending strict cohort before its first I/O.
+    // Page-local roots have priority; off-page roots rotate across passes.
+    let strict_plan = if crate::snapshots::claude_terminal_off() {
+        let page_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        strict_cohort::plan(
+            support_dir,
+            usage_roots,
+            &page_roots,
+            &index.claude_strict_service_scope(),
+        )
+    } else {
+        strict_cohort::Plan {
+            roots: usage_roots,
+            deferred: BTreeSet::new(),
+            deferred_bytes: 0,
+        }
+    };
+    let mut deferred_roots = strict_plan.deferred.len();
+    let mut deferred_bytes = strict_plan.deferred_bytes;
+    if deferred_roots > 0 {
+        full_rearm_evidence_complete = false;
+        identity_unhealthy_roots.extend(strict_plan.deferred.iter().cloned());
+    }
+    let usage_roots = strict_plan.roots;
+    let strict_budget = crate::snapshots::claude_terminal_off().then(|| {
+        crate::claude_local_otel::strict_budget::StrictReadBudget::new(
+            strict_cohort::BYTES_PER_PASS,
+        )
+    });
+
     // Effort has already updated pending-family state. Release all non-paired
     // rows before moving the selected roots into the usage aggregate.
     let paired_roots: BTreeSet<String> = usage_roots.iter().cloned().collect();
@@ -9536,6 +9676,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // E2: roots whose strict API and trace reads were both healthy. A healthy
     // sidecar may hold no rows for the root, so evidence keys cannot say this.
     let mut strict_healthy_roots = BTreeSet::new();
+    let mut trace_discarded_roots = BTreeSet::new();
     for root_session_id in usage_roots {
         let mut api = api_read.take_strict_report(support_dir, &root_session_id);
         let mut trace = match prepared.as_mut() {
@@ -9551,7 +9692,17 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         if !trace.is_complete() {
             stats.trace_incomplete_root_count += 1;
         }
+        stats.trace_rows_discarded.add(&trace.rows_discarded);
+        if !trace.rows_discarded.is_empty() {
+            trace_discarded_roots.insert(root_session_id.clone());
+        }
         if !api.health.is_complete() || !trace.is_complete() {
+            if crate::snapshots::claude_terminal_off() {
+                deferred_roots += 1;
+                deferred_bytes = deferred_bytes.saturating_add(
+                    crate::claude_local_otel::strict_cohort_bytes(support_dir, &root_session_id),
+                );
+            }
             full_rearm_evidence_complete = false;
             if let Some(rows) = api.evidence.remove(&root_session_id) {
                 veto_api_rows.insert(root_session_id.clone(), rows);
@@ -9596,6 +9747,18 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             trace_report.evidence.insert(root_session_id, rows);
         }
     }
+    let strict_bytes = strict_budget.as_ref().map_or(0, |b| b.consumed());
+    drop(strict_budget);
+    if crate::snapshots::claude_terminal_off() {
+        eprintln!("strict_cohort_deferred roots={deferred_roots} bytes={} consumed_bytes={strict_bytes} allowance_bytes={} custody=UNPROVEN", deferred_bytes, strict_cohort::BYTES_PER_PASS);
+    }
+    // Keep global negative-dependency debt separate from per-root health:
+    // page-local healthy accounting must not become an unrelated read error.
+    scan_result.strict_cohort_deferred_root_count = if crate::snapshots::claude_terminal_off() {
+        deferred_roots
+    } else {
+        0
+    };
     if stats.request_set_mismatch_root_count > 0 {
         index.note_claude_ignored_rearm_veto(
             &scan_result.census_window_end,
@@ -9617,6 +9780,14 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // A side-call census walk past its deadline decided nothing for its
         // families: the same seam keeps their owed history for a later page.
         index.hold_claude_history_for_unhealthy_telemetry_roots(&side_calls_unresolved);
+        // A discarded strict trace read defers the family's bodies through the
+        // E2 withhold: the accepted revision stays, delayed one pass, never
+        // replaced by an untagged one.
+        stats.trace_discard_deferred_items =
+            crate::snapshots::claude_request_money::e2::hold_trace_discarded(
+                &mut scan_result.snapshots,
+                &trace_discarded_roots,
+            );
     }
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
@@ -9627,6 +9798,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             identity_unhealthy_roots,
             crate::snapshots::claude_request_identity::desktop_census(index),
         )
+        .with_trace_discarded_roots(trace_discarded_roots)
         .with_status_coverage(crate::claude_status_coverage::snapshot())
         .with_native_originals(&originals)
         .with_accepted_buckets(accepted_identity_buckets)
@@ -9663,10 +9835,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     }
     if crate::snapshots::claude_request_money::e2::enabled() {
         if let Some(evidence) = &identity_evidence {
-            crate::snapshots::claude_request_identity::reconcile_request_accounts(
-                &mut scan_result.snapshots,
-                evidence,
-            );
+            stats.trace_discard_no_fallback_requests =
+                crate::snapshots::claude_request_identity::reconcile_request_accounts(
+                    &mut scan_result.snapshots,
+                    evidence,
+                );
         }
     }
     let request_owned_activity = identity_evidence.as_ref().map(|evidence| {
@@ -9800,6 +9973,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         })
         .count();
     stats.duplicate_census = disposition.duplicate_census;
+    stats.rearm_full_suppressed = disposition.rearm_full_suppressed;
     stats.full_rearm_suppression = disposition.full_rearm_suppression;
     stats.context_file_birth = disposition.context_file_birth.clone();
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
@@ -10260,11 +10434,14 @@ where
         );
     }
     let mut replaced_retained_proof = false;
-    for item in &batch {
-        let value = serde_json::to_value(item)?;
-        replaced_retained_proof |= progress
-            .accepted_identity_buckets
-            .invalidate_replaced(&value);
+    // Only proof the ledger holds can be replaced, whatever the capability.
+    if progress.accepted_identity_buckets.has_retained() {
+        for item in &batch {
+            let value = serde_json::to_value(item)?;
+            replaced_retained_proof |= progress
+                .accepted_identity_buckets
+                .invalidate_replaced(&value);
+        }
     }
     // Option (ii): the server may store a replacement proof even if this
     // reply is lost; drop the superseded one durably so no later marker can
@@ -12218,6 +12395,24 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
     } else {
         "sync failed".to_string()
     }
+}
+
+#[cfg(test)]
+pub(crate) fn terminal_off_traversal_ended_for_test(index: &ScanIndex) -> bool {
+    // The containment form of the C1b criterion: physical discovery ended,
+    // with any already-observed held rereads still queued and unproven.
+    let saved = serde_json::to_value(index).expect("encode the saved index");
+    saved
+        .get("traversal")
+        .filter(|value| !value.is_null())
+        .is_none_or(|traversal| {
+            traversal["pending_directories"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+                && traversal["pending_candidates"]
+                    .as_array()
+                    .is_some_and(|paths| paths.iter().all(|path| path["census_member"] == false))
+        })
 }
 
 #[cfg(test)]
@@ -23357,6 +23552,9 @@ mod tests {
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/continuation_prepare_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
+    // Main's original shared pipeline assertions run at the production OFF
+    // default, independently of the explicit-ON containment fixtures above.
+
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
     mod history_upgrade_pipeline_tests {
         include!("snapshot_sync/history_upgrade_pipeline_tests.rs");

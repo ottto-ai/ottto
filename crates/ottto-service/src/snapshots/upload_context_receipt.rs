@@ -18,8 +18,9 @@ pub(crate) struct Candidate {
     key: String,
     receipt: Receipt,
     /// Retry/ACK mode isolation remains source-wide even when the file's
-    /// acquisition receipt uses the unaffected base context.
-    mode_context: String,
+    /// acquisition receipt uses the unaffected base context. `None` when the
+    /// mode is the receipt's own context (always, switch OFF): no allocation.
+    mode_context: Option<String>,
     historical_replay_generation: Option<String>,
     bodies: BTreeMap<String, String>,
     wire_bytes: BTreeMap<String, u64>,
@@ -81,12 +82,181 @@ impl RearmCounts {
     }
 }
 
+// Selection-only RAM view derived from the existing exact per-ACK ledger.
+// Never serialized, uploaded, or used as a whole-file delivery receipt.
+#[derive(Debug, Clone, Default)]
+pub(super) struct MixedContextView {
+    claude: bool,
+    bindings: BTreeMap<String, String>,
+    pub(super) held_files: u64,
+}
+crate::heap_layout_bound::fields!(MixedContextView; claude, bindings, held_files);
+
 impl ScanIndex {
+    fn mixed_context_binding(&self, key: &str) -> Option<String> {
+        let entry = self.files.get(key)?;
+        if entry.source_file_fingerprint.is_empty() {
+            return None;
+        }
+        let mut h = Sha256::new();
+        for value in [
+            "mixed_context_selection:v1",
+            self.active_upload_context_fingerprint.as_deref()?,
+            self.historical_replay_generation
+                .as_deref()
+                .unwrap_or("none"),
+            &entry.source_file_fingerprint,
+            entry.last_upload_body_witness.as_deref()?,
+        ] {
+            update_length_prefixed(&mut h, value.as_bytes());
+        }
+        h.update(self.context_curve_replay_epoch.to_be_bytes());
+        for entity in self.file_snapshot_fingerprints.get(key)? {
+            update_length_prefixed(&mut h, entity.as_bytes());
+            if let Some(record) = self.quarantined_snapshot_fingerprints.get(entity) {
+                if self.active_quarantine_witness.as_ref() != Some(&record.witness) {
+                    return None;
+                }
+                update_length_prefixed(&mut h, record.upload_body_witness.as_deref()?.as_bytes());
+            }
+        }
+        Some(format!("{:x}", h.finalize()))
+    }
+
+    pub(crate) fn prepare_mixed_file_context_view<'a>(
+        &mut self,
+        source: SnapshotSource,
+        replay: Option<&str>,
+        mut accepted_body: impl FnMut(&str) -> Option<&'a str>,
+    ) {
+        self.mixed_context_view = MixedContextView::default();
+        self.mixed_context_view.claude =
+            source == SnapshotSource::ClaudeCode && claude_terminal_off();
+        if !self.mixed_context_view.claude || replay != self.historical_replay_generation.as_deref()
+        {
+            return;
+        }
+        for (key, entities) in &self.file_snapshot_fingerprints {
+            if entities.is_empty()
+                || !entities
+                    .iter()
+                    .any(|e| self.quarantined_snapshot_fingerprints.contains_key(e))
+            {
+                continue;
+            }
+            let bodies = entities
+                .iter()
+                .map(|entity| {
+                    if let Some(record) = self.quarantined_snapshot_fingerprints.get(entity) {
+                        (self.active_quarantine_witness.as_ref() == Some(&record.witness))
+                            .then_some(record.upload_body_witness.as_deref())
+                            .flatten()
+                    } else if self.accepted_snapshot_fingerprints.contains(entity) {
+                        accepted_body(entity)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Option<BTreeSet<_>>>();
+            let Some(bodies) = bodies else {
+                continue;
+            };
+            let expected = snapshot_file_upload_body_set_hex(bodies);
+            if self
+                .files
+                .get(key)
+                .and_then(|entry| entry.last_upload_body_witness.as_ref())
+                != Some(&expected)
+            {
+                continue;
+            }
+            if let Some(binding) = self.mixed_context_binding(key) {
+                self.mixed_context_view
+                    .bindings
+                    .insert(key.clone(), binding);
+            }
+        }
+    }
+
+    // Call only after this cycle's terminal leases, reason reoffers and
+    // cooldowns are active. The early ACK view alone cannot decide whether
+    // retained conflict debt is parked or selected for retry this cycle.
+    pub(crate) fn count_mixed_file_context_holds(&mut self) {
+        if !claude_terminal_off() {
+            return;
+        }
+
+        // Count even when the quiet path opens no candidate.
+        self.mixed_context_view.held_files = self
+            .mixed_context_view
+            .bindings
+            .keys()
+            .filter(|key| self.file_upload_context_waits_for_retry(key))
+            .count() as u64;
+        if self.mixed_context_view.held_files > 0 {
+            eprintln!(
+                "upload_context_mixed_held files={} scope=prepare",
+                self.mixed_context_view.held_files
+            );
+        }
+    }
+
+    fn mixed_context_current(&self, key: &str) -> bool {
+        self.file_snapshot_fingerprints
+            .get(key)
+            .is_some_and(|entities| {
+                entities.iter().all(|entity| {
+                    self.quarantined_snapshot_fingerprints.contains_key(entity)
+                        || self.accepted_snapshot_fingerprints.contains(entity)
+                })
+            })
+            && self
+                .mixed_context_binding(key)
+                .as_ref()
+                .is_some_and(|binding| self.mixed_context_view.bindings.get(key) == Some(binding))
+    }
+    pub(super) fn file_upload_context_waits_for_retry(&self, key: &str) -> bool {
+        self.mixed_context_view.claude
+            && self.mixed_context_current(key)
+            && self
+                .file_snapshot_fingerprints
+                .get(key)
+                .is_some_and(|entities| {
+                    entities.iter().any(|e| {
+                        self.quarantined_snapshot_fingerprints
+                            .get(e)
+                            .is_some_and(|r| {
+                                r.disposition == SnapshotQuarantineDisposition::RetryPending
+                            })
+                    }) && entities
+                        .iter()
+                        .all(|e| !self.quarantine_retry_selects_file(e, key))
+                })
+    }
+    fn mixed_terminal_context_settled(&self, key: &str) -> bool {
+        self.mixed_context_view.claude
+            && self.mixed_context_current(key)
+            && self
+                .file_snapshot_fingerprints
+                .get(key)
+                .is_some_and(|entities| {
+                    entities.iter().all(|entity| {
+                        self.quarantined_snapshot_fingerprints
+                            .get(entity)
+                            .map_or(true, |record| {
+                                record.disposition != SnapshotQuarantineDisposition::RetryPending
+                            })
+                    })
+                })
+    }
     pub(crate) fn source_upload_context_matches(&self) -> bool {
         self.upload_context_fingerprint == self.active_upload_context_fingerprint
     }
     pub(crate) fn activate_file_upload_context(&mut self, source: SnapshotSource, context: String) {
         self.activate_upload_context(context);
+        self.mixed_context_view = MixedContextView::default();
+        self.mixed_context_view.claude =
+            source == SnapshotSource::ClaudeCode && claude_terminal_off();
         self.file_upload_context_enabled =
             matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex);
         self.activate_quarantine_witness(source);
@@ -116,6 +286,28 @@ impl ScanIndex {
         let local_on = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
         let wire_on = crate::snapshot_sync::copy_unproven_upload_context(local_on.clone(), true);
         context == base || context == local_on || context == wire_on
+    }
+
+    /// OFF takes main's receipt path unless ON evidence of this base remains
+    /// (the adopted source context or any file receipt): then it stays current.
+    pub(crate) fn set_copy_prefix_base_upload_context(
+        &mut self,
+        base: Option<String>,
+        enabled: bool,
+    ) {
+        let on_evidence = |base: &String| {
+            let local_on = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
+            let wire_on =
+                crate::snapshot_sync::copy_unproven_upload_context(local_on.clone(), true);
+            let on = |context: &String| *context == local_on || *context == wire_on;
+            self.upload_context_fingerprint.as_ref().is_some_and(&on)
+                || self
+                    .files
+                    .values()
+                    .filter_map(|entry| entry.upload_context_receipt.as_ref())
+                    .any(|receipt| on(&receipt.context_fingerprint))
+        };
+        self.copy_prefix_base_upload_context = base.filter(|base| enabled || on_evidence(base));
     }
 
     /// Only mode debt can share the scoped history-read admission. A genuine
@@ -210,6 +402,21 @@ impl ScanIndex {
         if self.upload_context_fingerprint == self.active_upload_context_fingerprint {
             return false;
         }
+        if claude_terminal_off() {
+            if !self.file_upload_context_enabled || self.confirmed_empty_files.contains(key) {
+                // Only a complete empty projection in THIS Claude context may
+                // suppress its redundant read. Other sources and unknown debt keep
+                // their existing gate; no delivery receipt or proof is minted.
+                return !(self.file_upload_context_enabled
+                    && self.mixed_context_view.claude
+                    && terminal_off_empty_context_seen(self, key));
+            }
+            return !self.mixed_terminal_context_settled(key)
+                && self
+                    .files
+                    .get(key)
+                    .map_or(true, |entry| !self.receipt_matches(key, entry));
+        }
         if !self.file_upload_context_enabled || self.confirmed_empty_files.contains(key) {
             // A suppressed/empty result has no ACK receipt. Keep its existing
             // census-context gate so a new policy can make it uploadable.
@@ -225,6 +432,12 @@ impl ScanIndex {
             return false;
         }
         let key = local_index_key(&candidate.path);
+        if claude_terminal_off()
+            && self.mixed_context_view.claude
+            && !self.mixed_context_current(&key)
+        {
+            return false; // Unknown or old-context ACKs cannot hold D's projection.
+        }
         self.files.get(&key).is_some_and(|entry| {
             entry.source_file_fingerprint == candidate.source_file_fingerprint
                 && entry.size_bytes == candidate.size_bytes
@@ -237,9 +450,16 @@ impl ScanIndex {
             .get(&key)
             .is_some_and(|entities| {
                 !entities.is_empty()
-                    && entities
-                        .iter()
-                        .any(|entity| self.quarantined_snapshot_fingerprints.contains_key(entity))
+                    && entities.iter().any(|entity| {
+                        self.quarantined_snapshot_fingerprints
+                            .get(entity)
+                            .is_some_and(|record| {
+                                !claude_terminal_off()
+                                    || !self.mixed_context_view.claude
+                                    || record.disposition
+                                        == SnapshotQuarantineDisposition::RetryPending
+                            })
+                    })
                     && entities.iter().all(|entity| {
                         self.accepted_snapshot_fingerprints.contains(entity)
                             || self
@@ -307,11 +527,14 @@ impl ScanIndex {
                 if entry.last_upload_body_witness.as_ref() != Some(&body_witness) {
                     return None;
                 }
+                let mode_context = self.active_upload_context_fingerprint.as_ref()?;
+                let context_fingerprint = self.file_expected_context(key)?;
                 Some(Candidate {
                     key: key.clone(),
-                    mode_context: self.active_upload_context_fingerprint.clone()?,
+                    mode_context: (mode_context != context_fingerprint)
+                        .then(|| mode_context.clone()),
                     receipt: Receipt {
-                        context_fingerprint: self.file_expected_context(key)?.clone(),
+                        context_fingerprint: context_fingerprint.clone(),
                         replay_generation: self.context_curve_replay_epoch,
                         source_witness: entry.source_file_fingerprint.clone(),
                         body_witness,
@@ -341,7 +564,11 @@ impl ScanIndex {
         // Joined file aliases can earn separate receipts for one wire entity.
         let mut counted_entities = BTreeSet::new();
         for candidate in candidates {
-            if self.active_upload_context_fingerprint.as_ref() != Some(&candidate.mode_context)
+            let mode_context = candidate
+                .mode_context
+                .as_ref()
+                .unwrap_or(&candidate.receipt.context_fingerprint);
+            if self.active_upload_context_fingerprint.as_ref() != Some(mode_context)
                 || self.file_expected_context(&candidate.key)
                     != Some(&candidate.receipt.context_fingerprint)
                 || self.context_curve_replay_epoch != candidate.receipt.replay_generation

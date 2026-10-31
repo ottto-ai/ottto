@@ -36,7 +36,9 @@
   macOS `Rust contracts` job runs only in the merge queue, on `main` pushes and
   on manual dispatch. Build locally only when
   no CI path works: one changed crate, one build at a time, on an idle machine,
-  and say why in your report. A Linux green is fast feedback, not Mac evidence;
+  and say why in your report. Linux unit-test builds also run the heap-layout
+  (`layout_supported()`) paths; macOS APIs, tools and `cfg(target_os = "macos")`
+  tests still run only on the Mac. A Linux green is fast feedback, not Mac evidence;
   the macOS `Rust contracts` job in the merge queue stays the merge gate.
 - CI runs on pull requests. Push to the PR branch; do not also start Public CI by
   hand on a branch whose PR is open and mergeable. GitHub starts no pull-request
@@ -48,6 +50,12 @@
   macOS-only tests): `gh workflow run ci.yml --ref <branch>`; one run per head, and never
   restart a run because it is queued. Do not put `[skip ci]` in PR commits. Merge
   only after a green pull-request run on the final head.
+- Several PRs waiting for macOS evidence share one run:
+  `scripts/mac_batch.py plan <pr> <pr>...` merges their heads onto `main` in
+  memory and names conflicting pairs; `dispatch --gate <script>` pushes a
+  temporary `mac-batch/*` branch and starts one `ci.yml` run after the gate says
+  go; `report --run <id> --delete-branch` maps failing tests to PRs. `detect <pr>`
+  tells from the diff alone whether a PR needs macOS evidence (exit 10).
 - Merge only with `scripts/pr_merge_when_mac_green.sh <pr>`. It marks a draft
   ready, waits until the `ci.yml` checks of the pull-request run on the PR's head
   commit pass (Linux `Public surface checks`, `Rust advisory audit`, `Dependency

@@ -38,38 +38,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// Inline fields are paid by their containing slot and own no allocation.
-// Visit only owned heaps: scalar-by-scalar walks otherwise exhaust the
-// native frame's 4096-visit guard even when the frame uses under 1 MiB.
-// Destructuring is exhaustive; a field moved into the inline group must
-// prove INLINE_ONLY before the walk can succeed. Byte/visit caps stay native.
-macro_rules! money_heap_fields {
-    ($t:ty; inline: [$($inline:ident),*]; heap: [$($heap:ident),*]) => {
-        impl crate::heap_layout_bound::HeapLayoutBound for $t {
-            fn stable_heap(&self) -> bool {
-                let Self { $($inline,)* $($heap,)* } = self;
-                true $(&& crate::heap_layout_bound::HeapLayoutBound::stable_heap($inline))*
-                    $(&& crate::heap_layout_bound::HeapLayoutBound::stable_heap($heap))*
-            }
-            fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-                let Self { $($inline,)* $($heap,)* } = self;
-                $(require_inline($inline)?;)*
-                $(crate::heap_layout_bound::HeapLayoutBound::heap_bound($heap, c)?;)*
-                Some(())
-            }
-            fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-                let Self { $($inline,)* $($heap,)* } = self;
-                $(require_inline($inline)?;)*
-                $(crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound($heap, c)?;)*
-                Some(())
-            }
-        }
-    };
-}
-#[inline(always)]
-fn require_inline<T: crate::heap_layout_bound::HeapLayoutBound>(_: &T) -> Option<()> {
-    T::INLINE_ONLY.then_some(())
-}
+use crate::heap_layout_bound::split_fields as money_heap_fields;
 
 pub(crate) const GATE: bool = true;
 /// A record this much older than its file's effective birth was copied in.
@@ -3060,6 +3029,24 @@ fn hold_copies(item: &mut SnapshotItem, reason: &'static str) {
     }
 }
 
+/// This page discarded the family's strict trace read (cap or generation
+/// race), so no account can be decided for it: every member is withheld like
+/// an undecided copy. No new revision replaces the accepted one; the next
+/// clean page decides it. Returns the items withheld.
+pub(crate) fn hold_trace_discarded(items: &mut [SnapshotItem], roots: &BTreeSet<String>) -> u64 {
+    let mut held = 0;
+    for item in items {
+        if !roots.contains(claude_snapshot_family_root_ref(item)) {
+            continue;
+        }
+        if let Some(fold) = item.claude_money.as_deref_mut() {
+            fold.entity.held = true;
+            held += 1;
+        }
+    }
+    held
+}
+
 /// Decided: `uncovered` (and every id-less copy) counts, disclosed.
 fn restore_uncovered(item: &mut SnapshotItem, uncovered: &[String]) {
     let SnapshotItem {
@@ -4203,25 +4190,28 @@ pub(crate) fn finish_page(
         }
         true
     });
-    // Literal guards inspect the final request-owned bodies, after apply.
-    // A locally rebuilt body vetoed by history is not a corrected family.
-    let guard = index.claude_literal_guard(items);
-    let corrected_families = items
-        .iter()
-        .filter(|item| {
-            telemetry == TelemetryRead::Loaded
-                && !super::super::claude_reemission_stop_latched()
-                && !withheld.contains(&item.source_session_id)
-                && corrected_sessions.contains(&item.source_session_id)
-                && index.claude_history_emission.permits(item, &guard)
-        })
-        .map(|item| claude_snapshot_family_root_ref(item).to_owned())
-        .collect::<BTreeSet<_>>();
-    if !corrected_families.is_empty() {
-        let mut counts = Counts::default();
-        counts.0[23] = corrected_families.len() as u64;
-        diag("copy_prefix_families_corrected", counts.0[23]);
-        record_counts(counts);
+    // The guard walks every indexed file; build it only for a corrected session.
+    if !corrected_sessions.is_empty() {
+        // Literal guards inspect the final request-owned bodies, after apply.
+        // A locally rebuilt body vetoed by history is not a corrected family.
+        let guard = index.claude_literal_guard(items);
+        let corrected_families = items
+            .iter()
+            .filter(|item| {
+                telemetry == TelemetryRead::Loaded
+                    && !super::super::claude_reemission_stop_latched()
+                    && !withheld.contains(&item.source_session_id)
+                    && corrected_sessions.contains(&item.source_session_id)
+                    && index.claude_history_emission.permits(item, &guard)
+            })
+            .map(|item| claude_snapshot_family_root_ref(item).to_owned())
+            .collect::<BTreeSet<_>>();
+        if !corrected_families.is_empty() {
+            let mut counts = Counts::default();
+            counts.0[23] = corrected_families.len() as u64;
+            diag("copy_prefix_families_corrected", counts.0[23]);
+            record_counts(counts);
+        }
     }
     diag("withheld_sessions", withheld.len() as u64);
     // A withheld session is read again: its decisions count on that page.

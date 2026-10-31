@@ -365,42 +365,48 @@ fn retained_proof_needs_a_witnessed_stored_body_entity_ack() {
 }
 #[test]
 fn a_replacement_proof_leaves_the_ledger_durably_before_its_upload() {
-    let mut progress = retained_progress();
-    retained_ack(
-        &mut progress,
-        &[witnessed_body()],
-        false,
-        true,
-        true,
-        vec![],
-    );
-    assert_eq!(retained_rows(&progress), Some((1, 0)));
-    let mut replacement = witnessed_body();
-    replacement["snapshot_fingerprint"] = json!("9".repeat(64));
-    replacement["usage_buckets"][0]["model_usage"][0]["account_identifier_hash"] =
-        json!("c".repeat(64));
-    let saved = std::cell::Cell::new(None);
-    let mut accepted = 0;
-    let lost = attempt_snapshot_page(
-        &[replacement],
-        &[0],
-        "synthetic-retained-replacement",
-        &mut progress,
-        &mut accepted,
-        &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
-        &|_: &Value| "d".repeat(64),
-        &|value: &Value| value["source_session_id"].as_str(),
-        &mut |_| {
-            assert_eq!(saved.get(), Some((0, 0)), "persisted before the POST");
-            Err(anyhow!("reply lost"))
-        },
-        &mut |progress| {
-            saved.set(retained_rows(progress));
-            Ok(())
-        },
-    );
-    assert!(lost.is_err());
-    assert_eq!(retained_rows(&progress), Some((0, 0)));
+    for retained in [true, false] {
+        let mut progress = retained_progress();
+        retained_ack(
+            &mut progress,
+            &[witnessed_body()],
+            false,
+            true,
+            true,
+            vec![],
+        );
+        assert_eq!(retained_rows(&progress), Some((1, 0)));
+        // ON->OFF: proof left in the ledger is still superseded before the POST.
+        progress
+            .accepted_identity_buckets
+            .set_retained_enabled(retained);
+        let mut replacement = witnessed_body();
+        replacement["snapshot_fingerprint"] = json!("9".repeat(64));
+        replacement["usage_buckets"][0]["model_usage"][0]["account_identifier_hash"] =
+            json!("c".repeat(64));
+        let saved = std::cell::Cell::new(None);
+        let mut accepted = 0;
+        let lost = attempt_snapshot_page(
+            &[replacement],
+            &[0],
+            "synthetic-retained-replacement",
+            &mut progress,
+            &mut accepted,
+            &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
+            &|_: &Value| "d".repeat(64),
+            &|value: &Value| value["source_session_id"].as_str(),
+            &mut |_| {
+                assert_eq!(saved.get(), Some((0, 0)), "persisted before the POST");
+                Err(anyhow!("reply lost"))
+            },
+            &mut |progress| {
+                saved.set(retained_rows(progress));
+                Ok(())
+            },
+        );
+        assert!(lost.is_err());
+        assert_eq!(retained_rows(&progress), Some((0, 0)));
+    }
 }
 #[test]
 fn replay_generation_or_namespace_change_clears_retained_proof() {

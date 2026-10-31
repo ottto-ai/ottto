@@ -82,7 +82,10 @@ pub(crate) fn bound<T: HeapLayoutBound>(value: &T, limit: usize) -> Option<usize
     Some(c.bytes)
 }
 pub(crate) fn layout_supported() -> bool {
-    cfg!(target_os = "macos")
+    // Linux unit-test builds use the same std container layouts on the same
+    // 64-bit toolchain, so PR checks run the shipped macOS path. Non-test
+    // Linux builds keep refusing.
+    (cfg!(target_os = "macos") || cfg!(all(test, target_os = "linux")))
         && cfg!(target_pointer_width = "64")
         && compiler_layout_supported(env!("OTTTO_SCAN_LAYOUT_RUSTC"))
 }
@@ -380,6 +383,40 @@ macro_rules! fields {
     };
 }
 pub(crate) use fields;
+
+// Inline fields are paid by their containing slot and own no allocation.
+// Visit only owned heaps: scalar-by-scalar walks otherwise exhaust the
+// native frame's 4096-visit guard even when the frame uses under 1 MiB.
+// Destructuring is exhaustive; a field moved into the inline group must
+// prove INLINE_ONLY before the walk can succeed. Byte/visit caps stay native.
+macro_rules! split_fields {
+    ($t:ty; inline: [$($inline:ident),*]; heap: [$($heap:ident),*]) => {
+        impl crate::heap_layout_bound::HeapLayoutBound for $t {
+            fn stable_heap(&self) -> bool {
+                let Self { $($inline,)* $($heap,)* } = self;
+                true $(&& crate::heap_layout_bound::HeapLayoutBound::stable_heap($inline))*
+                    $(&& crate::heap_layout_bound::HeapLayoutBound::stable_heap($heap))*
+            }
+            fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+                let Self { $($inline,)* $($heap,)* } = self;
+                $(crate::heap_layout_bound::require_inline($inline)?;)*
+                $(crate::heap_layout_bound::HeapLayoutBound::heap_bound($heap, c)?;)*
+                Some(())
+            }
+            fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+                let Self { $($inline,)* $($heap,)* } = self;
+                $(crate::heap_layout_bound::require_inline($inline)?;)*
+                $(crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound($heap, c)?;)*
+                Some(())
+            }
+        }
+    };
+}
+#[inline(always)]
+pub(crate) fn require_inline<T: crate::heap_layout_bound::HeapLayoutBound>(_: &T) -> Option<()> {
+    T::INLINE_ONLY.then_some(())
+}
+pub(crate) use split_fields;
 
 impl HeapLayoutBound for &'static str {
     const STABLE_HEAP: bool = true;

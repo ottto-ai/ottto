@@ -3,8 +3,11 @@
 import copy
 import json
 import unittest
+from pathlib import Path
+import tempfile
 
-from money_equivalence import decode_receipt, has_forbidden_diff, receipt_diff
+from money_equivalence import (decode_receipt, has_forbidden_diff, receipt_diff,
+                               require_base_scan_fixture)
 
 
 CONTRACT = "usage_decrease_hold_ack_contract"
@@ -248,6 +251,92 @@ class MoneyEquivalenceTests(unittest.TestCase):
         for private in ("old-id", "new-id", "PRIVATE_HASH_VALUE"):
             self.assertNotIn(private, json.dumps(diff))
 
+    def test_wire_money_schema_paths_are_readable_without_values(self):
+        # Exact emitted record shapes from snapshots.rs, including both model
+        # row locations. Traverse every record/container field, not data maps.
+        money = {field: "PRIVATE_BEFORE" for field in (
+            "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_5m_tokens",
+            "cache_creation_1h_tokens", "reasoning_output_tokens", "unattributed_total_tokens",
+            "request_count", "cost_usd", "input_cost_usd", "output_cost_usd",
+            "cache_read_cost_usd", "cache_creation_cost_usd",
+        )}
+        part = dict(money, account_identifier_hash="PRIVATE_BEFORE", evidence_ref=0)
+        model = dict(money, **{field: "PRIVATE_BEFORE" for field in (
+            "model", "reasoning_effort", "auth_mode", "billing_channel", "billing_provider",
+            "gateway_provider", "model_provider", "subscription_product", "account_identifier_hash",
+        )}, evidence_ref=0, identity_parts=[part])
+        snapshot = {
+            "model_usage": [model],
+            "usage_buckets": [{"bucket_start": "PRIVATE_BEFORE", "model_usage": [copy.deepcopy(model)],
+                               "first_activity_at": "PRIVATE_BEFORE",
+                               "last_activity_at": "PRIVATE_BEFORE"}],
+            "cost": {field: "PRIVATE_BEFORE" for field in (
+                "total_cost_usd", "input_cost_usd", "output_cost_usd", "cache_read_cost_usd",
+                "cache_creation_cost_usd", "evidence_source",
+            )},
+            "session_account_evidence": {field: "PRIVATE_BEFORE" for field in (
+                "provider", "account_identifier_hash", "provider_workspace_hash",
+                "identity_hash_scheme", "evidence_source", "identity_disposition", "source_created_at",
+            )},
+            "request_evidence": [{"identity_basis": "PRIVATE_BEFORE",
+                                  "provider_workspace_hash": "PRIVATE_BEFORE"}],
+            "request_identity_refusals": 0,
+        }
+
+        def fields(value, path=()):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    yield path + (key,)
+                    yield from fields(child, path + (key,))
+            elif isinstance(value, list):
+                for i, child in enumerate(value):
+                    yield from fields(child, path + (i,))
+
+        self.base["snapshots"] = [snapshot]
+        for path in fields(snapshot):
+            with self.subTest(path=path):
+                self.head = copy.deepcopy(self.base)
+                target = self.head["snapshots"][0]
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = "PRIVATE_AFTER"
+                expected = "/0/0/snapshots/0/" + "/".join(map(str, path))
+                self.assert_change_fails("changed", expected)
+                logged = json.dumps(self.compare())
+                for private in ("PRIVATE_BEFORE", "PRIVATE_AFTER"):
+                    self.assertNotIn(private, logged)
+
+    def test_wire_money_data_maps_keep_schema_looking_keys_private(self):
+        for location in (("model_usage", 0),
+                         ("usage_buckets", 0, "model_usage", 0)):
+            for field in ("selector_context", "selector_sources"):
+                with self.subTest(location=location, field=field):
+                    self.base = envelope()
+                    self.base["snapshots"][0].update(
+                        model_usage=[{}], usage_buckets=[{"model_usage": [{}]}])
+                    target = self.base["snapshots"][0]
+                    for key in location:
+                        target = target[key]
+                    target[field] = {"billing_provider": {"auth_mode": "PRIVATE_BEFORE"}}
+                    self.head = copy.deepcopy(self.base)
+                    target = self.head["snapshots"][0]
+                    for key in location:
+                        target = target[key]
+                    target[field]["billing_provider"]["auth_mode"] = "PRIVATE_AFTER"
+                    prefix = "/0/0/snapshots/0/" + "/".join(map(str, location))
+                    self.assert_change_fails("changed", prefix + "/" + field + "/<key#0>/<key#0>")
+                    for private in ("billing_provider", "auth_mode", "PRIVATE_BEFORE", "PRIVATE_AFTER"):
+                        self.assertNotIn(private, json.dumps(self.compare()))
+
+        # client_report remains an opaque data map at the batch envelope.
+        self.base = envelope()
+        self.base["client_report"] = {"cost": {"total_cost_usd": "PRIVATE_BEFORE"}}
+        self.head = copy.deepcopy(self.base)
+        self.head["client_report"]["cost"]["total_cost_usd"] = "PRIVATE_AFTER"
+        self.assert_change_fails("changed", "/0/0/client_report/<key#0>/<key#0>")
+        for private in ("cost", "total_cost_usd", "PRIVATE_BEFORE", "PRIVATE_AFTER"):
+            self.assertNotIn(private, json.dumps(self.compare()))
+
     def test_invalid_receipts_fail_closed_without_values(self):
         for invalid in (b'[]', b'{}', b'[[true]]', b'[[256]]', b'[[255]]',
                         b'[[123]]', json.dumps([encode([])]),
@@ -259,6 +348,28 @@ class MoneyEquivalenceTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as error:
                     decode_receipt(invalid)
                 self.assertNotIn("DO_NOT_LOG_THIS_VALUE", str(error.exception))
+
+
+class TransplantTests(unittest.TestCase):
+    def test_base_scanner_fixture_is_preserved_and_missing_apis_fail_closed(self):
+        # Older bases must never acquire the head's ClaudeTerminalOffForTest
+        # prologue. Validate the real transplant guard without touching runtime.
+        with tempfile.TemporaryDirectory() as scratch:
+            base = Path(scratch)
+            fixture = base / "crates/ottto-service/src/snapshots/e2_pipeline_scan_fixture.rs"
+            fixture.parent.mkdir(parents=True)
+            original = b"// base adapter\nfn scan() {}\nfn scan_other() {}\nfn begin_durable() {}\n"
+            fixture.write_bytes(original)
+            require_base_scan_fixture(base)
+            self.assertEqual(fixture.read_bytes(), original)
+            for method in ("scan", "scan_other", "begin_durable"):
+                with self.subTest(missing=method):
+                    fixture.write_bytes(original.replace(f"fn {method}(".encode(), b"fn missing("))
+                    with self.assertRaisesRegex(RuntimeError, "base compat"):
+                        require_base_scan_fixture(base)
+            fixture.unlink()
+            with self.assertRaises(FileNotFoundError):
+                require_base_scan_fixture(base)
 
 
 if __name__ == "__main__":

@@ -79,6 +79,17 @@ jobs:
             crates -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Save main's cache even when a replay test fails, but only after both
+      # test binaries built; see the same step in linux-tests.yml.
+      - name: Build replay tests
+        run: |
+          build_status=0
+          cargo test -p ottto-service --test replay_harness --features replay-harness --locked --no-run || build_status=$?
+          cargo test -p ottto-service --lib --features replay-harness --locked --no-run || build_status=$?
+          if [ "$build_status" -eq 0 ]; then
+            echo "CACHE_ON_FAILURE=true" >> "$GITHUB_ENV"
+          fi
+
       - name: Replay harness (feature)
         run: |
           replay_status=0

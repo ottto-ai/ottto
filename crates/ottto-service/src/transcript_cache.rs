@@ -584,7 +584,10 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux")),
+        ignore = "needs macOS heap layout"
+    )]
     fn insertion_preflight_matches_real_rank_and_reservation_outcomes() {
         for reserved in [0, 32 * 1024, 96 * 1024, 128 * 1024] {
             for rank in [(9, 0), (10, 0), (20, 0), (30, 0)] {
