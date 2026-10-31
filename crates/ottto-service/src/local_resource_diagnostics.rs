@@ -120,6 +120,7 @@ thread_local! {
 pub(crate) fn claude_identity_over_cap(
     reasons: &std::collections::BTreeSet<crate::snapshots::claude_request_identity::OverCap>,
     item_bytes: usize,
+    components: Option<&ClaudeIdentityOverCapBytes>,
 ) {
     use crate::snapshots::claude_request_identity::OverCap;
     const LABELS: [&str; 6] = [
@@ -143,9 +144,12 @@ pub(crate) fn claude_identity_over_cap(
             let _ = counters[index].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
         }
         #[derive(Serialize)]
-        struct Counts {
+        struct Counts<'a> {
             claude_request_identity_over_cap: BTreeMap<&'static str, u64>,
             claude_request_identity_last_over_cap_item_bytes: usize,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            claude_request_identity_last_over_cap_components:
+                Option<&'a ClaudeIdentityOverCapBytes>,
         }
         traversal_point(
             "claude_request_identity_over_cap",
@@ -156,6 +160,7 @@ pub(crate) fn claude_identity_over_cap(
                     .zip(counters.iter().map(|n| n.load(Relaxed)))
                     .collect(),
                 claude_request_identity_last_over_cap_item_bytes: item_bytes,
+                claude_request_identity_last_over_cap_components: components,
             },
         );
     };
@@ -163,6 +168,21 @@ pub(crate) fn claude_identity_over_cap(
     CLAUDE_IDENTITY_OVER_CAP.with(record);
     #[cfg(not(test))]
     record(&CLAUDE_IDENTITY_OVER_CAP);
+}
+
+/// Wire bytes of the last over-cap tagged body by component, measured before
+/// its display leaves are shed; `after_shed` is what the tag selector then
+/// sees. Counts and an 8-hex entity digest only.
+#[derive(Serialize)]
+pub(crate) struct ClaudeIdentityOverCapBytes {
+    pub(crate) entity: String,
+    pub(crate) item: usize,
+    pub(crate) context_curve: usize,
+    pub(crate) cache_observations: usize,
+    pub(crate) identity: usize,
+    pub(crate) usage_buckets: usize,
+    pub(crate) rest: usize,
+    pub(crate) after_shed: usize,
 }
 
 /// Closed, content-free refusal labels; cumulative process counters on #799.
@@ -672,6 +692,20 @@ impl Probe {
         bytes: u64,
     ) {
         rearm_cause::completed(self.started, key, mode, bytes);
+    }
+    pub(crate) fn full_parse_reason(
+        &self,
+        mode: crate::transcript_acquisition::ReadMode,
+        reason: Option<crate::snapshots::CandidateParseReason>,
+        count: u64,
+        native_bytes: u64,
+    ) {
+        if let (crate::transcript_acquisition::ReadMode::Full(_), Some(reason)) = (mode, reason) {
+            rearm_cause::record_parse_reason(self.started, reason, count, native_bytes);
+        }
+    }
+    pub(crate) fn full_by_parse_reason(&self) -> claude_reread::FullByParseReason {
+        rearm_cause::full_by_parse_reason(self.started)
     }
     pub(crate) fn rearm_fulls(&self) -> rearm_cause::Counts {
         rearm_cause::page(self.started)
@@ -1361,12 +1395,7 @@ impl NativeDecision {
         );
     }
 }
-impl crate::heap_layout_bound::HeapLayoutBound for NativeDecision {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(false; NativeDecision);
 
 /// Per-page restore attempts. A miss class never authorizes a body read.
 #[derive(Debug, Default, Serialize)]
@@ -1594,12 +1623,7 @@ pub(crate) struct AcquisitionAdmission {
     pub(crate) prepare_started: usize,
     pub(crate) prepare_failed: usize,
 }
-impl crate::heap_layout_bound::HeapLayoutBound for AcquisitionAdmission {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(false; AcquisitionAdmission);
 
 /// Existing audit point, using already computed final/previous fingerprints.
 /// Additive aliases retain their meaning; neither comparison is an audit-policy
@@ -1644,6 +1668,8 @@ pub(crate) fn sampled_audit_comparison(
 pub(crate) struct PageEvents {
     #[serde(skip_serializing_if = "rearm_cause::Counts::is_empty")]
     pub(crate) full_cause: rearm_cause::Counts,
+    #[serde(skip_serializing_if = "claude_reread::FullByParseReason::is_empty")]
+    pub(crate) full_by_parse_reason: claude_reread::FullByParseReason,
     pub(crate) full_reasons: FullReasons,
     pub(crate) priority_full_replays: usize,
     pub(crate) audits_started: usize,
@@ -2068,6 +2094,7 @@ mod tests {
             },
             page_events: PageEvents {
                 full_cause: Default::default(),
+                full_by_parse_reason: Default::default(),
                 full_reasons: FullReasons([usize::MAX / 11; 11]),
                 priority_full_replays: usize::MAX,
                 audits_started: usize::MAX,
@@ -2414,6 +2441,53 @@ mod tests {
             &original
         ));
         assert!(records.is_empty());
+    }
+
+    /// [behaviour] Full parse reasons report selections and completed bytes on the existing page event.
+    #[test]
+    fn full_parse_reasons_are_sparse_page_local_counts_and_completed_bytes() {
+        use crate::snapshots::CandidateParseReason::{Rearmed, TranscriptChanged};
+        use crate::transcript_acquisition::{FullReason, ReadMode};
+        let (_, rows) = capture(|| {
+            let probe = Probe::start();
+            let full = ReadMode::Full(FullReason::StateMissing);
+            for (mode, reason, bytes) in [
+                (full, Some(Rearmed), 123),
+                (full, Some(TranscriptChanged), 456),
+                (ReadMode::Tail, Some(Rearmed), 999),
+                (ReadMode::Unchanged, Some(Rearmed), 999),
+                (full, None, 999),
+            ] {
+                probe.full_parse_reason(mode, reason, 1, 0);
+                probe.full_parse_reason(mode, reason, 0, bytes);
+            }
+            // A selected Full that has not completed contributes no bytes.
+            probe.full_parse_reason(full, Some(Rearmed), 1, 0);
+            for probe in [probe, Probe::start()] {
+                let mut reads = max_read_counts();
+                reads.page_events.full_by_parse_reason = probe.full_by_parse_reason();
+                probe.collection(
+                    "claude_code",
+                    CollectionCounts {
+                        scanned_files: 6,
+                        semantic_noops: 0,
+                        sampled_acquisition: Some(reads),
+                        full_causes: Default::default(),
+                    },
+                );
+            }
+        });
+        assert_eq!(rows[0]["stage"], "native_collection_page");
+        assert_eq!(
+            rows[0]["counts"]["sampled_acquisition"]["page_events"]["full_by_parse_reason"],
+            serde_json::json!({
+                "rearmed": {"count": 2, "completed_native_bytes": 123},
+                "transcript_changed": {"count": 1, "completed_native_bytes": 456},
+            })
+        );
+        assert!(rows[1]["counts"]["sampled_acquisition"]["page_events"]
+            .get("full_by_parse_reason")
+            .is_none());
     }
 
     #[test]

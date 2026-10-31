@@ -3253,6 +3253,31 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     )
 }
 
+/// Fixed labels for the partial-checkpoint steps whose own error carries no
+/// phrase `safe_error` knows. The checkpoint's other failures already carry
+/// fixed messages naming the partial checkpoint (listed in
+/// `PARTIAL_CHECKPOINT_FAILURES`).
+const CHECKPOINT_PROGRESS_LOCK: &str = "partial checkpoint: acquire progress lock";
+const CHECKPOINT_NATIVE_RESTORE: &str = "partial checkpoint: restore native selection";
+const CHECKPOINT_ACK_HANDOFF: &str = "partial checkpoint: stage ACK retirement handoff";
+const CHECKPOINT_VALIDATE_DESTINATION: &str = "partial checkpoint: validate destination";
+const CHECKPOINT_INDEX_SAVE: &str = "partial checkpoint: save scan index";
+
+/// Every partial-checkpoint failure label `safe_error` may print, so a failed
+/// checkpoint names its step instead of the bare "sync failed".
+const PARTIAL_CHECKPOINT_FAILURES: [&str; 10] = [
+    CHECKPOINT_PROGRESS_LOCK,
+    "read snapshot progress for partial checkpoint",
+    "parse snapshot progress for partial checkpoint",
+    "partial checkpoint lacks a source witness",
+    "snapshot progress changed before partial checkpoint",
+    "conflicting snapshot bodies before partial checkpoint",
+    CHECKPOINT_NATIVE_RESTORE,
+    CHECKPOINT_ACK_HANDOFF,
+    CHECKPOINT_VALIDATE_DESTINATION,
+    CHECKPOINT_INDEX_SAVE,
+];
+
 #[allow(clippy::too_many_arguments)]
 fn checkpoint_partial_snapshot_index_with_audit_release(
     index: &ScanIndex,
@@ -3270,7 +3295,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     audit_release: Option<AccountAuditRelease<'_>>,
     body_drains: crate::snapshots::ClaudeProofBodyDrains,
 ) -> Result<ScanIndex> {
-    let _lock = SnapshotProgressLock::acquire(progress_path)?;
+    let _lock = SnapshotProgressLock::acquire(progress_path).context(CHECKPOINT_PROGRESS_LOCK)?;
     let mut durable: SnapshotUploadProgress = match match read_limit {
         Some(cap) => crate::snapshot_retry::read_state(progress_path, cap),
         None => std::fs::read(progress_path),
@@ -3356,7 +3381,9 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         committable.settle_empty_claude_proof_corrections(scan);
     }
     if let Some(fallback) = fallback {
-        fallback.restore(&mut committable, committed_index)?;
+        fallback
+            .restore(&mut committable, committed_index)
+            .context(CHECKPOINT_NATIVE_RESTORE)?;
     }
     if let (Some(scan), Some(release)) = (correction_scan, audit_release) {
         scan.preserve_released_account_audits(
@@ -3379,23 +3406,25 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         correction_scan.is_some_and(|scan| scan.census_complete),
     );
     let scan_referenced = progress.ack_retirement_scan_references(committed_index, index);
-    progress.stage_ack_retirement_handoff_with_scan(
-        committed_index,
-        &mut committable,
-        &scan_referenced,
-        locally_held,
-        &census_absent,
-    )?;
+    progress
+        .stage_ack_retirement_handoff_with_scan(
+            committed_index,
+            &mut committable,
+            &scan_referenced,
+            locally_held,
+            &census_absent,
+        )
+        .context(CHECKPOINT_ACK_HANDOFF)?;
     let context_rearms = committable.accept_file_upload_context_acks(
         &progress.context_receipt_candidates,
         &progress.fresh_context_body_acks,
     );
-    validate_destination()?;
-    if let Some(cap) = read_limit {
-        committable.save_with_read_limit(index_path, cap)?;
-    } else {
-        committable.save(index_path)?;
-    }
+    validate_destination().context(CHECKPOINT_VALIDATE_DESTINATION)?;
+    let saved = match read_limit {
+        Some(cap) => committable.save_with_read_limit(index_path, cap),
+        None => committable.save(index_path),
+    };
+    saved.context(CHECKPOINT_INDEX_SAVE)?;
     if let Some(scan) = correction_scan {
         scan.report_discovery_growth_after_save(&committable);
         context_rearms.emit(scan.source);
@@ -4222,7 +4251,8 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
             let mut account_switch = ClaudeAccountSwitchProbe::default();
             let mut retry = live_snapshot_retry::LiveRetryOwner::production();
             loop {
-                if let Ok(roots) = crate::snapshot_roots::watcher_roots(&home) {
+                let prior = watcher.as_ref().map_or(&[][..], |current| current.roots());
+                if let Ok(roots) = crate::snapshot_roots::watcher_roots(&home, prior) {
                     if watcher.as_ref().map_or(true, |current| !current.matches_roots(&roots)) {
                         watcher = crate::snapshot_watcher::watch_snapshot_roots(roots).ok();
                     }
@@ -4312,7 +4342,7 @@ impl continuation::LoopHost for ContinuationLoop<'_> {
 
 /// Watch every enabled source's transcript roots, if the platform allows it.
 fn watch_snapshot_source_roots(home: &Path) -> Option<crate::snapshot_watcher::SnapshotWatcher> {
-    let roots = crate::snapshot_roots::watcher_roots(home).ok()?;
+    let roots = crate::snapshot_roots::watcher_roots(home, &[]).ok()?;
     crate::snapshot_watcher::watch_snapshot_roots(roots).ok()
 }
 
@@ -11312,6 +11342,19 @@ where
                     crate::client_report::ClientReportReason::RatelimitBackoff,
                     1,
                 );
+                // Fixed labels only: which shed this was (load shedding or the
+                // identity-unavailable 503) decides whether a retry can follow.
+                eprintln!(
+                    "local snapshot upload shed for {poison_scope}: status={}, \
+                     retry_after={}, code={}",
+                    shed.status,
+                    if shed.retry_after.is_some() {
+                        "present"
+                    } else {
+                        "absent"
+                    },
+                    shed.code.map_or("none", |code| code.as_str()),
+                );
                 // Stop the pass here rather than hammering the remaining pages
                 // at a server that just asked for room. Everything accepted so
                 // far is already checkpointed, so the retry resumes instead of
@@ -12523,6 +12566,13 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
         // "parse <endpoint> response failed" family: the request went through
         // but the backend reply didn't decode.
         "backend response was invalid".to_string()
+    } else if text.contains(crate::snapshot_roots::CLAUDE_ROOTS_CHANGED_DURING_SCAN) {
+        crate::snapshot_roots::CLAUDE_ROOTS_CHANGED_DURING_SCAN.to_string()
+    } else if let Some(step) = PARTIAL_CHECKPOINT_FAILURES
+        .into_iter()
+        .find(|step| text.contains(step))
+    {
+        step.to_string()
     } else {
         "sync failed".to_string()
     }
