@@ -32139,9 +32139,6 @@ impl OwnedSourceScan {
                     );
                 }
                 let scan = SourceScanResult {
-                    #[cfg(test)]
-                    forced_family_for_test: census.parse_reasons
-                        [CandidateParseReason::ForcedFamily as usize],
                     strict_cohort_deferred_root_count: 0,
                     source,
                     backfill_window_days,
@@ -32152,6 +32149,9 @@ impl OwnedSourceScan {
                     scanned_file_count,
                     scanned_session_count,
                     semantic_noop_count,
+                    #[cfg(test)]
+                    forced_family_for_test: census.parse_reasons
+                        [CandidateParseReason::ForcedFamily as usize],
                     census_complete,
                     census_window_end,
                     state_census_complete,
