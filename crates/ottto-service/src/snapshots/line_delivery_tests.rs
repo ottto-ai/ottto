@@ -1284,6 +1284,7 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
                     account_holds: holds,
                     memo: None,
                     growth: None,
+                    retry_allowed: false,
                 },
             )
             .is_some()
@@ -3985,6 +3986,7 @@ fn withheld_recovery_candidate(root: &Root, path: &Path, index: &ScanIndex) -> C
             account_holds: &index.claude_account_deferred_holds,
             memo: Some(&index.withheld_memo),
             growth: None,
+            retry_allowed: false,
         },
     )
     .unwrap()
