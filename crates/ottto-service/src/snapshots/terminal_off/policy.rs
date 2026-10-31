@@ -4,10 +4,19 @@ use std::path::Path;
 
 pub(super) const NAME: &str = "claude_terminal_off_enabled";
 fn enabled_at(support: &Path) -> bool {
+    marker_at(support, NAME)
+}
+pub(in crate::snapshots) fn marker_at(support: &Path, name: &str) -> bool {
     // As with mcp_inventory/disabled and context_footprint/disabled, the
     // owner's local marker is the setting. Refuse symlinks and non-files.
-    std::fs::symlink_metadata(support.join(NAME))
+    std::fs::symlink_metadata(support.join(name))
         .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+}
+
+/// A process-pinned support-dir switch behind the caller's own lock-free
+/// cell. The owner changes the marker and restarts the daemon to apply it.
+pub(in crate::snapshots) fn pinned_marker(cell: &std::sync::OnceLock<bool>, name: &str) -> bool {
+    *cell.get_or_init(|| marker_at(&ottto_core::default_support_dir(), name))
 }
 
 pub(super) fn enabled() -> bool {
@@ -22,6 +31,18 @@ pub(super) fn enabled() -> bool {
         // Ron changes the marker himself and restarts the daemon to apply it.
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| enabled_at(&ottto_core::default_support_dir()))
+    }
+}
+
+/// Q-W policy is pinned at first preparation, including absent/OFF markers.
+/// Fixtures read their scratch support directory, never the host policy.
+pub(in crate::snapshots) fn admission_reoffer_window(support: &Path) -> bool {
+    const NAME: &str = "claude_admission_reoffer_window_enabled";
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if cfg!(test) {
+        marker_at(support, NAME)
+    } else {
+        pinned_marker(&ENABLED, NAME)
     }
 }
 

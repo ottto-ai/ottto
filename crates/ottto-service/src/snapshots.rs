@@ -48489,6 +48489,64 @@ impl ScanIndex {
             })
     }
 
+    /// Q-W: every current-limit pending retry uses the same outside/unknown
+    /// incidence rule, regardless of which operation created or armed it.
+    pub(crate) fn snapshot_admission_reoffer_pending_for_scan(
+        &self,
+        source: SnapshotSource,
+        support: &Path,
+        window_days: u64,
+    ) -> bool {
+        if source != SnapshotSource::ClaudeCode
+            || !terminal_off_policy::admission_reoffer_window(support)
+        {
+            return self.snapshot_admission_reoffer_pending();
+        }
+        let Some(now) = unix_seconds(SystemTime::now()) else {
+            return self.snapshot_admission_reoffer_pending();
+        };
+        let (mut outside, mut inside) = (0, 0);
+        for (fingerprint, record) in &self.quarantined_snapshot_fingerprints {
+            if record.witness.item_wire_byte_limit != MAX_SNAPSHOT_ITEM_WIRE_BYTES
+                || record.disposition != SnapshotQuarantineDisposition::RetryPending
+            {
+                continue;
+            }
+            // A retry can age out after its refusal. Use the scanner's mtime
+            // cutoff on current metadata: committed mtimes can be stale after
+            // a restore/copy. Unknown incidence or metadata stays wide.
+            let mut found = false;
+            let outside_window = self
+                .file_snapshot_fingerprints
+                .iter()
+                .any(|(key, entities)| {
+                    if !entities.contains(fingerprint) {
+                        return false;
+                    }
+                    found = true;
+                    fs::symlink_metadata(key)
+                        .ok()
+                        .filter(|metadata| metadata.is_file())
+                        .and_then(|metadata| metadata.modified().ok())
+                        .and_then(unix_seconds)
+                        .map_or(true, |modified| {
+                            !is_recent_enough_at(modified, now, window_days)
+                        })
+                });
+            if outside_window || !found {
+                outside += 1;
+            } else {
+                inside += 1;
+            }
+        }
+        if outside + inside > 0 {
+            eprintln!(
+                "ottto-service: Claude admission scan window: outside_or_unknown={outside} inside={inside}"
+            );
+        }
+        outside > 0
+    }
+
     fn activate_quarantine_witness(&mut self, source: SnapshotSource) {
         self.active_quarantine_witness = Some(
             self.active_upload_context_fingerprint
@@ -53253,6 +53311,9 @@ mod tests {
     }
     mod stale_family_carry_tests {
         include!("snapshots/stale_family_carry_tests.rs");
+    }
+    mod admission_reoffer_window_tests {
+        include!("snapshots/admission_reoffer_window_tests.rs");
     }
     mod terminal_off_tests {
         include!("snapshots/terminal_off_tests.rs");
