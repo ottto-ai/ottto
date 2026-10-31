@@ -196,7 +196,7 @@ pub(crate) trait PlatformGates {
 }
 
 #[derive(Default)]
-pub(super) struct MacPlatformSignals {
+pub(crate) struct MacPlatformSignals {
     saved: Option<(u32, i32)>,
     #[cfg(test)]
     setter: Option<fn(u32, i32) -> bool>,
@@ -242,7 +242,7 @@ impl MacPlatformSignals {
             PlatformState::Unknown
         }
     }
-    fn background() -> Option<Self> {
+    pub(crate) fn background() -> Option<Self> {
         let mut signals = Self::default();
         (signals.enter_background_qos() == PlatformState::Allowed).then_some(signals)
     }

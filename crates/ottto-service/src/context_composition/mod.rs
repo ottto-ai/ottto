@@ -70,4 +70,4 @@ const LOCAL_DISABLE_ENV: &str = "OTTTO_CONTEXT_COMPOSITION_HARVEST_DISABLED";
 #[cfg(test)]
 mod tests;
 
-pub(crate) use v2::{set_utility_qos, thread_cpu_micros};
+pub(crate) use v2::thread_cpu_micros;

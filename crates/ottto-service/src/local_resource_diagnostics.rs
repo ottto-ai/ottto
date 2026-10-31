@@ -185,7 +185,7 @@ pub(crate) struct ClaudeIdentityOverCapBytes {
     pub(crate) after_shed: usize,
 }
 
-/// Persisted via ArchiveDisposition: never rename/remove; retain retired variants.
+/// Closed causes for native archive reader refusal and owed custody.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 pub(crate) enum CodexZstCause {
     #[serde(rename = "CompressedReplayNotAuthorized")]
@@ -206,43 +206,34 @@ pub(crate) enum CodexZstCause {
     ParentLedgerUnbound = 7,
     #[serde(rename = "CompressedPhysicalOffsetUnsupported")]
     PhysicalOffsetUnsupported = 8,
-    #[serde(alias = "CompressedConstructorUnfunded")]
-    #[serde(alias = "decode_budget")]
-    #[serde(alias = "CompressedCatchupTooLarge")]
     #[serde(rename = "CompressedAdmissionRefused")]
     AdmissionRefused = 9,
     #[serde(rename = "CompressedDecodeFailed")]
     DecodeFailed = 10,
-    #[serde(alias = "CompressedCompatibilityUnsupported")]
     #[serde(rename = "CompressedOwnerUnproven")]
     OwnerUnproven = 11,
-    #[serde(alias = "CompressedSettlementStuck")]
     #[serde(rename = "CompressedOutputHeld")]
     OutputHeld = 12,
     #[serde(rename = "CompressedDecodedOverLimit")]
     DecodedOverLimit = 13,
     #[serde(rename = "CompressedHeaderInvalid")]
     HeaderInvalid = 14,
-    #[serde(rename = "admission_starved")]
-    AdmissionStarved = 15,
     #[serde(rename = "CompressedCorrectionUnapplied")]
-    CorrectionUnapplied = 16,
+    CorrectionUnapplied = 15,
     #[serde(rename = "CompressedHeaderUnfunded")]
-    HeaderUnfunded = 17,
-    #[serde(alias = "CompressedParserStateRequired")]
+    HeaderUnfunded = 16,
     #[serde(rename = "CompressedCompatibilityUnfunded")]
-    CompatibilityUnfunded = 18,
+    CompatibilityUnfunded = 17,
     // Optional plain header occupancy refused an otherwise fundable decoder.
     #[serde(rename = "decoder_refused_header_occupancy")]
-    DecoderRefusedHeaderOccupancy = 19,
+    DecoderRefusedHeaderOccupancy = 18,
     #[serde(rename = "CompressedFamilyUnproven")]
-    FamilyUnproven = 20,
-    #[serde(alias = "archive_dominated")]
+    FamilyUnproven = 19,
     #[serde(rename = "ArchiveEquivalenceUnproven")]
-    ArchiveEquivalenceUnproven = 21,
+    ArchiveEquivalenceUnproven = 20,
     #[doc(hidden)]
     #[serde(skip)]
-    __Count = 22,
+    __Count = 21,
 }
 impl std::fmt::Display for CodexZstCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1912,7 +1903,6 @@ mod tests {
             OutputHeld,
             DecodedOverLimit,
             HeaderInvalid,
-            AdmissionStarved,
             CorrectionUnapplied,
             HeaderUnfunded,
             CompatibilityUnfunded,

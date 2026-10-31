@@ -3970,10 +3970,15 @@ impl SyncCounts {
             invalid_utf8_line_count: scan_result.invalid_utf8_line_count as u64,
             over_line_cap_count: scan_result.over_line_cap_count as u64,
             recognized_usage_drop_count: scan_result.recognized_usage_drop_count as u64,
-            ownership_incomplete_file_count: scan_result.ownership_incomplete_file_count as u64,
-            causes: scan_result
-                .causes
-                .summary(scan_result.ownership_incomplete_file_count),
+            ownership_incomplete_file_count: scan_result
+                .ownership_incomplete_file_count
+                .saturating_add(scan_result.archive_owed_count)
+                as u64,
+            causes: scan_result.causes.summary(
+                scan_result
+                    .ownership_incomplete_file_count
+                    .saturating_add(scan_result.archive_owed_count),
+            ),
             snapshot_unproven_terminal_count: 0,
             snapshot_superseded_terminal_count: 0,
             cooldown_conflict_deferred: 0,
@@ -12885,13 +12890,56 @@ pub(crate) fn terminal_off_traversal_ended_for_test(index: &ScanIndex) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     mod terminal_contract_retry_tests {
         include!("snapshot_sync/terminal_contract_retry_tests.rs");
     }
     mod ack_retention_tests {
         include!("snapshot_sync/ack_retention_tests.rs");
+    }
+    pub(crate) fn assert_archive_debt_preserves_replay_progress(
+        mut index: ScanIndex,
+        scan: &SourceScanResult,
+    ) {
+        assert!(scan.census_complete);
+        let counts = SyncCounts::from_scan_result(scan, 0, 7);
+        assert!(counts.has_disclosed_loss());
+        assert_eq!(counts.disclosed_loss(), DisclosedLoss::Unsettled);
+        let root = test_dir("archive-backfill-isolation");
+        let destination = "synthetic-destination";
+        let mut backfill = load_backfill_state(&root);
+        if scan.census_complete {
+            mark_backfill_complete_for_destination(
+                &mut backfill,
+                SnapshotSource::Codex,
+                destination,
+            );
+        }
+        assert!(
+            !pending_backfill_sources_for_destination(&backfill, destination)
+                .contains(&SnapshotSource::Codex)
+        );
+        let fp = "a".repeat(64);
+        let mut progress = SnapshotUploadProgress::new("c".repeat(64), test_quarantine_witness());
+        for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
+            progress.quarantine([fp.as_str()]);
+        }
+        progress
+            .quarantined_fingerprints
+            .get_mut(&fp)
+            .unwrap()
+            .retry_after_unix_seconds = 0;
+        index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
+        prepare_upload_progress_for_cycle_with_reoffer(
+            &mut progress,
+            &index,
+            "replay",
+            false,
+            None,
+        );
+        assert!(progress.active_quarantine_retries.contains(&fp));
+        std::fs::remove_dir_all(root).unwrap();
     }
     use crate::snapshots::finalize_scan_after_policy;
     #[test]

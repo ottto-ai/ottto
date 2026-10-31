@@ -7696,6 +7696,7 @@ pub struct SourceScanResult {
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
     pub census_complete: bool,
+    pub(crate) archive_owed_count:usize,
     // Per-page strict I/O debt, never serialized into ScanIndex.
     pub(crate) strict_cohort_deferred_root_count: usize,
     pub census_window_end: String,
@@ -26776,6 +26777,7 @@ impl OwnedSourceScan {
         if source == SnapshotSource::ClaudeCode && progress == TraversalProgress::Started {
             index.record_started_claude_request_identity_contract(claude_request_identity_capture);
         }
+        index.archive_pass.deferred = 0;
         let growth_active =
             source == SnapshotSource::ClaudeCode && sampled_audit::growth_active(index);
         if growth_active {
@@ -27524,7 +27526,7 @@ impl OwnedSourceScan {
     }
 
     fn step_with_capture_credit(
-        self,
+        mut self,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
         capture_credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
     ) -> Result<OwnedSourceScanStep, crate::source_rotation::LocalRefusal> {
@@ -27532,10 +27534,8 @@ impl OwnedSourceScan {
             self.source == SnapshotSource::ClaudeCode,
         );
         let _acquire_window = state_v2::telemetry::acquire_window(&self.index);
-        let archive_cpu = self
-            .index
-            .archive_pass
-            .started
+        self.index.archive_pass.started = false;
+        let archive_cpu = (!self.index.archives.is_empty())
             .then(crate::context_composition::thread_cpu_micros)
             .flatten();
         let archive_wall = archive_cpu.map(|_| std::time::Instant::now());
@@ -27547,7 +27547,7 @@ impl OwnedSourceScan {
             .map(|(a, b)| b.saturating_sub(a))
         {
             match &mut result {
-                Ok(OwnedSourceScanStep::Pending(s)) => {
+                Ok(OwnedSourceScanStep::Pending(s)) if s.index.archive_pass.started => {
                     s.index.archive_pass.cpu = s.index.archive_pass.cpu.saturating_add(cpu);
                     s.index.archive_pass.work =
                         s.index
@@ -27557,7 +27557,7 @@ impl OwnedSourceScan {
                                 t.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
                             }));
                 }
-                Ok(OwnedSourceScanStep::Complete { index, .. }) => {
+                Ok(OwnedSourceScanStep::Complete { index, .. }) if index.archive_pass.started => {
                     index.archive_pass.cpu = index.archive_pass.cpu.saturating_add(cpu);
                     index.archive_pass.work =
                         index
@@ -27567,7 +27567,7 @@ impl OwnedSourceScan {
                                 t.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
                             }));
                 }
-                Err(_) => {}
+                _ => {}
             }
         }
         match &result {
@@ -27781,15 +27781,6 @@ impl OwnedSourceScan {
                     ) {
                         pending!();
                     }
-                    if !inventory.archive_headers.is_empty() && !index.archive_pass.prepared {
-                        index.prepare_archive_reservations(
-                            &identified_candidates,
-                            inventory,
-                            &codex_page,
-                            codex_parent_ownership_ledgers.as_ref(),
-                        );
-                        pending!();
-                    }
                     let selected = identified_candidates
                         .iter()
                         .filter(|c| !codex_archive_path(&c.path))
@@ -27802,11 +27793,7 @@ impl OwnedSourceScan {
                         .collect::<BTreeSet<_>>();
                     inventory.complete &= selected.is_subset(&inventoried);
                     let mut owners = BTreeMap::<String, BTreeSet<PathBuf>>::new();
-                    for header in inventory
-                        .headers
-                        .iter()
-                        .filter(|h| !codex_archive_path(&h.candidate.path))
-                    {
+                    for header in &inventory.headers {
                         owners
                             .entry(header.owner.clone())
                             .or_default()
@@ -28259,6 +28246,17 @@ impl OwnedSourceScan {
                         });
                 }
                 codex_join_prepared = true;
+                if let Some(inventory) = codex_join_inventory.as_ref() {
+                    if !inventory.archive_headers.is_empty() && !index.archive_pass.prepared {
+                        index.prepare_archive_reservations(
+                            &identified_candidates,
+                            inventory,
+                            &codex_page,
+                            codex_parent_ownership_ledgers.as_ref(),
+                        );
+                        pending!();
+                    }
+                }
                 pending!();
             }
             if let Some(mut boot) = codex_join_active.take() {
@@ -28896,6 +28894,10 @@ impl OwnedSourceScan {
                 }
             }
             if let Some(mut active) = active_file.take() {
+                let compressed = active.parser.reader.reader.is_compressed();
+                let _archive_qos = compressed
+                    .then(crate::snapshot_sync::continuation::MacPlatformSignals::background);
+
                 if active.parser.reader.reader.is_compressed()
                     && index
                         .archives
@@ -28910,18 +28912,15 @@ impl OwnedSourceScan {
                         == 0
                 {
                     codex_page = sampled_scan::codex_cursor::PageBudget::default();
-                    index.archive_pass.prepare();
+                    index.archive_pass.power = index.archive_pass.gates.power_ready();
                     active_file = Some(active);
                     pending!();
                 }
                 if active.parser.reader.reader.is_compressed() && !index.archive_pass.ready(1) {
-                    if index.archive_pass.cpu != u64::MAX && index.archive_pass.gates.power_ready()
-                    {
-                        // A spent CPU/work page keeps the same paid RAM parser.
-                        codex_page = sampled_scan::codex_cursor::PageBudget::default();
-                        index.archive_pass.prepare();
-                        active_file = Some(active);
-                        pending!();
+                    for a in index.archives.values_mut() {
+                        if a.work.as_ref().is_some_and(|w| w.reserved && !w.decoded) {
+                            a.cancel_reservation();
+                        }
                     }
                     index.archive_hold(&active.candidate.path, CodexZstCause::AdmissionRefused);
                     active.parser.reader.reader.close();
@@ -29056,6 +29055,19 @@ impl OwnedSourceScan {
                         },
                     );
                     pending!();
+                }
+                if compressed {
+                    if let OpenedInput::Compressed(reader, _) = &active.parser.reader.reader {
+                        if reader.get_ref().decoded_bytes() > 0 {
+                            if let Some(w) = index
+                                .archives
+                                .get_mut(&local_index_key(&active.candidate.path))
+                                .and_then(|a| a.work.as_mut())
+                            {
+                                w.decoded = true;
+                            }
+                        }
+                    }
                 }
                 match stepped {
                     Ok(false) => {
@@ -29744,6 +29756,11 @@ impl OwnedSourceScan {
                             }
                             pending!();
                         }
+                        Err(_) if codex_archive_path(&candidate.path) => {
+                            index.archive_hold(&candidate.path, CodexZstCause::OutputHeld);
+                            parser.reader.reader.close();
+                            pending!();
+                        }
                         Err(_) => {
                             if let Some((context, publication)) =
                                 sampling.as_ref().zip(cursor_publication.take())
@@ -29780,6 +29797,11 @@ impl OwnedSourceScan {
                     && retained_bytes.saturating_add(incoming_bytes)
                         > codex_file_join::MAX_RECEIPT_BYTES
                 {
+                    if codex_archive_path(&candidate.path) {
+                        index.archive_hold(&candidate.path, CodexZstCause::OutputHeld);
+                        parser.reader.reader.close();
+                        pending!();
+                    }
                     if let Some((context, publication)) =
                         sampling.as_ref().zip(cursor_publication.take())
                     {
@@ -32402,7 +32424,8 @@ impl OwnedSourceScan {
                     scanned_file_count,
                     scanned_session_count,
                     semantic_noop_count,
-                    census_complete: census_complete && index.archive_owed_count() == 0,
+                    census_complete,
+                    archive_owed_count: index.archive_owed_count(),
                     census_window_end,
                     state_census_complete,
                     sidecar_census_complete,
@@ -32682,11 +32705,17 @@ impl OwnedSourceScan {
             let failed_open_retry =
                 sampled_audit::failed_open_debt(&rescue_key, audit_now).is_some();
             let verification_rescue = verification_rescue_debt || failed_open_retry;
+            let archive_candidate = codex_archive_path(&candidate.path);
+            let mut archive_census = ScanCensus::default();
             let Some((mut candidate, opened_file)) =
                 open_and_identify_scan_candidate_with_rescue_at(
                     source,
                     candidate,
-                    &mut census,
+                    if archive_candidate {
+                        &mut archive_census
+                    } else {
+                        &mut census
+                    },
                     CandidateWindow {
                         census_unix_seconds,
                         backfill_window_days,
@@ -32699,6 +32728,9 @@ impl OwnedSourceScan {
                     sampling.as_ref().map(|context| context.cache.as_ref()),
                 )
             else {
+                if archive_candidate {
+                    index.archive_hold(Path::new(&rescue_key), CodexZstCause::AdmissionRefused);
+                }
                 if verification_rescue && !failed_open_retry && !open_parked {
                     sampled_audit::progress_open_failed(index, &rescue_key, audit_now);
                 }
@@ -37406,10 +37438,7 @@ fn codex_sidecar_rollout_file_matches(
     } else {
         path
     };
-    if rollout_path.is_empty()
-        || !(path == Path::new(rollout_path)
-            || paths_resolve_to_same_file(path, Path::new(rollout_path)))
-    {
+    if rollout_path.is_empty() || !paths_resolve_to_same_file(path, Path::new(rollout_path)) {
         return false;
     }
     if compressed {
@@ -44300,6 +44329,10 @@ fn advance_bounded_directory_traversal_with_budget(
             }
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
+                Err(_) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
+                    index.archive_unavailable(&path);
+                    continue;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     disappearance_diagnostics::not_found(
                         &mut traversal.counts.disappeared_file_count,
@@ -44497,6 +44530,10 @@ fn candidate_from_traversal_path_at(
 ) -> Option<CandidateFile> {
     let metadata = match fs::symlink_metadata(&pending.path) {
         Ok(metadata) => metadata,
+        Err(_) if source == SnapshotSource::Codex && codex_archive_path(&pending.path) => {
+            discovery.index.archive_unavailable(&pending.path);
+            return None;
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if pending.watcher_hint {
                 // Remove/rename events legitimately name an object that no
@@ -45024,7 +45061,11 @@ impl<'a> DiscoveryRetention<'a> {
     ) -> bool {
         if codex_archive_path(path) {
             if let Some(a) = self.archives.get(&local_index_key(path)) {
-                if stamp.map_or(true, |s| !s.matches_acquisition(&a.stamp)) {
+                if stamp.map_or(true, |s| {
+                    a.stamp
+                        .as_ref()
+                        .map_or(true, |stamp| !s.matches_acquisition(stamp))
+                }) {
                     return true;
                 }
             }
@@ -45320,7 +45361,9 @@ fn open_and_identify_scan_candidate_with_rescue_at(
                 .filter(|m| m.is_file() && !m.file_type().is_symlink())
                 .and_then(|m| crate::transcript_acquisition::FileStamp::capture(m).ok())
                 .is_some_and(|stamp| {
-                    a.stamp.same_content(&stamp) && a.quiet_disposition() && !a.ready_full()
+                    a.stamp.as_ref().is_some_and(|old| old.same_content(&stamp))
+                        && a.quiet_disposition()
+                        && !a.ready_full()
                 })
             {
                 return None;

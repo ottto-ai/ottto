@@ -374,6 +374,8 @@ pub(super) struct HeaderInventory {
     pub(super) reuse_evictions: usize,
     cache_pruned: bool,
     pub(super) archive_complete: bool,
+    plain_finished: bool,
+    archive_checks: [std::cell::OnceCell<bool>; 3],
     pub(super) archive_headers: Vec<HeaderWitness>,
     archive_pending: VecDeque<PathBuf>,
     /// Roster files whose first record was refused, each with the metadata
@@ -420,6 +422,8 @@ impl HeaderInventory {
             reuse_evictions: 0,
             cache_pruned: false,
             archive_complete: true,
+            plain_finished: false,
+            archive_checks: Default::default(),
             archive_headers: Vec::new(),
             archive_pending: paths
                 .iter()
@@ -443,6 +447,24 @@ impl HeaderInventory {
                     .and_then(crate::transcript_acquisition::FileStamp::capture)
                     .is_ok_and(|stamp| header.stamp.same_content(&stamp))
             })
+    }
+    /// One scope check per reservation/read/publication boundary, shared by
+    /// every archive. Directory homes are validated once within that check.
+    pub(super) fn archive_scope_valid(&self, index: &ScanIndex, boundary: usize) -> bool {
+        *self.archive_checks[boundary].get_or_init(|| {
+            self.archive_complete
+                && codex_counting_version::absence_coverage_complete(index, self)
+                && self.content_unchanged()
+                && self.archives_unchanged()
+                && self
+                    .headers
+                    .iter()
+                    .chain(&self.archive_headers)
+                    .map(|h| &h.home)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .all(|home| self.directories.validate(home).is_ok())
+        })
     }
     pub(super) fn archives_unchanged(&self) -> bool {
         self.archive_headers.iter().all(|h| {
@@ -470,17 +492,23 @@ impl HeaderInventory {
         index: &mut ScanIndex,
         cache: Option<&Arc<sampled_scan::SharedCache>>,
     ) -> bool {
-        if !self.pending.is_empty() {
-            return self.step_cached(metadata, cache.map(Arc::as_ref))
-                && self.archive_pending.is_empty();
+        if !self.plain_finished {
+            if !self.step_cached(metadata, cache.map(Arc::as_ref)) {
+                return false;
+            }
+            self.plain_finished = true;
         }
+        index.archive_pass.started |= !self.archive_pending.is_empty();
         if !index.archive_pass.headers_prepared {
             index.archive_pass.headers_prepared = true;
             // One durable batch for bounded inventory work, independent from Full.
             if index.archive_pass.ready(1) {
                 for path in self.archive_pending.iter().take(MAX_HEADER_FILES) {
                     let key = local_index_key(path);
-                    if index.decode_holds.contains("archives", &key) {
+                    if index.archives.get(&key).is_some_and(|a| {
+                        a.stamp.is_none()
+                            && !matches!(a.disposition, ArchiveDisposition::HeaderValidated)
+                    }) {
                         continue;
                     }
                     if let Ok(meta) = fs::symlink_metadata(path) {
@@ -489,15 +517,21 @@ impl HeaderInventory {
                             if index
                                 .archives
                                 .get(&key)
-                                .map_or(true, |old| !old.stamp.same_content(&a.stamp))
+                                .map_or(true, |old| old.stamp != a.stamp)
                             {
                                 index.archives.insert(key.clone(), a);
                             }
                             if let Some(w) =
                                 index.archives.get_mut(&key).and_then(|a| a.work.as_mut())
                             {
-                                if !w.header_attempted {
-                                    w.header_attempted = true;
+                                if w.header.is_none()
+                                    && sampled_scan::now_seconds() >= w.header_retry_after
+                                {
+                                    w.header_attempts = w.header_attempts.saturating_add(1);
+                                    w.header_retry_after =
+                                        sampled_scan::now_seconds().saturating_add(21600);
+                                    w.save_pending = true;
+                                    w.reservation_saved = false;
                                     index.archive_pass.dirty = true;
                                 }
                             }
@@ -509,84 +543,96 @@ impl HeaderInventory {
                 return false;
             }
         }
-        let Some(path) = self.archive_pending.front().cloned() else {
-            return true;
-        };
-        if self.archive_headers.len() >= MAX_HEADER_FILES {
-            // Separate bounded archive share: ordinary joins remain complete.
-            self.archive_complete = false;
-            index.archive_pass.deferred = self
-                .archive_pending
-                .iter()
-                .filter(|p| {
-                    let key = local_index_key(p);
-                    !index.archives.contains_key(&key)
-                        && !index.decode_holds.contains("archives", &key)
-                })
-                .count();
-            self.archive_pending.clear();
-            return true;
-        }
-        let result = (|| -> Result<Option<HeaderWitness>> {
-            let root = self
-                .roots
-                .iter()
-                .filter(|r| path.starts_with(r))
-                .max_by_key(|r| r.components().count())
-                .context("archive root")?;
-            let stat = fs::symlink_metadata(&path)?;
-            anyhow::ensure!(
-                stat.is_file() && !stat.file_type().is_symlink(),
-                "archive object unavailable"
-            );
-            let mut candidate = CandidateFile {
-                physical_identity: None,
-                scan_root: root.clone(),
-                path: path.clone(),
-                size_bytes: stat.len(),
-                modified_unix_seconds: stat.modified().ok().and_then(unix_seconds).unwrap_or(0),
-                modified_unix_nanos: stat.modified().ok().and_then(unix_nanos).unwrap_or(0),
-                source_file_fingerprint: String::new(),
-                legacy_source_file_fingerprint: String::new(),
-                legacy_config_reconciliation_required: false,
-                opened_object_identity: String::new(),
-                fingerprint_changed_nanos: 0,
-                fingerprint_birth_nanos: 0,
-                withheld_content_stamp: None,
+        loop {
+            let Some(path) = self.archive_pending.front().cloned() else {
+                return true;
             };
-            prepare_owned_scan_candidate(
-                SnapshotSource::Codex,
-                &mut candidate,
-                metadata,
-                &ClaudeTitleMetadata::default(),
-                None,
-            );
-            let (owner, created_unix_ms) =
-                match index.inventory_archive_header(&candidate, cache)? {
-                    codex_compressed_input::HeaderRead::Validated(h) => {
-                        (codex_protected_owner(&h.owner), h.created_unix_ms)
-                    }
-                    codex_compressed_input::HeaderRead::Settled(owner) => (owner, None),
-                    codex_compressed_input::HeaderRead::Deferred => return Ok(None),
+            if self.archive_headers.len() >= MAX_HEADER_FILES {
+                // Separate bounded archive share: ordinary joins remain complete.
+                self.archive_complete = false;
+                index.archive_pass.deferred = self
+                    .archive_pending
+                    .iter()
+                    .filter(|p| {
+                        let key = local_index_key(p);
+                        !index.archives.contains_key(&key)
+                    })
+                    .count();
+                self.archive_pending.clear();
+                return true;
+            }
+            let settled = index
+                .archives
+                .get(&local_index_key(&path))
+                .is_some_and(|a| {
+                    matches!(
+                        a.disposition,
+                        ArchiveDisposition::Acquired | ArchiveDisposition::Empty
+                    )
+                });
+            let result = (|| -> Result<Option<HeaderWitness>> {
+                let root = self
+                    .roots
+                    .iter()
+                    .filter(|r| path.starts_with(r))
+                    .max_by_key(|r| r.components().count())
+                    .context("archive root")?;
+                let stat = fs::symlink_metadata(&path)?;
+                anyhow::ensure!(
+                    stat.is_file() && !stat.file_type().is_symlink(),
+                    "archive object unavailable"
+                );
+                let mut candidate = CandidateFile {
+                    physical_identity: None,
+                    scan_root: root.clone(),
+                    path: path.clone(),
+                    size_bytes: stat.len(),
+                    modified_unix_seconds: stat.modified().ok().and_then(unix_seconds).unwrap_or(0),
+                    modified_unix_nanos: stat.modified().ok().and_then(unix_nanos).unwrap_or(0),
+                    source_file_fingerprint: String::new(),
+                    legacy_source_file_fingerprint: String::new(),
+                    legacy_config_reconciliation_required: false,
+                    opened_object_identity: String::new(),
+                    fingerprint_changed_nanos: 0,
+                    fingerprint_birth_nanos: 0,
+                    withheld_content_stamp: None,
                 };
-            Ok(Some(HeaderWitness {
-                home: member_home(root),
-                candidate,
-                owner,
-                created_unix_ms,
-                metadata: metadata_witness(&stat),
-                stamp: FileStamp::capture(stat)?,
-            }))
-        })();
-        if index.archive_pass.dirty {
-            return false;
+                prepare_owned_scan_candidate(
+                    SnapshotSource::Codex,
+                    &mut candidate,
+                    metadata,
+                    &ClaudeTitleMetadata::default(),
+                    None,
+                );
+                let (owner, created_unix_ms) =
+                    match index.inventory_archive_header(&candidate, cache)? {
+                        codex_compressed_input::HeaderRead::Validated(h) => {
+                            (codex_protected_owner(&h.owner), h.created_unix_ms)
+                        }
+                        codex_compressed_input::HeaderRead::Settled(owner) => (owner, None),
+                        codex_compressed_input::HeaderRead::Deferred => return Ok(None),
+                    };
+                Ok(Some(HeaderWitness {
+                    home: member_home(root),
+                    candidate,
+                    owner,
+                    created_unix_ms,
+                    metadata: metadata_witness(&stat),
+                    stamp: FileStamp::capture(stat)?,
+                }))
+            })();
+            if index.archive_pass.dirty {
+                return false;
+            }
+            self.archive_pending.pop_front();
+            match result {
+                Ok(Some(h)) => self.archive_headers.push(h),
+                _ => self.archive_complete = false,
+            }
+            if !settled {
+                return false;
+            }
         }
-        self.archive_pending.pop_front();
-        match result {
-            Ok(Some(h)) => self.archive_headers.push(h),
-            _ => self.archive_complete = false,
-        }
-        false
     }
     pub(super) fn step_cached(
         &mut self,
@@ -731,11 +777,7 @@ impl HeaderInventory {
     }
     pub(super) fn groups(&self) -> BTreeMap<String, Group> {
         let mut groups = BTreeMap::<String, Group>::new();
-        for header in self
-            .headers
-            .iter()
-            .filter(|h| !codex_archive_path(&h.candidate.path))
-        {
+        for header in &self.headers {
             let key = group_key(&header.home, &header.owner);
             groups
                 .entry(key)
@@ -767,11 +809,7 @@ impl HeaderInventory {
             self.directories.validate(home)?;
         }
         let mut checked_headers = 0;
-        for header in self
-            .headers
-            .iter()
-            .filter(|h| !codex_archive_path(&h.candidate.path))
-        {
+        for header in &self.headers {
             let Some(selected) = owners.get(&header.home) else {
                 continue;
             };
@@ -792,7 +830,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, archive_complete, archive_headers, archive_pending, refused, bounded_out);
+crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, plain_finished, archive_checks, archive_complete, archive_headers, archive_pending, refused, bounded_out);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {

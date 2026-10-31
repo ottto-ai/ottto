@@ -1,6 +1,6 @@
 //! Standalone archive admission over the ordinary complete-scope inventory.
 use super::*;
-use codex_compressed_input::{archive_owed, ArchiveEvidence};
+use codex_compressed_input::{archive_alarm, ArchiveEvidence};
 
 pub(super) enum Admission {
     Read,
@@ -13,41 +13,69 @@ impl ScanIndex {
             a.hold(cause);
         }
     }
+    pub(super) fn archive_unavailable(&mut self, path: &Path) {
+        let a = self
+            .archives
+            .entry(local_index_key(path))
+            .or_insert_with(|| {
+                let mut a = ArchiveEvidence::unknown();
+                a.disposition = ArchiveDisposition::HeaderValidated;
+                a
+            });
+        if a.work.is_none() {
+            self.archive_pass.deferred += 1;
+            return;
+        }
+        if a.stamp.is_some() || matches!(a.disposition, ArchiveDisposition::HeaderValidated) {
+            a.transient();
+        }
+    }
     pub(super) fn archive_owed_count(&self) -> usize {
         self.archives
             .values()
             .filter(|a| a.owed_cause().is_some())
             .count()
-            + self.decode_holds.archive_keys().count()
             + self.archive_pass.deferred
     }
-    pub(super) fn disclose_archive_debt(&self) {
-        for a in self.archives.values() {
+    pub(super) fn disclose_archive_debt(&mut self) {
+        let mut counts = BTreeMap::<CodexZstCause, usize>::new();
+        let mut alarm = 0;
+        for a in self.archives.values_mut() {
             if let Some(cause) = a.owed_cause() {
-                archive_owed(cause, 1, cause != CodexZstCause::CorrectionUnapplied);
+                *counts.entry(cause).or_default() += 1;
+                if let Some(w) = a.work.as_mut() {
+                    if w.alarmed != Some(cause) {
+                        w.alarmed = Some(cause);
+                        alarm += 1;
+                    }
+                }
             }
         }
-        for _ in self.decode_holds.archive_keys() {
-            archive_owed(CodexZstCause::OwnerUnproven, 1, true);
-        }
         if self.archive_pass.deferred > 0 {
-            archive_owed(
-                CodexZstCause::AdmissionRefused,
-                self.archive_pass.deferred,
-                true,
-            );
+            *counts.entry(CodexZstCause::AdmissionRefused).or_default() +=
+                self.archive_pass.deferred;
         }
+        if self.archive_pass.deferred != self.archive_pass.last_deferred {
+            alarm += self.archive_pass.deferred;
+        }
+        self.archive_pass.last_deferred = self.archive_pass.deferred;
+        for (cause, count) in counts {
+            crate::local_resource_diagnostics::codex_zst_held(cause, count);
+        }
+        archive_alarm(alarm);
     }
     pub(super) fn hold_archive_corrections(&mut self) {
+        let mut changed = 0;
         for a in self.archives.values_mut() {
             if matches!(
                 a.disposition,
                 ArchiveDisposition::Acquired | ArchiveDisposition::Empty
             ) {
                 a.hold(CodexZstCause::CorrectionUnapplied);
-                archive_owed(CodexZstCause::CorrectionUnapplied, 1, true);
+                changed += 1;
             }
         }
+        archive_alarm(changed);
     }
     /// Reuse the ordinary absence owner; uncertainty in any configured root
     /// or inventoried home prevents publishing a uniqueness-dependent body.
@@ -55,18 +83,10 @@ impl ScanIndex {
         &self,
         key: &str,
         i: &codex_file_join::HeaderInventory,
+        boundary: usize,
     ) -> Result<(), CodexZstCause> {
-        if !i.archive_complete
-            || !codex_counting_version::absence_coverage_complete(self, i)
-            || !i.content_unchanged()
-            || !i.archives_unchanged()
-        {
-            return Err(CodexZstCause::OwnerUnproven);
-        }
-        for h in i.headers.iter().chain(&i.archive_headers) {
-            i.directories
-                .validate(&h.home)
-                .map_err(|_| CodexZstCause::OwnerUnproven)?;
+        if !i.archive_scope_valid(self, boundary) {
+            return Err(CodexZstCause::AdmissionRefused);
         }
         let h = i
             .archive_headers
@@ -119,6 +139,7 @@ impl ScanIndex {
             return;
         }
         self.archive_pass.prepared = true;
+        self.archive_pass.started = true;
         for c in candidates.iter().filter(|c| codex_archive_path(&c.path)) {
             let key = local_index_key(&c.path);
             let Some(a) = self.archives.get(&key) else {
@@ -127,21 +148,20 @@ impl ScanIndex {
             if a.quiet_disposition() {
                 continue;
             }
-            if !budget.archive_ready(&self.archive_pass) || !inventory.archive_complete {
+            if !budget.archive_ready(&self.archive_pass) {
                 continue;
             }
             if !self.archive_parent_ready(&key, validated) {
                 self.archive_hold(&c.path, CodexZstCause::ParentLedgerUnbound);
                 continue;
             }
-            match self.archive_fence(&key, inventory) {
+            match self.archive_fence(&key, inventory, 0) {
                 Err(cause) => self.archive_hold(&c.path, cause),
                 Ok(()) => {
                     let a = self.archives.get_mut(&key).unwrap();
-                    // A structural failure after a spent Full has no new proof
-                    // on this stamp. Only pre-Full fence holds can release here.
-                    if matches!(a.disposition, ArchiveDisposition::Held { .. })
-                        && a.work.as_ref().is_some_and(|w| w.attempts > 0)
+                    if a.work
+                        .as_ref()
+                        .is_some_and(|w| w.decoded && sampled_scan::now_seconds() < w.retry_after)
                     {
                         continue;
                     }
@@ -181,7 +201,7 @@ impl ScanIndex {
         }
         if let Err(cause) = inventory
             .ok_or(CodexZstCause::OwnerUnproven)
-            .and_then(|i| self.archive_fence(&key, i))
+            .and_then(|i| self.archive_fence(&key, i, 1))
         {
             self.archive_hold(&c.path, cause);
             return Admission::Held;
@@ -196,18 +216,18 @@ impl ScanIndex {
         inventory: Option<&codex_file_join::HeaderInventory>,
     ) -> bool {
         let key = local_index_key(path);
+        if let Err(cause) = inventory
+            .ok_or(CodexZstCause::OwnerUnproven)
+            .and_then(|i| self.archive_fence(&key, i, 2))
+        {
+            self.archive_hold(path, cause);
+            return false;
+        }
         if !self
             .archives
             .get_mut(&key)
             .is_some_and(|a| a.finish(owner, parsed))
         {
-            return false;
-        }
-        if let Err(cause) = inventory
-            .ok_or(CodexZstCause::OwnerUnproven)
-            .and_then(|i| self.archive_fence(&key, i))
-        {
-            self.archive_hold(path, cause);
             return false;
         }
         true

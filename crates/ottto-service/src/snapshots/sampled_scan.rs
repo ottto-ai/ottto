@@ -2135,7 +2135,6 @@ pub(super) fn new_source_parser(
     let input = if source == SnapshotSource::Codex
         && is_compressed_codex_rollout(Some(&candidate.path), None)
     {
-        crate::context_composition::set_utility_qos();
         let key = local_index_key(&candidate.path);
         anyhow::ensure!(
             index.archives.get(&key).is_some_and(|a| a.ready_full()),
