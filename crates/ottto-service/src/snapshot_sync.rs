@@ -1813,6 +1813,20 @@ impl SnapshotUploadProgress {
             .active_quarantine_witness
             .as_ref()
             .expect("upload progress always has an active quarantine witness");
+        let mut version_only_kept = 0;
+        for record in self.quarantined_fingerprints.values_mut() {
+            if record.witness != *active && record.witness.same_retry_contract(active) {
+                record.witness = active.clone();
+                version_only_kept += 1;
+            }
+        }
+        if version_only_kept > 0 {
+            crate::local_resource_diagnostics::traversal_point(
+                "quarantine_retry",
+                "unknown",
+                &serde_json::json!({"action": "version_only_kept", "count": version_only_kept}),
+            );
+        }
         let mut candidates = self
             .quarantined_fingerprints
             .iter()
@@ -1826,7 +1840,7 @@ impl SnapshotUploadProgress {
                     })
                     && record.disposition == SnapshotQuarantineDisposition::RetryPending
                     && ((record.contract_retry_claims.is_none()
-                        && &record.witness != active
+                        && !record.witness.same_retry_contract(active)
                         && !crate::snapshots::quarantine_context_only_changed(
                             &record.witness,
                             active,
@@ -1835,7 +1849,7 @@ impl SnapshotUploadProgress {
             })
             .map(|(fingerprint, record)| {
                 (
-                    (&record.witness == active) as u8,
+                    record.witness.same_retry_contract(active) as u8,
                     record.retry_after_unix_seconds,
                     fingerprint.clone(),
                 )
@@ -1903,12 +1917,19 @@ impl SnapshotUploadProgress {
                 .quarantined_fingerprints
                 .get_mut(fingerprint)
                 .expect("selected quarantine retry exists");
-            crate::snapshots::terminal_contract_retry::claim(record);
-            record.witness = active.clone();
-            record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
+            if record.contract_retry_claims.is_some() {
+                crate::snapshots::terminal_contract_retry::claim(record);
+                record.witness = active.clone();
+                record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
+            }
+            // Ordinary selection is not a send: deferred admission or an empty
+            // scan must leave the original deadline owed, including on restart.
         }
         self.active_quarantine_retries = retry;
-        !self.active_quarantine_retries.is_empty() || reoffer_changed || contract_retry_changed
+        !self.active_quarantine_retries.is_empty()
+            || version_only_kept > 0
+            || reoffer_changed
+            || contract_retry_changed
     }
 
     /// Due, exactly bound refusal re-offers: fingerprint -> (deadline, body).
@@ -2026,7 +2047,12 @@ impl SnapshotUploadProgress {
                         .get(*fingerprint)
                         .is_some_and(|record| {
                             record.disposition == SnapshotQuarantineDisposition::RetryPending
-                                && self.active_quarantine_witness.as_ref() == Some(&record.witness)
+                                && self
+                                    .active_quarantine_witness
+                                    .as_ref()
+                                    .is_some_and(|active| {
+                                        record.witness.same_retry_contract(active)
+                                    })
                                 && record.upload_body_witness.as_deref()
                                     == Some(refusal.body_witness.as_str())
                         })
@@ -2353,7 +2379,7 @@ impl SnapshotUploadProgress {
                     || (record.upload_body_witness.is_none()
                         && record.contract_retry_claims.is_some())
             });
-        let existing = budget.filter(|record| record.witness == witness);
+        let existing = budget.filter(|record| record.witness.same_retry_contract(&witness));
         let contract_retry_claims = budget.and_then(|record| record.contract_retry_claims);
         let reconstruction_contract = budget.map_or(
             crate::snapshots::terminal_contract_retry::current_contract(),
@@ -6633,7 +6659,15 @@ fn prepare_sync_source_inner(
         // identical entities and gives overlapping writers a CAS boundary.
         upload_progress.save(&upload_progress_path)?;
     }
-    save_terminal_contract_claims_for_scan(&mut index, &upload_progress, &index_path)?;
+    let quarantine_retry_paths =
+        save_terminal_contract_claims_for_scan(&mut index, &upload_progress, &index_path)?;
+    if !quarantine_retry_paths.is_empty() {
+        crate::local_resource_diagnostics::traversal_point(
+            "quarantine_retry",
+            source.api_slug(),
+            &serde_json::json!({"action": "enqueued", "count": quarantine_retry_paths.len()}),
+        );
+    }
     let active_legacy_reconciliation = upload_progress
         .active_quarantine_retries
         .intersection(&legacy_reconciliation_pending)
@@ -6706,6 +6740,7 @@ fn prepare_sync_source_inner(
     let mut watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
     // Leased unchanged files join the same bounded, revalidated hint queue.
     watcher_hints.paths.extend(reoffer_paths);
+    watcher_hints.paths.extend(quarantine_retry_paths);
     if watcher_hints.overflowed {
         eprintln!(
             "local snapshot watcher hint queue overflowed for {}; durable traversal will reconcile",
@@ -8863,30 +8898,18 @@ fn finish_sync_source(
     Ok(())
 }
 
-/// The progress claim was saved by the caller. Mirror its maximum into the
-/// durable index before granting the source selector a runtime lease.
+/// Contract-origin progress claims were saved by the caller. Mirror those
+/// claims before source acquisition, then bind every selected retry to one file.
+/// Ordinary retries retain their deadlines until an upload actually attempts them.
 fn save_terminal_contract_claims_for_scan(
     index: &mut ScanIndex,
     progress: &SnapshotUploadProgress,
     index_path: &Path,
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     if index.merge_terminal_contract_claims(&progress.quarantined_fingerprints) {
         index.save(index_path)?;
     }
-    index.activate_terminal_contract_retries(
-        progress
-            .active_quarantine_retries
-            .iter()
-            .filter(|fp| {
-                progress
-                    .quarantined_fingerprints
-                    .get(*fp)
-                    .is_some_and(|record| record.contract_retry_claims.is_some())
-            })
-            .cloned()
-            .collect(),
-    );
-    Ok(())
+    Ok(index.activate_terminal_contract_retries(progress.active_quarantine_retries.clone()))
 }
 
 /// Prepare the disposable upload ledger against the durable scan-index replay.
@@ -10580,7 +10603,41 @@ where
     if replaced_retained_proof {
         persist(progress)?;
     }
-    let response = upload(batch)?;
+    let response = upload(batch);
+    // The callback includes local preflight and authority checks. Only a reply
+    // or a typed remote failure proves this ordinary retry reached a send.
+    if response.is_ok()
+        || response.as_ref().is_err_and(|error| {
+            error.downcast_ref::<BatchRejected>().is_some()
+                || error.downcast_ref::<BatchAuthorizationRejected>().is_some()
+                || error
+                    .downcast_ref::<UploadFailureDiagnostics>()
+                    .is_some_and(UploadFailureDiagnostics::is_snapshot_batch)
+                || error.downcast_ref::<UploadShed>().is_some()
+                || error.downcast_ref::<SnapshotAckRejected>().is_some()
+        })
+    {
+        let mut retry_attempted = false;
+        for index in indices {
+            let fp = fingerprint(&items[*index]);
+            if progress.active_quarantine_retries.contains(fp) {
+                if let Some(record) = progress.quarantined_fingerprints.get_mut(fp) {
+                    if record.contract_retry_claims.is_none() {
+                        record.witness = progress
+                            .active_quarantine_witness
+                            .clone()
+                            .expect("upload progress always has an active quarantine witness");
+                        record.retry_after_unix_seconds = quarantine_retry_after(fp);
+                        retry_attempted = true;
+                    }
+                }
+            }
+        }
+        if retry_attempted {
+            persist(progress)?;
+        }
+    }
+    let response = response?;
     if response.disabled {
         return Ok(SnapshotPageOutcome::Disabled(response.disabled_reason));
     }
@@ -17735,8 +17792,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// [regress] M4 0.1.206 moved 9/9 unchanged-body deadlines by 21,444s.
     #[test]
-    fn snapshot_upload_progress_retries_same_fingerprint_after_contract_upgrade() {
+    fn version_only_quarantine_witness_change_keeps_retry_after() {
         let root = test_dir("snapshot-upload-progress-quarantine-upgrade");
         let path = root.join("progress-v2.json");
         let namespace = format!("{:064x}", 45);
@@ -17744,19 +17802,41 @@ mod tests {
         let old_witness = test_quarantine_witness();
         let mut progress = SnapshotUploadProgress::new(namespace.clone(), old_witness);
         progress.quarantine([fingerprint.as_str()]);
+        let original = progress.quarantined_fingerprints[&fingerprint].clone();
         progress.save(&path).expect("persist quarantine");
 
-        let mut repaired_witness = test_quarantine_witness();
-        repaired_witness.collector_version.push_str("-repair");
-        let mut repaired = SnapshotUploadProgress::load(&path, &namespace, repaired_witness)
-            .expect("load after repair");
+        let mut upgraded = test_quarantine_witness();
+        upgraded.collector_version.push_str("-upgrade");
+        upgraded.parser_version.push_str("-upgrade");
+        let mut repaired = SnapshotUploadProgress::load(&path, &namespace, upgraded.clone())
+            .expect("load after version-only upgrade");
+        repaired.prepare_quarantine_retries(&BTreeMap::new());
+        assert!(repaired.contains(&fingerprint));
+        assert!(repaired.active_quarantine_retries.is_empty());
+        let retained = &repaired.quarantined_fingerprints[&fingerprint];
+        assert_eq!(
+            retained.retry_after_unix_seconds,
+            original.retry_after_unix_seconds
+        );
+        assert_eq!(retained.upload_body_witness, original.upload_body_witness);
+        assert_eq!(
+            retained.failed_reconstruction_count,
+            original.failed_reconstruction_count
+        );
+        repaired.save(&path).unwrap();
+        repaired = SnapshotUploadProgress::load(&path, &namespace, upgraded.clone()).unwrap();
+        assert!(!repaired.prepare_quarantine_retries(&BTreeMap::new()));
+        assert_eq!(
+            repaired.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds,
+            original.retry_after_unix_seconds
+        );
+
+        // A real contract correction retains the existing immediate retry.
+        upgraded.contract.push_str("-repair");
+        repaired = SnapshotUploadProgress::load(&path, &namespace, upgraded).unwrap();
         repaired.prepare_quarantine_retries(&BTreeMap::new());
         assert!(!repaired.contains(&fingerprint));
         assert!(repaired.active_quarantine_retries.contains(&fingerprint));
-        assert!(repaired
-            .quarantined_fingerprints
-            .get(&fingerprint)
-            .is_some_and(|record| record.retry_after_unix_seconds > current_unix_seconds()));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -17806,13 +17886,14 @@ mod tests {
         assert_eq!(accepted, 1);
     }
 
-    /// Regression for the live 0.1.121 strand: the quarantine deadline became
+    /// [regress] M4 q8: four due quarantines had already left census pending.
+    /// Also retains the live 0.1.121 strand: the quarantine deadline became
     /// due after a settled sibling had already advanced the shared backend
     /// head, but an independently backed-off terminal-unhealthy traversal
     /// yielded no upload item. A vacuous completed upload must not let the
     /// disposable ledger erase the index-owned retry obligation.
     #[test]
-    fn due_quarantine_empty_scan_rearms_instead_of_clearing_the_obligation() {
+    fn due_not_pending_quarantine_is_resent_once_without_burning_an_unsent_deadline() {
         let root = test_dir("due-quarantine-terminal-unhealthy-empty-scan");
         let session_path = root.join("session.jsonl");
         std::fs::create_dir_all(&root).expect("create retry fixture root");
@@ -17897,9 +17978,9 @@ mod tests {
             .quarantined_snapshot_fingerprints
             .get(&fingerprint)
             .expect("an empty scan must leave the retry armed");
-        assert!(
-            retained.retry_after_unix_seconds > current_unix_seconds(),
-            "the fired deadline must be replaced by a future deadline"
+        assert_eq!(
+            retained.retry_after_unix_seconds, 0,
+            "claiming a retry without a send must keep its original due deadline"
         );
         assert!(
             index
@@ -17907,6 +17988,84 @@ mod tests {
                 .is_empty(),
             "the current-schema manifest revision stays armed rather than becoming unproven"
         );
+        // Resume the retained traversal with this file already observed and
+        // absent from its candidate queue, just like the four M4 quarantines.
+        let mut state = serde_json::to_value(&index).unwrap();
+        state["traversal"]["scan_roots"] = serde_json::json!([root]);
+        state["traversal"]["observed_index_keys"] = serde_json::json!([session_path]);
+        assert_eq!(
+            state["traversal"]["pending_candidates"],
+            serde_json::json!([])
+        );
+        index = serde_json::from_value(state).unwrap();
+        let index_path = root.join("index.json");
+        let progress_path = root.join("progress.json");
+        index.save(&index_path).unwrap();
+        progress.save(&progress_path).unwrap();
+        progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &progress.destination_namespace_hash,
+            snapshot_quarantine_witness(SnapshotSource::Pi),
+        )
+        .unwrap();
+        assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+        let hints =
+            save_terminal_contract_claims_for_scan(&mut index, &progress, &index_path).unwrap();
+        assert_eq!(hints, vec![session_path.clone()]);
+        let (mut retry, reads) =
+            crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+                crate::snapshots::scan_source_roots_with_test_limit_and_hints(
+                    SnapshotSource::Pi,
+                    std::slice::from_ref(&root),
+                    &mut index,
+                    collected_at,
+                    crate::snapshots::BACKFILL_WINDOW_DAYS,
+                    1,
+                    true,
+                    &hints,
+                )
+                .unwrap()
+            });
+        crate::snapshots::finalize_scan_after_policy(SnapshotSource::Pi, &mut retry, &mut index);
+        assert_eq!(reads.values().sum::<usize>(), 1);
+        assert_eq!(retry.snapshots.len(), 1);
+        assert_eq!(retry.snapshots[0].snapshot_fingerprint, fingerprint);
+        upload_resumable_batches(
+            &retry.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            |batch| {
+                upload_calls += 1;
+                assert_eq!(batch.len(), 1);
+                Ok(accepted_batch(1))
+            },
+            |state| state.save(&progress_path),
+        )
+        .unwrap();
+        index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        assert!(!progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+        let hints =
+            save_terminal_contract_claims_for_scan(&mut index, &progress, &index_path).unwrap();
+        assert!(hints.is_empty());
+        let (quiet, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+            crate::snapshots::scan_source_roots_with_test_limit_and_hints(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &mut index,
+                collected_at,
+                crate::snapshots::BACKFILL_WINDOW_DAYS,
+                1,
+                true,
+                &hints,
+            )
+            .unwrap()
+        });
+        assert!(reads.is_empty());
+        assert!(quiet.snapshots.is_empty());
+        assert_eq!((upload_calls, accepted), (1, 1));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -18182,15 +18341,9 @@ mod tests {
         progress =
             SnapshotUploadProgress::load(&path, &namespace, test_quarantine_witness()).unwrap();
         assert!(
-            !progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints),
-            "restart honors the durable lease deadline"
+            progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints),
+            "restart keeps the unsent admission re-offer due"
         );
-        progress
-            .quarantined_fingerprints
-            .get_mut(&fingerprint)
-            .unwrap()
-            .retry_after_unix_seconds = 0;
-        assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
         let mut accepted = 0;
         let mut sent = Vec::new();
         upload_resumable_batches(

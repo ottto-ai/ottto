@@ -559,6 +559,11 @@ impl UploadFailureDiagnostics {
         self.status_family
     }
 
+    /// Distinguish a page send failure from an earlier relay-token failure.
+    pub(crate) fn is_snapshot_batch(&self) -> bool {
+        self.endpoint == "snapshot_batch"
+    }
+
     /// Whether a snapshot page exceeded the client or gateway read deadline.
     ///
     /// Keep this endpoint-scoped: a relay-token timeout happened before the

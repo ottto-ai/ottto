@@ -3903,7 +3903,8 @@ pub struct ScanIndex {
     /// scheduling permission only, never acceptance evidence.
     #[serde(skip)]
     reason_reoffer_retries: BTreeMap<String, String>,
-    /// Runtime leases backed by claims saved in both checkpoints before scanning.
+    /// Runtime file owners for this cycle's quarantine retries. Contract-origin
+    /// leases additionally have claims saved in both checkpoints before scanning.
     #[serde(skip)]
     terminal_contract_retries: BTreeMap<String, String>,
     /// Runtime-only: this index's path was loaded in this process with no
@@ -4353,6 +4354,17 @@ pub struct SnapshotQuarantineWitness {
     pub item_wire_byte_limit: usize,
 }
 
+impl SnapshotQuarantineWitness {
+    /// Build/parser labels alone neither correct a body nor change its retry contract.
+    pub(crate) fn same_retry_contract(&self, other: &Self) -> bool {
+        self.contract == other.contract
+            && self.scan_identity_version == other.scan_identity_version
+            && self.snapshot_schema_version == other.snapshot_schema_version
+            && self.entity_ack_contract == other.entity_ack_contract
+            && self.item_wire_byte_limit == other.item_wire_byte_limit
+    }
+}
+
 const fn legacy_snapshot_item_wire_byte_limit() -> usize {
     128 * 1024
 }
@@ -4437,7 +4449,7 @@ pub(crate) fn quarantine_context_only_changed(
     }
     let mut normalized = previous.clone();
     normalized.contract.clone_from(&active.contract);
-    normalized == *active
+    normalized.same_retry_contract(active)
 }
 
 pub fn snapshot_quarantine_record(source: SnapshotSource) -> SnapshotQuarantineRecord {
@@ -48525,7 +48537,9 @@ impl ScanIndex {
                     return self.terminal_contract_retries.contains_key(fingerprint);
                 }
                 persisted.disposition == SnapshotQuarantineDisposition::RetryPending
-                    && (&persisted.witness != active || persisted.retry_after_unix_seconds <= now)
+                    && (self.terminal_contract_retries.contains_key(fingerprint)
+                        || !persisted.witness.same_retry_contract(active)
+                        || persisted.retry_after_unix_seconds <= now)
             })
     }
 
@@ -48538,7 +48552,10 @@ impl ScanIndex {
         terminal_contract_retry::merge_maps(&mut self.quarantined_snapshot_fingerprints, records)
     }
 
-    pub(crate) fn activate_terminal_contract_retries(&mut self, leases: BTreeSet<String>) {
+    pub(crate) fn activate_terminal_contract_retries(
+        &mut self,
+        leases: BTreeSet<String>,
+    ) -> Vec<PathBuf> {
         self.terminal_contract_retries.clear();
         // A fingerprint can have more than one indexed incidence. One claim
         // selects one owning file, never every duplicate incidence.
@@ -48549,6 +48566,14 @@ impl ScanIndex {
                     .or_insert_with(|| key.clone());
             }
         }
+        // Use the same revalidated candidate admission as exact refusal re-offers.
+        // Distinct entities in one file and duplicate incidences own one hint.
+        self.terminal_contract_retries
+            .values()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()
     }
 
     /// Arm this cycle's exact refusal re-offer leases and return the indexed
@@ -48611,7 +48636,10 @@ impl ScanIndex {
                 .is_some_and(|(body_witness, record)| {
                     record.disposition == SnapshotQuarantineDisposition::RetryPending
                         && record.upload_body_witness.as_deref() == Some(body_witness.as_str())
-                        && self.active_quarantine_witness.as_ref() == Some(&record.witness)
+                        && self
+                            .active_quarantine_witness
+                            .as_ref()
+                            .is_some_and(|active| record.witness.same_retry_contract(active))
                 })
     }
 
@@ -51767,10 +51795,9 @@ impl ScanIndex {
                                 self.quarantined_snapshot_fingerprints
                                     .get(fingerprint)
                                     .is_some_and(|record| {
-                                        self.active_quarantine_witness.as_ref()
-                                            == Some(&record.witness)
-                                            && !self
-                                                .quarantine_retry_selects_file(fingerprint, &key)
+                                        self.active_quarantine_witness.as_ref().is_some_and(
+                                            |active| record.witness.same_retry_contract(active),
+                                        ) && !self.quarantine_retry_selects_file(fingerprint, &key)
                                     })
                             })
                     });
