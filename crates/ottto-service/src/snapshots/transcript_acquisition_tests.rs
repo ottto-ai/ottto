@@ -5750,7 +5750,7 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
             "held-index.json"
         });
         index.save(&path).unwrap();
-        let index = ScanIndex::load(&path).unwrap();
+        let mut index = ScanIndex::load(&path).unwrap();
         let queued = index
             .traversal
             .as_ref()
@@ -5765,7 +5765,7 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
             &mut ScanCensus::default(),
             None,
             183,
-            discovery_retention!(index),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
         )
         .unwrap();
         let retry_dependencies = sampled_scan::reduction_dependencies(

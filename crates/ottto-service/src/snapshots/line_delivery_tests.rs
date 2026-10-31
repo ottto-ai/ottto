@@ -1146,6 +1146,23 @@ pub(in crate::snapshots) fn walk_all(index: &mut ScanIndex, days: u64) {
     }
 }
 
+/// Start and finish the next real bounded walk; elapsed probe time alone is not coverage.
+pub(in crate::snapshots) fn next_walk(index: &mut ScanIndex, days: u64) {
+    let previous = index.traversal.take().expect("first walk");
+    let at = (OffsetDateTime::parse(&previous.census_window_end, &Rfc3339).unwrap()
+        + time::Duration::seconds(1))
+    .format(&Rfc3339)
+    .unwrap();
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &previous.scan_roots,
+        index,
+        &at,
+        days,
+    );
+    walk_all(index, days);
+}
+
 /// [behaviour] Gate 1 with a 7-day request: an aged withheld key is still discovered and
 /// observed, an oversized one is observed, kept unread and counted, and once
 /// the holds resolve the ordinary window and size skips apply again.
@@ -1241,12 +1258,13 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
             &mut census,
             census_at,
             7,
-            crate::snapshots::DiscoveryRetention {
-                files: &BTreeMap::new(),
-                account_holds: holds,
-                memo: None,
-                growth: None,
-            },
+            &mut crate::snapshots::CandidateDiscovery::new(
+                &mut ScanIndex {
+                    claude_account_deferred_holds: holds.clone(),
+                    ..ScanIndex::default()
+                },
+                None,
+            ),
         )
         .map(|candidate| {
             open_and_identify_scan_candidate(
@@ -1387,7 +1405,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                 &mut census,
                 rfc3339_unix_seconds(NOW),
                 7,
-                discovery_retention!(index),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
             );
             assert_eq!(candidate.is_some(), retained, "candidate {name}");
             assert_eq!(
@@ -1409,7 +1427,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                 &mut ScanCensus::default(),
                 None,
                 7,
-                discovery_retention!(index),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
             )
             .unwrap();
             assert_eq!(
@@ -1798,7 +1816,25 @@ fn absent_account_hold_retires_without_money_or_completion_credit() {
     let mut releases = Vec::new();
     for (now, held) in [(1_000, 1), (1_599, 1), (1_600, 0), (2_200, 0)] {
         sampled_scan::set_test_now(Some(now));
-        let ((next, scan, _), rows) = capture(|| finish(new_scan(&root.projects(), index)));
+        let at = (OffsetDateTime::parse(NOW, &Rfc3339).unwrap()
+            + time::Duration::seconds(now as i64))
+        .format(&Rfc3339)
+        .unwrap();
+        let ((next, scan, _), rows) = capture(|| {
+            finish(OwnedSourceScan::new(
+                SnapshotSource::ClaudeCode,
+                &[root.projects()],
+                index,
+                &at,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            ))
+        });
         releases.extend(
             rows.into_iter()
                 .filter_map(|row| row["counts"]["withheld_hold_released"].as_object().cloned()),
@@ -1869,6 +1905,7 @@ fn reconciliation_keeps_present_withheld_keys_and_retires_absent_ones() {
     sampled_scan::set_test_now(Some(1_000));
     index.probe_absent_claude_account_deferred_holds();
     assert_eq!(index.claude_account_deferred_hold_count(), 2);
+    next_walk(&mut index, 7);
     sampled_scan::set_test_now(Some(1_599));
     index.probe_absent_claude_account_deferred_holds();
     assert_eq!(index.claude_account_deferred_hold_count(), 2);
@@ -2044,7 +2081,9 @@ fn withheld_account_growth_is_read_after_idling_past_the_window() {
 #[cfg(unix)]
 fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() {
     use sampled_scan::transition_fixture::{money_oracle, scan_money, Accepted};
-    for known_generation in [true, false] {
+    for (known_generation, hint_only) in
+        [(true, false), (false, false), (true, true), (false, true)]
+    {
         let root = Root::new("ld-held-rename-money");
         let original = root
             .projects()
@@ -2138,16 +2177,121 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
             held.claude_money_birth_store
                 .record_observation(SESSION, &old_key, i128::from(birth));
         }
+        let aged = now + time::Duration::days(731); // beyond min(requested=1000, 730 days)
+        let at = aged.format(&Rfc3339).unwrap();
+        sampled_scan::set_test_now(Some(aged.unix_timestamp() as u64));
+        if hint_only {
+            // Walk A before the rename, then leave its candidate backlog open.
+            // D can arrive only by hint in this generation, even after 600 s.
+            held.traversal = None;
+            ensure_bounded_traversal(source, &[root.projects()], &mut held, &at, 1_000);
+            walk_all(&mut held, 1_000);
+            assert!(held
+                .traversal
+                .as_ref()
+                .unwrap()
+                .observed_index_keys
+                .contains(&old_key));
+        }
+        let old_location = claude_money_birth_store::location_key(&old_key);
+        let new_location = claude_money_birth_store::location_key(&new_key);
+        let holder = claude_money_birth_store::location_key("synthetic-holder");
+        held.claude_copy_removals.store(
+            old_location,
+            BTreeMap::from([(holder, BTreeSet::from([7]))]),
+        );
+        assert!(held.claude_copy_removals.advance_hold(old_location));
+        held.claude_money_birth_store.set_money_marks(&old_key, 1);
+        crate::local_resource_diagnostics::withheld_support::take_withheld();
         fs::rename(&original, &moved).unwrap();
         assert_eq!(fs::metadata(&moved).unwrap().modified().unwrap(), modified);
         let checkpoint = root.0.join("held-rename-index.json");
         held.save(&checkpoint).unwrap();
         held = ScanIndex::load(&checkpoint).unwrap();
-        let aged = now + time::Duration::days(731); // beyond min(requested=1000, 730 days)
-        let at = aged.format(&Rfc3339).unwrap();
-        sampled_scan::set_test_now(Some(aged.unix_timestamp() as u64));
-        let scan = make(held.clone(), &at, 1_000);
+        let mut active = held.clone();
+        if hint_only {
+            withheld_account::support::clock(&active.withheld_memo);
+            for offset in [0, 600, 1_200] {
+                sampled_scan::set_test_now(Some(aged.unix_timestamp() as u64 + offset));
+                active.probe_absent_claude_account_deferred_holds();
+                assert!(
+                    active.claude_account_deferred_holds.contains_key(&old_key),
+                    "a resumed walk that predates NotFound cannot release custody"
+                );
+                assert!(active.files.contains_key(&old_key));
+            }
+            enqueue_watcher_hints(
+                source,
+                active.traversal.as_mut().unwrap(),
+                std::slice::from_ref(&moved),
+                false,
+            );
+            let hinted = active
+                .traversal
+                .as_mut()
+                .unwrap()
+                .pending_candidates
+                .iter()
+                .position(|p| p.path == moved)
+                .expect("destination hint");
+            let pending = active
+                .traversal
+                .as_mut()
+                .unwrap()
+                .pending_candidates
+                .remove(hinted)
+                .unwrap();
+            let candidate = candidate_from_traversal_path(
+                source,
+                pending,
+                &mut ScanCensus::default(),
+                rfc3339_unix_seconds(&at),
+                1_000,
+                &mut CandidateDiscovery::new(&mut active, None),
+            );
+            assert!(
+                candidate.is_none(),
+                "old observed path keeps ambiguous custody until a later walk"
+            );
+            assert!(
+                active
+                    .traversal
+                    .as_ref()
+                    .unwrap()
+                    .observed_index_keys
+                    .contains(&new_key),
+                "candidate metadata must record same-member presence before age refusal"
+            );
+            active.probe_absent_claude_account_deferred_holds();
+            assert!(active.claude_account_deferred_holds.contains_key(&old_key));
+            next_walk(&mut active, 1_000);
+        }
+        let scan = make(active, &at, 1_000);
+        assert!(
+            crate::local_resource_diagnostics::withheld_support::take_withheld()[0].is_empty(),
+            "custody transfer/uncertainty grants neither ReleasedDeleted nor ReleasedResolved"
+        );
         if known_generation {
+            assert!(scan.index.claude_copy_removals.get(old_location).is_empty());
+            assert_eq!(
+                scan.index.claude_copy_removals.get(new_location)[0]
+                    .1
+                    .as_ref(),
+                &[7]
+            );
+            assert!(scan.index.claude_copy_removals.pending(new_location));
+            assert_eq!(
+                scan.index
+                    .claude_money_birth_store
+                    .money_marks(old_location),
+                0
+            );
+            assert_eq!(
+                scan.index
+                    .claude_money_birth_store
+                    .money_marks(new_location),
+                1
+            );
             assert!(scan
                 .index
                 .claude_account_deferred_holds
@@ -3191,7 +3335,7 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
         let path = root.file(SESSION);
         let key = local_index_key(&path);
         let cache = Arc::new(sampled_scan::SharedCache::default());
-        let page = |index: ScanIndex, hints: &[PathBuf]| {
+        let page = |index: ScanIndex, hints: &[PathBuf], at: &str| {
             let recorder = Recorder::default();
             let ((index, scan, _), counts) = capture(|| {
                 finish(
@@ -3199,7 +3343,7 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
                         SnapshotSource::ClaudeCode,
                         &[root.projects()],
                         index,
-                        &days_from_now(0),
+                        at,
                         7,
                         10,
                         false,
@@ -3218,9 +3362,9 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
             (index, scan, recorder, page_counts(&counts))
         };
         append(&path, &assistant_line("u1"));
-        let (previous, _, _, _) = page(ScanIndex::default(), &[]);
+        let (previous, _, _, _) = page(ScanIndex::default(), &[], &days_from_now(0));
         append(&path, &assistant_line("u2"));
-        let (mut parsed, scan, recorder, _) = page(previous.clone(), &[]);
+        let (mut parsed, scan, recorder, _) = page(previous.clone(), &[], &days_from_now(0));
         let modes: Vec<_> = recorder
             .events()
             .into_iter()
@@ -3271,14 +3415,14 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
             Vec::new()
         };
         sampled_scan::set_test_now(Some(1_000));
-        let (first, scan, recorder, _) = page(held, &hints);
+        let (first, scan, recorder, _) = page(held, &hints, &days_from_now(0));
         assert!(first.claude_account_deferred_holds.contains_key(&key));
         assert!(first.files[&key].has_unverified_source());
         assert!(recorder.events().is_empty());
         assert_eq!(scan.scanned_file_count, 0);
         sampled_scan::set_test_now(Some(1_600));
         let deletion_baseline = first.clone();
-        let (removed, scan, recorder, counts) = page(first, &hints);
+        let (removed, scan, recorder, counts) = page(first, &hints, &days_from_now(1));
         sampled_scan::set_test_now(None);
         let removed = crate::snapshot_sync::withheld_support::settle_withheld(
             &deletion_baseline,
@@ -3323,7 +3467,7 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
             "no gauge membership remains"
         );
         append(&path, &assistant_line("new-object"));
-        let (_, scan, recorder, _) = page(removed, &[]);
+        let (_, scan, recorder, _) = page(removed, &[], &days_from_now(1));
         assert_eq!(scan.scanned_file_count, 1, "recreation is A1 FirstRead");
         assert!(recorder
             .events()
@@ -3436,7 +3580,7 @@ fn withheld_removed_project_releases_account_and_audit_debt() {
                     SnapshotSource::ClaudeCode,
                     &[root.projects()],
                     held,
-                    NOW,
+                    "2026-10-07T12:10:00Z",
                     BACKFILL_WINDOW_DAYS,
                     10,
                     false,
@@ -3655,8 +3799,20 @@ fn withheld_new_completed_checkpoint_requires_positive_absence() {
         let recorder = Recorder::default();
         let ((after, _, _), counts) = capture(|| {
             finish(
-                new_scan(&root.projects(), held)
-                    .with_line_observer("test", Box::new(recorder.clone())),
+                OwnedSourceScan::new(
+                    SnapshotSource::ClaudeCode,
+                    &[root.projects()],
+                    held,
+                    "2026-10-07T12:10:00Z",
+                    BACKFILL_WINDOW_DAYS,
+                    10,
+                    false,
+                    None,
+                    &[],
+                    false,
+                    true,
+                )
+                .with_line_observer("test", Box::new(recorder.clone())),
             )
         });
         sampled_scan::set_test_now(None);

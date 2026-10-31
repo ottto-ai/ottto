@@ -320,7 +320,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         &mut ScanCensus::default(),
         None,
         7,
-        discovery_retention!(index),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
     )
     .unwrap();
     prepare_owned_scan_candidate(

@@ -236,9 +236,11 @@ pub(crate) enum UnselectedReason {
     Size,
     /// The subset of size skips whose key holds a withheld-account revision.
     WithheldOversized,
+    /// F4 kept custody because another same-member path prevents absence proof.
+    WithheldAbsenceAmbiguous = 18,
 }
 /// Three reasons, seven withheld events, growth, deleted tokens and audit retirement.
-const UNSELECTED_REASONS: usize = 18;
+const UNSELECTED_REASONS: usize = 19;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -675,7 +677,12 @@ impl Probe {
                 .map(|(observer, counts)| BTreeMap::from([(observer, counts)])),
             line_delivery_unselected: drain(
                 source,
-                &[("age", 0), ("size", 1), ("withheld_oversized", 2)],
+                &[
+                    ("age", 0),
+                    ("size", 1),
+                    ("withheld_oversized", 2),
+                    ("withheld_absence_ambiguous", 18),
+                ],
             ),
             audit_retired_absent: drain(source, &[("events", 12)]),
             discovery_retained: drain(source, &[("grown", 10)]),

@@ -27236,6 +27236,8 @@ impl OwnedSourceScan {
             } else {
                 BTreeMap::new()
             };
+        let mut candidate_discovery =
+            CandidateDiscovery::new(index, Some(&resource_probe.discovery_growth));
         let mut files = pending_paths
             .into_iter()
             .filter_map(|pending| {
@@ -27245,7 +27247,7 @@ impl OwnedSourceScan {
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
-                    discovery_retention!(index, &resource_probe.discovery_growth),
+                    &mut candidate_discovery,
                 )
             })
             .collect::<Vec<_>>();
@@ -27441,7 +27443,13 @@ impl OwnedSourceScan {
                 .claude_stale_family_carry
                 .replay
                 .retain(|pending| !missing_family_paths.contains(&pending.path));
+            let move_sources = index.held_move_sources();
             for path in missing_family_paths {
+                let mut candidate_discovery = CandidateDiscovery {
+                    index,
+                    sources: std::borrow::Cow::Borrowed(&move_sources),
+                    growth: Some(&resource_probe.discovery_growth),
+                };
                 let Some(scan_root) = scan_roots
                     .iter()
                     .filter(|root| path.starts_with(root))
@@ -27462,7 +27470,7 @@ impl OwnedSourceScan {
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
-                    discovery_retention!(index, &resource_probe.discovery_growth),
+                    &mut candidate_discovery,
                 ) else {
                     continue;
                 };
@@ -44035,13 +44043,31 @@ fn claude_absence_is_removal(source: SnapshotSource, path: &Path) -> Parent {
     }
 }
 
+/// Mutable candidate-boundary owner plus the same bounded member view used by
+/// discovery. Built once per selection batch; no filesystem work or move authority.
+struct CandidateDiscovery<'a> {
+    index: &'a mut ScanIndex,
+    sources: std::borrow::Cow<'a, BTreeMap<String, Option<String>>>,
+    growth: Option<&'a discovery_growth::Page>,
+}
+impl<'a> CandidateDiscovery<'a> {
+    fn new(index: &'a mut ScanIndex, growth: Option<&'a discovery_growth::Page>) -> Self {
+        let sources = index.held_move_sources();
+        Self {
+            index,
+            sources: std::borrow::Cow::Owned(sources),
+            growth,
+        }
+    }
+}
+
 fn candidate_from_traversal_path(
     source: SnapshotSource,
     pending: ScanTraversalPath,
     census: &mut ScanCensus,
     census_unix_seconds: Option<u64>,
     backfill_window_days: u64,
-    retention: DiscoveryRetention<'_>,
+    discovery: &mut CandidateDiscovery<'_>,
 ) -> Option<CandidateFile> {
     candidate_from_traversal_path_at(
         source,
@@ -44050,7 +44076,7 @@ fn candidate_from_traversal_path(
         census,
         census_unix_seconds,
         backfill_window_days,
-        retention,
+        discovery,
     )
 }
 
@@ -44061,7 +44087,7 @@ fn candidate_from_traversal_path_at(
     census: &mut ScanCensus,
     census_unix_seconds: Option<u64>,
     backfill_window_days: u64,
-    retention: DiscoveryRetention<'_>,
+    discovery: &mut CandidateDiscovery<'_>,
 ) -> Option<CandidateFile> {
     let metadata = match fs::symlink_metadata(&pending.path) {
         Ok(metadata) => metadata,
@@ -44105,6 +44131,21 @@ fn candidate_from_traversal_path_at(
         }
         return None;
     }
+    if source == SnapshotSource::ClaudeCode {
+        if let Some(mut walk) = discovery.index.traversal.take() {
+            discovery.index.rehome_discovered_account_hold(
+                &mut walk,
+                &discovery.sources,
+                &pending.path,
+                &metadata,
+            );
+            discovery.index.traversal = Some(walk);
+        }
+    }
+    let retention = DiscoveryRetention {
+        growth: discovery.growth,
+        ..discovery_retention!(discovery.index)
+    };
     retention.observe_stamped_growth(
         &pending.path,
         metadata.len(),
@@ -49960,7 +50001,7 @@ impl ScanIndex {
         path: &Path,
         metadata: &fs::Metadata,
     ) {
-        if sources.is_empty() {
+        if sources.is_empty() || !walk.scan_roots.iter().any(|root| path.starts_with(root)) {
             return;
         }
         let Some((_, member)) = claude_index_path_family_member(path) else {
@@ -49993,8 +50034,15 @@ impl ScanIndex {
             self.files.contains_key(&key) && !self.claude_account_deferred_holds.contains_key(&key);
         self.rekey_account_custody(old, &key);
         // Custody is at the destination BEFORE the owner retires the source generation.
-        self.claude_money_birth_store
-            .record_discovered_move(&member, old, &key, opened);
+        if !self
+            .claude_money_birth_store
+            .record_discovered_move(&member, old, &key, opened)
+        {
+            // Roll custody back on an unexpected owner refusal. Existing
+            // admitted proof/marks stay retained, and no source hold releases.
+            self.rekey_account_custody(&key, old);
+            return;
+        }
         if needs_classification {
             // An already-bound destination needs one real classification of the
             // transferred debt; discovery itself cannot resolve it from an ACK.
@@ -50007,6 +50055,13 @@ impl ScanIndex {
 
     /// Move, never settle, existing custody. No transcript read or release/ACK credit.
     fn rekey_account_custody(&mut self, from: &str, to: &str) {
+        let from_location = claude_money_birth_store::location_key(from);
+        let to_location = claude_money_birth_store::location_key(to);
+        self.claude_copy_removals.rekey(from_location, to_location);
+        let marks = self.claude_money_birth_store.money_marks(from_location)
+            | self.claude_money_birth_store.money_marks(to_location);
+        self.claude_money_birth_store.set_money_marks(to, marks);
+        self.claude_money_birth_store.set_money_marks(from, 0);
         let indexed = self.files.contains_key(to);
         if let Some(entry) = self.files.remove(from) {
             if let Some(current) = self.files.get_mut(to) {
@@ -51186,24 +51241,44 @@ impl ScanIndex {
             self.withheld_memo.reset_absence(key);
             return false;
         }
-        if self.traversal.as_ref().is_some_and(|walk| {
-            !walk.pending_directories.is_empty()
-                || walk.counts.directory_entry_cap_exceeded_count != 0
-                || claude_index_path_family_member(Path::new(key)).is_some_and(|(_, member)| {
-                    members
-                        .paths
-                        .get(&member)
-                        .is_some_and(|paths| paths.iter().any(|other| other != key))
-                })
-        }) {
+        let Some(walk) = self.traversal.as_ref() else {
+            self.withheld_memo.reset_absence(key);
+            return false;
+        };
+        let ambiguous =
+            claude_index_path_family_member(Path::new(key)).is_some_and(|(_, member)| {
+                members
+                    .paths
+                    .get(&member)
+                    .is_some_and(|paths| paths.iter().any(|other| other != key))
+            });
+        if ambiguous
+            || walk.counts.directory_entry_cap_exceeded_count != 0
+            || walk.counts.unreadable_path_count != 0
+        {
+            if ambiguous {
+                line_delivery_unselected("claude_code", UnselectedReason::WithheldAbsenceAmbiguous);
+            }
             self.withheld_memo.reset_absence(key);
             return false;
         }
+        // Keep the first NotFound across an unfinished later walk, but never
+        // retire before that walk completes. No added walk or metadata read.
+        if !walk.pending_directories.is_empty() {
+            return false;
+        }
+        let Some(walk_window) = rfc3339_unix_seconds(&walk.census_window_end) else {
+            self.withheld_memo.reset_absence(key);
+            return false;
+        };
         let parent = self
             .traversal
             .as_ref()
             .and_then(|walk| sampled_audit::absence_parent(Path::new(key), &walk.scan_roots));
-        if !self.withheld_memo.absence_eligible(key, parent) {
+        if !self
+            .withheld_memo
+            .absence_eligible(key, parent, walk_window)
+        {
             return false;
         }
         let census_record = self.claude_request_census.get(key).is_some();
@@ -56472,7 +56547,7 @@ mod tests {
             &mut census,
             census_at,
             BACKFILL_WINDOW_DAYS,
-            DiscoveryRetention::unverified(&BTreeMap::new()),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
         )
         .expect("recent path is discovered");
 
@@ -94731,7 +94806,7 @@ mod census_unreadable_tests {
             &mut census,
             None,
             30,
-            DiscoveryRetention::unverified(&BTreeMap::new()),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
         )
         .is_none());
         assert_eq!(
@@ -94755,7 +94830,7 @@ mod census_unreadable_tests {
             &mut census,
             None,
             30,
-            DiscoveryRetention::unverified(&BTreeMap::new()),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
         )
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();

@@ -474,12 +474,12 @@ impl BirthStore {
         from: &str,
         to: &str,
         opened: ClaudeOpenedBirth,
-    ) {
+    ) -> bool {
+        if !self.can_record_discovered_move(session, from, to, opened) {
+            return false;
+        }
         self.record_opened(session, to, i128::from(opened.birth), opened);
-        assert!(
-            self.record_proven_move(session, location_key(from), to),
-            "validated custody move"
-        );
+        self.record_proven_move(session, location_key(from), to)
     }
 
     /// Existing generation tombstones identify a custody handoff across settlement.

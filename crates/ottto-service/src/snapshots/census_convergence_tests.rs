@@ -1168,6 +1168,7 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
     sampled_scan::set_test_now(Some(1_000));
     absent.probe_absent_claude_account_deferred_holds();
     assert_eq!(absent.claude_account_deferred_hold_count(), 1);
+    crate::snapshots::line_delivery_tests::next_walk(&mut absent, 7);
     sampled_scan::set_test_now(Some(1_600));
     absent.probe_absent_claude_account_deferred_holds();
     sampled_scan::set_test_now(None);

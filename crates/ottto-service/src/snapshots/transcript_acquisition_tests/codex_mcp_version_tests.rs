@@ -39,7 +39,7 @@ fn current_candidate(f: &ScanFixture, index: &ScanIndex) -> CandidateFile {
         &mut census,
         None,
         BACKFILL_WINDOW_DAYS,
-        crate::snapshots::DiscoveryRetention::unverified(&index.files),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
     )
     .unwrap();
     prepare_owned_scan_candidate(

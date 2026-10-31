@@ -85,7 +85,7 @@ impl Fixture {
             &mut ScanCensus::default(),
             None,
             BACKFILL_WINDOW_DAYS,
-            crate::snapshots::DiscoveryRetention::unverified(&BTreeMap::new()),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
         )
         .unwrap()
     }

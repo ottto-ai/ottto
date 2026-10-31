@@ -682,7 +682,8 @@ the next slot, failing toward reading rather than dropping the obligation.
 was proved absent), `deleted_tokens` (its last-known withheld tokens, when
 available), and `resolved` (a parse bound the account). A held audit obligation
 is retired only after two consecutive rooted NotFound observations at least
-600 seconds apart under the same validated parent. Elapsed witness time uses
+600 seconds apart under the same validated parent, after a later directory
+walk has started and completed (details below). Elapsed witness time uses
 RAM-only monotonic `Instant`, independently of wall-clock corrections; an earlier
 monotonic observation resets the sequence. Each observation uses
 `sampled_audit::proven_absent`: ENOENT of the file or a missing intermediate
@@ -742,24 +743,39 @@ are a lower bound; after a restart each held key re-enters on its one `start`
 re-parse. A released key (resolved, deleted, or dropped from the hold map)
 leaves both. The map is charged with the memo.
 
-A held file renamed within a configured root keeps its **correctness hold**.
-Before the age gate, bounded discovery reuses the birth/move owner's recorded
-physical generation (device/inode, birth and append-compatible extent) to move
-its hold, indexed audit debt, incidence and advisory memo to the discovered path.
-The already owned committed baseline follows that generation before held-result
-restoration; a rename grants no upload, ACK, census or absence credit. An already
-indexed destination keeps its current checkpoint and exact incidence; the existing
-carried-ACK owner preserves prior incidence, and transferred debt resolves only
-through the normal classifier. Discovery and absence checks use bounded member
-lookups derived once per tick/page, with at most two observed paths per held
-member sufficient to detect another path. These lookups are temporary, not move
-authority or another registry. No extra
-walk, stat or transcript read proves the move: it uses the metadata the bounded
-walk already has. If the generation is unknown, replaced or ambiguous, custody
-stays at the old path. The existing observed-key view records the same-member
-presence even when age would skip it; F4 waits while bounded discovery is pending or its directory-entry cap refused coverage
-or that uncertain destination remains observed. Losing proof delays resolution
-and never deletes the old debt. Hold caps and ordinary size gates remain.
+A held file whose rename preserves its member (session stem/subagent root)
+within a configured root keeps its **correctness hold**. Before age rejection,
+both bounded directory discovery and candidate gates (including watcher hints)
+reuse the birth/move owner's recorded physical generation (device/inode, known
+birth and append-compatible extent). Proven custody moves its hold, indexed
+audit debt, incidence, stored copy-removal groups/retry age, money marks and
+advisory memo to the destination. Copy proofs naming the moved holder follow it.
+The owned committed baseline follows before held-result restoration. Moving
+custody grants no upload, ACK, census or release credit. An indexed destination
+keeps its current checkpoint/exact incidence; carried-ACK custody preserves the
+prior incidence, and only the normal classifier resolves transferred debt.
+
+Temporary bounded member lookups are derived once per walk/selection batch or
+page, with at most two observed paths per held member. They are not move proof
+or another registry. No extra walk, stat or transcript read proves a move: the
+walk/candidate gate reuses metadata it already holds. Unknown, replaced or
+ambiguous identity keeps old-path custody; filesystems without birth time keep
+but never move that hold. The existing observed-key view records same-member
+presence even when age skips it. An ambiguous surviving sibling can retain the
+stale hold indefinitely, consuming a slot under the 4096 cap and delaying complete
+rebuild. `counts.line_delivery_unselected.withheld_absence_ambiguous` counts each
+F4 refusal for that reason (probe decisions, not unique files).
+
+F4 additionally requires a completed directory walk whose traversal window is
+later than the one at the first NotFound. Pending directories keep the witness
+but cannot authorize release; unreadable coverage, directory-entry cap refusal
+or ambiguous presence resets it. Two validated NotFound probes under a retained stable parent must
+still be at least 600 monotonic seconds apart. A resumed old generation, even if
+held open beyond 600 seconds, cannot retire the hold; a restart loses the RAM
+witness and waits again. This uses ordinary bounded traversal only. Renames
+that change the member are not attempted, and out-of-root destinations are not
+covered; these retain ordinary positively proven deletion semantics. Hold caps
+and ordinary size gates remain.
 
 Known limitations: same-size middle-only rewrites remain Ron's accepted interior-edit residual.
 Evidence outside stamped inputs (including API/trace metadata tokens and

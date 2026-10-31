@@ -39,7 +39,7 @@ struct Entry {
     seen: Option<Box<Seen>>,
     tokens: Option<u64>,
     first_seen: u64,
-    absence: Option<(std::time::Instant, Box<sampled_audit::AbsenceParent>)>,
+    absence: Option<(std::time::Instant, u64, Box<sampled_audit::AbsenceParent>)>,
 }
 crate::heap_layout_bound::fields!(Entry; seen, tokens, first_seen, absence);
 type Entries = BTreeMap<[u8; 32], Entry>;
@@ -346,6 +346,7 @@ impl Memo {
         &self,
         key: &str,
         parent: Option<sampled_audit::AbsenceParent>,
+        walk_window: u64,
     ) -> bool {
         self.with_state(|state| {
             if state.refused {
@@ -364,10 +365,14 @@ impl Memo {
             let Some(entry) = state.entries.get_mut(&memo_key(key)) else {
                 return false;
             };
-            if let Some((first, before)) = &entry.absence {
+            if let Some((first, first_window, before)) = &entry.absence {
                 if let Some(elapsed) = now.checked_duration_since(*first) {
                     if before.same_parent(&parent) {
-                        return elapsed >= std::time::Duration::from_secs(600);
+                        // A later completed walk must have started after the first
+                        // observation's traversal. A resumed/restarted generation
+                        // cannot prove a destination was discovered after that probe.
+                        return walk_window > *first_window
+                            && elapsed >= std::time::Duration::from_secs(600);
                     }
                 }
             }
@@ -390,7 +395,7 @@ impl Memo {
                 .entries
                 .get_mut(&memo_key(key))
                 .expect("admitted memo entry");
-            entry.absence = Some((now, Box::new(parent)));
+            entry.absence = Some((now, walk_window, Box::new(parent)));
             false
         })
         .unwrap_or(false)
@@ -666,6 +671,7 @@ mod tests {
             if interruption == "backward" {
                 for (now, held) in [(999, 1), (1_598, 1), (1_599, 0)] {
                     sampled_scan::set_test_now(Some(now));
+                    crate::snapshots::line_delivery_tests::next_walk(&mut index, 7);
                     index.probe_absent_claude_account_deferred_holds();
                     assert_eq!(index.claude_account_deferred_hold_count(), held);
                 }
@@ -719,6 +725,7 @@ mod tests {
                 1,
                 "{interruption}"
             );
+            crate::snapshots::line_delivery_tests::next_walk(&mut index, 7);
             sampled_scan::set_test_now(Some(2_201));
             index.probe_absent_claude_account_deferred_holds();
             assert_eq!(

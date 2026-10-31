@@ -2174,7 +2174,7 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
     let _clock = TestClock;
     let due = sampled_scan::now_seconds();
     for at_open in [false, true] {
-        let hold = erased_hold(due);
+        let mut hold = erased_hold(due);
         let key = hold.key.clone();
         let pending = || ScanTraversalPath {
             scan_root: hold.fixture.root.clone(),
@@ -2189,7 +2189,7 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
             &mut census,
             Some(due),
             BACKFILL_WINDOW_DAYS,
-            discovery_retention!(hold.index),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut hold.index, None),
         )
         .expect("retained while recent");
         File::open(&hold.fixture.file.0)
@@ -2213,7 +2213,7 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
                 &mut census,
                 Some(due),
                 BACKFILL_WINDOW_DAYS,
-                discovery_retention!(hold.index),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut hold.index, None),
             )
             .is_none());
         }
