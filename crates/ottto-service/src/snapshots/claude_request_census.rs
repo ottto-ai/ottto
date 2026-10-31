@@ -1297,7 +1297,6 @@ impl ClaudeRequestCensus {
         &mut self,
         files: &BTreeMap<String, ScanIndexEntry>,
         cutoff: u64,
-        held: &dyn Fn(&str) -> bool,
         fits: &dyn Fn(usize, usize) -> bool,
         all_or_none: bool,
         excluded: &dyn Fn(&str) -> bool,
@@ -3107,13 +3106,23 @@ fn insert_transcript_record(
             revalidate_retirement_growth(index, census, cutoff);
             let active = super::sampled_audit::growth_active(index);
             let excluded = |key: &str| {
-                active
-                    && super::sampled_audit::growth_excluded_parts(
-                        key,
-                        &index.v2().growth_retention,
-                        index.traversal.as_ref(),
-                        None,
-                    )
+                (super::restart_restore::enabled()
+                    && (page_held.contains(key)
+                        || index
+                            .traversal
+                            .as_ref()
+                            .is_some_and(|t| t.residue.index_keys.contains(key))
+                        || index
+                            .scan_residue_witness
+                            .as_ref()
+                            .is_some_and(|w| w.index_keys.contains(key))))
+                    || active
+                        && super::sampled_audit::growth_excluded_parts(
+                            key,
+                            &index.v2().growth_retention,
+                            index.traversal.as_ref(),
+                            None,
+                        )
             };
             released = census
                 .release_aged(&index.files, cutoff, fits, true, &excluded)
@@ -3423,7 +3432,15 @@ fn retire_claude_transcript_records_excluding(
         .growth_retention;
     let walk = index.traversal.as_ref();
     let excluded = |key: &str| {
-        active && super::sampled_audit::growth_excluded_parts(key, growth, walk, terminal_residue)
+        (super::restart_restore::enabled()
+            && (terminal_residue.is_some_and(|keys| keys.contains(key))
+                || walk.is_some_and(|t| t.residue.index_keys.contains(key))
+                || index
+                    .scan_residue_witness
+                    .as_ref()
+                    .is_some_and(|w| w.index_keys.contains(key))))
+            || active
+                && super::sampled_audit::growth_excluded_parts(key, growth, walk, terminal_residue)
     };
     let files = &index.files;
     let census = &mut owned_census;
@@ -4205,7 +4222,7 @@ impl ScanIndex {
         &mut self,
         window: u64,
     ) -> (u64, u64, u64, u64) {
-        let retirement = retire_claude_transcript_records(self, window, &BTreeSet::new());
+        let retirement = retire_claude_transcript_records(self, window);
         (
             retirement.aged,
             retirement.kept_overlap_records,

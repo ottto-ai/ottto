@@ -6546,6 +6546,11 @@ fn prepare_sync_source_inner(
     let legacy_upload_progress_path = snapshot_upload_progress_path(&v2_index_path);
     let upload_progress_path = snapshot_upload_progress_path(&index_path);
     adopt_legacy_checkpoint_file(&legacy_upload_progress_path, &upload_progress_path)?;
+    crate::snapshots::register_state_v2_resume_owner(
+        &index_path,
+        support_dir,
+        &daemon.transcript_cache,
+    )?;
     let (mut index, load_origin, mut upload_progress) = load_source_checkpoints(
         &index_path,
         &upload_progress_path,

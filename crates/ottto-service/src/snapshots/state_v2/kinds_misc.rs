@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 macro_rules! catalogue {
     ($( $field:ident => ($kind:literal,$mode:ident) ),* $(,)?) => {
         pub(super) const KINDS:&[&str]=&[$($kind,)* "v1_field.repair_provenance","raw_hold.files","raw_hold.growth_retention","raw_hold.claude_account_family_witnesses","raw_hold.claude_account_family_pending","raw_hold.claude_usage_family_witnesses","raw_hold.claude_usage_family_pending","raw_hold.claude_usage_authority_quarantine","raw_hold.quarantined_snapshot_fingerprints",];
-        pub(super) fn field_kind(field:&str)->Option<&'static str> { match field { $(stringify!($field)=>Some($kind),)* _=>None } }
+        pub(super) fn field_kind(field:&str)->Option<&'static str> { match field { $(stringify!($field)=>Some($kind),)* "reread_guard"=>Some("v1_field.reread_guard"), _=>None } }
         fn field_mode(kind:&str)->mapper::Members { match kind { $($kind=>mapper::Members::$mode,)* _=>mapper::Members::Field } }
         macro_rules! fields { ($apply:ident) => { $($apply!($field,$kind);)* }; }
     };
@@ -71,6 +71,7 @@ catalogue! {
     codex_counting_tombstones => ("v1_field.codex_counting_tombstones",Map),
     codex_counting_evicted_legacy => ("v1_field.codex_counting_evicted_legacy",Field),
     upload_ack_retirement_handoff => ("accepted.ack_handoff",Field),
+    o3_replay => ("v1_field.reread_guard",Field),
     held_audit_progress => ("scan_state.held_audit_progress",Field),
     claude_money_birth_store => ("v1_field.birth_store",Field),
     claude_desktop_store_inventory => ("v1_field.claude_desktop_store_inventory",Field),
@@ -479,7 +480,7 @@ pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut Kin
             )?;
         };
         ($field:ident,$kind:literal) => {
-            write_field(&index.$field, stringify!($field), $kind, tx, cx)?;
+            write_field(&index.$field, wire_slot(stringify!($field)), $kind, tx, cx)?;
         };
     }
     fields!(save);
@@ -505,7 +506,7 @@ pub(super) fn hydrate_txn(
     );
     macro_rules! load {
         ($field:ident,$kind:literal) => {
-            index.$field = read_field(stringify!($field), $kind, tx, cx)?;
+            index.$field = read_field(wire_slot(stringify!($field)), $kind, tx, cx)?;
         };
     }
     fields!(load);
@@ -525,7 +526,7 @@ pub(super) fn delta(
         (claude_desktop_store_inventory,$kind:literal) => {};
         ($field:ident,$kind:literal) => {
             if dirty.contains(stringify!($field)) {
-                write_field(&next.$field, stringify!($field), $kind, tx, cx)?;
+                write_field(&next.$field, wire_slot(stringify!($field)), $kind, tx, cx)?;
             }
         };
     }
@@ -591,7 +592,7 @@ pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
 ) -> std::result::Result<bool, A::Error> {
     macro_rules! check {
         ($field:ident,$kind:literal) => {
-            if field == stringify!($field) {
+            if field == wire_slot(stringify!($field)) {
                 codec::check_field(map, &model.$field)?;
                 return Ok(true);
             }
@@ -604,4 +605,12 @@ pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
         _ => return Ok(false),
     }
     Ok(true)
+}
+
+fn wire_slot(field: &str) -> &str {
+    if field == "o3_replay" {
+        "reread_guard"
+    } else {
+        field
+    }
 }

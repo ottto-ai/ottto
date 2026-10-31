@@ -509,7 +509,7 @@ fn side_maps(index: &ScanIndex) -> Option<u64> {
     bytes = bytes.checked_add(heap(&index.claude_history_unverified_in_process)?)?;
     bytes = bytes.checked_add(heap(&index.claude_rebuild_read_load_eligible)?)?;
     bytes = bytes.checked_add(heap(&index.reason_reoffer_cooldowns)?)?;
-    bytes = bytes.checked_add(heap(&index.retired_reread_guard)?)?;
+    bytes = bytes.checked_add(heap(&index.o3_replay)?)?;
     bytes = bytes.checked_add(heap(&index.held_audit_progress)?)?;
     bytes = bytes.checked_add(heap(&index.claude_money_birth_store)?)?;
     bytes = bytes.checked_add(heap(&index.claude_desktop_store_inventory)?)?;

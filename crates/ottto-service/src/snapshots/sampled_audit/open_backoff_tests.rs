@@ -377,6 +377,7 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
             candidate.clone(),
             &mut ScanCensus::default(),
             CandidateWindow {
+                cache: None,
                 census_unix_seconds: None,
                 backfill_window_days: 183,
                 files: &index.files,
@@ -405,6 +406,7 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
         candidate,
         &mut ScanCensus::default(),
         CandidateWindow {
+            cache: None,
             census_unix_seconds: None,
             backfill_window_days: 183,
             files: &index.files,

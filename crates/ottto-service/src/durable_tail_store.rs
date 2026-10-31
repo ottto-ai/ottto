@@ -47,8 +47,10 @@ use std::sync::{
 };
 
 pub(crate) mod active;
+mod immutable;
 mod stream;
 pub(crate) use active::{ActiveLease, ActiveOverBudget, LeaseWait, ACTIVE_BYTES};
+pub(crate) use immutable::ImmutableRecord;
 pub(crate) use stream::{
     FailureDisposition, PrepareStoreFailure, PreparedHeader, PreparedRecord, ReceiptProof,
     RecordIdentity,
@@ -720,6 +722,8 @@ pub(crate) struct BatchReceipt {
 /// One store directory. The in-RAM map of last durable content digests
 /// decides dirtiness, so a clean record is never rewritten.
 pub(crate) struct DurableTailStore {
+    immutable_target: Option<(Digest32, PathBuf)>,
+    immutable_sync_due: bool,
     dir: PathBuf,
     source: DurableSource,
     durable: BTreeMap<Digest32, (Option<Digest32>, Stamp, bool)>,
@@ -781,6 +785,8 @@ impl DurableTailStore {
     pub(crate) fn new(dir: PathBuf, source: DurableSource) -> Self {
         Self {
             dir,
+            immutable_target: None,
+            immutable_sync_due: false,
             durable: BTreeMap::new(),
             source,
             counters: StoreCounters::default(),
@@ -940,6 +946,11 @@ impl DurableTailStore {
     }
 
     fn record_path(&self, key: &Digest32) -> PathBuf {
+        if let Some((target_key, path)) = &self.immutable_target {
+            if target_key == key {
+                return path.clone();
+            }
+        }
         self.dir.join(format!("{}{RECORD_SUFFIX}", hex(key)))
     }
 
@@ -2458,9 +2469,9 @@ impl DurableTailStore {
 
     /// Retire exactly the verified predecessor. `sync_due` belongs to writer
     /// custody: once unlink succeeds, absence never cancels the sync barrier.
-    pub(crate) fn retire_exact<W: SingleWriter>(
+    pub(crate) fn retire_exact(
         &mut self,
-        writer: &W,
+        writer: &dyn SingleWriter,
         proof: &MutationWitness,
         sync_due: &mut bool,
     ) -> RetireOutcome {

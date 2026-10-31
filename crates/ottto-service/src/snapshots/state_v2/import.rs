@@ -154,24 +154,7 @@ impl Mapper for ClaudeMapper {
         index: &ScanIndex,
         original: Option<&Original>,
     ) -> Result<KindCx> {
-        let original = original.ok_or(Pause::Mismatch)?;
-        original.unchanged()?;
-        let mut tx = store.begin(TxnMode::Write)?;
-        let identity = identity(&mut tx)?;
-        let generation = self.import_generation(index)?;
-        anyhow::ensure!(identity.fence_generation == generation, Pause::Mismatch);
-        let mut cx = KindCx::default();
-        cx.binding = Some(identity.binding.clone());
-        cx.presence = original.presence.clone();
-        kinds::populate(index, &mut tx, &mut cx)?;
-        anyhow::ensure!(
-            tx.commit(index.generation, generation) == DurableCommitOutcome::Committed(generation),
-            Pause::Mismatch
-        );
-        // A COMMIT advanced control.generation; the proof must compare the
-        // normalized G graph against that one deliberate G+1 control change.
-        let mut tx = store.begin(TxnMode::Read)?;
-        verify_normalized_at(&mut tx, index, original, identity.binding, generation)
+        self.import_graph_with_hooks(store, index, original, None)
     }
     fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)> {
         let mut tx = store.begin(TxnMode::Read)?;
@@ -190,6 +173,59 @@ impl Mapper for ClaudeMapper {
     }
 }
 impl ClaudeMapper {
+    fn import_graph_with_hooks<S: Store>(
+        &self,
+        store: &mut S,
+        index: &ScanIndex,
+        original: Option<&Original>,
+        mut hooks: Option<&mut dyn ResumeHooks>,
+    ) -> Result<KindCx> {
+        let original = original.ok_or(Pause::Mismatch)?;
+        original.unchanged()?;
+        let identity = {
+            let mut tx = store.begin(TxnMode::Read)?;
+            identity(&mut tx)?
+        };
+        let generation = self.import_generation(index)?;
+        anyhow::ensure!(identity.fence_generation == generation, Pause::Mismatch);
+        let mut cx = KindCx::default();
+        cx.binding = Some(identity.binding.clone());
+        cx.presence = original.presence.clone();
+        let mut imported = index.clone();
+        imported.generation = generation;
+        if let Some(hooks) = hooks.as_deref_mut() {
+            let empty = ScanIndex::default();
+            let reserved = cx.prepare_plan(&empty, &imported, hooks)?;
+            let planned = cx.prepared_checkpoints().cloned();
+            cx.prepared = None;
+            let selected = hooks.preflight_selected(&empty, &imported, &cx.committed)?;
+            anyhow::ensure!(selected <= reserved, "state_v2_resume_staging_admission");
+            cx.preflight_reserved(&empty, &imported, hooks, selected)?;
+            cx.check_planned_checkpoints(planned.as_ref())?;
+        }
+        let mut tx = store.begin(TxnMode::Write)?;
+        kinds::populate_import(index, &imported, &mut tx, &mut cx)?;
+        anyhow::ensure!(
+            tx.commit(index.generation, generation) == DurableCommitOutcome::Committed(generation),
+            Pause::Mismatch
+        );
+        if let Some(hooks) = hooks.as_deref_mut() {
+            cx.post_commit(&DurableCommitOutcome::Committed(generation), hooks)?;
+        }
+        // A COMMIT advanced control.generation; the proof must compare the
+        // normalized G graph against that one deliberate G+1 control change.
+        let mut tx = store.begin(TxnMode::Read)?;
+        let mut verified = verify_normalized_with_checkpoints(
+            &mut tx,
+            index,
+            original,
+            identity.binding,
+            generation,
+            cx.committed.clone(),
+        )?;
+        verified.committed = cx.committed;
+        Ok(verified)
+    }
     /// The one production save: merge current CAS custody, then run the
     /// semantic delta under the resident committed context. Emit the complete
     /// dirty delta against the resident header map. Saves above 5k rows /
@@ -205,7 +241,7 @@ impl ClaudeMapper {
         prev: &ScanIndex,
         next: &mut ScanIndex,
         cx: &mut KindCx,
-        claim_only: bool,
+        owner: SaveOwner<'_>,
     ) -> Result<()> {
         {
             let mut tx = db.begin(TxnMode::Read)?;
@@ -216,18 +252,11 @@ impl ClaudeMapper {
             next,
             super::super::sampled_scan::now_seconds(),
         );
-        if !claim_only {
+        if !owner.claim_only {
             next.retire_committed_claude_account_pending_windows();
         }
         super::super::lenient_decode::check_held_output(next)?;
-        kinds::save_graph(
-            db,
-            identity,
-            prev,
-            next,
-            cx,
-            &mut kinds_files::NoResumeHooks,
-        )
+        kinds::save_graph(db, identity, prev, next, cx, owner.hooks)
     }
 }
 
@@ -826,6 +855,23 @@ fn verify_normalized_at(
     binding: super::super::scan_index_persistence::Binding,
     generation: u64,
 ) -> Result<KindCx> {
+    verify_normalized_with_checkpoints(
+        tx,
+        index,
+        original,
+        binding,
+        generation,
+        std::collections::BTreeMap::new(),
+    )
+}
+fn verify_normalized_with_checkpoints(
+    tx: &mut dyn Transaction,
+    index: &ScanIndex,
+    original: &Original,
+    binding: super::super::scan_index_persistence::Binding,
+    generation: u64,
+    checkpoints: std::collections::BTreeMap<String, super::resume::ResumeCheckpoint>,
+) -> Result<KindCx> {
     let mut proof = ReadBack {
         inner: tx,
         generation,
@@ -835,6 +881,16 @@ fn verify_normalized_at(
     let mut cx = KindCx::default();
     cx.binding = Some(binding);
     cx.presence = original.presence.clone();
+    // Import parity reads the additional exact-reference rows in the same
+    // read-back transaction, without treating them as v1 parser state.
+    if !checkpoints.is_empty() {
+        cx.prepared = Some(super::resume::Prepared {
+            generation: index.generation,
+            signature: super::resume::files_signature(index)?,
+            checkpoints: checkpoints.clone(),
+        });
+    }
+
     kinds::populate(index, &mut proof, &mut cx)?;
     let mut count = 0_u64;
     let mut after = None;
@@ -876,6 +932,8 @@ fn verify_normalized_at(
         after = page.last().map(|h| h.key.clone());
     }
     anyhow::ensure!(proof.refs.is_empty(), Pause::Mismatch);
+    cx.prepared = None;
+    cx.committed = checkpoints;
     Ok(cx)
 }
 struct ReadBack<'a> {
@@ -1674,5 +1732,92 @@ mod codec_mapper_regressions {
         let original = Original::default();
         let mut tx = db.begin(TxnMode::Read).unwrap();
         verify_normalized_at(&mut tx, &index, &original, money_test_support::binding(), 1).unwrap();
+    }
+}
+
+pub(super) struct SaveOwner<'a> {
+    pub(super) claim_only: bool,
+    pub(super) hooks: &'a mut dyn ResumeHooks,
+}
+
+/// Runtime composition retains the source cache's existing store owner.
+pub(super) struct ResumeMapper {
+    adapter: Option<std::cell::RefCell<super::resume_adapter::Adapter>>,
+}
+impl ResumeMapper {
+    pub(super) fn new(
+        cache: Option<std::sync::Arc<super::super::sampled_scan::SharedCache>>,
+        path: &Path,
+        binding: super::super::scan_index_persistence::Binding,
+    ) -> Result<Self> {
+        Ok(Self {
+            adapter: cache
+                .map(|cache| {
+                    super::resume_adapter::Adapter::new(cache, path, binding)
+                        .map(std::cell::RefCell::new)
+                })
+                .transpose()?,
+        })
+    }
+}
+impl Mapper for ResumeMapper {
+    fn references(
+        header: &Header,
+        value: &dyn Value,
+        refs: &mut dyn FnMut(&RowKey) -> Result<()>,
+    ) -> Result<()> {
+        ClaudeMapper::references(header, value, refs)
+    }
+    fn private_paths(
+        header: &Header,
+        value: &dyn Value,
+        paths: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
+        ClaudeMapper::private_paths(header, value, paths)
+    }
+    fn inventory_context(&self, path: &Path) -> std::result::Result<Option<Original>, Pause> {
+        ClaudeMapper.inventory_context(path)
+    }
+    fn preflight(&self, index: &ScanIndex) -> std::result::Result<(), Pause> {
+        match &self.adapter {
+            Some(adapter) => adapter
+                .borrow()
+                .preflight_import()
+                .map_err(|_| Pause::Mismatch),
+            None => ClaudeMapper.preflight(index),
+        }
+    }
+    fn import_generation(&self, index: &ScanIndex) -> Result<u64> {
+        ClaudeMapper.import_generation(index)
+    }
+    fn import_graph<S: Store>(
+        &self,
+        store: &mut S,
+        index: &ScanIndex,
+        original: Option<&Original>,
+    ) -> Result<KindCx> {
+        match &self.adapter {
+            Some(adapter) => ClaudeMapper.import_graph_with_hooks(
+                store,
+                index,
+                original,
+                Some(&mut *adapter.borrow_mut()),
+            ),
+            None => ClaudeMapper.import_graph(store, index, original),
+        }
+    }
+    fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)> {
+        let Some(adapter) = &self.adapter else {
+            let (index, cx) = ClaudeMapper.hydrate_context(store)?;
+            anyhow::ensure!(cx.committed.is_empty(), "state_v2_resume_owner_required");
+            return Ok((index, cx));
+        };
+        let mut tx = store.begin(TxnMode::Read)?;
+        let identity = identity(&mut tx)?;
+        anyhow::ensure!(
+            identity.binding.source == super::super::scan_index_persistence::Source::Claude,
+            Hold::ForeignBinding
+        );
+        kinds::hydrate_txn_with_hooks(&mut tx, identity.binding, &mut *adapter.borrow_mut())
     }
 }

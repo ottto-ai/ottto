@@ -33,6 +33,7 @@ pub(crate) use acquired::{AcquiredChain, AcquisitionProtocol, ImmutableCounting}
 mod owed;
 pub(in crate::snapshots) use owed::OwedCompletionAdmission;
 pub(crate) use owed::{OwedAdmission, OwedQuery, ReceiptOwed};
+mod resume;
 mod write_ahead;
 pub(in crate::snapshots) use write_ahead::{
     CommitFences, FinishAcquisition, LiveFinishView, NativeFinishAttempt,
@@ -4051,6 +4052,26 @@ impl SharedCache {
                 return Err(MissClass::HistoryOwed.into());
             }
             let (outcome, disabled) = match stores.slot(source).as_mut() {
+                Some(slot)
+                    if snapshot_source == SnapshotSource::ClaudeCode
+                        && state_v2::state_v2_growth_retention_active(index) =>
+                {
+                    let Some(checkpoint) = index
+                        .v2()
+                        .resume_checkpoints
+                        .as_ref()
+                        .and_then(|refs| refs.get(key))
+                    else {
+                        return Err(MissClass::NoEntry.into());
+                    };
+                    if lease.charge(store::RESTORE_INPUT_BYTES).is_err() {
+                        return Ok(Err("input"));
+                    }
+                    match state_v2::resume_adapter::Adapter::restore(&mut slot.store, checkpoint) {
+                        Ok(record) => (ReadOutcome::Found(record), slot.store.disabled().is_some()),
+                        Err(_) => return Ok(Err("committed_reference_unresolved")),
+                    }
+                }
                 Some(slot) => match slot.store.read_bounded(&store_key, lease) {
                     Ok(outcome) => (outcome, slot.store.disabled().is_some()),
                     Err(store::ActiveOverBudget) => return Ok(Err("input")),
@@ -5322,6 +5343,11 @@ impl SharedCache {
     ) -> Option<store::BatchReceipt> {
         durable_source(snapshot_source)?;
         self.erase_private_labels(writer, snapshot_source, None);
+        if snapshot_source == SnapshotSource::ClaudeCode
+            && state_v2::state_v2_growth_retention_active(index)
+        {
+            return None;
+        }
         if !restart_restore::enabled() {
             return None;
         }
@@ -5829,6 +5855,11 @@ impl SharedCache {
                     .collect();
                 self.erase_private_labels(writer, snapshot_source, Some(&keep));
             }
+        }
+        if snapshot_source == SnapshotSource::ClaudeCode
+            && state_v2::state_v2_growth_retention_active(index)
+        {
+            return Ok(());
         }
         if !restart_restore::enabled() {
             return Ok(());

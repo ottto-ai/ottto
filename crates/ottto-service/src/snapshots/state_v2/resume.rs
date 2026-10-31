@@ -58,14 +58,14 @@ pub(super) fn files_signature(index: &ScanIndex) -> Result<[u8; 32]> {
     .context("state_v2_resume_serialize")?;
     Ok(hash.finalize().into())
 }
-fn publication(entry: &ScanIndexEntry) -> Result<[u8; 16]> {
+pub(in crate::snapshots) fn publication(entry: &ScanIndexEntry) -> Result<[u8; 16]> {
     use sha2::Digest;
     let mut hash = value_digest_start(1);
     hash.update(codec::json(entry, MUTABLE_VALUE_BYTES)?);
     Ok(integrity(hash))
 }
 impl ResumeCheckpoint {
-    pub(super) fn validate(
+    pub(in crate::snapshots) fn validate(
         &self,
         path: &str,
         entry: &ScanIndexEntry,
@@ -167,7 +167,7 @@ pub(crate) struct FinishProof {
     pub source_proof: [u8; 32],
     pub settled_dependencies: [u8; 32],
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct StagedCheckpoints {
     /// Actual immutable record bytes fsynced by R1, including replaced records.
     /// The owner reserves these bytes during committable-unit admission.
@@ -449,3 +449,6 @@ impl KindCx {
         }
     }
 }
+
+crate::heap_layout_bound::fields!(ResumeCheckpoint; record_generation, record_name, trailer_digest, file_generation, committed_bytes, reduction_version, reduction_allowlist, reduction_pin, binding, key_digest, context, scope, entry, publication, certificate);
+crate::heap_layout_bound::fields!(Certificate; device, inode, length, modified, birth_nanos, sealed_offset, sample_len, head_sha256, boundary_sha256, verified_unix_seconds, audit_debt_unix_seconds);

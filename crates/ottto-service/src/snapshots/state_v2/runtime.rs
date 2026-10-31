@@ -138,6 +138,7 @@ impl ResumeExclusion {
 }
 struct RouteState {
     pace: Pace,
+    resume_owner: Option<std::sync::Weak<super::super::sampled_scan::SharedCache>>,
     latched: bool,
     inventory_ready: bool,
     original: Option<import::Original>,
@@ -204,6 +205,7 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
             .or_insert_with(|| {
                 Arc::new(Mutex::new(RouteState {
                     pace: Pace::default(),
+                    resume_owner: None,
                     latched: false,
                     inventory_ready: false,
                     original: None,
@@ -303,7 +305,18 @@ pub(in super::super) fn load_locked(
         return Ok((None, false));
     }
     let switched = enabled(support);
-    let index = load_with_custody(path, switched, &ClaudeMapper, custody)?;
+    let owner = if switched || custody {
+        with_state(path, |state| {
+            Ok(state
+                .resume_owner
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade))
+        })?
+    } else {
+        None
+    };
+    let mapper = import::ResumeMapper::new(owner, path, binding_for(path)?)?;
+    let index = load_with_custody(path, switched, &mapper, custody)?;
     let sample_v1 = switched && index.is_none();
     Ok((index, sample_v1))
 }
@@ -473,7 +486,26 @@ fn pause(state: &mut RouteState, now: Instant, class: Pause) {
 /// Import is attempted only on the normalized available graph and only if the
 /// pre-decode inventory acquired a due slot. No writes on any paused path.
 pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> Result<()> {
-    import_with(path, index, &ClaudeMapper)
+    let owner = if index.v2().persistence_v2.is_some()
+        || states()
+            .lock()
+            .map_err(|_| Hold::DbUnavailable)?
+            .contains_key(path)
+    {
+        with_state(path, |state| {
+            Ok(state
+                .resume_owner
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade))
+        })?
+    } else {
+        None
+    };
+    let Some(binding) = binding(path) else {
+        return Ok(());
+    };
+    let mapper = import::ResumeMapper::new(owner, path, binding)?;
+    import_with(path, index, &mapper)
 }
 fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Result<()> {
     let Some(binding) = binding(path) else {
@@ -562,6 +594,7 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             Hold::DbUnavailable
         );
         index.generation = stamp.0;
+        index.v2_mut().resume_checkpoints = Some(Arc::new(cx.committed.clone()));
         index.v2_mut().persistence_v2 = Some(Arc::new(Runtime {
             active: true,
             session: Mutex::new(Some(Session {
@@ -609,6 +642,22 @@ fn save_with_custody(
     }
     // This accessor authenticates the owner/session; call before route/session locks.
     let claim_generation = super::super::sampled_audit::own_growth_claim_generation(index, path);
+    // Fund staging before route/session/progress locks; the active owner may
+    // wait for another source, so it must never wait under these locks.
+    let owner = if index.v2().persistence_v2.is_some() {
+        with_state(path, |state| {
+            Ok(state
+                .resume_owner
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade))
+        })?
+    } else {
+        None
+    };
+    let mut adapter = owner
+        .map(|cache| super::resume_adapter::Adapter::new(cache, path, binding.clone()))
+        .transpose()
+        .map_err(Hold::storage)?;
     let mut stale_graph = false;
     let mut result = held(with_state(path, |state| {
         let pair = fence::reconcile(path, &binding, state.latched)?;
@@ -646,14 +695,24 @@ fn save_with_custody(
                     path,
                     owner,
                 )?;
+                ensure!(
+                    adapter.is_some() || session.cx.committed.is_empty(),
+                    "state_v2_resume_owner_required"
+                );
+                let mut fallback = super::resume::NoResumeHooks;
+                let hooks: &mut dyn super::resume::ResumeHooks = match adapter.as_mut() {
+                    Some(adapter) => adapter,
+                    None => &mut fallback,
+                };
                 ClaudeMapper.save(
                     &mut session.db,
                     &identity,
                     &previous,
                     index,
                     &mut session.cx,
-                    claim_only,
+                    import::SaveOwner { claim_only, hooks },
                 )?;
+                index.v2_mut().resume_checkpoints = Some(Arc::new(session.cx.committed.clone()));
                 session.stamp = session.db.stamp()?;
                 // Only a freshly committed replacement/finish resolves the
                 // failed key. Unrelated saves and elapsed backoff never do.
@@ -1183,3 +1242,23 @@ pub(in super::super) fn confirmed_growth_stamp(
 #[cfg(test)]
 #[path = "runtime_growth_tests.rs"]
 mod growth_tests;
+
+/// Called by the existing source owner before its first load. OFF does not
+/// allocate a route or initialize a durable store.
+pub(in crate::snapshots) fn register_resume_owner(
+    path: &Path,
+    support: &Path,
+    cache: &Arc<super::super::sampled_scan::SharedCache>,
+) -> Result<()> {
+    if binding(path).is_none()
+        || !super::super::restart_restore::enabled()
+        || !(enabled(Some(support)) || published(path)?)
+    {
+        return Ok(());
+    }
+    cache.initialize_resume_owner(path);
+    with_state(path, |state| {
+        state.resume_owner = Some(Arc::downgrade(cache));
+        Ok(())
+    })
+}

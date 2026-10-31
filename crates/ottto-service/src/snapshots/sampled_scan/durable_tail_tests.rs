@@ -13222,3 +13222,112 @@ fn off_no_record_growth_uses_ordinary_full_without_store_io() {
         assert!(!store::store_dir_for_index(&index_path).exists());
     });
 }
+
+/// [format] the v2 adapter stages native state and reopens only the committed ref.
+#[test]
+fn v2_resume_adapter_native_plan_stage_and_exact_reopen() {
+    use crate::snapshots::state_v2::resume::ResumeHooks;
+    use crate::snapshots::state_v2::resume_adapter::Adapter;
+    let _restart = crate::snapshots::RestartRestoreForTest::enabled();
+    let root = crate::test_scratch::ScratchDir::new("v2-native-resume");
+    let writer = test_locks::hold(&root);
+    let projects = root.join("projects");
+    std::fs::create_dir(&projects).unwrap();
+    let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+    std::fs::write(&path, a1a_row("accepted", 100)).unwrap();
+    let index_path = root.join("index.json");
+    let owner = crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::default();
+    owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
+    let mut prev = ScanIndex::default();
+    prev.activate_effective_upload_body_witness_revision(effective_revision(
+        SnapshotSource::ClaudeCode,
+    ));
+    let (mut next, mut scan, _) =
+        claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+            owner.scan(
+                std::slice::from_ref(&projects),
+                &root,
+                prev.clone(),
+                100,
+                true,
+                &BTreeMap::new(),
+                &[],
+            )
+        });
+    a1a_wire(&root, &mut next, &mut scan);
+    next.generation = prev.generation + 1;
+    let binding = scan_index_persistence::Binding {
+        source: scan_index_persistence::Source::Claude,
+        namespace_hash: "a".repeat(64),
+    };
+    let key = local_index_key(&path);
+    let current = BTreeMap::new();
+    let mut adapter = Adapter::new(owner.cache.clone(), &index_path, binding.clone()).unwrap();
+    store::test_hooks::set_before_access(Some(Box::new(|_, _| {
+        panic!("plan performed filesystem IO")
+    })));
+    let planned = adapter.plan(&prev, &next, &current).unwrap();
+    store::test_hooks::set_before_access(None);
+    assert!(planned.excluded.is_empty());
+    let checkpoint = planned
+        .replacements
+        .get(&key)
+        .expect("native checkpoint")
+        .clone();
+    assert_eq!(
+        checkpoint.committed_bytes,
+        std::fs::metadata(&path).unwrap().len()
+    );
+    assert_eq!(
+        adapter.preflight_selected(&prev, &next, &current).unwrap(),
+        planned.bytes
+    );
+    let staged = adapter.stage(&prev, &next, &current).unwrap();
+    assert_eq!(staged.replacements, planned.replacements);
+    let committed = staged.replacements;
+    adapter.post_commit(next.generation, &committed).unwrap();
+    drop(adapter);
+    // A later, durable, uncommitted candidate must never become the restore target.
+    owner
+        .cache
+        .with_resume_store(&index_path, |store| {
+            let (record, _) = store
+                .read_immutable(&checkpoint.record_name, &checkpoint.key_digest)
+                .unwrap();
+            let future = store::ImmutableRecord::plan(record.record.clone(), 999, "uncommitted");
+            store.stage_immutable(writer, &future)?;
+            Ok(())
+        })
+        .unwrap();
+    owner.evict();
+    let mut reopened = Adapter::new(owner.cache.clone(), &index_path, binding.clone()).unwrap();
+    reopened.on_open(next.generation, &committed).unwrap();
+    owner
+        .cache
+        .with_resume_store(&index_path, |store| {
+            let restored = Adapter::restore(store, &checkpoint)?;
+            assert_eq!(restored.index_generation, 1);
+            assert_eq!(restored.trailer_digest(), Some(checkpoint.trailer_digest));
+            Ok(())
+        })
+        .unwrap();
+    let mut missing = checkpoint.clone();
+    missing.record_name = missing.record_name.replace(".rec", "_missing.rec");
+    assert!(reopened
+        .on_open(next.generation, &BTreeMap::from([(key.clone(), missing)]))
+        .is_err());
+    drop(reopened);
+    // Eviction of the RAM candidate is a per-file exclusion; the prior exact
+    // checkpoint remains intact. S1's stage_exclusion test asserts SQL rollback
+    // of the complete dependent unit and its unchanged committed extent.
+    let mut changed = next.clone();
+    changed.generation += 1;
+    changed.files.get_mut(&key).unwrap().size_bytes += 7;
+    let mut refused = Adapter::new(owner.cache.clone(), &index_path, binding).unwrap();
+    let plan = refused.plan(&next, &changed, &committed).unwrap();
+    assert_eq!(plan.excluded, BTreeSet::from([key]));
+    assert!(std::fs::metadata(
+        store::store_dir_for_index(&index_path).join(checkpoint.record_name)
+    )
+    .is_ok());
+}

@@ -1,6 +1,6 @@
 //! The complete semantic adapter has one context and one transaction boundary.
 //! A context belongs to the committed graph; discard it after any failed write.
-//! NoResumeHooks keeps conversion paused until the R1 owner adapter is installed.
+//! The route supplies the source owner’s immutable-record adapter.
 use super::*;
 use anyhow::{bail, ensure};
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,6 +20,16 @@ pub(super) struct KindCx {
 }
 
 pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
+    populate_import(index, index, tx, cx)
+}
+/// Import keeps the old control generation until COMMIT while file refs bind
+/// the new generation. All semantic owners still share the same transaction.
+pub(super) fn populate_import(
+    index: &ScanIndex,
+    files: &ScanIndex,
+    tx: &mut dyn Transaction,
+    cx: &mut KindCx,
+) -> Result<()> {
     ensure!(!cx.valid, "state_v2_context_already_populated");
     let result = (|| {
         for table in [Table::Records, Table::RequestSets] {
@@ -29,7 +39,7 @@ pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut Kin
             );
         }
         kinds_misc::populate(index, tx, cx)?;
-        kinds_files::populate(index, tx, cx)?;
+        kinds_files::populate(files, tx, cx)?;
         kinds_accounts::populate(index, tx, cx)?;
         kinds_census::populate(index, tx, cx)
     })();
@@ -102,6 +112,9 @@ pub(super) fn hydrate_txn_with_hooks(
     kinds_accounts::hydrate_txn(tx, &mut index, &mut cx)?;
     kinds_census::hydrate_txn(tx, &mut index, &mut cx)?;
     hooks.on_open(index.generation, &cx.committed)?;
+    if !cx.committed.is_empty() {
+        index.v2_mut().resume_checkpoints = Some(std::sync::Arc::new(cx.committed.clone()));
+    }
     cx.valid = true;
     Ok((index, cx))
 }
