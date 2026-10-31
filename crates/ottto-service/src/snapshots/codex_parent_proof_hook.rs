@@ -106,7 +106,6 @@ pub(super) fn codex_parent_proof_step(
     identities: &CodexParentIdentities,
     page: &mut PageBudget,
     now: u64,
-    traces: Option<&Arc<CodexTurnTraceMap>>,
 ) {
     // Stage 1 (parent r79): a continuation page runs no part of the hook,
     // not even a held job's step or suspend.
@@ -286,7 +285,7 @@ pub(super) fn codex_parent_proof_step(
     let mut budget = page.singleton_remaining(Limits::current());
     let before = budget;
     let run = match lease.job().readers.as_deref_mut() {
-        Some(readers) => readers.run(&mut budget, room, traces),
+        Some(readers) => readers.run(&mut budget, room),
         None => CodexProofRun::Done,
     };
     page.charge(false, before.saturating_sub(budget));

@@ -241,11 +241,7 @@ pub(crate) struct CapCounts {
     #[serde(skip_serializing_if = "is_zero")]
     pub boundary_overflow_events: u64,
     #[serde(skip_serializing_if = "is_zero")]
-    pub boundary_records_cleared: u64,
-    #[serde(skip_serializing_if = "is_zero")]
     pub bootstrap_overflow_events: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub bootstrap_records_cleared: u64,
     #[serde(skip_serializing_if = "is_zero")]
     pub parent_signature_clear_events: u64,
     #[serde(skip_serializing_if = "is_zero")]
@@ -262,79 +258,28 @@ impl CapCounts {
     pub(crate) fn is_empty(&self) -> bool {
         *self == Self::default()
     }
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.boundary_overflow_events = self
-            .boundary_overflow_events
-            .saturating_add(other.boundary_overflow_events);
-        self.boundary_records_cleared = self
-            .boundary_records_cleared
-            .saturating_add(other.boundary_records_cleared);
-        self.bootstrap_overflow_events = self
-            .bootstrap_overflow_events
-            .saturating_add(other.bootstrap_overflow_events);
-        self.bootstrap_records_cleared = self
-            .bootstrap_records_cleared
-            .saturating_add(other.bootstrap_records_cleared);
-        self.parent_signature_clear_events = self
-            .parent_signature_clear_events
-            .saturating_add(other.parent_signature_clear_events);
-        self.price_trace_row_limit_hits = self
-            .price_trace_row_limit_hits
-            .saturating_add(other.price_trace_row_limit_hits);
-        self.parent_ref_refusals = self
-            .parent_ref_refusals
-            .saturating_add(other.parent_ref_refusals);
-        self.inventory_hold_keys_discarded = self
-            .inventory_hold_keys_discarded
-            .saturating_add(other.inventory_hold_keys_discarded);
-    }
-}
-crate::heap_layout_bound::fields!(CapCounts; boundary_overflow_events, boundary_records_cleared, bootstrap_overflow_events, bootstrap_records_cleared, parent_signature_clear_events, price_trace_row_limit_hits, parent_ref_refusals, inventory_hold_keys_discarded);
-
-/// Transient events ride the existing shared trace map, including side parses.
-/// Nothing is added to the accumulator's durable bytes or shape fingerprint.
-#[derive(Debug, Default)]
-pub(crate) struct CapEvents {
-    counts: [AtomicU64; 6],
-}
-#[derive(Clone, Copy)]
-pub(crate) enum CapEvent {
-    BoundaryOverflow,
-    BoundaryRecordsCleared,
-    BootstrapOverflow,
-    BootstrapRecordsCleared,
-    ParentSignatureClear,
-    PriceTraceRowLimit,
-}
-impl CapEvents {
-    pub(crate) fn record(&self, event: CapEvent, count: u64) {
-        let _ = self.counts[event as usize].fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |value| Some(value.saturating_add(count)),
-        );
-    }
-    pub(crate) fn take(&self) -> CapCounts {
-        let take = |event: CapEvent| self.counts[event as usize].swap(0, Ordering::Relaxed);
-        CapCounts {
-            boundary_overflow_events: take(CapEvent::BoundaryOverflow),
-            boundary_records_cleared: take(CapEvent::BoundaryRecordsCleared),
-            bootstrap_overflow_events: take(CapEvent::BootstrapOverflow),
-            bootstrap_records_cleared: take(CapEvent::BootstrapRecordsCleared),
-            parent_signature_clear_events: take(CapEvent::ParentSignatureClear),
-            price_trace_row_limit_hits: take(CapEvent::PriceTraceRowLimit),
-            ..Default::default()
+    /// Drain the existing trace map's fixed inline slots once per page.
+    pub(crate) fn drain(&mut self, events: &[AtomicU64; 4]) {
+        for (slot, event) in [
+            &mut self.boundary_overflow_events,
+            &mut self.bootstrap_overflow_events,
+            &mut self.parent_signature_clear_events,
+            &mut self.price_trace_row_limit_hits,
+        ]
+        .into_iter()
+        .zip(events)
+        {
+            *slot = slot.saturating_add(event.swap(0, Ordering::Relaxed));
         }
     }
-}
-impl crate::heap_layout_bound::HeapLayoutBound for CapEvents {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        let Self { counts: _ } = self;
-        c.add(0)
+    pub(crate) fn record(event: &AtomicU64) {
+        let _ = event.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.saturating_add(1))
+        });
     }
 }
+crate::heap_layout_bound::fields!(CapCounts; boundary_overflow_events, bootstrap_overflow_events, parent_signature_clear_events, price_trace_row_limit_hits, parent_ref_refusals, inventory_hold_keys_discarded);
+crate::heap_layout_bound::no_heap!(true; AtomicU64);
 
 #[derive(Default, Serialize)]
 struct CensusLossCounts {
@@ -1100,9 +1045,7 @@ mod tests {
         // PR-P: the two parent fields at their maxima.
         diagnostics.caps = CapCounts {
             boundary_overflow_events: u64::MAX,
-            boundary_records_cleared: u64::MAX,
             bootstrap_overflow_events: u64::MAX,
-            bootstrap_records_cleared: u64::MAX,
             parent_signature_clear_events: u64::MAX,
             price_trace_row_limit_hits: u64::MAX,
             parent_ref_refusals: u64::MAX,

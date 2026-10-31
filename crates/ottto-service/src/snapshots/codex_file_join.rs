@@ -2304,7 +2304,7 @@ pub(super) mod tests {
         traces.priority_turns.insert(turn.into());
         let job = replay_group(
             inventory.groups().into_values().next().unwrap(),
-            Some(Arc::new(traces.clone())),
+            Some(Arc::new(traces)),
             &ScanIndex::default(),
         )
         .unwrap();

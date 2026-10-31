@@ -1,7 +1,7 @@
 use crate::codex_scan_diagnostics::{
-    self, CapCounts, CapEvent, CapEvents, CensusGates, CodexScanDiagnostics, FileReason,
-    IdentityConflictTaxonomy, IncompleteShape, ParentUnresolvableCauses, RecoveryLineage,
-    StateRowFieldDiffs, UnreadableCause, UnreadableCauses, LINEAGE_SAMPLES,
+    self, CapCounts, CensusGates, CodexScanDiagnostics, FileReason, IdentityConflictTaxonomy,
+    IncompleteShape, ParentUnresolvableCauses, RecoveryLineage, StateRowFieldDiffs,
+    UnreadableCause, UnreadableCauses, LINEAGE_SAMPLES,
 };
 use crate::local_resource_diagnostics::claude_absence::Parent;
 use crate::local_resource_diagnostics::claude_contract;
@@ -25,6 +25,7 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -17621,7 +17622,8 @@ fn is_claude_desktop_session_id(value: &str) -> bool {
 /// decisions after traces expire without extending them to new contributions.
 #[derive(Debug, Default)]
 struct CodexTurnTraceMap {
-    cap_events: CapEvents,
+    // Transient slots: boundary, bootstrap, signature clear, trace-row limit.
+    cap_events: [AtomicU64; 4],
     since_epoch: i64,
     priority_turns: BTreeSet<String>,
     /// A present trace DB failed to load, or its row cap was reached: absent
@@ -19069,20 +19071,16 @@ impl SnapshotAccumulator {
         })
     }
 
-    fn note_codex_cap(&self, event: CapEvent, count: u64) {
+    fn note_codex_cap(&self, event: usize) {
         if let Some(traces) = &self.codex_turn_traces {
-            traces.cap_events.record(event, count);
+            CapCounts::record(&traces.cap_events[event]);
         }
     }
 
     fn buffer_codex_boundary_record(&mut self, value: &Value) {
         const MAX_BOUNDARY_BUFFER_RECORDS: usize = 64;
         if self.codex_boundary_buffer_len() == MAX_BOUNDARY_BUFFER_RECORDS {
-            self.note_codex_cap(CapEvent::BoundaryOverflow, 1);
-            self.note_codex_cap(
-                CapEvent::BoundaryRecordsCleared,
-                self.codex_boundary_buffer_len() as u64,
-            );
+            self.note_codex_cap(0);
             self.clear_codex_boundary_buffer();
             self.codex_legacy_bootstrap_valid = false;
             self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
@@ -19142,11 +19140,7 @@ impl SnapshotAccumulator {
                 return;
             }
             if self.codex_legacy_bootstrap_buffer.len() == MAX_BOOTSTRAP_RECORDS {
-                self.note_codex_cap(CapEvent::BootstrapOverflow, 1);
-                self.note_codex_cap(
-                    CapEvent::BootstrapRecordsCleared,
-                    self.codex_legacy_bootstrap_buffer.len() as u64,
-                );
+                self.note_codex_cap(1);
                 self.codex_legacy_bootstrap_buffer.clear();
                 self.codex_legacy_bootstrap_valid = false;
                 return;
@@ -19244,7 +19238,7 @@ impl SnapshotAccumulator {
             return;
         };
         if self.codex_physical_signatures.len() == MAX_CODEX_PARENT_LEDGER_SIGNATURES {
-            self.note_codex_cap(CapEvent::ParentSignatureClear, 1);
+            self.note_codex_cap(2);
             self.codex_physical_signatures.clear();
             self.codex_physical_signatures_complete = false;
             return;
@@ -22993,12 +22987,7 @@ impl CodexProofReaders {
     /// `Memory`, before reading the line. Fix rounds 2c/3: a first header
     /// whose kept strings, or a salvage whose timestamp, is over the slack
     /// left is refused before any of it is kept: `Memory` (`step_fits`).
-    pub(in crate::snapshots) fn run(
-        &mut self,
-        budget: &mut u64,
-        room: usize,
-        traces: Option<&Arc<CodexTurnTraceMap>>,
-    ) -> CodexProofRun {
+    pub(in crate::snapshots) fn run(&mut self, budget: &mut u64, room: usize) -> CodexProofRun {
         let reserve = codex_proof_step_reserve();
         let mut walk = None;
         loop {
@@ -23022,20 +23011,7 @@ impl CodexProofReaders {
             };
             let refused = match trailing {
                 Some((at, next)) if self.parent.done || self.ring.get(next).is_some() => {
-                    // Bind instrumentation only during the parse, after admission.
-                    // Never retain/charge the shared trace map in a proof job.
-                    self.children[at]
-                        .reader
-                        .parser
-                        .accumulator
-                        .codex_turn_traces = traces.cloned();
-                    let refused = self.step_child(at, next, slack, budget);
-                    self.children[at]
-                        .reader
-                        .parser
-                        .accumulator
-                        .codex_turn_traces = None;
-                    refused
+                    self.step_child(at, next, slack, budget)
                 }
                 trailing => self.step_parent(trailing.map(|(at, _)| at), slack, budget),
             };
@@ -31453,7 +31429,7 @@ impl OwnedSourceScan {
                 context_read_budget.flush(index, &codex_selected_flags);
                 if let Some(traces) = &codex_turn_traces {
                     if let Some(traversal) = index.traversal.as_mut() {
-                        traversal.counts.caps.merge(traces.cap_events.take());
+                        traversal.counts.caps.drain(&traces.cap_events);
                     }
                 }
                 if codex_page.continuation() {
@@ -31489,7 +31465,6 @@ impl OwnedSourceScan {
                             &codex_parent_identities,
                             &mut codex_page,
                             sampled_scan::now_seconds(),
-                            codex_turn_traces.as_ref(),
                         );
                     }
                 }
@@ -31498,11 +31473,6 @@ impl OwnedSourceScan {
                     .is_some_and(|phase| phase.pause_before_finalization())
                 {
                     pending!();
-                }
-                if let Some(traces) = &codex_turn_traces {
-                    if let Some(traversal) = index.traversal.as_mut() {
-                        traversal.counts.caps.merge(traces.cap_events.take());
-                    }
                 }
                 let terminal_effects_allowed = source != SnapshotSource::ClaudeCode
                     || claude_terminal_authority(index, true, &census_window_end);
@@ -32204,23 +32174,22 @@ impl OwnedSourceScan {
                         .map_or(0, |traces| traces.since_epoch)
                         as u64;
                     local_diagnostics.price_tier_old_files_without_receipt = index
-                        .files
+                        .file_snapshot_fingerprints
                         .iter()
-                        .filter(|(key, entry)| {
-                            entry.codex_applied_tier_receipt.is_none()
-                                && index.file_snapshot_fingerprints.get(*key).is_some_and(
-                                    |fingerprints| {
-                                        !fingerprints.is_empty()
-                                            && fingerprints.iter().all(|fingerprint| {
-                                                index
-                                                    .snapshot_activity_at
-                                                    .get(fingerprint)
-                                                    .and_then(Option::as_deref)
-                                                    .and_then(rfc3339_unix_seconds)
-                                                    .is_some_and(|activity| activity < cutoff)
-                                            })
-                                    },
-                                )
+                        .filter(|(key, fingerprints)| {
+                            index
+                                .files
+                                .get(*key)
+                                .is_some_and(|entry| entry.codex_applied_tier_receipt.is_none())
+                                && !fingerprints.is_empty()
+                                && fingerprints.iter().all(|fingerprint| {
+                                    index
+                                        .snapshot_activity_at
+                                        .get(fingerprint)
+                                        .and_then(Option::as_deref)
+                                        .and_then(rfc3339_unix_seconds)
+                                        .is_some_and(|activity| activity < cutoff)
+                                })
                         })
                         .count()
                         as u64;
@@ -40907,7 +40876,7 @@ impl CodexTurnTraceMap {
                     &db_path,
                     since_epoch,
                     &mut map.priority_turns,
-                    &map.cap_events,
+                    &map.cap_events[3],
                 );
             }
         }
@@ -40930,7 +40899,7 @@ fn load_codex_logs2_priority_turns(
     path: &Path,
     since_epoch: i64,
     priority_turns: &mut BTreeSet<String>,
-    cap_events: &CapEvents,
+    row_limit_hits: &AtomicU64,
 ) -> bool {
     if !path.exists() {
         return true;
@@ -40976,7 +40945,7 @@ fn load_codex_logs2_priority_turns(
     }
     // Saturation is potential omission, not an exact excluded-trace count.
     if read == CODEX_LOGS2_MAX_ROWS as u64 {
-        cap_events.record(CapEvent::PriceTraceRowLimit, 1);
+        CapCounts::record(row_limit_hits);
     }
     complete && read < CODEX_LOGS2_MAX_ROWS as u64
 }
