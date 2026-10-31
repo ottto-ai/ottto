@@ -514,6 +514,8 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
         "spent",
         "funding",
         "funding_spent",
+        "audit_cap",
+        "prepare_io",
     ] {
         let refuse_return = matches!(return_mode, "capacity" | "poison" | "persistent_capacity");
         let root = crate::test_scratch::ScratchDir::new("cold-prepare-return-tail");
@@ -593,6 +595,51 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
             .unwrap()
             .write_all(suffix.as_bytes())
             .unwrap();
+        if matches!(return_mode, "audit_cap" | "prepare_io") {
+            struct ClearOldSampleIo;
+            impl Drop for ClearOldSampleIo {
+                fn drop(&mut self) {
+                    crate::transcript_acquisition::OLD_SAMPLE_IO_ERROR
+                        .with(|fault| fault.set(false));
+                }
+            }
+            let _clear_io = ClearOldSampleIo;
+            let before = (retail_bytes(source, 0), retail_bytes(source, 1));
+            let mut scan = start(index);
+            if return_mode == "audit_cap" {
+                scan.sampling.as_mut().unwrap().audit_slots = 0;
+                // Like the resident audit-cap regression, offer NEW debt;
+                // an existing unverified marker intentionally bypasses the cap.
+                scan.index
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+            } else {
+                crate::transcript_acquisition::OLD_SAMPLE_IO_ERROR.with(|fault| fault.set(true));
+            }
+            let (_, result, modes) = finish(scan);
+            assert_eq!(modes.0, 1, "cold refusal must reach a fresh Full");
+            assert_eq!(modes.1, 0);
+            assert_eq!(result.snapshots.len(), 1);
+            assert_eq!(result.snapshots[0].input_tokens, 125);
+            let stores = cache.durable().unwrap();
+            assert_eq!(stores.counters.restored, 1, "actual cold transfer");
+            assert_eq!(stores.counters.retail_attempts, 0, "no unused Q11 spend");
+            assert!(stores
+                .retail_spent
+                .values()
+                .all(|custody| custody.spent.is_none()));
+            drop(stores);
+            assert_eq!((retail_bytes(source, 0), retail_bytes(source, 1)), before);
+            let store::LeaseWait::Granted(lease) =
+                cache.acquire_active(source, store::ACTIVE_BYTES)
+            else {
+                panic!("cold Full fallback leaked transfer funding")
+            };
+            lease.release();
+            continue;
+        }
         if return_mode.starts_with("funding") {
             let spent = return_mode == "funding_spent";
             let suffix_bytes = suffix.len() as u64;
