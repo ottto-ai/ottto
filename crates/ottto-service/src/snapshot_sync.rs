@@ -1922,8 +1922,8 @@ impl SnapshotUploadProgress {
                 record.witness = active.clone();
                 record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
             }
-            // Ordinary selection is not a send: deferred admission or an empty
-            // scan must leave the original deadline owed, including on restart.
+            // Selection is not a send. Offered or still-queued work keeps its
+            // deadline; source-held work is paced at the final offer boundary.
         }
         self.active_quarantine_retries = retry;
         !self.active_quarantine_retries.is_empty()
@@ -2150,6 +2150,7 @@ impl SnapshotUploadProgress {
     fn defer_held_quarantine_retries(
         &mut self,
         offered: &[SnapshotItem],
+        index: &ScanIndex,
         source: SnapshotSource,
     ) -> bool {
         let mut deferred = 0;
@@ -2157,6 +2158,7 @@ impl SnapshotUploadProgress {
             if offered
                 .iter()
                 .any(|item| &item.snapshot_fingerprint == fingerprint)
+                || index.quarantine_retry_is_queued(fingerprint)
             {
                 return true;
             }
@@ -8046,7 +8048,7 @@ fn finish_sync_source(
     }
     // The same hook every resend path calls; nothing held is left by now.
     index.retain_claude_history_emission_permitted(&mut scan_result.snapshots);
-    if upload_progress.defer_held_quarantine_retries(&scan_result.snapshots, source) {
+    if upload_progress.defer_held_quarantine_retries(&scan_result.snapshots, &index, source) {
         upload_progress.save(&upload_progress_path)?;
     }
     let projected_pending_head_file_witnesses =
@@ -8944,7 +8946,7 @@ fn finish_sync_source(
 
 /// Contract-origin progress claims were saved by the caller. Mirror those
 /// claims before source acquisition, then bind every selected retry to one file.
-/// Ordinary retries retain their deadlines until an upload actually attempts them.
+/// Ordinary offered/queued retries stay due; source-held ones use ordinary backoff.
 fn save_terminal_contract_claims_for_scan(
     index: &mut ScanIndex,
     progress: &SnapshotUploadProgress,
@@ -18005,7 +18007,11 @@ mod tests {
             "source hold must not acquire the transcript"
         );
         assert!(scan.snapshots.is_empty());
-        assert!(progress.defer_held_quarantine_retries(&scan.snapshots, SnapshotSource::Pi));
+        assert!(progress.defer_held_quarantine_retries(
+            &scan.snapshots,
+            &index,
+            SnapshotSource::Pi
+        ));
         assert!(!scan.census_complete);
         let mut accepted = 0;
         let mut upload_calls = 0;
@@ -18069,6 +18075,32 @@ mod tests {
         let hints =
             save_terminal_contract_claims_for_scan(&mut index, &progress, &index_path).unwrap();
         assert_eq!(hints, vec![session_path.clone()]);
+        let (pending, reads) =
+            crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+                crate::snapshots::scan_source_roots_with_test_limit_and_hints(
+                    SnapshotSource::Pi,
+                    std::slice::from_ref(&root),
+                    &mut index,
+                    collected_at,
+                    crate::snapshots::BACKFILL_WINDOW_DAYS,
+                    0,
+                    true,
+                    &hints,
+                )
+                .unwrap()
+            });
+        assert!(reads.is_empty());
+        assert!(pending.snapshots.is_empty());
+        assert!(index.quarantine_retry_is_queued(&fingerprint));
+        assert!(!progress.defer_held_quarantine_retries(
+            &pending.snapshots,
+            &index,
+            SnapshotSource::Pi
+        ));
+        assert_eq!(
+            progress.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds,
+            0
+        );
         let (mut retry, reads) =
             crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
                 crate::snapshots::scan_source_roots_with_test_limit_and_hints(
@@ -18087,7 +18119,11 @@ mod tests {
         assert_eq!(reads.values().sum::<usize>(), 1);
         assert_eq!(retry.snapshots.len(), 1);
         assert_eq!(retry.snapshots[0].snapshot_fingerprint, fingerprint);
-        assert!(!progress.defer_held_quarantine_retries(&retry.snapshots, SnapshotSource::Pi));
+        assert!(!progress.defer_held_quarantine_retries(
+            &retry.snapshots,
+            &index,
+            SnapshotSource::Pi
+        ));
         // The existing DNS incident class fails before a batch can be sent.
         let unsent = upload_resumable_batches(
             &retry.snapshots,

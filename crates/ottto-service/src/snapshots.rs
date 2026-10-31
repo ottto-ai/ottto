@@ -48576,6 +48576,19 @@ impl ScanIndex {
             .collect()
     }
 
+    /// A leased file still queued for a bounded page has not reached a hold.
+    pub(crate) fn quarantine_retry_is_queued(&self, fingerprint: &str) -> bool {
+        self.terminal_contract_retries
+            .get(fingerprint)
+            .is_some_and(|key| {
+                self.traversal
+                    .iter()
+                    .flat_map(|traversal| traversal.pending_candidates.iter())
+                    .chain(self.claude_stale_family_carry.replay.iter())
+                    .any(|pending| pending.path == Path::new(key))
+            })
+    }
+
     /// Arm this cycle's exact refusal re-offer leases and return the indexed
     /// files that hold them, for the bounded watcher-hint queue. Paths come
     /// only from the committed file/entity incidence table; the scan
