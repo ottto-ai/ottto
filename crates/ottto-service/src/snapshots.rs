@@ -7673,6 +7673,8 @@ pub(crate) struct CensusStatus {
     pub retryable_problem: bool,
     pub transport_reservation_refused: bool,
     pub carry_admission_veto: bool,
+    pub state_loader_failed: bool,
+    pub reconciliation_incomplete: bool,
     pub retry_attempt: u8,
     pub retry_not_before_unix_seconds: Option<u64>,
     pub admission_due_unix_seconds: Option<u64>,
@@ -32060,6 +32062,7 @@ impl OwnedSourceScan {
                     .as_ref()
                     .filter(|_| source == SnapshotSource::ClaudeCode)
                     .and_then(|origin| origin.admission.as_ref());
+                let loaders = &codex_title_metadata.local_diagnostics;
                 let census_status = CensusStatus {
                     pending_work: !traversal.pending_directories.is_empty()
                         || !traversal.pending_candidates.is_empty()
@@ -32070,6 +32073,20 @@ impl OwnedSourceScan {
                         .transport_reservation_refused,
                     carry_admission_veto: admission
                         .is_some_and(|state| !(claude_terminal_off() && state.complete)),
+                    // Completeness also falls on identity conflicts: require
+                    // an actual failed loader (#985), not just a false gate.
+                    state_loader_failed: source == SnapshotSource::Codex
+                        && (!state_census_complete || !sidecar_census_complete)
+                        && [
+                            loaders.state_titles.failed_roots,
+                            loaders.state_threads.failed_roots,
+                            loaders.spawn_edges.failed_roots,
+                            loaders.rollout_extents.failed_roots,
+                            loaders.session_index.failed_roots,
+                        ]
+                        .into_iter()
+                        .any(|failed| failed > 0),
+                    reconciliation_incomplete: !reconciliation_complete,
                     retry_attempt: traversal.unhealthy_retry_attempt,
                     retry_not_before_unix_seconds: traversal
                         .unhealthy_retry_not_before_unix_seconds,

@@ -1285,10 +1285,12 @@ pub const CENSUS_STATUS_CONTRACT: &str = "census_status:v1";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CensusBlockCause {
-    TransportReservation,
-    CarryAdmission,
     UnreadableEvents,
     DisappearedFiles,
+    CarryAdmission,
+    StateLoader,
+    TransportReservation,
+    OwnershipIncomplete,
     Other,
 }
 

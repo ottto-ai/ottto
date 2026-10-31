@@ -11551,14 +11551,20 @@ fn collector_status_request(
     if census_status_active {
         let census = status.counts.census_status;
         // First failed gate wins, even if discovery is still progressing.
-        block_cause = if census.transport_reservation_refused {
-            Some(CensusBlockCause::TransportReservation)
-        } else if census.carry_admission_veto {
-            Some(CensusBlockCause::CarryAdmission)
-        } else if status.counts.unreadable_path_count > 0 {
+        block_cause = if status.counts.unreadable_path_count > 0 {
             Some(CensusBlockCause::UnreadableEvents)
         } else if status.counts.disappeared_file_count > 0 {
             Some(CensusBlockCause::DisappearedFiles)
+        } else if census.carry_admission_veto {
+            Some(CensusBlockCause::CarryAdmission)
+        } else if census.state_loader_failed {
+            Some(CensusBlockCause::StateLoader)
+        } else if census.transport_reservation_refused {
+            Some(CensusBlockCause::TransportReservation)
+        } else if census.reconciliation_incomplete
+            && status.counts.ownership_incomplete_file_count > 0
+        {
+            Some(CensusBlockCause::OwnershipIncomplete)
         } else if !census.pending_work || census.retryable_problem {
             Some(CensusBlockCause::Other)
         } else {
@@ -20024,6 +20030,8 @@ mod tests {
                     retryable_problem: true,
                     transport_reservation_refused: true,
                     carry_admission_veto: true,
+                    state_loader_failed: true,
+                    reconciliation_incomplete: true,
                     retry_attempt: 4,
                     retry_not_before_unix_seconds: Some(60),
                     admission_due_unix_seconds: Some(30),
@@ -20073,33 +20081,71 @@ mod tests {
         }
     }
 
-    /// [behaviour] The real hint boundary and shared builder emit all five
+    /// [behaviour] The real hint boundary and shared builder emit all seven
     /// causes plus advancing work, with fixed priority and truthful retries.
     #[test]
     #[serial(source_manifests)]
     fn census_status_contract_reports_first_gate_and_real_retry() {
         let _source_manifests = SourceManifestTestGuard::new();
         for source in [SnapshotSource::Codex, SnapshotSource::ClaudeCode] {
-            // Earlier rows fail later gates too, proving first-match order.
-            for (transport, carry, unreadable, disappeared, pending, retryable, cause) in [
-                (true, true, 2, 3, true, true, Some("transport_reservation")),
-                (false, true, 2, 3, true, true, Some("carry_admission")),
-                (false, false, 2, 3, true, true, Some("unreadable_events")),
-                (false, false, 0, 3, true, true, Some("disappeared_files")),
-                (false, false, 0, 0, false, false, Some("other")),
-                (false, false, 0, 0, true, true, Some("other")),
-                (false, false, 0, 0, true, false, None),
+            // One row per cause; each earlier row also fails later gates.
+            for (
+                cause,
+                (
+                    unreadable,
+                    disappeared,
+                    carry,
+                    state,
+                    transport,
+                    reconciliation,
+                    ownership,
+                    pending,
+                    retryable,
+                ),
+            ) in [
+                (
+                    Some("unreadable_events"),
+                    (2, 3, true, true, true, true, 1, true, true),
+                ),
+                (
+                    Some("disappeared_files"),
+                    (0, 3, true, true, true, true, 1, true, true),
+                ),
+                (
+                    Some("carry_admission"),
+                    (0, 0, true, true, true, true, 1, true, true),
+                ),
+                (
+                    Some("state_loader"),
+                    (0, 0, false, true, true, true, 1, true, true),
+                ),
+                (
+                    Some("transport_reservation"),
+                    (0, 0, false, false, true, true, 1, true, true),
+                ),
+                (
+                    Some("ownership_incomplete"),
+                    (0, 0, false, false, false, true, 1, true, true),
+                ),
+                (
+                    Some("other"),
+                    (0, 0, false, false, false, true, 0, true, true),
+                ),
+                (None, (0, 0, false, false, false, false, 1, true, false)),
             ] {
                 let mut counts = SyncCounts::for_policy(183);
                 counts.skipped_file_count_due_to_limit = 7;
                 counts.scan_cap_hit = true;
                 counts.unreadable_path_count = unreadable;
                 counts.disappeared_file_count = disappeared;
+                counts.ownership_incomplete_file_count = ownership;
                 counts.census_status = crate::snapshots::CensusStatus {
                     pending_work: pending,
                     retryable_problem: retryable,
                     transport_reservation_refused: transport,
                     carry_admission_veto: carry,
+                    state_loader_failed: state,
+                    reconciliation_incomplete: reconciliation,
                     retry_attempt: 4,
                     retry_not_before_unix_seconds: Some(60),
                     admission_due_unix_seconds: Some(30),
