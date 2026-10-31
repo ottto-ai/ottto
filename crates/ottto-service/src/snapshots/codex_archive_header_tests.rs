@@ -27,32 +27,37 @@ fn with_archive_discovery<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
     run()
 }
 
+/// [format] An index saved with the retired optional header `cli_version`
+/// still loads with its validated header; new saves omit the field.
 #[test]
-fn header_cli_version_is_bounded_at_capture_restore_and_accessor() {
-    for (version, keep) in [
-        ("v1.2".to_owned(), true),
-        (" ".repeat(64), true),
-        ("x".repeat(65), false),
-        ("bad\nversion".to_owned(), false),
-        ("bad\u{7f}".to_owned(), false),
-        ("λ".to_owned(), false),
-    ] {
-        let mut bytes = serde_json::to_vec(&json!({"type":"session_meta", "payload": {
-            "id":"compressed-fixture", "cli_version": version, "timestamp": NOW,
-        }}))
-        .unwrap();
-        bytes.push(b'\n');
-        let header = ValidatedHeader::from_bytes(&bytes).unwrap();
-        assert_eq!(header.cli_version(), keep.then_some(version.as_str()));
-        assert!(header.created_unix_ms.is_some());
-        let mut persisted = serde_json::to_value(&header).unwrap();
-        persisted["cli_version"] = json!(version);
-        let restored: ValidatedHeader = serde_json::from_value(persisted).unwrap();
-        assert_eq!(restored.cli_version(), keep.then_some(version.as_str()));
+fn saved_header_with_retired_cli_version_still_loads() {
+    let f = ArchiveFixture::new(b"synthetic stamp only");
+    let key = local_index_key(&f.0);
+    let mut bytes = serde_json::to_vec(&json!({"type":"session_meta", "payload": {
+        "id":"compressed-fixture", "cli_version": "v1.2", "timestamp": NOW,
+    }}))
+    .unwrap();
+    bytes.push(b'\n');
+    let header = ValidatedHeader::from_bytes(&bytes).unwrap();
+    assert!(header.created_unix_ms.is_some());
+    let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+    evidence.header_validated = Some(header);
+    let mut index = ScanIndex::default();
+    index.files.entry(key.clone()).or_default().archive = Some(Box::new(evidence));
+    let current = serde_json::to_value(&index).unwrap();
+    assert!(current["files"][&key]["archive"]["header_validated"]
+        .get("cli_version")
+        .is_none());
+    let saved = f.0.parent().unwrap().join("index.json");
+    for version in [json!("v1.2"), json!(" ".repeat(64)), json!(null)] {
+        let mut old = current.clone();
+        old["files"][&key]["archive"]["header_validated"]["cli_version"] = version;
+        fs::write(&saved, serde_json::to_vec(&old).unwrap()).unwrap();
+        let restored = ScanIndex::load(&saved).unwrap();
+        assert!(restored.archive_header(&f.0).is_some());
         assert_eq!(
-            restored.cli_version.is_some(),
-            keep,
-            "invalid stored value dropped"
+            serde_json::to_value(&restored).unwrap()["files"][&key]["archive"]["header_validated"],
+            current["files"][&key]["archive"]["header_validated"]
         );
     }
     assert!(ValidatedHeader::from_bytes(b"{}\n").is_none());
@@ -179,7 +184,7 @@ fn inventory_header_once_then_full_once_with_physical_accounting() {
         .as_ref()
         .unwrap()
         .quiet(&File::open(&f.0).unwrap()));
-    assert_eq!(state.codex_archive_cli_version(&f.0), Some("0.77.0"));
+    assert!(state.archive_header(&f.0).is_some());
     assert_eq!(
         decodes(&header_inventory(&f, &mut state, &cache)),
         0,
@@ -238,7 +243,7 @@ fn inventory_header_once_then_full_once_with_physical_accounting() {
     }
     // Content stamp change invalidates the accessor and permits one new header attempt.
     fs::write(&f.0, [encoded.as_slice(), b"changed"].concat()).unwrap();
-    assert!(quiet.codex_archive_cli_version(&f.0).is_none());
+    assert!(quiet.archive_header(&f.0).is_none());
     assert_eq!(decodes(&header_inventory(&f, &mut quiet, &cache)), 1);
     assert_eq!(decodes(&header_inventory(&f, &mut quiet, &cache)), 0);
 }
@@ -342,7 +347,6 @@ fn refused_header_admission_does_not_spend_a_decode_attempt() {
         .unwrap();
     let mut state = ScanIndex::default();
     let key = local_index_key(&f.0);
-    admission_streak(&key, false);
     for attempt in 1..=14 {
         let mut work = funded_header_work();
         let (_, rows) = crate::local_resource_diagnostics::capture(|| {
@@ -369,7 +373,7 @@ fn refused_header_admission_does_not_spend_a_decode_attempt() {
             usize::from(attempt == 12)
         );
         assert_eq!(
-            admission_starved_count(Some(&key)),
+            cache.archive_starved_count(Some(&key)),
             usize::from(attempt >= 12)
         );
         assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_inventory"));
@@ -390,13 +394,12 @@ fn refused_header_admission_does_not_spend_a_decode_attempt() {
             > 0
     );
     assert_eq!(counts["codex_zst_decoder_allocation_refusals"], 0);
-    assert_eq!(admission_starved_count(Some(&key)), 0);
+    assert_eq!(cache.archive_starved_count(Some(&key)), 0);
     assert_eq!(
-        admission_streak(&key, true),
+        cache.archive_streak(&key, true),
         1,
         "funded header reset the streak to zero"
     );
-    admission_streak(&key, false);
     assert_eq!(
         state.files[&key].archive.as_ref().unwrap().decode_attempts,
         0
@@ -529,7 +532,7 @@ fn full_read_accepts_seventy_kib_header_and_settles_once() {
     assert!(observer.0.lock().unwrap().is_empty());
     assert_eq!(result.ownership_incomplete_file_count, 0);
     assert!(!result.snapshots.is_empty());
-    assert_eq!(state.codex_archive_cli_version(&f.0), Some("v-large"));
+    assert!(state.archive_header(&f.0).is_some());
     state.settle_archive_bodies(
         &result
             .snapshots
@@ -713,7 +716,7 @@ fn double_uuid_archive_has_named_owner_hold_no_replacement_or_redecode() {
             > 0
     ));
     assert!(
-        state.codex_archive_cli_version(&f.0).is_none(),
+        state.archive_header(&f.0).is_none(),
         "unbound full header is not shared metadata"
     );
     let cache = Arc::new(sampled_scan::SharedCache::default());
@@ -2970,7 +2973,6 @@ fn header_deferred_gates_and_absent_cache_do_not_increment_admission_streak() {
         .unwrap_or_else(PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let key = local_index_key(&f.0);
-    admission_streak(&key, false);
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut state = ScanIndex::default();
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
@@ -3010,11 +3012,10 @@ fn header_deferred_gates_and_absent_cache_do_not_increment_admission_streak() {
         .iter()
         .any(|r| r["stage"] == "codex_zst_admission_alarm"));
     assert_eq!(
-        admission_streak(&key, true),
+        cache.archive_streak(&key, true),
         1,
         "no actual claim was refused"
     );
-    admission_streak(&key, false);
 }
 
 fn power_plain_sibling(f: &ArchiveFixture) -> CandidateFile {
@@ -3074,7 +3075,7 @@ fn archive_power_loss_after_construction_defers_without_read_or_attempt_and_plai
                 let mut scan = activated_selector_scan(
                     &f,
                     ScanIndex::default(),
-                    cache,
+                    cache.clone(),
                     VecDeque::from([plain, f.candidate()]),
                 );
                 assert!(scan.index.archive_pass.power, "constructed while Allowed");
@@ -3109,7 +3110,7 @@ fn archive_power_loss_after_construction_defers_without_read_or_attempt_and_plai
             1
         );
         assert_eq!(
-            admission_starved_count(Some(&key)),
+            cache.archive_starved_count(Some(&key)),
             0,
             "power refusal is not a claim"
         );
@@ -3138,7 +3139,7 @@ fn archive_power_loss_between_header_and_body_preserves_paid_header_and_plain_pr
                 let scan = activated_selector_scan(
                     &f,
                     ScanIndex::default(),
-                    cache,
+                    cache.clone(),
                     VecDeque::from([plain, f.candidate()]),
                 );
                 crate::local_resource_diagnostics::capture(|| finish_selector(scan))
@@ -3171,7 +3172,7 @@ fn archive_power_loss_between_header_and_body_preserves_paid_header_and_plain_pr
                 .count(),
             1
         );
-        assert_eq!(admission_starved_count(Some(&key)), 0);
+        assert_eq!(cache.archive_starved_count(Some(&key)), 0);
         let (state, result, retry_rows, _) = selector_archive_pass(&f, checkpoint(&state));
         assert_eq!(
             decodes(&retry_rows),
@@ -3201,7 +3202,6 @@ fn activated_selector_reaches_inherited_header_claim_starvation_and_resets_on_pr
     let occupied = OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
         .unwrap()
         .unwrap();
-    admission_streak(&key, false);
     for attempt in 1..=14 {
         let scan = activated_selector_scan(
             &f,
@@ -3221,7 +3221,7 @@ fn activated_selector_reaches_inherited_header_claim_starvation_and_resets_on_pr
             usize::from(attempt == 12)
         );
         assert_eq!(
-            admission_starved_count(Some(&key)),
+            cache.archive_starved_count(Some(&key)),
             usize::from(attempt >= 12)
         );
         assert_eq!(
@@ -3240,7 +3240,7 @@ fn activated_selector_reaches_inherited_header_claim_starvation_and_resets_on_pr
     let scan = activated_selector_scan(
         &f,
         ScanIndex::default(),
-        cache,
+        cache.clone(),
         VecDeque::from([f.candidate()]),
     );
     let ((index, result), rows) =
@@ -3252,9 +3252,8 @@ fn activated_selector_reaches_inherited_header_claim_starvation_and_resets_on_pr
         1
     );
     assert_eq!(
-        admission_streak(&key, true),
+        cache.archive_streak(&key, true),
         1,
         "successful funding reset the inherited streak"
     );
-    admission_streak(&key, false);
 }

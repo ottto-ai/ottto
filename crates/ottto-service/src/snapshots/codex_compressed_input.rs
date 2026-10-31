@@ -6,7 +6,6 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::mem::size_of;
 use std::path::Path;
-use std::sync::{Mutex, PoisonError};
 #[path = "codex_decoder_allocation.rs"]
 mod decoder_allocation;
 use decoder_allocation::Context as DecoderContext;
@@ -76,54 +75,6 @@ pub(super) fn compressed_input_credit() -> io::Result<usize> {
         .ok_or_else(|| invalid("compressed rollout credit overflow"))
 }
 
-pub(super) fn thread_cpu_micros() -> u64 {
-    let mut spec: libc::timespec = unsafe { std::mem::zeroed() };
-    // SAFETY: valid writable timespec, querying only the current thread.
-    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spec) } != 0 {
-        return 0;
-    }
-    (spec.tv_sec as u64)
-        .saturating_mul(1_000_000)
-        .saturating_add(spec.tv_nsec as u64 / 1_000)
-}
-
-static STREAKS: Mutex<BTreeMap<[u8; 32], u8>> = Mutex::new(BTreeMap::new());
-pub(super) fn admission_streak(key: &str, yielded: bool) -> u8 {
-    use sha2::Digest;
-    let hash = sha2::Sha256::digest(key.as_bytes()).into();
-    let mut slots = STREAKS.lock().unwrap_or_else(PoisonError::into_inner);
-    let previous = slots.remove(&hash).unwrap_or(0);
-    if !yielded {
-        return 0;
-    }
-    if slots.len() == 256 {
-        slots.pop_first();
-    }
-    let count = previous.saturating_add(1).min(13);
-    slots.insert(hash, count);
-    count
-}
-/// Shared body-refusal/header-claim signal; header deferral gates are not claims.
-pub(super) fn record_admission_yield(key: &str) {
-    if admission_streak(key, true) == 12 {
-        crate::local_resource_diagnostics::traversal_point(
-            "codex_zst_admission_alarm",
-            "codex",
-            &serde_json::json!({"consecutive_yields": 12, "admission_starved_count": admission_starved_count(None)}),
-        );
-    }
-}
-/// Count starved tracked keys, optionally scoped to one physical archive.
-pub(super) fn admission_starved_count(key: Option<&str>) -> usize {
-    use sha2::Digest;
-    let hash: Option<[u8; 32]> = key.map(|key| sha2::Sha256::digest(key.as_bytes()).into());
-    STREAKS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .filter(|(k, n)| **n >= 12 && hash.as_ref().map_or(true, |h| h == *k))
-        .count()
-}
 impl super::OwnedSourceScan {
     pub(crate) fn persist_archive_reservation(
         &mut self,
@@ -252,14 +203,6 @@ pub(super) struct ValidatedHeader {
     pub(super) owner: String,
     pub(super) digest: String,
     pub(super) created_unix_ms: Option<i64>,
-    #[serde(default, deserialize_with = "bounded_cli_version")]
-    cli_version: Option<String>,
-}
-fn bounded_cli_version<'de, D: serde::Deserializer<'de>>(
-    de: D,
-) -> Result<Option<String>, D::Error> {
-    use serde::Deserialize;
-    Ok(Option::<String>::deserialize(de)?.filter(|s| ValidatedHeader::bounded_version(s)))
 }
 impl ValidatedHeader {
     pub(super) fn from_bytes(bytes: &[u8]) -> Option<Self> {
@@ -281,26 +224,13 @@ impl ValidatedHeader {
                 .and_then(Value::as_str)
                 .and_then(|ts| OffsetDateTime::parse(ts, &Rfc3339).ok())
                 .and_then(|ts| i64::try_from(ts.unix_timestamp_nanos() / 1_000_000).ok()),
-            cli_version: meta
-                .get("cli_version")
-                .and_then(Value::as_str)
-                .filter(|s| Self::bounded_version(s))
-                .map(str::to_owned),
         })
     }
     fn filename_matches(&self, path: &Path) -> bool {
         super::codex_session_id_candidates_from_path(&path.with_extension("")).contains(&self.owner)
     }
-    fn bounded_version(s: &str) -> bool {
-        s.len() <= 64 && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
-    }
-    pub(super) fn cli_version(&self) -> Option<&str> {
-        self.cli_version
-            .as_deref()
-            .filter(|s| Self::bounded_version(s))
-    }
 }
-crate::heap_layout_bound::fields!(ValidatedHeader; owner, digest, created_unix_ms, cli_version);
+crate::heap_layout_bound::fields!(ValidatedHeader; owner, digest, created_unix_ms);
 impl ArchiveEvidence {
     fn header_for(&self, path: &Path) -> Option<&ValidatedHeader> {
         self.header_validated
@@ -592,11 +522,14 @@ impl<R: Read> Read for BoundedDecoder<R> {
         if self.failed {
             return Err(invalid("compressed rollout previously failed"));
         }
-        let started = thread_cpu_micros();
+        let started = crate::context_composition::thread_cpu_micros();
         let result = self.read_inner(output);
-        self.cpu_micros = self
-            .cpu_micros
-            .saturating_add(thread_cpu_micros().saturating_sub(started));
+        if let Some((started, ended)) = started.zip(crate::context_composition::thread_cpu_micros())
+        {
+            self.cpu_micros = self
+                .cpu_micros
+                .saturating_add(ended.saturating_sub(started));
+        }
         if result.is_err() {
             self.failed = true;
         }
@@ -816,6 +749,7 @@ impl std::error::Error for ArchiveScopeDeferred {}
 impl super::ScanCensus {
     pub(super) fn archive_parser_failure(
         &mut self,
+        cache: Option<&super::sampled_scan::SharedCache>,
         source: super::SnapshotSource,
         index: &super::ScanIndex,
         path: &Path,
@@ -837,7 +771,7 @@ impl super::ScanCensus {
             || error.is::<ArchiveAdmissionYield>()
             || bodyless_pending
         {
-            self.archive_failure(index, path, super::UnreadableCause::Reduction);
+            self.archive_failure(cache, index, path, super::UnreadableCause::Reduction);
         } else {
             let cause = archive
                 .and_then(|a| a.terminal_cause())
@@ -847,6 +781,7 @@ impl super::ScanCensus {
     }
     pub(super) fn archive_failure(
         &mut self,
+        cache: Option<&super::sampled_scan::SharedCache>,
         index: &super::ScanIndex,
         path: &Path,
         normal: super::UnreadableCause,
@@ -854,7 +789,9 @@ impl super::ScanCensus {
         let key = super::local_index_key(path);
         let archive = index.files.get(&key).and_then(|e| e.archive.as_deref());
         if let Some(cause) = archive.and_then(|a| a.terminal_cause()).or_else(|| {
-            (admission_starved_count(Some(&key)) > 0).then_some(CodexZstCause::AdmissionStarved)
+            cache
+                .is_some_and(|cache| cache.archive_starved_count(Some(&key)) > 0)
+                .then_some(CodexZstCause::AdmissionStarved)
         }) {
             self.archive_residue(path, archive, cause);
         } else {
@@ -982,9 +919,6 @@ impl super::ScanIndex {
         }
     }
 
-    pub fn codex_archive_cli_version(&self, path: &Path) -> Option<&str> {
-        self.archive_header(path)?.cli_version()
-    }
     pub(super) fn archive_header(&self, path: &Path) -> Option<&ValidatedHeader> {
         let key = super::local_index_key(path);
         let archive = self.files.get(&key)?.archive.as_ref()?;
@@ -1025,17 +959,17 @@ impl super::ScanIndex {
         if work.cpu_micros >= 30_000_000 {
             return Ok(HeaderRead::Deferred);
         }
-        let started = thread_cpu_micros();
+        let started = crate::context_composition::thread_cpu_micros();
         let mut evidence = ArchiveEvidence::begin(&file, &candidate.path, previous)?;
         evidence.disposition = ArchiveDisposition::HeaderValidated;
         evidence.decode_attempts = 0;
-        let mut input = match cache.map(|cache| OpenedInput::funded(file, cache)) {
-            Some(Ok(Some(input))) => {
-                admission_streak(&key, false);
+        let mut input = match cache.map(|cache| (cache, OpenedInput::funded(file, cache))) {
+            Some((cache, Ok(Some(input)))) => {
+                cache.archive_streak(&key, false);
                 input.header_only()
             }
-            Some(Ok(None)) => {
-                record_admission_yield(&key);
+            Some((cache, Ok(None))) => {
+                cache.archive_yield(&key);
                 return Ok(HeaderRead::Deferred);
             }
             _ => {
@@ -1074,7 +1008,10 @@ impl super::ScanIndex {
             ),
             _ => unreachable!(),
         };
-        let cpu = thread_cpu_micros().saturating_sub(started);
+        // Unknown CPU exhausts the header work: unknown is denied.
+        let cpu = started
+            .zip(crate::context_composition::thread_cpu_micros())
+            .map_or(u64::MAX, |(started, ended)| ended.saturating_sub(started));
         work.physical_bytes = work.physical_bytes.saturating_add(physical);
         work.decoded_bytes = work.decoded_bytes.saturating_add(decoded);
         work.cpu_micros = work.cpu_micros.saturating_add(cpu);
@@ -1184,6 +1121,7 @@ pub(in crate::snapshots) mod tests {
     use crate::transcript_acquisition::Scope;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::sync::{Mutex, PoisonError};
 
     pub(in crate::snapshots) static DECODER_TEST_LOCK: Mutex<()> = Mutex::new(());
     const NOW: &str = "2026-10-07T12:00:00Z";
@@ -1215,6 +1153,7 @@ pub(in crate::snapshots) mod tests {
         }
     }
 
+    /// [regress] Darwin decoder peak outgrew the old 9.8 MB credit (Mac CI run 40942402563).
     #[test]
     fn decoder_credit_preserves_the_platform_receipt_and_margin() {
         #[cfg(target_os = "macos")]
@@ -1231,6 +1170,7 @@ pub(in crate::snapshots) mod tests {
         // upgraded decoder no longer fits its platform credit plus 10%.
     }
 
+    /// [behaviour]
     #[test]
     fn decoder_native_peak_is_visible_on_the_existing_input_carrier() {
         let f = fixture(
@@ -1258,6 +1198,7 @@ pub(in crate::snapshots) mod tests {
         assert_eq!(counts["codex_zst_decoder_allocation_refusals"], 0);
     }
 
+    /// [behaviour]
     #[test]
     fn decoder_production_window_peak_allocation() {
         // Streaming, unknown content size prevents the encoder shrinking the
@@ -1648,6 +1589,18 @@ pub(in crate::snapshots) mod tests {
         roots: &[PathBuf],
         setup: impl FnOnce(&mut OwnedSourceScan),
     ) -> (ScanIndex, SourceScanResult, Vec<Value>, Ends) {
+        let cache = paid.then(|| Arc::new(sampled_scan::SharedCache::default()));
+        archive_pass_in(f, index, cache, limit, roots, setup)
+    }
+    /// `archive_pass_with` in one process cache across passes.
+    fn archive_pass_in(
+        f: &ArchiveFixture,
+        index: ScanIndex,
+        cache: Option<Arc<sampled_scan::SharedCache>>,
+        limit: Option<u64>,
+        roots: &[PathBuf],
+        setup: impl FnOnce(&mut OwnedSourceScan),
+    ) -> (ScanIndex, SourceScanResult, Vec<Value>, Ends) {
         let ends = Ends::default();
         let mut committed = index.clone();
         let reservation_path = f.0.parent().unwrap().join("reservation.json");
@@ -1667,11 +1620,8 @@ pub(in crate::snapshots) mod tests {
                 true,
             )
             .with_line_observer("archive", Box::new(ends.clone()));
-            if paid {
-                scan = scan.with_sampled_acquisition(
-                    Arc::new(sampled_scan::SharedCache::default()),
-                    Scope("archive-test".into()),
-                );
+            if let Some(cache) = cache {
+                scan = scan.with_sampled_acquisition(cache, Scope("archive-test".into()));
             }
             // Deterministic A1 permission; corrections need the explicit A3
             // permission fixture, independently of the host's actual power.
@@ -2294,6 +2244,7 @@ pub(in crate::snapshots) mod tests {
             ArchiveDisposition::Pending { attempts, .. } if attempts == expected)
         );
     }
+    /// [behaviour]
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn archive_admission_yields_without_consuming_evidence_or_a_retry() {
@@ -2345,6 +2296,7 @@ pub(in crate::snapshots) mod tests {
             }
         }
     }
+    /// [behaviour]
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn archive_interrupted_decode_budget_sticks_and_content_change_resets_attempts() {
@@ -2427,6 +2379,7 @@ pub(in crate::snapshots) mod tests {
             fs::write(&f.0, &encoded).unwrap();
         }
     }
+    /// [behaviour]
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn archive_identity_revalidation_failure_remains_pending_and_releases_owner() {
@@ -2454,6 +2407,7 @@ pub(in crate::snapshots) mod tests {
             .contains(&super::super::line_delivery::DeliveryEnd::Complete));
         assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_owner"));
     }
+    /// [behaviour]
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn archive_expired_launch_evidence_is_a_pending_finish_error() {
@@ -2516,6 +2470,7 @@ pub(in crate::snapshots) mod tests {
             assert!(result.unreadable_path_count > 0);
         }
     }
+    /// [behaviour]
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn pending_io_without_body_remains_disclosed_on_every_quiet_pass() {
@@ -2538,105 +2493,100 @@ pub(in crate::snapshots) mod tests {
             index = next;
         }
     }
+    /// [behaviour] Twelve consecutive funding yields alarm once and make the
+    /// archive's failure starved residue; a yield writes no evidence and a
+    /// funded read ends the streak.
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
-    fn admission_starvation_alarms_at_twelve_passes_without_touching_evidence() {
+    fn admission_starvation_alarms_at_twelve_yields_without_touching_evidence() {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let f =
             ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let key = local_index_key(&f.0);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let busy = OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
+            .unwrap()
+            .unwrap();
         let mut index = ScanIndex::default();
-        let saved_index = f.0.parent().unwrap().join("index.json");
         for pass in 1..=14 {
-            assert!(serde_json::to_value(&index)
-                .unwrap()
-                .get("compressed_admission_yields")
-                .is_none());
-            index.save(&saved_index).unwrap();
-            assert!(!fs::read_to_string(&saved_index)
-                .unwrap()
-                .contains("compressed_admission_yields"));
-            index = ScanIndex::load(&saved_index).unwrap();
-            // Each yield is a new retry generation. A retained generation keeps
-            // its earlier RU counts even after this archive becomes residue.
-            index.traversal = None;
-            let (next, result, rows, _) = archive_pass(&f, index, false, None);
-            assert!(next.files.is_empty());
+            let (result, rows) = crate::local_resource_diagnostics::capture(|| {
+                factory(&f, &mut index, Some(&cache)).map(|_| ())
+            });
+            assert!(result.is_err());
+            assert!(index.files.is_empty());
             assert_eq!(decodes(&rows), 0);
-            assert_eq!(result.unreadable_path_count > 0, pass < 12);
-            assert_eq!(
-                rows.iter()
-                    .filter(|r| r["stage"] == "codex_zst_refused")
-                    .count(),
-                1
-            );
             assert_eq!(
                 rows.iter()
                     .filter(|r| r["stage"] == "codex_zst_admission_alarm")
                     .count(),
                 usize::from(pass == 12)
             );
-            index = next;
+            let mut census = ScanCensus::default();
+            census.archive_failure(Some(&cache), &index, &f.0, UnreadableCause::Reduction);
+            assert_eq!(census.unreadable_path_count > 0, pass < 12);
         }
-        let (index, _, rows, _) = archive_pass(&f, index, true, None);
-        assert_eq!(decodes(&rows), 1);
-        let key = local_index_key(&f.0);
-        assert_eq!(
-            admission_streak(&key, true),
-            1,
-            "funding reset the process streak"
-        );
-        admission_streak(&key, false);
+        busy.close();
+        factory(&f, &mut index, Some(&cache))
+            .unwrap()
+            .reader
+            .reader
+            .close();
+        assert_eq!(cache.archive_starved_count(Some(&key)), 0);
         assert!(index.files[&key].archive.is_some());
     }
+    /// [behaviour] Streaks stay bounded, live only in the process cache and
+    /// end when their index key is retired.
     #[test]
     fn admission_streaks_are_bounded_and_retired_with_archive_keys() {
-        let _lock = ARCHIVE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        STREAKS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        for i in 0..512 {
-            assert_eq!(admission_streak(&format!("synthetic-archive-{i}"), true), 1);
-            assert!(STREAKS.lock().unwrap_or_else(PoisonError::into_inner).len() <= 256);
+        let cache = sampled_scan::SharedCache::default();
+        for i in 0..300 {
+            for _ in 0..12 {
+                cache.archive_streak(&format!("synthetic-archive-{i}"), true);
+            }
         }
-        assert_eq!(
-            STREAKS.lock().unwrap_or_else(PoisonError::into_inner).len(),
-            256
+        assert_eq!(cache.archive_starved_count(None), 256);
+        let key = "z-absent".to_owned();
+        for _ in 0..12 {
+            cache.archive_streak(&key, true);
+        }
+        assert_eq!(cache.archive_starved_count(Some(&key)), 1);
+        let mut scan = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &[],
+            ScanIndex::default(),
+            NOW,
+            365,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            false,
         );
-        let f = ArchiveFixture::new(b"synthetic stamp only");
-        let key = local_index_key(&f.0);
-        assert_eq!(admission_streak(&key, true), 1);
-        let mut index = ScanIndex::default();
-        index.files.entry(key.clone()).or_default().archive = Some(Box::new(
-            ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap(),
-        ));
-        assert!(serde_json::to_value(&index)
+        scan.index
+            .traversal
+            .as_mut()
             .unwrap()
-            .get("compressed_admission_yields")
-            .is_none());
-        assert!(!super::super::lenient_decode::FIELDS.contains(&"compressed_admission_yields"));
-        index.remove_file_entry(&key);
-        assert!(!index.files.contains_key(&key));
+            .reconciliation_upper_bound = Some(key.clone());
+        scan.index
+            .files
+            .insert(key.clone(), ScanIndexEntry::default());
+        assert!(reconcile_missing_index_entries_with_side(
+            &mut scan.index,
+            100,
+            Some((&cache, 0))
+        ));
+        assert!(!scan.index.files.contains_key(&key));
+        assert_eq!(cache.archive_starved_count(Some(&key)), 0, "retirement");
         assert_eq!(
-            admission_streak(&key, true),
-            1,
-            "retirement reset the streak"
+            sampled_scan::SharedCache::default().archive_starved_count(None),
+            0,
+            "a new process starts every streak again"
         );
-        STREAKS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        assert_eq!(
-            admission_streak(&key, true),
-            1,
-            "new process starts a new streak"
-        );
-        admission_streak(&key, false);
     }
+    /// [off=main]
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn actual_plain_codex_record_has_no_archive_allocation() {
@@ -2720,6 +2670,7 @@ pub(in crate::snapshots) mod tests {
             _ => panic!("expected funded decoder"),
         }
     }
+    /// [money]
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn retained_ack_cannot_settle_a_new_failed_archive_attempt() {
@@ -2774,6 +2725,7 @@ pub(in crate::snapshots) mod tests {
             ArchiveDisposition::Acquired
         ));
     }
+    /// [money]
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn archive_and_plain_prior_exclusive_bodies_suppress_state_only_replacements() {
@@ -2901,6 +2853,7 @@ pub(in crate::snapshots) mod tests {
             }
         }
     }
+    /// [format]
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn archive_reservation_is_durable_before_read_and_survives_mid_decode_crash() {
@@ -2979,6 +2932,7 @@ pub(in crate::snapshots) mod tests {
             .reader
             .close();
     }
+    /// [format]
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn archive_reservation_save_failure_releases_owner_and_restores_committed_entry() {
@@ -3005,6 +2959,7 @@ pub(in crate::snapshots) mod tests {
             |r| r["stage"] == "codex_zst_input" && r["counts"]["codex_zst_decoded_bytes"] == 0
         ));
     }
+    /// [behaviour]
     #[test]
     fn decoder_read_io_is_not_a_sticky_content_refusal() {
         struct Broken;
@@ -3021,6 +2976,7 @@ pub(in crate::snapshots) mod tests {
             .and_then(|e| e.downcast_ref::<CodexZstCause>())
             .is_none());
     }
+    /// [format]
     #[test]
     fn plain_entries_have_no_archive_allocation_and_stubs_grant_no_authority() {
         use crate::heap_layout_bound::HeapLayoutBound;
@@ -3055,6 +3011,7 @@ pub(in crate::snapshots) mod tests {
         assert!(saved.confirmed_empty_files.is_empty());
         assert!(saved.traversal.is_none());
     }
+    /// [money]
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn archive_priority_receipt_survives_trace_expiry_and_lost_ack() {
@@ -3122,6 +3079,7 @@ pub(in crate::snapshots) mod tests {
             serde_json::to_value(&first.snapshots).unwrap()
         );
     }
+    /// [format]
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn archive_v2_and_legacy_ack_evidence_carry_with_settled_bodies() {
@@ -3182,6 +3140,7 @@ pub(in crate::snapshots) mod tests {
             assert!(result.snapshots.is_empty());
         }
     }
+    /// [money]
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn archive_fork_child_before_plain_parent_recovers_exclusive_money_on_bounded_retry() {

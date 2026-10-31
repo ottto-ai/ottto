@@ -16,6 +16,7 @@ const STATE_BYTES: usize =
     CACHE_BYTES - crate::source_rotation::OVERLAP_BUDGET - AUDIT_AND_SCRATCH_BYTES;
 
 pub(super) mod codex_cursor;
+pub(crate) use codex_cursor::ArchivePass;
 #[cfg(unix)]
 pub(super) mod durable_tail;
 #[cfg(all(unix, test))]
@@ -2121,7 +2122,7 @@ pub(super) fn new_source_parser_with_archive_scope(
                                 }
                                 codex_zst_refused(CodexZstCause::CorrectionUnapplied);
                             })?;
-                        codex_compressed_input::admission_streak(&key, false);
+                        cache.archive_streak(&key, false);
                         index
                             .files
                             .get_mut(&key)
@@ -2163,10 +2164,14 @@ pub(super) fn new_source_parser_with_archive_scope(
             }
         };
         let Some(input) = input else {
-            codex_compressed_input::record_admission_yield(&key);
+            if let Some(cache) = cache {
+                cache.archive_yield(&key);
+            }
             anyhow::bail!(codex_compressed_input::ArchiveAdmissionYield);
         };
-        codex_compressed_input::admission_streak(&key, false);
+        if let Some(cache) = cache {
+            cache.archive_streak(&key, false);
+        }
         let mut evidence = match codex_compressed_input::ArchiveEvidence::begin(
             input.get_ref(),
             &candidate.path,
