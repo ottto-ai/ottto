@@ -15997,8 +15997,6 @@ fn plain_cursor_resumes_unchanged_when_its_archive_sibling_is_family_held() {
             &paths,
             Some(&dirs),
         );
-        // Synthetic future-admission seam; cached headers still need QoS permission.
-        inv.archive_work.allowed = true;
         while inv.step_with_archive(&CodexTitleMetadata::default(), &mut index, Some(&cache))
             != codex_file_join::HeaderStep::Complete
         {}
