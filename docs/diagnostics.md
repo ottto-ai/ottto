@@ -441,6 +441,18 @@ before creating a credential-bearing client. Environment/default endpoint
 fallback applies only when the binding is absent, never after a failed load.
 This applies to every source and composition/footprint/inventory harvest.
 
+## Unreadable Codex Slot Registry (File Watcher)
+
+The transcript file watcher also watches each accepted Codex slot home's
+`sessions/` and `archived_sessions/`. When the Codex slot registry cannot be
+read, the watcher keeps its other roots and the slot homes it last read (none
+at daemon start), and emits a schema-2 `watcher_roots` point on the existing
+`local_resources` carrier with `counts.codex_slot_registry_unreadable: 1`,
+once each time the registry becomes unreadable. There is no cumulative total.
+The next successful read replaces the slot homes. No path or error text is
+emitted. Collection does not depend on the watcher; slot transcripts are still
+found by the scan.
+
 ## Unreadable Connection Binding
 
 Endpoint resolution also emits a schema-2 `connection_binding_read` point on

@@ -117,38 +117,45 @@ fn watcher_roots_with(
     read: Result<Vec<PathBuf>>,
     codex: &mut WatchedCodexHomes,
 ) -> Result<Vec<(SnapshotSource, PathBuf)>> {
-    match read {
-        Ok(mut homes) => {
+    let homes = match &read {
+        Ok(homes) => {
+            let mut homes = homes.clone();
             homes.sort();
-            *codex = WatchedCodexHomes {
-                homes,
-                registry_unreadable: false,
-            };
+            homes
         }
-        Err(_) if !codex.registry_unreadable => {
-            codex.registry_unreadable = true;
-            crate::local_resource_diagnostics::traversal_point(
-                "watcher_roots",
-                "codex",
-                &serde_json::json!({"codex_slot_registry_unreadable": 1}),
-            );
-        }
-        Err(_) => {}
-    }
-    [
+        Err(_) => codex.homes.clone(),
+    };
+    let roots = [
         SnapshotSource::Codex,
         SnapshotSource::ClaudeCode,
         SnapshotSource::Pi,
     ]
     .into_iter()
     .map(|source| {
-        Ok(scan_roots(source, home, &codex.homes)?
+        Ok(scan_roots(source, home, &homes)?
             .into_iter()
             .map(|root| (source, root))
             .collect::<Vec<_>>())
     })
-    .collect::<Result<Vec<_>>>()
-    .map(|roots| roots.into_iter().flatten().collect())
+    .collect::<Result<Vec<_>>>()?
+    .into_iter()
+    .flatten()
+    .collect();
+    // Only roots the caller receives update the state.
+    if read.is_ok() {
+        *codex = WatchedCodexHomes {
+            homes,
+            registry_unreadable: false,
+        };
+    } else if !codex.registry_unreadable {
+        codex.registry_unreadable = true;
+        crate::local_resource_diagnostics::traversal_point(
+            "watcher_roots",
+            "codex",
+            &serde_json::json!({"codex_slot_registry_unreadable": 1}),
+        );
+    }
+    Ok(roots)
 }
 
 pub(crate) fn validate_claude_roots(home: &Path, expected: &[PathBuf]) -> Result<()> {
@@ -524,7 +531,12 @@ mod tests {
                 .count()
         };
         assert_eq!(counted(&lines), 1);
-        assert!(!roots.iter().any(|(_, root)| root == &slot_sessions));
+        let codex_roots = roots
+            .iter()
+            .filter(|(source, _)| *source == SnapshotSource::Codex)
+            .map(|(_, root)| root.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(codex_roots, SnapshotSource::Codex.default_roots(&home));
         assert_codex_write_queued(
             roots,
             &day.join("rollout-2026-10-31T10-00-00-default.jsonl"),
