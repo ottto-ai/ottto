@@ -392,117 +392,6 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Capture is process-local in RAM, but a durable checkpoint crosses a
-/// restart. Both toggle directions must change Claude's binding (Codex is
-/// unaffected) and refuse the old record under the actual env setting.
-#[test]
-fn attribution_capture_toggle_refuses_the_previous_claude_record() {
-    if !crate::test_isolation::run_here() {
-        return;
-    }
-    let root = crate::test_scratch::private_dir("ottto-dt-attribution");
-    let lock = test_locks::hold(&root);
-    let source = SnapshotSource::ClaudeCode;
-    let namespace = Scope("attribution-test".into());
-    let scope = Scope("attribution-file".into());
-    let index_path = root.join("index.json");
-    let path = root.join("11111111-2222-4333-8444-555555555555.jsonl");
-    native_fixture(&path);
-    let key = local_index_key(&path);
-    let mut index = ScanIndex::default();
-    index.files.insert(
-        key.clone(),
-        serde_json::from_value(serde_json::json!({
-            "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"
-        }))
-        .unwrap(),
-    );
-    index.save(&index_path).unwrap();
-    for before in [false, true] {
-        // Isolated child process: no concurrent test can observe the env.
-        std::env::set_var(
-            "OTTTO_CLAUDE_ATTRIBUTION_CAPTURE",
-            if before { "1" } else { "0" },
-        );
-        let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
-        let codex_before =
-            Interpretation::of(SnapshotSource::Codex, &key, &index, false, &namespace);
-        let binding = expected(
-            DurableSource::ClaudeCode,
-            source,
-            &key,
-            &scope,
-            &index,
-            &interpretation,
-            None,
-        )
-        .unwrap()
-        .binding;
-        let (reduction, _) = native_record(&path, &scope);
-        let mut store = DurableTailStore::new(
-            store::store_dir_for_index(&index_path),
-            durable_source(source).unwrap(),
-        );
-        store
-            .write_after_save(
-                lock,
-                index.generation,
-                vec![PendingRecord {
-                    binding: binding.clone(),
-                    certificate: certificate(&path, &scope),
-                    body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
-                        .unwrap(),
-                    allowlist: codec::allowlist_digest(source),
-                }],
-            )
-            .unwrap();
-        std::env::set_var(
-            "OTTTO_CLAUDE_ATTRIBUTION_CAPTURE",
-            if before { "0" } else { "1" },
-        );
-        let after = Interpretation::of(source, &key, &index, false, &namespace);
-        let changed = expected(
-            DurableSource::ClaudeCode,
-            source,
-            &key,
-            &scope,
-            &index,
-            &after,
-            None,
-        )
-        .unwrap()
-        .binding;
-        assert_ne!(binding.scope, changed.scope);
-        assert_eq!(binding.entry, changed.entry);
-        assert_eq!(binding.key, changed.key);
-        assert_eq!(binding.context, changed.context);
-        assert_eq!(
-            codex_before.identity_contract,
-            Interpretation::of(SnapshotSource::Codex, &key, &index, false, &namespace)
-                .identity_contract
-        );
-        let cache = SharedCache::default();
-        cache.durable_begin_pass(source, &index_path, &namespace, false);
-        assert!(cache
-            .durable_restore(
-                source,
-                &key,
-                &path,
-                &scope,
-                &mut File::open(&path).unwrap(),
-                &index,
-                &after
-            )
-            .into_test_option()
-            .is_none());
-        let (counts, disk) = cache.durable_counters(source).unwrap();
-        assert_eq!(counts.ineligible.get("scope"), Some(&1));
-        assert_eq!(counts.restored, 0);
-        assert_eq!(disk.records_read, 1);
-    }
-    let _ = std::fs::remove_dir_all(root);
-}
-
 /// A Codex transcript whose open call's id is `call_id_bytes` long: the id
 /// is kept verbatim in the record body, so it sizes the body. Three counted
 /// requests close the session-start window first, so its re-derived opening
@@ -3198,10 +3087,7 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
     let before = Interpretation::of(source, &key, &index, true, &namespace);
     assert_eq!(
         before.identity_contract,
-        format!(
-            "claude_code_jsonl:own_request_identity_rows:v1/e2_grouping:v1|changed=false|capture=true|attr={}",
-            claude_attribution_capture_enabled()
-        ),
+        "claude_code_jsonl:own_request_identity_rows:v1/e2_grouping:v1|changed=false|capture=true",
         "the pre-cutover interpretation bytes"
     );
     let capture = claude_request_identity::captures(source);

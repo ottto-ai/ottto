@@ -184,9 +184,10 @@ pub(super) const KEY_CONTEXT_FIELDS: usize =
     SELECTOR_CONTEXT_ALLOWED.len() + ROW_BILLING_FIELDS.len();
 
 /// Live copies of one usage row's strings and maps (X_out family R): the
-/// accumulator's row, `bound_claude_attribution_mcp_tool_cardinality`'s
-/// clone (past its row limit also a fallback key and a rewritten row), and
-/// the bucket and session `SnapshotModelUsage` clones `into_items` emits.
+/// accumulator's row and the bucket and session `SnapshotModelUsage` clones
+/// `into_items` emits. The other two are the retired Claude attribution
+/// rebalancer's clone and fallback row, still charged until the X_out owner
+/// re-proves the bound without them.
 pub(super) const ROW_COPIES: usize = 5;
 /// A `time` RFC 3339 text: at most 35 bytes (four-digit year, nine fraction
 /// digits, a `+hh:mm` offset) in a buffer grown to at most twice that.
