@@ -6,9 +6,7 @@
 // into future-paging completion just to make those controls pass.
 use super::*;
 use crate::snapshots::claude_request_money::e2;
-use crate::snapshots::e2_pipeline_scan_fixture::{
-    birth_store_bytes, without_money_folds, E2ScanFixture,
-};
+use crate::snapshots::e2_pipeline_scan_fixture::{birth_store_bytes, E2ScanFixture};
 use serde_json::json;
 
 const ROOT: &str = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
@@ -610,67 +608,6 @@ fn terminal_off_on_ready(
         "real finalized bodies pass batching and entity ACK"
     );
     p
-}
-
-#[test]
-fn e2_pipeline_dark_matches_fold_absent_publication_and_selection() {
-    e2_pipeline_dark_matches_fold_absent_publication_and_selection_body();
-}
-
-fn e2_pipeline_dark_matches_fold_absent_publication_and_selection_body() {
-    let mut c = Corpus::new("e2-pipeline-dark");
-    crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&c.support, &[ROOT, COPY]);
-    c.root(
-        ROOT,
-        &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:01:00Z", 20)),
-    );
-    c.agent(0, &line(ROOT, "agent", AT, 3));
-    c.write_at(
-        &format!("alternate/{ROOT}.jsonl"),
-        &line(ROOT, "r1", AT, 10),
-        "2026-08-02T07:03:00Z",
-    );
-    c.write_at(
-        &format!("{COPY}.jsonl"),
-        &(line(COPY, "r1", AT, 10) + &line(COPY, "branch-own", "2026-08-02T07:04:00Z", 2)),
-        "2026-08-02T07:03:00Z",
-    );
-    c.evidence(&[api("r1", 10, 100)], &[]);
-    let scanner = E2ScanFixture::default();
-    let mut dark = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
-    let mut reference = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
-    without_money_folds(&mut reference.scan);
-    dark.enrich(&c);
-    reference.enrich(&c);
-    assert_eq!(
-        canonical(&dark.scan.snapshots),
-        canonical(&reference.scan.snapshots)
-    );
-    dark.finish();
-    reference.finish();
-    assert_eq!(dark.receipt(), reference.receipt());
-    let (mut a, mut b) = (e2_progress(), e2_progress());
-    let (ra, ba, oa) = upload(&dark.scan.snapshots, &mut a, ack);
-    let (rb, bb, ob) = upload(&reference.scan.snapshots, &mut b, ack);
-    assert_eq!(ra.unwrap(), rb.unwrap());
-    assert_eq!((ba, oa), (bb, ob));
-    assert_eq!(canonical(&a), canonical(&b));
-    dark.index
-        .record_accepted_snapshot_fingerprints(&a.accepted_fingerprints);
-    reference
-        .index
-        .record_accepted_snapshot_fingerprints(&b.accepted_fingerprints);
-    assert_eq!(canonical(&dark.index), canonical(&reference.index));
-    let next_a = c.raw(&scanner, dark.index, 100, false, &[]);
-    let next_b = c.raw(&scanner, reference.index, 100, false, &[]);
-    assert_eq!(
-        canonical(&next_a.scan.snapshots),
-        canonical(&next_b.scan.snapshots)
-    );
-    assert_eq!(
-        next_a.scan.scanned_file_count,
-        next_b.scan.scanned_file_count
-    );
 }
 
 /// [money] Cumulative acquisition modes and an independent cold read preserve all money fields.

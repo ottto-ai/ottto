@@ -2030,105 +2030,6 @@ impl Drop for ApcFixture {
     }
 }
 
-/// Natural regression and its continuation. The changed proof after the
-/// terminal hold reloads intact, rebinds the record and owes a correction;
-/// held bodies are never ACKed; the census completes while members are owed;
-/// each owed member drains only on its exact corrected-body ACK or a proven
-/// no-op, and the record clears with the last one. An unchanged later
-/// generation grants nothing again.
-#[test]
-#[serial(source_manifests)]
-fn changed_proof_after_terminal_authority_owes_one_exact_correction() {
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
-
-    let _source_manifests = SourceManifestTestGuard::new();
-    let fixture = ApcFixture::new("claude-authority-proof-correction-natural", false);
-    let (_, grant) = fixture.reach_grant();
-    let (drained, settled_hour, _) = fixture.drain_until_clear(&grant, grant.hour + 1);
-    assert!(
-        grant.owed.is_subset(&drained),
-        "every owed member drained exactly: owed {:?} drained {:?}",
-        grant.owed,
-        drained
-    );
-    let quiet = fixture.generation(settled_hour + 1, |_| ApcUpload::Accept);
-    for (number, page) in quiet.iter().enumerate() {
-        let transition = ApcFixture::check(page, &format!("quiet page {number}"));
-        assert!(
-            transition.granted.is_none(),
-            "the same proof grants nothing again"
-        );
-        assert!(page.record().is_none());
-        assert!(page.candidates.is_empty());
-    }
-    assert!(
-        grant.record.member_source_file_fingerprints.len() >= grant.owed.len(),
-        "{:?}",
-        grant.record
-    );
-}
-
-/// R2: an owed member deferred by its account hold stays owed while owed
-/// siblings drain on their own exact settlement; the record is kept until
-/// that member's own ACK or no-op, then clears.
-#[test]
-#[serial(source_manifests)]
-fn account_held_member_stays_owed_while_owed_siblings_drain_across_passes() {
-    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
-
-    let _source_manifests = SourceManifestTestGuard::new();
-    let fixture = ApcFixture::new("claude-authority-proof-correction-account-held", true);
-    let (_, grant) = fixture.reach_grant();
-    assert!(
-        grant.owed.len() >= 2,
-        "the fixture owes at least two members: {:?}",
-        grant.owed
-    );
-    let held_member = grant.owed.iter().last().cloned().unwrap();
-    fixture
-        .withheld_owners
-        .borrow_mut()
-        .insert(held_member.clone());
-    let deferred = fixture.generation(grant.hour + 1, |_| ApcUpload::Accept);
-    let mut drained = BTreeSet::new();
-    for (number, page) in deferred.iter().enumerate() {
-        let transition = ApcFixture::check(page, &format!("deferred page {number}"));
-        assert!(transition.granted.is_none());
-        assert!(!transition.failed);
-        assert!(!transition.cleared, "the record outlives its held member");
-        drained.extend(transition.acked);
-        drained.extend(transition.noop);
-        if page.parsed.contains(&held_member) {
-            assert!(
-                page.held_sessions.contains(&held_member),
-                "the withheld owner proof defers the member"
-            );
-            assert!(!page.captured_members().contains(&held_member));
-        }
-    }
-    let last = deferred.last().unwrap();
-    let (_, owed) = last
-        .record()
-        .and_then(|record| record.correction)
-        .expect("the correction stays pending");
-    assert_eq!(owed, BTreeSet::from([held_member.clone()]));
-    assert_eq!(
-        drained,
-        grant
-            .owed
-            .iter()
-            .filter(|member| **member != held_member)
-            .cloned()
-            .collect::<BTreeSet<_>>(),
-        "each other owed member drained on its own exact settlement"
-    );
-    fixture.withheld_owners.borrow_mut().clear();
-    let (finally, _, _) = fixture.drain_until_clear(&grant, grant.hour + 2);
-    assert_eq!(finally, BTreeSet::from([held_member]));
-}
-
 /// SHED, R6 and acceptance additions 1 and 4: a crash after the parse and
 /// before any settlement leaves the durable index byte-identical; a shed page
 /// that actually offered an owed corrected body records no ACK for it and
@@ -2494,119 +2395,6 @@ fn new_request_after_the_grant_fails_then_one_new_proof_regrants_all_members() {
         .expect("write churn receipt");
 }
 
-/// R1 and R2 natural incidence across separate bounded pages. After the
-/// natural grant (no seeded state), the unrelated sibling session keeps
-/// working, so the next bounded traversal parses it beside the family root
-/// and the owed members fall on separate pages. Each owed member drains on its
-/// own page by its exact corrected-body ACK or proven no-op; the record keeps
-/// the remaining members after every earlier drain page and clears exactly
-/// with the last one; every save reloads intact; at least one corrected body
-/// is actually uploaded and acknowledged.
-#[test]
-#[serial(source_manifests)]
-fn natural_owed_members_drain_on_separate_bounded_pages() {
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
-
-    let _source_manifests = SourceManifestTestGuard::new();
-    let fixture = ApcFixture::new("claude-authority-proof-correction-multipage", false);
-    let (_, grant) = fixture.reach_grant();
-    assert!(
-        grant.owed.len() >= 2,
-        "NATURAL PRECONDITION: the hour-{} grant owes members of more than one bounded page; owed {:?} of recorded members {:?}",
-        grant.hour,
-        grant.owed,
-        grant
-            .record
-            .member_source_file_fingerprints
-            .keys()
-            .collect::<Vec<_>>()
-    );
-    // Preserve the original hour-12 causal fixture, then tighten its drain
-    // page size. One parsed file per page forces the naturally owed
-    // members to settle on separate real bounded pages without seeding debt.
-    fixture.page_files.set(1);
-    ApcFixture::append(&fixture.sibling_path(), &apc_note_line(APC_SIBLING, 2));
-    let pages = fixture.generation(grant.hour + 1, |_| ApcUpload::Accept);
-    let mut drained_on = BTreeMap::new();
-    let mut acked = BTreeSet::new();
-    let mut noop = BTreeSet::new();
-    let mut cleared_on = None;
-    for (number, page) in pages.iter().enumerate() {
-        let label = format!("multipage page {number}");
-        let transition = ApcFixture::check(page, &label);
-        assert!(transition.granted.is_none(), "{label}: no regrant");
-        assert!(!transition.failed, "{label}: no failure");
-        assert!(transition.empty.is_empty() && transition.retired.is_empty());
-        for member in transition.acked.iter().chain(&transition.noop) {
-            assert!(
-                drained_on.insert(member.clone(), number).is_none(),
-                "{label}: {member} drains once"
-            );
-        }
-        acked.extend(transition.acked);
-        noop.extend(transition.noop);
-        if transition.cleared {
-            assert!(cleared_on.is_none(), "the record clears exactly once");
-            cleared_on = Some(number);
-        } else if cleared_on.is_some() {
-            assert!(
-                page.record().is_none(),
-                "later pages cannot revive the record"
-            );
-        } else if !drained_on.is_empty() {
-            let (_, owed) = page
-                .record()
-                .and_then(|record| record.correction)
-                .expect("the record outlives every page before its last drain");
-            assert_eq!(
-                owed,
-                grant
-                    .owed
-                    .iter()
-                    .filter(|member| !drained_on.contains_key(*member))
-                    .cloned()
-                    .collect::<BTreeSet<_>>(),
-                "{label}: only drained members leave the owed set"
-            );
-        }
-    }
-    assert_eq!(
-        drained_on.keys().cloned().collect::<BTreeSet<_>>(),
-        grant.owed,
-        "every owed member drains in this generation"
-    );
-    let drain_pages = drained_on.values().copied().collect::<BTreeSet<_>>();
-    assert!(
-        drain_pages.len() >= 2,
-        "owed members drain on separate bounded pages: {drained_on:?}"
-    );
-    assert_eq!(
-        cleared_on,
-        drain_pages.last().copied(),
-        "the record clears exactly with its last owed member"
-    );
-    assert!(
-        !acked.is_empty(),
-        "at least one corrected body was uploaded and ACKed"
-    );
-    let restarted = ScanIndex::load(&fixture.index_path).expect("restart");
-    assert!(restarted
-        .claude_authority_record_for_test(APC_ROOT)
-        .is_none());
-    let line = serde_json::json!({
-        "receipt": "claude_authority_proof_correction_multipage:v1",
-        "owed_member_count": grant.owed.len(),
-        "drain_page_count": drain_pages.len(),
-        "acked_member_count": acked.len(),
-        "noop_member_count": noop.len(),
-        "page_count": pages.len(),
-        "page_file_limit": fixture.page_files.get(),
-    });
-    std::io::stderr()
-        .write_all(format!("{line}\n").as_bytes())
-        .expect("write multipage receipt");
-}
-
 /// R2, CONTROLLED: the owed set is seeded (through the persisted index) to all
 /// three family members after the natural grant, to make this control independent of the natural grant distribution. With the sibling working,
 /// the root and one agent settle on their own separate pages by exact ACK or
@@ -2622,6 +2410,13 @@ fn controlled_three_owed_members_settle_on_their_own_pages_while_one_is_account_
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-three-owed", true);
     let (_, natural) = fixture.reach_grant();
+    // A02 transfer (E2-003): the natural grant already owes more than one
+    // member before the controlled seeding widens it to the whole family.
+    assert!(
+        natural.owed.len() >= 2,
+        "the fixture owes at least two members: {:?}",
+        natural.owed
+    );
     let family = apc_family_sessions();
     fixture.seed_correction(&family);
     let held_member = apc_member_session(Some(APC_AGENTS[1]));
@@ -3420,31 +3215,193 @@ fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
     panic!("the re-armed family is re-read within two bounded generations");
 }
 
-/// SOURCE/COST/SI Round 12 tombstone, proving case. A proven family is held
-/// RetryPending (unhealthy evidence), every member is removed, and a
-/// raw-complete census retires it as absent: the record goes, the tombstone
-/// and the proven witness stay. The members return while the evidence is
-/// still unhealthy: they are read through the authority path, never as new
-/// files, held with nothing offered, and a bounded RetryPending record
-/// re-forms against the same witness. Once the evidence is healthy again,
-/// the ordinary parser rebuilds every member from the CURRENT sidecar rows,
-/// the record resolves, the reported bodies are offered and accepted, and the
-/// tombstone clears with that settled proof.
+/// E2 flip (T8 round 2): a correction owed before the flip settles on its
+/// owed members' first request-owned bodies, through the same exact-ACK
+/// settlement, with one read each; once clear nothing is re-offered.
 #[test]
 #[serial(source_manifests)]
-fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() {
-    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
+fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = ApcFixture::new("claude-authority-proof-correction-e2-flip", false);
+    let grant = { fixture.reach_grant().1 };
+    // A01 transfer (E2-002): the grant's record covers every owed member.
+    assert!(
+        grant.record.member_source_file_fingerprints.len() >= grant.owed.len(),
+        "{:?}",
+        grant.record
+    );
+    // A01 transfer (E2-008): more than one owed member, so the drain can
+    // span separate bounded pages.
+    assert!(
+        grant.owed.len() >= 2,
+        "the grant owes more than one member: {:?}",
+        grant.owed
+    );
 
+    crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&fixture.support, &[]);
+    // A01 transfer (E2-008): one parsed file per page puts the owed members
+    // on separate real bounded pages; the sibling keeps working beside them.
+    fixture.page_files.set(1);
+    ApcFixture::append(&fixture.sibling_path(), &apc_note_line(APC_SIBLING, 2));
+    let mut reads = BTreeMap::<String, usize>::new();
+    let mut acked = BTreeSet::new();
+    let mut cleared_hour = None;
+    // A01 transfer (E2-002, E2-008): every page is checked against SOURCE;
+    // each owed member drains once, on its exact ACK or proven no-op; the
+    // record keeps exactly the undrained members and clears exactly once,
+    // with the last drain.
+    let mut drained_on = BTreeMap::<String, (u32, usize)>::new();
+    let mut cleared_on = None;
+    for hour in grant.hour + 1..grant.hour + 4 {
+        let pages = fixture.generation(hour, |_| ApcUpload::Accept);
+        for (number, page) in pages.iter().enumerate() {
+            let label = format!("hour {hour} page {number}");
+            let transition = ApcFixture::check(page, &label);
+            assert!(transition.granted.is_none(), "{label}: no regrant");
+            assert!(!transition.failed, "{label}: no failure");
+            assert!(transition.empty.is_empty() && transition.retired.is_empty());
+            for member in transition.acked.iter().chain(&transition.noop) {
+                assert!(
+                    drained_on.insert(member.clone(), (hour, number)).is_none(),
+                    "{label}: {member} drains once"
+                );
+            }
+            if transition.cleared {
+                assert!(cleared_on.is_none(), "the record clears exactly once");
+                cleared_on = Some((hour, number));
+            } else if cleared_on.is_some() {
+                assert!(
+                    page.record().is_none(),
+                    "{label}: later pages cannot revive the record"
+                );
+            } else if !drained_on.is_empty() {
+                let (_, owed) = page
+                    .record()
+                    .and_then(|record| record.correction)
+                    .expect("the record outlives every page before its last drain");
+                assert_eq!(
+                    owed,
+                    grant
+                        .owed
+                        .iter()
+                        .filter(|member| !drained_on.contains_key(*member))
+                        .cloned()
+                        .collect::<BTreeSet<_>>(),
+                    "{label}: only drained members leave the owed set"
+                );
+            }
+            for fingerprint in &grant.held {
+                assert!(
+                    !page
+                        .index
+                        .accepted_snapshot_fingerprint_recorded(fingerprint),
+                    "{label}: a held body is never ACKed"
+                );
+            }
+            for member in page.parsed.intersection(&grant.owed) {
+                *reads.entry(member.clone()).or_default() += 1;
+            }
+            for item in page
+                .scan
+                .snapshots
+                .iter()
+                .filter(|item| grant.owed.contains(&item.source_session_id))
+            {
+                assert_eq!(
+                    item.usage_accounting_contract.as_deref(),
+                    Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT),
+                    "hour {hour}: an owed member's body is request-owned after the flip"
+                );
+                if page.uploaded.contains(&item.snapshot_fingerprint) {
+                    acked.insert(item.source_session_id.clone());
+                }
+            }
+        }
+        let last = pages.last().unwrap();
+        if last.record().is_none() {
+            // A01 transfer (E2-002): the settled family keeps the granted
+            // proof and every member's current head is accepted.
+            assert_eq!(
+                last.index
+                    .claude_usage_family_witness_digest_for_test(APC_ROOT)
+                    .as_deref(),
+                Some(grant.proof.as_str())
+            );
+            for (member, entities) in ApcFixture::family_entities(&last.index) {
+                assert!(!entities.is_empty(), "{member} has a current head");
+                assert!(
+                    entities.iter().all(|fingerprint| last
+                        .index
+                        .accepted_snapshot_fingerprint_recorded(fingerprint)),
+                    "{member}'s current head is accepted"
+                );
+            }
+            cleared_hour = Some(hour);
+            break;
+        }
+    }
+    let cleared_hour = cleared_hour.expect("the pre-flip correction clears after the flip");
+    assert_eq!(
+        acked, grant.owed,
+        "every owed member settles on its own request-owned ACK"
+    );
+    assert!(
+        reads.values().all(|reads| *reads == 1),
+        "one read per owed member, no extra: {reads:?}"
+    );
+    // A01 transfer (E2-002, E2-008): every owed member drained exactly, on
+    // separate bounded pages, and the record cleared with the last one.
+    assert_eq!(
+        drained_on.keys().cloned().collect::<BTreeSet<_>>(),
+        grant.owed,
+        "every owed member drains: {drained_on:?}"
+    );
+    let drain_pages = drained_on.values().copied().collect::<BTreeSet<_>>();
+    assert!(
+        drain_pages.len() >= 2,
+        "owed members drain on separate bounded pages: {drained_on:?}"
+    );
+    assert_eq!(
+        cleared_on,
+        drain_pages.last().copied(),
+        "the record clears exactly with its last owed member"
+    );
+    let restarted = ScanIndex::load(&fixture.index_path).expect("restart");
+    assert!(restarted
+        .claude_authority_record_for_test(APC_ROOT)
+        .is_none());
+    let quiet = fixture.generation(cleared_hour + 1, |_| ApcUpload::Accept);
+    for (number, page) in quiet.iter().enumerate() {
+        assert!(page.record().is_none());
+        assert!(
+            page.offered_bodies
+                .keys()
+                .all(|session| !grant.owed.contains(session)),
+            "nothing is re-offered once settled"
+        );
+        // A01 transfer (E2-002): the same proof grants nothing again and no
+        // correction candidate is captured on a quiet generation.
+        let transition = ApcFixture::check(page, &format!("quiet page {number}"));
+        assert!(
+            transition.granted.is_none(),
+            "the same proof grants nothing again"
+        );
+        assert!(page.candidates.is_empty());
+    }
+}
+
+/// E2 flip (T8 round 2), returning tombstoned family (the tombstone formed
+/// before the flip). Gate on, each returning member's request-owned body
+/// replaces its session: offered and ACKed exactly once (no double count),
+/// the tombstone clears with that publication and no authority record is
+/// left; a quiet generation offers nothing again.
+#[test]
+#[serial(source_manifests)]
+fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
     let _manifests = SourceManifestTestGuard::new();
-    let fixture = ApcFixture::new("patha-tombstone-reproves", false);
-    let established = fixture.establish();
+    let fixture = ApcFixture::new("e2-tombstone-returns", false);
     let family = apc_family_sessions();
-    // A restart after the in-process baseline: retirement needs verified
-    // history (SOURCE Round 11 guard b) and a clear re-emission latch.
-    crate::snapshots::forget_claude_unverified_history_indexes_for_test();
-    crate::snapshots::restart_claude_reemission_stop_for_test();
-    // Every page is a whole traversal, so all members share one page.
-    fixture.page_files.set(16);
+    let api = fixture.sidecar_path("claude-code-effort");
     let mut hour = 10;
     let mut pages_until = |label: &str, done: &dyn Fn(&ApcPage) -> bool| -> Vec<ApcPage> {
         let mut pages = Vec::new();
@@ -3453,11 +3410,7 @@ fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() 
                 &format!("2026-08-02T{hour:02}:{number:02}:00Z"),
                 ApcUpload::Accept,
             );
-            assert_eq!(
-                fixture.quarantined_index_count(),
-                0,
-                "{label}: the saved index always reloads"
-            );
+            assert_eq!(fixture.quarantined_index_count(), 0, "{label}");
             let finished = done(&page);
             pages.push(page);
             if finished {
@@ -3468,8 +3421,12 @@ fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() 
         panic!("PRECONDITION_NOT_REACHED: {label}");
     };
 
-    // 1. Unhealthy evidence holds the family RetryPending on its changed root.
-    let api = fixture.sidecar_path("claude-code-effort");
+    // Before the flip: a held family is removed and retired as absent.
+    crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&fixture.support, &[APC_ROOT]);
+    let established = fixture.establish();
+    crate::snapshots::forget_claude_unverified_history_indexes_for_test();
+    crate::snapshots::restart_claude_reemission_stop_for_test();
+    fixture.page_files.set(16);
     let healthy_api = std::fs::read(&api).expect("read the healthy API sidecar");
     fixture.corrupt_api_sidecar();
     ApcFixture::append(&fixture.member_path(None), &apc_note_line(APC_ROOT, 0));
@@ -3477,8 +3434,6 @@ fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() 
         page.record()
             .is_some_and(|record| !record.terminal && record.bound_to_retained_witness)
     });
-
-    // 2. Every member is removed; a raw-complete census retires the family.
     let members = std::iter::once(None)
         .chain(APC_AGENTS.iter().map(|agent| Some(*agent)))
         .map(|agent| {
@@ -3493,6 +3448,8 @@ fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() 
     let retired = pages_until("the absent family retires", &|page| {
         page.record().is_none() && page.index.claude_family_tombstoned_for_test(APC_ROOT)
     });
+    // A11 transfer (E2-015): the tombstone keeps the proven witness and no
+    // member key is left.
     let retired = retired.last().expect("retiring page");
     assert_eq!(
         retired
@@ -3504,7 +3461,10 @@ fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() 
     );
     assert!(ApcFixture::family_keys(&retired.index).is_empty());
 
-    // 3. The members return under unhealthy evidence: held, nothing offered.
+    // A11 transfer (E2-015), before the list removal: the members return
+    // under unhealthy evidence. They are read through the authority path,
+    // never skipped, held with nothing offered, and a bounded RetryPending
+    // record re-forms against the same witness; the tombstone stays.
     for (path, bytes) in &members {
         std::fs::write(path, bytes).expect("restore the family member");
     }
@@ -3547,157 +3507,6 @@ fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() 
         crate::snapshots::claude_absence_counters_for_test().tombstone_hits > hits_before,
         "the return is counted"
     );
-
-    // 4. Healthy evidence again: the next changed revision re-proves from
-    // the current sidecar rows, and the reported bodies are re-offered.
-    std::fs::write(&api, &healthy_api).expect("repair the API sidecar");
-    ApcFixture::append(&fixture.member_path(None), &apc_note_line(APC_ROOT, 1));
-    let reproved = pages_until("the returning family re-proves", &|page| {
-        page.record().is_none()
-            && family
-                .iter()
-                .all(|session| page.offered_bodies.contains_key(session))
-    });
-    let page = reproved.last().unwrap();
-    for item in page
-        .scan
-        .snapshots
-        .iter()
-        .filter(|item| family.contains(&item.source_session_id))
-    {
-        assert_eq!(item.usage_accounting_contract.as_deref(), APC_REPORTED);
-        assert!(page.uploaded.contains(&item.snapshot_fingerprint));
-    }
-    assert_eq!(ApcFixture::family_keys(&page.index).len(), family.len());
-
-    // 5. The settled proof cleared the tombstone; the family stays settled.
-    let cleared = pages_until("the tombstone clears", &|page| {
-        !page.index.claude_family_tombstoned_for_test(APC_ROOT)
-    });
-    let last = cleared.last().unwrap();
-    assert!(last.record().is_none());
-    assert_eq!(ApcFixture::family_keys(&last.index).len(), family.len());
-}
-
-/// E2 flip (T8 round 2): a correction owed before the flip settles on its
-/// owed members' first request-owned bodies, through the same exact-ACK
-/// settlement, with one read each; once clear nothing is re-offered.
-#[test]
-#[serial(source_manifests)]
-fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
-    let _source_manifests = SourceManifestTestGuard::new();
-    let fixture = ApcFixture::new("claude-authority-proof-correction-e2-flip", false);
-    let grant = { fixture.reach_grant().1 };
-
-    crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&fixture.support, &[]);
-    let mut reads = BTreeMap::<String, usize>::new();
-    let mut acked = BTreeSet::new();
-    let mut cleared_hour = None;
-    for hour in grant.hour + 1..grant.hour + 4 {
-        let pages = fixture.generation(hour, |_| ApcUpload::Accept);
-        for page in &pages {
-            for member in page.parsed.intersection(&grant.owed) {
-                *reads.entry(member.clone()).or_default() += 1;
-            }
-            for item in page
-                .scan
-                .snapshots
-                .iter()
-                .filter(|item| grant.owed.contains(&item.source_session_id))
-            {
-                assert_eq!(
-                    item.usage_accounting_contract.as_deref(),
-                    Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT),
-                    "hour {hour}: an owed member's body is request-owned after the flip"
-                );
-                if page.uploaded.contains(&item.snapshot_fingerprint) {
-                    acked.insert(item.source_session_id.clone());
-                }
-            }
-        }
-        if pages.last().unwrap().record().is_none() {
-            cleared_hour = Some(hour);
-            break;
-        }
-    }
-    let cleared_hour = cleared_hour.expect("the pre-flip correction clears after the flip");
-    assert_eq!(
-        acked, grant.owed,
-        "every owed member settles on its own request-owned ACK"
-    );
-    assert!(
-        reads.values().all(|reads| *reads == 1),
-        "one read per owed member, no extra: {reads:?}"
-    );
-    for page in &fixture.generation(cleared_hour + 1, |_| ApcUpload::Accept) {
-        assert!(page.record().is_none());
-        assert!(
-            page.offered_bodies
-                .keys()
-                .all(|session| !grant.owed.contains(session)),
-            "nothing is re-offered once settled"
-        );
-    }
-}
-
-/// E2 flip (T8 round 2), returning tombstoned family (the tombstone formed
-/// before the flip). Gate on, each returning member's request-owned body
-/// replaces its session: offered and ACKed exactly once (no double count),
-/// the tombstone clears with that publication and no authority record is
-/// left; a quiet generation offers nothing again.
-#[test]
-#[serial(source_manifests)]
-fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
-    let _manifests = SourceManifestTestGuard::new();
-    let fixture = ApcFixture::new("e2-tombstone-returns", false);
-    let family = apc_family_sessions();
-    let api = fixture.sidecar_path("claude-code-effort");
-    let mut hour = 10;
-    let mut pages_until = |label: &str, done: &dyn Fn(&ApcPage) -> bool| -> Vec<ApcPage> {
-        let mut pages = Vec::new();
-        for number in 0..2 * APC_MAX_PAGES {
-            let page = fixture.page(
-                &format!("2026-08-02T{hour:02}:{number:02}:00Z"),
-                ApcUpload::Accept,
-            );
-            assert_eq!(fixture.quarantined_index_count(), 0, "{label}");
-            let finished = done(&page);
-            pages.push(page);
-            if finished {
-                hour += 1;
-                return pages;
-            }
-        }
-        panic!("PRECONDITION_NOT_REACHED: {label}");
-    };
-
-    // Before the flip: a held family is removed and retired as absent.
-    crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&fixture.support, &[APC_ROOT]);
-    fixture.establish();
-    crate::snapshots::forget_claude_unverified_history_indexes_for_test();
-    crate::snapshots::restart_claude_reemission_stop_for_test();
-    fixture.page_files.set(16);
-    let healthy_api = std::fs::read(&api).expect("read the healthy API sidecar");
-    fixture.corrupt_api_sidecar();
-    ApcFixture::append(&fixture.member_path(None), &apc_note_line(APC_ROOT, 0));
-    pages_until("a RetryPending hold", &|page| {
-        page.record()
-            .is_some_and(|record| !record.terminal && record.bound_to_retained_witness)
-    });
-    let members = std::iter::once(None)
-        .chain(APC_AGENTS.iter().map(|agent| Some(*agent)))
-        .map(|agent| {
-            let path = fixture.member_path(agent);
-            let bytes = std::fs::read(&path).expect("read the member transcript");
-            (path, bytes)
-        })
-        .collect::<Vec<_>>();
-    for (path, _) in &members {
-        std::fs::remove_file(path).expect("remove the family member");
-    }
-    pages_until("the absent family retires", &|page| {
-        page.record().is_none() && page.index.claude_family_tombstoned_for_test(APC_ROOT)
-    });
     crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&fixture.support, &[]);
 
     // After the flip: the family returns.

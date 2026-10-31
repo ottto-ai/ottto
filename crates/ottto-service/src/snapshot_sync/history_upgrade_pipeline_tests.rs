@@ -2563,6 +2563,29 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
             changed.index.files[&unlisted].effective_upload_body_witness_revision,
             3
         );
+        // A21 (was `e2_pipeline_dark_matches_fold_absent_publication_and_selection`):
+        // the listed family's ordinary body takes the same batching, ACK
+        // progress, index and next-selection route as the unlisted literal.
+        // `cycle` already asserts the upload completed (batching and entity ACK).
+        let body = |session: &str| {
+            let items = changed
+                .scan
+                .snapshots
+                .iter()
+                .filter(|item| item.source_session_id == session)
+                .collect::<Vec<_>>();
+            assert_eq!(items.len(), 1, "one body batched for {session}");
+            items[0].snapshot_fingerprint.clone()
+        };
+        let settled = [body(HISTORY_SESSIONS[0]), body(HISTORY_SESSIONS[1])];
+        let current = changed.index.current_snapshot_fingerprints();
+        for fingerprint in &settled {
+            assert!(
+                changed.index.accepted_snapshot_fingerprint_recorded(fingerprint),
+                "accepted progress reaches the index: {fingerprint}"
+            );
+            assert!(current.contains(fingerprint), "indexed body: {fingerprint}");
+        }
         for hour in [10, 11] {
             let quiet = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), E2_HISTORY_UPGRADE);
             assert!(
@@ -2574,10 +2597,15 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
                 quiet.scan.scanned_file_count, 0,
                 "never re-read by revision 3"
             );
+            assert!(quiet.scan.snapshots.is_empty(), "nothing re-selected");
             assert_eq!(
                 quiet.index.files[&listed].effective_upload_body_witness_revision,
                 2
             );
+            for fingerprint in &settled {
+                assert!(quiet.index.accepted_snapshot_fingerprint_recorded(fingerprint));
+                assert!(quiet.index.current_snapshot_fingerprints().contains(fingerprint));
+            }
         }
     });
 }

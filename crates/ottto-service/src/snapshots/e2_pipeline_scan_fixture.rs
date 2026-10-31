@@ -240,13 +240,6 @@ impl E2ScanFixture {
     }
 }
 
-pub(crate) fn without_money_folds(scan: &mut SourceScanResult) {
-    // Publication reference: the legacy caller has no E2 fold carrier.
-    for item in &mut scan.snapshots {
-        item.claude_money = None;
-    }
-}
-
 pub(crate) fn birth_store_bytes(index: &ScanIndex) -> Vec<u8> {
     serde_json::to_vec(&index.claude_money_birth_store).unwrap()
 }
