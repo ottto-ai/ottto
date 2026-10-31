@@ -16,10 +16,6 @@ pub(crate) const CACHE_ENTRIES: usize = 256;
 /// measured capacities could change without transferring ownership back out.
 pub(crate) trait FrozenCacheState: HeapLayoutBound {
     fn supports_frozen_charge(&self) -> bool;
-    fn is_pi(&self) -> bool {
-        false
-    }
-    fn record_evicted_by_pi(&self) {}
 }
 impl FrozenCacheState for String {
     fn supports_frozen_charge(&self) -> bool {
@@ -619,7 +615,6 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         self.entries.remove(&key);
         self.remove_custody(&key);
         let taken: &Taken<S> = incoming.borrow();
-        let by_pi = taken.retained.state.is_pi();
         let refuse = |event, taken| {
             record(event);
             Err(taken)
@@ -683,11 +678,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
                 admitted = false;
             } else if let Some((victim, _)) = victim {
                 let victim = victim.clone();
-                if let Some(entry) = self.entries.remove(&victim) {
-                    if by_pi {
-                        entry.retained.state.record_evicted_by_pi();
-                    }
-                }
+                self.entries.remove(&victim);
                 self.remove_custody(&victim);
             } else {
                 return refuse(Event::InsertNoVictimRefused, incoming);

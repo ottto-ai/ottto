@@ -1682,17 +1682,6 @@ fallbacks use `resource_full{cache_transit}` and the existing source-tagged alar
 A Pi usage ledger above 65,536 keys refuses persistence through the shared
 `not_persisted{wa.entry_cap}` class; the ledger is never truncated.
 
-The same #799 page line (source `pi`) reports cache-only
-`retention_bound_refused_pi` events, a subset of `retention_bound_refused`.
-The refusal count reuses the retention decision without another heap walk.
-It does not mean a durable write was attempted or refused.
-`cache_evicted_by_pi_claude_code` and `cache_evicted_by_pi_codex` count respective
-insert-time capacity victims (excludes `Release::CopyAdmission` releases).
-They also appear on the existing
-`process_retained_cache_lifecycle_totals` line (source `unknown`): cumulative,
-saturating process totals since startup, shared across namespaces. They are
-counts only, with no file names, response ids or content.
-
 `restored_behind_accepted.published` on `durable_tail_alarm` with source `pi`
 counts a durable-restored Tail or Unchanged read ending strictly below the
 frozen indexed accepted extent when it offers a complete body after policy and

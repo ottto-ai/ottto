@@ -104,16 +104,6 @@ impl CachedJsonlReduction {
     }
 }
 impl crate::transcript_cache::FrozenCacheState for CachedJsonlReduction {
-    fn is_pi(&self) -> bool {
-        self.accumulator.source == SnapshotSource::Pi
-    }
-    fn record_evicted_by_pi(&self) {
-        match self.accumulator.source {
-            SnapshotSource::ClaudeCode => record(Event::CacheEvictedByPiClaudeCode),
-            SnapshotSource::Codex => record(Event::CacheEvictedByPiCodex),
-            SnapshotSource::Pi => {}
-        }
-    }
     fn supports_frozen_charge(&self) -> bool {
         // retain_reduction removes these live, shared inputs from the copy.
         // Refuse frozen accounting if an adapter ever forgets that boundary.
@@ -535,13 +525,6 @@ impl OwnedJsonlParser {
         bound
     }
 
-    fn record_retention_bound_refusal(&self) {
-        record(Event::RetentionBoundRefused);
-        if self.source == SnapshotSource::Pi {
-            record(Event::RetentionBoundRefusedPi);
-        }
-    }
-
     /// Take the acquisition certificate only after EOF. This does not authorize
     /// publication/index clearing: the host must also complete native finish,
     /// ownership/loss/source/dependency validation and its existing CAS boundary.
@@ -590,7 +573,7 @@ impl OwnedJsonlParser {
         {
             true
         } else {
-            self.record_retention_bound_refusal();
+            record(Event::RetentionBoundRefused);
             #[cfg(test)]
             {
                 let charge = self.retention_bound(usize::MAX);
@@ -732,7 +715,7 @@ impl OwnedJsonlParser {
         }
         let limit = budget_after.min(release.entry_limit);
         if self.certified_charge(&checkpoint, limit).is_none() {
-            self.record_retention_bound_refusal();
+            record(Event::RetentionBoundRefused);
             #[cfg(test)]
             {
                 let charge = self.certified_charge(&checkpoint, usize::MAX);
@@ -759,7 +742,7 @@ impl OwnedJsonlParser {
         let rank = release.rank;
         let outcome = release.execute();
         if outcome != sampled_scan::ReleaseOutcome::Released {
-            self.record_retention_bound_refusal();
+            record(Event::RetentionBoundRefused);
             #[cfg(test)]
             sampled_scan::test_hooks::record_bucket(classify_refusal(
                 RefusalView::deferred(budget_after, entry_limit),
