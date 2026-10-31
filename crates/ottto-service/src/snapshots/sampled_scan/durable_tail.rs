@@ -1208,58 +1208,6 @@ impl SharedCache {
     /// that are still resident and kept by the save, then collects records
     /// the save no longer keeps. `writer` proves the single state-directory
     /// writer (#801).
-    /// Post-save archive domain fence, run before the pinned
-    /// `durable_write_after_save`: a touched RAM-only archive reduction or
-    /// compressed checkpoint is never written and any older record for its key
-    /// is invalidated, even if another caller touched or selected it.
-    pub(crate) fn durable_fence_archives<W: SingleWriter>(
-        &self,
-        writer: &W,
-        snapshot_source: SnapshotSource,
-    ) {
-        let Some(source) = durable_source(snapshot_source) else {
-            return;
-        };
-        let touched = {
-            let Some(mut stores) = self.durable() else {
-                return;
-            };
-            if stores.slot(source).is_none() {
-                return;
-            }
-            stores.touched.clone()
-        };
-        let fenced = {
-            let Ok(cache) = self.retained() else {
-                return;
-            };
-            touched
-                .into_iter()
-                .filter(|key| {
-                    cache.peek(key).is_some_and(|retained| {
-                        retained.checkpoint.is_compressed() || codex_archive_path(Path::new(key))
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
-        if fenced.is_empty() {
-            return;
-        }
-        let Some(mut stores) = self.durable() else {
-            return;
-        };
-        let mut invalidate = BTreeSet::new();
-        for key in &fenced {
-            stores.touched.remove(key);
-            stores.selected.remove(key);
-            invalidate.insert(store::key_digest(source, key));
-            Counters::bump(&mut stores.counters.not_persisted, "compressed");
-        }
-        if let Some(slot) = stores.slot(source).as_mut() {
-            let _ = slot.store.remove_keys(writer, &invalidate);
-        }
-    }
-
     pub(crate) fn durable_write_after_save<W: SingleWriter>(
         &self,
         writer: &W,
