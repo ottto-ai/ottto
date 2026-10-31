@@ -1009,6 +1009,9 @@ impl HeaderInventory {
             if cause == CodexZstCause::FamilyUnproven {
                 self.family_held.insert(key, false);
             } else {
+                // Custody reads held owners before classification rebuilds them:
+                // a persisted Held archive's owner keeps tombstone absence scope.
+                self.held_owners.extend(archive_owners(&key));
                 self.held_archives.insert(key);
             }
             return HeaderStep::Pending;
@@ -5140,33 +5143,35 @@ pub(in crate::snapshots) mod header_cache_tests {
             let ((mut index, mut scan), reads) = tests::header_reads(|| {
                 let mut inventoried = false;
                 for _ in 0..1000 {
-                    if !inventoried {
-                        if let Some(inventory) = owned.codex_join_inventory.as_mut() {
-                            let before = serde_json::to_value(&owned.index).unwrap();
-                            let (_, operations) = cache_operations(|| {
-                                while inventory.step_with_archive(
-                                    &CodexTitleMetadata::default(),
-                                    &mut owned.index,
-                                    Some(&cache),
-                                ) != HeaderStep::Complete
-                                {}
-                            });
-                            assert_eq!(serde_json::to_value(&owned.index).unwrap(), before);
-                            assert!(inventory.complete);
-                            assert!(inventory.refused.is_empty());
-                            assert_eq!(inventory.reuse_hits, paths.len() - 2);
-                            assert_eq!(inventory.reuse_misses, 2);
-                            assert_eq!(
-                                inventory.owner_for_path(Path::new(&held)),
-                                Some(owner.as_str())
-                            );
-                            assert!(
-                                operations.iter().all(|(_, key)| key != &held),
-                                "held key has no cache lookup, invalidation or insertion"
-                            );
-                            assert!(operations.iter().any(|(operation, _)| *operation == "get"));
-                            inventoried = true;
-                        }
+                    if let Some(inventory) = owned
+                        .codex_join_inventory
+                        .as_mut()
+                        .filter(|i| i.feed_prepared && !inventoried)
+                    {
+                        let before = serde_json::to_value(&owned.index).unwrap();
+                        let (_, operations) = cache_operations(|| {
+                            while inventory.step_with_archive(
+                                &CodexTitleMetadata::default(),
+                                &mut owned.index,
+                                Some(&cache),
+                            ) != HeaderStep::Complete
+                            {}
+                        });
+                        assert_eq!(serde_json::to_value(&owned.index).unwrap(), before);
+                        assert!(inventory.complete);
+                        assert!(inventory.refused.is_empty());
+                        assert_eq!(inventory.reuse_hits, paths.len() - 2);
+                        assert_eq!(inventory.reuse_misses, 2);
+                        assert_eq!(
+                            inventory.owner_for_path(Path::new(&held)),
+                            Some(owner.as_str())
+                        );
+                        assert!(
+                            operations.iter().all(|(_, key)| key != &held),
+                            "held key has no cache lookup, invalidation or insertion"
+                        );
+                        assert!(operations.iter().any(|(operation, _)| *operation == "get"));
+                        inventoried = true;
                     }
                     match owned.step(None) {
                         OwnedSourceScanStep::Pending(next) => owned = next,
@@ -5634,7 +5639,14 @@ pub(in crate::snapshots) mod header_cache_tests {
         );
         evidence.disposition = codex_compressed_input::ArchiveDisposition::HeaderValidated;
         let mut wire = serde_json::to_value(ScanIndex::default()).unwrap();
-        wire["files"][&key] = serde_json::json!({"size_bytes":[],"archive":evidence});
+        // Damage only `size_bytes` of an otherwise complete native record.
+        let mut raw = serde_json::to_value(ScanIndexEntry {
+            archive: Some(Box::new(evidence)),
+            ..Default::default()
+        })
+        .unwrap();
+        raw["size_bytes"] = serde_json::json!([]);
+        wire["files"][&key] = raw;
         let held = lenient_decode::read_bounded(&serde_json::to_vec(&wire).unwrap()).unwrap();
         assert!(held.decode_holds_file(&key));
         let decoders = codex_zst_refusal_tests::decoder_construction_count();
