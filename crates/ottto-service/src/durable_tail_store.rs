@@ -2259,7 +2259,7 @@ impl DurableTailStore {
     /// Known-empty inventory is the only negative privacy fact. An absent
     /// store needs no sweep; an existing store with a missing/damaged inventory
     /// fails closed. The inventory carries key digests only, never labels.
-    fn private_label_keys(&self) -> io::Result<Option<BTreeSet<Digest32>>> {
+    pub(crate) fn private_label_keys(&self) -> io::Result<Option<BTreeSet<Digest32>>> {
         if matches!(fs::symlink_metadata(&self.dir), Err(e) if e.kind() == io::ErrorKind::NotFound)
         {
             return Ok(Some(BTreeSet::new()));

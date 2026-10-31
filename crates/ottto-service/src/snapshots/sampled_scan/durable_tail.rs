@@ -5795,12 +5795,28 @@ impl SharedCache {
         index: &ScanIndex,
     ) -> std::io::Result<()> {
         if let Some(ds) = durable_source(snapshot_source) {
-            let keep = index
-                .files
-                .keys()
-                .map(|key| store::key_digest(ds, key))
-                .collect();
-            self.erase_private_labels(writer, snapshot_source, Some(&keep));
+            let possible = self.durable().and_then(|mut stores| {
+                let slot = stores.slot(ds).as_ref()?;
+                if !slot.store.private_label_purge_needed(None) {
+                    return None;
+                }
+                slot.store
+                    .private_label_keys()
+                    .ok()
+                    .flatten()
+                    .or_else(|| slot.store.inventory().ok())
+            });
+            if let Some(possible) = possible {
+                // Retention intersects a bounded marker/inventory, never a
+                // second unbounded copy of the committed index.
+                let keep = index
+                    .files
+                    .keys()
+                    .map(|key| store::key_digest(ds, key))
+                    .filter(|key| possible.contains(key))
+                    .collect();
+                self.erase_private_labels(writer, snapshot_source, Some(&keep));
+            }
         }
         if !restart_restore::enabled() {
             return Ok(());
