@@ -39,7 +39,9 @@ pub(crate) struct Properties {
             SnapshotSource,
             &mut crate::durable_tail_store::ActiveLease,
         ) -> Result<durable::Decoded, crate::durable_tail_codec::DecodeFailure>,
-    pub(super) verify: fn(&[u8]) -> Result<(), Corrupt>,
+    /// The complete structural walk, including the end check, on the
+    /// caller's decoder (which may observe it, e.g. for private labels).
+    pub(super) verify: fn(&mut crate::durable_tail_codec::Dec<'_>) -> Result<(), Corrupt>,
 }
 
 // Current PL-retained schema only. Historical pins refuse at dispatch; there is
@@ -60,7 +62,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         decode: durable::decode_body,
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
-        verify: durable::verify,
+        verify: durable::verify_body,
     },
     Properties {
         source: DurableSource::Codex,
@@ -76,7 +78,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         decode: durable::decode_body,
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
-        verify: durable::verify,
+        verify: durable::verify_body,
     },
     Properties {
         source: DurableSource::Pi,
@@ -92,7 +94,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         decode: durable::decode_body,
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
-        verify: durable::pi::verify,
+        verify: durable::pi::verify_body,
     },
 ];
 

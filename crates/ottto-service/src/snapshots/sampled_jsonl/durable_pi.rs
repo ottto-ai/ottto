@@ -49,12 +49,8 @@ pub(in crate::snapshots) fn put_body(
     PiSection::put_borrowed(e, keys, &has_parent, &header_nanos)
 }
 
-/// Header-dispatched Pi verification row; the table admits only format 3.
-pub(in crate::snapshots) fn verify(body: &[u8]) -> Result<(), Corrupt> {
-    verify_body(&mut Dec::new(body))
-}
-
-/// Structural verification of a Pi body, without allocation.
+/// Structural verification of a Pi body, without allocation. The registry row's
+/// walk; the table admits only format 3.
 pub(crate) fn verify_body(d: &mut Dec<'_>) -> Result<(), Corrupt> {
     CachedJsonlReduction::verify(d)?;
     Rederive::verify(d)?;

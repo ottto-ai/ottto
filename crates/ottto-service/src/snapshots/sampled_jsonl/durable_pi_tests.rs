@@ -374,7 +374,7 @@ fn pi_registered_body_rows_preserve_populated_body_bytes() {
     assert!(row.representation(3, &[0; 32]).is_none());
     let bytes = (row.encode)(&original, RECORD_BYTES, 1024 * 1024).unwrap();
     assert_eq!(bytes, unbounded_body(&original));
-    assert_eq!((row.verify)(&bytes), Ok(()));
+    assert_eq!((row.verify)(&mut Dec::new(&bytes)), Ok(()));
     let decoded = (row.decode)(&bytes, SnapshotSource::Pi).unwrap();
     assert_eq!(
         (row.encode)(&decoded.reduction, RECORD_BYTES, 1024 * 1024).unwrap(),
@@ -393,7 +393,7 @@ fn pi_registered_body_rows_preserve_populated_body_bytes() {
     assert_eq!(plan.write(&mut streamed, len).unwrap(), bytes.len());
     assert_eq!(streamed, bytes);
     for end in 0..bytes.len() {
-        assert!((row.verify)(&bytes[..end]).is_err());
+        assert!((row.verify)(&mut Dec::new(&bytes[..end])).is_err());
         assert!((row.decode)(&bytes[..end], SnapshotSource::Pi).is_err());
     }
 }

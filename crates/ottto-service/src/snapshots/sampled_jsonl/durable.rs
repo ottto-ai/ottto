@@ -292,12 +292,11 @@ pub(in crate::snapshots) fn body_has_skill_labels(
     source: SnapshotSource,
     body: &[u8],
 ) -> Result<bool, Corrupt> {
+    let row = crate::durable_tail_store::DurableSource::from_snapshot(source)
+        .ok_or(Corrupt)?
+        .properties();
     let mut d = Dec::new(body);
-    // Use the registered sources' complete walks on the observing decoder.
-    match source {
-        SnapshotSource::ClaudeCode | SnapshotSource::Codex => verify_body(&mut d)?,
-        SnapshotSource::Pi => pi::verify_body(&mut d)?,
-    }
+    (row.verify)(&mut d)?;
     Ok(d.has_pl_labels())
 }
 
@@ -308,7 +307,7 @@ pub(crate) fn verify(body: &[u8]) -> Result<(), Corrupt> {
     verify_body(&mut Dec::new(body))
 }
 
-fn verify_body(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+pub(in crate::snapshots) fn verify_body(d: &mut Dec<'_>) -> Result<(), Corrupt> {
     CachedJsonlReduction::verify(d)?;
     Rederive::verify(d)?;
     d.finish()

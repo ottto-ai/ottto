@@ -258,7 +258,7 @@ pub(crate) fn verify_durable_body(
     let mut d = crate::durable_tail_codec::Dec::new(body);
     let nested = <SnapshotSource as crate::durable_tail_codec::Durable>::take(&mut d).ok();
     nested.and_then(sampled_scan::durable_tail::durable_source) == Some(source)
-        && (source.properties().verify)(body).is_ok()
+        && (source.properties().verify)(&mut crate::durable_tail_codec::Dec::new(body)).is_ok()
 }
 #[cfg(all(test, unix))]
 pub(crate) fn durable_body_has_skill_labels_for_test(
@@ -30637,12 +30637,7 @@ impl OwnedSourceScan {
                     .zip(file_sampling.as_ref())
                     .filter(|(_, active)| {
                         restart_restore::enabled()
-                            && matches!(
-                                source,
-                                SnapshotSource::ClaudeCode
-                                    | SnapshotSource::Codex
-                                    | SnapshotSource::Pi
-                            )
+                            && sampled_scan::durable_tail::durable_source(source).is_some()
                             // No new acquisition is written for an ordinary
                             // Unchanged read. Receipt-owed retries retain their
                             // exact native owner; quiet debt changes settle only
