@@ -234,26 +234,33 @@ fn sibling_append_uses_the_constructor_policy_and_keeps_the_child_body() {
 #[test]
 fn legacy_count_and_account_changes_reselect_through_the_application_owner() {
     let fixture = Fixture::new();
-    let (index, _, walk, _) = fixture.run(ScanIndex::default(), true, None, 100);
+    let (seed, _, _, _) = fixture.run(ScanIndex::default(), true, None, 100);
+    assert!(seed.claude_account_family_witnesses.contains_key("root"));
+    // Start selection with an already established family witness, as on an
+    // indexed legacy family. Reuse the actual application's proof, then build
+    // fresh file bindings under its digest from the first constructor call.
+    // This separates count invalidation from a fingerprint-formula transition.
+    let baseline = ScanIndex {
+        claude_account_family_witnesses: seed.claude_account_family_witnesses,
+        ..ScanIndex::default()
+    };
+    let (index, _, walk, _) = fixture.run(baseline, true, None, 100);
     assert!(index.claude_account_family_witnesses.contains_key("root"));
-    // Settle the transition into a newly proven legacy family before testing
-    // its count dependency. Otherwise the legacy-proof transition alone would
-    // select every child even if evidence_request_count were omitted.
-    let (index, _, walk, _) = fixture.run(index, true, Some(walk), 100);
-    assert!(index.claude_account_family_witnesses.contains_key("root"));
+    let refusal_index = index.clone();
+    let refusal_walk = walk.clone();
+    let key = local_index_key(&fixture.transcripts.join("root/subagents/agent-a.jsonl"));
+    let accepted = index.files[&key].last_snapshot_fingerprint.clone();
     append_pair(&fixture.support, "req-b2", "b", &"a".repeat(64));
-    let (mut index, _, walk, selected) = fixture.run(index, true, Some(walk), 100);
+    let (_, _, _, selected) = fixture.run(index, true, Some(walk), 100);
     assert_eq!(
         selected, 3,
         "legacy evidence_request_count is a dependency of every member"
     );
-    let key = local_index_key(&fixture.transcripts.join("root/subagents/agent-a.jsonl"));
-    let accepted = index.files[&key].last_snapshot_fingerprint.clone();
-    // Preserve the actual witness from the prior complete application, then
-    // make one later observation conflict while only the root fits this page.
-    assert!(index.claude_account_family_witnesses.contains_key("root"));
+    // Replay the accepted baseline with conflicting evidence on a bounded
+    // page. The account owner must clear the unselected child's source proof
+    // while preserving its last accepted body.
     append_pair(&fixture.support, "req-conflict", "b", &"b".repeat(64));
-    let (next, _, _, _) = fixture.run(std::mem::take(&mut index), true, Some(walk), 1);
+    let (next, _, _, _) = fixture.run(refusal_index, true, Some(refusal_walk), 1);
     assert!(next.files[&key].source_file_fingerprint.is_empty());
     assert_eq!(next.files[&key].last_snapshot_fingerprint, accepted);
 }
