@@ -311,7 +311,7 @@ fn complete_misc_dirty_plan_covers_scalar_map_ack_and_raw_hold_changes() {
             mapper::key("setting.upload_context_fingerprint", "", 0).unwrap(),
             mapper::key("accepted.entity", "", 0).unwrap(),
             mapper::key(
-                "v1_field.accepted_snapshot_fingerprints",
+                "accepted.entity",
                 &"e".repeat(64),
                 1
             )
