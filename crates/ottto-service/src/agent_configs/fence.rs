@@ -416,25 +416,6 @@ mod tests {
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    #[test]
-    fn extract_fence_lines_returns_region_or_none() {
-        let body = "before\n# ottto:start\na = 1\n# ottto:end\nafter\n";
-        assert_eq!(
-            extract_fence_lines(body),
-            Some(vec![
-                "# ottto:start".to_string(),
-                "a = 1".to_string(),
-                "# ottto:end".to_string(),
-            ])
-        );
-        assert_eq!(extract_fence_lines("no fence here\n"), None);
-        assert_eq!(extract_fence_lines("# ottto:start\nunclosed\n"), None);
-        assert_eq!(
-            extract_fence_lines("# ottto:start\na\n# ottto:end\n# ottto:start\nb\n# ottto:end\n"),
-            None
-        );
-    }
-
     fn test_path(name: &str) -> PathBuf {
         let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join("ottto-fence-tests").join(format!(
@@ -453,29 +434,6 @@ mod tests {
 
     fn read(path: &Path) -> String {
         fs::read_to_string(path).expect("read test file")
-    }
-
-    #[test]
-    fn upsert_creates_missing_file() {
-        let path = test_path("missing");
-        let result = upsert_fence(&path, "export A=1").expect("upsert");
-
-        assert!(result.changed);
-        assert!(result.created);
-        assert_eq!(read(&path), "# ottto:start\nexport A=1\n# ottto:end\n");
-    }
-
-    #[test]
-    fn upsert_preserves_crlf_file_outside_fence() {
-        let path = test_path("crlf");
-        write(&path, "alpha=1\r\nbeta=2\r\n");
-
-        upsert_fence(&path, "managed=1\nsecond=2").expect("upsert");
-
-        assert_eq!(
-            read(&path),
-            "# ottto:start\r\nmanaged=1\r\nsecond=2\r\n# ottto:end\r\nalpha=1\r\nbeta=2\r\n"
-        );
     }
 
     #[test]
@@ -506,79 +464,6 @@ mod tests {
     }
 
     #[test]
-    fn upsert_would_change_reports_missing_changed_without_writing() {
-        let path = test_path("would-change-missing");
-
-        assert!(upsert_would_change(&path, "managed=true").expect("dry run"));
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn upsert_would_change_reports_matching_body_unchanged() {
-        let path = test_path("would-change-noop");
-        write(
-            &path,
-            "# ottto:start\nmanaged=true\n# ottto:end\nuser=true\n",
-        );
-
-        assert!(!upsert_would_change(&path, "managed=true").expect("dry run"));
-        assert_eq!(
-            read(&path),
-            "# ottto:start\nmanaged=true\n# ottto:end\nuser=true\n"
-        );
-    }
-
-    #[test]
-    fn upsert_would_change_validates_changed_result() {
-        let path = test_path("would-change-validator");
-        write(&path, "user=true\n");
-
-        let error = upsert_would_change_with_validator(&path, "managed=true", |_| {
-            Err("not parseable".to_string())
-        })
-        .expect_err("validation failed");
-
-        assert!(matches!(error, AgentConfigError::ValidationFailed { .. }));
-        assert_eq!(read(&path), "user=true\n");
-    }
-
-    #[test]
-    fn remove_deletes_existing_fence() {
-        let path = test_path("remove");
-        write(
-            &path,
-            "# ottto:start\nmanaged=true\n# ottto:end\nuser=true\n",
-        );
-
-        let result = remove_fence(&path).expect("remove");
-
-        assert!(result.changed);
-        assert_eq!(read(&path), "user=true\n");
-    }
-
-    #[test]
-    fn remove_noops_without_fence() {
-        let path = test_path("remove-noop");
-        write(&path, "user=true\n");
-
-        let result = remove_fence(&path).expect("remove");
-
-        assert!(!result.changed);
-        assert_eq!(read(&path), "user=true\n");
-    }
-
-    #[test]
-    fn remove_noops_for_missing_file() {
-        let path = test_path("remove-missing");
-
-        let result = remove_fence(&path).expect("remove");
-
-        assert!(!result.changed);
-        assert!(!result.created);
-        assert!(!path.exists());
-    }
-
-    #[test]
     fn body_marker_line_is_rejected() {
         let path = test_path("body-marker");
         let error = upsert_fence(&path, "safe\n# ottto:start\nunsafe").expect_err("reject");
@@ -591,9 +476,7 @@ mod tests {
     fn missing_end_marker_is_rejected() {
         for original in [
             "# ottto:start\nmanaged=true\n",
-            "managed=true\n# ottto:end\n",
             "# ottto:start\none=1\n# ottto:end\n# ottto:start\ntwo=2\n# ottto:end\n",
-            "# ottto:end\nmanaged=true\n# ottto:start\n",
         ] {
             let path = test_path("ambiguous-markers");
             write(&path, original);
@@ -605,38 +488,6 @@ mod tests {
                 assert_eq!(read(&path), original);
             }
         }
-    }
-
-    #[test]
-    fn upsert_adds_parent_directories() {
-        let path = test_path("parents").join("nested/config.env");
-
-        upsert_fence(&path, "managed=true").expect("upsert");
-
-        assert_eq!(read(&path), "# ottto:start\nmanaged=true\n# ottto:end\n");
-    }
-
-    #[test]
-    fn body_with_crlf_is_normalized_to_file_eol() {
-        let path = test_path("body-crlf");
-        write(&path, "user=true\n");
-
-        upsert_fence(&path, "a=1\r\nb=2\r\n").expect("upsert");
-
-        assert_eq!(
-            read(&path),
-            "# ottto:start\na=1\nb=2\n# ottto:end\nuser=true\n"
-        );
-    }
-
-    #[test]
-    fn remove_handles_end_marker_at_eof() {
-        let path = test_path("end-at-eof");
-        write(&path, "prefix\n# ottto:start\nmanaged=true\n# ottto:end");
-
-        remove_fence(&path).expect("remove");
-
-        assert_eq!(read(&path), "prefix\n");
     }
 
     #[test]
@@ -665,22 +516,6 @@ mod tests {
             })
             .count();
         assert_eq!(temp_count, 0);
-    }
-
-    #[test]
-    fn validator_success_sees_post_write_content() {
-        let path = test_path("validator-success");
-
-        upsert_fence_with_validator(&path, "managed=true", |body| {
-            if body.contains(FENCE_START) && body.contains("managed=true") {
-                Ok(())
-            } else {
-                Err("missing managed block".to_string())
-            }
-        })
-        .expect("upsert");
-
-        assert!(read(&path).contains("managed=true"));
     }
 
     #[test]

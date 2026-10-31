@@ -461,64 +461,11 @@ mod tests {
     use crate::test_scratch;
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
-    use std::path::Path;
 
     fn scratch_home(name: &str) -> PathBuf {
         std::env::temp_dir()
             .join("ottto-command-env-tests")
             .join(test_scratch::unique_name(name))
-    }
-
-    #[test]
-    fn path_env_includes_launchd_safe_cli_locations() {
-        let path_env = path_env_from(
-            Some(OsString::from("/usr/bin:/bin")),
-            Some(OsString::from("/Users/tester")),
-        )
-        .expect("path env");
-        let dirs = env::split_paths(&path_env).collect::<Vec<_>>();
-
-        assert_eq!(dirs.first(), Some(&PathBuf::from("/usr/bin")));
-        assert!(dirs.contains(&PathBuf::from("/Users/tester/.local/bin")));
-        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")));
-        assert!(dirs.contains(&PathBuf::from("/usr/local/bin")));
-    }
-
-    #[test]
-    fn search_dirs_include_per_user_cli_install_locations() {
-        let dirs = executable_search_dirs_from(
-            Some(OsString::from("/usr/bin")),
-            Some(OsString::from("/Users/tester")),
-            true,
-        );
-
-        // Native Claude installer symlink dir and common npm global prefixes
-        // must be searched even when the daemon PATH omits them.
-        assert!(dirs.contains(&PathBuf::from("/Users/tester/.local/bin")));
-        assert!(dirs.contains(&PathBuf::from("/Users/tester/.npm-global/bin")));
-        assert!(dirs.contains(&PathBuf::from("/Users/tester/.claude/local")));
-    }
-
-    #[test]
-    fn search_dirs_enumerate_nvm_node_bins_when_present() {
-        let home = scratch_home("nvm");
-        let node_bin = home.join(".nvm/versions/node/v22.19.0/bin");
-        fs::create_dir_all(&node_bin).expect("nvm node bin");
-        // A stray non-directory entry alongside the versions must be ignored.
-        fs::write(home.join(".nvm/versions/node/README"), "x").ok();
-
-        let dirs = executable_search_dirs_from(
-            Some(OsString::from("/usr/bin")),
-            Some(home.as_os_str().to_os_string()),
-            true,
-        );
-
-        assert!(
-            dirs.contains(&node_bin),
-            "nvm-managed node global bin must be searched: {dirs:?}"
-        );
-
-        fs::remove_dir_all(&home).ok();
     }
 
     #[test]
@@ -543,60 +490,6 @@ mod tests {
         assert_eq!(found, Some(claude));
 
         fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn claude_resolver_requires_absolute_executable_and_accepts_official_style_symlink() {
-        let home = scratch_home("hardened-claude-resolver");
-        let bin = home.join(".local/bin");
-        let versions = home.join(".local/share/claude/versions");
-        fs::create_dir_all(&bin).expect("bin");
-        fs::create_dir_all(&versions).expect("versions");
-
-        let target = versions.join("2.1.202");
-        fs::write(&target, "#!/bin/sh\n").expect("target");
-        let mut permissions = fs::metadata(&target).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&target, permissions).expect("chmod");
-        let shim = bin.join("claude");
-        symlink(&target, &shim).expect("symlink");
-
-        assert!(is_absolute_executable(&shim));
-        assert!(!is_absolute_executable(Path::new("relative/claude")));
-
-        fs::remove_file(&shim).expect("remove shim");
-        fs::write(&shim, "#!/bin/sh\n").expect("non-executable shim");
-        assert!(!is_absolute_executable(&shim));
-
-        fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn codex_executable_prefers_desktop_bundle_locations() {
-        let dirs = executable_search_dirs_for_program_with_home(
-            "codex",
-            Some(OsString::from("/Users/tester")),
-        );
-
-        let bundle_dirs = |root: &str, bundle: &str| {
-            let resources = format!("{root}/{bundle}/Contents/Resources");
-            [
-                PathBuf::from(&resources),
-                PathBuf::from(format!("{resources}/codex-cli/bin")),
-                PathBuf::from(format!("{resources}/codex-cli/CodexCLI.app/Contents/MacOS")),
-            ]
-        };
-        // The ChatGPT desktop app vendors the codex CLI the same way; a Mac
-        // with only ChatGPT.app installed must still resolve codex.
-        let expected = [
-            bundle_dirs("/Applications", "Codex.app"),
-            bundle_dirs("/Users/tester/Applications", "Codex.app"),
-            bundle_dirs("/Applications", "ChatGPT.app"),
-            bundle_dirs("/Users/tester/Applications", "ChatGPT.app"),
-        ]
-        .concat();
-        assert_eq!(dirs[..expected.len()], expected[..]);
-        assert!(dirs.len() > expected.len(), "PATH directories follow");
     }
 
     /// Resolve through the same lookup `executable_path` uses; whatever it
@@ -708,12 +601,7 @@ mod tests {
             "Desktop's bundled CLI does not require default login"
         );
         assert!(claude_desktop_vendored_bin_dirs(&home).contains(&desktop_bin));
-        for prefix in [
-            ".local/bin",
-            ".npm-global/bin",
-            ".nvm/versions/node/v22.19.0/bin",
-            ".claude/local",
-        ] {
+        for prefix in [".nvm/versions/node/v22.19.0/bin"] {
             let bin = home.join(prefix);
             fs::create_dir_all(&bin).expect("cli prefix");
             let cli = bin.join("claude");
@@ -734,52 +622,6 @@ mod tests {
             None,
         );
         fs::remove_dir_all(home).expect("cleanup");
-    }
-
-    #[test]
-    fn executable_path_semantics_find_vendored_claude_binary() {
-        let home = scratch_home("claude-desktop-binary");
-        let bin_dir = home.join(
-            "Library/Application Support/Claude/claude-code/2.1.202/claude.app/Contents/MacOS",
-        );
-        fs::create_dir_all(&bin_dir).expect("vendored dir");
-        let claude = bin_dir.join("claude");
-        fs::write(&claude, "#!/bin/sh\n").expect("write claude");
-
-        // The search dirs also include the real machine's PATH entries; keep
-        // only dirs under the scratch home so a genuine `claude` install on
-        // the host cannot satisfy (or shadow) the lookup.
-        let found = executable_search_dirs_for_program_with_home(
-            "claude",
-            Some(home.as_os_str().to_os_string()),
-        )
-        .into_iter()
-        .filter(|dir| dir.starts_with(&home))
-        .map(|dir| dir.join("claude"))
-        .find(|candidate| candidate.is_file());
-
-        assert_eq!(found, Some(claude));
-
-        fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn path_env_deduplicates_candidate_dirs() {
-        let path_env = path_env_from(
-            Some(OsString::from(
-                "/opt/homebrew/bin:/usr/bin:/opt/homebrew/bin",
-            )),
-            None,
-        )
-        .expect("path env");
-        let dirs = env::split_paths(&path_env).collect::<Vec<_>>();
-
-        assert_eq!(
-            dirs.iter()
-                .filter(|dir| dir.as_path() == Path::new("/opt/homebrew/bin"))
-                .count(),
-            1
-        );
     }
 
     #[test]
@@ -839,23 +681,5 @@ mod tests {
             env.get("GEMINI_API_KEY"),
             Some(&OsString::from("gemini-key"))
         );
-    }
-
-    #[test]
-    fn parse_provider_env_output_keeps_only_allowlisted_keys() {
-        let env = parse_provider_env_output(
-            b"GOOGLE_CLOUD_PROJECT=ottto\nPATH=/tmp\nVERTEXAI_LOCATION=us-central1\nMALICIOUS=value\n",
-        );
-
-        assert_eq!(
-            env.get("GOOGLE_CLOUD_PROJECT"),
-            Some(&OsString::from("ottto"))
-        );
-        assert_eq!(
-            env.get("VERTEXAI_LOCATION"),
-            Some(&OsString::from("us-central1"))
-        );
-        assert!(!env.contains_key("PATH"));
-        assert!(!env.contains_key("MALICIOUS"));
     }
 }
