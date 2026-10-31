@@ -287,22 +287,29 @@ pub(in crate::snapshots) fn encode_permitted(
 }
 
 /// No allocation or transcript input: locate literals in a verified record body.
-pub(in crate::snapshots) fn body_has_skill_labels(body: &[u8]) -> Result<bool, Corrupt> {
+pub(in crate::snapshots) fn body_has_skill_labels(
+    source: SnapshotSource,
+    body: &[u8],
+) -> Result<bool, Corrupt> {
     let mut d = Dec::new(body);
-    CachedJsonlReduction::verify(&mut d)?;
-    Rederive::verify(&mut d)?;
-    let present = d.has_pl_labels();
-    d.finish()?;
-    Ok(present)
+    // Use the registered sources' complete walks on the observing decoder.
+    match source {
+        SnapshotSource::ClaudeCode | SnapshotSource::Codex => verify_body(&mut d)?,
+        SnapshotSource::Pi => pi::verify_body(&mut d)?,
+    }
+    Ok(d.has_pl_labels())
 }
 
 /// Structural body verification only: no reduction, re-derivation or live
 /// inputs. The caller separately checks source/binding and envelope integrity.
 /// Precondition: check size, mode and the envelope trailer before this walk.
 pub(crate) fn verify(body: &[u8]) -> Result<(), Corrupt> {
-    let mut d = Dec::new(body);
-    CachedJsonlReduction::verify(&mut d)?;
-    Rederive::verify(&mut d)?;
+    verify_body(&mut Dec::new(body))
+}
+
+fn verify_body(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+    CachedJsonlReduction::verify(d)?;
+    Rederive::verify(d)?;
     d.finish()
 }
 

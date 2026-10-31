@@ -12266,7 +12266,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-/// [format] consent off post save purges pl records and on does not force a read or write.
+/// [format] Pi live preparation refuses an oversized ledger without truncation.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn pi_live_prepare_ledger_cap_counts_entry_cap_refusal_once() {
@@ -12355,67 +12355,105 @@ fn pi_census_and_summary_work_before_any_native_record() {
 #[path = "durable_tail_pi_bound_tests.rs"]
 mod pi_bound;
 
+/// [format] consent off post save purges pl records and on does not force a read or write.
 #[test]
 fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let root = crate::test_scratch::private_dir("skill-consent-save");
-    let lock = test_locks::hold(&root);
-    let source = SnapshotSource::ClaudeCode;
-    let path = root.join("synthetic.jsonl");
-    native_fixture(&path);
-    let scope = Scope("skill-consent".into());
-    let index_path = root.join("index.json");
-    let mut index = ScanIndex::default();
-    index.save(&index_path).unwrap();
-    let before_index = std::fs::read(&index_path).unwrap();
-    let key = store::key_digest(DurableSource::ClaudeCode, "synthetic");
-    let mut disk = DurableTailStore::new(
-        store::store_dir_for_index(&index_path),
-        DurableSource::ClaudeCode,
-    );
-    disk.write_after_save(
-        lock,
-        index.generation,
-        0,
-        vec![PendingRecord {
-            acquisition: None,
-            binding: Binding {
-                source: DurableSource::ClaudeCode,
-                key,
-                context: [1; 32],
-                scope: [2; 32],
-                entry: [3; 32],
-            },
-            certificate: certificate(&path, &scope),
-            body: crate::snapshots::durable_store_fixture_body_with_skill(),
-            allowlist: codec::allowlist_digest(source),
-        }],
-    )
-    .unwrap();
-    assert!(matches!(disk.read(&key), ReadOutcome::Found(_)));
-    let cache = SharedCache::default();
-    cache.durable_begin_pass(source, &index_path, &scope, false);
-    cache.durable_skill_label_permission(source, false);
-    cache.durable_write_after_save(lock, source, &index);
-    assert!(matches!(disk.read(&key), ReadOutcome::Missing));
-    let (counts, _) = cache.durable_counters(source).unwrap();
-    assert_eq!(counts.not_persisted.get("skill_label_purged"), Some(&1));
-    assert_eq!(
-        std::fs::read(&index_path).unwrap(),
-        before_index,
-        "privacy erasure changes no committed money/ACK state"
-    );
-    cache.durable_skill_label_permission(source, true);
-    cache.durable_write_after_save(lock, source, &index);
-    assert!(
-        matches!(disk.read(&key), ReadOutcome::Missing),
-        "consent enablement alone cannot create a record or force a transcript read"
-    );
-    cache.durable_begin_pass(source, &index_path, &scope, false);
-    assert!(
-        !cache.skill_labels_enabled(source),
-        "a new cycle defaults fail-closed until its owner supplies policy"
-    );
+    for (source, fork) in [
+        (SnapshotSource::ClaudeCode, false),
+        (SnapshotSource::Pi, false),
+        (SnapshotSource::Pi, true),
+    ] {
+        let root = crate::test_scratch::ScratchDir::new("skill-consent-save");
+        let lock = test_locks::hold(&root);
+        let path = root.join("synthetic.jsonl");
+        if source == SnapshotSource::Pi {
+            std::fs::write(&path, b"{\"type\":\"session\",\"id\":\"synthetic\"}\n").unwrap();
+        } else {
+            native_fixture(&path);
+        }
+        let scope = Scope("skill-consent".into());
+        let (mut reduction, _) = native_record_of(&path, &scope, source);
+        let acc = reduction.accumulator_for_test();
+        acc.note_provider_skill(Some("SyntheticPurgeLabel".into()));
+        if fork {
+            acc.seen_pi_usage_keys = PiLedger::from_parts(
+                BTreeMap::from([("11".repeat(32), PiUsageDedupState::default())]),
+                true,
+                Some(1),
+            );
+        }
+        let body = codec::encode_permitted(
+            &reduction,
+            store::RECORD_BYTES,
+            jsonl_line_cap() as u64,
+            true,
+        )
+        .unwrap();
+        assert_eq!(codec::body_has_skill_labels(source, &body), Ok(true));
+        let ds = durable_source(source).unwrap();
+        let index_path = root.join("index.json");
+        let mut index = ScanIndex::default();
+        index.save(&index_path).unwrap();
+        let before_index = std::fs::read(&index_path).unwrap();
+        let key = store::key_digest(ds, "synthetic");
+        let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+        disk.write_after_save(
+            lock,
+            index.generation,
+            0,
+            vec![PendingRecord {
+                acquisition: (source == SnapshotSource::Pi).then_some(store::AcquisitionFields {
+                    acquired_revision: 1,
+                    protocol: AcquisitionProtocol::WriteAhead,
+                }),
+                binding: Binding {
+                    source: ds,
+                    key,
+                    context: [1; 32],
+                    scope: [2; 32],
+                    entry: [3; 32],
+                },
+                certificate: certificate(&path, &scope),
+                body,
+                allowlist: codec::allowlist_digest(source),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(disk.read(&key), ReadOutcome::Found(_)));
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &scope, false);
+        cache.durable_skill_label_permission(source, false);
+        cache.durable_write_after_save(lock, source, &index);
+        assert!(matches!(disk.read(&key), ReadOutcome::Missing));
+        assert!(
+            cache
+                .durable()
+                .unwrap()
+                .slot(ds)
+                .as_ref()
+                .unwrap()
+                .skill_label_purge_complete
+        );
+        let (counts, _) = cache.durable_counters(source).unwrap();
+        assert_eq!(counts.not_persisted.get("skill_label_purged"), Some(&1));
+        assert_eq!(
+            std::fs::read(&index_path).unwrap(),
+            before_index,
+            "privacy erasure changes no committed money/ACK state"
+        );
+        cache.durable_skill_label_permission(source, true);
+        cache.durable_write_after_save(lock, source, &index);
+        assert!(
+            matches!(disk.read(&key), ReadOutcome::Missing),
+            "consent enablement alone cannot create a record or force a transcript read"
+        );
+        cache.durable_begin_pass(source, &index_path, &scope, false);
+        assert!(
+            !cache.skill_labels_enabled(source),
+            "a new cycle defaults fail-closed until its owner supplies policy"
+        );
+    }
 }
 
 /// [format] quiet restore has no sample or content input before decode on all sources.

@@ -5331,7 +5331,9 @@ impl SharedCache {
             let mut stores = self.durable()?;
             let slot = stores.slot(durable_source(snapshot_source)?).as_mut()?;
             match slot.store.purge_private_labels(writer, |body| {
-                codec::body_has_skill_labels(body).unwrap_or(false)
+                // The store's predicate can erase, but cannot report a detector
+                // refusal. Erase an uninspectable known body conservatively.
+                codec::body_has_skill_labels(snapshot_source, body).unwrap_or(true)
             }) {
                 Ok(report) => {
                     slot.skill_label_purge_complete = report.refused == 0;

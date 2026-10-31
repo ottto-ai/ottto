@@ -2173,7 +2173,7 @@ fn skill_label_bounds_and_consent_preserve_the_whole_native_state() {
         BTreeSet::from(["FirstSpelling".into()])
     );
     let body = encode_permitted(&record, usize::MAX, line_cap(), true).unwrap();
-    assert!(body_has_skill_labels(&body).unwrap());
+    assert!(body_has_skill_labels(SnapshotSource::ClaudeCode, &body).unwrap());
     let decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
     assert!(
         !decoded.permits_skill_labels(false),
