@@ -24441,14 +24441,15 @@ impl ScanIndex {
     /// `codex_proof_index_minted`, persisted from its first use. `seq` never
     /// falls below the path's high-water, so within one process it never
     /// repeats across failed checkpoints, unsaved missing indexes or partial
-    /// commits.
-    fn mint_or_reuse_codex_proof_incarnation(&mut self, path: &Path, origin: LoadOrigin) {
+    /// commits. Returns whether this is the path's first load in this process.
+    fn mint_or_reuse_codex_proof_incarnation(&mut self, path: &Path, origin: LoadOrigin) -> bool {
         if !self.persistence_available() {
-            return;
+            return false;
         }
 
         let mut minted = minted_proof_incarnations();
         let memo = minted.get(path);
+        let first_load_in_process = memo.is_none();
         let high_water = memo.map_or(0, |memo| memo.seq_high_water);
         let reused = memo.and_then(|memo| match (&origin, &memo.identity) {
             (LoadOrigin::Loaded(now), MintedIdentity::Loaded(before)) if now == before => {
@@ -24484,6 +24485,7 @@ impl ScanIndex {
                 seq_high_water: self.codex_parent_proof_seq,
             },
         );
+        first_load_in_process
     }
 }
 
@@ -43472,6 +43474,73 @@ fn refresh_retained_codex_roster(
     }
 }
 
+/// F5: once per process, queue again the Codex files a retained generation
+/// observed but never indexed. A page dequeues and observes a file when it
+/// reads it, before the upload settles. A partial checkpoint keeps that
+/// traversal but drops the unacknowledged entry, so a restart before the final
+/// save left the file in no queue until the next generation (K7). Each one
+/// re-enters as a census member and passes the ordinary candidate gate: one
+/// counted first read. Files another record owns (queued, residue, inventory
+/// hold, state-only block, terminal disposition, decode hold), gone, or
+/// oversized are left alone.
+fn requeue_unindexed_codex_observed(index: &mut ScanIndex) {
+    let Some(traversal) = index.traversal.as_ref() else {
+        return;
+    };
+    let queued = traversal
+        .pending_candidates
+        .iter()
+        .map(|candidate| local_index_key(&candidate.path))
+        .collect::<BTreeSet<_>>();
+    let orphans = traversal
+        .observed_index_keys
+        .iter()
+        .filter(|key| {
+            !index.files.contains_key(*key)
+                && !queued.contains(*key)
+                && !traversal.residue.index_keys.contains(*key)
+                && !traversal
+                    .residue
+                    .codex_inventory_hold
+                    .as_ref()
+                    .is_some_and(|hold| hold.owed.contains(*key))
+                && !index.codex_state_only_blocked_by_file.contains_key(*key)
+                && !index.terminal_jsonl_dispositions.contains_key(*key)
+                && !index.decode_holds_file(key)
+        })
+        .filter_map(|key| {
+            let path = PathBuf::from(key);
+            let scan_root = traversal.owning_scan_root(&path)?.clone();
+            fs::symlink_metadata(&path).ok().filter(|metadata| {
+                metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() <= max_jsonl_file_bytes(SnapshotSource::Codex)
+            })?;
+            Some(ScanTraversalPath {
+                scan_root,
+                path,
+                census_member: true,
+                watcher_hint: false,
+            })
+        })
+        .take(MAX_BACKFILL_FILES_PER_SOURCE)
+        .collect::<Vec<_>>();
+    if orphans.is_empty() {
+        return;
+    }
+    crate::local_resource_diagnostics::traversal_point(
+        "codex_unindexed_requeue",
+        "codex",
+        &json!({"requeued": orphans.len()}),
+    );
+    index
+        .traversal
+        .as_mut()
+        .expect("traversal checked above")
+        .pending_candidates
+        .extend(orphans);
+}
+
 /// Remember the candidates an incomplete Codex header inventory held on this
 /// page, with what made it incomplete. With an incomplete inventory every
 /// selected candidate is held, so this page's residue is exactly the held
@@ -48719,7 +48788,10 @@ impl ScanIndex {
         };
         let load_origin = ScanIndexLoadOrigin::from(&origin);
         index.settle_claude_index_load(path, load_origin);
-        index.mint_or_reuse_codex_proof_incarnation(path, origin);
+        let first_load_in_process = index.mint_or_reuse_codex_proof_incarnation(path, origin);
+        if source == SnapshotSource::Codex && first_load_in_process {
+            requeue_unindexed_codex_observed(&mut index);
+        }
         if source == SnapshotSource::ClaudeCode
             && load_origin.is_fresh(&index)
             && fs::symlink_metadata(ReemissionExclusions::seen_marker_path(support_dir)).is_ok()
