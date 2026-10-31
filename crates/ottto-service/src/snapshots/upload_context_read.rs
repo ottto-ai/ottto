@@ -205,6 +205,7 @@ impl ScanIndex {
                         terminal_off_decision_now(audit_now),
                         true,
                         false,
+                        false,
                     )
                     .0
                     != CandidateDecision::Parse)

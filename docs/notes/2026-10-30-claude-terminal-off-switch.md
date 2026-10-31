@@ -160,7 +160,7 @@ paired next-release work; no new absence shortcut is introduced here.
 These change only the ON path; with the switch OFF each gated site runs main's
 code. None adds a persisted field, and none adds a field to an OFF-reachable
 struct: ON-only counts live in the `local_resource_diagnostics` per-source
-static array (Claude slots 6-9), so OFF struct sizes and the heap-bound walk
+static array (Claude slots 21-24), so OFF struct sizes and the heap-bound walk
 equal main (Lead B Q2, 2026-10-31).
 
 - **R7 (witness-bound family re-read):** like main's `stale_pending_roots`,
@@ -233,3 +233,31 @@ equal main (Lead B Q2, 2026-10-31).
   the native harness UNEXECUTED. The three arms share one test thread's
   containment RAM memos, so a green result does not claim cold-process memo
   fidelity.
+
+## Strict paired-sidecar service under the terminal-off switch
+
+Lead B (2) ACCEPTED: page pairs as OFF + max(16 MiB, first off-page pair);
+the off-page part is at most 2×64 MiB. The planner's
+`allowance_bytes` is max(16 MiB, its metadata reservation). At read time,
+each page pair and the first rotating off-page pair reserve both 64 MiB
+per-file caps. Only actual bytes are charged. Later off-page pairs share the
+unused part of 16 MiB, so growth in the first pair cannot enlarge that bound.
+The per-file cap and existing generation/growth discard checks still apply.
+
+Page pairs therefore cannot be budget-deferred, even after growth between
+planning and reading. If an ordinary off-page pair is budget-deferred, the
+existing scoped strict-cohort cursor stops at its predecessor. The first such
+root is read with the protected reservation on pass N+1. With M roots remaining
+in that stable cohort, every later budget-deferred root gets its protected read
+within at most M passes: each pass advances through at least its first off-page
+root without skipping the first budget deferral. Becoming a page root serves it
+immediately. This is a budget-service bound; malformed, replaced, continuously
+changing-during-read or per-file oversized evidence still keeps its existing
+hold. Restart or eviction of the existing 64-scope cursor restarts rotation.
+
+The existing `strict_cohort_deferred` line reports `budget_deferred_roots`
+(one per root with API or trace allowance shortfall) separately from #932 growth
+discards, and `budget_protected_pairs` (protected page/first-pair reservations).
+Both drain slots in the existing local-resource diagnostics atomic array; no
+heap-measured report, serialized diagnostics record or OFF layout gains fields.
+The switch remains default OFF; no marker is created by this change.
